@@ -39,4 +39,4 @@ version = {attr = "torch_spyre.version.__version__"}  # any module attribute com
 readme = {file = ["README.rst", "USAGE.rst"]}
 
 [tool.mypy]
-ignore_missing_imports = True
+ignore_missing_imports = true
