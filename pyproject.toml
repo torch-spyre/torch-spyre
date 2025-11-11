@@ -37,3 +37,6 @@ exclude = ["tests"]  # exclude packages matching these glob patterns (empty by d
 [tool.setuptools.dynamic]
 version = {attr = "torch_spyre.version.__version__"}  # any module attribute compatible with ast.literal_eval
 readme = {file = ["README.rst", "USAGE.rst"]}
+
+[tool.mypy]
+ignore_missing_imports = True
