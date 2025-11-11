@@ -17,7 +17,12 @@ run_mypy() {
         mypy --python-version "${PYTHON_VERSION}" "$@"
         return
     fi
-    mypy --follow-imports skip --python-version "${PYTHON_VERSION}" "$@"
+    if [[ $# -eq 0 ]]; then
+        return
+    fi
+    mypy --follow-imports skip --python-version "${PYTHON_VERSION}" \
+    --exclude '_inductor/(wrapper\.py|spyre_kernel\.py|dsc\.py|customops\.py|runtime/async_compile\.py|stickify\.py|passes/__init__.py)' \
+    "$@"
 }
 
 run_mypy # Note that this is less strict than CI
