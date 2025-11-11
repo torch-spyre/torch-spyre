@@ -14,7 +14,7 @@ from .kernel_runner import (
     SpyreUnimplementedRunner,
 )
 
-_argument_names = ["arg0", "arg1", "arg2", "arg3"]
+_argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
 
 
 def get_output_dir(kernel_name: str):
