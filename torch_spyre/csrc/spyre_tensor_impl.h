@@ -23,6 +23,21 @@
 
 namespace spyre {
 
+class SpyreDCI {
+public:
+    enum StickFormat {
+        Dense = 0,
+        Sparse,
+        SparseMulti,
+    };
+    std::vector<int32_t> dim_order;
+    int32_t num_stick_dims;
+    StickFormat format;
+
+    SpyreDCI(int32_t num_dims);
+    SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims, StickFormat format);
+};
+
 /**
  * An SpyreTensorImpl has extra information needed for Spyre tensors,
  * like what sticks are there.

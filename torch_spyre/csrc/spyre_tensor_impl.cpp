@@ -22,6 +22,19 @@
 
 namespace spyre {
 
+/**
+ * Initialize a default format (generic stick) DCI for a tensor with num_dims dimensions.
+ */
+SpyreDCI::SpyreDCI(int32_t num_dims) : dim_order({}), num_stick_dims(1), format(StickFormat::Dense) {
+  for (int32_t i = 0; i < num_dims; i++) {
+    dim_order.push_back(i);
+  }
+}
+
+SpyreDCI::SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims, StickFormat format) 
+  : dim_order(dim_order), num_stick_dims(num_stick_dims), format(format) { }
+
+
 SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
                                  c10::DispatchKeySet key_set,
                                  const caffe2::TypeMeta& dtype)
