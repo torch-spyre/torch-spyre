@@ -100,6 +100,9 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
         RUNTIME_DIR / "include",
     ]
     INCLUDE_DIRS += [
+        RUNTIME_DIR / "include" / "common",
+    ]
+    INCLUDE_DIRS += [
         RUNTIME_DIR / "include" / "concurrentqueue" / "moodycamel",
     ]
     INCLUDE_DIRS += [
