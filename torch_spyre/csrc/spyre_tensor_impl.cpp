@@ -31,7 +31,7 @@ SpyreDCI::SpyreDCI(int32_t num_dims) : dim_order({}), num_stick_dims(1), format(
   }
 }
 
-SpyreDCI::SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims, StickFormat format) 
+SpyreDCI::SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims, StickFormat format)
   : dim_order(dim_order), num_stick_dims(num_stick_dims), format(format) { }
 
 
