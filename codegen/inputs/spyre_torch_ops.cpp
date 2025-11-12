@@ -391,7 +391,7 @@ at::Tensor &spyre__addmm_out(const at::Tensor &self, const at::Tensor &mat1,
   return out;
 }
 
-at::Tensor& spyre__fill_Scalar(at::Tensor& self, const at::Scalar& other) {
+at::Tensor &spyre__fill_Scalar(at::Tensor &self, const at::Scalar &other) {
   DEBUGINFO("Tensor is on: ", self.device());
   at::Tensor tmp = (at::ones(self.sizes(), self.dtype()) * other);
   self = spyre::spyre_copy_from(tmp, self, false);

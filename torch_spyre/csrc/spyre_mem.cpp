@@ -167,7 +167,7 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
                        std::optional<c10::Device> device_opt,
                        std::optional<bool> pin_memory_opt,
                        std::optional<c10::MemoryFormat> memory_format_opt) {
-    c10::Device device = device_opt.value_or(
+  c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("shape=", size, " on Spyre ", device);
   const auto dtype = c10::dtype_or_default(dtype_opt);
@@ -307,7 +307,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     constInput.SetSpyreData(
         (static_cast<SharedOwnerCtx*>(dst.storage().data_ptr().get_context()))
             ->owner);
-    
+
     auto copy_status = gl.Copy(sendnn::Outputs(), {constInput}, 1);
 
     return dst;
