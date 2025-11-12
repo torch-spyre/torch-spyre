@@ -78,7 +78,7 @@ class _SpyreImpl:
                 self.manual_seed(seed, device=idx)
 
     def is_available(self) -> bool:
-        if self._is_in_bad_fork:
+        if self._is_in_bad_fork():
             return True
         else:
             return getattr(self._C, "is_available", lambda: True)()

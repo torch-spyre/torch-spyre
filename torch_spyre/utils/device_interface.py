@@ -33,14 +33,14 @@ class SpyreInterface(DeviceInterface):
     # Can be mock patched by @patch decorator.
     @staticmethod
     def is_available() -> bool:
-        return torch.spyre.is_available()
+        return torch.spyre.is_available()  # type: ignore[attr-defined]
 
     @classmethod
-    def get_device_properties(cls, device=None) -> SpyreDeviceProperties:
+    def get_device_properties(cls, device: _device_t = None) -> SpyreDeviceProperties:
         return cls.Worker.get_device_properties(device)
 
     @staticmethod
-    def get_compute_capability(device) -> str:
+    def get_compute_capability(device: _device_t = None) -> Any:
         # TODO (tmhoangt): read this from cache
         # as worker process don't get access to device due to driver limitation
         return ""

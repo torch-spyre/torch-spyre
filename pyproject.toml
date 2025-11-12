@@ -23,6 +23,15 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 test = ["transformers"]
+dev = [
+    "mypy>=1.11.1",
+    "types-cachetools",
+    "types-setuptools",
+    "types-PyYAML",
+    "types-requests",
+    "types-psutil",
+    "pydantic>=2.0"
+]
 
 [project.entry-points."torch.backends"]
 torch_spyre = "torch_spyre:_autoload"
@@ -38,8 +47,17 @@ exclude = ["tests"]  # exclude packages matching these glob patterns (empty by d
 version = {attr = "torch_spyre.version.__version__"}  # any module attribute compatible with ast.literal_eval
 readme = {file = ["README.rst", "USAGE.rst"]}
 
-[tool.mypy]
-ignore_missing_imports = true
-
 [tool.ruff]
 line-length = 88
+
+[tool.mypy]
+ignore_missing_imports = true
+exclude = ".*torch_spyre/_inductor/(wrapper\\.py|spyre_kernel\\.py|dsc\\.py|customops\\.py|runtime/async_compile\\.py|stickify\\.py|passes/__init__\\.py)"
+
+[[tool.mypy.overrides]]
+module = ["torch_spyre._inductor.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["tests._inductor.utils"]
+ignore_errors = true

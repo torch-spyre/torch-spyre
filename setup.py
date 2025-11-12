@@ -117,6 +117,12 @@ EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
 
 
 class clean(Command):
+    def initialize_options(self):
+        pass
+
+    def finalize_options(self):
+        pass
+
     def run(self):
         # Remove torch_spyre extension
         for path in (ROOT_DIR / PATH_NAME).glob("**/*.so"):
