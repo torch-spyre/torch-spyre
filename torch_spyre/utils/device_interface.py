@@ -1,3 +1,17 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 from torch._dynamo.device_interface import DeviceInterface, _device_t
 from typing import Any
@@ -19,14 +33,14 @@ class SpyreInterface(DeviceInterface):
     # Can be mock patched by @patch decorator.
     @staticmethod
     def is_available() -> bool:
-        return torch.spyre.is_available()
+        return torch.spyre.is_available()  # type: ignore[attr-defined]
 
     @classmethod
-    def get_device_properties(cls, device=None) -> SpyreDeviceProperties:
+    def get_device_properties(cls, device: _device_t = None) -> SpyreDeviceProperties:
         return cls.Worker.get_device_properties(device)
 
     @staticmethod
-    def get_compute_capability(device) -> str:
+    def get_compute_capability(device: _device_t = None) -> Any:
         # TODO (tmhoangt): read this from cache
         # as worker process don't get access to device due to driver limitation
         return ""

@@ -17,7 +17,11 @@ run_mypy() {
         mypy --python-version "${PYTHON_VERSION}" "$@"
         return
     fi
-    mypy --follow-imports skip --python-version "${PYTHON_VERSION}" "$@"
+    if [[ $# -eq 0 ]]; then
+        return
+    fi
+    mypy --follow-imports skip --python-version "${PYTHON_VERSION}" \
+    "$@"
 }
 
 run_mypy # Note that this is less strict than CI

@@ -1,3 +1,17 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from contextlib import contextmanager
 
 import torch
@@ -94,7 +108,7 @@ def spyre_unsqueeze(x, dim):
             res_dim_order.append(d)
             res_dim_order.append(d + 1)
     res = x.new_empty(res_shape)
-    res.spyre_dci = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.stick_sparse)
+    res.spyre_dci = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.format)
     return res
 
 

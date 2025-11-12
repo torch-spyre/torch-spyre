@@ -38,9 +38,21 @@ repos:
         "--extensions=cpp,h ",
         --exclude=codegen/inputs/RegistrationDeclarations.h
       ]
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.11.1  # use the latest stable version
+  hooks:
+    - id: mypy
+      name: mypy (type checking)
+      language: system
+      types: [python]
+      args: 
+          - --config-file=pyproject.toml
+          - torch_spyre
+          - tests
+      pass_filenames: false
 - repo: local
   hooks:
-  - id: clang-format
+  - id: clang-format-local
     name: clang-format
     entry: tools/clang-format-hook.sh 
     language: system
@@ -51,7 +63,7 @@ repos:
     language: python
     types: [python]
     additional_dependencies: &mypy_deps [mypy==1.11.1, types-cachetools, types-setuptools, types-PyYAML, types-requests, pydantic]
-    stages: [pre-commit] # Don't run in CI
+    stages: [manual] # Don't run in CI
   - id: mypy-3.10 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
     name: Run mypy for Python 3.10
     entry: tools/mypy.sh 1 "3.10"

@@ -17,6 +17,8 @@ pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu-cxx11-
 
 ### How to Install
 
+To install Torch Spyre, clone the repository and from the cloned directory run the following command:
+
 ```bash
 pip3 install -e . --no-deps --no-build-isolation -vvv --verbose
 ```
