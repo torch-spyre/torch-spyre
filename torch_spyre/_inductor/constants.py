@@ -13,6 +13,7 @@
 # limitations under the License.
 
 MATMUL_REDUCTION_OP = "matmul"
+BATCH_MATMUL_OP = "batchmatmul"
 TRANSPOSE_OP = "transpose"
 DEVICE_NAME = "spyre"
 

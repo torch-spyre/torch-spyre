@@ -18,7 +18,7 @@ from torch._inductor.ir import Reduction, Pointwise
 from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
-from .constants import MATMUL_REDUCTION_OP
+from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import SpyrePointwise, SpyreReduction
 
 
@@ -46,6 +46,36 @@ def lower_mm(x, y):
 
     return result
 
+
+@lowering.register_lowering(torch.ops.aten.bmm.default)
+def lower_bmm(x, y):
+    def inner_fn(index, reduction_index):
+        i0, i1, i2 = index
+        x_layout = x.get_layout()
+        y_layout = y.get_layout()
+        (r0,) = reduction_index
+        tmp1 = ops.load(
+            x.get_name(), x_layout.stride[0] * i0 + x_layout.stride[1] * i1 + r0
+        )
+        tmp2 = ops.load(
+            y.get_name(), y_layout.stride[0] * i0 + y_layout.stride[1] * r0 + i2
+        )
+        return (tmp1, tmp2)
+    
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_OP,
+        input_node=[x, y],
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[2]],  # B, M, N
+        reduction_ranges=[x.get_size()[2]],  # K
+    )
+
+    result.realize()
+
+    return result
 
 @lowering.register_lowering(torch.ops.spyre.swap)
 def lower_swap(x):

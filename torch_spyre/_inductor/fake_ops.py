@@ -18,6 +18,7 @@ import torch
 from torch._dynamo.backends.common import AotAutograd
 from .stickify import (
     spyre_matmul_result_shape,
+    spyre_bmm_result_shape,
     spyre_reduction_result_shape,
     spyre_pointwise_result_shape,
     SpyreDCI,
@@ -34,6 +35,13 @@ def spyre_matmul(x, y):
     res = x.new_empty(res_size)
     res.spyre_dci = res_dci
     return res
+
+
+def spyre_bmm(x, y):
+     res_size, res_dci = spyre_bmm_result_shape(x, y)
+     res = x.new_empty(res_size)
+     res.spyre_dci = res_dci
+     return res
 
 
 def spyre_amax(x, dim, keepdim=False):
@@ -146,6 +154,7 @@ _meta_ops = {
     aten.max.dim: spyre_max,
     aten.min.dim: spyre_min,
     aten.mm.default: spyre_matmul,
+    aten.bmm.default: spyre_bmm,
     aten.sum.dim_IntList: spyre_sum,
     # Pointwise binary
     aten.add.Tensor: spyre_pointwise_binary,
