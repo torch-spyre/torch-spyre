@@ -379,6 +379,18 @@ at::Tensor &spyre__addmm_out(const at::Tensor &self, const at::Tensor &mat1,
   return out;
 }
 
+at::Tensor& spyre__fill_Scalar(at::Tensor& self, const at::Scalar& other) {
+  DEBUGINFO("Tensor is on: ", self.device());
+  at::Tensor tmp = (at::ones(self.sizes(), self.dtype()) * other);
+  self = spyre::spyre_copy_from(tmp, self, false);
+  return self;
+}
+
+TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  m.impl("fill_.Scalar", TORCH_FN(spyre__fill_Scalar));
+}
+// fill_.Scalar
+
 // TODO(filhan): Even though codegen generated version should work, throws
 // DummyOp error. Decomposed for now.
 at::Tensor spyre__addmm_default(const at::Tensor &self, const at::Tensor &mat1,

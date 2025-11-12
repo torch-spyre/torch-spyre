@@ -31,14 +31,20 @@ class TestSpyre(TestCase):
         for i in range(torch.spyre._device_daemon.NUM_DEVICES):
             self.assertIn(f"pt_autograd_{i}", all_thread_names)
 
-    @unittest.skip("Skip for now")
-    def test_factory(self):
-        a = torch.empty(50, device="spyre")
+    def test_empty_factory(self):
+        a = torch.empty(50, device="spyre", dtype=torch.float16)
         self.assertEqual(a.device.type, "spyre")
 
         a.fill_(3.5)
 
-        self.assertTrue(a.eq(3.5).all())
+        a_cpu = a.cpu()
+        self.assertTrue(a_cpu.eq(3.5).all())
+    
+    def test_ones_factory(self):
+        a = torch.ones(50, device="spyre", dtype=torch.float16)
+        self.assertEqual(a.device.type, "spyre")
+        a_cpu = a.cpu()
+        self.assertTrue(a_cpu.eq(1.0).all())
 
     @unittest.skip("Skip for now")
     def test_printing(self):

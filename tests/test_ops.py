@@ -32,6 +32,13 @@ class TestOps(TestCase):
         self.mm_b = 5
         self.mm_c = 7
 
+    def test_inplace_fill_scalar(self):
+        x = torch.tensor([1, -2, 3], dtype=self.dtype, device="spyre")
+        x.fill_(5.0)
+        x_actual = x.cpu()
+        x_expected = torch.tensor([5.0, 5.0, 5.0], dtype=self.dtype)
+        torch.testing.assert_close(x_expected, x_actual, rtol=self.rtol, atol=self.atol)
+
     def test_copy(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
         y = x.to("spyre").to("cpu")
