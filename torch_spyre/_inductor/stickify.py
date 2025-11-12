@@ -156,6 +156,20 @@ def spyre_matmul_result_shape(
     return res_size, res_dci
 
 
+def spyre_bmm_result_shape(
+    x: torch.Tensor, y: torch.Tensor
+) -> Tuple[Sequence[int], SpyreDCI]:
+    x_dci: SpyreDCI = x.get_dci()
+    y_dci: SpyreDCI = y.get_dci()
+    if x_dci.stick_sparse or y_dci.stick_sparse:
+        raise Unsupported(f"bmm on sparse tensors {x_dci} {y_dci}")
+    if x_dci.dim_order != y_dci.dim_order:
+        raise Unsupported(f"bmm stick dimensions mismatch {x_dci} {y_dci}")
+    res_dci = SpyreDCI(list(x_dci.dim_order))
+    res_size = [x.size()[0], x.size()[1], y.size()[-1]]
+    return res_size, res_dci
+
+
 def spyre_reduction_result_shape(
     x: torch.Tensor, axis: Union[int, list[int]], keepdims: bool = False
 ) -> Tuple[Sequence[int], SpyreDCI]:

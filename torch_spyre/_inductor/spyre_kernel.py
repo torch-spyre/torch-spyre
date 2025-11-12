@@ -31,7 +31,7 @@ from torch._inductor.virtualized import ReductionType, StoreMode, V
 
 
 from .runtime import ConstantArg, TensorArg
-from .constants import MATMUL_REDUCTION_OP, TRANSPOSE_OP
+from .constants import MATMUL_REDUCTION_OP, TRANSPOSE_OP, BATCH_MATMUL_OP
 from . import Unsupported
 from .opoverrides import SpyreKernelOverrides
 from .opfuncs import UNIMPLEMENTED, get_spyre_op
@@ -217,6 +217,51 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             for input in self.compute_inputs:
                 if not isinstance(input, TensorAccess):
                     raise Unsupported(f"matmul: unsupported input {input}")
+                scale = self.analyze_tensor_access(di, input.index)
+                args.append(
+                    TensorArg(
+                        True,
+                        actuals.index(input.name),
+                        input.dtype,
+                    )
+                )
+                scales.append(scale)
+            scale = self.analyze_tensor_access(di, self.compute_output.index)
+            args.append(
+                TensorArg(
+                    False,
+                    actuals.index(self.compute_output.name),
+                    self.compute_output.dtype,
+                )
+            )
+            scales.append(scale)
+            return KernelSummary(di, scales, args, self.op_info)
+        elif self.spyre_op == BATCH_MATMUL_OP:
+            # BATCH_MATMUL is specially constructed by our lowering operation.
+            # It has exactly 2 tensor inputs and 1 tensor output.
+            if (
+                (not len(self.range_trees) == 2)
+                or (not self.range_trees[0].name == "xindex")
+                or (not len(self.range_trees[0].var_list) == 3)  # FIXME: generalize
+                or (not self.range_trees[1].name == "r0_index")
+                or (not len(self.range_trees[1].var_list) == 1)
+            ):
+                raise Unsupported(f"batchmatmul range trees {self.range_trees}")
+            idx_rt = self.range_trees[0]
+            red_rt = self.range_trees[1]
+            x_0 = idx_rt.var_list[0]
+            x_1 = idx_rt.var_list[1]
+            x_2 = idx_rt.var_list[2]
+            r_0 = red_rt.var_list[0]
+            di = [
+                DimensionInfo(x_2, int(idx_rt.var_ranges[x_2])),  # x
+                DimensionInfo(x_1, int(idx_rt.var_ranges[x_1])),  # mb
+                DimensionInfo(r_0, int(red_rt.var_ranges[r_0])),  # in
+                DimensionInfo(x_0, int(idx_rt.var_ranges[x_0])),  # out
+            ]
+            args = []
+            scales = []
+            for input in self.compute_inputs:
                 scale = self.analyze_tensor_access(di, input.index)
                 args.append(
                     TensorArg(
