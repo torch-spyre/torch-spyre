@@ -823,6 +823,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         }
     }
 
+
 def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     # [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
     return {

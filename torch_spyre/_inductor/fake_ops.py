@@ -38,10 +38,10 @@ def spyre_matmul(x, y):
 
 
 def spyre_bmm(x, y):
-     res_size, res_dci = spyre_bmm_result_shape(x, y)
-     res = x.new_empty(res_size)
-     res.spyre_dci = res_dci
-     return res
+    res_size, res_dci = spyre_bmm_result_shape(x, y)
+    res = x.new_empty(res_size)
+    res.spyre_dci = res_dci
+    return res
 
 
 def spyre_amax(x, dim, keepdim=False):

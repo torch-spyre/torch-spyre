@@ -161,7 +161,7 @@ def spyre_bmm_result_shape(
 ) -> Tuple[Sequence[int], SpyreDCI]:
     x_dci: SpyreDCI = x.get_dci()
     y_dci: SpyreDCI = y.get_dci()
-    if x_dci.stick_sparse or y_dci.stick_sparse:
+    if x_dci.format != StickFormat.DENSE or y_dci.format != StickFormat.DENSE:
         raise Unsupported(f"bmm on sparse tensors {x_dci} {y_dci}")
     if x_dci.dim_order != y_dci.dim_order:
         raise Unsupported(f"bmm stick dimensions mismatch {x_dci} {y_dci}")
