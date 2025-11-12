@@ -153,3 +153,7 @@ def _autoload():
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
+
+    from torch_spyre._inductor import _autoload as ts_autoload
+
+    ts_autoload()
