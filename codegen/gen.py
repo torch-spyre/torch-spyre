@@ -80,7 +80,9 @@ def generate_and_register_wrappers(codegen_dir: Union[str, Path]):
     # Get all schemas and declarations of pytorch ops
     with open(pytorch_schemas_path, "rt") as f:
         schemas = f.readlines()
-    schemas = [json.loads(d.split("//")[-1]) for d in schemas[3:]]  # extract schemas
+    schemas = [
+        json.loads(d.split("//")[-1]) for d in schemas[19:]
+    ]  # extract schemas (skip frontmatter)
 
     with open(pytorch_declarations_path) as f:
         declarations = yaml.safe_load(f)
