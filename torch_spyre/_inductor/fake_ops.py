@@ -108,7 +108,7 @@ def spyre_unsqueeze(x, dim):
             res_dim_order.append(d)
             res_dim_order.append(d + 1)
     res = x.new_empty(res_shape)
-    res.spyre_dci = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.stick_sparse)
+    res.spyre_dci = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.format)
     return res
 
 

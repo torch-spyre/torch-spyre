@@ -159,7 +159,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self,
         op_dimensions: Sequence[DimensionInfo],
         index: sympy.Expr,
-    ) -> Sequence[int]:
+    ) -> list[int]:
         """
         Return the scale implied by the given iteration space and indexing expression
         """
@@ -269,6 +269,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             for input in self.compute_inputs:
                 if isinstance(input, TensorAccess):
                     scale = self.analyze_tensor_access(di, input.index)
+                    if self.compute_op == "layernormscale":
+                        scale[-1] = -2
                     args.append(
                         TensorArg(
                             True,

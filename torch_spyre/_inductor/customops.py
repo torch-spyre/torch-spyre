@@ -15,7 +15,7 @@
 from typing import Optional
 import torch
 
-from .stickify import SpyreDCI, spyre_reduction_result_shape
+from .stickify import SpyreDCI, spyre_reduction_result_shape, StickFormat
 from . import Unsupported
 
 
@@ -31,7 +31,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("compact only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], stick_sparse=False)
+    output.spyre_dci = SpyreDCI([0], format=StickFormat.DENSE)
     return output
 
 
@@ -40,7 +40,7 @@ def swap(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
-    output.spyre_dci = SpyreDCI([0], stick_sparse=True)
+    output.spyre_dci = SpyreDCI([0], format=StickFormat.SPARSE)
     return output
 
 
@@ -49,7 +49,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
-    output.spyre_dci = SpyreDCI([0], stick_sparse=True)
+    output.spyre_dci = SpyreDCI([0], format=StickFormat.SPARSE)
     return output
 
 
@@ -58,7 +58,7 @@ def slice(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], stick_sparse=False)
+    output.spyre_dci = SpyreDCI([0], format=StickFormat.DENSE)
     return output
 
 
@@ -67,13 +67,13 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], stick_sparse=False)
+    output.spyre_dci = SpyreDCI([0], format=StickFormat.DENSE)
     return output
 
 
 @torch.library.custom_op("spyre::layer_norm", mutates_args=())
 def layer_norm(
-    input: torch.Tensor,
+    x: torch.Tensor,
     normalized_shape: list[int],
     weight: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
@@ -83,50 +83,56 @@ def layer_norm(
         raise Unsupported(
             f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
         )
-    return torch.native_layer_norm(input, normalized_shape, weight, bias, eps)[0]
+    return torch.native_layer_norm(x, normalized_shape, weight, bias, eps)[0]
 
 
 @layer_norm.register_fake
 def _(
-    input: torch.Tensor,
+    x: torch.Tensor,
     normalized_shape: list[int],
     weight: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ):
-    res = input.new_empty(input.size())
-    res.spyre_dci = input.get_dci()
+    res = x.new_empty(x.size())
+    res.spyre_dci = x.get_dci()
     return res
 
 
 @torch.library.custom_op("spyre::exx2", mutates_args=(), device_types="spyre")
-def exx2(input: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor:
+def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor:
     pass
 
 
 @exx2.register_fake
-def _(input: torch.Tensor, exx2Scale: float, useZeroMean: bool):
-    res_size, res_dci = spyre_reduction_result_shape(input, [input.ndim - 1], True)
-    res = input.new_empty(res_size)
+def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
+    res_size, res_dci = spyre_reduction_result_shape(x, [x.ndim - 1], False)
+    res_dci = SpyreDCI(res_dci.dim_order, format=StickFormat.SPARSE_MULTI)
+    res = x.new_empty(res_size)
     res.spyre_dci = res_dci
     return res
 
 
 @torch.library.custom_op("spyre::layernormscale", mutates_args=(), device_types="spyre")
-def layernormscale(input: torch.Tensor, eps: float) -> torch.Tensor:
+def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:
     pass
 
 
 @layernormscale.register_fake
-def _(input: torch.Tensor, eps: float) -> torch.Tensor:
-    res = input.new_empty(input.size())
-    res.spyre_dci = input.get_dci()
+def _(x: torch.Tensor, eps: float) -> torch.Tensor:
+    x_dci = x.get_dci()
+    if x_dci.format != StickFormat.SPARSE_MULTI:
+        raise Unsupported(f"layernormscale: Unexpected format {x_dci.format}")
+    res_dci = SpyreDCI(x_dci.dim_order, format=StickFormat.SPARSE)
+    res_size = list(x.size())
+    res = x.new_empty(res_size)
+    res.spyre_dci = res_dci
     return res
 
 
 @torch.library.custom_op("spyre::layernormnorm", mutates_args=(), device_types="spyre")
 def layernormnorm(
-    input: torch.Tensor,
+    x: torch.Tensor,
     mean: torch.Tensor,
     norm_mean: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -137,12 +143,12 @@ def layernormnorm(
 
 @layernormnorm.register_fake
 def _(
-    input: torch.Tensor,
+    x: torch.Tensor,
     mean: torch.Tensor,
     norm_mean: torch.Tensor,
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    res = input.new_empty(input.size())
-    res.spyre_dci = input.get_dci()
+    res = x.new_empty(x.size())
+    res.spyre_dci = x.get_dci()
     return res
