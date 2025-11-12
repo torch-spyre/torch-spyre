@@ -16,6 +16,47 @@ import math
 import os
 
 
+def encode_constant(v):
+    """
+    TODO: This is a stub implmentation to enable development work for layernorm.
+          This function really belongs in torch-spyre by wrapping the native deeptools::FloatToFp16Bin
+    """
+    if isinstance(v, float):
+        if v == 0.00390625:
+            return 11776
+        elif v == 0:
+            return 0
+        elif v == 1e-5:
+            return 7327
+        else:
+            print(f"WARNING: finish hacky constant encoding function! {v}")
+            return 1
+    elif isinstance(v, bool):
+        return 1 if v else 0
+
+
+def generate_constant_info(**kwargs):
+    if "op_info" not in kwargs or "constants" not in kwargs["op_info"]:
+        return "{}"
+    constant_info = {}
+    for name, value in kwargs["op_info"]["constants"].items():
+        ci = {
+            "dataFormat_": "SEN169_FP16",
+            "name_": name,
+            "data_": {
+                "dim_prop_func": [{"Const": {}}, {"Const": {}}, {"Map": {}}],
+                "dim_prop_attr": [
+                    {"factor_": 1, "label_": "core"},
+                    {"factor_": 1, "label_": "corelet"},
+                    {"factor_": 1, "label_": "time"},
+                ],
+                "data_": {"[0, 0, 0]": [encode_constant(value)]},
+            },
+        }
+        constant_info[f"{len(constant_info)}"] = ci
+    return constant_info
+
+
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
 
@@ -323,6 +364,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                             }
                             for i, tensor in enumerate(tensors)
                         ],
+                        "constantInfo_": generate_constant_info(**kwargs),
                         "computeOp_": [
                             {
                                 "exUnit": "sfp",
