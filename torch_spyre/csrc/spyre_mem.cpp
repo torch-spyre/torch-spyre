@@ -167,24 +167,6 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
                        std::optional<c10::Device> device_opt,
                        std::optional<bool> pin_memory_opt,
                        std::optional<c10::MemoryFormat> memory_format_opt) {
-  // // Calculate contiguous strides
-  // std::vector<int64_t> strides(size.size());
-  // int64_t stride = 1;
-  
-  // for (int64_t i = size.size() - 1; i >= 0; --i) {
-  //     strides[i] = stride;
-  //     stride *= size[i];
-  // }
-  // at::Tensor result = spyre_empty_strided(size, strides, dtype_opt, layout_opt, device_opt, pin_memory_opt);
-  
-  // if (memory_format_opt.has_value()) {
-  //   // Restriding a just-created empty contiguous tensor does nothing.
-  //   if (*memory_format_opt != c10::MemoryFormat::Contiguous) {
-  //     result.unsafeGetTensorImpl()->empty_tensor_restride(*memory_format_opt);
-  //   }
-  // }
-  // DEBUGINFO("Result: ", (static_cast<SharedOwnerCtx*>(result.storage().data_ptr().get_context()))->owner);
-  // return result;
     c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("shape=", size, " on Spyre ", device);
@@ -217,14 +199,6 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
-  std::string pin_mem;
-  if (pin_memory_opt.has_value()) {
-      pin_mem = *pin_memory_opt ? "true" : "false";
-  } else {
-      pin_mem = "nullopt";
-  }
-  
-  DEBUGINFO("Layout:", c10::layout_or_default(layout_opt), ", PinMemory: ", pin_mem);
 
   const auto scalar_type = c10::dtype_or_default(dtype_opt);
   TORCH_CHECK(device.is_privateuseone());
@@ -311,6 +285,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   DEBUGINFO("dst is on:", dst.device());
   at::Storage source_storage;
   at::Storage dest_storage;
+
   if (self.is_cpu() && dst.is_privateuseone()) {
     // Copy from CPU to Spyre
     std::optional<sendnn::GraphLoader> opt_gl =
