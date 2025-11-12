@@ -61,7 +61,7 @@ def lower_bmm(x, y):
             y.get_name(), y_layout.stride[0] * i0 + y_layout.stride[1] * r0 + i2
         )
         return (tmp1, tmp2)
-    
+
     result = Reduction.create(
         reduction_type=BATCH_MATMUL_OP,
         input_node=[x, y],
@@ -76,6 +76,7 @@ def lower_bmm(x, y):
     result.realize()
 
     return result
+
 
 @lowering.register_lowering(torch.ops.spyre.swap)
 def lower_swap(x):

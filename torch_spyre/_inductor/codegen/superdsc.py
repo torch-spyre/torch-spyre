@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from torch_spyre._inductor.constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP, TRANSPOSE_OP
+from torch_spyre._inductor.constants import (
+    MATMUL_REDUCTION_OP,
+    BATCH_MATMUL_OP,
+    TRANSPOSE_OP,
+)
 from torch_spyre._inductor import Unsupported
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (

@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Union
-import re
+import regex as re
 
 import torch
 import sympy
