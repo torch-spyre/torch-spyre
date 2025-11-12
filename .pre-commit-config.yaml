@@ -52,7 +52,7 @@ repos:
       pass_filenames: false
 - repo: local
   hooks:
-  - id: clang-format
+  - id: clang-format-local
     name: clang-format
     entry: tools/clang-format-hook.sh 
     language: system

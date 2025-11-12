@@ -179,13 +179,14 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreDCI> dci_cls(m, "SpyreDCI");
   dci_cls.def_readwrite("dim_order", &spyre::SpyreDCI::dim_order)
-    .def_readwrite("num_stick_dims", &spyre::SpyreDCI::num_stick_dims)
-    .def_readwrite("format", &spyre::SpyreDCI::format)
-    .def(py::init<int32_t>())
-    .def(py::init<std::vector<int32_t>, int32_t, spyre::SpyreDCI::StickFormat>());
+      .def_readwrite("num_stick_dims", &spyre::SpyreDCI::num_stick_dims)
+      .def_readwrite("format", &spyre::SpyreDCI::format)
+      .def(py::init<int32_t>())
+      .def(py::init<std::vector<int32_t>, int32_t,
+                    spyre::SpyreDCI::StickFormat>());
 
   py::enum_<spyre::SpyreDCI::StickFormat>(dci_cls, "StickFormat")
-    .value("Dense", spyre::SpyreDCI::StickFormat::Dense)
-    .value("Sparse", spyre::SpyreDCI::StickFormat::Sparse)
-    .value("SparseMulti", spyre::SpyreDCI::StickFormat::SparseMulti);
+      .value("Dense", spyre::SpyreDCI::StickFormat::Dense)
+      .value("Sparse", spyre::SpyreDCI::StickFormat::Sparse)
+      .value("SparseMulti", spyre::SpyreDCI::StickFormat::SparseMulti);
 }

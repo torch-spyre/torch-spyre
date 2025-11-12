@@ -19,23 +19,26 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <vector>
+
 #include "spyre_storage_impl.h"
 
 namespace spyre {
 
 class SpyreDCI {
-public:
-    enum StickFormat {
-        Dense = 0,
-        Sparse,
-        SparseMulti,
-    };
-    std::vector<int32_t> dim_order;
-    int32_t num_stick_dims;
-    StickFormat format;
+ public:
+  enum StickFormat {
+    Dense = 0,
+    Sparse,
+    SparseMulti,
+  };
+  std::vector<int32_t> dim_order;
+  int32_t num_stick_dims;
+  StickFormat format;
 
-    SpyreDCI(int32_t num_dims);
-    SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims, StickFormat format);
+  explicit SpyreDCI(int32_t num_dims);
+  SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims,
+           StickFormat format);
 };
 
 /**
