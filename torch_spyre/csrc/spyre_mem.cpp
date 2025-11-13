@@ -138,61 +138,43 @@ auto get_device_stride(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         stride_info.stride_dst_.push_back(1);
         stride_info.stride_dst_.push_back(stick_size);
         stride_info.stride_src_.push_back(stick_size);
-      } else {
-        if (i == dev_dim_order.size() - 1 && dev_dim_order.size() == 3) {
-          stride_info.stride_src_.push_back(stick_size);
+      } else if (dim == dev_dim_order.front()) {
+        stride_info.size_.push_back(requires_padding ? cpu_shape[dim]
+                                                     : stick_size);
+        stride_info.stride_src_.push_back(cpu_strides[dim]);
+        stride_info.stride_dst_.push_back(1);
+      } else if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
+        stride_info.stride_dst_.push_back(stick_size);
+        stride_info.size_.push_back(cpu_shape[dev_dim_order.back()]);
+        stride_info.stride_src_.push_back(cpu_strides[dev_dim_order.back()]);
+        stride_info.stride_src_.push_back(stick_size);
+        stride_info.size_.push_back(
+            requires_padding ? 1
+                             : (cpu_shape[dev_dim_order.front()] / stick_size));
+        stride_info.stride_dst_.push_back(cpu_shape[dim] * stick_size);
+      } else if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
+        stride_info.stride_src_.push_back(stick_size);
+        stride_info.stride_src_.push_back(cpu_strides[dim]);
+        stride_info.stride_dst_.push_back(cpu_shape[dev_dim_order[i - 1]] *
+                                          stick_size);
+        stride_info.size_.push_back(
+            requires_padding ? 1
+                             : cpu_shape[dev_dim_order.front()] / stick_size);
+        stride_info.stride_dst_.push_back(
+            (requires_padding ? stick_size : cpu_shape.back()) *
+            cpu_shape.front());
 
-          if (requires_padding) {
-            stride_info.size_.push_back(1);
-            stride_info.stride_dst_.push_back(128);
-          } else {
-            stride_info.size_.push_back(cpu_shape[dev_dim_order.front()] /
-                                        stick_size);
-            stride_info.stride_dst_.push_back(cpu_shape[dev_dim_order[i - 1]] *
-                                              stick_size);
-          }
-        }
-        if (i == dev_dim_order.size() - 1 && dev_dim_order.size() <= 2) {
+        stride_info.size_.push_back(cpu_shape[dim]);
+      } else {
+        stride_info.size_.push_back(cpu_shape[dim]);
+        stride_info.stride_src_.push_back(cpu_strides[dim]);
+        if (stride_info.stride_dst_.back() == 1) {
           stride_info.stride_dst_.push_back(stick_size);
-          stride_info.size_.push_back(cpu_shape[dev_dim_order.back()]);
-          stride_info.stride_src_.push_back(cpu_strides[dev_dim_order.back()]);
-        }
-        if (dim == dev_dim_order.front()) {
-          if (requires_padding) {
-            stride_info.size_.push_back(cpu_shape[dim]);
-          } else {
-            stride_info.size_.push_back(stick_size);
-          }
-          stride_info.stride_src_.push_back(cpu_strides[dim]);
-          stride_info.stride_dst_.push_back(1);
-        } else if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
-          stride_info.stride_src_.push_back(stick_size);
-          if (requires_padding) {
-            stride_info.size_.push_back(1);
-          } else {
-            stride_info.size_.push_back(cpu_shape[dev_dim_order.front()] /
-                                        stick_size);
-          }
-          stride_info.stride_dst_.push_back(cpu_shape[dim] * stick_size);
-        } else if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
-          stride_info.stride_src_.push_back(cpu_strides[dim]);
-          stride_info.size_.push_back(cpu_shape[dim]);
-          if (requires_padding) {
-            stride_info.stride_dst_.push_back(128);
-          } else {
-            stride_info.stride_dst_.push_back(cpu_shape.back() *
-                                              cpu_shape.front());
-          }
         } else {
-          stride_info.size_.push_back(cpu_shape[dim]);
-          stride_info.stride_src_.push_back(cpu_strides[dim]);
-          if (stride_info.stride_dst_.back() == 1) {
-            stride_info.stride_dst_.push_back(stick_size);
-          } else {
-            stride_info.stride_dst_.push_back(cpu_shape[dim] * stick_size);
-          }
+          stride_info.stride_dst_.push_back(cpu_shape[dim] * stick_size);
         }
       }
+
     } else {  // device->host
       if (dev_dim_order.size() == 1) {
         if (requires_padding) {
@@ -206,60 +188,41 @@ auto get_device_stride(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         stride_info.stride_dst_.push_back(1);
         stride_info.stride_dst_.push_back(stick_size);
         stride_info.stride_src_.push_back(stick_size);
-      } else {
-        if (i == dev_dim_order.size() - 1 && dev_dim_order.size() == 3) {
-          stride_info.stride_dst_.push_back(stick_size);
+      } else if (dim == dev_dim_order.front()) {
+        stride_info.size_.push_back(requires_padding ? cpu_shape[dim]
+                                                     : stick_size);
+        stride_info.stride_src_.push_back(1);
+        stride_info.stride_dst_.push_back(cpu_strides[dim]);
+      } else if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
+        stride_info.stride_dst_.push_back(stick_size);
+        stride_info.stride_dst_.push_back(cpu_strides[dim]);
+        stride_info.stride_src_.push_back(cpu_shape[dev_dim_order[i - 1]] *
+                                          stick_size);
+        stride_info.size_.push_back(
+            requires_padding ? 1
+                             : cpu_shape[dev_dim_order.front()] / stick_size);
+        stride_info.stride_src_.push_back(
+            (requires_padding ? stick_size : cpu_shape.back()) *
+            cpu_shape.front());
+        stride_info.size_.push_back(cpu_shape[dim]);
+      } else if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
+        stride_info.stride_src_.push_back(stick_size);
+        stride_info.size_.push_back(cpu_shape[dev_dim_order.back()]);
+        stride_info.stride_dst_.push_back(cpu_strides[dev_dim_order.back()]);
+        stride_info.stride_dst_.push_back(stick_size);
+        stride_info.size_.push_back(
+            requires_padding ? 1
+                             : (cpu_shape[dev_dim_order.front()] / stick_size));
 
-          if (requires_padding) {
-            stride_info.size_.push_back(1);
-            stride_info.stride_src_.push_back(128);
-          } else {
-            stride_info.size_.push_back(cpu_shape[dev_dim_order.front()] /
-                                        stick_size);
-            stride_info.stride_src_.push_back(cpu_shape[dev_dim_order[i - 1]] *
-                                              stick_size);
-          }
-        }
-        if (i == dev_dim_order.size() - 1 && dev_dim_order.size() <= 2) {
+        stride_info.stride_src_.push_back(cpu_shape[dim] * stick_size);
+      } else {
+        stride_info.size_.push_back(cpu_shape[dim]);
+        if (stride_info.stride_src_.back() == 1) {
           stride_info.stride_src_.push_back(stick_size);
-          stride_info.size_.push_back(cpu_shape[dev_dim_order.back()]);
-          stride_info.stride_dst_.push_back(cpu_strides[dev_dim_order.back()]);
-        }
-        if (dim == dev_dim_order.front()) {
-          if (requires_padding) {
-            stride_info.size_.push_back(cpu_shape[dim]);
-          } else {
-            stride_info.size_.push_back(stick_size);
-          }
-          stride_info.stride_src_.push_back(1);
-          stride_info.stride_dst_.push_back(cpu_strides[dim]);
-        } else if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
-          stride_info.stride_dst_.push_back(cpu_strides[dim]);
-          if (requires_padding) {
-            stride_info.stride_src_.push_back(128);
-          } else {
-            stride_info.stride_src_.push_back(cpu_shape.back() *
-                                              cpu_shape.front());
-          }
-          stride_info.size_.push_back(cpu_shape[dim]);
-        } else if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
-          stride_info.stride_dst_.push_back(stick_size);
-          if (requires_padding) {
-            stride_info.size_.push_back(1);
-          } else {
-            stride_info.size_.push_back(cpu_shape[dev_dim_order.front()] /
-                                        stick_size);
-          }
-          stride_info.stride_src_.push_back(cpu_shape[dim] * stick_size);
         } else {
-          stride_info.size_.push_back(cpu_shape[dim]);
-          if (stride_info.stride_src_.back() == 1) {
-            stride_info.stride_src_.push_back(stick_size);
-          } else {
-            stride_info.stride_src_.push_back(cpu_shape[dim] * stick_size);
-          }
-          stride_info.stride_dst_.push_back(cpu_strides[dim]);
+          stride_info.stride_src_.push_back(cpu_shape[dim] * stick_size);
         }
+        stride_info.stride_dst_.push_back(cpu_strides[dim]);
       }
     }
   }
