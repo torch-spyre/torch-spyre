@@ -4,6 +4,6 @@
 # Avoid adding requirements directly to this file.
 # Instead, modify the two files referenced above.
 
-pyyaml
-regex
-numpy
+pyyaml==6.0.3
+regex==2025.11.3
+numpy==2.3.4

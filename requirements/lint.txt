@@ -1,4 +1,8 @@
-# formatting
+black==25.11.0
+isort==7.0.0
+mypy==1.13.0
+mypy-extensions==1.0.0
 pre-commit==4.0.1
-
-types-psutil
+pydantic==2.12.4
+types-psutil==7.0.0.20251111
+types-pyyaml==6.0.12.20250915
