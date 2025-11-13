@@ -52,11 +52,10 @@ line-length = 88
 
 [tool.mypy]
 ignore_missing_imports = true
-exclude = ".*torch_spyre/_inductor/(wrapper\\.py|spyre_kernel\\.py|dsc\\.py|customops\\.py|runtime/async_compile\\.py|stickify\\.py|passes/__init__\\.py)"
 
 [[tool.mypy.overrides]]
 module = ["torch_spyre._inductor.*"]
-ignore_errors = true
+disable_error_code = ["attr-defined"]
 
 [[tool.mypy.overrides]]
 module = ["tests._inductor.utils"]

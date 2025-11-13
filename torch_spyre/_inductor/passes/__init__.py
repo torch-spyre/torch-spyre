@@ -36,8 +36,7 @@ class CustomPrePasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [c.file() for c in custom_pre_passes]
-        files = tuple(set(files + [__file__]))
-        return get_hash_for_files(files)
+        return get_hash_for_files(tuple(set(files + [__file__])))
 
 
 class CustomPostPasses(CustomGraphPass):
@@ -47,5 +46,4 @@ class CustomPostPasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [c.file() for c in custom_post_passes]
-        files = tuple(set(files + [__file__]))
-        return get_hash_for_files(files)
+        return get_hash_for_files(tuple(set(files + [__file__])))

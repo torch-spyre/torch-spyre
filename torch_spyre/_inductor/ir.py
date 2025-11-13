@@ -36,7 +36,7 @@ class SpyreReduction(Reduction):
     op_info: Any
 
     @classmethod
-    def create(
+    def create(  # type: ignore[override]
         cls,
         device: torch.device,
         dst_dtype: torch.dtype,

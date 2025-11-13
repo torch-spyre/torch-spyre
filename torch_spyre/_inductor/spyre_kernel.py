@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Union
-import re
+import regex as re
 
 import torch
 import sympy
@@ -110,8 +110,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.compute_op = op
         self.spyre_op = get_spyre_op(op)
         self.compute_op_is_reduction = is_reduction
-        if hasattr(self.current_node.node.data, "op_info"):
-            self.op_info.update(self.current_node.node.data.op_info)
+        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
+            self.op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
@@ -145,6 +145,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         self.record_compute_op(reduction_type, True)
+        return ()
 
     def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
         """
