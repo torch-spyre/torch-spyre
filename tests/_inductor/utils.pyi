@@ -1,0 +1,6 @@
+from typing import Any, overload
+
+@overload
+def make_test(_base_func: Any, _op: Any, _params: Any) -> Any: ...
+@overload
+def make_test(_base_func: Any, _params: Any) -> Any: ...

@@ -1,3 +1,17 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise
@@ -64,7 +78,7 @@ def lower_slice(x):
 @lowering.register_lowering(torch.ops.spyre.exx2)
 def lower_exx2(x, exx2Scale, useZeroMean):
     kwargs = lowering._make_reduction_inner(
-        x, axis=[-1], keepdims=True, dtype=x.dtype, override_return_dtype=None
+        x, axis=[-1], keepdims=False, dtype=x.dtype, override_return_dtype=None
     )
     op_info = {
         "constants": {
@@ -92,8 +106,8 @@ def lower_layernormnorm(x, mean, norm_mean, weight, bias):
     def inner_fn(index):
         loaded_inputs = [
             x.make_loader()(index),
-            mean.make_loader()(index[-2:]),
-            norm_mean.make_loader()(index[-2:]),
+            mean.make_loader()(index[-1:]),
+            norm_mean.make_loader()(index[-1:]),
         ]
         if weight is not None:
             loaded_inputs.append(weight.make_loader()(index[-1:]))
