@@ -4,10 +4,11 @@ requires = [
 	"jinja2",
     "ninja",
     "setuptools>=80",
-    "torch>=2.7.0",  # Needed to use BuildExtension
+    "torch~=2.7.0",  # Needed to use BuildExtension
     "wheel",
     "regex",
-    "pyyaml", # needed for codegen
+    "pyyaml~=6.0.0", # needed for codegen
+    "numpy~=2.3.4"
 ]
 build-backend = "setuptools.build_meta"
 
@@ -17,20 +18,39 @@ authors = [
     {name = "PyTorch-Spyre Core Team"}
 ]
 description = "PyTorch-Spyre out of tree registration"
-dependencies = ["torch>=2.7.0"]
+dependencies = [
+    "torch~=2.7.0",
+    "psutil~=7.1.0"
+]
 requires-python = ">=3.8"
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["transformers"]
-dev = [
-    "mypy>=1.11.1",
+test = [
+    "expecttest~=0.3.0",
+    "pqdm~=0.2.0",
+    "pytest~=9.0.0",
+    "pytest-asyncio",
+    "pytest-forked",
+    "pytest-rerunfailures",
+    "pytest-shard",
+    "pytest-timeout",
+    "transformers"
+    ]
+lint = [
+    "pre-commit~=4.0.1",
+    # Type Checking
+    "mypy~=1.13.0",
+    "mypy-extensions~=1.0.0",
     "types-cachetools",
     "types-setuptools",
     "types-PyYAML",
     "types-requests",
     "types-psutil",
-    "pydantic>=2.0"
+    # Linters
+    "pydantic~=2.0",
+    "black~=25.11.0",
+    "isort~=7.0.0"
 ]
 
 [project.entry-points."torch.backends"]
@@ -61,3 +81,12 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = ["tests._inductor.utils"]
 ignore_errors = true
+
+[tool.uv]
+required-version = ">=0.9.0"
+index-url = "https://download.pytorch.org/whl/cpu"
+extra-index-url = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"
+
+[tool.uv.pip]
+universal = true
