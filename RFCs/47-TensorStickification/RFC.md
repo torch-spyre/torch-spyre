@@ -1,6 +1,6 @@
 # Problem Statement
 
-### Background: Spyre Tensors
+## Background: Spyre Tensors
 
 Spyre is a SIMD dataflow engine.  All memory and compute operations
 operate on chunks of 128 bytes.  We call this chunk of 128 bytes a
@@ -105,10 +105,10 @@ The torch-spyre plugin implements `SpyreTensorImpl`, a subclass of
 `TensorImpl` that contains a `SpyreDeviceLayout` object with encapsulates
 the device memory layout information.  In our current implementation,
 `SpyreDeviceLayout` stores the device size and strides,
-a mapping between host and device dimensions, and padding/stick dimension 
+a mapping between host and device dimensions, and padding/stick dimension
 information. The 3 tuples mentioned earlier and needed for DMA operations
 can be derived from `SpyreDeviceLayout` and the host size and strides stored
-in the `TensorImpl`. 
+in the `TensorImpl`.
 
 This `SpyreDeviceLayout` is initialized whenever a Tensor is
 created on the Spyre device (eg. by using `to` to transfer a Tensor to
@@ -153,7 +153,7 @@ fairly  early in Inductor's compilation stages.  In particular, we
   instance of the `SpyreDeviceLayout` class
 
 + enhance the code that constructs a `FakeTensor` from a `Tensor` to capture
-the `SpyreDeviceLayout` and store it in the `FakeTensor`. 
+the `SpyreDeviceLayout` and store it in the `FakeTensor`.
 
 + enhance the `FakeTensor` propagation machinery and fake_ops to use the
 extended layout information on their inputs to compute the extended
@@ -162,7 +162,7 @@ layout information of their outputs.
 + use the extended layout information from the fx graph nodes in the
 Spyre backend code generation.
 
-We are also evaluating a less invasive alternative implementation of 
+We are also evaluating a less invasive alternative implementation of
 `3` in which device layouts are introduced later in Inductor compilation,
 by doing a pass over the SchedulerNodes immediately before final code generation
 and replacing `FlexibleLayout` with `SpyreFixedLayout` using the `SpyreFixedLaout` information
