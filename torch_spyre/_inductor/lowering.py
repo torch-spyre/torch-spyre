@@ -151,3 +151,22 @@ def lower_layernormscale(x, eps):
     )
     pw.realize()
     return pw
+
+@lowering.register_lowering(torch.ops.aten.mean.dim)
+def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
+    kwargs = lowering._make_reduction_inner(
+        x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+    )
+    size = x.get_size()
+    denom = torch._inductor.utils.sympy_product(size[i] for i in axis)
+    scaling_factor = 1.0 / denom
+    op_info = {
+        "constants": {
+            "scaling_factor": scaling_factor
+        }
+    }
+    result = SpyreReduction.create(
+        reduction_type="mean", input_node=x, op_info=op_info, **kwargs
+    )
+    result.realize()
+    return result

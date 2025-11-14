@@ -147,6 +147,7 @@ _meta_ops = {
     aten.min.dim: spyre_min,
     aten.mm.default: spyre_matmul,
     aten.sum.dim_IntList: spyre_sum,
+    aten.mean.dim: spyre_sum,
     # Pointwise binary
     aten.add.Tensor: spyre_pointwise_binary,
     aten.div.Tensor: spyre_pointwise_binary,

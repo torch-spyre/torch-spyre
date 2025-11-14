@@ -36,6 +36,7 @@ def _initialize_opfunc_mapping():
         "prod": UNIMPLEMENTED,
         "sum": "sum",
         "xor_sum": UNIMPLEMENTED,
+        "mean": "mean",
     }
 
     # Default all Inductor ops to UNIMPLEMENTED
