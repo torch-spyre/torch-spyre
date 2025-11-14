@@ -257,15 +257,10 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
     cpu_tensor = &dst;
     dev_tensor = &self;
   }
-  auto* ctx = static_cast<SharedOwnerCtx*>(
-      dev_tensor->storage().data_ptr().get_context());
-  flex::DeviceMemoryAllocationPtr& dev_data = ctx->owner;
   constexpr auto sen_dtype_cpu = sendnn::sen_datatype_enum::float16;
   constexpr auto sen_dtype_dev = sendnn::sen_datatype_enum::sen_fp16;
-  uint64_t alignment =
-      GlobalRuntime::get()->DeviceAlignment();  // ~ senbfcc::page_size();
   auto layout = sendnn::TensorLayout::NHWC;
-  // Create a graph that copy host-2-device and back
+
   sendnn::TensorShape dev_tensor_shape(get_device_shape(cpu_tensor));
 
   sendnn::TensorInfo cpu_ti(sen_dtype_cpu,
@@ -284,21 +279,21 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
     DMAParameters dma_param{xfer_size, 0,
                             0};  // (num_bytes, offset_src, offset_dst)
     if (host2device) {
-      auto inp_node = gb_sn->PrimaryInput("PrimaryInput0", dci_ti);
+      auto inp_node = gb_sn->PrimaryInput("Input", dci_ti);
       auto h2d_dt = gb_sn->SenDataTransfer(
-          "H2D DT",
+          "Host2Sen-Transfer",
           dev_ti,    // output (holding shape, type, and location DEVICE)
           inp_node,  // input (node created using PrimaryInput and on HOST)
           dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
-      auto out_node = gb_sn->PrimaryOutput("PrimaryInput0", h2d_dt);
+      auto out_node = gb_sn->PrimaryOutput("Output", h2d_dt);
     } else {
-      auto inp_node = gb_sn->PrimaryInput("PrimaryOutput0", dev_ti);
+      auto inp_node = gb_sn->PrimaryInput("Input", dev_ti);
       auto d2h_dt = gb_sn->SenDataTransfer(
-          "D2H DT",
+          "Sen2Host-Transfer",
           dci_ti,    // output (holding shape, type and location HOST)
           inp_node,  // input (node created as a result of SenDataTransfer)
           dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
-      auto out_node = gb_sn->PrimaryOutput("PrimaryOutput0", d2h_dt);
+      auto out_node = gb_sn->PrimaryOutput("Output", d2h_dt);
     }
 
     SEN_THROW_NOK(gb_sn->Finalize(&fdc_graph));
@@ -307,25 +302,23 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
   {  // add above subgraph as part of SenFusedDeviceCompute node
     flex::FlexGraphBuilder fgb;
     if (host2device) {
-      auto inp_node = fgb.PrimaryInput("SN PI", cpu_ti);
+      auto inp_node = fgb.PrimaryInput("Input", cpu_ti);
       auto h2d_dci = generate_dci(cpu_tensor, host2device);
       auto h2d_dci_node = fgb.SenHostCompute(
           "Host2Sen-HostPrep", {dci_ti}, {inp_node}, "SenDataConvert", h2d_dci);
 
-      auto fdc =
-          fgb.SenFusedDeviceCompute("FDC", {dci_ti}, {h2d_dci_node}, fdc_graph);
-      fgb.PrimaryOutput("SN PO", fdc->OutputPort(0));
+      auto fdc = fgb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
+                                           {h2d_dci_node}, fdc_graph);
+      fgb.PrimaryOutput("Output", fdc->OutputPort(0));
     } else {
-      sendnn::NodePtr inp_node = fgb.PrimaryInput(
-          "SN PI", dci_ti);  // not important in terms of shape (as it will be
-                             // empty when using)
-      auto fdc =
-          fgb.SenFusedDeviceCompute("FDC", {dci_ti}, {inp_node}, fdc_graph);
+      sendnn::NodePtr inp_node = fgb.PrimaryInput("Input", dci_ti);
+      auto fdc = fgb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
+                                           {inp_node}, fdc_graph);
       auto d2h_dci = generate_dci(dev_tensor, host2device);
       sendnn::NodePtr d2h_dci_node = fgb.SenHostCompute(
           "Sen2Host-HostPrep", cpu_ti, fdc, "SenDataConvert", d2h_dci);
 
-      fgb.PrimaryOutput("SN PO", d2h_dci_node->OutputPort(0));
+      fgb.PrimaryOutput("Output", d2h_dci_node->OutputPort(0));
     }
 
     SEN_THROW_NOK(fgb.Finalize(&exec_graph));
@@ -344,21 +337,13 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
   // STAGE 2: SenSuperNodeV2 graph
   sendnn::Graph g;
   {  // SenSuperNodeV2 graph
-    std::vector<sendnn::NodeOrIndexedNode> inp_nodes;
     flex::FlexGraphBuilder gb;
-    unsigned inp_counter = 0;
-    for (auto& inp : exec_graph.input_ops_) {
-      auto ti = sendnn::TensorInfo(inp->Output(0));
-      auto pi = gb.PrimaryInput("PI-To_SN-" + inp->Name(), ti);
-      inp_nodes.emplace_back(pi);
-      ++inp_counter;
-    }
-    unsigned out_counter = 0;
-    std::vector<sendnn::TensorInfo> fdc_tis;
-    for (auto& out : exec_graph.output_ops_) {
-      fdc_tis.emplace_back(out->Input(0));
-      ++out_counter;
-    }
+
+    sendnn::TensorInfo inp_ti =
+        sendnn::TensorInfo(exec_graph.input_ops_.front()->Output(0));
+    sendnn::TensorInfo out_ti =
+        sendnn::TensorInfo(exec_graph.output_ops_.front()->Input(0));
+    sendnn::NodeOrIndexedNode inp_node = gb.PrimaryInput("Input", inp_ti);
 
     std::string k_uuid = "dma-network";
     sendnn::attributes::SenPartitionInit part_init;
@@ -367,13 +352,10 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
     part_init.segment_table_ = segment_table;
 
     auto sn_exec =
-        gb.SenSuperNodeV2("SN Exec", fdc_tis, inp_nodes, k_uuid, 0, 1,
-                          part_init, exec_graph, {}, false, true, true);
+        gb.SenSuperNodeV2("SenSuperNodeV2_0", {out_ti}, {inp_node}, k_uuid, 0,
+                          1, part_init, exec_graph, {}, false, true, true);
 
-    out_counter = 0;
-    for (auto& out : fdc_graph.output_ops_) {
-      gb.PrimaryOutput("PO-From_SN-" + out->Name(), {out_counter, sn_exec});
-    }
+    gb.PrimaryOutput("Output", {0, sn_exec});
 
     SEN_THROW_NOK(gb.Finalize(&g));
   }
@@ -381,22 +363,10 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
   // STAGE 3:
   std::shared_ptr<sendnn::GraphLoader> gl;
   gl = std::make_shared<sendnn::GraphLoader>(GlobalRuntime::get());
-  {  // SuperNodeContext*
+  {
     SEN_THROW_NOK(gl->LoadGraph(g));
-
-    // hardcode to eager-mode for proper allocation when compiling eager graphs
-    // //FIXME (tmhoangt): check if we need it here
-    const char* prev_eager_env_str = std::getenv(EAGER_MODE_ENV);
-    setenv(EAGER_MODE_ENV, "1", 1);
-
     SEN_THROW_NOK(gl->CompileGraph());
-    // //FIXME (tmhoangt): check if we need it here
-    // reset eager_mode
-    setenv(EAGER_MODE_ENV,
-           prev_eager_env_str != nullptr ? prev_eager_env_str : "0", 1);
-
-    SEN_THROW_NOK(
-        gl->ParseGraph());  // now we have G2 graph of SuperNodeContext*
+    SEN_THROW_NOK(gl->ParseGraph());
   }
   return gl;
 }
@@ -571,12 +541,12 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
 }
 
 /**
- * This method will run a dummy graph based on a single input/output to extract
- * the proper Spyre sizes, then allocate that space on the Spyre and and set the
- * handle for the tensor to that of the memory in the Spyre. For now, it
- * allocates a CPU tensor with the correct size, as the actual storage will stay
- * on CPU until the rest of the stack is ready to filter out the allocation and
- * deallocation of memory from the graph processing.
+ * This method will determine the size of the tensor on Spyre, then allocate
+ * that space on the Spyre and and set the handle for the tensor to that of the
+ * memory in the Spyre. For now, it allocates a CPU tensor with the correct
+ * size, as the actual storage will stay on CPU until the rest of the stack is
+ * ready to filter out the allocation and deallocation of memory from the graph
+ * processing.
  */
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                                std::optional<c10::ScalarType> dtype_opt,
