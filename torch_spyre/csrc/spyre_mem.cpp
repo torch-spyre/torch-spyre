@@ -53,36 +53,53 @@ struct DMAParameters {
   const off64_t src_offset;
   const off64_t dst_offset;
 };
-auto get_device_shape(c10::IntArrayRef sizes) -> std::vector<int64_t> {
-  /* Given the CPU Tensor's shape, return the shape of the tensor on Spyre
-   */
+auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
+  std::vector<int64_t> dim_order;
+  switch (sizes.size()) {
+    case 1:
+      dim_order = {0};
+      break;
+    case 2:
+      dim_order = {1, 0};
+      break;
+    case 3:
+      dim_order = {2, 0, 1};
+      break;
+    default:
+      throw std::runtime_error("Unsupported tensor rank");
+  }
+  return dim_order;
+}
+auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
+    -> std::vector<int64_t> {
   auto cpu_shape = sizes.vec();
   std::vector<int64_t> dev_shape;
-  auto stick_size = 64;
-  auto requires_padding = (cpu_shape.back() % stick_size != 0);
+  auto dev_dim_order = get_device_layout(sizes);
+  auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
 
-  for (int i = 0; i < cpu_shape.size(); i++) {
-    if (i == 0 && cpu_shape.size() == 1) {
+  /* Based on the dimension ordering on the device, provide the shape of the
+   * device tensor. Currently, assuming the generic stick format is used for all
+   * tensors the layout is: 1D [stick_size, cpu_shape[0]/stick_size] or
+   * [stick_size, 1] when padding is required. 2D [stick_size, cpu_shape[0],
+   * cpu_shape[1]/stick_size] 3D [stick_size, cpu_shape[0],
+   * cpu_shape[2]/stick_size, cpu_shape[1]]
+   */
+  for (int i = 0; i < dev_dim_order.size(); i++) {
+    auto& dim = dev_dim_order[i];
+    if (i == 0) {
       dev_shape.push_back(stick_size);
+    } else if (i == 1) {
+      dev_shape.push_back(cpu_shape[dim]);
+    }
+    if (i == dev_dim_order.size() - 1) {
       if (requires_padding) {
         dev_shape.push_back(1);
       } else {
-        dev_shape.push_back(cpu_shape.back() / stick_size);
+        dev_shape.push_back(cpu_shape[dev_dim_order.front()] / stick_size);
       }
-    } else if (i == 0) {
-      dev_shape.push_back(stick_size);
-    } else if (i == sizes.size() - 1) {
-      if (cpu_shape.size() <= 2) dev_shape.push_back(cpu_shape[i - 1]);
-      if (requires_padding) {
-        auto padded_shape =
-            cpu_shape.back() + (stick_size - (cpu_shape.back() % stick_size));
-        dev_shape.push_back(padded_shape / stick_size);
-      } else {
-        dev_shape.push_back(cpu_shape.back() / stick_size);
+      if (dev_dim_order.size() == 3) {
+        dev_shape.push_back(cpu_shape[dim]);
       }
-      if (cpu_shape.size() > 2) dev_shape.push_back(cpu_shape[i - 1]);
-    } else {
-      dev_shape.push_back(cpu_shape[i - 1]);
     }
   }
   std::reverse(dev_shape.begin(), dev_shape.end());
@@ -93,35 +110,17 @@ auto get_device_shape(const at::Tensor* tensor) -> std::vector<int64_t> {
    * Spyre
    */
   const c10::IntArrayRef& sizes = tensor->sizes();
-  return get_device_shape(sizes);
-}
-auto get_device_layout(c10::IntArrayRef sizes, c10::IntArrayRef strides)
-    -> std::vector<int64_t> {
-  std::vector<int64_t> dim_order;
-  auto stick_size = 64;
-  auto requires_padding = (sizes.back() % stick_size != 0);
-
-  for (int i = 0; i < sizes.size(); i++) {
-    if (sizes.size() == 1) {
-      dim_order.push_back(i);
-    } else {
-      if (i == 0) {
-        dim_order.push_back(sizes.size() - 1);
-      } else {
-        dim_order.push_back(i - 1);
-      }
-    }
-  }
-  return dim_order;
+  int stick_size = 128 / tensor->element_size();
+  return get_device_shape(sizes, stick_size);
 }
 auto get_device_stride(c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                       bool host2device) -> data_conversion_stride_info {
+                       int stick_size, bool host2device)
+    -> data_conversion_stride_info {
   data_conversion_stride_info stride_info;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
-  auto stick_size = 64;
   auto requires_padding = (cpu_shape.back() % stick_size != 0);
-  auto dev_dim_order = get_device_layout(sizes, strides);
+  auto dev_dim_order = get_device_layout(sizes);
 
   for (int i = 0; i < dev_dim_order.size(); i++) {
     auto& dim = dev_dim_order[i];
@@ -239,6 +238,7 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
   std::stringstream s;
   auto cpu_shape = tensor->sizes().vec();
   auto cpu_strides = tensor->strides().vec();
+  int stick_size = 128 / tensor->element_size();
   std::vector<int64_t> dev_shape = get_device_shape(tensor);
   data_conversion_info* dci = new data_conversion_info();
   dci->dci_dsName_ = "DCI-Tensor-0";
@@ -247,9 +247,8 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
       host2device ? DataFormats::IEEE_FP16 : DataFormats::SEN169_FP16;
   dci->dataformat_dst_ =
       host2device ? DataFormats::SEN169_FP16 : DataFormats::IEEE_FP16;
-
-  data_conversion_stride_info stride_info =
-      get_device_stride(tensor->sizes(), tensor->strides(), host2device);
+  data_conversion_stride_info stride_info = get_device_stride(
+      tensor->sizes(), tensor->strides(), stick_size, host2device);
   dci->dcsi_.push_back(stride_info);
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   std::reverse(dev_shape.begin(), dev_shape.end());
@@ -611,13 +610,13 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
-  DEBUGINFO("device shape: ", get_device_shape(size));
-  auto dev_sizes = get_device_shape(size);
+  int stick_size = 64;  // 128 / word size
+  auto dev_sizes = get_device_shape(size, stick_size);
   size_t size_bytes = 128;  // stick-size
   for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
     size_bytes *= *it;
   }
-
+  DEBUGINFO("device shape: ", get_device_shape(size, stick_size));
   DEBUGINFO("bytes on spyre: ", size_bytes);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
