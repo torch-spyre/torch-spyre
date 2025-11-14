@@ -79,10 +79,10 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
 
   /* Based on the dimension ordering on the device, provide the shape of the
    * device tensor. Currently, assuming the generic stick format is used for all
-   * tensors the layout is: 1D [stick_size, cpu_shape[0]/stick_size] or
-   * [stick_size, 1] when padding is required. 2D [stick_size, cpu_shape[0],
-   * cpu_shape[1]/stick_size] 3D [stick_size, cpu_shape[0],
-   * cpu_shape[2]/stick_size, cpu_shape[1]]
+   * tensors the layout is:
+   * 1D [stick_size, cpu_shape[0]/stick_size]
+   * 2D [stick_size, cpu_shape[0], cpu_shape[1]/stick_size]
+   * 3D [stick_size, cpu_shape[0], cpu_shape[2]/stick_size, cpu_shape[1]]
    */
   for (int i = 0; i < dev_dim_order.size(); i++) {
     auto& dim = dev_dim_order[i];
@@ -102,6 +102,7 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
       }
     }
   }
+  // Device shape is reversed for the G2 graph node
   std::reverse(dev_shape.begin(), dev_shape.end());
   return dev_shape;
 }
@@ -113,8 +114,47 @@ auto get_device_shape(const at::Tensor* tensor) -> std::vector<int64_t> {
   int stick_size = 128 / tensor->element_size();
   return get_device_shape(sizes, stick_size);
 }
-auto get_device_stride(c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                       int stick_size, bool host2device)
+auto get_dim_cpu_stride(int dim, std::vector<int64_t> dev_dim_order,
+                        std::vector<int64_t> cpu_strides) {
+  /* Returns the stride for a given dimension on the host. */
+  int cpu_stride;
+  if (dim == dev_dim_order.front()) {
+    cpu_stride = 1;
+  } else {
+    cpu_stride = cpu_strides[dim];
+  }
+  return cpu_stride;
+}
+auto get_dim_dev_stride(int dim, int stick_size,
+                        std::vector<int64_t> dev_dim_order,
+                        std::vector<int64_t> cpu_shape) {
+  /* Returns the device stride for a given dimension */
+  int dev_stride;
+  if (dim == dev_dim_order.front()) {
+    // First dimesion on the device has a stride of 1.
+    dev_stride = 1;
+  } else if (dim == dev_dim_order.back() && cpu_shape.size() == 3) {
+    dev_stride = cpu_shape[dim];
+  } else {
+    dev_stride = stick_size;
+  }
+  return dev_stride;
+}
+auto get_dim_size(int stick_size, int dim, std::vector<int64_t> cpu_shape,
+                  std::vector<int64_t> dev_dim_order, bool requires_padding) {
+  /* Returns the size for a given dimension on the device */
+  int dim_size;
+  if (!requires_padding && dim == dev_dim_order.front()) {
+    // Size of the first dimension on the device is the stick size when padding
+    // is not required
+    dim_size = stick_size;
+  } else {
+    dim_size = cpu_shape[dim];
+  }
+  return dim_size;
+}
+auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                            int stick_size, bool host2device)
     -> data_conversion_stride_info {
   data_conversion_stride_info stride_info;
   auto cpu_shape = sizes.vec();
@@ -123,106 +163,50 @@ auto get_device_stride(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   auto dev_dim_order = get_device_layout(sizes);
 
   for (int i = 0; i < dev_dim_order.size(); i++) {
+    /*
+     * Fill out size, stride on host and stride on device for current dimension
+     * to determine layout conversion requirements.
+     */
     auto& dim = dev_dim_order[i];
-    if (host2device) {  // host->device
-      if (dev_dim_order.size() == 1) {
-        if (requires_padding) {
-          stride_info.size_.push_back(cpu_shape[dim]);
-          stride_info.size_.push_back(1);
-        } else {
-          stride_info.size_.push_back(stick_size);
-          stride_info.size_.push_back(cpu_shape[dim] / stick_size);
-        }
-        stride_info.stride_src_.push_back(1);
-        stride_info.stride_dst_.push_back(1);
-        stride_info.stride_dst_.push_back(stick_size);
-        stride_info.stride_src_.push_back(stick_size);
-      } else if (dim == dev_dim_order.front()) {
-        stride_info.size_.push_back(requires_padding ? cpu_shape[dim]
-                                                     : stick_size);
-        stride_info.stride_src_.push_back(cpu_strides[dim]);
-        stride_info.stride_dst_.push_back(1);
-      } else if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
-        stride_info.stride_dst_.push_back(stick_size);
-        stride_info.size_.push_back(cpu_shape[dev_dim_order.back()]);
-        stride_info.stride_src_.push_back(cpu_strides[dev_dim_order.back()]);
-        stride_info.stride_src_.push_back(stick_size);
-        stride_info.size_.push_back(
-            requires_padding ? 1
-                             : (cpu_shape[dev_dim_order.front()] / stick_size));
-        stride_info.stride_dst_.push_back(cpu_shape[dim] * stick_size);
-      } else if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
-        stride_info.stride_src_.push_back(stick_size);
-        stride_info.stride_src_.push_back(cpu_strides[dim]);
-        stride_info.stride_dst_.push_back(cpu_shape[dev_dim_order[i - 1]] *
-                                          stick_size);
-        stride_info.size_.push_back(
-            requires_padding ? 1
-                             : cpu_shape[dev_dim_order.front()] / stick_size);
-        stride_info.stride_dst_.push_back(
-            (requires_padding ? stick_size : cpu_shape.back()) *
-            cpu_shape.front());
+    auto cpu_stride = get_dim_cpu_stride(dim, dev_dim_order, cpu_strides);
+    auto dev_stride =
+        get_dim_dev_stride(dim, stick_size, dev_dim_order, cpu_shape);
+    auto dim_size = get_dim_size(stick_size, dim, cpu_shape, dev_dim_order,
+                                 requires_padding);
 
-        stride_info.size_.push_back(cpu_shape[dim]);
+    if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
+      /* For 3D tensors, the 3rd stride/size is for stick_dim / stick_size
+       * dimension */
+      stride_info.stride_src_.push_back(
+          host2device ? stick_size
+                      : (cpu_shape[dev_dim_order[i - 1]] * stick_size));
+      stride_info.stride_dst_.push_back(
+          host2device ? (cpu_shape[dev_dim_order[i - 1]] * stick_size)
+                      : stick_size);
+      stride_info.size_.push_back(
+          requires_padding ? 1 : cpu_shape[dev_dim_order.front()] / stick_size);
+      dev_stride =
+          (requires_padding ? stick_size : cpu_shape[dev_dim_order.front()]) *
+          cpu_shape.front();
+    }
+    stride_info.size_.push_back(dim_size);
+    stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
+    stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
+
+    if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
+      /* For 1 and 2D tensors, the final stride / size is for the stick_dim /
+       * stick_size dim */
+      cpu_stride = stick_size;
+      if (dev_dim_order.size() == 2) {
+        dev_stride = cpu_shape[dim] * stick_size;
       } else {
-        stride_info.size_.push_back(cpu_shape[dim]);
-        stride_info.stride_src_.push_back(cpu_strides[dim]);
-        if (stride_info.stride_dst_.back() == 1) {
-          stride_info.stride_dst_.push_back(stick_size);
-        } else {
-          stride_info.stride_dst_.push_back(cpu_shape[dim] * stick_size);
-        }
+        dev_stride = stick_size;
       }
-
-    } else {  // device->host
-      if (dev_dim_order.size() == 1) {
-        if (requires_padding) {
-          stride_info.size_.push_back(cpu_shape[dim]);
-          stride_info.size_.push_back(1);
-        } else {
-          stride_info.size_.push_back(stick_size);
-          stride_info.size_.push_back(cpu_shape[dim] / stick_size);
-        }
-        stride_info.stride_src_.push_back(1);
-        stride_info.stride_dst_.push_back(1);
-        stride_info.stride_dst_.push_back(stick_size);
-        stride_info.stride_src_.push_back(stick_size);
-      } else if (dim == dev_dim_order.front()) {
-        stride_info.size_.push_back(requires_padding ? cpu_shape[dim]
-                                                     : stick_size);
-        stride_info.stride_src_.push_back(1);
-        stride_info.stride_dst_.push_back(cpu_strides[dim]);
-      } else if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
-        stride_info.stride_dst_.push_back(stick_size);
-        stride_info.stride_dst_.push_back(cpu_strides[dim]);
-        stride_info.stride_src_.push_back(cpu_shape[dev_dim_order[i - 1]] *
-                                          stick_size);
-        stride_info.size_.push_back(
-            requires_padding ? 1
-                             : cpu_shape[dev_dim_order.front()] / stick_size);
-        stride_info.stride_src_.push_back(
-            (requires_padding ? stick_size : cpu_shape.back()) *
-            cpu_shape.front());
-        stride_info.size_.push_back(cpu_shape[dim]);
-      } else if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
-        stride_info.stride_src_.push_back(stick_size);
-        stride_info.size_.push_back(cpu_shape[dev_dim_order.back()]);
-        stride_info.stride_dst_.push_back(cpu_strides[dev_dim_order.back()]);
-        stride_info.stride_dst_.push_back(stick_size);
-        stride_info.size_.push_back(
-            requires_padding ? 1
-                             : (cpu_shape[dev_dim_order.front()] / stick_size));
-
-        stride_info.stride_src_.push_back(cpu_shape[dim] * stick_size);
-      } else {
-        stride_info.size_.push_back(cpu_shape[dim]);
-        if (stride_info.stride_src_.back() == 1) {
-          stride_info.stride_src_.push_back(stick_size);
-        } else {
-          stride_info.stride_src_.push_back(cpu_shape[dim] * stick_size);
-        }
-        stride_info.stride_dst_.push_back(cpu_strides[dim]);
-      }
+      stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
+      stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
+      stride_info.size_.push_back(
+          requires_padding ? 1
+                           : (cpu_shape[dev_dim_order.front()] / stick_size));
     }
   }
   stride_info.offset_src_ = 0;
@@ -247,7 +231,7 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
       host2device ? DataFormats::IEEE_FP16 : DataFormats::SEN169_FP16;
   dci->dataformat_dst_ =
       host2device ? DataFormats::SEN169_FP16 : DataFormats::IEEE_FP16;
-  data_conversion_stride_info stride_info = get_device_stride(
+  data_conversion_stride_info stride_info = get_device_stride_info(
       tensor->sizes(), tensor->strides(), stick_size, host2device);
   dci->dcsi_.push_back(stride_info);
   std::reverse(cpu_shape.begin(), cpu_shape.end());
@@ -276,20 +260,20 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
   auto* ctx = static_cast<SharedOwnerCtx*>(
       dev_tensor->storage().data_ptr().get_context());
   flex::DeviceMemoryAllocationPtr& dev_data = ctx->owner;
-  constexpr auto sendnnCpuT = sendnn::sen_datatype_enum::float16;
-  constexpr auto sendnnSpyreT = sendnn::sen_datatype_enum::sen_fp16;
+  constexpr auto sen_dtype_cpu = sendnn::sen_datatype_enum::float16;
+  constexpr auto sen_dtype_dev = sendnn::sen_datatype_enum::sen_fp16;
   uint64_t alignment =
       GlobalRuntime::get()->DeviceAlignment();  // ~ senbfcc::page_size();
   auto layout = sendnn::TensorLayout::NHWC;
   // Create a graph that copy host-2-device and back
   sendnn::TensorShape dev_tensor_shape(get_device_shape(cpu_tensor));
 
-  sendnn::TensorInfo cpu_ti(sendnnCpuT,
+  sendnn::TensorInfo cpu_ti(sen_dtype_cpu,
                             sendnn::TensorShape(cpu_tensor->sizes().vec()),
                             layout, sendnn::TensorLocation::HOST());
-  sendnn::TensorInfo dev_ti(sendnnSpyreT, dev_tensor_shape, layout,
+  sendnn::TensorInfo dev_ti(sen_dtype_dev, dev_tensor_shape, layout,
                             sendnn::TensorLocation::DEVICE());
-  sendnn::TensorInfo dci_ti(sendnnSpyreT, dev_tensor_shape, layout,
+  sendnn::TensorInfo dci_ti(sen_dtype_dev, dev_tensor_shape, layout,
                             sendnn::TensorLocation::HOST());
   //  STAGE 1: execution graph
   sendnn::SubGraph fdc_graph;
@@ -297,26 +281,24 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
   {  // subgraph (execution graph)
     flex::FlexGraphBuilder gb;
     flex::FlexGraphBuilder* gb_sn = &gb;
-    DMAParameters tp{xfer_size, 0, 0};  // (num_bytes, offset_src, offset_dst)
+    DMAParameters dma_param{xfer_size, 0,
+                            0};  // (num_bytes, offset_src, offset_dst)
     if (host2device) {
-      auto pi = gb_sn->PrimaryInput("SN PI", dci_ti);
+      auto inp_node = gb_sn->PrimaryInput("PrimaryInput0", dci_ti);
       auto h2d_dt = gb_sn->SenDataTransfer(
           "H2D DT",
-          dev_ti,  // output (holding shape, type, and location DEVICE)
-          pi,      // input (node created using PrimaryInput and on HOST)
-          dev_ti.DataSize(), tp.src_offset, tp.dst_offset);
-      auto po = gb_sn->PrimaryOutput("SN PO", h2d_dt);
+          dev_ti,    // output (holding shape, type, and location DEVICE)
+          inp_node,  // input (node created using PrimaryInput and on HOST)
+          dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
+      auto out_node = gb_sn->PrimaryOutput("PrimaryInput0", h2d_dt);
     } else {
-      auto pi = gb_sn->PrimaryInput("SN PI", dev_ti);
+      auto inp_node = gb_sn->PrimaryInput("PrimaryOutput0", dev_ti);
       auto d2h_dt = gb_sn->SenDataTransfer(
           "D2H DT",
-          dci_ti,  // output (holding shape, type and location HOST)
-          pi,  // input (node created as a result of SenDataTransfer node above,
-               // i.e. on DEVICE)
-          dev_ti.DataSize(),
-          tp.src_offset,   // device side
-          tp.dst_offset);  // host side
-      auto po = gb_sn->PrimaryOutput("SN PO", d2h_dt);
+          dci_ti,    // output (holding shape, type and location HOST)
+          inp_node,  // input (node created as a result of SenDataTransfer)
+          dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
+      auto out_node = gb_sn->PrimaryOutput("PrimaryOutput0", d2h_dt);
     }
 
     SEN_THROW_NOK(gb_sn->Finalize(&fdc_graph));
@@ -337,8 +319,6 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::NodePtr inp_node = fgb.PrimaryInput(
           "SN PI", dci_ti);  // not important in terms of shape (as it will be
                              // empty when using)
-      // sendnn::NodePtr inp_node = fgb.HeapInput("SN PI", dci_ti); //not
-      // important in terms of shape (as it will be empty when using)
       auto fdc =
           fgb.SenFusedDeviceCompute("FDC", {dci_ti}, {inp_node}, fdc_graph);
       auto d2h_dci = generate_dci(dev_tensor, host2device);
