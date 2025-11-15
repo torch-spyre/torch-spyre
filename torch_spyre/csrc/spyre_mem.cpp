@@ -25,8 +25,12 @@
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
 #include <torch/library.h>
+#include <util/sen_data_convert.h>
 
 #include <algorithm>
+#include <cassert>
+#include <flex/flex_graph_builder.hpp>
+#include <memory>
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
@@ -43,6 +47,360 @@
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
+
+struct DMAParameters {
+  const int64_t size_bytes;  // bytes to transfer
+  const off64_t src_offset;
+  const off64_t dst_offset;
+};
+auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
+  std::vector<int64_t> dim_order;
+  switch (sizes.size()) {
+    case 1:
+      dim_order = {0};
+      break;
+    case 2:
+      dim_order = {1, 0};
+      break;
+    case 3:
+      dim_order = {2, 0, 1};
+      break;
+    default:
+      throw std::runtime_error("Unsupported tensor rank");
+  }
+  return dim_order;
+}
+auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
+    -> std::vector<int64_t> {
+  auto cpu_shape = sizes.vec();
+  std::vector<int64_t> dev_shape;
+  auto dev_dim_order = get_device_layout(sizes);
+  auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
+
+  /* Based on the dimension ordering on the device, provide the shape of the
+   * device tensor. Currently, assuming the generic stick format is used for all
+   * tensors the layout is:
+   * 1D [stick_size, cpu_shape[0]/stick_size]
+   * 2D [stick_size, cpu_shape[0], cpu_shape[1]/stick_size]
+   * 3D [stick_size, cpu_shape[0], cpu_shape[2]/stick_size, cpu_shape[1]]
+   */
+  for (int i = 0; i < dev_dim_order.size(); i++) {
+    auto& dim = dev_dim_order[i];
+    if (i == 0) {
+      dev_shape.push_back(stick_size);
+    } else if (i == 1) {
+      dev_shape.push_back(cpu_shape[dim]);
+    }
+    if (i == dev_dim_order.size() - 1) {
+      if (requires_padding) {
+        dev_shape.push_back(1);
+      } else {
+        dev_shape.push_back(cpu_shape[dev_dim_order.front()] / stick_size);
+      }
+      if (dev_dim_order.size() == 3) {
+        dev_shape.push_back(cpu_shape[dim]);
+      }
+    }
+  }
+  // Device shape is reversed for the G2 graph node
+  std::reverse(dev_shape.begin(), dev_shape.end());
+  return dev_shape;
+}
+auto get_device_shape(const at::Tensor* tensor) -> std::vector<int64_t> {
+  /* Given the CPU Tensor, return the shape of the equivalent tensor on
+   * Spyre
+   */
+  const c10::IntArrayRef& sizes = tensor->sizes();
+  int stick_size = 128 / tensor->element_size();
+  return get_device_shape(sizes, stick_size);
+}
+auto get_dim_cpu_stride(int dim, std::vector<int64_t> dev_dim_order,
+                        std::vector<int64_t> cpu_strides) {
+  /* Returns the stride for a given dimension on the host. */
+  int cpu_stride;
+  if (dim == dev_dim_order.front()) {
+    cpu_stride = 1;
+  } else {
+    cpu_stride = cpu_strides[dim];
+  }
+  return cpu_stride;
+}
+auto get_dim_dev_stride(int dim, int stick_size,
+                        std::vector<int64_t> dev_dim_order,
+                        std::vector<int64_t> cpu_shape) {
+  /* Returns the device stride for a given dimension */
+  int dev_stride;
+  if (dim == dev_dim_order.front()) {
+    // First dimesion on the device has a stride of 1.
+    dev_stride = 1;
+  } else if (dim == dev_dim_order.back() && cpu_shape.size() == 3) {
+    dev_stride = cpu_shape[dim];
+  } else {
+    dev_stride = stick_size;
+  }
+  return dev_stride;
+}
+auto get_dim_size(int stick_size, int dim, std::vector<int64_t> cpu_shape,
+                  std::vector<int64_t> dev_dim_order, bool requires_padding) {
+  /* Returns the size for a given dimension on the device */
+  int dim_size;
+  if (!requires_padding && dim == dev_dim_order.front()) {
+    // Size of the first dimension on the device is the stick size when padding
+    // is not required
+    dim_size = stick_size;
+  } else {
+    dim_size = cpu_shape[dim];
+  }
+  return dim_size;
+}
+auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                            int stick_size, bool host2device)
+    -> data_conversion_stride_info {
+  data_conversion_stride_info stride_info;
+  auto cpu_shape = sizes.vec();
+  auto cpu_strides = strides.vec();
+  auto requires_padding = (cpu_shape.back() % stick_size != 0);
+  auto dev_dim_order = get_device_layout(sizes);
+
+  for (int i = 0; i < dev_dim_order.size(); i++) {
+    /*
+     * Fill out size, stride on host and stride on device for current dimension
+     * to determine layout conversion requirements.
+     */
+    auto& dim = dev_dim_order[i];
+    auto cpu_stride = get_dim_cpu_stride(dim, dev_dim_order, cpu_strides);
+    auto dev_stride =
+        get_dim_dev_stride(dim, stick_size, dev_dim_order, cpu_shape);
+    auto dim_size = get_dim_size(stick_size, dim, cpu_shape, dev_dim_order,
+                                 requires_padding);
+
+    if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
+      /* For 3D tensors, the 3rd stride/size is for stick_dim / stick_size
+       * dimension */
+      stride_info.stride_src_.push_back(
+          host2device ? stick_size
+                      : (cpu_shape[dev_dim_order[i - 1]] * stick_size));
+      stride_info.stride_dst_.push_back(
+          host2device ? (cpu_shape[dev_dim_order[i - 1]] * stick_size)
+                      : stick_size);
+      stride_info.size_.push_back(
+          requires_padding ? 1 : cpu_shape[dev_dim_order.front()] / stick_size);
+      dev_stride =
+          (requires_padding ? stick_size : cpu_shape[dev_dim_order.front()]) *
+          cpu_shape.front();
+    }
+    stride_info.size_.push_back(dim_size);
+    stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
+    stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
+
+    if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
+      /* For 1 and 2D tensors, the final stride / size is for the stick_dim /
+       * stick_size dim */
+      cpu_stride = stick_size;
+      if (dev_dim_order.size() == 2) {
+        dev_stride = cpu_shape[dim] * stick_size;
+      } else {
+        dev_stride = stick_size;
+      }
+      stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
+      stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
+      stride_info.size_.push_back(
+          requires_padding ? 1
+                           : (cpu_shape[dev_dim_order.front()] / stick_size));
+    }
+  }
+  stride_info.offset_src_ = 0;
+  stride_info.offset_dst_ = 0;
+  return stride_info;
+}
+
+auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
+  /* Returns data conversion information in string
+   *   host2device = true : then 'tensor' is CPU-tensor
+   *   host2device = false: then 'tensor' is Spyre-tensor
+   */
+  std::stringstream s;
+  auto cpu_shape = tensor->sizes().vec();
+  auto cpu_strides = tensor->strides().vec();
+  int stick_size = 128 / tensor->element_size();
+  std::vector<int64_t> dev_shape = get_device_shape(tensor);
+  data_conversion_info* dci = new data_conversion_info();
+  dci->dci_dsName_ = "DCI-Tensor-0";
+  dci->isHostToSen_ = host2device;
+  dci->dataformat_src_ =
+      host2device ? DataFormats::IEEE_FP16 : DataFormats::SEN169_FP16;
+  dci->dataformat_dst_ =
+      host2device ? DataFormats::SEN169_FP16 : DataFormats::IEEE_FP16;
+  data_conversion_stride_info stride_info = get_device_stride_info(
+      tensor->sizes(), tensor->strides(), stick_size, host2device);
+  dci->dcsi_.push_back(stride_info);
+  std::reverse(cpu_shape.begin(), cpu_shape.end());
+  std::reverse(dev_shape.begin(), dev_shape.end());
+  dci->input_shape_ = host2device ? cpu_shape : dev_shape;
+  dci->output_shape_ = host2device ? dev_shape : cpu_shape;
+
+  dci->exportJson(s);
+  return s.str();
+}
+
+auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
+                    bool host2device) -> std::shared_ptr<sendnn::GraphLoader> {
+  /* self = source
+   * dst  = destination
+   */
+  const at::Tensor* dev_tensor;
+  const at::Tensor* cpu_tensor;
+  if (host2device) {
+    cpu_tensor = &self;
+    dev_tensor = &dst;
+  } else {
+    cpu_tensor = &dst;
+    dev_tensor = &self;
+  }
+  constexpr auto sen_dtype_cpu = sendnn::sen_datatype_enum::float16;
+  constexpr auto sen_dtype_dev = sendnn::sen_datatype_enum::sen_fp16;
+  auto layout = sendnn::TensorLayout::NHWC;
+
+  sendnn::TensorShape dev_tensor_shape(get_device_shape(cpu_tensor));
+
+  sendnn::TensorInfo cpu_ti(sen_dtype_cpu,
+                            sendnn::TensorShape(cpu_tensor->sizes().vec()),
+                            layout, sendnn::TensorLocation::HOST());
+  sendnn::TensorInfo dev_ti(sen_dtype_dev, dev_tensor_shape, layout,
+                            sendnn::TensorLocation::DEVICE());
+  sendnn::TensorInfo dci_ti(sen_dtype_dev, dev_tensor_shape, layout,
+                            sendnn::TensorLocation::HOST());
+  //  STAGE 1: execution graph
+  sendnn::SubGraph fdc_graph;
+  int64_t xfer_size = dev_tensor_shape.Volume() * cpu_tensor->element_size();
+  {  // subgraph (execution graph)
+    flex::FlexGraphBuilder gb;
+    flex::FlexGraphBuilder* gb_sn = &gb;
+    DMAParameters dma_param{xfer_size, 0,
+                            0};  // (num_bytes, offset_src, offset_dst)
+    if (host2device) {
+      auto inp_node = gb_sn->PrimaryInput("Input", dci_ti);
+      auto h2d_dt = gb_sn->SenDataTransfer(
+          "Host2Sen-Transfer",
+          dev_ti,    // output (holding shape, type, and location DEVICE)
+          inp_node,  // input (node created using PrimaryInput and on HOST)
+          dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
+      auto out_node = gb_sn->PrimaryOutput("Output", h2d_dt);
+    } else {
+      auto inp_node = gb_sn->PrimaryInput("Input", dev_ti);
+      auto d2h_dt = gb_sn->SenDataTransfer(
+          "Sen2Host-Transfer",
+          dci_ti,    // output (holding shape, type and location HOST)
+          inp_node,  // input (node created as a result of SenDataTransfer)
+          dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
+      auto out_node = gb_sn->PrimaryOutput("Output", d2h_dt);
+    }
+
+    SEN_THROW_NOK(gb_sn->Finalize(&fdc_graph));
+  }
+  sendnn::SubGraph exec_graph;
+  {  // add above subgraph as part of SenFusedDeviceCompute node
+    flex::FlexGraphBuilder fgb;
+    if (host2device) {
+      auto inp_node = fgb.PrimaryInput("Input", cpu_ti);
+      auto h2d_dci = generate_dci(cpu_tensor, host2device);
+      auto h2d_dci_node = fgb.SenHostCompute(
+          "Host2Sen-HostPrep", {dci_ti}, {inp_node}, "SenDataConvert", h2d_dci);
+
+      auto fdc = fgb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
+                                           {h2d_dci_node}, fdc_graph);
+      fgb.PrimaryOutput("Output", fdc->OutputPort(0));
+    } else {
+      sendnn::NodePtr inp_node = fgb.PrimaryInput("Input", dci_ti);
+      auto fdc = fgb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
+                                           {inp_node}, fdc_graph);
+      auto d2h_dci = generate_dci(dev_tensor, host2device);
+      sendnn::NodePtr d2h_dci_node = fgb.SenHostCompute(
+          "Sen2Host-HostPrep", cpu_ti, fdc, "SenDataConvert", d2h_dci);
+
+      fgb.PrimaryOutput("Output", d2h_dci_node->OutputPort(0));
+    }
+
+    SEN_THROW_NOK(fgb.Finalize(&exec_graph));
+  }
+
+  sendnn::SegmentTable segment_table = {
+      sendnn::Segment::PRIMARY_OUT(xfer_size),
+      sendnn::Segment::PRIMARY_IN(xfer_size),
+      sendnn::Segment::INVALID,
+      sendnn::Segment::INVALID,
+      sendnn::Segment::INVALID,
+      sendnn::Segment::INVALID,
+      sendnn::Segment::INVALID,
+      sendnn::Segment::PROGRAM(1024),
+  };
+  // STAGE 2: SenSuperNodeV2 graph
+  sendnn::Graph g;
+  {  // SenSuperNodeV2 graph
+    flex::FlexGraphBuilder gb;
+
+    sendnn::TensorInfo inp_ti =
+        sendnn::TensorInfo(exec_graph.input_ops_.front()->Output(0));
+    sendnn::TensorInfo out_ti =
+        sendnn::TensorInfo(exec_graph.output_ops_.front()->Input(0));
+    sendnn::NodeOrIndexedNode inp_node = gb.PrimaryInput("Input", inp_ti);
+
+    std::string k_uuid = "dma-network";
+    sendnn::attributes::SenPartitionInit part_init;
+    part_init.network_uuid_ = k_uuid;
+    part_init.partition_idx_ = 0;
+    part_init.segment_table_ = segment_table;
+
+    auto sn_exec =
+        gb.SenSuperNodeV2("SenSuperNodeV2_0", {out_ti}, {inp_node}, k_uuid, 0,
+                          1, part_init, exec_graph, {}, false, true, true);
+
+    gb.PrimaryOutput("Output", {0, sn_exec});
+
+    SEN_THROW_NOK(gb.Finalize(&g));
+  }
+
+  // STAGE 3:
+  std::shared_ptr<sendnn::GraphLoader> gl;
+  gl = std::make_shared<sendnn::GraphLoader>(GlobalRuntime::get());
+  {
+    SEN_THROW_NOK(gl->LoadGraph(g));
+    SEN_THROW_NOK(gl->CompileGraph());
+    SEN_THROW_NOK(gl->ParseGraph());
+  }
+  return gl;
+}
+auto DMA_h2d(const at::Tensor& self, const at::Tensor& dst) {
+  std::shared_ptr<sendnn::GraphLoader> gl = CreateDMAGraph(self, dst, true);
+  if (!gl) {
+    DEBUGINFO("GraphLoader is null!");
+    return;
+  }
+
+  // execute
+  constexpr int sn_idx = 0;
+  constexpr int tensor_idx = 0;
+  auto inp_tensor = createInputTensor(*gl, self.storage().data_ptr().get(),
+                                      tensor_idx, sn_idx);
+  auto* ctx =
+      static_cast<SharedOwnerCtx*>(dst.storage().data_ptr().get_context());
+  flex::DeviceMemoryAllocationPtr& dev_data = ctx->owner;
+  inp_tensor.SetSpyreData(dev_data);  // ctx->owner;
+
+  SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
+}
+auto DMA_d2h(const at::Tensor& self, const at::Tensor& dst) {
+  std::shared_ptr<sendnn::GraphLoader> gl = CreateDMAGraph(self, dst, false);
+  // execute
+  constexpr int sn_idx = 0;
+  constexpr int tensor_idx = 0;
+  auto out_tensor = createOutputTensor(*gl, dst.storage().data_ptr().get(),
+                                       tensor_idx, sn_idx);
+  auto* ctx =
+      static_cast<SharedOwnerCtx*>(self.storage().data_ptr().get_context());
+  out_tensor.SetSpyreData(ctx->owner);
+  SEN_THROW_NOK(gl->Copy({out_tensor}, sendnn::Inputs(), sn_idx));
+}
 
 struct SpyreGuardImpl final : c10::impl::DeviceGuardImplInterface {
   static thread_local c10::DeviceIndex
@@ -183,12 +541,12 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
 }
 
 /**
- * This method will run a dummy graph based on a single input/output to extract
- * the proper Spyre sizes, then allocate that space on the Spyre and and set the
- * handle for the tensor to that of the memory in the Spyre. For now, it
- * allocates a CPU tensor with the correct size, as the actual storage will stay
- * on CPU until the rest of the stack is ready to filter out the allocation and
- * deallocation of memory from the graph processing.
+ * This method will determine the size of the tensor on Spyre, then allocate
+ * that space on the Spyre and and set the handle for the tensor to that of the
+ * memory in the Spyre. For now, it allocates a CPU tensor with the correct
+ * size, as the actual storage will stay on CPU until the rest of the stack is
+ * ready to filter out the allocation and deallocation of memory from the graph
+ * processing.
  */
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                                std::optional<c10::ScalarType> dtype_opt,
@@ -196,53 +554,20 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                                std::optional<c10::Device> device_opt,
                                std::optional<bool> pin_memory_opt) {
   // SETUP FOR Spyre TENSOR
+  at::detail::check_size_nonnegative(size);
+  const auto scalar_type = c10::dtype_or_default(dtype_opt);
+  caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
-
-  const auto scalar_type = c10::dtype_or_default(dtype_opt);
-  TORCH_CHECK(device.is_privateuseone());
-  TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
-              "Non strided layout not supported");
-  TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
-              "Pin memory can only be on CPU");
-  const c10::DeviceGuard device_guard(device);
-  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
-
-  at::detail::check_size_nonnegative(size);
-  caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
-
-  // handle tensors with min stride == 64 by altering the tensor size
-  std::vector<int64_t> mutable_size(size.begin(), size.end());
-  std::vector<int64_t> mutable_stride(stride.begin(), stride.end());
-  auto min = std::min_element(stride.begin(), stride.end());
-  if (*min == 64) {
-    auto index = std::distance(stride.begin(), min);
-    mutable_size[index] *= 64;
-    mutable_stride[index] = 1;
-    size = mutable_size;
-    stride = mutable_stride;
+  int stick_size = 64;  // 128 / word size
+  auto dev_sizes = get_device_shape(size, stick_size);
+  size_t size_bytes = 128;  // stick-size
+  for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
+    size_bytes *= *it;
   }
-  DEBUGINFO("NEW Size: ", size, ", NEW Stride: ", stride);
-
-  // create a dummy graph builder operation to produce the right size
-  std::optional<sendnn::GraphLoader> opt_gl =
-      spyre::getCachedGraphLoader("Relu", size, stride);
-
-  sendnn::GraphLoader gl;
-  if (opt_gl.has_value()) {
-    gl = opt_gl.value();
-  } else {
-    sendnn::GraphBuilder gb = spyre::createDummyOp(size);
-    gl = spyre::prepareGraphLoader(&gb);
-    // gl = spyre::parseGraphLoader(gl, size, stride);
-    gl = spyre::parseGraphLoader(gl);
-    auto predict_s = gl.Predict(sendnn::Outputs(), sendnn::Inputs());
-    spyre::storeCachedGraphLoader("Relu", size, stride, gl);
-  }
-
-  // get the input size based on Spyre input
-  size_t size_bytes = gl.getTempAllocationNBytes().at(0);
+  DEBUGINFO("device shape: ", get_device_shape(size, stick_size));
+  DEBUGINFO("bytes on spyre: ", size_bytes);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
       c10::StorageImpl::use_byte_size_t(), size_bytes,
@@ -251,6 +576,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   auto spyre_storage = c10::Storage(spyre_storage_impl);
 
   // Create the Spyre Tensor
+  const c10::DeviceGuard device_guard(device);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, dtype);
 
@@ -286,54 +613,19 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   at::Storage source_storage;
   at::Storage dest_storage;
 
+  // TODO(tmhoangt): add type conversion node
+  TORCH_CHECK(
+      self.scalar_type() == dst.scalar_type(),
+      "Spyre backend does not support type conversion yet during copy.");
+
   if (self.is_cpu() && dst.is_privateuseone()) {
-    // Copy from CPU to Spyre
-    std::optional<sendnn::GraphLoader> opt_gl =
-        spyre::getCachedGraphLoader("Relu", self.sizes(), self.strides());
-    sendnn::GraphLoader gl;
-    if (opt_gl.has_value()) {
-      gl = opt_gl.value();
-    } else {
-      sendnn::GraphBuilder gb = spyre::createDummyOp(self.sizes());
-      gl = spyre::prepareGraphLoader(&gb);
-      gl = spyre::parseGraphLoader(gl, self.sizes(), self.strides());
-      auto predict_s = gl.Predict(sendnn::Outputs(), sendnn::Inputs());
-      spyre::storeCachedGraphLoader("Relu", self.sizes(), self.strides(), gl);
-    }
-
-    // perform eager copy
-    sendnn::ConstTensor constInput =
-        createInputTensor(gl, self.storage().data_ptr().get());
-    constInput.SetSpyreData(
-        (static_cast<SharedOwnerCtx*>(dst.storage().data_ptr().get_context()))
-            ->owner);
-
-    auto copy_status = gl.Copy(sendnn::Outputs(), {constInput}, 1);
-
+    DMA_h2d(self, dst);
     return dst;
+
   } else if (self.is_privateuseone() && dst.is_cpu()) {
-    // Copy from Spyre to CPU
-    std::optional<sendnn::GraphLoader> opt_gl =
-        spyre::getCachedGraphLoader("Relu", self.sizes(), self.strides());
-    sendnn::GraphLoader gl;
-    if (opt_gl.has_value()) {
-      gl = opt_gl.value();
-    } else {
-      sendnn::GraphBuilder gb = spyre::createDummyOp(self.sizes());
-      gl = spyre::prepareGraphLoader(&gb);
-      gl = spyre::parseGraphLoader(gl, self.sizes(), self.strides());
-      auto predict_s = gl.Predict(sendnn::Outputs(), sendnn::Inputs());
-      spyre::storeCachedGraphLoader("Relu", self.sizes(), self.strides(), gl);
-    }
-
-    auto constOutput = createOutputTensor(gl, dst.storage().data_ptr().get());
-    constOutput.SetSpyreData(
-        (static_cast<SharedOwnerCtx*>(self.storage().data_ptr().get_context()))
-            ->owner);
-
-    auto copy_status = gl.Copy({constOutput}, sendnn::Inputs(), 1);
-
+    DMA_d2h(self, dst);
     return dst;
+
   } else if (self.is_privateuseone() && dst.is_privateuseone()) {
     // Copy from Spyre to Spyre
     // FIXME: This will need to be addressed for proper spyre to spyre copy
@@ -341,16 +633,16 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->storage();
     dest_storage =
         (static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl()))->storage();
+    DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
+              source_storage.device(), "to", dest_storage.device());
+    std::memcpy(dest_storage.data_ptr().get(), source_storage.data_ptr().get(),
+                source_storage.nbytes());
+    DEBUGINFO("Finished Copying ");
+    return dst;
   } else {
     // For all other cases fallback to the upstream implementation
     return at::_copy_from(self, dst, non_blocking);
   }
-  DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
-            source_storage.device(), "to", dest_storage.device());
-  std::memcpy(dest_storage.data_ptr().get(), source_storage.data_ptr().get(),
-              source_storage.nbytes());
-  DEBUGINFO("Finished Copying ");
-  return dst;
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

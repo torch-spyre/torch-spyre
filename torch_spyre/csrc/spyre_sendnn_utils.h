@@ -115,7 +115,7 @@ sendnn::ConstTensor createInputTensor(sendnn::GraphLoader& gl, void* data_ptr,
                                       uint64_t sn_index = 1);
 
 sendnn::Tensor createOutputTensor(sendnn::GraphLoader& gl, void* data_ptr,
-                                  unsigned int input_index = 0,
+                                  unsigned int output_index = 0,
                                   uint64_t sn_index = 1);
 
 sendnn::TensorInfo getTensorInfo(const at::Tensor& input);

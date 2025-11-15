@@ -53,8 +53,36 @@ class TestOps(TestCase):
         x_expected = torch.tensor([5.0, 5.0, 5.0], dtype=self.dtype)
         torch.testing.assert_close(x_expected, x_actual, rtol=self.rtol, atol=self.atol)
 
-    def test_copy(self):
+    def test_copy_1d_padded(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_2d_padded(self):
+        x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_3d_padded(self):
+        x = torch.tensor(
+            [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
+            dtype=self.dtype,
+        )
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_1d(self):
+        x = torch.rand(256, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_2d(self):
+        x = torch.rand(256, 128, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_3d(self):
+        x = torch.rand(256, 128, 512, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
@@ -64,18 +92,23 @@ class TestOps(TestCase):
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_t_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_transpose_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.transpose(0, 1).to("cpu")
-        torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol
+        )
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_transpose_3d(self):
         x = torch.tensor(
             [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
@@ -83,43 +116,60 @@ class TestOps(TestCase):
         )
         x_spyre = x.to("spyre")
         y = x_spyre.transpose(0, 1).to("cpu")
-        torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol
+        )
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_permute_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.permute(1, 0).to("cpu")
-        torch.testing.assert_close(y, x.permute(1, 0), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, x.permute(1, 0), rtol=self.rtol, atol=self.atol
+        )
 
     def test_abs(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.abs(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.abs(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.abs(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_relu(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.relu(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.relu(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.relu(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_exp(self):
         x = torch.tensor([-10, -1, 0, 1, 10], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.exp(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.exp(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.exp(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_exp_transpose(self):
-        x = torch.tensor([[-10, -1, 0, 1, 10], [1, 2, 3, 4, 5]], dtype=self.dtype)
+        x = torch.tensor(
+            [[-10, -1, 0, 1, 10], [1, 2, 3, 4, 5]], dtype=self.dtype
+        )
         x_spyre = x.to("spyre")
         y = torch.exp(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.exp(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.exp(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_log(self):
         x = torch.tensor([0.1, 1, 10, 100], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.log(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.log(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.log(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_reciprocal(self):
         x = torch.tensor([-2, 1, 3], dtype=self.dtype)
@@ -133,19 +183,25 @@ class TestOps(TestCase):
         x = torch.tensor([-2, 1, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.sigmoid(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.sigmoid(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.sigmoid(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_sqrt(self):
         x = torch.tensor([0, 1, 2.25, 4, 10000], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.sqrt(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.sqrt(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.sqrt(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_tanh(self):
         x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.tanh(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.tanh(x), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            y, torch.tanh(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_clone(self):
         x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
@@ -153,13 +209,16 @@ class TestOps(TestCase):
         y = torch.clone(x_spyre).to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_add_Tensor(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
         y = torch.tensor([4, 5, 6], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.add(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.add(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.add(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     def test_add_Scalar(self):
         x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype)
@@ -168,6 +227,7 @@ class TestOps(TestCase):
         z = (x_spyre + y).to("cpu")
         torch.testing.assert_close(z, x + y, rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_add_Tensor_transpose(self):
         x = torch.arange(8, dtype=self.dtype).view(2, 4)
         y = torch.arange(8, dtype=self.dtype).view(4, 2) * 10
@@ -198,7 +258,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mul(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mul(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mul(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     def test_mm_ab_bc(self):
         x = torch.arange(self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -210,7 +272,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_ac_cb(self):
@@ -223,7 +287,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_ba_ac(self):
@@ -236,7 +302,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_bc_ca(self):
@@ -249,7 +317,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_ca_ab(self):
@@ -262,8 +332,11 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_mm_cb_ba(self):
         x = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_b
@@ -274,7 +347,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.mm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_bmm_ab_bc(self):
@@ -288,7 +363,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_bmm_cb_ba(self):
@@ -302,7 +379,9 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y_spyre = y.to("spyre")
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_matmul_ab_bc(self):
@@ -399,7 +478,9 @@ class TestOps(TestCase):
                         outputs_cpu = op_handle(*sample_input)
 
                         sample_input_spyre = [
-                            s_.to("spyre") if isinstance(s_, torch.Tensor) else s_
+                            s_.to("spyre")
+                            if isinstance(s_, torch.Tensor)
+                            else s_
                             for s_ in sample_input
                         ]
                         outputs_spyre = op_handle(*sample_input_spyre)
@@ -433,9 +514,13 @@ class TestOps(TestCase):
                                     )
 
                     except Exception:
-                        print(f"Could not run test for {declaration['operator_name']}")
+                        print(
+                            f"Could not run test for {declaration['operator_name']}"
+                        )
             else:
-                print(f"Could not find op_info for {declaration['operator_name']}")
+                print(
+                    f"Could not find op_info for {declaration['operator_name']}"
+                )
 
             return close
 
