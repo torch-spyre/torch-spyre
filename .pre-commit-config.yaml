@@ -57,6 +57,12 @@ repos:
     entry: tools/clang-format-hook.sh 
     language: system
     files: \.(cpp|hpp|cc|hh|c|h)$
+  - id: check-requirements-dev
+    name: Check requirements/dev.txt sync
+    entry: tools/check-requirements.sh
+    language: system
+    files: pyproject.toml
+    pass_filenames: false
   - id: mypy-local
     name: Run mypy for local Python installation
     entry: tools/mypy.sh 0 "local"
