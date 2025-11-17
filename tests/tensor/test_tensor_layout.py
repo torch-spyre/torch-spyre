@@ -71,6 +71,13 @@ class TestSpyreTensorLayout(TestCase):
         )
         self.assertEqual(stl.format, SpyreTensorLayout.StickFormat.Sparse)
 
+    def test_stl_str(self):
+        stl = SpyreTensorLayout([512, 256], torch.float16)
+        self.assertEqual(
+            str(stl),
+            'SpyreTensorLayout(device_size=[4, 512, 64], device_strides=[32768, 64, 1], dim_map =[1, 0, 1], num_stick_dims=1, format="Dense")',
+        )
+
 
 if __name__ == "__main__":
     run_tests()

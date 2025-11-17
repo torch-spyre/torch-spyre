@@ -183,6 +183,9 @@ PYBIND11_MODULE(_C, m) {
       .def_readwrite("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readwrite("num_stick_dims", &spyre::SpyreTensorLayout::num_stick_dims)
       .def_readwrite("format", &spyre::SpyreTensorLayout::format)
+      .def("__str__", [](const spyre::SpyreTensorLayout& c) {
+        return c.toString();
+      })
       .def(py::init<std::vector<int64_t>, c10::ScalarType>())
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, 
           std::vector<int32_t>, int32_t, spyre::SpyreTensorLayout::StickFormat>());

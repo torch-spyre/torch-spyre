@@ -30,8 +30,6 @@ namespace spyre {
 SpyreTensorLayout::SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype)
     : device_size({}), device_strides({}), dim_map({}), num_stick_dims(1), format(StickFormat::Dense) {
 
-  fprintf(stderr, "HI DAVE 0\n");
-
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + this->num_stick_dims;
   auto elem_bytes = c10::elementSize(dtype);
@@ -64,6 +62,43 @@ SpyreTensorLayout::SpyreTensorLayout(std::vector<int64_t> host_size, c10::Scalar
 SpyreTensorLayout::SpyreTensorLayout(std::vector<int64_t> device_size, std::vector<int64_t> device_strides, 
     std::vector<int32_t> dim_map, int32_t num_stick_dims, StickFormat format)
     : device_size(device_size), device_strides(device_strides), dim_map(dim_map), num_stick_dims(num_stick_dims), format(format) {}
+
+std::string SpyreTensorLayout::toString() const {
+  std::stringstream ss;
+  ss << "SpyreTensorLayout(";
+  ss << "device_size=[";
+  for (size_t i = 0; i < this->device_size.size(); i++){
+    ss << this->device_size[i];
+    if (i < this->device_size.size() - 1) {
+      ss << ", ";
+    }
+  }
+  ss <<"], device_strides=[";
+  for (size_t i = 0; i < this->device_strides.size(); i++){
+    ss << this->device_strides[i];
+    if (i < this->device_strides.size() - 1) {
+      ss << ", ";
+    }
+  }
+  ss << "], dim_map =[";
+  for (size_t i = 0; i < this->dim_map.size(); i++){
+    ss << this->dim_map[i];
+    if (i < this->dim_map.size() - 1) {
+      ss << ", ";
+    }
+  }
+  ss << "], num_stick_dims=";
+  ss << this->num_stick_dims;
+  if (this->format == StickFormat::Dense) {
+    ss << ", format=\"Dense\"";
+  } else if (this->format == StickFormat::Sparse) {
+    ss << ", format=\"Sparse\"";
+  } else {
+    ss << ", format=\"SparseMulti\"";
+  }
+  ss << ")";
+  return ss.str();
+}
 
 
 SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,

@@ -49,8 +49,11 @@ class SpyreTensorLayout {
    * Generic stick format is row major with a single dense stick dimension.
    */
   SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype);
+
   SpyreTensorLayout(std::vector<int64_t> device_size, std::vector<int64_t> device_strides, 
     std::vector<int32_t> dim_mapping, int32_t num_stick_dims, StickFormat format);
+
+  std::string toString() const;
 };
 
 /**
