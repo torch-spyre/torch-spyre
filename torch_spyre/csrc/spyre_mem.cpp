@@ -125,9 +125,9 @@ auto get_dim_cpu_stride(int dim, std::vector<int64_t> dev_dim_order,
   }
   return cpu_stride;
 }
-auto get_dim_dev_stride(int dim, int stick_size,
-                        std::vector<int64_t> dev_dim_order,
-                        std::vector<int64_t> cpu_shape) {
+auto get_dim_device_stride(int dim, int stick_size,
+                           std::vector<int64_t> dev_dim_order,
+                           std::vector<int64_t> cpu_shape) {
   /* Returns the device stride for a given dimension */
   int dev_stride;
   if (dim == dev_dim_order.front()) {
@@ -140,8 +140,10 @@ auto get_dim_dev_stride(int dim, int stick_size,
   }
   return dev_stride;
 }
-auto get_dim_size(int stick_size, int dim, std::vector<int64_t> cpu_shape,
-                  std::vector<int64_t> dev_dim_order, bool requires_padding) {
+auto get_dim_device_size(int stick_size, int dim,
+                         std::vector<int64_t> cpu_shape,
+                         std::vector<int64_t> dev_dim_order,
+                         bool requires_padding) {
   /* Returns the size for a given dimension on the device */
   int dim_size;
   if (!requires_padding && dim == dev_dim_order.front()) {
@@ -170,9 +172,9 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     auto& dim = dev_dim_order[i];
     auto cpu_stride = get_dim_cpu_stride(dim, dev_dim_order, cpu_strides);
     auto dev_stride =
-        get_dim_dev_stride(dim, stick_size, dev_dim_order, cpu_shape);
-    auto dim_size = get_dim_size(stick_size, dim, cpu_shape, dev_dim_order,
-                                 requires_padding);
+        get_dim_device_stride(dim, stick_size, dev_dim_order, cpu_shape);
+    auto dim_size = get_dim_device_size(stick_size, dim, cpu_shape,
+                                        dev_dim_order, requires_padding);
 
     if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
       /* For 3D tensors, the 3rd stride/size is for stick_dim / stick_size
