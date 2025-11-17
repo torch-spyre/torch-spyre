@@ -68,6 +68,9 @@ auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
     case 3:
       dim_order = {2, 0, 1};
       break;
+    case 4:
+      dim_order = {3, 2, 1, 0};
+      break;
     default:
       throw std::runtime_error("Unsupported tensor rank");
   }
@@ -91,12 +94,14 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
    * 1D [stick_size, cpu_shape[0]/stick_size]
    * 2D [stick_size, cpu_shape[0], cpu_shape[1]/stick_size]
    * 3D [stick_size, cpu_shape[0], cpu_shape[2]/stick_size, cpu_shape[1]]
+   * 4D [stick_size, cpu_shape[2], cpu_shape[1], cpu_shape[3]/stick_size,
+   * cpu_shape[0]]
    */
   for (int i = 0; i < dev_dim_order.size(); i++) {
     auto& dim = dev_dim_order[i];
     if (i == 0) {
       dev_shape.push_back(stick_size);
-    } else if (i == 1) {
+    } else if (i == 1 || i == 2 && dev_dim_order.size() == 4) {
       dev_shape.push_back(cpu_shape[dim]);
     }
     if (i == dev_dim_order.size() - 1) {
@@ -105,7 +110,7 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
       } else {
         dev_shape.push_back(cpu_shape[dev_dim_order.front()] / stick_size);
       }
-      if (dev_dim_order.size() == 3) {
+      if (dev_dim_order.size() >= 3) {
         dev_shape.push_back(cpu_shape[dim]);
       }
     }
@@ -143,6 +148,8 @@ auto get_dim_device_stride(int dim, int stick_size,
     dev_stride = 1;
   } else if (dim == dev_dim_order.back() && cpu_shape.size() == 3) {
     dev_stride = cpu_shape[dim];
+  } else if (dim == 1 && cpu_shape.size() == 4) {
+    dev_stride = cpu_shape.back() * stick_size;
   } else {
     dev_stride = stick_size;
   }
@@ -199,6 +206,22 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
           (requires_padding ? stick_size : cpu_shape[dev_dim_order.front()]) *
           cpu_shape.front();
     }
+    if (dim == dev_dim_order.back() && dev_dim_order.size() == 4) {
+      /* For 4D tensors, the 4th stride/size is for stick_dim / stick_size
+       * dimension */
+      stride_info.stride_src_.push_back(
+          host2device ? stick_size
+                      : (cpu_shape[dev_dim_order.front()] *
+                         (cpu_shape[dev_dim_order[i - 1]] * stick_size)));
+      stride_info.stride_dst_.push_back(
+          host2device ? (cpu_shape[dev_dim_order.front()]) *
+                            (cpu_shape[dev_dim_order[i - 1]] * stick_size)
+                      : stick_size);
+      stride_info.size_.push_back(
+          requires_padding ? 1 : cpu_shape[dev_dim_order.front()] / stick_size);
+      dev_stride = cpu_stride;
+    }
+
     stride_info.size_.push_back(dim_size);
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);

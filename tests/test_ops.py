@@ -51,7 +51,9 @@ class TestOps(TestCase):
         x.fill_(5.0)
         x_actual = x.cpu()
         x_expected = torch.tensor([5.0, 5.0, 5.0], dtype=self.dtype)
-        torch.testing.assert_close(x_expected, x_actual, rtol=self.rtol, atol=self.atol)
+        torch.testing.assert_close(
+            x_expected, x_actual, rtol=self.rtol, atol=self.atol
+        )
 
     def test_copy_1d_padded(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
@@ -71,6 +73,11 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
+    def test_copy_4d_padded(self):
+        x = torch.rand(2, 2, 2, 3, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
     def test_copy_1d(self):
         x = torch.rand(256, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
@@ -83,6 +90,11 @@ class TestOps(TestCase):
 
     def test_copy_3d(self):
         x = torch.rand(256, 128, 512, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_4d(self):
+        x = torch.rand(2, 6, 128, 128, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
