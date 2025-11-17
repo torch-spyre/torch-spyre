@@ -73,6 +73,9 @@ auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
     case 3:
       dim_order = {2, 0, 1};
       break;
+    case 4:
+      dim_order = {3, 2, 1, 0};
+      break;
     default:
       throw std::runtime_error("Unsupported tensor rank");
   }
@@ -96,12 +99,14 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
    * 1D [stick_size, cpu_shape[0]/stick_size]
    * 2D [stick_size, cpu_shape[0], cpu_shape[1]/stick_size]
    * 3D [stick_size, cpu_shape[0], cpu_shape[2]/stick_size, cpu_shape[1]]
+   * 4D [stick_size, cpu_shape[2], cpu_shape[1], cpu_shape[3]/stick_size,
+   * cpu_shape[0]]
    */
   for (int i = 0; i < dev_dim_order.size(); i++) {
     auto& dim = dev_dim_order[i];
     if (i == 0) {
       dev_shape.push_back(stick_size);
-    } else if (i == 1) {
+    } else if (i == 1 || i == 2 && dev_dim_order.size() == 4) {
       dev_shape.push_back(cpu_shape[dim]);
     }
     if (i == dev_dim_order.size() - 1) {
@@ -110,7 +115,7 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
       } else {
         dev_shape.push_back(cpu_shape[dev_dim_order.front()] / stick_size);
       }
-      if (dev_dim_order.size() == 3) {
+      if (dev_dim_order.size() >= 3) {
         dev_shape.push_back(cpu_shape[dim]);
       }
     }
@@ -140,16 +145,17 @@ auto get_dim_cpu_stride(int dim, std::vector<int64_t> dev_dim_order,
 }
 auto get_dim_device_stride(int dim, int stick_size,
                            std::vector<int64_t> dev_dim_order,
-                           std::vector<int64_t> cpu_shape) {
+                           std::vector<int64_t> dev_strides,
+                           std::vector<int64_t> dim_sizes) {
   /* Returns the device stride for a given dimension */
   int dev_stride;
-  if (dim == dev_dim_order.front()) {
+  if (dim == dev_dim_order.front() && dim_sizes.size() == 0) {
     // First dimesion on the device has a stride of 1.
     dev_stride = 1;
-  } else if (dim == dev_dim_order.back() && cpu_shape.size() == 3) {
-    dev_stride = cpu_shape[dim];
-  } else {
+  } else if (dev_dim_order.size() <= 3 && dim_sizes.size() == 1) {
     dev_stride = stick_size;
+  } else {
+    dev_stride = dev_strides.back() * dim_sizes.back();
   }
   return dev_stride;
 }
@@ -174,8 +180,8 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   data_conversion_stride_info stride_info;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
-  auto requires_padding = (cpu_shape.back() % stick_size != 0);
   auto dev_dim_order = get_device_layout(sizes);
+  auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
 
   for (int i = 0; i < dev_dim_order.size(); i++) {
     /*
@@ -184,27 +190,27 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
      */
     auto& dim = dev_dim_order[i];
     auto cpu_stride = get_dim_cpu_stride(dim, dev_dim_order, cpu_strides);
-    auto dev_stride =
-        get_dim_device_stride(dim, stick_size, dev_dim_order, cpu_shape);
+    auto dev_stride = get_dim_device_stride(
+        dim, stick_size, dev_dim_order,
+        host2device ? stride_info.stride_dst_ : stride_info.stride_src_,
+        stride_info.size_);
     auto dim_size = get_dim_device_size(stick_size, dim, cpu_shape,
                                         dev_dim_order, requires_padding);
 
-    if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
-      /* For 3D tensors, the 3rd stride/size is for stick_dim / stick_size
-       * dimension */
-      stride_info.stride_src_.push_back(
-          host2device ? stick_size
-                      : (cpu_shape[dev_dim_order[i - 1]] * stick_size));
-      stride_info.stride_dst_.push_back(
-          host2device ? (cpu_shape[dev_dim_order[i - 1]] * stick_size)
-                      : stick_size);
+    if (dim == dev_dim_order.back() && dev_dim_order.size() >= 3) {
+      /* For 3D and 4D tensors, the second to last stride/size is for stick_dim
+       * / stick_size dimension */
+      stride_info.stride_src_.push_back(host2device ? stick_size : dev_stride);
+      stride_info.stride_dst_.push_back(host2device ? dev_stride : stick_size);
       stride_info.size_.push_back(
           requires_padding ? 1 : cpu_shape[dev_dim_order.front()] / stick_size);
-      dev_stride =
-          (requires_padding ? stick_size : cpu_shape[dev_dim_order.front()]) *
-          cpu_shape.front();
+      dev_stride = get_dim_device_stride(
+          dim, stick_size, dev_dim_order,
+          host2device ? stride_info.stride_dst_ : stride_info.stride_src_,
+          stride_info.size_);
     }
     stride_info.size_.push_back(dim_size);
+
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
 
@@ -212,11 +218,10 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       /* For 1 and 2D tensors, the final stride / size is for the stick_dim /
        * stick_size dim */
       cpu_stride = stick_size;
-      if (dev_dim_order.size() == 2) {
-        dev_stride = cpu_shape[dim] * stick_size;
-      } else {
-        dev_stride = stick_size;
-      }
+      dev_stride = dev_stride = get_dim_device_stride(
+          dim, stick_size, dev_dim_order,
+          host2device ? stride_info.stride_dst_ : stride_info.stride_src_,
+          stride_info.size_);
       stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
       stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
       stride_info.size_.push_back(
