@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Union
-import re
+import regex as re
 
 import torch
 import sympy
@@ -60,7 +60,7 @@ class DimensionInfo:
 class KernelSummary:
     op: list[DimensionInfo]
     scales: list[list[int]]
-    arguments: list[TensorAccess | Constant]
+    arguments: list[TensorArg | ConstantArg]
     op_info: dict[str, Any]
 
 
@@ -94,9 +94,9 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.compute_op: str = ""
         self.compute_op_is_reduction = False
         self.spyre_op: str = ""
-        self.op_info = {}
+        self.op_info: dict[str, Any] = {}
         self.compute_inputs: list[TensorAccess | Constant] = []
-        self.compute_output: TensorAccess = None
+        self.compute_output: Optional[TensorAccess] = None
 
     def create_cse_var(self, name, bounds=None, dtype=None):
         return SpyreKernelCSEVariable(name, bounds, dtype)
@@ -110,8 +110,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.compute_op = op
         self.spyre_op = get_spyre_op(op)
         self.compute_op_is_reduction = is_reduction
-        if hasattr(self.current_node.node.data, "op_info"):
-            self.op_info.update(self.current_node.node.data.op_info)
+        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
+            self.op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
@@ -145,6 +145,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         self.record_compute_op(reduction_type, True)
+        return ()
 
     def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
         """
@@ -165,7 +166,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         """
         return [1 if di.var in index.free_symbols else -1 for di in op_dimensions]
 
-    def analyze_index_expr(self, index: sympy.Expr) -> Sequence[DimensionInfo]:
+    def analyze_index_expr(self, index: sympy.Expr) -> list[DimensionInfo]:
         """
         Return the iteration space implied by the index expression
         """
@@ -189,6 +190,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             raise Unsupported("kernel with no output")
 
         actuals = self.args.python_argdefs()[1]
+        args: list[TensorArg | ConstantArg] = []
+        scales = []
         if self.spyre_op == MATMUL_REDUCTION_OP:
             # MATMUL is specially constructed by our lowering operation.
             # It has exactly 2 tensor inputs and 1 tensor output.
@@ -210,9 +213,10 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 DimensionInfo(r_0, int(red_rt.var_ranges[r_0])),
                 DimensionInfo(x_0, int(idx_rt.var_ranges[x_0])),
             ]
-            args = []
-            scales = []
+
             for input in self.compute_inputs:
+                if not isinstance(input, TensorAccess):
+                    raise Unsupported(f"matmul: unsupported input {input}")
                 scale = self.analyze_tensor_access(di, input.index)
                 args.append(
                     TensorArg(
@@ -239,8 +243,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             ):
                 raise Unsupported(f"reduction operands: {self.compute_inputs}")
             di = self.analyze_index_expr(self.compute_inputs[0].index)
-            args = []
-            scales = []
             input = self.compute_inputs[0]
             scale = self.analyze_tensor_access(di, input.index)
             args.append(
@@ -264,8 +266,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         elif not self.spyre_op == "":
             # Pointwise compute ops are defined by the output's index
             di = self.analyze_index_expr(self.compute_output.index)
-            args = []
-            scales = []
             for input in self.compute_inputs:
                 if isinstance(input, TensorAccess):
                     scale = self.analyze_tensor_access(di, input.index)
@@ -296,6 +296,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             # Reshapes and transposes take exactly one input and use both indexes
             if not len(self.compute_inputs) == 1:
                 raise Unsupported(f"data op has {len(self.compute_inputs)} inputs")
+            if not isinstance(self.compute_inputs[0], TensorAccess):
+                raise Unsupported(f"data op unexpected input: {self.compute_inputs[0]}")
             self.spyre_op = TRANSPOSE_OP
             input_stride = list(
                 self.get_strides(self.compute_inputs[0].index).values()
@@ -309,8 +311,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 self.spyre_op = "slice"
             in_di = self.analyze_index_expr(self.compute_inputs[0].index)
             out_di = self.analyze_index_expr(self.compute_output.index)
-            args = []
-            scales = []
             input = self.compute_inputs[0]
             scale = self.analyze_tensor_access(in_di, input.index)
             args.append(
