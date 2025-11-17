@@ -6,7 +6,7 @@ black==25.11.0
     # via torch-spyre (pyproject.toml)
 cfgv==3.4.0
     # via pre-commit
-click==8.3.0
+click==8.3.1
     # via black
 colorama==0.4.6 ; sys_platform == 'win32'
     # via click
@@ -69,7 +69,7 @@ torch==2.7.1+cpu ; sys_platform != 'darwin'
     # via torch-spyre (pyproject.toml)
 types-cachetools==6.2.0.20251022
     # via torch-spyre (pyproject.toml)
-types-psutil==7.0.0.20251111
+types-psutil==7.0.0.20251116
     # via torch-spyre (pyproject.toml)
 types-pyyaml==6.0.12.20250915
     # via torch-spyre (pyproject.toml)
