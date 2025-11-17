@@ -4,7 +4,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NEW_REQUIREMENTS=$(mktemp)
 
 cd ${ROOT_DIR}
-uv pip compile pyproject.toml --extra test --extra lint > "${NEW_REQUIREMENTS}"
+uv pip compile pyproject.toml --extra test --extra lint --emit-index-url --no-emit-package torch > "${NEW_REQUIREMENTS}"
 
 if ! diff -q "requirements/dev.txt" "${NEW_REQUIREMENTS}" > /dev/null 2>&1; then
     {
