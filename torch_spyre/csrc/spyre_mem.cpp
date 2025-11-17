@@ -372,7 +372,7 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
   }
   return gl;
 }
-auto DMA_h2d(const at::Tensor& self, const at::Tensor& dst) {
+auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
   std::shared_ptr<sendnn::GraphLoader> gl = CreateDMAGraph(self, dst, true);
   if (!gl) {
     DEBUGINFO("GraphLoader is null!");
@@ -391,7 +391,7 @@ auto DMA_h2d(const at::Tensor& self, const at::Tensor& dst) {
 
   SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
 }
-auto DMA_d2h(const at::Tensor& self, const at::Tensor& dst) {
+auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
   std::shared_ptr<sendnn::GraphLoader> gl = CreateDMAGraph(self, dst, false);
   // execute
   constexpr int sn_idx = 0;
@@ -621,11 +621,11 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
       "Spyre backend does not support type conversion yet during copy.");
 
   if (self.is_cpu() && dst.is_privateuseone()) {
-    DMA_h2d(self, dst);
+    copy_host_to_device(self, dst);
     return dst;
 
   } else if (self.is_privateuseone() && dst.is_cpu()) {
-    DMA_d2h(self, dst);
+    copy_device_to_host(self, dst);
     return dst;
 
   } else if (self.is_privateuseone() && dst.is_privateuseone()) {
