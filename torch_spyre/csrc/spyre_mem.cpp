@@ -85,8 +85,8 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
   auto dev_dim_order = get_device_layout(sizes);
   /* If the CPU tensor's inner-most dimension is smaller than the stick size,
    * then pad the dimension up to the stick size.
-   * TODO(avery): support general padding if size of the stick dimension not a multiple
-   * of the stick size.
+   * TODO(tmhoangt): support general padding if size of the stick dimension is
+   * not a multiple of the stick size.
    */
   auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
 
@@ -351,8 +351,8 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::Segment::PROGRAM(128),
   };
   // STAGE 2: SenSuperNodeV2 graph
-  sendnn::Graph sn_graph;
-  {  // SenSuperNodeV2 graph
+  sendnn::Graph sn_graph;  // sn = supernode
+  {                        // SenSuperNodeV2 graph
     flex::FlexGraphBuilder gb;
 
     sendnn::TensorInfo inp_ti =
