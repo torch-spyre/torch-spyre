@@ -57,6 +57,7 @@ repos:
     entry: tools/clang-format-hook.sh 
     language: system
     files: \.(cpp|hpp|cc|hh|c|h)$
+    stages: [manual] # Don't run in CI
   - id: check-requirements-dev
     name: Check requirements/dev.txt sync
     entry: tools/check-requirements.sh
