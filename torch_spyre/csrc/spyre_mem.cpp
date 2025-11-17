@@ -48,8 +48,13 @@
 
 namespace spyre {
 
+/* struct holding the parameters for DMA-based copy
+   size_bytes: number of bytes to transfer
+   src_offset: offset from src base pointer
+   dst_offset: offset from destination base pointer
+ */
 struct DMAParameters {
-  const int64_t size_bytes;  // bytes to transfer
+  const int64_t size_bytes;
   const off64_t src_offset;
   const off64_t dst_offset;
 };
@@ -80,7 +85,7 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
   auto dev_dim_order = get_device_layout(sizes);
   /* If the CPU tensor's inner-most dimension is smaller than the stick size,
    * then pad the dimension up to the stick size.
-   * TODO: support general padding if size of the stick dimension not a multiple
+   * TODO(avery): support general padding if size of the stick dimension not a multiple
    * of the stick size.
    */
   auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
@@ -346,7 +351,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::Segment::PROGRAM(128),
   };
   // STAGE 2: SenSuperNodeV2 graph
-  sendnn::Graph g2_graph;
+  sendnn::Graph sn_graph;
   {  // SenSuperNodeV2 graph
     flex::FlexGraphBuilder gb;
 
@@ -358,7 +363,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
 
     std::string k_uuid = "dma-network";
     sendnn::attributes::SenPartitionInit part_init;
-    part_init.network_uuid_ = "dma-network";
+    part_init.network_uuid_ = k_uuid;
     part_init.partition_idx_ = 0;
     part_init.segment_table_ = segment_table;
 
@@ -367,14 +372,14 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
                           1, part_init, exec_graph, {}, false, true, true);
     gb.PrimaryOutput("Output", {0, sn});
 
-    SEN_THROW_NOK(gb.Finalize(&g2_graph));
+    SEN_THROW_NOK(gb.Finalize(&sn_graph));
   }
 
   // STAGE 3:
   std::shared_ptr<sendnn::GraphLoader> gl;
   gl = std::make_shared<sendnn::GraphLoader>(GlobalRuntime::get());
   {
-    SEN_THROW_NOK(gl->LoadGraph(g2_graph));
+    SEN_THROW_NOK(gl->LoadGraph(sn_graph));
     SEN_THROW_NOK(gl->CompileGraph());
     SEN_THROW_NOK(gl->ParseGraph());
   }
