@@ -106,8 +106,9 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
             if isinstance(t, torch.Tensor):
                 if t.device.type == "spyre":
                     dci = t.get_dci()
-                    self.layout = dci.spyre_layout(t.device, t.size(), t.dtype)
-                    return self.layout
+                    if isinstance(dci, SpyreDCI):
+                        self.layout = dci.spyre_layout(t.device, t.size(), t.dtype)
+                        return self.layout
             elif isinstance(t, tuple) and (
                 n.target == torch.ops.aten.max.dim or n.target == torch.ops.aten.min.dim
             ):
@@ -115,8 +116,9 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
                 t = t[0]
                 if t.device.type == "spyre":
                     dci = t.get_dci()
-                    self.layout = dci.spyre_layout(t.device, t.size(), t.dtype)
-                    return self.layout
+                    if isinstance(dci, SpyreDCI):
+                        self.layout = dci.spyre_layout(t.device, t.size(), t.dtype)
+                        return self.layout
 
         return self.layout
     elif isinstance(self.layout, Layout):

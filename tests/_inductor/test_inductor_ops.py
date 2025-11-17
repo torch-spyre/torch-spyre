@@ -15,12 +15,12 @@
 import unittest
 import torch
 
-from utils import (
+from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
     make_param_dict,
 )
-from utils import compare, compare_with_cpu
+from utils_inductor import compare, compare_with_cpu
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
