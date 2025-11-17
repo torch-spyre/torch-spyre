@@ -35,7 +35,7 @@ jobs:
         cache-dependency-glob: "requirements/*"
     - run: uv venv
     - name: Install pre-commit
-      run: uv pip install -r requirements/dev.txt  # uv detects the virtual env
+      run: uv pip install -r requirements/lint.txt  # uv detects the virtual env
     - run: echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
     - name: Restore/Cache pre-commit environment
       uses: actions/cache@v4
