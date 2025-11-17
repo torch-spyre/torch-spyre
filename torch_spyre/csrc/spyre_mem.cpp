@@ -280,6 +280,8 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
 
   sendnn::TensorShape dev_tensor_shape(get_device_shape(cpu_tensor));
 
+  // ti = transfer info
+  // dci = data conversion info
   sendnn::TensorInfo cpu_ti(sen_dtype_cpu,
                             sendnn::TensorShape(cpu_tensor->sizes().vec()),
                             layout, sendnn::TensorLocation::HOST());
@@ -292,8 +294,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   int64_t xfer_size = dev_tensor_shape.Volume() * cpu_tensor->element_size();
   {
     flex::FlexGraphBuilder gb;
-    DMAParameters dma_param{xfer_size, 0,
-                            0};  // (num_bytes, offset_src, offset_dst)
+    DMAParameters dma_param{xfer_size, 0, 0};
     if (host2device) {
       auto inp_node = gb.PrimaryInput("Input", dci_ti);
       auto xfer_node = gb.SenDataTransfer(
