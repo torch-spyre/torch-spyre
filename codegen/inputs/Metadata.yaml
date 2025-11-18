@@ -101,7 +101,7 @@
   template_name: custom
 - operator_name: eq
   sendnn_func_name: Equal
-  template_name: custom
+  template_name: base
 - operator_name: embedding
   sendnn_func_name: Gather
   template_name: base
@@ -121,7 +121,7 @@
   template_name: base
 - operator_name: ge
   sendnn_func_name: GreaterEqual
-  template_name: custom
+  template_name: base
 - operator_name: gelu
   sendnn_func_name: Gelu
   template_name: base

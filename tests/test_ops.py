@@ -91,6 +91,24 @@ class TestOps(TestCase):
         y = x_spyre.permute(1, 0).to("cpu")
         torch.testing.assert_close(y, x.permute(1, 0), rtol=self.rtol, atol=self.atol)
 
+    def test_eq(self):
+        x = torch.tensor([1, -2, 3], dtype=self.dtype)
+        y = torch.tensor([0, -2, 4], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        # FIXME: equal is currently returning back the same dtype as the original tensor, we need to have this return a bool
+        actual = (x_spyre == y_spyre).cpu().bool()
+        torch.testing.assert_close(actual, x == y, rtol=self.rtol, atol=self.atol)
+
+    def test_ge(self):
+        x = torch.tensor([1, -2, 3], dtype=self.dtype)
+        y = torch.tensor([0, -2, 4], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        # FIXME: equal is currently returning back the same dtype as the original tensor, we need to have this return a bool
+        actual = (x_spyre >= y_spyre).cpu().bool()
+        torch.testing.assert_close(actual, x >= y, rtol=self.rtol, atol=self.atol)
+
     def test_abs(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
