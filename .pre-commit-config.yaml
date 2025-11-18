@@ -1,3 +1,4 @@
+---
 default_install_hook_types:
   - pre-commit
   - commit-msg
@@ -15,7 +16,7 @@ repos:
     rev: v0.9.31
     hooks:
       - id: pymarkdown
-        exclude: '.*\.inc\.md'
+        exclude: .*\.inc\.md
         args: [fix]
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
@@ -36,13 +37,20 @@ repos:
           - --extensions=cpp,h
           - --exclude=codegen/inputs/RegistrationDeclarations.h
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.1 # use the latest stable version
+    rev: v1.11.1   # use the latest stable version
     hooks:
       - id: mypy
         types: [python]
         args: [torch_spyre, tests]
         pass_filenames: false
         additional_dependencies: [types-PyYAML]
+  - repo: https://github.com/jumanjihouse/pre-commit-hook-yamlfmt
+    rev: 0.2.1   # or other specific tag
+    hooks:
+      - id: yamlfmt
+        args: [--mapping, '2', --sequence, '4', --offset, '2']
+        files: \.(yml|yaml)$
+        exclude: codegen/.*
   - repo: local
     hooks:
       - id: check-requirements-dev
@@ -82,7 +90,8 @@ repos:
       # Keep `suggestion` last
       - id: suggestion
         name: Suggestion
-        entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
+        entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command 
+          with SKIP=<hook-id>."'
         language: system
         verbose: true
         pass_filenames: false

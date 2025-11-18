@@ -38,7 +38,7 @@ huggingface-hub==0.36.0
     # via
     #   tokenizers
     #   transformers
-hypothesis==6.148.1
+hypothesis==6.148.2
     # via torch-spyre (pyproject.toml)
 identify==2.6.15
     # via pre-commit

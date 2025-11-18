@@ -21,7 +21,7 @@ filelock==3.20.0
     #   virtualenv
 fsspec==2025.10.0
     # via torch
-hypothesis==6.148.1
+hypothesis==6.148.2
     # via torch-spyre (pyproject.toml)
 identify==2.6.15
     # via pre-commit
