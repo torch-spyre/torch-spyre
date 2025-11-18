@@ -15,6 +15,8 @@ Non-interactive, simple script:
 python3 -m pytest tests/
 
 python3 examples/tensor_allocate.py
+
+python3 examples/softmax.py
 ```
 
 Interactive:
