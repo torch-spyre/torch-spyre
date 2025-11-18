@@ -9,6 +9,8 @@ They are used for managing caches in CI and for the convenience of users.
 - [lint.txt](lint.txt): everything required to lint
 - [run.txt](run.txt): everything required to run
 
+A number of tests require `torch_sendnn` to be installed. This install step is not covered by the requirements files.
+
 To refresh the requirement files, please run the [update.sh](../tools/update-requirements.sh) script from this folder (requires `uv`).
 
 One of the pre-commit checks verifies if the requirement files are up to date, using the [check.sh](../tools/check-requirements.sh) script.

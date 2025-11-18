@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-    # any change here should be reflected int the build dependencies below
+    # any change here should be reflected in the build dependencies below
     "build~=1.3.0",  # only required to build torch_sendnn
     "cmake>=3.26.1,<4.0.0",
     "expecttest~=0.3.0",

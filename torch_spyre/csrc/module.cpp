@@ -177,16 +177,23 @@ PYBIND11_MODULE(_C, m) {
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
 
-  py::class_<spyre::SpyreDCI> dci_cls(m, "SpyreDCI");
-  dci_cls.def_readwrite("dim_order", &spyre::SpyreDCI::dim_order)
-      .def_readwrite("num_stick_dims", &spyre::SpyreDCI::num_stick_dims)
-      .def_readwrite("format", &spyre::SpyreDCI::format)
-      .def(py::init<int32_t>())
-      .def(py::init<std::vector<int32_t>, int32_t,
-                    spyre::SpyreDCI::StickFormat>());
+  py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
+  dci_cls.def_readwrite("device_size", &spyre::SpyreTensorLayout::device_size)
+      .def_readwrite("device_strides",
+                     &spyre::SpyreTensorLayout::device_strides)
+      .def_readwrite("dim_map", &spyre::SpyreTensorLayout::dim_map)
+      .def_readwrite("num_stick_dims",
+                     &spyre::SpyreTensorLayout::num_stick_dims)
+      .def_readwrite("format", &spyre::SpyreTensorLayout::format)
+      .def("__str__",
+           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def(py::init<std::vector<int64_t>, c10::ScalarType>())
+      .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
+                    std::vector<int32_t>, int32_t,
+                    spyre::SpyreTensorLayout::StickFormat>());
 
-  py::enum_<spyre::SpyreDCI::StickFormat>(dci_cls, "StickFormat")
-      .value("Dense", spyre::SpyreDCI::StickFormat::Dense)
-      .value("Sparse", spyre::SpyreDCI::StickFormat::Sparse)
-      .value("SparseMulti", spyre::SpyreDCI::StickFormat::SparseMulti);
+  py::enum_<spyre::SpyreTensorLayout::StickFormat>(dci_cls, "StickFormat")
+      .value("Dense", spyre::SpyreTensorLayout::StickFormat::Dense)
+      .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse)
+      .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
 }
