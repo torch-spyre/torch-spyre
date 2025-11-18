@@ -19,26 +19,46 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <string>
 #include <vector>
 
 #include "spyre_storage_impl.h"
 
 namespace spyre {
 
-class SpyreDCI {
+class SpyreTensorLayout {
  public:
   enum StickFormat {
     Dense = 0,
     Sparse,
     SparseMulti,
   };
-  std::vector<int32_t> dim_order;
+
+  std::vector<int64_t> device_size;
+  std::vector<int64_t> device_strides;
+  /**
+   * Record the mapping from host size to device_size.
+   * It has len(device_size) entires whose values are indices in the host size
+   * vector. Stick dimensions will appear twice; non-stick dimensions will
+   * appear once.
+   */
+  std::vector<int32_t> dim_map;
   int32_t num_stick_dims;
   StickFormat format;
 
-  explicit SpyreDCI(int32_t num_dims);
-  SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims,
-           StickFormat format);
+  /**
+   * Construct a SpyreTensorLayout in generic stick format for the argument
+   * host_size. Generic stick format is row major with a single dense stick
+   * dimension.
+   */
+  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype);
+
+  SpyreTensorLayout(std::vector<int64_t> device_size,
+                    std::vector<int64_t> device_strides,
+                    std::vector<int32_t> dim_mapping, int32_t num_stick_dims,
+                    StickFormat format);
+
+  std::string toString() const;
 };
 
 /**
