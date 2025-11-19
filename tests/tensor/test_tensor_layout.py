@@ -46,6 +46,21 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.format, SpyreTensorLayout.StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
 
+    def test_dim_order(self):
+        stl = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
+        self.assertEqual(stl.device_size, [8, 256, 64])
+        self.assertEqual(stl.device_strides, [16384, 64, 1])
+        self.assertEqual(stl.dim_map, [0, 1, 0])
+        self.assertEqual(stl.format, SpyreTensorLayout.StickFormat.Dense)
+        self.assertEqual(stl.num_stick_dims, 1)
+
+        stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
+        self.assertEqual(stl.device_size, [8, 256, 8, 64])
+        self.assertEqual(stl.device_strides, [131072, 512, 64, 1])
+        self.assertEqual(stl.dim_map, [0, 2, 1, 0])
+        self.assertEqual(stl.format, SpyreTensorLayout.StickFormat.Dense)
+        self.assertEqual(stl.num_stick_dims, 1)
+
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
         stl_y = SpyreTensorLayout(
