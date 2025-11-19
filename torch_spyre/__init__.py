@@ -135,6 +135,32 @@ def make_spyre_module() -> types.ModuleType:
 
     return mod
 
+def _patch_tensor_repr_for_spyre():
+    import torch
+    if getattr(torch.Tensor, "_spyre_repr_patched", False):
+        return
+
+    orig_repr = torch.Tensor.__repr__
+
+    def spyre_aware_repr(self):
+        dev = getattr(self, "device", None)
+        if dev is not None and dev.type == "spyre":
+            try:
+                return orig_repr(self.to("cpu"))
+            except Exception:
+                # Fallback if .to("cpu") fails for some weird reason
+                return (
+                    f"SpyreTensor(shape={tuple(self.shape)}, "
+                    f"dtype={self.dtype}, device={self.device})"
+                )
+
+        # Non-spyre tensors use normal behavior
+        return orig_repr(self)
+
+    torch.Tensor.__repr__ = spyre_aware_repr
+    torch.Tensor._spyre_repr_patched = True
+
+
 
 def _autoload():
     # guard if autoload may run more than once
@@ -143,6 +169,8 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+    # Run patch on import
+    _patch_tensor_repr_for_spyre()
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)

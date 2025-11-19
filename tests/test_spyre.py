@@ -60,18 +60,25 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(1.0).all())
 
-    @unittest.skip("Skip for now")
     def test_printing(self):
-        # a = torch.ones(20, device="spyre")
-        a = torch.tensor([1, 2]).to("spyre")
-        # Does not crash!
+        t = torch.ones((2, 3), device="spyre", dtype=torch.float16)
+
+        # Try printing
+        try:
+            print(t)
+            print("Tensor printing works!")
+        except NotImplementedError as e:
+            print("Printing failed:", e)
+            assert False, "Spyre backend should support tensor printing"
+
+        a = torch.tensor([1, 2], dtype=torch.float16).to("spyre")
         try:
             a_repr = f"{a}"
         except RuntimeError as re:
             self.fail(f"Printing tensor failed with runtime error {re}")
 
         # Check the the print includes all elements and Spyre device
-        expected_a_repr = "tensor([1, 2], device='spyre:0')"
+        expected_a_repr = "tensor([1., 2.], dtype=torch.float16)"
         self.assertEqual(expected_a_repr, a_repr)
 
     def test_cross_device_copy(self):
