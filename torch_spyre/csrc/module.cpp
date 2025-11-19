@@ -182,7 +182,14 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
   sen_outputs.push_back(tensor);
 
   // Execute device init
-  if (args.size() >= 3) {
+  if (args.size() == 6) {
+    // Filling in segment 5 adds another input to the device init supernode
+    status =
+        gl.Predict(sendnn::Outputs(), {sen_inputs[1], sen_outputs.front()}, 1);
+    if (!status.IsOk()) throw std::runtime_error(status.Message());
+    status = gl.Compute(sen_outputs, sen_inputs, 2);
+    if (!status.IsOk()) throw std::runtime_error(status.Message());
+  } else if (args.size() >= 3) {
     status = gl.Predict(sendnn::Outputs(), {sen_inputs[1]}, 1);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
 
