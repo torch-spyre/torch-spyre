@@ -1,4 +1,3 @@
----
 default_install_hook_types:
   - pre-commit
   - commit-msg
@@ -48,7 +47,7 @@ repos:
     rev: 0.2.3
     hooks:
       - id: yamlfmt
-        args: [--mapping, '2', --sequence, '4', --offset, '2', --preserve_null]
+        args: [--mapping, '2', --sequence, '4', --offset, '2', --preserve_null, --implicit_start]
         files: \.(yml|yaml)$
         exclude: codegen/.*
   - repo: local
