@@ -135,8 +135,10 @@ def make_spyre_module() -> types.ModuleType:
 
     return mod
 
+
 def _patch_tensor_repr_for_spyre():
     import torch
+
     if getattr(torch.Tensor, "_spyre_repr_patched", False):
         return
 
@@ -161,7 +163,6 @@ def _patch_tensor_repr_for_spyre():
     torch.Tensor._spyre_repr_patched = True
 
 
-
 def _autoload():
     # guard if autoload may run more than once
     if getattr(_autoload, "_ran", False):
@@ -169,6 +170,7 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+
     # Run patch on import
     _patch_tensor_repr_for_spyre()
 
