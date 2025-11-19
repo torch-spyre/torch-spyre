@@ -3,7 +3,7 @@
 --index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://pypi.org/simple
 
-cfgv==3.4.0
+cfgv==3.5.0
     # via pre-commit
 distlib==0.4.0
     # via virtualenv
