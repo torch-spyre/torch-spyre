@@ -84,8 +84,7 @@ class SpyreTensorLayout {
 
   /**
    * Initialize a SpyreTensorLayout for the argument host_size with the given
-   * order of dimensions in decreasing stride order, number of stick dimensions,
-   * and stick format.
+   * order of dimensions in decreasing stride order and stick format.
    */
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
             std::vector<int32_t> dim_order, StickFormat format = Dense);
