@@ -148,13 +148,21 @@ def _patch_tensor_repr_for_spyre():
         dev = getattr(self, "device", None)
         if dev is not None and dev.type == "spyre":
             try:
-                return orig_repr(self.to("cpu"))
+                s = orig_repr(self.to("cpu"))
             except Exception:
                 # Fallback if .to("cpu") fails for some weird reason
                 return (
                     f"SpyreTensor(shape={tuple(self.shape)}, "
                     f"dtype={self.dtype}, device={self.device})"
                 )
+            if "device=" in s:
+                return s.replace("device='cpu'", f"device='{self.device}'")
+            if s.endswith(")"):
+                s = s[:-1] + f", device='{self.device}')"
+            else:
+                # Odd case: just append device info
+                s = s + f" (device='{self.device}')"
+            return s
 
         # Non-spyre tensors use normal behavior
         return orig_repr(self)
