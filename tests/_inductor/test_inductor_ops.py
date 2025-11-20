@@ -217,14 +217,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             }
         },
         (
-            "test_where_ge_cpu",
-            "test_where_ge_cpu",
+            "test_where",
+            "test_where_cpu",
         ): {
-            "param_sets": make_param_dict(
-                [
-                    ((256,),) * 2,
-                ]
-            ),
+            "param_sets": {
+                "eq": (
+                    lambda x, y: x == y,
+                    cached_randn((256,)),
+                    cached_randn((256,)),
+                ),
+                "ge": (
+                    lambda x, y: x >= y,
+                    cached_randn((256,)),
+                    cached_randn((256,)),
+                ),
+            }
         },
     }
 
@@ -285,8 +292,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
         compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
 
-    def test_where_ge_cpu(self, x, y):
-        compare_with_cpu(lambda x, y: torch.where(x >= y, x, y), x, y)
+    def test_where_cpu(self, cond_op, x, y):
+        compare_with_cpu(lambda x, y: torch.where(cond_op(x, y), x, y), x, y)
 
 
 if __name__ == "__main__":

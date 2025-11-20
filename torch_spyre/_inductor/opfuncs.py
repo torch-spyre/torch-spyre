@@ -67,6 +67,7 @@ def _initialize_opfunc_mapping():
     # NOTE: If you add a new op here, you must also update fake_ops.ps
     pointwise_ops["truediv"] = "realdiv"
     pointwise_ops["relu"] = "relufwd"
+    pointwise_ops["eq"] = "equal"
     pointwise_ops["ge"] = "greaterequal"
     pointwise_ops["where"] = "where3"
 
