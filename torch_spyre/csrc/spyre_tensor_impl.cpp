@@ -151,10 +151,10 @@ void SpyreTensorImpl::shallow_copy_from(
   at::TensorImpl::shallow_copy_from(impl);
 }
 
-/**
- * Custom metadata implementations
- * These are all temporary implementation to get the Spyre Tensor with CPU
- * storage working
- */
+SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  return static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())
+      ->spyre_layout;
+}
 
 };  // namespace spyre
