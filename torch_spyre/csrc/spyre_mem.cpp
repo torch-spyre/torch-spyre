@@ -58,26 +58,41 @@ struct DMAParameters {
   const off64_t src_offset;
   const off64_t dst_offset;
 };
+/*
+ * Ordering of tensor dimensions on the device for
+ * default (generic stick) format.
+ * Non-stick dimensions appear once, stick dimensions appear twice.
+ *
+ * @param sizes: dimension sizes of the CPU tensor
+ * @return ordering of dimensions on device
+ */
 auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
-  /* Provide ordering of tensor dimensions on the device for
-   * generic stick format.
-   */
   std::vector<int64_t> dim_order;
   switch (sizes.size()) {
     case 1:
-      dim_order = {0};
+      dim_order = {0, 0};
       break;
     case 2:
-      dim_order = {1, 0};
+      dim_order = {1, 0, 1};
       break;
     case 3:
-      dim_order = {2, 0, 1};
+      dim_order = {2, 0, 2, 1};
+      break;
+    case 4:
+      dim_order = {3, 2, 1, 3, 0};
       break;
     default:
       throw std::runtime_error("Unsupported tensor rank");
   }
   return dim_order;
 }
+/*
+ * Shape of tensor on the device.
+ *
+ * @param sizes: dimension sizes of the CPU tensor
+ * @param stick_size: stick length for the dtype
+ * @return shape of tensor on the device
+ */
 auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
     -> std::vector<int64_t> {
   auto cpu_shape = sizes.vec();
@@ -90,148 +105,147 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
    */
   auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
 
-  /* Based on the dimension ordering on the device, provide the shape of the
-   * device tensor. Currently, assuming the generic stick format is used for all
-   * tensors the layout is:
-   * 1D [stick_size, cpu_shape[0]/stick_size]
-   * 2D [stick_size, cpu_shape[0], cpu_shape[1]/stick_size]
-   * 3D [stick_size, cpu_shape[0], cpu_shape[2]/stick_size, cpu_shape[1]]
-   */
-  for (int i = 0; i < dev_dim_order.size(); i++) {
-    auto& dim = dev_dim_order[i];
-    if (i == 0) {
-      dev_shape.push_back(stick_size);
-    } else if (i == 1) {
-      dev_shape.push_back(cpu_shape[dim]);
-    }
-    if (i == dev_dim_order.size() - 1) {
-      if (requires_padding) {
-        dev_shape.push_back(1);
-      } else {
-        dev_shape.push_back(cpu_shape[dev_dim_order.front()] / stick_size);
-      }
-      if (dev_dim_order.size() == 3) {
-        dev_shape.push_back(cpu_shape[dim]);
-      }
+  auto stick_dim = dev_dim_order.front();
+  dev_shape.push_back(stick_size);
+
+  for (int i = 1; i < dev_dim_order.size(); i++) {
+    auto dim = dev_dim_order[i];
+    if (dim == stick_dim) {
+      dev_shape.push_back(
+          requires_padding ? 1 : cpu_shape[dev_dim_order.front()] / stick_size);
+    } else {
+      dev_shape.push_back(cpu_shape[dev_dim_order[i]]);
     }
   }
   // Device shape is reversed for the G2 graph node
   std::reverse(dev_shape.begin(), dev_shape.end());
   return dev_shape;
 }
+/*
+ * Shape of tensor on the device.
+ *
+ * @param tensor: CPU tensor
+ * @return shape of tensor on the device
+ */
 auto get_device_shape(const at::Tensor* tensor) -> std::vector<int64_t> {
-  /* Given the CPU Tensor, return the shape of the equivalent tensor on
-   * Spyre
-   */
   const c10::IntArrayRef& sizes = tensor->sizes();
   int stick_size = 128 / tensor->element_size();
   return get_device_shape(sizes, stick_size);
 }
-auto get_dim_cpu_stride(int dim, std::vector<int64_t> dev_dim_order,
+/*
+ * CPU stride for a dimension.
+ *
+ * @param dim: dimension index
+ * @param stick_size: stick length for the dtype
+ * @param dev_dim_order: order of tensor dimensions on device
+ * @param cpu_strides: strides of cpu tensor
+ * @return CPU stride of the dimension
+ */
+auto get_dim_cpu_stride(int dim, int stick_size,
+                        std::vector<int64_t> dev_dim_order,
                         std::vector<int64_t> cpu_strides) {
-  /* Returns the stride for a given dimension on the host. */
   int cpu_stride;
-  if (dim == dev_dim_order.front()) {
-    cpu_stride = 1;
+  if (dim == dev_dim_order.front()) {  // stick_dim
+    cpu_stride = stick_size;
   } else {
     cpu_stride = cpu_strides[dim];
   }
   return cpu_stride;
 }
+/*
+ * Device stride for a dimension.
+ *
+ * @param dim: dimension index
+ * @param stick_size: stick length for the dtype
+ * @param dev_dim_order: order of tensor dimensions on device
+ * @param dev_strides: strides of device tensor
+ * @param dim_sizes: size of dimensions on device
+ * @return device stride of the dimension
+ */
 auto get_dim_device_stride(int dim, int stick_size,
                            std::vector<int64_t> dev_dim_order,
-                           std::vector<int64_t> cpu_shape) {
-  /* Returns the device stride for a given dimension */
+                           std::vector<int64_t> dev_strides,
+                           std::vector<int64_t> dim_sizes) {
   int dev_stride;
-  if (dim == dev_dim_order.front()) {
-    // First dimesion on the device has a stride of 1.
-    dev_stride = 1;
-  } else if (dim == dev_dim_order.back() && cpu_shape.size() == 3) {
-    dev_stride = cpu_shape[dim];
-  } else {
+  if (dim_sizes.size() == 1) {
     dev_stride = stick_size;
+  } else {
+    dev_stride = dev_strides.back() * dim_sizes.back();
   }
   return dev_stride;
 }
+/*
+ * Size of dimension on the device.
+ *
+ * @param stick_size: stick length for the dtype
+ * @param dim: dimensions idx
+ * @param cpu_shape: dimension sizes of cpu tensor
+ * @param dev_dim_order: order of tensor dimensions on device
+ * @param requires_padding: if the dimension needs to be padded
+ * @return size of a dimension on the device
+ */
 auto get_dim_device_size(int stick_size, int dim,
                          std::vector<int64_t> cpu_shape,
                          std::vector<int64_t> dev_dim_order,
                          bool requires_padding) {
   /* Returns the size for a given dimension on the device */
   int dim_size;
-  if (!requires_padding && dim == dev_dim_order.front()) {
-    // Size of the first dimension on the device is the stick size when padding
-    // is not required
-    dim_size = stick_size;
+  if (dim == dev_dim_order.front()) {  // stick dim
+    dim_size = requires_padding ? 1 : cpu_shape[dim] / stick_size;
   } else {
     dim_size = cpu_shape[dim];
   }
   return dim_size;
 }
+/*
+ * Fills out size and strides for each dimension of the tensor.
+ *
+ * @param sizes: dimension sizes of the CPU tensor
+ * @param strides: dimension strides of the CPU tensor
+ * @param stick_size: stick length for the dtype
+ * @param host2device: direction of data conversion
+ * @return description of data conversion
+ */
 auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                             int stick_size, bool host2device)
     -> data_conversion_stride_info {
   data_conversion_stride_info stride_info;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
-  auto requires_padding = (cpu_shape.back() % stick_size != 0);
   auto dev_dim_order = get_device_layout(sizes);
+  auto requires_padding = (cpu_shape[dev_dim_order.front()] % stick_size != 0);
 
-  for (int i = 0; i < dev_dim_order.size(); i++) {
-    /*
-     * Fill out size, stride on host and stride on device for current dimension
-     * to determine layout conversion requirements.
-     */
+  stride_info.size_.push_back(
+      requires_padding ? cpu_shape[dev_dim_order.front()] : stick_size);
+  stride_info.stride_src_.push_back(1);
+  stride_info.stride_dst_.push_back(1);
+
+  for (int i = 1; i < dev_dim_order.size(); i++) {
     auto& dim = dev_dim_order[i];
-    auto cpu_stride = get_dim_cpu_stride(dim, dev_dim_order, cpu_strides);
-    auto dev_stride =
-        get_dim_device_stride(dim, stick_size, dev_dim_order, cpu_shape);
+    auto cpu_stride =
+        get_dim_cpu_stride(dim, stick_size, dev_dim_order, cpu_strides);
+    auto dev_stride = get_dim_device_stride(
+        dim, stick_size, dev_dim_order,
+        host2device ? stride_info.stride_dst_ : stride_info.stride_src_,
+        stride_info.size_);
     auto dim_size = get_dim_device_size(stick_size, dim, cpu_shape,
                                         dev_dim_order, requires_padding);
-
-    if (dim == dev_dim_order.back() && dev_dim_order.size() == 3) {
-      /* For 3D tensors, the 3rd stride/size is for stick_dim / stick_size
-       * dimension */
-      stride_info.stride_src_.push_back(
-          host2device ? stick_size
-                      : (cpu_shape[dev_dim_order[i - 1]] * stick_size));
-      stride_info.stride_dst_.push_back(
-          host2device ? (cpu_shape[dev_dim_order[i - 1]] * stick_size)
-                      : stick_size);
-      stride_info.size_.push_back(
-          requires_padding ? 1 : cpu_shape[dev_dim_order.front()] / stick_size);
-      dev_stride =
-          (requires_padding ? stick_size : cpu_shape[dev_dim_order.front()]) *
-          cpu_shape.front();
-    }
     stride_info.size_.push_back(dim_size);
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
-
-    if (dim == dev_dim_order.back() && dev_dim_order.size() <= 2) {
-      /* For 1 and 2D tensors, the final stride / size is for the stick_dim /
-       * stick_size dim */
-      cpu_stride = stick_size;
-      if (dev_dim_order.size() == 2) {
-        dev_stride = cpu_shape[dim] * stick_size;
-      } else {
-        dev_stride = stick_size;
-      }
-      stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
-      stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
-      stride_info.size_.push_back(
-          requires_padding ? 1
-                           : (cpu_shape[dev_dim_order.front()] / stick_size));
-    }
   }
   stride_info.offset_src_ = 0;
   stride_info.offset_dst_ = 0;
   return stride_info;
 }
-
+/*
+ * Generate description of data conversion for a tensor.
+ *
+ * @param tensor: tensor to convert
+ * @return data conversion information in string
+ */
 auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
-  /* Returns data conversion information in string
-   *   host2device = true : then 'tensor' is CPU-tensor
+  /*   host2device = true : then 'tensor' is CPU-tensor
    *   host2device = false: then 'tensor' is Spyre-tensor
    * TODO: support strided tensors
    */
