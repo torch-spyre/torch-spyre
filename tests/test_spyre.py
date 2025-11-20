@@ -106,6 +106,7 @@ class TestSpyre(TestCase):
             assert False, "Spyre backend should support tensor printing"
 
     def test_cross_device_copy_scalar(self):
+        # scalar tensor becomes 1D tensor on Spyre
         a = torch.tensor(10, dtype=torch.float16)
         b = a.to(device="spyre").add(2).to(device="cpu")
         self.assertEqual(b.ndim, 1)
@@ -132,6 +133,7 @@ class TestSpyre(TestCase):
             assert x.device.type == "cpu", "initial device is not cpu"
             x_spyre = x.to("spyre")
             assert x_spyre.device.type == "spyre", "to device is not spyre"
+            assert x_spyre.dtype == x.dtype
             x_cpu = x_spyre.to("cpu")
             custom_rtol = 2e-3
             custom_atol = 1e-5
