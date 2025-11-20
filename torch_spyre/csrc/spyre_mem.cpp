@@ -45,6 +45,7 @@
 #include "spyre_sendnn_utils.h"
 #include "spyre_storage_impl.h"
 #include "spyre_tensor_impl.h"
+#include "types_mapping.h"
 
 namespace spyre {
 
@@ -82,7 +83,9 @@ auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
       dim_order = {3, 2, 1, 3, 0};
       break;
     default:
-      throw std::runtime_error("Unsupported tensor rank");
+      std::stringstream ss;
+      ss << "Unsupported tensor rank: " << std::to_string(sizes.size());
+      throw std::runtime_error(ss.str());
   }
   return dim_order;
 }
@@ -129,7 +132,8 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
  */
 auto get_device_shape(const at::Tensor* tensor) -> std::vector<int64_t> {
   const c10::IntArrayRef& sizes = tensor->sizes();
-  int stick_size = 128 / tensor->element_size();
+  constexpr auto bytesPerStick = 128;
+  int stick_size = bytesPerStick / tensor->element_size();
   return get_device_shape(sizes, stick_size);
 }
 /*
@@ -249,18 +253,19 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
    *   host2device = false: then 'tensor' is Spyre-tensor
    * TODO: support strided tensors
    */
+  auto str_type = torchScalarToString[tensor->scalar_type()];
+  const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;
   auto cpu_shape = tensor->sizes().vec();
   auto cpu_strides = tensor->strides().vec();
-  int stick_size = 128 / tensor->element_size();
+  constexpr auto bytesPerStick = 128;
+  int stick_size = bytesPerStick / tensor->element_size();
   std::vector<int64_t> dev_shape = get_device_shape(tensor);
   data_conversion_info* dci = new data_conversion_info();
   dci->dci_dsName_ = "DCI-Tensor-0";
   dci->isHostToSen_ = host2device;
-  dci->dataformat_src_ =
-      host2device ? DataFormats::IEEE_FP16 : DataFormats::SEN169_FP16;
-  dci->dataformat_dst_ =
-      host2device ? DataFormats::SEN169_FP16 : DataFormats::IEEE_FP16;
+  dci->dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
+  dci->dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
   data_conversion_stride_info stride_info = get_device_stride_info(
       tensor->sizes(), tensor->strides(), stick_size, host2device);
   dci->dcsi_.push_back(stride_info);
@@ -288,8 +293,8 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
     cpu_tensor = &dst;
     dev_tensor = &self;
   }
-  constexpr auto sen_dtype_cpu = sendnn::sen_datatype_enum::float16;
-  constexpr auto sen_dtype_dev = sendnn::sen_datatype_enum::sen_fp16;
+  auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
+  const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
   auto layout = sendnn::TensorLayout::NHWC;
 
   sendnn::TensorShape dev_tensor_shape(get_device_shape(cpu_tensor));
@@ -590,14 +595,20 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
-  int stick_size = 64;  // 128 / word size
-  auto dev_sizes = get_device_shape(size, stick_size);
-  size_t size_bytes = 128;  // stick-size
-  for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
-    size_bytes *= *it;
+  constexpr auto bytesPerStick = 128;
+  size_t size_bytes;
+  size_t dev_elementsize_in_bytes = c10::elementSize(scalar_type);
+  int stick_size = bytesPerStick / dev_elementsize_in_bytes;
+  if (size.size() == 0) {
+    size_bytes = bytesPerStick;
+  } else {
+    // int stick_size = 64;  // 128 / word size
+    auto dev_sizes = get_device_shape(size, stick_size);
+    size_bytes = bytesPerStick;
+    for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
+      size_bytes *= *it;
+    }
   }
-  DEBUGINFO("device shape: ", get_device_shape(size, stick_size));
-  DEBUGINFO("bytes on spyre: ", size_bytes);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
       c10::StorageImpl::use_byte_size_t(), size_bytes,
@@ -611,7 +622,18 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, dtype);
 
-  tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride);
+  if (size.size() == 0) {
+    std::vector<int64_t> one = {1};
+    c10::IntArrayRef tmp_size(one);
+    c10::IntArrayRef tmp_stride(one);
+    DEBUGINFO("device shape: ", get_device_shape(tmp_size, stick_size));
+    DEBUGINFO("bytes on spyre: ", size_bytes);
+    tensor.unsafeGetTensorImpl()->set_sizes_and_strides(tmp_size, tmp_stride);
+  } else {
+    DEBUGINFO("device shape: ", get_device_shape(size, stick_size));
+    DEBUGINFO("bytes on spyre: ", size_bytes);
+    tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride);
+  }
 
   return tensor;
 }
@@ -638,8 +660,8 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
-  DEBUGINFO("self is on:", self.device());
-  DEBUGINFO("dst is on:", dst.device());
+  DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());
+  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
   at::Storage source_storage;
   at::Storage dest_storage;
 
@@ -649,7 +671,12 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
       "Spyre backend does not support type conversion yet during copy.");
 
   if (self.is_cpu() && dst.is_privateuseone()) {
-    copy_host_to_device(self, dst);
+    if (self.dim() == 0) {
+      at::Tensor tmp_tensor = self.reshape({1});
+      copy_host_to_device(tmp_tensor, dst);
+    } else {
+      copy_host_to_device(self, dst);
+    }
     return dst;
 
   } else if (self.is_privateuseone() && dst.is_cpu()) {

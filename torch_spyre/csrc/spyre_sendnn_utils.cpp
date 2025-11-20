@@ -23,6 +23,7 @@
 
 #include "logging.h"
 #include "module.h"
+#include "types_mapping.h"
 
 using json = nlohmann::json;
 
@@ -250,17 +251,20 @@ sendnn::TensorInfo getTensorInfo(const at::Tensor& input) {
       shape.push_back(element);
     }
   }
+  auto str_type = torchScalarToString[input.scalar_type()];
+  const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
   sendnn::TensorShape t_shape(shape);
-  sendnn::TensorInfo ti{sendnn::sen_datatype_enum::float16, t_shape,
-                        sendnn::TensorLayout::NHWC};
+  sendnn::TensorInfo ti{sen_dtype_cpu, t_shape, sendnn::TensorLayout::NHWC};
   return ti;
 }
 
-sendnn::TensorInfo getScalarTensorInfo() {
+sendnn::TensorInfo getScalarTensorInfo(const at::Tensor& input) {
+  // get the scalar shape, but type is matched with the given tensor
   std::vector<int64_t> shape = {1};
   sendnn::TensorShape t_shape(shape);
-  sendnn::TensorInfo ti{sendnn::sen_datatype_enum::float16, t_shape,
-                        sendnn::TensorLayout::NHWC};
+  auto str_type = torchScalarToString[input.scalar_type()];
+  const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
+  sendnn::TensorInfo ti{sen_dtype_cpu, t_shape, sendnn::TensorLayout::NHWC};
   return ti;
 }
 

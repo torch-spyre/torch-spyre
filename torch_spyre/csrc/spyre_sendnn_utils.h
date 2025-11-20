@@ -120,6 +120,6 @@ sendnn::Tensor createOutputTensor(sendnn::GraphLoader& gl, void* data_ptr,
 
 sendnn::TensorInfo getTensorInfo(const at::Tensor& input);
 
-sendnn::TensorInfo getScalarTensorInfo();
+sendnn::TensorInfo getScalarTensorInfo(const at::Tensor& input);
 
 }  // namespace spyre

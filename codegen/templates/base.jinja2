@@ -152,10 +152,10 @@
         {% endif %}
     auto inp_{{ loop.index }} = gb.PrimaryInput("Input{{ loop.index }}", ti_{{ loop.index }});
       {% elif arguments[idx].sendnn_type == "PrimaryInputScalar" %}
-    sendnn::TensorInfo ti_{{ loop.index }} = getScalarTensorInfo();
+    sendnn::TensorInfo ti_{{ loop.index }} = getScalarTensorInfo({{ arguments[0].name }});
     auto inp_{{ loop.index }} = gb.PrimaryInput("Input{{loop.index}}", ti_{{ loop.index }});
       {% elif arguments[idx].sendnn_type == "ConstInput" %}
-    sendnn::TensorInfo ti_{{ loop.index }} = getScalarTensorInfo();
+    sendnn::TensorInfo ti_{{ loop.index }} = getScalarTensorInfo({{ arguments[0].name }});
         {% if ('optional' in arguments[idx].type or 'Optional' in arguments[idx].type) %}
     sendnn::ConstTensor ct_{{ loop.index }} = sendnn::ConstTensor(ti_{{ loop.index }}, *{{ arguments[idx].name }});
         {% else %}
