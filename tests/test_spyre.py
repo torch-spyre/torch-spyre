@@ -15,6 +15,7 @@
 # Owner(s): ["module: cpp"]
 
 import os
+import regex as re
 import unittest
 import psutil
 
@@ -77,8 +78,13 @@ class TestSpyre(TestCase):
         except RuntimeError as re:
             self.fail(f"Printing tensor failed with runtime error {re}")
 
+        def normalize_device(s):
+            return re.sub(r"(device='spyre):\d+'", r"\1:0'", s)
+
+        a_repr = normalize_device(a_repr)
+
         # Check the the print includes all elements and Spyre device
-        expected_a_repr = "tensor([1., 2.], dtype=torch.float16)"
+        expected_a_repr = "tensor([1., 2.], dtype=torch.float16, device='spyre:0')"
         self.assertEqual(expected_a_repr, a_repr)
 
     def test_cross_device_copy(self):
