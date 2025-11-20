@@ -93,6 +93,14 @@ class SpyreTensorLayout {
             std::vector<int32_t> dim_order, StickFormat format = Dense);
 
   std::string toString() const;
+
+  bool operator==(const SpyreTensorLayout& other) const {
+    return this->device_size == other.device_size &&
+           this->device_strides == other.device_strides &&
+           this->dim_map == other.dim_map &&
+           this->num_stick_dims == other.num_stick_dims &&
+           this->format == other.format;
+  }
 };
 
 /**
