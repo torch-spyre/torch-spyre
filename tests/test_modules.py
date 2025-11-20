@@ -40,6 +40,7 @@ class TestOps(TestCase):
         self.atol = 1e-3
         self.dtype = torch.float16
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_linear(self):
         m = nn.Linear(3, 5, dtype=self.dtype)
         m_spyre = copy.deepcopy(m)

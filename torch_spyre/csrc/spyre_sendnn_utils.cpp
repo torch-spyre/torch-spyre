@@ -235,9 +235,9 @@ sendnn::ConstTensor createInputTensor(sendnn::GraphLoader& gl, void* data_ptr,
 }
 
 sendnn::Tensor createOutputTensor(sendnn::GraphLoader& gl, void* data_ptr,
-                                  unsigned int input_index /*= 0*/,
+                                  unsigned int output_index /*= 0*/,
                                   uint64_t sn_index /*= 1*/) {
-  auto inp_ti = gl.GetOutputs(sn_index)[input_index];
+  auto inp_ti = gl.GetOutputs(sn_index)[output_index];
   return sendnn::Tensor(inp_ti, data_ptr);
 }
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Optional, Sequence
 import torch
 
 from torch._inductor.decomposition import register_decomposition
@@ -44,7 +44,7 @@ orig_layer_norm = torch.nn.functional.layer_norm
 
 def spyre_layer_norm(
     input: torch.Tensor,
-    normalized_shape: list[int],
+    normalized_shape: Sequence[int],
     weight: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,

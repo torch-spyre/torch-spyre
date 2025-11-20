@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+from typing import Union
 import torch
 
 
@@ -25,8 +26,8 @@ class TensorArg:
 
 @dataclasses.dataclass
 class ConstantArg:
-    value: str
-    dtype: str
+    value: Union[bool, float, int]
+    dtype: torch.dtype
 
 
 @dataclasses.dataclass

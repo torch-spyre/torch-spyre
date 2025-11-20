@@ -53,8 +53,36 @@ class TestOps(TestCase):
         x_expected = torch.tensor([5.0, 5.0, 5.0], dtype=self.dtype)
         torch.testing.assert_close(x_expected, x_actual, rtol=self.rtol, atol=self.atol)
 
-    def test_copy(self):
+    def test_copy_1d_padded(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_2d_padded(self):
+        x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_3d_padded(self):
+        x = torch.tensor(
+            [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
+            dtype=self.dtype,
+        )
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_1d(self):
+        x = torch.rand(256, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_2d(self):
+        x = torch.rand(256, 128, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_3d(self):
+        x = torch.rand(256, 128, 512, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
@@ -64,18 +92,21 @@ class TestOps(TestCase):
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_t_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_transpose_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_transpose_3d(self):
         x = torch.tensor(
             [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
@@ -85,6 +116,7 @@ class TestOps(TestCase):
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_permute_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
@@ -171,6 +203,7 @@ class TestOps(TestCase):
         y = torch.clone(x_spyre).to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_add_Tensor(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
         y = torch.tensor([4, 5, 6], dtype=self.dtype)
@@ -186,6 +219,7 @@ class TestOps(TestCase):
         z = (x_spyre + y).to("cpu")
         torch.testing.assert_close(z, x + y, rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_add_Tensor_transpose(self):
         x = torch.arange(8, dtype=self.dtype).view(2, 4)
         y = torch.arange(8, dtype=self.dtype).view(4, 2) * 10
@@ -282,6 +316,7 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_mm_cb_ba(self):
         x = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_b

@@ -16,26 +16,99 @@
 
 #include "spyre_tensor_impl.h"
 
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "logging.h"
 
 namespace spyre {
 
-/**
- * Initialize a default format (generic stick) DCI for a tensor with num_dims
- * dimensions.
- */
-SpyreDCI::SpyreDCI(int32_t num_dims)
-    : dim_order({}), num_stick_dims(1), format(StickFormat::Dense) {
-  for (int32_t i = 0; i < num_dims; i++) {
+#define BYTES_IN_STICK 128
+
+void SpyreTensorLayout::init(std::vector<int64_t> host_size,
+                             c10::ScalarType dtype) {
+  int host_dims = static_cast<int32_t>(host_size.size());
+  std::vector<int32_t> dim_order;
+  for (int32_t i = 0; i < host_dims; i++) {
     dim_order.push_back(i);
+  }
+  init(host_size, dtype, dim_order, Dense);
+}
+
+void SpyreTensorLayout::init(std::vector<int64_t> host_size,
+                             c10::ScalarType dtype,
+                             std::vector<int32_t> dim_order,
+                             StickFormat format) {
+  int host_dims = static_cast<int>(host_size.size());
+  int device_dims = host_dims + 1;
+  auto elem_bytes = c10::elementSize(dtype);
+  auto elems_in_stick = BYTES_IN_STICK / elem_bytes;
+
+  this->device_size.resize(device_dims);
+  this->device_strides.resize(device_dims);
+  this->dim_map.resize(device_dims);
+  this->format = format;
+  this->num_stick_dims = 1;
+
+  // Stick dim
+  auto stick_dim = dim_order[host_dims - 1];
+  this->dim_map[0] = stick_dim;
+  this->dim_map[device_dims - 1] = stick_dim;
+  this->device_size[0] =
+      (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
+  this->device_size[device_dims - 1] = elems_in_stick;
+
+  // Non-stick dims
+  for (int i = 1; i < device_dims - 1; i++) {
+    this->dim_map[i] = dim_order[i - 1];
+    this->device_size[i] = host_size[dim_order[i - 1]];
+  }
+
+  int64_t cur_stride = elems_in_stick;
+  device_strides[device_dims - 1] = 1;
+  for (int i = device_dims - 2; i >= 0; i--) {
+    this->device_strides[i] = cur_stride;
+    cur_stride = cur_stride * this->device_size[i];
   }
 }
 
-SpyreDCI::SpyreDCI(std::vector<int32_t> dim_order, int32_t num_stick_dims,
-                   StickFormat format)
-    : dim_order(dim_order), num_stick_dims(num_stick_dims), format(format) {}
+std::string SpyreTensorLayout::toString() const {
+  std::stringstream ss;
+  ss << "SpyreTensorLayout(";
+  ss << "device_size=[";
+  for (size_t i = 0; i < this->device_size.size(); i++) {
+    ss << this->device_size[i];
+    if (i < this->device_size.size() - 1) {
+      ss << ", ";
+    }
+  }
+  ss << "], device_strides=[";
+  for (size_t i = 0; i < this->device_strides.size(); i++) {
+    ss << this->device_strides[i];
+    if (i < this->device_strides.size() - 1) {
+      ss << ", ";
+    }
+  }
+  ss << "], dim_map =[";
+  for (size_t i = 0; i < this->dim_map.size(); i++) {
+    ss << this->dim_map[i];
+    if (i < this->dim_map.size() - 1) {
+      ss << ", ";
+    }
+  }
+  ss << "], num_stick_dims=";
+  ss << this->num_stick_dims;
+  if (this->format == StickFormat::Dense) {
+    ss << ", format=\"Dense\"";
+  } else if (this->format == StickFormat::Sparse) {
+    ss << ", format=\"Sparse\"";
+  } else {
+    ss << ", format=\"SparseMulti\"";
+  }
+  ss << ")";
+  return ss.str();
+}
 
 SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
                                  c10::DispatchKeySet key_set,

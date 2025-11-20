@@ -94,15 +94,17 @@ class SpyreDCI:
         self, size: torch.Size, dtype: torch.dtype
     ) -> list[int | torch.SymInt]:
         cur_stride = 1 if self.format == StickFormat.DENSE else elems_per_stick(dtype)
-        strides = [-1] * len(size)
+        strides: list[int | torch.SymInt] = [-1] * len(size)
         for d in reversed(self.dim_order):
             strides[d] = cur_stride
             cur_stride = cur_stride * size[d]
         return strides
 
-    def spyre_layout(self, device: torch.device, size: torch.Size, dtype: torch.dtype):
+    def spyre_layout(
+        self, device: torch.device, size: torch.Size, dtype: torch.dtype
+    ) -> FixedLayout:
         stride = self.spyre_strides(size, dtype)
-        return SpyreFixedLayout(device, dtype, size, stride, self)
+        return SpyreFixedLayout(device, dtype, list(size), stride, self)
 
 
 class SpyreFixedLayout(FixedLayout):
@@ -155,7 +157,7 @@ def spyre_matmul_result_shape(
 
 
 def spyre_reduction_result_shape(
-    x: torch.Tensor, axis: Union[int, Sequence[int]], keepdims: bool = False
+    x: torch.Tensor, axis: Union[int, list[int]], keepdims: bool = False
 ) -> Tuple[Sequence[int], SpyreDCI]:
     # Normalize axis
     x_size = x.size()
@@ -232,7 +234,7 @@ def spyre_pointwise_result_shape(
         res_format = x_dci.format
     elif x_dci.format == StickFormat.DENSE and y_broadcasted[x_dci.get_stick_dims()[0]]:
         res_format = StickFormat.DENSE
-    elif y_dci.format == StickFormat.DENSE and x_broadcasted(y_dci.get_stick_dims()[0]):
+    elif y_dci.format == StickFormat.DENSE and x_broadcasted[y_dci.get_stick_dims()[0]]:
         res_format = StickFormat.DENSE
     else:
         raise Unsupported(

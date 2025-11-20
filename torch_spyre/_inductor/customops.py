@@ -100,7 +100,7 @@ def _(
 
 
 @torch.library.custom_op("spyre::exx2", mutates_args=(), device_types="spyre")
-def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor:
+def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor:  # type: ignore[empty-body]
     pass
 
 
@@ -114,7 +114,7 @@ def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
 
 
 @torch.library.custom_op("spyre::layernormscale", mutates_args=(), device_types="spyre")
-def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:
+def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:  # type: ignore[empty-body]
     pass
 
 
@@ -131,7 +131,7 @@ def _(x: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 @torch.library.custom_op("spyre::layernormnorm", mutates_args=(), device_types="spyre")
-def layernormnorm(
+def layernormnorm(  # type: ignore[empty-body]
     x: torch.Tensor,
     mean: torch.Tensor,
     norm_mean: torch.Tensor,
