@@ -5,14 +5,14 @@ requires = [
     "cmake>=3.26.1,<4.0.0",
     "expecttest~=0.3.0",
     "hypothesis~=6.148.1",
-    "jinja2",
-    "ninja",
+    "jinja2~=3.1.6",
+    "ninja~=1.13.0",
     "numpy~=2.3.4",
     "pyyaml~=6.0.0", # needed for codegen
-    "regex",
+    "regex~=2025.11.3",
     "setuptools<=75.8.2",
     "torch~=2.7.1",  # Needed to use BuildExtension
-    "wheel"
+    "wheel~=0.45.1"
 ]
 build-backend = "setuptools.build_meta"
 
@@ -24,7 +24,7 @@ authors = [
 description = "PyTorch-Spyre out of tree registration"
 dependencies = [
     "numpy~=2.3.4",
-    "regex",
+    "regex~=2025.11.3",
     "torch~=2.7.1",
     "psutil~=7.1.0"
 ]
@@ -38,25 +38,25 @@ build = [ # no-isolation build
     "cmake>=3.26.1,<4.0.0",
     "expecttest~=0.3.0",
     "hypothesis~=6.148.1",
-    "jinja2",
-    "ninja",
+    "jinja2~=3.1.6",
+    "ninja~=1.13.0",
     "numpy~=2.3.4",
     "pyyaml~=6.0.0", # needed for codegen
-    "regex",
+    "regex~=2025.11.3",
     "setuptools<=75.8.2",
     "torch~=2.7.1",  # Needed to use BuildExtension
-    "wheel"
+    "wheel~=0.45.1"
 ]
 test = [
     "pytest~=9.0.0",
 #    "torch_sendnn", # must be installed manually
-    "transformers"
+    "transformers~=4.57.1"
 ]
 lint = [
     "mypy~=1.13.0",
     "pre-commit~=4.0.1",
-    "types-PyYAML",
-    "uv~=0.9.10"
+    "types-PyYAML~=6.0.12.20250915",
+    "uv~=0.9.10",
 ]
 
 [project.entry-points."torch.backends"]

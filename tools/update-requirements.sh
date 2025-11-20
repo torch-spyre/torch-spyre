@@ -2,9 +2,18 @@
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+cleanup() {
+    rm ${ROOT_DIR}/requirements/constraints.txt || true
+}
+
+trap cleanup EXIT SIGINT SIGTERM
+
 cd ${ROOT_DIR}
 
-uv pip compile pyproject.toml --emit-index-url > requirements/run.txt
-uv pip compile pyproject.toml --emit-index-url --extra lint --no-emit-package torch > requirements/lint.txt
-uv pip compile pyproject.toml --emit-index-url --extra lint --extra build > requirements/build.txt
-uv pip compile pyproject.toml --emit-index-url --extra lint --extra build --extra test > requirements/dev.txt
+cp requirements/dev.txt requirements/constraints.txt
+COMPILE_OPTIONS="--emit-index-url --build-constraints requirements/constraints.txt"
+
+uv pip compile pyproject.toml $COMPILE_OPTIONS > requirements/run.txt
+uv pip compile pyproject.toml $COMPILE_OPTIONS --extra lint --no-emit-package torch > requirements/lint.txt
+uv pip compile pyproject.toml $COMPILE_OPTIONS --extra lint --extra build > requirements/build.txt
+uv pip compile pyproject.toml $COMPILE_OPTIONS --all-extras > requirements/dev.txt

@@ -3,23 +3,30 @@
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NEW_REQUIREMENTS=$(mktemp)
 
+cleanup() {
+    rm ${ROOT_DIR}/requirements/constraints.txt || true
+}
+
+trap cleanup EXIT SIGINT SIGTERM
+
 cd ${ROOT_DIR}
-uv pip compile pyproject.toml --emit-index-url --extra lint --extra build --extra test > "${NEW_REQUIREMENTS}"
+
+cp requirements/dev.txt requirements/constraints.txt
+COMPILE_OPTIONS="--emit-index-url --build-constraints requirements/constraints.txt"
+
+uv pip compile pyproject.toml $COMPILE_OPTIONS --all-extras > "${NEW_REQUIREMENTS}"
 
 if ! diff -q "requirements/dev.txt" "${NEW_REQUIREMENTS}" > /dev/null 2>&1; then
     {
-        echo "⚠️  WARNING: requirements/dev.txt may be out of sync with pyproject.toml"
+        echo "⚠️  WARNING: requirements/dev.txt is out of sync with pyproject.toml"
         echo ""
-        echo "    This could be due to a change in the PR or to a new patch version of a library being available"
-        echo "    This diff shows the potentially missing update:"
+        echo "    This is due to a change in the PR"
+        echo "    This diff shows the missing update:"
         echo ""
         echo "    $(diff requirements/dev.txt ${NEW_REQUIREMENTS})"
         echo ""
-        echo "    If you would like to update requirements/dev.txt, run:"
+        echo "    To update the requirement files, run:"
         echo "    ./tools/update-requirements.sh"
-        echo ""
-        echo "    If version change is not related to this PR and you prefer to skip the update for now,"
-        echo "    please pin the full package version (including patch version) in the pyproject.toml."
         echo ""
     } >&2
     exit 1
