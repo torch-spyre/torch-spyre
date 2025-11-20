@@ -71,6 +71,11 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
+    def test_copy_4d_padded(self):
+        x = torch.rand(2, 2, 2, 3, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
     def test_copy_1d(self):
         x = torch.rand(256, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
@@ -83,6 +88,11 @@ class TestOps(TestCase):
 
     def test_copy_3d(self):
         x = torch.rand(256, 128, 512, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_4d(self):
+        x = torch.rand(2, 6, 3, 128, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 

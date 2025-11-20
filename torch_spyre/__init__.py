@@ -17,6 +17,7 @@ import threading
 import types
 import importlib
 from .constants import DEVICE_NAME
+from ._monkey_patch import _patch_tensor_for_spyre
 
 _runtime_init_lock = threading.Lock()
 
@@ -143,6 +144,9 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+
+    # Run patch on import
+    _patch_tensor_for_spyre()
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
