@@ -15,7 +15,6 @@
 # Owner(s): ["module: cpp"]
 
 import os
-import regex as re
 import unittest
 import psutil
 
@@ -61,6 +60,40 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(1.0).all())
 
+    def test_str(self):
+        a = torch.tensor([1, 2], dtype=torch.float16).to("spyre")
+        a_repr = str(a)
+        import regex as re
+
+        def normalize_device(s):
+            return re.sub(r"(device='spyre):\d+'", r"\1:0'", s)
+
+        a_repr = normalize_device(a_repr)
+
+        # Check the the print includes all elements and Spyre device
+        expected_a_repr = "tensor([1., 2.], dtype=torch.float16, device='spyre:0')"
+        self.assertEqual(expected_a_repr, a_repr)
+
+    def test_repr(self):
+        a = torch.tensor([1.234242424234, 2], dtype=torch.float16).to("spyre")
+        try:
+            a_repr = f"{a}"
+        except RuntimeError as re:
+            self.fail(f"Printing tensor failed with runtime error {re}")
+
+        import regex as re
+
+        def normalize_device(s):
+            return re.sub(r"(device='spyre):\d+'", r"\1:0'", s)
+
+        a_repr = normalize_device(a_repr)
+
+        # Check the the print includes all elements and Spyre device
+        expected_a_repr = (
+            "tensor([1.2344, 2.0000], dtype=torch.float16, device='spyre:0')"
+        )
+        self.assertEqual(expected_a_repr, a_repr)
+
     def test_printing(self):
         t = torch.ones((2, 3), device="spyre", dtype=torch.float16)
 
@@ -71,21 +104,6 @@ class TestSpyre(TestCase):
         except NotImplementedError as e:
             print("Printing failed:", e)
             assert False, "Spyre backend should support tensor printing"
-
-        a = torch.tensor([1, 2], dtype=torch.float16).to("spyre")
-        try:
-            a_repr = f"{a}"
-        except RuntimeError as re:
-            self.fail(f"Printing tensor failed with runtime error {re}")
-
-        def normalize_device(s):
-            return re.sub(r"(device='spyre):\d+'", r"\1:0'", s)
-
-        a_repr = normalize_device(a_repr)
-
-        # Check the the print includes all elements and Spyre device
-        expected_a_repr = "tensor([1., 2.], dtype=torch.float16, device='spyre:0')"
-        self.assertEqual(expected_a_repr, a_repr)
 
     def test_cross_device_copy(self):
         a = torch.rand(10, dtype=torch.float16)

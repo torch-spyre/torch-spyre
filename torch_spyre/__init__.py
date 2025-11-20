@@ -17,6 +17,7 @@ import threading
 import types
 import importlib
 from .constants import DEVICE_NAME
+from ._monkey_patch import _patch_tensor_for_spyre
 
 _runtime_init_lock = threading.Lock()
 
@@ -136,41 +137,6 @@ def make_spyre_module() -> types.ModuleType:
     return mod
 
 
-def _patch_tensor_repr_for_spyre():
-    import torch
-
-    if getattr(torch.Tensor, "_spyre_repr_patched", False):
-        return
-
-    orig_repr = torch.Tensor.__repr__
-
-    def spyre_aware_repr(self):
-        dev = getattr(self, "device", None)
-        if dev is not None and dev.type == "spyre":
-            try:
-                s = orig_repr(self.to("cpu"))
-            except Exception:
-                # Fallback if .to("cpu") fails for some weird reason
-                return (
-                    f"SpyreTensor(shape={tuple(self.shape)}, "
-                    f"dtype={self.dtype}, device={self.device})"
-                )
-            if "device=" in s:
-                return s.replace("device='cpu'", f"device='{self.device}'")
-            if s.endswith(")"):
-                s = s[:-1] + f", device='{self.device}')"
-            else:
-                # Odd case: just append device info
-                s = s + f" (device='{self.device}')"
-            return s
-
-        # Non-spyre tensors use normal behavior
-        return orig_repr(self)
-
-    torch.Tensor.__repr__ = spyre_aware_repr
-    torch.Tensor._spyre_repr_patched = True
-
-
 def _autoload():
     # guard if autoload may run more than once
     if getattr(_autoload, "_ran", False):
@@ -180,7 +146,7 @@ def _autoload():
     import torch  # noqa: E402
 
     # Run patch on import
-    _patch_tensor_repr_for_spyre()
+    _patch_tensor_for_spyre()
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
