@@ -56,17 +56,17 @@ class TestOps(TestCase):
         x_expected = torch.tensor([5.0, 5.0, 5.0], dtype=self.dtype)
         torch.testing.assert_close(x_expected, x_actual, rtol=self.rtol, atol=self.atol)
 
-    def test_copy_1d_padded(self):
+    def test_copy_1d_padded_to_stick(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    def test_copy_2d_padded(self):
+    def test_copy_2d_padded_to_stick(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    def test_copy_3d_padded(self):
+    def test_copy_3d_padded_to_stick(self):
         x = torch.tensor(
             [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
             dtype=self.dtype,
@@ -74,8 +74,28 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    def test_copy_4d_padded(self):
+    def test_copy_4d_padded_to_stick(self):
         x = torch.rand(2, 2, 2, 3, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_4d_padded(self):
+        x = torch.rand(2, 2, 2, 120, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_3d_padded(self):
+        x = torch.rand(2, 2, 72, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_2d_padded(self):
+        x = torch.rand(2, 205, dtype=self.dtype)
+        y = x.to("spyre").to("cpu")
+        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
+
+    def test_copy_1d_padded(self):
+        x = torch.rand(511, dtype=self.dtype)
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
