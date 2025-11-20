@@ -201,4 +201,6 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
                     std::vector<int32_t>, int32_t,
                     spyre::SpyreTensorLayout::StickFormat>());
+
+  m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
 }

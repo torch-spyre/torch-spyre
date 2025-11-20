@@ -595,6 +595,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
+<<<<<<< HEAD
   auto stl = SpyreTensorLayout(size.vec(), scalar_type);
   constexpr auto bytesPerStick = 128;
   size_t size_bytes;
@@ -609,6 +610,14 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
     for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
       size_bytes *= *it;
     }
+=======
+  auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
+  int stick_size = 64;  // 128 / word size
+  auto dev_sizes = get_device_shape(size, stick_size);
+  size_t size_bytes = 128;  // stick-size
+  for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
+    size_bytes *= *it;
+>>>>>>> b18143e (add python API to get SpyreTensorLayout from torch.tensor)
   }
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
@@ -623,20 +632,20 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, dtype);
 
+  auto tensorImpl = tensor.unsafeGetTensorImpl();
   if (size.size() == 0) {
     std::vector<int64_t> one = {1};
     c10::IntArrayRef tmp_size(one);
     c10::IntArrayRef tmp_stride(one);
     DEBUGINFO("device shape: ", get_device_shape(tmp_size, stick_size));
     DEBUGINFO("bytes on spyre: ", size_bytes);
-    tensor.unsafeGetTensorImpl()->set_sizes_and_strides(tmp_size, tmp_stride);
+    tensorImpl->set_sizes_and_strides(tmp_size, tmp_stride);
   } else {
     DEBUGINFO("device shape: ", get_device_shape(size, stick_size));
     DEBUGINFO("bytes on spyre: ", size_bytes);
-    tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride);
+    tensorImpl->set_sizes_and_strides(size, stride);
   }
-  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
-      stl;
+  static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
 
   return tensor;
 }
