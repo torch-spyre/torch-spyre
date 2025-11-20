@@ -46,6 +46,9 @@ class SpyreTensorLayout {
   int32_t num_stick_dims;
   StickFormat format;
 
+  SpyreTensorLayout() = default;
+  ~SpyreTensorLayout() = default;
+
   /**
    * Construct a SpyreTensorLayout in generic stick format for the argument
    * host_size. Generic stick format is row major with a single dense stick
@@ -93,13 +96,15 @@ class SpyreTensorLayout {
 };
 
 /**
- * An SpyreTensorImpl has extra information needed for Spyre tensors,
- * like what sticks are there.
+ * A SpyreTensorImpl extends TensorImpl by adding a SpyreTensorLayout
+ * that encapsulates the on-device layout of the Tensor.
  */
 class SpyreTensorImpl : public at::TensorImpl {
  public:
   SpyreTensorImpl() = delete;
   ~SpyreTensorImpl() = default;
+
+  SpyreTensorLayout spyre_layout;
 
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
