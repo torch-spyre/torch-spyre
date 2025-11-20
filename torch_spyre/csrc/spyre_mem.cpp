@@ -595,6 +595,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
+  auto stl = SpyreTensorLayout(size.vec(), scalar_type);
   constexpr auto bytesPerStick = 128;
   size_t size_bytes;
   size_t dev_elementsize_in_bytes = c10::elementSize(scalar_type);
@@ -634,6 +635,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
     DEBUGINFO("bytes on spyre: ", size_bytes);
     tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride);
   }
+  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
+      stl;
 
   return tensor;
 }
