@@ -80,7 +80,7 @@ typing-extensions==4.15.0
     # via
     #   mypy
     #   torch
-uv==0.9.10
+uv==0.9.11
     # via torch-spyre (pyproject.toml)
 virtualenv==20.35.4
     # via pre-commit

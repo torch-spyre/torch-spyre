@@ -134,7 +134,7 @@ typing-extensions==4.15.0
     #   torch
 urllib3==2.5.0
     # via requests
-uv==0.9.10
+uv==0.9.11
     # via torch-spyre (pyproject.toml)
 virtualenv==20.35.4
     # via pre-commit
