@@ -15,6 +15,7 @@
 MATMUL_REDUCTION_OP = "matmul"
 TRANSPOSE_OP = "transpose"
 DEVICE_NAME = "spyre"
+BYTES_PER_STICK = 128
 
 SEGMENT_OFFSETS = [
     0x0,

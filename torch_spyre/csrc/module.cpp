@@ -16,7 +16,10 @@
 
 #include "module.h"
 
+#include <c10/core/ScalarType.h>
 #include <pybind11/pybind11.h>
+#include <util/sen_data_convert.h>
+#include <util/sendefs.h>
 
 #include <flex/flex_factory.hpp>
 #include <memory>
@@ -34,6 +37,7 @@
 #include "logging.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
+#include "types_mapping.h"
 
 namespace spyre {
 
@@ -168,7 +172,24 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
 
   return;
 }
+auto getSenDataFormat(c10::ScalarType torch_dtype) {
+  const auto [dtype_cpu, dtype_dev] =
+      stringToDTDataFormatPair(torchScalarToString[torch_dtype]);
+  return EnumsConversion::dataFormatsToString(dtype_dev);
+}
+auto encodeConstant(uint32_t torch_const, const std::string &data_format) {
+  uint32_t sen_const;
+  DataFormats df;
+  df = FromString<DataFormats>(data_format);
 
+  if (df == DataFormats::IEEE_FP32) {
+    sen_const =
+        deeptools::BinaryConvert<uint32_t>(static_cast<float>(torch_const));
+  } else {
+    sen_const = deeptools::FloatToFp16Bin(torch_const);
+  }
+  return sen_const;
+}
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -176,6 +197,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
+  m.def("encode_constant", &spyre::encodeConstant);
+  m.def("get_sen_data_format", &spyre::getSenDataFormat);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 

@@ -55,12 +55,20 @@ class SpyreAsyncCompile:
                 raise RuntimeError("TOOO: implement SDSC generation for constants")
             elif ts.is_input:
                 inputs.append(
-                    {"name": _argument_names[index], "scale": ks.scales[index]}
+                    {
+                        "name": _argument_names[index],
+                        "scale": ks.scales[index],
+                        "dtype": ts.dtype,
+                    }
                 )
                 arg_mapping.append(ts.arg_index)
             else:
                 outputs.append(
-                    {"name": _argument_names[index], "scale": ks.scales[index]}
+                    {
+                        "name": _argument_names[index],
+                        "scale": ks.scales[index],
+                        "dtype": ts.dtype,
+                    }
                 )
                 arg_mapping.append(ts.arg_index)
         kernel_descriptor = {
