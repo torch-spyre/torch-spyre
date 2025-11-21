@@ -42,9 +42,10 @@ class TestOps(TestCase):
         self.atol = 1e-1
         self.dtype = torch.float16
 
-        self.mm_a = 3
-        self.mm_b = 5
-        self.mm_c = 7
+        self.mm_a = 67
+        self.mm_b = 256
+        self.mm_c = 128
+        torch.random.manual_seed(42)
 
     def test_inplace_fill_scalar(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype, device="spyre")
@@ -263,10 +264,10 @@ class TestOps(TestCase):
         torch.testing.assert_close(z, torch.mul(x, y), rtol=self.rtol, atol=self.atol)
 
     def test_mm_ab_bc(self):
-        x = torch.arange(self.mm_a * self.mm_b, dtype=self.dtype).view(
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_a, self.mm_b
         )
-        y = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_b, self.mm_c
         )
         x_spyre = x.to("spyre")

@@ -58,6 +58,7 @@ class _SpyreImpl:
             # put any light, once-per-process setup here
             self._C = importlib.import_module("torch_spyre._C")
             # this will create the allocator
+
             self._C.start_runtime()
             self._initialized = True
 
@@ -151,6 +152,8 @@ def _autoload():
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
+
+    import torch_spyre.ops  # noqa: E402
 
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging

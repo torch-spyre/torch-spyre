@@ -209,248 +209,6 @@ void matmul_input_assignment(
                                 ->owner;
 }
 
-// TODO(filhan): Even though codegen generated version should work,
-// this manually implemented version handles more failure cases.
-at::Tensor spyre__mm_default(const at::Tensor &self, const at::Tensor &mat2) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat2.device());
-
-  bool transpose_flag = (self.sizes()[0] > self.sizes()[1]) &&
-                        (mat2.sizes()[0] > mat2.sizes()[1]);
-  auto out_shape_stride =
-      getOutputShapeStrideForMatmul(self.sizes(), mat2.sizes(), transpose_flag);
-  auto result = spyre_empty_strided(
-      out_shape_stride.first, out_shape_stride.second, self.scalar_type(),
-      self.layout(), self.device(), self.is_pinned());
-
-  std::string graph_label = "Mm";
-  graph_label += "__" + std::to_string(false);
-  graph_label += "__" + std::to_string(false);
-
-  DEBUGINFO("Operating on graph with label: ", graph_label);
-
-  // create a dummy graph builder operation to produce the right size
-  std::optional<sendnn::GraphLoader> opt_gl = spyre::getCachedGraphLoader(
-      graph_label, result.sizes(), result.strides());
-
-  sendnn::ConstTensor mat2_input_sendnn_tensor;
-  sendnn::GraphLoader gl;
-  if (opt_gl.has_value()) {
-    gl = opt_gl.value();
-    mat2_input_sendnn_tensor =
-        createInputTensor(gl, mat2.storage().data_ptr().get(), 1, 2);
-  } else {
-    sendnn::GraphBuilder gb;
-
-    sendnn::TensorInfo ti_1 = getTensorInfo(self);
-    auto inp_1 = gb.PrimaryInput("Input1", ti_1);
-    sendnn::TensorInfo ti_2 = getTensorInfo(mat2);
-    auto inp_2 = gb.PrimaryInput("Input2", ti_2);
-    auto inp_3 = transpose_flag;
-    auto inp_4 = transpose_flag;
-
-    sendnn::TensorInfo ti = getTensorInfo(result);
-
-    if (transpose_flag) {
-      auto r = gb.MatMul("Mm", ti, inp_2, inp_1, inp_3, inp_4);
-      gb.PrimaryOutput("Output", r);
-    } else {
-      auto r = gb.MatMul("Mm", ti, inp_1, inp_2, inp_3, inp_4);
-      gb.PrimaryOutput("Output", r);
-    }
-
-    gl = prepareGraphLoader(&gb);
-    gl = parseGraphLoader(gl);
-    mat2_input_sendnn_tensor =
-        createInputTensor(gl, mat2.storage().data_ptr().get(), 1, 2);
-    auto predict_s =
-        gl.Predict(sendnn::Outputs(), {mat2_input_sendnn_tensor}, 1);
-    storeCachedGraphLoader(graph_label, result.sizes(), result.strides(), gl);
-  }
-
-  std::vector<flex::DeviceMemoryAllocationPtr> eagerInputs(2, nullptr);
-  matmul_input_assignment(self, eagerInputs, 0, transpose_flag);
-  matmul_input_assignment(mat2, eagerInputs, 1, transpose_flag);
-  sendnn::ConstTensor self_input_sendnn_tensor =
-      createInputTensor(gl, self.storage().data_ptr().get(), 0, 2);
-
-  self_input_sendnn_tensor.SetSpyreData(eagerInputs[0]);
-  mat2_input_sendnn_tensor.SetSpyreData(eagerInputs[1]);
-  auto output_sendnn_tensor =
-      createOutputTensor(gl, result.storage().data_ptr().get(), 0, 2);
-  output_sendnn_tensor.SetSpyreData(
-      static_cast<SharedOwnerCtx *>(result.storage().data_ptr().get_context())
-          ->owner);
-
-  auto copy_status =
-      gl.Compute({output_sendnn_tensor},
-                 {self_input_sendnn_tensor, mat2_input_sendnn_tensor}, 2);
-
-  // Will result in copy if result is SpyreTensor
-  if (transpose_flag) result = at::transpose(result, 0, 1);
-
-  return result;
-}
-
-// TODO(filhan): Even though codegen generated version should work,
-// this manually implemented version handles more failure cases.
-at::Tensor spyre__bmm_default(const at::Tensor &self, const at::Tensor &mat2) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat2.device());
-
-  bool transpose_flag = (self.sizes()[1] > self.sizes()[2]) &&
-                        (mat2.sizes()[1] > mat2.sizes()[2]);
-  auto out_shape_stride =
-      getOutputShapeStrideForMatmul(self.sizes(), mat2.sizes(), transpose_flag);
-  auto result = spyre_empty_strided(
-      out_shape_stride.first, out_shape_stride.second, self.scalar_type(),
-      self.layout(), self.device(), self.is_pinned());
-
-  std::string graph_label = "Bmm";
-  graph_label += "__" + std::to_string(false);
-  graph_label += "__" + std::to_string(false);
-
-  DEBUGINFO("Operating on graph with label: ", graph_label);
-
-  // create a dummy graph builder operation to produce the right size
-  std::optional<sendnn::GraphLoader> opt_gl = spyre::getCachedGraphLoader(
-      graph_label, result.sizes(), result.strides());
-
-  sendnn::ConstTensor mat2_input_sendnn_tensor;
-  sendnn::GraphLoader gl;
-  if (opt_gl.has_value()) {
-    gl = opt_gl.value();
-    mat2_input_sendnn_tensor =
-        createInputTensor(gl, mat2.storage().data_ptr().get(), 1, 2);
-  } else {
-    sendnn::GraphBuilder gb;
-
-    sendnn::TensorInfo ti_1 = getTensorInfo(self);
-    auto inp_1 = gb.PrimaryInput("Input1", ti_1);
-    sendnn::TensorInfo ti_2 = getTensorInfo(mat2);
-    auto inp_2 = gb.PrimaryInput("Input2", ti_2);
-    auto inp_3 = transpose_flag;
-    auto inp_4 = transpose_flag;
-
-    sendnn::TensorInfo ti = getTensorInfo(result);
-
-    if (transpose_flag) {
-      auto r = gb.BatchMatMul("Bmm", ti, inp_2, inp_1, inp_3, inp_4);
-      gb.PrimaryOutput("Output", r);
-    } else {
-      auto r = gb.BatchMatMul("Bmm", ti, inp_1, inp_2, inp_3, inp_4);
-      gb.PrimaryOutput("Output", r);
-    }
-
-    gl = prepareGraphLoader(&gb);
-    gl = parseGraphLoader(gl);
-    mat2_input_sendnn_tensor =
-        createInputTensor(gl, mat2.storage().data_ptr().get(), 1, 2);
-    auto predict_s =
-        gl.Predict(sendnn::Outputs(), {mat2_input_sendnn_tensor}, 1);
-    storeCachedGraphLoader(graph_label, result.sizes(), result.strides(), gl);
-  }
-
-  std::vector<flex::DeviceMemoryAllocationPtr> eagerInputs(2, nullptr);
-  matmul_input_assignment(self, eagerInputs, 0, transpose_flag);
-  matmul_input_assignment(mat2, eagerInputs, 1, transpose_flag);
-  sendnn::ConstTensor self_input_sendnn_tensor =
-      createInputTensor(gl, self.storage().data_ptr().get(), 0, 2);
-
-  self_input_sendnn_tensor.SetSpyreData(eagerInputs[0]);
-  mat2_input_sendnn_tensor.SetSpyreData(eagerInputs[1]);
-
-  auto output_sendnn_tensor =
-      createOutputTensor(gl, result.storage().data_ptr().get(), 0, 2);
-  output_sendnn_tensor.SetSpyreData(
-      static_cast<SharedOwnerCtx *>(result.storage().data_ptr().get_context())
-          ->owner);
-
-  auto copy_status =
-      gl.Compute({output_sendnn_tensor},
-                 {self_input_sendnn_tensor, mat2_input_sendnn_tensor}, 2);
-
-  if (transpose_flag)
-    result = at::transpose(result, result.dim() - 2, result.dim() - 1);
-
-  return result;
-}
-
-// TODO(filhan): Even though codegen generated version should work, throws
-// DummyOp error. Decomposed for now.
-at::Tensor &spyre__addmm_out(const at::Tensor &self, const at::Tensor &mat1,
-                             const at::Tensor &mat2, const at::Scalar &beta,
-                             const at::Scalar &alpha, at::Tensor &out) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat1.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat2.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == out.device());
-
-  at::Tensor mm_result = spyre__mm_default(mat1, mat2);
-  out = spyre__add_Tensor(mm_result, self, alpha);  // add does not use alpha
-  return out;
-}
-
-at::Tensor &spyre__fill_Scalar(at::Tensor &self, const at::Scalar &other) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  at::Tensor tmp = (at::ones(self.sizes(), self.dtype()) * other);
-  self = spyre::spyre_copy_from(tmp, self, false);
-  return self;
-}
-
-TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
-  m.impl("fill_.Scalar", TORCH_FN(spyre__fill_Scalar));
-}
-// fill_.Scalar
-
-// TODO(filhan): Even though codegen generated version should work, throws
-// DummyOp error. Decomposed for now.
-at::Tensor spyre__addmm_default(const at::Tensor &self, const at::Tensor &mat1,
-                                const at::Tensor &mat2, const at::Scalar &beta,
-                                const at::Scalar &alpha) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat1.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat2.device());
-
-  at::Tensor mm_result = spyre__mm_default(mat1, mat2);
-  at::Tensor result =
-      spyre__add_Tensor(mm_result, self, alpha);  // add does not use alpha
-  return result;
-}
-
-// TODO(filhan): Even though codegen generated version should work, throws
-// DummyOp error. Decomposed for now.
-at::Tensor spyre__addmm_dtype(const at::Tensor &self, const at::Tensor &mat1,
-                              const at::Tensor &mat2, at::ScalarType out_dtype,
-                              const at::Scalar &beta, const at::Scalar &alpha) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat1.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat2.device());
-
-  at::Tensor mm_result = spyre__mm_default(mat1, mat2);
-  at::Tensor result =
-      spyre__add_Tensor(mm_result, self, alpha);  // add does not use alpha
-  return result;
-}
-
-// TODO(filhan): Even though codegen generated version should work, throws
-// DummyOp error. Decomposed for now.
-at::Tensor &spyre__addmm_dtype_out(const at::Tensor &self,
-                                   const at::Tensor &mat1,
-                                   const at::Tensor &mat2,
-                                   at::ScalarType out_dtype,
-                                   const at::Scalar &beta,
-                                   const at::Scalar &alpha, at::Tensor &out) {
-  DEBUGINFO("Tensor is on: ", self.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat1.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == mat2.device());
-  // TORCH_INTERNAL_ASSERT(self.device() == out.device());
-
-  at::Tensor mm_result = spyre__mm_default(mat1, mat2);
-  out = spyre__add_Tensor(mm_result, self, alpha);  // add does not use alpha
-  return out;
-}
-
 // TODO(filhan): Even though codegen generated version should work, throws
 // DummyOp error. Decomposed for now.
 at::Tensor spyre__mean_dim(const at::Tensor &self, at::OptionalIntArrayRef dim,
@@ -582,22 +340,24 @@ at::Tensor spyre__clone_default(
   return result;
 }
 
+at::Tensor &spyre__fill_Scalar(at::Tensor &self, const at::Scalar &other) {
+  DEBUGINFO("Tensor is on: ", self.device());
+  at::Tensor tmp = (at::ones(self.sizes(), self.dtype()) * other);
+  self = spyre::spyre_copy_from(tmp, self, false);
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(spyre__view));
   m.impl("_local_scalar_dense", TORCH_FN(spyre___local_scalar_dense));
   m.impl("native_dropout", TORCH_FN(spyre__native_dropout_default));
   m.impl("native_layer_norm", TORCH_FN(spyre__native_layer_norm_default));
-  m.impl("mm", TORCH_FN(spyre__mm_default));
-  m.impl("bmm", TORCH_FN(spyre__bmm_default));
-  m.impl("addmm.dtype_out", TORCH_FN(spyre__addmm_dtype_out));
-  m.impl("addmm.dtype", TORCH_FN(spyre__addmm_dtype));
-  m.impl("addmm", TORCH_FN(spyre__addmm_default));
-  m.impl("addmm.out", TORCH_FN(spyre__addmm_out));
   m.impl("mean.dim", TORCH_FN(spyre__mean_dim));
   m.impl("mean.out", TORCH_FN(spyre__mean_out));
   m.impl("ne.Scalar_out", TORCH_FN(spyre__ne_Scalar_out));
   m.impl("cumsum", TORCH_FN(spyre__cumsum_default));
   m.impl("clone", TORCH_FN(spyre__clone_default));
+  m.impl("fill_.Scalar", TORCH_FN(spyre__fill_Scalar));
 }
 
 }  // namespace
