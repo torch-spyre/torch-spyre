@@ -93,6 +93,22 @@ class TestSpyreTensorLayout(TestCase):
             'SpyreTensorLayout(device_size=[4, 512, 64], device_strides=[32768, 64, 1], dim_map =[1, 0, 1], num_stick_dims=1, format="Dense")',
         )
 
+    def test_device_alloc(self):
+        x = torch.rand([512, 256], dtype=torch.float16).to("spyre")
+        stl = x.device_tensor_layout()
+        self.assertEqual(stl.device_size, [4, 512, 64])
+        self.assertEqual(stl.device_strides, [32768, 64, 1])
+        self.assertEqual(stl.dim_map, [1, 0, 1])
+        self.assertEqual(stl.format, SpyreTensorLayout.StickFormat.Dense)
+        self.assertEqual(stl.num_stick_dims, 1)
+
+    def test_equality(self):
+        x = SpyreTensorLayout([512, 256], torch.float16)
+        y = SpyreTensorLayout([512, 256], torch.float16, [0, 1])
+        z = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
+        self.assertEqual(x, y)
+        self.assertNotEqual(y, z)
+
 
 if __name__ == "__main__":
     run_tests()

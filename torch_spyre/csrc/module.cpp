@@ -16,6 +16,7 @@
 
 #include "module.h"
 
+#include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 
 #include <flex/flex_factory.hpp>
@@ -193,6 +194,7 @@ PYBIND11_MODULE(_C, m) {
       .def_readwrite("format", &spyre::SpyreTensorLayout::format)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>())
       .def(py::init<std::vector<int64_t>, c10::ScalarType, std::vector<int32_t>,
                     spyre::SpyreTensorLayout::StickFormat>(),
@@ -201,4 +203,6 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
                     std::vector<int32_t>, int32_t,
                     spyre::SpyreTensorLayout::StickFormat>());
+
+  m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
 }
