@@ -70,6 +70,7 @@ def _initialize_opfunc_mapping():
     pointwise_ops["eq"] = "equal"
     pointwise_ops["ge"] = "greaterequal"
     pointwise_ops["where"] = "where3"
+    pointwise_ops["le"] = "lesserequal"
 
     return pointwise_ops | reductions
 

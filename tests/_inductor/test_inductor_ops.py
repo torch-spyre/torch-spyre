@@ -231,6 +231,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256,)),
                     cached_randn((256,)),
                 ),
+                "le": (
+                    lambda x, y: x <= y,
+                    cached_randn((256,)),
+                    cached_randn((256,)),
+                ),
             }
         },
     }
