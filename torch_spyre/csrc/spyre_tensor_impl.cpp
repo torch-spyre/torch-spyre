@@ -40,6 +40,19 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order,
                              StickFormat format) {
+  if (host_size.size() == 0) {
+    // Degenerate case of 0-dimension tensor (ie, a scalar)
+    this->device_size.resize(1);
+    this->device_strides.resize(1);
+    this->dim_map.resize(1);
+    this->format = Sparse;
+    this->num_stick_dims = 1;
+    this->device_size[0] = 1;
+    this->device_strides[0] = 1;
+    this->dim_map[0] = -1;  // host_size has no entries!
+    return;
+  }
+
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + 1;
   auto elem_bytes = c10::elementSize(dtype);
