@@ -262,11 +262,11 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             args = []
             scales = []
             for input in self.compute_inputs:
-                scale = self.analyze_tensor_access(di, input.index)
+                scale = self.analyze_tensor_access(di, input.index)  # type: ignore[union-attr]
                 args.append(
                     TensorArg(
                         True,
-                        actuals.index(input.name),
+                        actuals.index(input.name),  # type: ignore[union-attr]
                         input.dtype,
                     )
                 )
