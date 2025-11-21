@@ -14,36 +14,16 @@
 
 import math
 import os
+from torch_spyre._C import encode_constant, get_sen_data_format
+from torch_spyre._inductor.constants import BYTES_PER_STICK
 
-
-def encode_constant(v):
-    """
-    TODO: This is a stub implmentation to enable development work for layernorm.
-          This function really belongs in torch-spyre by wrapping the native deeptools::FloatToFp16Bin
-    """
-    if isinstance(v, float):
-        if v == 0.00390625:
-            return 11776
-        elif v == 0:
-            return 0
-        elif v == 1e-5:
-            return 7327
-        elif v == 0.000347222222222222:
-            return 9944
-        else:
-            print(f"WARNING: finish hacky constant encoding function! {v}")
-            return 1
-    elif isinstance(v, bool):
-        return 1 if v else 0
-
-
-def generate_constant_info(**kwargs):
+def generate_constant_info(data_format, **kwargs):
     if "op_info" not in kwargs or "constants" not in kwargs["op_info"]:
         return "{}"
     constant_info = {}
     for name, value in kwargs["op_info"]["constants"].items():
         ci = {
-            "dataFormat_": "SEN169_FP16",
+            "dataFormat_": data_format,
             "name_": name,
             "data_": {
                 "dim_prop_func": [{"Const": {}}, {"Const": {}}, {"Map": {}}],
@@ -52,7 +32,7 @@ def generate_constant_info(**kwargs):
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encode_constant(value)]},
+                "data_": {"[0, 0, 0]": [encode_constant(value, data_format)]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -61,6 +41,8 @@ def generate_constant_info(**kwargs):
 
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
+
+    data_format = get_sen_data_format(inputs[0]["dtype"])
 
     # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
     cores = int(os.getenv("SENCORES", "1"))
@@ -131,7 +113,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 + ["out"]
                                 + (["x"] if d3 else []),
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [64],
+                                "stickSize_": [
+                                    BYTES_PER_STICK // inputs[0]["dtype"].itemsize
+                                ],
                             }
                         },
                         "scheduleTree_": [
@@ -194,7 +178,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                     },
                                                     {
                                                         "Affine": {
-                                                            "alpha_": 64,
+                                                            "alpha_": BYTES_PER_STICK
+                                                            // tensor["dtype"].itemsize,
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -220,12 +205,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                     },
                                                     {
                                                         "factor_": dimensions[-1]
-                                                        // 64
+                                                        // (
+                                                            BYTES_PER_STICK
+                                                            // tensor["dtype"].itemsize
+                                                        )
                                                         // cores,
                                                         "label_": "elem_arr_1",
                                                     },
                                                     {
-                                                        "factor_": 64,
+                                                        "factor_": BYTES_PER_STICK
+                                                        // tensor["dtype"].itemsize,
                                                         "label_": "elem_arr_0",
                                                     },
                                                 ],
@@ -357,8 +346,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     else []
                                 )
                                 + tensor["scale"][1:-1],
-                                "wordLength": 2,
-                                "dataFormat_": "SEN169_FP16",
+                                "wordLength": tensor["dtype"].itemsize,
+                                "dataFormat_": get_sen_data_format(tensor["dtype"]),
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
@@ -366,13 +355,13 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                             }
                             for i, tensor in enumerate(tensors)
                         ],
-                        "constantInfo_": generate_constant_info(**kwargs),
+                        "constantInfo_": generate_constant_info(data_format, **kwargs),
                         "computeOp_": [
                             {
                                 "exUnit": "sfp",
                                 "opFuncName": op,
                                 "attributes_": {
-                                    "dataFormat_": "SEN169_FP16",
+                                    "dataFormat_": data_format,
                                     "fidelity_": "regular",
                                 },
                                 "location": "Inner",
@@ -444,17 +433,23 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             "INPUT": {
                                 "layoutDimOrder_": ["mb", "in"],
                                 "stickDimOrder_": ["in"],
-                                "stickSize_": [64],
+                                "stickSize_": [
+                                    BYTES_PER_STICK // inputs[0]["dtype"].itemsize
+                                ],
                             },
                             "OUTPUT": {
                                 "layoutDimOrder_": ["mb", "out"],
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [64],
+                                "stickSize_": [
+                                    BYTES_PER_STICK // outputs[0]["dtype"].itemsize
+                                ],
                             },
                             "KERNEL": {
                                 "layoutDimOrder_": ["in", "out"],
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [64],
+                                "stickSize_": [
+                                    BYTES_PER_STICK // inputs[1]["dtype"].itemsize
+                                ],
                             },
                         },
                         "scheduleTree_": [
@@ -510,8 +505,20 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                     },
                                                     {
                                                         "Affine": {
-                                                            "alpha_": 64
-                                                            if size % 64 == 0
+                                                            "alpha_": (
+                                                                BYTES_PER_STICK
+                                                                // inputs[0][
+                                                                    "dtype"
+                                                                ].itemsize
+                                                            )
+                                                            if size
+                                                            % (
+                                                                BYTES_PER_STICK
+                                                                // inputs[0][
+                                                                    "dtype"
+                                                                ].itemsize
+                                                            )
+                                                            == 0
                                                             else 1,
                                                             "beta_": 0,
                                                         }
@@ -537,14 +544,39 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size // 64
-                                                        if size % 64 == 0
+                                                        "factor_": size
+                                                        // (
+                                                            BYTES_PER_STICK
+                                                            // inputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        if size
+                                                        % (
+                                                            BYTES_PER_STICK
+                                                            // inputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        == 0
                                                         else size,
                                                         "label_": "elem_arr_1",
                                                     },
                                                     {
-                                                        "factor_": 64
-                                                        if size % 64 == 0
+                                                        "factor_": (
+                                                            BYTES_PER_STICK
+                                                            // inputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        if size
+                                                        % (
+                                                            BYTES_PER_STICK
+                                                            // inputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        == 0
                                                         else 1,
                                                         "label_": "elem_arr_0",
                                                     },
@@ -611,8 +643,20 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                     },
                                                     {
                                                         "Affine": {
-                                                            "alpha_": 64
-                                                            if size % 64 == 0
+                                                            "alpha_": (
+                                                                BYTES_PER_STICK
+                                                                // inputs[1][
+                                                                    "dtype"
+                                                                ].itemsize
+                                                            )
+                                                            if size
+                                                            % (
+                                                                BYTES_PER_STICK
+                                                                // inputs[1][
+                                                                    "dtype"
+                                                                ].itemsize
+                                                            )
+                                                            == 0
                                                             else 1,
                                                             "beta_": 0,
                                                         }
@@ -638,14 +682,39 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size // 64
-                                                        if size % 64 == 0
+                                                        "factor_": size
+                                                        // (
+                                                            BYTES_PER_STICK
+                                                            // inputs[1][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        if size
+                                                        % (
+                                                            BYTES_PER_STICK
+                                                            // inputs[1][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        == 0
                                                         else size,
                                                         "label_": "elem_arr_1",
                                                     },
                                                     {
-                                                        "factor_": 64
-                                                        if size % 64 == 0
+                                                        "factor_": (
+                                                            BYTES_PER_STICK
+                                                            // inputs[1][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        if size
+                                                        % (
+                                                            BYTES_PER_STICK
+                                                            // inputs[1][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        == 0
                                                         else 1,
                                                         "label_": "elem_arr_0",
                                                     },
@@ -712,8 +781,20 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                     },
                                                     {
                                                         "Affine": {
-                                                            "alpha_": 64
-                                                            if size % 64 == 0
+                                                            "alpha_": (
+                                                                BYTES_PER_STICK
+                                                                // outputs[0][
+                                                                    "dtype"
+                                                                ].itemsize
+                                                            )
+                                                            if size
+                                                            % (
+                                                                BYTES_PER_STICK
+                                                                // outputs[0][
+                                                                    "dtype"
+                                                                ].itemsize
+                                                            )
+                                                            == 0
                                                             else 1,
                                                             "beta_": 0,
                                                         }
@@ -739,14 +820,39 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size // 64
-                                                        if size % 64 == 0
+                                                        "factor_": size
+                                                        // (
+                                                            BYTES_PER_STICK
+                                                            // outputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        if size
+                                                        % (
+                                                            BYTES_PER_STICK
+                                                            // outputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        == 0
                                                         else size,
                                                         "label_": "elem_arr_1",
                                                     },
                                                     {
-                                                        "factor_": 64
-                                                        if size % 64 == 0
+                                                        "factor_": (
+                                                            BYTES_PER_STICK
+                                                            // outputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        if size
+                                                        % (
+                                                            BYTES_PER_STICK
+                                                            // outputs[0][
+                                                                "dtype"
+                                                            ].itemsize
+                                                        )
+                                                        == 0
                                                         else 1,
                                                         "label_": "elem_arr_0",
                                                     },
@@ -768,8 +874,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "dsName_": "Tensor0",
                                 "dsType_": "INPUT",
                                 "scale_": inputs[0]["scale"][0:2],
-                                "wordLength": 2,
-                                "dataFormat_": "SEN169_FP16",
+                                "wordLength": inputs[0]["dtype"].itemsize,
+                                "dataFormat_": get_sen_data_format(inputs[0]["dtype"]),
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
@@ -780,8 +886,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "dsName_": "Tensor1",
                                 "dsType_": "KERNEL",
                                 "scale_": inputs[1]["scale"][1:3],
-                                "wordLength": 2,
-                                "dataFormat_": "SEN169_FP16",
+                                "wordLength": inputs[1]["dtype"].itemsize,
+                                "dataFormat_": get_sen_data_format(inputs[1]["dtype"]),
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
@@ -795,8 +901,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     outputs[0]["scale"][0],
                                     outputs[0]["scale"][2],
                                 ],
-                                "wordLength": 2,
-                                "dataFormat_": "SEN169_FP16",
+                                "wordLength": outputs[0]["dtype"].itemsize,
+                                "dataFormat_": get_sen_data_format(outputs[0]["dtype"]),
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
@@ -808,7 +914,9 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "exUnit": "pt",
                                 "opFuncName": op,
                                 "attributes_": {
-                                    "dataFormat_": "SEN169_FP16",
+                                    "dataFormat_": get_sen_data_format(
+                                        inputs[0]["dtype"]
+                                    ),
                                     "fidelity_": "regular",
                                 },
                                 "location": "Inner",
