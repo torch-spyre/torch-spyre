@@ -257,9 +257,9 @@ auto get_device_stride_info(std::vector<int64_t> cpu_shape,
  * second data_conversion_stride_info has the same cpu and device strides as the
  * first. For the second, the size of the stick dimension is the remainder of
  * the dimension size divided by the stick size (rounded down). The cpu offset
- * is the dimension size divided by the stick size, multiplied by the stick
- * size. The device offset is the size of the stick size multiplied by the
- * volume of the dimensions preceeding the stick dim on the device.
+ * is the dimension size divided by the stick size (rounded up), multiplied by
+ * the stick size. The device offset is the size of the stick size multiplied by
+ * the volume of the dimensions preceeding the stick dim on the device.
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
