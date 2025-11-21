@@ -14,7 +14,7 @@
 
 import math
 import os
-
+from torch_spyre._inductor import Unsupported
 
 def encode_constant(v):
     """
@@ -62,12 +62,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
     cores = int(os.getenv("SENCORES", "1"))
+    cores = min(cores, dimensions[-1] // 64)
     if cores > 1:
-        assert len(dimensions) == 1
-        assert dimensions[0] // 64 // cores > 0
-        for t in tensors:
-            for s in t["scale"]:
-                assert s == 1
+        try:
+            for t in tensors:
+                for s in t["scale"]:
+                    if s != 1:
+                        raise Unsupported("broadcast/reduction with core division")
+        except Unsupported:
+            print(f"WARNING: defaulting to one core for op {op}")
+            cores = 1
 
     d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
