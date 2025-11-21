@@ -233,6 +233,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        (
+            "test_pointwise_binary_op_fp32",
+            "test_binary_op",
+        ): {
+            "ops_dict": POINTWISE_BINARY_OPS_DICT,
+            "param_sets": {
+                "fp32": (
+                    cached_randn((67, 256), dtype=torch.float32),
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -255,7 +267,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # TODO: Division by 0 differs on Spyre from CPU, sidestep for now.
             zero_mask = b == 0.0
             b[zero_mask] = FP16_EPS
-        compare(op, a, b)
+        if a.dtype == torch.float32:
+            compare_with_cpu(op, a, b)
+        else:
+            compare(op, a, b)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
