@@ -17,7 +17,6 @@
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_spyre._C import SpyreTensorLayout
-from torch_spyre.utils.tensors import spyre_tensor_layout
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -96,7 +95,7 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_device_alloc(self):
         x = torch.rand([512, 256], dtype=torch.float16).to("spyre")
-        stl = spyre_tensor_layout(x)
+        stl = x.device_tensor_layout()
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.device_strides, [32768, 64, 1])
         self.assertEqual(stl.dim_map, [1, 0, 1])
