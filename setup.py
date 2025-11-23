@@ -137,6 +137,20 @@ class clean(Command):
 
 
 def run_codegen():
+    import sys
+    import importlib
+
+    is_meta = any(
+        cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
+    )
+
+    if not importlib.util.find_spec("sendnn"):
+        if not is_meta:
+            raise ImportError("sendnn is required for building. Install it first.")
+
+        print("Skipping codegen (sendnn not available, metadata extraction only)")
+        return None
+
     gen_script = CODEGEN_DIR / "gen.py"
 
     if not gen_script.exists():
@@ -156,7 +170,9 @@ def run_codegen():
 if __name__ == "__main__":
     OUTPUT_CODEGEN_DIR = run_codegen()
 
-    sources = list(CSRC_DIR.glob("*.cpp")) + list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
+    sources = list(CSRC_DIR.glob("*.cpp"))
+    if OUTPUT_CODEGEN_DIR:
+        sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
     sources = [str(p.relative_to(ROOT_DIR).as_posix()) for p in sorted(sources)]
     sources = sorted([str(s) for s in sources])
 
