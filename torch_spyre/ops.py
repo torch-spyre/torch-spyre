@@ -1,3 +1,17 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import torch
 
 
@@ -13,57 +27,3 @@ def spyre__mm_out(
 ) -> torch.Tensor:
     compiled_mm = torch.compile(torch.mm, dynamic=False)
     return compiled_mm(self, mat2, out=out)
-
-
-@torch.library.register_kernel("aten::bmm", ["spyre"])
-def spyre__bmm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
-    compiled_bmm = torch.compile(torch.bmm)
-    return compiled_bmm(self, mat2)
-
-
-@torch.library.register_kernel("aten::addmm.dtype_out", ["spyre"])
-def spyre__addmm_dtype_out(
-    self: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    out_dtype: torch.dtype,
-    beta,
-    alpha,
-    out: torch.Tensor,
-) -> torch.Tensor:
-    compiled_addmm = torch.compile(torch.addmm)
-    return compiled_addmm(self, mat1, mat2, out_dtype, beta, alpha, out=out)
-
-
-@torch.library.register_kernel("aten::addmm.dtype", ["spyre"])
-def spyre__addmm_dtype(
-    self: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    out_dtype: torch.dtype,
-    beta,
-    alpha,
-) -> torch.Tensor:
-    compiled_addmm = torch.compile(torch.addmm)
-    return compiled_addmm(self, mat1, mat2, out_dtype, beta, alpha)
-
-
-@torch.library.register_kernel("aten::addmm", ["spyre"])
-def spyre__addmm(
-    self: torch.Tensor, mat1: torch.Tensor, mat2: torch.Tensor, beta, alpha
-) -> torch.Tensor:
-    compiled_addmm = torch.compile(torch.addmm)
-    return compiled_addmm(self, mat1, mat2, beta, alpha)
-
-
-@torch.library.register_kernel("aten::addmm.out", ["spyre"])
-def spyre__addmm_out(
-    self: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    beta,
-    alpha,
-    out: torch.Tensor,
-) -> torch.Tensor:
-    compiled_addmm = torch.compile(torch.addmm)
-    return compiled_addmm(self, mat1, mat2, beta, alpha, out=out)

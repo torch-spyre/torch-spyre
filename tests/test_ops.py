@@ -275,12 +275,11 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
     def test_mm_ac_cb(self):
-        x = torch.arange(self.mm_a * self.mm_c, dtype=self.dtype).view(
+        x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_a, self.mm_c
         )
-        y = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_b
         )
         x_spyre = x.to("spyre")
@@ -290,10 +289,10 @@ class TestOps(TestCase):
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_ba_ac(self):
-        x = torch.arange(self.mm_a * self.mm_b, dtype=self.dtype).view(
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_b, self.mm_a
         )
-        y = torch.arange(self.mm_a * self.mm_c, dtype=self.dtype).view(
+        y = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_a, self.mm_c
         )
         x_spyre = x.to("spyre")
@@ -303,10 +302,10 @@ class TestOps(TestCase):
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_bc_ca(self):
-        x = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
+        x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_b, self.mm_c
         )
-        y = torch.arange(self.mm_a * self.mm_c, dtype=self.dtype).view(
+        y = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_a
         )
         x_spyre = x.to("spyre")
@@ -316,10 +315,10 @@ class TestOps(TestCase):
 
     @unittest.skip("matmuls have some issues with shapes")
     def test_mm_ca_ab(self):
-        x = torch.arange(self.mm_a * self.mm_c, dtype=self.dtype).view(
+        x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_a
         )
-        y = torch.arange(self.mm_a * self.mm_b, dtype=self.dtype).view(
+        y = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_a, self.mm_b
         )
         x_spyre = x.to("spyre")
@@ -329,10 +328,10 @@ class TestOps(TestCase):
 
     @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_mm_cb_ba(self):
-        x = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
+        x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_b
         )
-        y = torch.arange(self.mm_a * self.mm_b, dtype=self.dtype).view(
+        y = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_b, self.mm_a
         )
         x_spyre = x.to("spyre")
@@ -343,10 +342,10 @@ class TestOps(TestCase):
     @unittest.skip("matmuls have some issues with shapes")
     def test_bmm_ab_bc(self):
         B = 1
-        x = torch.arange(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
+        x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
             B, self.mm_a, self.mm_b
         )
-        y = torch.arange(B * self.mm_b * self.mm_c, dtype=self.dtype).view(
+        y = torch.randn(B * self.mm_b * self.mm_c, dtype=self.dtype).view(
             B, self.mm_b, self.mm_c
         )
         x_spyre = x.to("spyre")
@@ -357,10 +356,10 @@ class TestOps(TestCase):
     @unittest.skip("matmuls have some issues with shapes")
     def test_bmm_cb_ba(self):
         B = 1
-        x = torch.arange(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
+        x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
             B, self.mm_c, self.mm_b
         )
-        y = torch.arange(B * self.mm_b * self.mm_a, dtype=self.dtype).view(
+        y = torch.randn(B * self.mm_b * self.mm_a, dtype=self.dtype).view(
             B, self.mm_b, self.mm_a
         )
         x_spyre = x.to("spyre")
@@ -371,10 +370,10 @@ class TestOps(TestCase):
     @unittest.skip("matmuls have some issues with shapes")
     def test_matmul_ab_bc(self):
         B = 1
-        x = torch.arange(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
+        x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
             B, self.mm_a, self.mm_b
         )
-        y = torch.arange(self.mm_b * self.mm_c, dtype=self.dtype).view(
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_b, self.mm_c
         )
         x_spyre = x.to("spyre")
@@ -387,10 +386,10 @@ class TestOps(TestCase):
     @unittest.skip("matmuls have some issues with shapes")
     def test_matmul_cb_ba(self):
         B = 1
-        x = torch.arange(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
+        x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
             B, self.mm_c, self.mm_b
         )
-        y = torch.arange(self.mm_b * self.mm_a, dtype=self.dtype).view(
+        y = torch.randn(self.mm_b * self.mm_a, dtype=self.dtype).view(
             self.mm_b, self.mm_a
         )
         x_spyre = x.to("spyre")
