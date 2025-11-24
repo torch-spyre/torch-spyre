@@ -2,18 +2,15 @@
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-cleanup() {
-    rm ${ROOT_DIR}/requirements/constraints.txt || true
-}
-
-trap cleanup EXIT SIGINT SIGTERM
-
 cd ${ROOT_DIR}
 
-cp requirements/dev.txt requirements/constraints.txt
-COMPILE_OPTIONS="--emit-index-url --build-constraints requirements/constraints.txt"
+# Refresh the uv.lock file, based on pyproject.toml
+uv lock
 
-uv pip compile pyproject.toml $COMPILE_OPTIONS > requirements/run.txt
-uv pip compile pyproject.toml $COMPILE_OPTIONS --extra lint --no-emit-package torch > requirements/lint.txt
-uv pip compile pyproject.toml $COMPILE_OPTIONS --extra lint --extra build > requirements/build.txt
-uv pip compile pyproject.toml $COMPILE_OPTIONS --all-extras > requirements/dev.txt
+# Regenerate requirement files for convenience
+UV_EXPORT_OPTIONS="--format requirements.txt --no-hashes --no-install-project"
+
+uv export $UV_EXPORT_OPTIONS > requirements/run.txt
+uv export $UV_EXPORT_OPTIONS --extra lint --no-emit-package torch > requirements/lint.txt
+uv export $UV_EXPORT_OPTIONS --extra lint --extra build > requirements/build.txt
+uv export $UV_EXPORT_OPTIONS --all-extras > requirements/dev.txt

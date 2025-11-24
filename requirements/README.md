@@ -10,10 +10,20 @@ They are used for managing caches in CI and for the convenience of users.
 
 A number of tests require `torch_sendnn` to be installed. This install step is not covered by the requirements files.
 
-To refresh the requirement files, please run the [update.sh](../tools/update-requirements.sh) script from this folder (requires `uv`).
+To refresh the requirement files, please run the [`update-requirements.sh`](../tools/update-requirements.sh) script from this folder (requires `uv`).
 
-One of the pre-commit checks verifies if the requirement files are up to date, using the [check.sh](../tools/check-requirements.sh) script.
+One of the pre-commit checks verifies if the requirement files are up to date, using the [`check-requirements.sh`](../tools/check-requirements.sh) script.
 
-When it fails, it could be due to a change in the PR or to a new patch version of a library being available.
-The check script will show the diff. If the version change is not related to this PR and you prefer to skip the
-update for now, please pin the full package version (including patch version) in [pyproject.toml](../pyproject.toml).
+When it fails, it means that the `pyproject.toml` file was modified, and the `update-requirements.sh` was not executed.
+
+## Updating Dependencies
+
+If a new version of a dependency is required:
+
+- Update the version in the `pyproject.toml` file
+- Run the `update-requirements.sh` script
+
+If a new dependency is required or if a transitive dependency needs to be updated:
+
+- Add the new dependencies to the `pyproject.toml` file, pinned to a specific version
+- Run the `update-requirements.sh` script
