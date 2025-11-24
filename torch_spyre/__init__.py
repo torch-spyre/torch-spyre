@@ -58,7 +58,6 @@ class _SpyreImpl:
             # put any light, once-per-process setup here
             self._C = importlib.import_module("torch_spyre._C")
             # this will create the allocator
-
             self._C.start_runtime()
             self._initialized = True
 

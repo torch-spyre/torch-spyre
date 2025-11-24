@@ -42,6 +42,8 @@ class TestOps(TestCase):
         self.atol = 1e-1
         self.dtype = torch.float16
 
+        # TODO: The tensor size was changed (from 3, 5, 7 respectively) to avoid padding in the stick dimension.
+        #   Once we have proper padding to stack handled, these values should be changed back
         self.mm_a = 67
         self.mm_b = 256
         self.mm_c = 128

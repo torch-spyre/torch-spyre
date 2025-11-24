@@ -42,11 +42,11 @@ class TestOps(TestCase):
 
     @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_linear(self):
-        m = nn.Linear(8, 128, dtype=self.dtype)
+        m = nn.Linear(3, 5, dtype=self.dtype)
         m_spyre = copy.deepcopy(m)
         m_spyre.to("spyre")
 
-        x = torch.randn(64, 8, dtype=self.dtype)
+        x = torch.arange(6, dtype=self.dtype).view(2, 3)
         x_spyre = x.to("spyre")
 
         with torch.no_grad():

@@ -69,6 +69,8 @@ def _autoload():
     torch._inductor.config.benchmark_harness = False
     torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
     torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
+    # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
+    # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
     torch._inductor.config.unroll_reductions_threshold = 1
 
     # Do not force output tensor strides to conform to eager strides -- hack for dealing with stickified tensors for now.
