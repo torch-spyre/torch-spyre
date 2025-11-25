@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from typing import Sequence, Tuple, Union
-from enum import Enum
 import dataclasses
 
 import torch
@@ -24,6 +23,7 @@ from torch.fx.experimental.symbolic_shapes import (
     is_nested_int,
 )
 
+from torch_spyre._C import SpyreTensorLayout
 from . import Unsupported
 
 
@@ -32,12 +32,6 @@ BYTES_IN_STICK = 128
 
 def elems_per_stick(dtype: torch.dtype) -> int:
     return BYTES_IN_STICK // dtype.itemsize
-
-
-class StickFormat(Enum):
-    DENSE = 1
-    SPARSE = 2
-    SPARSE_MULTI = 3
 
 
 @dataclasses.dataclass
@@ -52,7 +46,7 @@ class SpyreDCI:
 
     dim_order: list[int]
     num_stick_dims: int = 1
-    format: StickFormat = StickFormat.DENSE
+    format: SpyreTensorLayout.StickFormat = SpyreTensorLayout.StickFormat.Dense
 
     def __post_init__(self):
         assert self.num_stick_dims == 1, "currently limited to one stick dimension"
@@ -93,7 +87,11 @@ class SpyreDCI:
     def spyre_strides(
         self, size: torch.Size, dtype: torch.dtype
     ) -> list[int | torch.SymInt]:
-        cur_stride = 1 if self.format == StickFormat.DENSE else elems_per_stick(dtype)
+        cur_stride = (
+            1
+            if self.format == SpyreTensorLayout.StickFormat.Dense
+            else elems_per_stick(dtype)
+        )
         strides: list[int | torch.SymInt] = [-1] * len(size)
         for d in reversed(self.dim_order):
             strides[d] = cur_stride
@@ -147,7 +145,10 @@ def spyre_matmul_result_shape(
 ) -> Tuple[Sequence[int], SpyreDCI]:
     x_dci: SpyreDCI = x.get_dci()
     y_dci: SpyreDCI = y.get_dci()
-    if x_dci.format != StickFormat.DENSE or y_dci.format != StickFormat.DENSE:
+    if (
+        x_dci.format != SpyreTensorLayout.StickFormat.Dense
+        or y_dci.format != SpyreTensorLayout.StickFormat.Dense
+    ):
         raise Unsupported(f"matmul on non-dense tensors {x_dci} {y_dci}")
     if x_dci.dim_order != y_dci.dim_order:
         raise Unsupported(f"matmul stick dimensions mismatch {x_dci} {y_dci}")
@@ -183,7 +184,9 @@ def spyre_reduction_result_shape(
     res_order = [rd for rd in res_order if rd >= 0]
     result_dci = SpyreDCI(
         res_order,
-        format=StickFormat.SPARSE if is_stick_reduction else StickFormat.DENSE,
+        format=SpyreTensorLayout.StickFormat.Sparse
+        if is_stick_reduction
+        else SpyreTensorLayout.StickFormat.Dense,
     )
     return res_size, result_dci
 
@@ -232,10 +235,16 @@ def spyre_pointwise_result_shape(
     y_dci = y.get_dci()
     if x_dci.format == y_dci.format:
         res_format = x_dci.format
-    elif x_dci.format == StickFormat.DENSE and y_broadcasted[x_dci.get_stick_dims()[0]]:
-        res_format = StickFormat.DENSE
-    elif y_dci.format == StickFormat.DENSE and x_broadcasted[y_dci.get_stick_dims()[0]]:
-        res_format = StickFormat.DENSE
+    elif (
+        x_dci.format == SpyreTensorLayout.StickFormat.Dense
+        and y_broadcasted[x_dci.get_stick_dims()[0]]
+    ):
+        res_format = SpyreTensorLayout.StickFormat.Dense
+    elif (
+        y_dci.format == SpyreTensorLayout.StickFormat.Dense
+        and x_broadcasted[y_dci.get_stick_dims()[0]]
+    ):
+        res_format = SpyreTensorLayout.StickFormat.Dense
     else:
         raise Unsupported(
             f"binop with incompatible DCIs: {x_dci} {y_dci} {x_broadcasted} {y_broadcasted}"
