@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548  # v6.1.0
         with:
           python-version: '3.12'
-      - uses: astral-sh/setup-uv@30ce38e20653a26dd16caa082b010cec334ccf56  # v7.1.3
+      - uses: astral-sh/setup-uv@be7fc19b4169c26a2aa1b8a430af391f2a96b3c9  # v7.1.3
       - name: Recompile requirements
         run: ./tools/update-requirements.sh
 
