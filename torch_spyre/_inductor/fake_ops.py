@@ -20,8 +20,8 @@ from .stickify import (
     spyre_matmul_result_shape,
     spyre_reduction_result_shape,
     spyre_pointwise_result_shape,
-    SpyreDCI,
 )
+from torch_spyre._C import SpyreTensorLayout
 
 DispatchKey = torch._C.DispatchKey  # type: ignore[attr-defined]
 
@@ -94,13 +94,13 @@ def spyre_pointwise_binary(x, y):
 
 def spyre_pointwise_unary(x):
     res = x.new_empty(x.size())
-    res.spyre_layout = x.get_dci()
+    res.spyre_layout = x.get_spyre_layout()
     return res
 
 
 def spyre_unsqueeze(x, dim):
     x_size = x.size()
-    x_dci = x.get_dci()
+    x_dci = x.get_spyre_layout()
     if dim < 0:
         dim += len(x_size) + 1
     res_shape = list(x_size)
@@ -115,21 +115,23 @@ def spyre_unsqueeze(x, dim):
             res_dim_order.append(d)
             res_dim_order.append(d + 1)
     res = x.new_empty(res_shape)
-    res.spyre_layout = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.format)
+    res.spyre_layout = SpyreTensorLayout(
+        res_shape, res.dtype, res_dim_order, x_dci.format
+    )
     return res
 
 
 def spyre_where(cond, x, y):
     # TODO: check op validity and generalize
     res = x.new_empty(x.size())
-    res.spyre_layout = x.get_dci()
+    res.spyre_layout = x.get_spyre_layout()
     return res
 
 
 def spyre_fresh_tensor_constructor_wrapper(orig_fn, *args, **kwargs):
     """Creating tensor fresh from size/stride.  Assume generic stick"""
     res = orig_fn(*args, **kwargs)
-    res.spyre_layout = SpyreDCI.generic_stick_dci(res)
+    res.spyre_layout = SpyreTensorLayout(res.size(), res.dtype)
     return res
 
 
@@ -142,7 +144,7 @@ def spyre_like_tensor_constructor_wrapper(orig_fn, input, *args, **kwargs):
         print(
             f"Warning: like_tensor constructor given {input} that lacks spyre_layout; assuming generic stick layout"
         )
-        res.spyre_layout = SpyreDCI.generic_stick_dci(res)
+        res.spyre_layout = SpyreTensorLayout(res.size(), res.dtype)
     return res
 
 

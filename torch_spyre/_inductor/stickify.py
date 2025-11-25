@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from typing import Sequence, Tuple, Union
-import dataclasses
 
 import torch
 from sympy import Expr
@@ -27,86 +26,47 @@ from torch_spyre._C import SpyreTensorLayout
 from . import Unsupported
 
 
-BYTES_IN_STICK = 128
+def stl_host_dim_order(self: SpyreTensorLayout) -> list[int]:
+    return self.dim_map[1:]
 
 
-def elems_per_stick(dtype: torch.dtype) -> int:
-    return BYTES_IN_STICK // dtype.itemsize
+def stl_stick_dim(self: SpyreTensorLayout) -> int:
+    return self.dim_map[-1]
 
 
-@dataclasses.dataclass
-class SpyreDCI:
-    """
-    FIXME: This will be part of csrc with a pybind to be placed in TensorImpl
-    NOTE: dim_order follows the PyTorch conventions.
-    dim_order[-1] is the dimenson with the smallest stride;
-    dim_order[0] is the dimension with the largest stride.
-    dim_order[-num_stick_dims:] are the stick dimensions
-    """
+def stl_is_stick_reduction(self: SpyreTensorLayout, axis: list[int]) -> bool:
+    stick_dim = self.stick_dim()
+    if stick_dim in axis:
+        if len(axis) > 1:
+            Unsupported(f"reduction on both stick and non-stick dimensions {axis}")
+        return True
+    else:
+        return False
 
-    dim_order: list[int]
-    num_stick_dims: int = 1
-    format: SpyreTensorLayout.StickFormat = SpyreTensorLayout.StickFormat.Dense
 
-    def __post_init__(self):
-        assert self.num_stick_dims == 1, "currently limited to one stick dimension"
+def stl_spyre_fixed_layout(
+    self: SpyreTensorLayout, device: torch.device, size: torch.Size, dtype: torch.dtype
+):
+    cur_stride = (
+        1
+        if self.format == SpyreTensorLayout.StickFormat.Dense
+        else 128 // dtype.itemsize  # TODO - get from self.device_strides?
+    )
+    stride: list[int | torch.SymInt] = [-1] * len(size)
+    for d in reversed(self.host_dim_order()):
+        stride[d] = cur_stride
+        cur_stride = cur_stride * size[d]
+    return SpyreFixedLayout(device, dtype, list(size), stride, self)
 
-    @staticmethod
-    def generic_stick_dci(t: torch.Tensor):
-        dim_order = list(range(len(t.size())))
-        return SpyreDCI(dim_order)
 
-    def get_stick_dims(self) -> list[int]:
-        return self.dim_order[-self.num_stick_dims :]
-
-    def is_stick_dim(self, dim: Union[int | list[int]]) -> bool:
-        stick_dims = self.get_stick_dims()
-        if isinstance(dim, int):
-            return dim in stick_dims
-        else:
-            for d in dim:
-                if d in stick_dims:
-                    return True
-            return False
-
-    def is_stick_reduction(self, axis: list[int]) -> bool:
-        stick = False
-        non_stick = False
-        stick_dims = self.get_stick_dims()
-        for d in axis:
-            if d in stick_dims:
-                stick = True
-            else:
-                non_stick = True
-        if stick and non_stick:
-            raise Unsupported(
-                f"reduction on both stick and non-stick dimensions {axis}"
-            )
-        return stick
-
-    def spyre_strides(
-        self, size: torch.Size, dtype: torch.dtype
-    ) -> list[int | torch.SymInt]:
-        cur_stride = (
-            1
-            if self.format == SpyreTensorLayout.StickFormat.Dense
-            else elems_per_stick(dtype)
-        )
-        strides: list[int | torch.SymInt] = [-1] * len(size)
-        for d in reversed(self.dim_order):
-            strides[d] = cur_stride
-            cur_stride = cur_stride * size[d]
-        return strides
-
-    def spyre_layout(
-        self, device: torch.device, size: torch.Size, dtype: torch.dtype
-    ) -> FixedLayout:
-        stride = self.spyre_strides(size, dtype)
-        return SpyreFixedLayout(device, dtype, list(size), stride, self)
+setattr(SpyreTensorLayout, "host_dim_order", stl_host_dim_order)
+setattr(SpyreTensorLayout, "stick_dim", stl_stick_dim)
+setattr(SpyreTensorLayout, "is_stick_reduction", stl_is_stick_reduction)
+setattr(SpyreTensorLayout, "spyre_fixed_layout", stl_spyre_fixed_layout)
 
 
 class SpyreFixedLayout(FixedLayout):
-    dci: SpyreDCI
+    device_layout: SpyreTensorLayout
 
     def __init__(
         self,
@@ -114,16 +74,16 @@ class SpyreFixedLayout(FixedLayout):
         dtype: torch.dtype,
         size: list[Expr],
         stride: list[Expr],
-        dci: SpyreDCI,
+        device_layout: SpyreTensorLayout,
     ) -> None:
         super().__init__(device, dtype, size, stride)
-        self.dci = dci
+        self.device_layout = device_layout
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
         return (
             f"{type(self).__name__}('{self.device.type}{device_index_str}', {self.dtype}, "
-            f"size={self.size}, stride={self.stride}, dci={self.dci})"
+            f"size={self.size}, stride={self.stride}, device_layout={self.device_layout})"
         )
 
     def get_allocation_size(self) -> list[Expr]:
@@ -133,18 +93,18 @@ class SpyreFixedLayout(FixedLayout):
     __repr__ = __str__
 
 
-def tensor_get_dci(self: torch.Tensor) -> SpyreDCI:
+def tensor_get_spyre_layout(self: torch.Tensor) -> SpyreTensorLayout:
     if not hasattr(self, "spyre_layout"):
         print(f"Warning: {self} lacks spyre_layout; assuming generic stick layout")
-        self.spyre_layout = SpyreDCI.generic_stick_dci(self)
+        self.spyre_layout = SpyreTensorLayout(self.size(), self.dtype)
     return self.spyre_layout
 
 
 def spyre_matmul_result_shape(
     x: torch.Tensor, y: torch.Tensor
-) -> Tuple[Sequence[int], SpyreDCI]:
-    x_dci: SpyreDCI = x.get_dci()
-    y_dci: SpyreDCI = y.get_dci()
+) -> Tuple[Sequence[int], SpyreTensorLayout]:
+    x_dci: SpyreTensorLayout = x.get_spyre_layout()
+    y_dci: SpyreTensorLayout = y.get_spyre_layout()
     if (
         x_dci.format != SpyreTensorLayout.StickFormat.Dense
         or y_dci.format != SpyreTensorLayout.StickFormat.Dense
@@ -152,14 +112,14 @@ def spyre_matmul_result_shape(
         raise Unsupported(f"matmul on non-dense tensors {x_dci} {y_dci}")
     if x_dci.dim_order != y_dci.dim_order:
         raise Unsupported(f"matmul stick dimensions mismatch {x_dci} {y_dci}")
-    res_dci = SpyreDCI(list(x_dci.dim_order))
     res_size = [x.size()[0], y.size()[1]]
+    res_dci = SpyreTensorLayout(res_size, x_dci.dtype)  # TODO: forcing generic stick
     return res_size, res_dci
 
 
 def spyre_reduction_result_shape(
     x: torch.Tensor, axis: Union[int, list[int]], keepdims: bool = False
-) -> Tuple[Sequence[int], SpyreDCI]:
+) -> Tuple[Sequence[int], SpyreTensorLayout]:
     # Normalize axis
     x_size = x.size()
     if isinstance(axis, int):
@@ -169,10 +129,10 @@ def spyre_reduction_result_shape(
             axis[i] += len(x_size) if len(x_size) else 1
 
     # Compute result shape + DCI
-    x_dci: SpyreDCI = x.get_dci()
+    x_dci: SpyreTensorLayout = x.get_spyre_layout()
     is_stick_reduction = x_dci.is_stick_reduction(axis)
     res_size = list(x_size)
-    res_order = list(x_dci.dim_order)
+    res_order = x_dci.host_dim_order()
     for d in axis:
         if keepdims:
             res_size[d] = 1
@@ -182,21 +142,21 @@ def spyre_reduction_result_shape(
             res_order = [rd if rd < d else rd - 1 for rd in res_order]
     res_size = [rs for rs in res_size if rs >= 0]
     res_order = [rd for rd in res_order if rd >= 0]
-    result_dci = SpyreDCI(
-        res_order,
-        format=SpyreTensorLayout.StickFormat.Sparse
+    res_format = (
+        SpyreTensorLayout.StickFormat.Sparse
         if is_stick_reduction
-        else SpyreTensorLayout.StickFormat.Dense,
+        else SpyreTensorLayout.StickFormat.Dense
     )
+    result_dci = SpyreTensorLayout(res_size, x.dtype, res_order, format=res_format)
     return res_size, result_dci
 
 
 def spyre_pointwise_result_shape(
     x: torch.Tensor, y: torch.Tensor
-) -> Tuple[Sequence[int], SpyreDCI]:
+) -> Tuple[Sequence[int], SpyreTensorLayout]:
     """
     Compute the shape of the result of a pointwise binary operation.
-    The code is based torch.broadcast_shapes with Spyre enhancements.
+    The code is based on torch.broadcast_shapes with Spyre enhancements.
     """
     x_size = x.size()
     y_size = y.size()
@@ -231,18 +191,18 @@ def spyre_pointwise_result_shape(
         res_size[i] = y_size[i]
         x_broadcasted[i] = True
 
-    x_dci = x.get_dci()
-    y_dci = y.get_dci()
+    x_dci = x.get_spyre_layout()
+    y_dci = y.get_spyre_layout()
     if x_dci.format == y_dci.format:
         res_format = x_dci.format
     elif (
         x_dci.format == SpyreTensorLayout.StickFormat.Dense
-        and y_broadcasted[x_dci.get_stick_dims()[0]]
+        and y_broadcasted[x_dci.stick_dim()]
     ):
         res_format = SpyreTensorLayout.StickFormat.Dense
     elif (
         y_dci.format == SpyreTensorLayout.StickFormat.Dense
-        and x_broadcasted[y_dci.get_stick_dims()[0]]
+        and x_broadcasted[y_dci.stick_dim]
     ):
         res_format = SpyreTensorLayout.StickFormat.Dense
     else:
@@ -250,5 +210,6 @@ def spyre_pointwise_result_shape(
             f"binop with incompatible DCIs: {x_dci} {y_dci} {x_broadcasted} {y_broadcasted}"
         )
 
+    # TODO: Forcing generic stick dimension order
     dim_order = list(range(len(res_size)))
-    return res_size, SpyreDCI(dim_order, format=res_format)
+    return res_size, SpyreTensorLayout(res_size, x.dtype, dim_order, format=res_format)

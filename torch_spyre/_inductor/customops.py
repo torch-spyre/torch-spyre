@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from typing import Optional
 import torch
 
-from .stickify import SpyreDCI, spyre_reduction_result_shape
+from .stickify import spyre_reduction_result_shape
 from . import Unsupported
 from torch_spyre._C import SpyreTensorLayout
 
@@ -32,7 +33,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("compact only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
+    output.spyre_layout = SpyreTensorLayout(output.size(), output.dtype)
     return output
 
 
@@ -41,7 +42,6 @@ def swap(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
-    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Sparse)
     return output
 
 
@@ -50,7 +50,9 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
-    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Sparse)
+    output.spyre_layout = SpyreTensorLayout(
+        output.size(), output.dtype, [0], SpyreTensorLayout.StickFormat.Sparse
+    )
     return output
 
 
@@ -59,7 +61,6 @@ def slice(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
     return output
 
 
@@ -68,7 +69,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
+    output.spyre_layout = SpyreTensorLayout(output.size(), output.dtype)
     return output
 
 
@@ -96,7 +97,7 @@ def _(
     eps: float = 1e-5,
 ):
     res = x.new_empty(x.size())
-    res.spyre_layout = x.get_dci()
+    res.spyre_layout = x.get_spyre_layout()
     return res
 
 
@@ -108,9 +109,7 @@ def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor: 
 @exx2.register_fake
 def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
     res_size, res_dci = spyre_reduction_result_shape(x, [x.ndim - 1], False)
-    res_dci = SpyreDCI(
-        res_dci.dim_order, format=SpyreTensorLayout.StickFormat.SparseMulti
-    )
+    res_dci.format = SpyreTensorLayout.StickFormat.SparseMulti
     res = x.new_empty(res_size)
     res.spyre_layout = res_dci
     return res
@@ -123,10 +122,11 @@ def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:  # type: ignore
 
 @layernormscale.register_fake
 def _(x: torch.Tensor, eps: float) -> torch.Tensor:
-    x_dci = x.get_dci()
+    x_dci = x.get_spyre_layout()
     if x_dci.format != SpyreTensorLayout.StickFormat.SparseMulti:
         raise Unsupported(f"layernormscale: Unexpected format {x_dci.format}")
-    res_dci = SpyreDCI(x_dci.dim_order, format=SpyreTensorLayout.StickFormat.Sparse)
+    res_dci = copy.deepcopy(x_dci)
+    res_dci.format = SpyreTensorLayout.StickFormat.Sparse
     res_size = list(x.size())
     res = x.new_empty(res_size)
     res.spyre_layout = res_dci
@@ -153,5 +153,5 @@ def _(
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
     res = x.new_empty(x.size())
-    res.spyre_layout = x.get_dci()
+    res.spyre_layout = x.get_spyre_layout()
     return res

@@ -21,7 +21,8 @@ from torch._subclasses.fake_tensor import (
 )
 from torch._inductor.ir import FlexibleLayout, Layout, significant_strides_equal
 from torch._subclasses.fake_impls import fast_detach
-from .stickify import tensor_get_dci, SpyreDCI, SpyreFixedLayout
+from .stickify import tensor_get_spyre_layout, SpyreFixedLayout
+from torch_spyre._C import SpyreTensorLayout
 
 orig_from_real_tensor = FakeTensorConverter.from_real_tensor
 orig_from_meta_and_device = FakeTensorConverter.from_meta_and_device
@@ -29,7 +30,7 @@ orig_from_meta_and_device = FakeTensorConverter.from_meta_and_device
 
 def install_spyre_tensors():
     """Extend Tensor and IR Classes for Spyre Stickification"""
-    torch.Tensor.get_dci = tensor_get_dci
+    torch.Tensor.get_spyre_layout = tensor_get_spyre_layout
     FakeTensorConverter.from_meta_and_device = spyre_ftc_from_meta_and_device
     FakeTensorConverter.from_real_tensor = spyre_ftc_from_real_tensor
     torch._functorch._aot_autograd.dispatch_and_compile_graph._detach_and_copy_item_memo = spyre_detach_and_copy_item_memo
@@ -63,9 +64,9 @@ def spyre_ftc_from_real_tensor(
         trace=trace,
     )
     if t.device.type == "spyre":
-        # TODO: Extract DCI from SpyreTensorImpl (once torch_spyre stores it).
-        #       For initial development, synthesize a DCI that encodes generic stick layout.
-        res.spyre_layout = SpyreDCI.generic_stick_dci(res)
+        # TODO: Extract SpyreTensorLayout from SpyreTensorImpl (once torch_spyre stores it).
+        #       For initial development, synthesize one that encodes generic stick layout.
+        res.spyre_layout = SpyreTensorLayout(res.shape, res.dtype)
     return res
 
 
@@ -74,7 +75,7 @@ def spyre_ftc_from_meta_and_device(
 ) -> FakeTensor:
     res = orig_from_meta_and_device(self, fake_mode, t, device)
     if hasattr(t, "spyre_layout"):
-        res.spyre_layout = t.get_dci()
+        res.spyre_layout = t.get_spyre_layout()
     return res
 
 
@@ -105,9 +106,11 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
             t = n.meta.get("val", None)
             if isinstance(t, torch.Tensor):
                 if t.device.type == "spyre":
-                    dci = t.get_dci()
-                    if isinstance(dci, SpyreDCI):
-                        self.layout = dci.spyre_layout(t.device, t.size(), t.dtype)
+                    dci = t.get_spyre_layout()
+                    if isinstance(dci, SpyreTensorLayout):
+                        self.layout = dci.spyre_fixed_layout(
+                            t.device, t.size(), t.dtype
+                        )
                         return self.layout
             elif isinstance(t, tuple) and (
                 n.target == torch.ops.aten.max.dim or n.target == torch.ops.aten.min.dim
@@ -115,9 +118,11 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
                 # TODO: This only works because Spyre implements amax/amin and doesn't implement argmax/argmin
                 t = t[0]
                 if t.device.type == "spyre":
-                    dci = t.get_dci()
-                    if isinstance(dci, SpyreDCI):
-                        self.layout = dci.spyre_layout(t.device, t.size(), t.dtype)
+                    dci = t.get_spyre_layout()
+                    if isinstance(dci, SpyreTensorLayout):
+                        self.layout = dci.spyre_fixed_layout(
+                            t.device, t.size(), t.dtype
+                        )
                         return self.layout
 
         return self.layout

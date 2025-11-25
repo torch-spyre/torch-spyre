@@ -82,7 +82,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         if codegen_shape_tuple != codegen_allocation_shape_tuple:
             out = out + f".as_strided({codegen_shape_tuple}, {codegen_stride_tuple})"
 
-        out = out + f" {self.comment} {layout.dci}"
+        out = out + f" {self.comment} {layout.device_layout}"
         return out
 
 
