@@ -42,6 +42,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add requirements/*.txt
+          git add requirements/*.txt uv.lock
           git commit -m "[dependabot skip] chore: recompile requirements after dependency update"
           git push
