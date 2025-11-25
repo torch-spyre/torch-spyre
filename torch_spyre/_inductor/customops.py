@@ -32,7 +32,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("compact only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
+    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
     return output
 
 
@@ -41,7 +41,7 @@ def swap(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
-    output.spyre_dci = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Sparse)
+    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Sparse)
     return output
 
 
@@ -50,7 +50,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
-    output.spyre_dci = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Sparse)
+    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Sparse)
     return output
 
 
@@ -59,7 +59,7 @@ def slice(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
+    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
     return output
 
 
@@ -68,7 +68,7 @@ def _(input):
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
+    output.spyre_layout = SpyreDCI([0], format=SpyreTensorLayout.StickFormat.Dense)
     return output
 
 
@@ -96,7 +96,7 @@ def _(
     eps: float = 1e-5,
 ):
     res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
+    res.spyre_layout = x.get_dci()
     return res
 
 
@@ -112,7 +112,7 @@ def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
         res_dci.dim_order, format=SpyreTensorLayout.StickFormat.SparseMulti
     )
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_dci
     return res
 
 
@@ -129,7 +129,7 @@ def _(x: torch.Tensor, eps: float) -> torch.Tensor:
     res_dci = SpyreDCI(x_dci.dim_order, format=SpyreTensorLayout.StickFormat.Sparse)
     res_size = list(x.size())
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_dci
     return res
 
 
@@ -153,5 +153,5 @@ def _(
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
     res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
+    res.spyre_layout = x.get_dci()
     return res

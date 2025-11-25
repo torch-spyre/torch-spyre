@@ -134,10 +134,10 @@ class SpyreFixedLayout(FixedLayout):
 
 
 def tensor_get_dci(self: torch.Tensor) -> SpyreDCI:
-    if not hasattr(self, "spyre_dci"):
-        print(f"Warning: {self} lacks spyre_dci; assuming generic stick layout")
-        self.spyre_dci = SpyreDCI.generic_stick_dci(self)
-    return self.spyre_dci
+    if not hasattr(self, "spyre_layout"):
+        print(f"Warning: {self} lacks spyre_layout; assuming generic stick layout")
+        self.spyre_layout = SpyreDCI.generic_stick_dci(self)
+    return self.spyre_layout
 
 
 def spyre_matmul_result_shape(

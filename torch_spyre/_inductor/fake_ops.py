@@ -32,46 +32,46 @@ aten = torch.ops.aten
 def spyre_matmul(x, y):
     res_size, res_dci = spyre_matmul_result_shape(x, y)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_dci
     return res
 
 
 def spyre_amax(x, dim, keepdim=False):
     res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_dci
     return res
 
 
 def spyre_amin(x, dim, keepdim=False):
     res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_dci
     return res
 
 
 def spyre_max(x, dim, keepdim=False):
     res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
     values = x.new_empty(res_size)
-    values.spyre_dci = res_dci
+    values.spyre_layout = res_dci
     indices = x.new_empty(res_size, dtype=torch.int64)
-    indices.spyre_dci = res_dci
+    indices.spyre_layout = res_dci
     return torch.return_types.max(sequence=(values, indices))
 
 
 def spyre_min(x, dim, keepdim=False):
     res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
     values = x.new_empty(res_size)
-    values.spyre_dci = res_dci
+    values.spyre_layout = res_dci
     indices = x.new_empty(res_size, dtype=torch.int64)
-    indices.spyre_dci = res_dci
+    indices.spyre_layout = res_dci
     return torch.return_types.min(sequence=(values, indices))
 
 
 def spyre_sum(x, axis, keepdims=False):
     res_size, res_dci = spyre_reduction_result_shape(x, axis, keepdims)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_dci
     return res
 
 
@@ -86,7 +86,7 @@ def spyre_pointwise_binary(x, y):
     if isinstance(y, torch.Tensor):
         res_size, res_dci = spyre_pointwise_result_shape(x, y)
         res = x.new_empty(res_size)
-        res.spyre_dci = res_dci
+        res.spyre_layout = res_dci
         return res
     else:
         return spyre_pointwise_unary(x)
@@ -94,7 +94,7 @@ def spyre_pointwise_binary(x, y):
 
 def spyre_pointwise_unary(x):
     res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
+    res.spyre_layout = x.get_dci()
     return res
 
 
@@ -115,34 +115,34 @@ def spyre_unsqueeze(x, dim):
             res_dim_order.append(d)
             res_dim_order.append(d + 1)
     res = x.new_empty(res_shape)
-    res.spyre_dci = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.format)
+    res.spyre_layout = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.format)
     return res
 
 
 def spyre_where(cond, x, y):
     # TODO: check op validity and generalize
     res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
+    res.spyre_layout = x.get_dci()
     return res
 
 
 def spyre_fresh_tensor_constructor_wrapper(orig_fn, *args, **kwargs):
     """Creating tensor fresh from size/stride.  Assume generic stick"""
     res = orig_fn(*args, **kwargs)
-    res.spyre_dci = SpyreDCI.generic_stick_dci(res)
+    res.spyre_layout = SpyreDCI.generic_stick_dci(res)
     return res
 
 
 def spyre_like_tensor_constructor_wrapper(orig_fn, input, *args, **kwargs):
     """Creating a new tensor with same shape as input.  Propagate SpyreDCI if present."""
     res = orig_fn(input, *args, **kwargs)
-    if hasattr(input, "spyre_dci"):
-        res.spyre_dci = input.spyre_dci
+    if hasattr(input, "spyre_layout"):
+        res.spyre_layout = input.spyre_layout
     else:
         print(
-            f"Warning: like_tensor constructor given {input} that lacks spyre_dci; assuming generic stick layout"
+            f"Warning: like_tensor constructor given {input} that lacks spyre_layout; assuming generic stick layout"
         )
-        res.spyre_dci = SpyreDCI.generic_stick_dci(res)
+        res.spyre_layout = SpyreDCI.generic_stick_dci(res)
     return res
 
 

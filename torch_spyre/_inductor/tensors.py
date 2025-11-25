@@ -65,7 +65,7 @@ def spyre_ftc_from_real_tensor(
     if t.device.type == "spyre":
         # TODO: Extract DCI from SpyreTensorImpl (once torch_spyre stores it).
         #       For initial development, synthesize a DCI that encodes generic stick layout.
-        res.spyre_dci = SpyreDCI.generic_stick_dci(res)
+        res.spyre_layout = SpyreDCI.generic_stick_dci(res)
     return res
 
 
@@ -73,8 +73,8 @@ def spyre_ftc_from_meta_and_device(
     self, fake_mode: FakeTensorMode, t: torch.Tensor, device: torch.device
 ) -> FakeTensor:
     res = orig_from_meta_and_device(self, fake_mode, t, device)
-    if hasattr(t, "spyre_dci"):
-        res.spyre_dci = t.get_dci()
+    if hasattr(t, "spyre_layout"):
+        res.spyre_layout = t.get_dci()
     return res
 
 
@@ -84,8 +84,8 @@ def spyre_snapshot_fake(val: torch.Tensor) -> Optional[torch.Tensor]:
     else:
         res = val.detach()
     # Propagate SpyreDCI to detached copy of val
-    if res is not None and hasattr(val, "spyre_dci"):
-        res.spyre_dci = val.spyre_dci
+    if res is not None and hasattr(val, "spyre_layout"):
+        res.spyre_layout = val.spyre_layout
 
     return res
 
@@ -94,8 +94,8 @@ def spyre_detach_and_copy_item_memo(t):
     detached_t = t.detach()
     if hasattr(t, "item_memo"):
         detached_t.item_memo = t.item_memo
-    if hasattr(t, "spyre_dci"):
-        detached_t.spyre_dci = t.spyre_dci
+    if hasattr(t, "spyre_layout"):
+        detached_t.spyre_layout = t.spyre_layout
     return detached_t
 
 
