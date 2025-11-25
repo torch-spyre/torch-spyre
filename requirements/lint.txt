@@ -22,12 +22,14 @@ mypy==1.18.2
     # via torch-spyre
 mypy-extensions==1.1.0
     # via mypy
-networkx==3.6
+networkx==3.5
     # via torch
 nodeenv==1.9.1
     # via pre-commit
 numpy==2.3.5
     # via torch-spyre
+pathspec==0.12.1
+    # via mypy
 platformdirs==4.5.0
     # via virtualenv
 pre-commit==4.5.0
@@ -38,7 +40,7 @@ pyyaml==6.0.3
     # via pre-commit
 regex==2025.11.3
     # via torch-spyre
-setuptools==80.9.0
+setuptools==75.8.2
     # via torch
 sympy==1.14.0
     # via torch

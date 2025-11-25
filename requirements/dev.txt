@@ -8,7 +8,7 @@ cfgv==3.5.0
     # via pre-commit
 charset-normalizer==3.4.4
     # via requests
-cmake==4.2.0
+cmake==3.31.10
     # via torch-spyre
 colorama==0.4.6 ; (os_name != 'nt' and sys_platform == 'win32') or (os_name == 'nt' and sys_platform != 'darwin')
     # via
@@ -31,7 +31,7 @@ fsspec==2025.10.0
     #   torch
 hf-xet==1.2.0 ; platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
     # via huggingface-hub
-huggingface-hub==1.1.5
+huggingface-hub==0.36.0
     # via
     #   tokenizers
     #   transformers
@@ -55,7 +55,7 @@ mypy==1.18.2
     # via torch-spyre
 mypy-extensions==1.1.0
     # via mypy
-networkx==3.6
+networkx==3.5
     # via torch
 ninja==1.13.0
     # via torch-spyre
@@ -71,6 +71,8 @@ packaging==25.0
     #   huggingface-hub
     #   pytest
     #   transformers
+pathspec==0.12.1
+    # via mypy
 platformdirs==4.5.0
     # via virtualenv
 pluggy==1.6.0
@@ -101,7 +103,7 @@ requests==2.32.5
     #   transformers
 safetensors==0.7.0
     # via transformers
-setuptools==80.9.0
+setuptools==75.8.2
     # via
     #   torch
     #   torch-spyre
@@ -119,7 +121,7 @@ tqdm==4.67.1
     # via
     #   huggingface-hub
     #   transformers
-transformers==4.57.2
+transformers==4.57.1
     # via torch-spyre
 types-pyyaml==6.0.12.20250915
     # via torch-spyre
