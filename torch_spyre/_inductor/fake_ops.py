@@ -106,7 +106,7 @@ def spyre_unsqueeze(x, dim):
     res_shape = list(x_size)
     res_shape.insert(dim, 1)
     res_dim_order = []
-    for d in x_dci.dim_order:
+    for d in x_dci.host_dim_order():
         if d < dim:
             res_dim_order.append(d)
         elif d > dim:

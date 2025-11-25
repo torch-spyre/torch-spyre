@@ -110,10 +110,10 @@ def spyre_matmul_result_shape(
         or y_dci.format != SpyreTensorLayout.StickFormat.Dense
     ):
         raise Unsupported(f"matmul on non-dense tensors {x_dci} {y_dci}")
-    if x_dci.dim_order != y_dci.dim_order:
+    if x_dci.host_dim_order() != y_dci.host_dim_order():
         raise Unsupported(f"matmul stick dimensions mismatch {x_dci} {y_dci}")
     res_size = [x.size()[0], y.size()[1]]
-    res_dci = SpyreTensorLayout(res_size, x_dci.dtype)  # TODO: forcing generic stick
+    res_dci = SpyreTensorLayout(res_size, x.dtype, x_dci.host_dim_order())
     return res_size, res_dci
 
 
