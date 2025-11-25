@@ -105,15 +105,15 @@ def spyre_unsqueeze(x, dim):
         dim += len(x_size) + 1
     res_shape = list(x_size)
     res_shape.insert(dim, 1)
-    res_dim_order = []
-    for d in x_dci.host_dim_order():
-        if d < dim:
-            res_dim_order.append(d)
-        elif d > dim:
-            res_dim_order.append(d + 1)
-        else:
-            res_dim_order.append(d)
-            res_dim_order.append(d + 1)
+    x_dim_order = x_dci.host_dim_order()
+    if dim in x_dim_order:
+        idx = x_dim_order.index(dim)
+        res_dim_order = [x + 1 if x >= dim else x for x in x_dim_order]
+        res_dim_order.insert(idx, dim)
+    else:
+        idx = x_dim_order.index(dim - 1)
+        res_dim_order = list(x_dim_order)
+        res_dim_order.insert(idx + 1, dim)
     res = x.new_empty(res_shape)
     res.spyre_layout = SpyreTensorLayout(
         res_shape, res.dtype, res_dim_order, x_dci.format
