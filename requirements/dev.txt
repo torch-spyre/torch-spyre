@@ -101,7 +101,7 @@ requests==2.32.5
     #   transformers
 safetensors==0.7.0
     # via transformers
-setuptools==80.9.0
+setuptools==75.8.2
     # via
     #   torch
     #   torch-spyre
