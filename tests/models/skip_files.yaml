@@ -1,0 +1,5 @@
+skip:
+  - models/gpt-oss/test_mul_ng.py
+
+xfail:
+  - models/gpt-oss/dummy_xfail.py
