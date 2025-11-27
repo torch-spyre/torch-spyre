@@ -5,11 +5,6 @@ import torch.nn as nn
 import random
 import numpy as np
 
-try:
-	import pytest
-except ImportError:
-	pass
-
 
 def get_op_callable():
 	return torch.mul
