@@ -50,4 +50,4 @@ def test_mul_ng():
 	assert same, f"Outputs are different: max diff={max_diff}"
 
 if __name__ == '__main__':
-	test_mul_ok()
+	test_mul_ng()
