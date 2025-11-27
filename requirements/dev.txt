@@ -75,7 +75,7 @@ platformdirs==4.5.0
     # via virtualenv
 pluggy==1.6.0
     # via pytest
-pre-commit==4.0.1
+pre-commit==4.5.0
     # via torch-spyre
 psutil==7.1.3
     # via torch-spyre
