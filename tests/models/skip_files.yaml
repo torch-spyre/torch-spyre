@@ -1,5 +1,9 @@
 skip:
-  - models/gpt-oss/test_mul_ng.py
+  padding:
+    - models/gpt-oss/test_mul_ng.py
+  others:
+    - models/gpt-oss/dummy_skip.py
 
 xfail:
-  - models/gpt-oss/dummy_xfail.py
+  others:
+    - models/gpt-oss/dummy_xfail.py
