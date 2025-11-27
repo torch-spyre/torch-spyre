@@ -44,10 +44,8 @@ def pytest_collection_modifyitems(config, items):
     for reason in reasons:
         marker = pytest.mark.skip(reason=f"marked skip in skip_files.yaml: {reason}")
         skip_files = data["skip"][str(reason)]
-        print(reason, skip_files)
         skip_paths = [pathlib.Path(p).resolve() for p in skip_files]
         for p in skip_paths:
-            print("SKIP:", p)
             skip_markers[p] = marker
 
     reasons = data.get("xfail", [])
@@ -56,13 +54,29 @@ def pytest_collection_modifyitems(config, items):
         xfail_files = data.get(reason, [])
         xfail_paths = [pathlib.Path(p).resolve() for p in xfail_files]
         for p in xfail_paths:
-            print("SKIP:", p)
             xfail_markers[p] = marker
 
     for item in items:
         test_file = pathlib.Path(item.fspath).resolve()
-        print("T:", test_file)
         if test_file in skip_markers:
             item.add_marker(skip_markers[test_file])
         if test_file in xfail_markers:
             item.add_marker(xfail_markers[test_file])
+
+'''
+def pytest_ignore_collect(path, config):
+    if os.getenv("TEST_MODELS_OPS_ONLY_SKIP_FILES") is not None:
+        return False
+
+    yaml_path = pathlib.Path("models/skip_files.yaml")
+    if not yaml_path.exists():
+        return False
+
+    with open(yaml_path, "r") as f:
+        data = yaml.safe_load(f) or {}
+
+    exclude_files = data.get("exclude", [])
+    exclude_paths = [pathlib.Path(p).resolve() for p in exclude_files]
+
+    return path.resolve() in exclude_paths
+'''
