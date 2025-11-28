@@ -75,6 +75,13 @@ def spyre_sum(x, axis, keepdims=False):
     return res
 
 
+def spyre_mean(x, axis, keepdims=False):
+    res_size, res_dci = spyre_reduction_result_shape(x, axis, keepdims)
+    res = x.new_empty(res_size)
+    res.spyre_dci = res_dci
+    return res
+
+
 def spyre_pointwise_binary(x, y):
     if isinstance(y, torch.Tensor):
         res_size, res_dci = spyre_pointwise_result_shape(x, y)
@@ -147,6 +154,7 @@ _meta_ops = {
     aten.min.dim: spyre_min,
     aten.mm.default: spyre_matmul,
     aten.sum.dim_IntList: spyre_sum,
+    aten.mean.dim: spyre_mean,
     # Pointwise binary
     aten.add.Tensor: spyre_pointwise_binary,
     aten.div.Tensor: spyre_pointwise_binary,

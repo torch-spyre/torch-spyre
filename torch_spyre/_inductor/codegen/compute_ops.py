@@ -28,6 +28,8 @@ def encode_constant(v):
             return 0
         elif v == 1e-5:
             return 7327
+        elif v == 0.000347222222222222:
+            return 9944
         else:
             print(f"WARNING: finish hacky constant encoding function! {v}")
             return 1
