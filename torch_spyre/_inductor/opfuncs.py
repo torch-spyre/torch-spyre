@@ -68,6 +68,7 @@ def _initialize_opfunc_mapping():
     pointwise_ops["truediv"] = "realdiv"
     pointwise_ops["relu"] = "relufwd"
     pointwise_ops["eq"] = "equal"
+    pointwise_ops["ne"] = "notequal"
     pointwise_ops["ge"] = "greaterequal"
     pointwise_ops["where"] = "where3"
 

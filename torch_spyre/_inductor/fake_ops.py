@@ -153,6 +153,7 @@ _meta_ops = {
     aten.eq.Tensor: spyre_pointwise_binary,
     aten.ge.Tensor: spyre_pointwise_binary,
     aten.mul.Tensor: spyre_pointwise_binary,
+    aten.ne.Tensor: spyre_pointwise_binary,
     aten.sub.Tensor: spyre_pointwise_binary,
     # Pointwise unary
     aten.abs.default: spyre_pointwise_unary,
