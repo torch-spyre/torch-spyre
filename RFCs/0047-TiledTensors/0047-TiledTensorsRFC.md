@@ -1,6 +1,24 @@
-# Problem Statement
+# [Tiled Tensors]
 
-## Background: Spyre Tensors
+**Authors:**
+* @dgrove-oss
+
+## **Summary**
+
+PyTorch tensors have a `size()` method that describes their logical dimensionality.
+When a tensor is realized, its elements must be laid out in some specific linerar order
+in memory. The `strides()` of a tensor are used to encode this linear ordering.
+This encoding using `strides()` can represent commonly used linearizations including
+row major (dimension `-1` has stride `1`) and column major (dimension `0` has stride `1`).
+However `strides()` by itself cannot properly represent *tiled* tensors, which break the invariant
+that the stride beween consecutive elements in a dimension can be described by a single integer.
+The goal of this RFC is to motivate the need for enabling tiled tensors as a first-class concept
+in PyTorch and to extend the APIs and implementation q to naturally support them.
+but is inadequate to represent *tiled* tensors.
+
+## **Motivation**
+
+### Background: Spyre Tensors
 
 Spyre is a SIMD dataflow engine.  All memory and compute operations
 operate on chunks of 128 bytes.  We call this chunk of 128 bytes a
@@ -75,7 +93,7 @@ Mappings between host and device memory for the resulting stick-sparse
 tensors can be encoded just in the strides (no modulus/floor is
 needed).
 
-### Implications of Sticks for PyTorch
+### Implications of Tiled Tensors for PyTorch
 
 To implement host/device memory transfers and device memory allocation
 for Spyre, the runtime representation of Spyre Tensors must accurately
@@ -97,9 +115,9 @@ stick dimensions for individual Tensors to enable them to guide the
 compiler/runtime system into making optimal use of the hardware for
 key kernels.
 
-# Proposed Solution
+## **Proposed Implementation**
 
-## Runtime / Programming Model Support
+### Runtime / Programming Model Support
 
 The torch-spyre plugin implements `SpyreTensorImpl`, a subclass of
 `TensorImpl` that contains a `SpyreDeviceLayout` object with encapsulates
@@ -129,7 +147,7 @@ dimension(s). This is an expensive operation, since it involves
 creating a new backing storage on the device and reading/writing all
 bytes of the Tensor to achieve the required memory layout.
 
-## Dynamo / Inductor Compile Time Support
+### Dynamo / Inductor Compile Time Support
 
 For both correctness and optimization purposes, the on-device memory
 layout of Spyre Tensors must be accurately represented in at least
@@ -149,17 +167,17 @@ all realized operations have `SpyreFixedLayouts` instead of `FixedLayout`.
 
 In our current prototype, we have accomplished `3` by interposing
 fairly  early in Inductor's compilation stages.  In particular, we
-+ dynamically add a new field to `FakeTensor` instances that holds an
+* dynamically add a new field to `FakeTensor` instances that holds an
   instance of the `SpyreDeviceLayout` class
 
-+ enhance the code that constructs a `FakeTensor` from a `Tensor` to capture
+* enhance the code that constructs a `FakeTensor` from a `Tensor` to capture
 the `SpyreDeviceLayout` and store it in the `FakeTensor`.
 
-+ enhance the `FakeTensor` propagation machinery and fake_ops to use the
+* enhance the `FakeTensor` propagation machinery and fake_ops to use the
 extended layout information on their inputs to compute the extended
 layout information of their outputs.
 
-+ use the extended layout information from the fx graph nodes in the
+* use the extended layout information from the fx graph nodes in the
 Spyre backend code generation.
 
 We are also evaluating a less invasive alternative implementation of
@@ -168,3 +186,80 @@ by doing a pass over the SchedulerNodes immediately before final code generation
 and replacing `FlexibleLayout` with `SpyreFixedLayout` using the `SpyreFixedLaout` information
 from the Node's inputs and the operation being performed to derive the
 `SpyreFixedLayout` of the output.
+
+## **Metrics **
+ <!--
+What are the main metrics to measure the value of this feature?
+-->
+
+TODO
+
+## **Drawbacks**
+<!--
+Are there any reasons why we should not do this? Here we aim to evaluate risk and check ourselves.
+
+Please consider:
+* is it a breaking change?
+* Impact on UX
+* implementation cost, both in terms of code size and complexity
+* integration of this feature with other existing and planned features
+-->
+
+TODO
+
+## **Alternatives**
+<!--
+What other designs have been considered? What is the impact of not doing this?
+-->
+TODO
+
+## **Prior Art**
+<!--
+Discuss prior art (both good and bad) in relation to this proposal:
+* Does this feature exist in other libraries? What experience has their community had?
+* What lessons can be learned from other implementations of this feature?
+* Published papers or great posts that discuss this
+-->
+TODO
+
+## **How we teach this**
+<!--
+* What names and terminology work best for these concepts and why? How is this idea best presented?
+* Would the acceptance of this proposal mean the PyTorch documentation must be re-organized or altered?
+* How should this feature be taught to existing PyTorch users?
+-->
+TODO
+
+## **Unresolved questions**
+<!--
+* What parts of the design do you expect to resolve through the RFC process before this gets merged?
+* What parts of the design do you expect to resolve through the implementation of this feature before stabilization?
+* What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?
+-->
+
+## Resolution
+
+TBD
+
+### Level of Support
+<!--
+Choose one of the following:
+* 1: Overwhelming positive feedback.
+* 2: Positive feedback.
+* 3: Majority Acceptance, with conflicting Feedback.
+* 4: Acceptance, with Little Feedback.
+* 5: Unclear Resolution.
+* 6: RFC Rejected.
+* 7: RFC Rejected, with Conflicting Feedback.
+-->
+
+#### Additional Context
+
+### Next Steps
+
+#### Tracking issue
+<!---
+<github issue URL>
+-->
+
+#### Exceptions
