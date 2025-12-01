@@ -45,6 +45,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   auto elem_bytes = c10::elementSize(dtype);
   auto elems_in_stick = BYTES_IN_STICK / elem_bytes;
 
+  TORCH_CHECK(host_size.size() == dim_order.size(),
+              "Invalid arguments: host_size.size() != dim_order.size()");
+
   this->device_size.resize(device_dims);
   this->device_strides.resize(device_dims);
   this->dim_map.resize(device_dims);
