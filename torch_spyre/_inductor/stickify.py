@@ -103,18 +103,18 @@ def tensor_get_spyre_layout(self: torch.Tensor) -> SpyreTensorLayout:
 def spyre_matmul_result_shape(
     x: torch.Tensor, y: torch.Tensor
 ) -> Tuple[Sequence[int], SpyreTensorLayout]:
-    x_dci: SpyreTensorLayout = x.get_spyre_layout()
-    y_dci: SpyreTensorLayout = y.get_spyre_layout()
+    x_layout: SpyreTensorLayout = x.get_spyre_layout()
+    y_layout: SpyreTensorLayout = y.get_spyre_layout()
     if (
-        x_dci.format != SpyreTensorLayout.StickFormat.Dense
-        or y_dci.format != SpyreTensorLayout.StickFormat.Dense
+        x_layout.format != SpyreTensorLayout.StickFormat.Dense
+        or y_layout.format != SpyreTensorLayout.StickFormat.Dense
     ):
-        raise Unsupported(f"matmul on non-dense tensors {x_dci} {y_dci}")
-    if x_dci.host_dim_order() != y_dci.host_dim_order():
-        raise Unsupported(f"matmul stick dimensions mismatch {x_dci} {y_dci}")
+        raise Unsupported(f"matmul on non-dense tensors {x_layout} {y_layout}")
+    if x_layout.host_dim_order() != y_layout.host_dim_order():
+        raise Unsupported(f"matmul stick dimensions mismatch {x_layout} {y_layout}")
     res_size = [x.size()[0], y.size()[1]]
-    res_dci = SpyreTensorLayout(res_size, x.dtype, x_dci.host_dim_order())
-    return res_size, res_dci
+    res_layout = SpyreTensorLayout(res_size, x.dtype, x_layout.host_dim_order())
+    return res_size, res_layout
 
 
 def spyre_reduction_result_shape(
@@ -129,10 +129,10 @@ def spyre_reduction_result_shape(
             axis[i] += len(x_size) if len(x_size) else 1
 
     # Compute result shape + DCI
-    x_dci: SpyreTensorLayout = x.get_spyre_layout()
-    is_stick_reduction = x_dci.is_stick_reduction(axis)
+    x_layout: SpyreTensorLayout = x.get_spyre_layout()
+    is_stick_reduction = x_layout.is_stick_reduction(axis)
     res_size = list(x_size)
-    res_order = x_dci.host_dim_order()
+    res_order = x_layout.host_dim_order()
     for d in axis:
         if keepdims:
             res_size[d] = 1
@@ -147,8 +147,8 @@ def spyre_reduction_result_shape(
         if is_stick_reduction
         else SpyreTensorLayout.StickFormat.Dense
     )
-    result_dci = SpyreTensorLayout(res_size, x.dtype, res_order, format=res_format)
-    return res_size, result_dci
+    res_layout = SpyreTensorLayout(res_size, x.dtype, res_order, format=res_format)
+    return res_size, res_layout
 
 
 def spyre_pointwise_result_shape(
@@ -191,23 +191,23 @@ def spyre_pointwise_result_shape(
         res_size[i] = y_size[i]
         x_broadcasted[i] = True
 
-    x_dci = x.get_spyre_layout()
-    y_dci = y.get_spyre_layout()
-    if x_dci.format == y_dci.format:
-        res_format = x_dci.format
+    x_layout = x.get_spyre_layout()
+    y_layout = y.get_spyre_layout()
+    if x_layout.format == y_layout.format:
+        res_format = x_layout.format
     elif (
-        x_dci.format == SpyreTensorLayout.StickFormat.Dense
-        and y_broadcasted[x_dci.stick_dim()]
+        x_layout.format == SpyreTensorLayout.StickFormat.Dense
+        and y_broadcasted[x_layout.stick_dim()]
     ):
         res_format = SpyreTensorLayout.StickFormat.Dense
     elif (
-        y_dci.format == SpyreTensorLayout.StickFormat.Dense
-        and x_broadcasted[y_dci.stick_dim]
+        y_layout.format == SpyreTensorLayout.StickFormat.Dense
+        and x_broadcasted[y_layout.stick_dim]
     ):
         res_format = SpyreTensorLayout.StickFormat.Dense
     else:
         raise Unsupported(
-            f"binop with incompatible DCIs: {x_dci} {y_dci} {x_broadcasted} {y_broadcasted}"
+            f"binop with incompatible DCIs: {x_layout} {y_layout} {x_broadcasted} {y_broadcasted}"
         )
 
     # TODO: Forcing generic stick dimension order

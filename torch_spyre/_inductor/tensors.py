@@ -106,9 +106,9 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
             t = n.meta.get("val", None)
             if isinstance(t, torch.Tensor):
                 if t.device.type == "spyre":
-                    dci = t.get_spyre_layout()
-                    if isinstance(dci, SpyreTensorLayout):
-                        self.layout = dci.spyre_fixed_layout(
+                    layout = t.get_spyre_layout()
+                    if isinstance(layout, SpyreTensorLayout):
+                        self.layout = layout.spyre_fixed_layout(
                             t.device, t.size(), t.dtype
                         )
                         return self.layout
@@ -118,9 +118,9 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
                 # TODO: This only works because Spyre implements amax/amin and doesn't implement argmax/argmin
                 t = t[0]
                 if t.device.type == "spyre":
-                    dci = t.get_spyre_layout()
-                    if isinstance(dci, SpyreTensorLayout):
-                        self.layout = dci.spyre_fixed_layout(
+                    layout = t.get_spyre_layout()
+                    if isinstance(layout, SpyreTensorLayout):
+                        self.layout = layout.spyre_fixed_layout(
                             t.device, t.size(), t.dtype
                         )
                         return self.layout

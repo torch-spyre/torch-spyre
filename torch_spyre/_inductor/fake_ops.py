@@ -30,63 +30,63 @@ aten = torch.ops.aten
 
 
 def spyre_matmul(x, y):
-    res_size, res_dci = spyre_matmul_result_shape(x, y)
+    res_size, res_layout = spyre_matmul_result_shape(x, y)
     res = x.new_empty(res_size)
-    res.spyre_layout = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_amax(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     res = x.new_empty(res_size)
-    res.spyre_layout = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_amin(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     res = x.new_empty(res_size)
-    res.spyre_layout = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_max(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     values = x.new_empty(res_size)
-    values.spyre_layout = res_dci
+    values.spyre_layout = res_layout
     indices = x.new_empty(res_size, dtype=torch.int64)
-    indices.spyre_layout = res_dci
+    indices.spyre_layout = res_layout
     return torch.return_types.max(sequence=(values, indices))
 
 
 def spyre_min(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     values = x.new_empty(res_size)
-    values.spyre_layout = res_dci
+    values.spyre_layout = res_layout
     indices = x.new_empty(res_size, dtype=torch.int64)
-    indices.spyre_layout = res_dci
+    indices.spyre_layout = res_layout
     return torch.return_types.min(sequence=(values, indices))
 
 
 def spyre_sum(x, axis, keepdims=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, axis, keepdims)
+    res_size, res_layout = spyre_reduction_result_shape(x, axis, keepdims)
     res = x.new_empty(res_size)
-    res.spyre_layout = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_mean(x, axis, keepdims=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, axis, keepdims)
+    res_size, res_layout = spyre_reduction_result_shape(x, axis, keepdims)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_pointwise_binary(x, y):
     if isinstance(y, torch.Tensor):
-        res_size, res_dci = spyre_pointwise_result_shape(x, y)
+        res_size, res_layout = spyre_pointwise_result_shape(x, y)
         res = x.new_empty(res_size)
-        res.spyre_layout = res_dci
+        res.spyre_layout = res_layout
         return res
     else:
         return spyre_pointwise_unary(x)
@@ -100,12 +100,12 @@ def spyre_pointwise_unary(x):
 
 def spyre_unsqueeze(x, dim):
     x_size = x.size()
-    x_dci = x.get_spyre_layout()
+    x_layout = x.get_spyre_layout()
     if dim < 0:
         dim += len(x_size) + 1
     res_shape = list(x_size)
     res_shape.insert(dim, 1)
-    x_dim_order = x_dci.host_dim_order()
+    x_dim_order = x_layout.host_dim_order()
     if dim in x_dim_order:
         idx = x_dim_order.index(dim)
         res_dim_order = [x + 1 if x >= dim else x for x in x_dim_order]
@@ -116,7 +116,7 @@ def spyre_unsqueeze(x, dim):
         res_dim_order.insert(idx + 1, dim)
     res = x.new_empty(res_shape)
     res.spyre_layout = SpyreTensorLayout(
-        res_shape, res.dtype, res_dim_order, x_dci.format
+        res_shape, res.dtype, res_dim_order, x_layout.format
     )
     return res
 

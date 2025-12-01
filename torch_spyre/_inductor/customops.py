@@ -108,10 +108,10 @@ def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor: 
 
 @exx2.register_fake
 def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
-    res_size, res_dci = spyre_reduction_result_shape(x, [x.ndim - 1], False)
-    res_dci.format = SpyreTensorLayout.StickFormat.SparseMulti
+    res_size, res_layout = spyre_reduction_result_shape(x, [x.ndim - 1], False)
+    res_layout.format = SpyreTensorLayout.StickFormat.SparseMulti
     res = x.new_empty(res_size)
-    res.spyre_layout = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
@@ -122,14 +122,14 @@ def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:  # type: ignore
 
 @layernormscale.register_fake
 def _(x: torch.Tensor, eps: float) -> torch.Tensor:
-    x_dci = x.get_spyre_layout()
-    if x_dci.format != SpyreTensorLayout.StickFormat.SparseMulti:
-        raise Unsupported(f"layernormscale: Unexpected format {x_dci.format}")
-    res_dci = copy.deepcopy(x_dci)
-    res_dci.format = SpyreTensorLayout.StickFormat.Sparse
+    x_layout = x.get_spyre_layout()
+    if x_layout.format != SpyreTensorLayout.StickFormat.SparseMulti:
+        raise Unsupported(f"layernormscale: Unexpected format {x_layout.format}")
+    res_layout = copy.deepcopy(x_layout)
+    res_layout.format = SpyreTensorLayout.StickFormat.Sparse
     res_size = list(x.size())
     res = x.new_empty(res_size)
-    res.spyre_layout = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
