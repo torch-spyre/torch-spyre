@@ -161,11 +161,7 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     size = x.get_size()
     denom = torch._inductor.utils.sympy_product(size[i] for i in axis)
     scaling_factor = 1.0 / denom
-    op_info = {
-        "constants": {
-            "scaling_factor": scaling_factor
-        }
-    }
+    op_info = {"constants": {"scaling_factor": scaling_factor}}
     result = SpyreReduction.create(
         reduction_type="mean", input_node=x, op_info=op_info, **kwargs
     )
