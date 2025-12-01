@@ -31,7 +31,7 @@ fsspec==2025.10.0
     #   torch
 hf-xet==1.2.0 ; platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
     # via huggingface-hub
-huggingface-hub==0.36.0
+huggingface-hub==1.1.7
     # via
     #   tokenizers
     #   transformers
