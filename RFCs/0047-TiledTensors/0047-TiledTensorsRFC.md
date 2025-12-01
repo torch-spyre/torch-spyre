@@ -1,4 +1,4 @@
-# [Tiled Tensors]
+# Tiled Tensors
 
 **Authors:**
 * @dgrove-oss
@@ -187,7 +187,7 @@ and replacing `FlexibleLayout` with `SpyreFixedLayout` using the `SpyreFixedLaou
 from the Node's inputs and the operation being performed to derive the
 `SpyreFixedLayout` of the output.
 
-## **Metrics **
+## **Metrics**
  <!--
 What are the main metrics to measure the value of this feature?
 -->
