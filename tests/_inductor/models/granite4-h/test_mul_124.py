@@ -47,7 +47,7 @@ def test_mul_124():
     if not same:
         max_diff = (out_cpu - out_sen).abs().max().item()
         print("Max diff:", max_diff)
-    
+
     assert same, f"Outputs are different: max diff={max_diff}"
 
 
