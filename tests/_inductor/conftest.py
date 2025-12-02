@@ -68,7 +68,7 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(xfail_markers[test_file])
 
 
-def pytest_ignore_collect(collection_path, path, config):
+def pytest_ignore_collect(collection_path, config):
     if os.getenv("TEST_MODELS_OPS_ONLY_SKIP_FILES") is None:
         return False
 
