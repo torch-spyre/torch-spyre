@@ -17,6 +17,7 @@ import os
 import pytest
 import yaml
 
+
 def pytest_sessionstart(session):
     """
     Called after the Session object has been created and
@@ -25,8 +26,11 @@ def pytest_sessionstart(session):
     os.environ.setdefault("DTLOG_LEVEL", "error")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
 
+
 # for test_models_ops.py
 def pytest_collection_modifyitems(config, items):
+    if os.getenv("TEST_MODELS_OPS_ONLY_SKIP_FILES") is not None:
+        return False
     if os.getenv("TEST_MODELS_OPS_IGNORE_SKIP_FILES") is not None:
         return False
 
@@ -63,9 +67,9 @@ def pytest_collection_modifyitems(config, items):
         if test_file in xfail_markers:
             item.add_marker(xfail_markers[test_file])
 
-'''
-def pytest_ignore_collect(path, config):
-    if os.getenv("TEST_MODELS_OPS_ONLY_SKIP_FILES") is not None:
+
+def pytest_ignore_collect(collection_path, path, config):
+    if os.getenv("TEST_MODELS_OPS_ONLY_SKIP_FILES") is None:
         return False
 
     yaml_path = pathlib.Path("models/skip_files.yaml")
@@ -75,8 +79,20 @@ def pytest_ignore_collect(path, config):
     with open(yaml_path, "r") as f:
         data = yaml.safe_load(f) or {}
 
-    exclude_files = data.get("exclude", [])
-    exclude_paths = [pathlib.Path(p).resolve() for p in exclude_files]
+    exclude_paths = []
+    reasons = data.get("skip", [])
+    for reason in reasons:
+        skip_files = data["skip"][str(reason)]
+        exclude_paths.extend([pathlib.Path(p).resolve() for p in skip_files])
 
-    return path.resolve() in exclude_paths
-'''
+    reasons = data.get("xfail", [])
+    for reason in reasons:
+        xfail_files = data["xfail"][str(reason)]
+        exclude_paths.extend([pathlib.Path(p).resolve() for p in xfail_files])
+    print(exclude_paths)
+
+    p = collection_path.resolve()
+    print("CP", p, str(type(collection_path)), str(type(exclude_paths[0])))
+    if os.path.isdir(p):
+        return False
+    return p not in exclude_paths
