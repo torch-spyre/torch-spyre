@@ -67,7 +67,7 @@ struct DMAParameters {
  * @param sizes: dimension sizes of the CPU tensor
  * @return ordering of dimensions on device
  */
-auto get_device_layout(std::vector<int64_t> sizes) -> std::vector<int64_t> {
+auto get_device_layout(c10::IntArrayRef sizes) -> std::vector<int64_t> {
   std::vector<int64_t> dim_order;
   switch (sizes.size()) {
     case 1:
@@ -100,7 +100,7 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
     -> std::vector<int64_t> {
   auto cpu_shape = sizes.vec();
   std::vector<int64_t> dev_shape;
-  auto dev_dim_order = get_device_layout(cpu_shape);
+  auto dev_dim_order = get_device_layout(sizes);
   auto stick_dim_shape = cpu_shape[dev_dim_order.front()];
   auto stick_dim = dev_dim_order.front();
   /* Pad the stick dimension if size of the dimension is
@@ -209,12 +209,13 @@ auto get_dim_device_size(int stick_size, int dim,
  * @param host2device: direction of data conversion
  * @return description of data conversion
  */
-auto get_device_stride_info(std::vector<int64_t> cpu_shape,
+auto get_device_stride_info(c10::IntArrayRef sizes,
                             std::vector<int64_t> cpu_strides,
                             std::vector<int64_t> dev_shape, int stick_size,
                             bool host2device) -> data_conversion_stride_info {
   data_conversion_stride_info stride_info;
-  auto dev_dim_order = get_device_layout(cpu_shape);
+  auto cpu_shape = sizes.vec();
+  auto dev_dim_order = get_device_layout(sizes);
   bool size_less_than_stick = cpu_shape[dev_dim_order.front()] < stick_size;
 
   stride_info.size_.push_back(
@@ -275,7 +276,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   std::vector<data_conversion_stride_info> dcsi;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
-  auto dev_dim_order = get_device_layout(cpu_shape);
+  auto dev_dim_order = get_device_layout(sizes);
   bool requires_padding = cpu_shape[dev_dim_order.front()] % stick_size != 0;
   bool size_less_than_stick = cpu_shape[dev_dim_order.front()] < stick_size;
   data_conversion_stride_info stride_info;
