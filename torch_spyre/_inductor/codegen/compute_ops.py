@@ -17,6 +17,7 @@ import os
 from torch_spyre._C import encode_constant, get_sen_data_format
 from torch_spyre._inductor.constants import BYTES_PER_STICK
 
+
 def generate_constant_info(data_format, **kwargs):
     if "op_info" not in kwargs or "constants" not in kwargs["op_info"]:
         return "{}"
