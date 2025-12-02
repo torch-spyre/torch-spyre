@@ -173,12 +173,12 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
 
   return;
 }
-auto getSenDataFormat(c10::ScalarType torch_dtype) {
+std::string getSenDataFormat(c10::ScalarType torch_dtype) {
   const auto [dtype_cpu, dtype_dev] =
       stringToDTDataFormatPair(torchScalarToString[torch_dtype]);
   return EnumsConversion::dataFormatsToString(dtype_dev);
 }
-auto encodeConstant(uint32_t torch_const, const std::string &data_format) {
+uint32_t encodeConstant(uint32_t torch_const, const std::string &data_format) {
   uint32_t sen_const;
   DataFormats df;
   df = FromString<DataFormats>(data_format);
