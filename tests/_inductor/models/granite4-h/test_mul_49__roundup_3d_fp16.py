@@ -1,9 +1,7 @@
-import numpy
 import torch
 import torch.nn as nn
 import random
 import numpy as np
-from math import inf
 
 
 def get_op_callable():
