@@ -178,7 +178,7 @@ std::string getSenDataFormat(c10::ScalarType torch_dtype) {
       stringToDTDataFormatPair(torchScalarToString[torch_dtype]);
   return EnumsConversion::dataFormatsToString(dtype_dev);
 }
-uint32_t encodeConstant(uint32_t torch_const, const std::string &data_format) {
+uint32_t encodeConstant(float torch_const, const std::string &data_format) {
   uint32_t sen_const;
   DataFormats df;
   df = FromString<DataFormats>(data_format);
