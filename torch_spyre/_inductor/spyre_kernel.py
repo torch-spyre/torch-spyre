@@ -31,7 +31,7 @@ from torch._inductor.virtualized import ReductionType, StoreMode, V
 
 
 from .runtime import ConstantArg, TensorArg
-from .constants import MATMUL_REDUCTION_OP, TRANSPOSE_OP
+from .constants import MATMUL_REDUCTION_OP, TRANSPOSE_OP, SPYRE_FP32_OPS
 from . import Unsupported
 from .opoverrides import SpyreKernelOverrides
 from .opfuncs import UNIMPLEMENTED, get_spyre_op
@@ -355,7 +355,12 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 with buf.indent():
                     for arg in ks.arguments:
                         buf.writeline(f"{arg!r},")
-                        if arg.dtype != torch.float16:
+                        if (
+                            arg.dtype == torch.float32
+                            and self.spyre_op not in SPYRE_FP32_OPS
+                        ):
+                            raise Unsupported(f"{self.spyre_op} on {arg.dtype} dtype")
+                        elif arg.dtype != torch.float16 and arg.dtype != torch.float32:
                             raise Unsupported(f"operations on {arg.dtype} dtype")
                 buf.writeline("]")
             buf.writeline(")")
