@@ -180,12 +180,13 @@ layout information of their outputs.
 * use the extended layout information from the fx graph nodes in the
 Spyre backend code generation.
 
-We are also evaluating a less invasive alternative implementation of
-`3` in which device layouts are introduced later in Inductor compilation,
-by doing a pass over the SchedulerNodes immediately before final code generation
-and replacing `FlexibleLayout` with `SpyreFixedLayout` using the `SpyreFixedLaout` information
-from the Node's inputs and the operation being performed to derive the
-`SpyreFixedLayout` of the output.
+We are also evaluating a less invasive alternative implementation
+in which device layouts are introduced later in Inductor compilation.
+We do this by using the `_pre_fusion_custom_pass` extension point of the `Scheduler`
+to do a pass over the topologically sorted SchedulerNodes and replacing the
+`FixedLayout` of each `ComputedBuffer` with a `SpyreFixedLayout`. We believe
+we should be able to adapt the tiled tensor shape computation which is currently
+being done in fake_ops to run over the LoopLevelIR instead.
 
 ## **Metrics**
  <!--
