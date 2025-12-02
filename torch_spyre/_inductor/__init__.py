@@ -61,6 +61,7 @@ def _autoload():
 
     # Customize inductor configuration
     from .passes import CustomPrePasses, CustomPostPasses
+    from .stickify import propagate_spyre_tensor_layouts
 
     torch._inductor.config.triton.use_block_ptr = True
     torch._inductor.config.triton.prefer_nd_tiling = True
@@ -69,6 +70,7 @@ def _autoload():
     torch._inductor.config.benchmark_harness = False
     torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
     torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
+    torch._inductor.config._pre_fusion_custom_pass = propagate_spyre_tensor_layouts
     # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
     torch._inductor.config.unroll_reductions_threshold = 1

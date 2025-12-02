@@ -16,6 +16,7 @@ from contextlib import contextmanager
 
 import torch
 from torch._dynamo.backends.common import AotAutograd
+from torch._inductor.virtualized import V
 from .stickify import (
     spyre_matmul_result_shape,
     spyre_bmm_result_shape,
@@ -271,7 +272,11 @@ class SpyreAotAutograd(AotAutograd):
             isinstance(t, torch.Tensor) and t.device.type == "spyre"
             for t in example_inputs
         ):
-            with spyre_meta_ops(), spyre_data_types():
+            with (
+                spyre_meta_ops(),
+                spyre_data_types(),
+                V.set_real_inputs(example_inputs),
+            ):
                 return super().__call__(gm, example_inputs, **kwargs)
         else:
             return super().__call__(gm, example_inputs, **kwargs)

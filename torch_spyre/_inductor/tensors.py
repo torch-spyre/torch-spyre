@@ -36,10 +36,12 @@ def install_spyre_tensors():
     torch._functorch._aot_autograd.dispatch_and_compile_graph._detach_and_copy_item_memo = spyre_detach_and_copy_item_memo
     torch.fx.experimental.proxy_tensor.snapshot_fake = spyre_snapshot_fake
     torch.fx.passes.fake_tensor_prop.snapshot_fake = spyre_snapshot_fake
+    """
     torch._inductor.ir.Buffer.get_layout = spyre_get_layout
     torch._inductor.ir.Buffer.freeze_layout_with_exact_strides = (
         spyre_freeze_layout_with_exact_strides
     )
+    """
 
 
 def spyre_ftc_from_real_tensor(

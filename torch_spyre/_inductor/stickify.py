@@ -16,12 +16,13 @@ from typing import Sequence, Tuple, Union
 
 import torch
 from sympy import Expr
-from torch._inductor.ir import FixedLayout
+from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
+from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.virtualized import V
 from torch.fx.experimental.symbolic_shapes import (
     guard_size_oblivious,
     is_nested_int,
 )
-
 from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
 
@@ -214,3 +215,38 @@ def spyre_pointwise_result_shape(
     # TODO: Forcing generic stick dimension order
     dim_order = list(range(len(res_size)))
     return res_size, SpyreTensorLayout(res_size, x.dtype, dim_order, format=res_format)
+
+
+def propagate_spyre_tensor_layouts(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
+        if isinstance(real_input, torch.Tensor):
+            stl = real_input.device_tensor_layout()
+            if stl is None:
+                # TODO: This should become a hard-error
+                print(
+                    f"Warning: missing device_tensor_layout on graph input {name}; assuming generic stick layout"
+                )
+                stl = SpyreTensorLayout(real_input.size(), real_input.dtype)
+            tb = V.graph.graph_inputs[name]
+            if (
+                not isinstance(tb, TensorBox)
+                or not isinstance(tb.data, StorageBox)
+                or not isinstance(tb.data.data, InputBuffer)
+            ):
+                raise Unsupported(
+                    "graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                )
+            ptl = tb.data.data.layout
+            if not isinstance(ptl, FixedLayout):
+                raise Unsupported("graph input {name} does not have a FixedLayout")
+            tb.data.data.layout = SpyreFixedLayout(
+                ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
+            )
+
+    print(f"{V.graph.graph_inputs}")
+    for n in nodes:
+        print(f"{n} {type(n.node)} {n.read_writes} {n.outputs_by_name}")
+
+    return nodes
