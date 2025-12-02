@@ -49,6 +49,9 @@
 
 namespace spyre {
 
+using DataConversionStrideInfo = data_conversion_stride_info;
+using DataConversionInfo = data_conversion_info;
+
 /* struct holding the parameters for DMA-based copy
    size_bytes: number of bytes to transfer
    src_offset: offset from src base pointer
@@ -100,7 +103,7 @@ auto get_device_shape(c10::IntArrayRef sizes, int stick_size)
     -> std::vector<int64_t> {
   auto cpu_shape = sizes.vec();
   std::vector<int64_t> dev_shape;
-  auto dev_dim_order = get_device_layout(sizes);
+  auto dev_dim_order = get_device_layout(cpu_shape);
   auto stick_dim_shape = cpu_shape[dev_dim_order.front()];
   auto stick_dim = dev_dim_order.front();
   /* Pad the stick dimension if size of the dimension is
@@ -209,13 +212,12 @@ auto get_dim_device_size(int stick_size, int dim,
  * @param host2device: direction of data conversion
  * @return description of data conversion
  */
-auto get_device_stride_info(c10::IntArrayRef sizes,
+auto get_device_stride_info(std::vector<int64_t> cpu_shape,
                             std::vector<int64_t> cpu_strides,
                             std::vector<int64_t> dev_shape, int stick_size,
-                            bool host2device) -> data_conversion_stride_info {
-  data_conversion_stride_info stride_info;
-  auto cpu_shape = sizes.vec();
-  auto dev_dim_order = get_device_layout(sizes);
+                            bool host2device) -> DataConversionStrideInfo {
+  DataConversionStrideInfo stride_info;
+  auto dev_dim_order = get_device_layout(cpu_shape);
   bool size_less_than_stick = cpu_shape[dev_dim_order.front()] < stick_size;
 
   stride_info.size_.push_back(
@@ -250,12 +252,12 @@ auto get_device_stride_info(c10::IntArrayRef sizes,
  * added during the data conversion step. This padding is handled in two
  * different ways based on the size of the dimension:
  *    1. If the size of the stick dimension is less than the stick size, then
- *     a single data_conversion_stride_info struct is created with the size of
+ *     a single DataConversionStrideInfo struct is created with the size of
  * that dimension being the cpu shape.
  *    2. If the size of the stick dimension is more than the stick size, then
- * two data_conversion_stride_info are needed. The first is has the size of the
+ * two DataConversionStrideInfo are needed. The first is has the size of the
  * stick dimension being the cpu shape. The cpu and device offsets are 0. The
- * second data_conversion_stride_info has the same cpu and device strides as the
+ * second DataConversionStrideInfo has the same cpu and device strides as the
  * first. For the second, the size of the stick dimension is the remainder of
  * the dimension size divided by the stick size (rounded down). The cpu offset
  * is the dimension size divided by the stick size (rounded up), multiplied by
@@ -272,22 +274,22 @@ auto get_device_stride_info(c10::IntArrayRef sizes,
 auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                              std::vector<int64_t> dev_shape, int stick_size,
                              bool host2device)
-    -> std::vector<data_conversion_stride_info> {
-  std::vector<data_conversion_stride_info> dcsi;
+    -> std::vector<DataConversionStrideInfo> {
+  std::vector<DataConversionStrideInfo> dcsi;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
-  auto dev_dim_order = get_device_layout(sizes);
+  auto dev_dim_order = get_device_layout(cpu_shape);
   bool requires_padding = cpu_shape[dev_dim_order.front()] % stick_size != 0;
   bool size_less_than_stick = cpu_shape[dev_dim_order.front()] < stick_size;
-  data_conversion_stride_info stride_info;
+  DataConversionStrideInfo stride_info;
 
   stride_info = get_device_stride_info(cpu_shape, cpu_strides, dev_shape,
                                        stick_size, host2device);
   dcsi.push_back(stride_info);
 
   if (requires_padding && !size_less_than_stick) {
-    /* Second data_conversion_stride_info has same strides, so we can reuse the
-     * stride information from the first data_conversion_stride_info
+    /* Second DataConversionStrideInfo has same strides, so we can reuse the
+     * stride information from the first DataConversionStrideInfo
      * and update the stick dim sizes and offsets
      */
     auto pad_stride_info = stride_info;
@@ -332,7 +334,7 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
   constexpr auto bytesPerStick = 128;
   int stick_size = bytesPerStick / tensor->element_size();
   std::vector<int64_t> dev_shape = get_device_shape(tensor);
-  data_conversion_info* dci = new data_conversion_info();
+  DataConversionInfo* dci = new data_conversion_info();
   dci->dci_dsName_ = "DCI-Tensor-0";
   dci->isHostToSen_ = host2device;
   dci->dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
