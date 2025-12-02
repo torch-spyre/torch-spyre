@@ -3,6 +3,13 @@ skip:
   padded_tensor:
     - models/gpt-oss/test_mul_ng.py
     - models/granite4-h/test_mul_48.py
+    - models/granite4-h/test_mul_49.py
+  # https://github.com/torch-spyre/torch-spyre/issues/165
+  fp32:
+    - models/granite4-h/test_mul_49.py
+  # https://github.com/torch-spyre/torch-spyre/issues/180
+  more_3d_tensor:
+    - models/granite4-h/test_mul_49.py
   # https://github.com/torch-spyre/torch-spyre/issues/51
   constant:
     - models/granite4-h/test_mul_162.py
