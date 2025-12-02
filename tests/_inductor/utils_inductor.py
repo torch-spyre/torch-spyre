@@ -169,11 +169,12 @@ class ParameterizedTestMeta(type):
 
 
 # compare with eager
-def compare_with_eager(fn, *args, atol=0, rtol=0):
+def compare_with_eager(fn, *args, atol=0, rtol=0, needs_device=False):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
     device_args = [arg.to(DEVICE) for arg in args]
-    result = torch.compile(fn)(*device_args).cpu()
-    eager_result = fn(*device_args).cpu()
+    device_kwargs = {"device": DEVICE} if needs_device else {}
+    result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
+    eager_result = fn(*device_args, **device_kwargs).cpu()
     torch.testing.assert_close(
         result,
         eager_result,
@@ -185,10 +186,11 @@ def compare_with_eager(fn, *args, atol=0, rtol=0):
 
 
 # compare with cpu
-def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1):
+def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1, needs_device=False):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
     device_args = [arg.to(DEVICE) for arg in args]
-    result = torch.compile(fn)(*device_args).cpu()
+    device_kwargs = {"device": DEVICE} if needs_device else {}
+    result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
     cpu_result = fn(*args)
     torch.testing.assert_close(
         result,
@@ -217,10 +219,11 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1):
 
 
 # compare with sendnn
-def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0):
+def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
     device_args = [arg.to(DEVICE) for arg in args]
-    result = torch.compile(fn)(*device_args).cpu()
+    device_kwargs = {"device": DEVICE} if needs_device else {}
+    result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
     sendnn_result = torch.compile(fn, backend="sendnn")(*args).cpu()
     torch.testing.assert_close(
         result,
@@ -233,12 +236,15 @@ def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0):
 
 
 # 4-way comparison
-def compare(fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1):
+def compare(
+    fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
+):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
     device_args = [arg.to(DEVICE) for arg in args]
-    result = torch.compile(fn)(*device_args).cpu()
+    device_kwargs = {"device": DEVICE} if needs_device else {}
+    result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
 
-    eager_result = fn(*device_args).cpu()
+    eager_result = fn(*device_args, **device_kwargs).cpu()
     torch.testing.assert_close(
         result,
         eager_result,

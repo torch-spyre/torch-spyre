@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import unittest
 import torch
 
@@ -24,9 +25,11 @@ from utils_inductor import compare, compare_with_cpu
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
+    "cos": torch.cos,
     "exp": torch.exp,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "sin": torch.sin,
     "tanh": torch.tanh,
 }
 
@@ -376,19 +379,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
             },
         },
+        (
+            "test_fallback",
+            "test_fallback_cpu",
+        ): {
+            "param_sets": {
+                "1d": (cached_randn((128,), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_arange",
+            "test_arange_cpu",
+        ): {
+            "param_sets": {
+                "end": (64.0,),
+                "start_end": (64.0, 128.0),
+                "start_end_step": (0.0, 128.0, 2.0),
+            },
+        },
+        (
+            "test_new_ones",
+            "test_new_ones_cpu",
+        ): {
+            "param_sets": {
+                "size_1": (
+                    cached_randn((64, 256)),
+                    ([64, 256]),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):
         if op == torch.reciprocal:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
 
-        if op == torch.exp:
-            # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
+        cpu_ops = {
+            torch.cos,  # CPU fallback
+            torch.exp,  # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
+            torch.sin,  # CPU fallback
+        }
+        if op in cpu_ops:
             compare_with_cpu(op, x)
         else:
             compare(op, x)
@@ -465,6 +504,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_fallback_cpu(self, x):
+        def fn(t):
+            t = torch.exp(t)  # compiled op
+            t = torch.sin(t)  # fallback op
+            t = torch.exp(t)  # compiled op
+            return t
+
+        compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_arange_cpu(self, *args):
+        def fn(device=None):
+            return torch.arange(*args, dtype=torch.float16, device=device)
+
+        compare_with_cpu(fn, needs_device=True)
+
+    def test_new_ones_cpu(self, x, y):
+        compare_with_cpu(lambda x: x.new_ones((x.size())), x)
 
 
 if __name__ == "__main__":
