@@ -1,6 +1,11 @@
 skip:
-  padding:
+  # https://github.com/torch-spyre/torch-spyre/issues/38
+  padded_tensor:
     - models/gpt-oss/test_mul_ng.py
+    - models/granite4-h/test_mul_48.py
+  # https://github.com/torch-spyre/torch-spyre/issues/51
+  constant:
+    - models/granite4-h/test_mul_162.py
   others:
     - models/gpt-oss/dummy_skip.py
 
