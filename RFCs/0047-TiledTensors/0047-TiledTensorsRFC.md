@@ -5,16 +5,16 @@
 
 ## **Summary**
 
-PyTorch tensors have a `size()` method that describes their logical dimensionality.
+PyTorch tensors have a `size()` that describes their logical dimensionality.
 When a tensor is realized, its elements must be laid out in some specific linerar order
-in memory. The `strides()` of a tensor are used to encode this linear ordering.
-This encoding using `strides()` can represent commonly used linearizations including
-row major (dimension `-1` has stride `1`) and column major (dimension `0` has stride `1`).
+in memory. In PyTorch, the `strides()` of a tensor encode this linear ordering by specifiying
+for each dimension of the tensor the distance between consecutive elements of the dimension.
+Commonly used used linearizations including row major (dimension `-1` has stride `1`) and
+column major (dimension `0` has stride `1`) can be naturally represented using `strides()`.
 However `strides()` by itself cannot properly represent *tiled* tensors, which break the invariant
-that the stride beween consecutive elements in a dimension can be described by a single integer.
-The goal of this RFC is to motivate the need for enabling tiled tensors as a first-class concept
-in PyTorch and to extend the APIs and implementation q to naturally support them.
-but is inadequate to represent *tiled* tensors.
+that the stride beween every consecutive element in a dimension can be described by a single integer.
+The goal of this RFC is to motivate the need for enabling a tiled memory layout as a first-class concept
+in PyTorch and to extend PyTorch's APIs and implementation to naturally support them.
 
 ## **Motivation**
 
@@ -26,13 +26,23 @@ _stick_.  The in-memory format of tensors on the Spyre device is
 designed to support efficient SIMD computations on sticks of data. In
 particular, one or more of every tensor’s dimensions are designated as
 stick dimensions.  All stick dimensions are padded to be multiples of
-128 bytes. To maximize reuse and to enable efficient device
-memory/scratchpad transfers, stick dimensions are laid out in a tiled
+128 bytes.
+
+The importance of memory layout for efficient computation is familiar from
+GPUs, but it is even more important on Spyre.  
+To compute on the values stored in a stick of a tensor, the stick must
+be loaded from the main on-chip memory to smaller pre-core scratchpad memories.
+Small intermediate tensors may live entirely in scratchpads. The datapath
+between the main on-chip memory and the scratchpad only allows a fixed number
+of outstanding load requests.  A load request may be for a single stick or for multiple
+contiguous sticks.  To optimize memory access performance in the presence of these
+constraints,  stick dimensions are laid out in a tiled
 fashion in the device’s memory (sticks that are consecutive in a stick
 dimension from the perspective of PyTorch-level indexing may not
-actually be assigned consecutive memory addresses on the device).  The
-importance of memory layout for efficient computation is familiar from
-GPUs, but it is even more important on Spyre.  Furthermore, the
+actually be assigned consecutive memory addresses on the device).  This places
+tiles of a tensor in contiguous memory, enabling the use of bulk load requests.
+
+In additon to the memory subsytems constraints described above, the
 compute operations of Spyre’s SIMD dataflow engine impose a number of
 legality constraints on the memory layout of their inputs and the
 layout of the resulting output.
@@ -212,7 +222,22 @@ TODO
 <!--
 What other designs have been considered? What is the impact of not doing this?
 -->
-TODO
+As described [above](#background-spyre-tensors), the tiled memory layout of an
+N-dimensional tensors with k stick dimensions could be encoded as an N+k dimensional
+tensor using the existing `size()` and `strides()` APIs. A possible implementation
+would be to simply have the compiler rewrite the FX graph to be in this form relatively
+early in compilation. We identified several drawbacks of this approach:
+* Unclear how to handle "user-visible" tensors such as graph inputs/outputs.
+* Unclear semantics for non-Pointwise operations.  For example a matrix multiply
+  on a 2-D tensor has a well-understood semantics; the semantics of a matrix multiply
+  on a 3-D tensor where dimension 0 and 2 are the tiled dimension 1 are not standard.
+* Does not by iteself address enforcing the layout constraints of specific compute operations.
+  
+Similarly, we could defer exposing the tiled memory representation and extra dimensions
+until Inductor's final code generation (following a similar pattern to how tiling is
+implemented in the Triton backend of Inductor).  This blocks us from effective use of
+Inductor for memory planning and cross-core work divsion because these optimizations need
+an accurate view of the on-device representation of tensors to perform their tasks.
 
 ## **Prior Art**
 <!--
