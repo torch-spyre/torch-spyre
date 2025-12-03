@@ -45,7 +45,16 @@ class SpyreInterface(DeviceInterface):
         # as worker process don't get access to device due to driver limitation
         return ""
 
-    class Worker:
+    class Worker(DeviceInterface.Worker):
+        # TODO (yoheiueda) Support non-zero index values when multiple Spyre cards are supported in the future
+        @staticmethod
+        def set_device(device: int):
+            raise NotImplementedError
+
+        @staticmethod
+        def current_device() -> int:
+            return 0
+
         @staticmethod
         def get_device_properties(device: _device_t = None):
             # TODO (tmhoangt): read this from cache
