@@ -57,7 +57,7 @@ def stl_spyre_fixed_layout(
     for d in reversed(self.host_dim_order()):
         stride[d] = cur_stride
         cur_stride = cur_stride * size[d]
-    return SpyreFixedLayout(device, dtype, list(size), stride, self)
+    return FixedTiledLayout(device, dtype, list(size), stride, self)
 
 
 setattr(SpyreTensorLayout, "host_dim_order", stl_host_dim_order)
@@ -66,7 +66,7 @@ setattr(SpyreTensorLayout, "is_stick_reduction", stl_is_stick_reduction)
 setattr(SpyreTensorLayout, "spyre_fixed_layout", stl_spyre_fixed_layout)
 
 
-class SpyreFixedLayout(FixedLayout):
+class FixedTiledLayout(FixedLayout):
     device_layout: SpyreTensorLayout
 
     def __init__(
@@ -220,6 +220,7 @@ def spyre_pointwise_result_shape(
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
+    # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
         if isinstance(real_input, torch.Tensor):
             stl = real_input.device_tensor_layout()
@@ -241,11 +242,10 @@ def propagate_spyre_tensor_layouts(
             ptl = tb.data.data.layout
             if not isinstance(ptl, FixedLayout):
                 raise Unsupported("graph input {name} does not have a FixedLayout")
-            tb.data.data.layout = SpyreFixedLayout(
+            tb.data.data.layout = FixedTiledLayout(
                 ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
             )
 
-    print(f"{V.graph.graph_inputs}")
     for n in nodes:
         print(f"{n} {type(n.node)} {n.read_writes} {n.outputs_by_name}")
 

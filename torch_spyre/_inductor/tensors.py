@@ -21,7 +21,7 @@ from torch._subclasses.fake_tensor import (
 )
 from torch._inductor.ir import FlexibleLayout, Layout, significant_strides_equal
 from torch._subclasses.fake_impls import fast_detach
-from .stickify import tensor_get_spyre_layout, SpyreFixedLayout
+from .stickify import tensor_get_spyre_layout, FixedTiledLayout
 from torch_spyre._C import SpyreTensorLayout
 
 orig_from_real_tensor = FakeTensorConverter.from_real_tensor
@@ -136,7 +136,7 @@ def spyre_get_layout(self: torch._inductor.ir.Buffer) -> Layout:
 def spyre_freeze_layout_with_exact_strides(  # type: ignore[no-untyped-def]
     self, exact_strides, allow_padding=False
 ) -> None:
-    if isinstance(self.layout, SpyreFixedLayout):
+    if isinstance(self.layout, FixedTiledLayout):
         assert significant_strides_equal(
             exact_strides, self.layout.stride, self.layout.size
         )
