@@ -16,8 +16,8 @@
 
 #include "module.h"
 
-#include <pybind11/operators.h>
 #include <c10/core/ScalarType.h>
+#include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
