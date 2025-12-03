@@ -51,6 +51,7 @@ def _initialize_opfunc_mapping():
         "abs",
         "add",
         "exp",
+        "gelu",
         "layernormnorm",
         "layernormscale",
         "log",

@@ -155,3 +155,18 @@ def _(
     res = x.new_empty(x.size())
     res.spyre_layout = x.get_spyre_layout()
     return res
+
+
+@torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
+def gelu(
+    input: torch.Tensor,
+    approximate: str = "none",
+) -> torch.Tensor:
+    pass
+
+
+@gelu.register_fake
+def _(input: torch.Tensor, approximate: str = "none"):
+    res = input.new_empty(input.size())
+    res.spyre_dci = input.get_spyre_layout()
+    return res

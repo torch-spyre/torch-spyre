@@ -42,6 +42,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.fma({x})"
 
     @staticmethod
+    def gelu(x):
+        return f"spyre.gelu({x})"
+
+    @staticmethod
     def layernormnorm(a, b, c, d, e):
         return f"spyre.layernormnorm({a}, {b}, {c}, {d}, {e})"
 

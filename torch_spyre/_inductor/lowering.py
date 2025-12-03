@@ -167,3 +167,24 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     )
     result.realize()
     return result
+
+
+lowering.register_op_dtype_propagation_rules(
+    "gelu", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
+)
+
+
+@lowering.register_lowering(torch.ops.spyre.gelu)
+def lower_gelu(x, approximate="none"):
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.gelu.__name__)(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw

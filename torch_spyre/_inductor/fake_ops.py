@@ -167,6 +167,7 @@ _meta_ops = {
     # Pointwise unary
     aten.abs.default: spyre_pointwise_unary,
     aten.exp.default: spyre_pointwise_unary,
+    aten.gelu.default: spyre_pointwise_unary,
     aten.log.default: spyre_pointwise_unary,
     aten.neg.default: spyre_pointwise_unary,
     aten.reciprocal.default: spyre_pointwise_unary,
