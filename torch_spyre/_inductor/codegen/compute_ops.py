@@ -985,17 +985,17 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         },
                         "primaryDsInfo_": {
                             "INPUT": {
-                                "layoutDimOrder_": ["mb", "in", "x"],
+                                "layoutDimOrder_": ["x", "in", "mb"],
                                 "stickDimOrder_": ["in"],
                                 "stickSize_": [64],
                             },
                             "OUTPUT": {
-                                "layoutDimOrder_": ["mb", "out", "x"],
+                                "layoutDimOrder_": ["x", "out", "mb"],
                                 "stickDimOrder_": ["out"],
                                 "stickSize_": [64],
                             },
                             "KERNEL": {
-                                "layoutDimOrder_": ["in", "out", "x"],
+                                "layoutDimOrder_": ["x", "out", "in"],
                                 "stickDimOrder_": ["out"],
                                 "stickSize_": [64],
                             },
@@ -1007,7 +1007,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "prev_": "",
                                 "ldsIdx_": 0,
                                 "component_": "hbm",
-                                "layoutDimOrder_": ["mb", "in", "x"],
+                                "layoutDimOrder_": ["x", "in", "mb"],
                                 "maxDimSizes_": [-1, -1, -1],
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
@@ -1112,7 +1112,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "prev_": "",
                                 "ldsIdx_": 1,
                                 "component_": "hbm",
-                                "layoutDimOrder_": ["in", "out", "x"],
+                                "layoutDimOrder_": ["x", "out", "in"],
                                 "maxDimSizes_": [-1, -1, -1],
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
@@ -1217,7 +1217,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "prev_": "",
                                 "ldsIdx_": 2,
                                 "component_": "hbm",
-                                "layoutDimOrder_": ["mb", "out", "x"],
+                                "layoutDimOrder_": ["x", "out", "mb"],
                                 "maxDimSizes_": [-1, -1, -1],
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
