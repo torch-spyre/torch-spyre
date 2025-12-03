@@ -212,12 +212,13 @@ auto get_dim_device_size(int stick_size, int dim,
  * @param host2device: direction of data conversion
  * @return description of data conversion
  */
-auto get_device_stride_info(std::vector<int64_t> cpu_shape,
-                            std::vector<int64_t> cpu_strides,
+auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                             std::vector<int64_t> dev_shape, int stick_size,
                             bool host2device) -> DataConversionStrideInfo {
   DataConversionStrideInfo stride_info;
-  auto dev_dim_order = get_device_layout(cpu_shape);
+  auto cpu_shape = sizes.vec();
+  auto cpu_strides = strides.vec();
+  auto dev_dim_order = get_device_layout(sizes);
   bool size_less_than_stick = cpu_shape[dev_dim_order.front()] < stick_size;
 
   stride_info.size_.push_back(
@@ -277,14 +278,13 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     -> std::vector<DataConversionStrideInfo> {
   std::vector<DataConversionStrideInfo> dcsi;
   auto cpu_shape = sizes.vec();
-  auto cpu_strides = strides.vec();
   auto dev_dim_order = get_device_layout(cpu_shape);
   bool requires_padding = cpu_shape[dev_dim_order.front()] % stick_size != 0;
   bool size_less_than_stick = cpu_shape[dev_dim_order.front()] < stick_size;
   DataConversionStrideInfo stride_info;
 
-  stride_info = get_device_stride_info(cpu_shape, cpu_strides, dev_shape,
-                                       stick_size, host2device);
+  stride_info = get_device_stride_info(sizes, strides, dev_shape, stick_size,
+                                       host2device);
   dcsi.push_back(stride_info);
 
   if (requires_padding && !size_less_than_stick) {
