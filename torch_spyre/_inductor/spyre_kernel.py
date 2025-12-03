@@ -355,6 +355,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 with buf.indent():
                     for arg in ks.arguments:
                         buf.writeline(f"{arg!r},")
+                        if arg.dtype != torch.float16:
+                            raise Unsupported(f"operations on {arg.dtype} dtype")
                 buf.writeline("]")
             buf.writeline(")")
 

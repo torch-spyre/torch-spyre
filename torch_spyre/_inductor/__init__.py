@@ -95,7 +95,7 @@ def _autoload():
     # Disable fusing of mm + permute/transpose for now.
     torch._inductor.config.permute_fusion = False
 
-    # Disabled becuase the fake tensor cache doesn't preserve our added spyre_dci field
+    # Disabled becuase the fake tensor cache doesn't preserve our added spyre_layout field
     torch._dynamo.config.fake_tensor_cache_enabled = False
 
     install_spyre_tensors()

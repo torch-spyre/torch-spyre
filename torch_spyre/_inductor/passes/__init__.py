@@ -20,12 +20,8 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 
-from .conversions import RemoveElementTypeConversions
 
-
-custom_pre_passes: List[Callable[[torch.fx.graph.Graph], None]] = [
-    RemoveElementTypeConversions(),
-]
+custom_pre_passes: List[Callable[[torch.fx.graph.Graph], None]] = []
 custom_post_passes: List[Callable[[torch.fx.graph.Graph], None]] = []
 
 

@@ -20,8 +20,8 @@ from .stickify import (
     spyre_matmul_result_shape,
     spyre_reduction_result_shape,
     spyre_pointwise_result_shape,
-    SpyreDCI,
 )
+from torch_spyre._C import SpyreTensorLayout
 
 DispatchKey = torch._C.DispatchKey  # type: ignore[attr-defined]
 
@@ -30,56 +30,63 @@ aten = torch.ops.aten
 
 
 def spyre_matmul(x, y):
-    res_size, res_dci = spyre_matmul_result_shape(x, y)
+    res_size, res_layout = spyre_matmul_result_shape(x, y)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_amax(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_amin(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_max(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     values = x.new_empty(res_size)
-    values.spyre_dci = res_dci
+    values.spyre_layout = res_layout
     indices = x.new_empty(res_size, dtype=torch.int64)
-    indices.spyre_dci = res_dci
+    indices.spyre_layout = res_layout
     return torch.return_types.max(sequence=(values, indices))
 
 
 def spyre_min(x, dim, keepdim=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, dim, keepdim)
+    res_size, res_layout = spyre_reduction_result_shape(x, dim, keepdim)
     values = x.new_empty(res_size)
-    values.spyre_dci = res_dci
+    values.spyre_layout = res_layout
     indices = x.new_empty(res_size, dtype=torch.int64)
-    indices.spyre_dci = res_dci
+    indices.spyre_layout = res_layout
     return torch.return_types.min(sequence=(values, indices))
 
 
 def spyre_sum(x, axis, keepdims=False):
-    res_size, res_dci = spyre_reduction_result_shape(x, axis, keepdims)
+    res_size, res_layout = spyre_reduction_result_shape(x, axis, keepdims)
     res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
+    res.spyre_layout = res_layout
+    return res
+
+
+def spyre_mean(x, axis, keepdims=False):
+    res_size, res_layout = spyre_reduction_result_shape(x, axis, keepdims)
+    res = x.new_empty(res_size)
+    res.spyre_layout = res_layout
     return res
 
 
 def spyre_pointwise_binary(x, y):
     if isinstance(y, torch.Tensor):
-        res_size, res_dci = spyre_pointwise_result_shape(x, y)
+        res_size, res_layout = spyre_pointwise_result_shape(x, y)
         res = x.new_empty(res_size)
-        res.spyre_dci = res_dci
+        res.spyre_layout = res_layout
         return res
     else:
         return spyre_pointwise_unary(x)
@@ -87,55 +94,57 @@ def spyre_pointwise_binary(x, y):
 
 def spyre_pointwise_unary(x):
     res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
+    res.spyre_layout = x.get_spyre_layout()
     return res
 
 
 def spyre_unsqueeze(x, dim):
     x_size = x.size()
-    x_dci = x.get_dci()
+    x_layout = x.get_spyre_layout()
     if dim < 0:
         dim += len(x_size) + 1
     res_shape = list(x_size)
     res_shape.insert(dim, 1)
-    res_dim_order = []
-    for d in x_dci.dim_order:
-        if d < dim:
-            res_dim_order.append(d)
-        elif d > dim:
-            res_dim_order.append(d + 1)
-        else:
-            res_dim_order.append(d)
-            res_dim_order.append(d + 1)
+    x_dim_order = x_layout.host_dim_order()
+    if dim in x_dim_order:
+        idx = x_dim_order.index(dim)
+        res_dim_order = [x + 1 if x >= dim else x for x in x_dim_order]
+        res_dim_order.insert(idx, dim)
+    else:
+        idx = x_dim_order.index(dim - 1)
+        res_dim_order = list(x_dim_order)
+        res_dim_order.insert(idx + 1, dim)
     res = x.new_empty(res_shape)
-    res.spyre_dci = SpyreDCI(res_dim_order, x_dci.num_stick_dims, x_dci.format)
+    res.spyre_layout = SpyreTensorLayout(
+        res_shape, res.dtype, res_dim_order, x_layout.format
+    )
     return res
 
 
 def spyre_where(cond, x, y):
     # TODO: check op validity and generalize
     res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
+    res.spyre_layout = x.get_spyre_layout()
     return res
 
 
 def spyre_fresh_tensor_constructor_wrapper(orig_fn, *args, **kwargs):
     """Creating tensor fresh from size/stride.  Assume generic stick"""
     res = orig_fn(*args, **kwargs)
-    res.spyre_dci = SpyreDCI.generic_stick_dci(res)
+    res.spyre_layout = SpyreTensorLayout(res.size(), res.dtype)
     return res
 
 
 def spyre_like_tensor_constructor_wrapper(orig_fn, input, *args, **kwargs):
     """Creating a new tensor with same shape as input.  Propagate SpyreDCI if present."""
     res = orig_fn(input, *args, **kwargs)
-    if hasattr(input, "spyre_dci"):
-        res.spyre_dci = input.spyre_dci
+    if hasattr(input, "spyre_layout"):
+        res.spyre_layout = input.spyre_layout
     else:
         print(
-            f"Warning: like_tensor constructor given {input} that lacks spyre_dci; assuming generic stick layout"
+            f"Warning: like_tensor constructor given {input} that lacks spyre_layout; assuming generic stick layout"
         )
-        res.spyre_dci = SpyreDCI.generic_stick_dci(res)
+        res.spyre_layout = SpyreTensorLayout(res.size(), res.dtype)
     return res
 
 
@@ -147,6 +156,7 @@ _meta_ops = {
     aten.min.dim: spyre_min,
     aten.mm.default: spyre_matmul,
     aten.sum.dim_IntList: spyre_sum,
+    aten.mean.dim: spyre_mean,
     # Pointwise binary
     aten.add.Tensor: spyre_pointwise_binary,
     aten.div.Tensor: spyre_pointwise_binary,
