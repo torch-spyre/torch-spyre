@@ -27,7 +27,7 @@ from .data_ops import (
 
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
-    if len(dimensions) > 3:
+    if len(dimensions) > 3 and op != BATCH_MATMUL_OP:
         raise Unsupported(f"operation on {len(dimensions)}-D tensor")
     if op == MATMUL_REDUCTION_OP:
         return generate_matmul(
