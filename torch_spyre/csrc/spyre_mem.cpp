@@ -334,19 +334,19 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
   constexpr auto bytesPerStick = 128;
   int stick_size = bytesPerStick / tensor->element_size();
   std::vector<int64_t> dev_shape = get_device_shape(tensor);
-  DataConversionInfo* dci = new data_conversion_info();
-  dci->dci_dsName_ = "DCI-Tensor-0";
-  dci->isHostToSen_ = host2device;
-  dci->dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
-  dci->dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
+  DataConversionInfo dci{};
+  dci.dci_dsName_ = "DCI-Tensor-0";
+  dci.isHostToSen_ = host2device;
+  dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
+  dci.dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   std::reverse(dev_shape.begin(), dev_shape.end());
-  dci->dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(),
-                                       dev_shape, stick_size, host2device);
-  dci->input_shape_ = host2device ? cpu_shape : dev_shape;
-  dci->output_shape_ = host2device ? dev_shape : cpu_shape;
+  dci.dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(),
+                                      dev_shape, stick_size, host2device);
+  dci.input_shape_ = host2device ? cpu_shape : dev_shape;
+  dci.output_shape_ = host2device ? dev_shape : cpu_shape;
 
-  dci->exportJson(s);
+  dci.exportJson(s);
   return s.str();
 }
 
