@@ -6,8 +6,6 @@ test operations used in models with torch.compile
 This repository provides a test framework for validating models with `torch.compile`.  
 You can run all tests, selectively skip tests, or report detailed information about skipped and failed cases.
 
-
-
 ## How to run tests
 
 ### Run tests by default
@@ -18,7 +16,6 @@ executes all pytest-style files except those listed in `models/skip_files.yaml`
 python test_models_ops.py
 ```
 
-
 ### Run tests with detailed reporting
 
 show additional information about their skip, failed, and error resons
@@ -26,7 +23,6 @@ show additional information about their skip, failed, and error resons
 ```
 python test_models_ops.py --report sfE
 ```
-
 
 ### Skip file format `models/skip_files.yaml`
 
