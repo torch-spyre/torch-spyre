@@ -18,15 +18,6 @@ import pytest
 import yaml
 
 
-def pytest_sessionstart(session):
-    """
-    Called after the Session object has been created and
-    before performing collection and entering the run test loop.
-    """
-    os.environ.setdefault("DTLOG_LEVEL", "error")
-    os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
-
-
 # for test_models_ops.py
 def pytest_collection_modifyitems(config, items):
     if os.getenv("TEST_MODELS_OPS_ONLY_SKIP_FILES") is not None:
