@@ -1,7 +1,8 @@
 # Tiled Tensors
 
 **Authors:**
-* @dgrove-oss, @tardieu
+* @dgrove-oss
+* @tardieu
 
 ## **Summary**
 
