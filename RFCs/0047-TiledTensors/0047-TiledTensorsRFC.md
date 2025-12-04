@@ -64,7 +64,7 @@ if it were a 3-D tensor of size `(4, 1024, 64)` with strides `(65536, 64, 1)`.
 Each row of the PyTorch tensor is broken into 4 non-consecutive sticks which now
 form the outermost dimension of the 3-D tensor. As a benefit, the tensor on the
 device is conveniently laid out into contiguous `(N, 64)` tiles with `1 <= N <=
-1024`.
+1024` matching the width of the systolic array.
 
 Generalizing to N dimensions with k tiling dimensions, the mapping between host
 and device layouts can be represented as 3 tuples of N+k integers corresponding
@@ -107,7 +107,7 @@ along the stick dimension, Spyre’s SIMD engine produces results that only
 contain a single element per stick. For a float16 tensor, the stride of the
 output stick dimension is 64.
 
-### Implications of Tensor Layouts for PyTorch
+### Implications of Device Tensor Layouts for PyTorch
 
 To implement host/device memory transfers and device memory allocation for
 accelerators with tiling and/or padding constraints, the runtime representation
@@ -116,10 +116,10 @@ the host memory layout to the device memory layout and vice versa.
 
 For correct compilation and optimization, Inductor needs to accurately model the
 device memory layout of tensors. Some key challenges include capturing the
-non-contiguity of tiled dimensions (impacts loop simplifications), sparse and/or
-padded layouts (impacts memory planning and backend code generation). Inductor
-has to ensure operands have compatible memory layouts and derive the memory
-layouts of computed tensors.
+multiple strides of tiled dimensions (impacts loop simplifications), sparse
+and/or padded layouts (impacts memory planning and backend code generation).
+Inductor has to ensure operands have compatible memory layouts and derive the
+memory layouts of computed tensors.
 
 Because layout constraints may be both hard and soft resulting into large search
 spaces for device memory layouts, the programming model needs to have hooks that
