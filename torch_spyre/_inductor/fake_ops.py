@@ -273,7 +273,7 @@ class SpyreAotAutograd(AotAutograd):
             for t in example_inputs
         ):
             with (
-                spyre_meta_ops(),
+                # spyre_meta_ops(),
                 spyre_data_types(),
                 V.set_real_inputs(example_inputs),
             ):

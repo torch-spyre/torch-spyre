@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Tuple, Union
+from typing import NamedTuple, Sequence, Tuple, Union
 
+import sympy
 import torch
 from sympy import Expr
 from torch._inductor.dependencies import MemoryDep
@@ -27,6 +28,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 from torch.fx.experimental.symbolic_shapes import (
     guard_size_oblivious,
@@ -229,10 +231,29 @@ def spyre_pointwise_result_shape(
     return res_size, SpyreTensorLayout(res_size, x.dtype, dim_order, format=res_format)
 
 
-def pointwise_layout(
-    node: Pointwise, args: list[FixedTiledLayout], output: FixedLayout
-) -> FixedTiledLayout:
-    op = node.get_origin_node().target
+def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
+    """
+    Order the free variables in an index expression in decreasing stride order.
+    """
+    strides = {
+        s: sympy_subs(index, {s: 1}) - sympy_subs(index, {s: 0})
+        for s in index.free_symbols
+    }
+    ordered_strides: Sequence[tuple[sympy.Symbol, sympy.Expr]] = sorted(
+        strides.items(), key=lambda item: item[1], reverse=True
+    )
+    return [item[0] for item in ordered_strides]
+
+
+class Arg(NamedTuple):
+    dep: MemoryDep
+    layout: FixedTiledLayout
+
+
+def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
+    pw: Pointwise = n.node.data
+    output: FixedLayout = n.node.get_layout()
+    op = pw.get_origin_node().target
     if len(args) == 1:
         x = args[0]
         match op:
@@ -252,68 +273,69 @@ def pointwise_layout(
                 raise Unsupported("TODO: swap")
             case _:
                 # Generic pointwise unary: output layout is same as input
-                if not x.size == output.size:
+                if not x.layout.size == output.size:
                     raise Unsupported(
-                        f"size mismatch:  {op}({x.size})=>{output.size}) "
+                        f"size mismatch:  {op}({x.layout.size})=>{output.size}) "
                     )
                 stl = SpyreTensorLayout(
                     output.size,
                     output.dtype,
-                    x.device_layout.host_dim_order(),
-                    x.device_layout.format,
+                    x.layout.device_layout.host_dim_order(),
+                    x.layout.device_layout.format,
                 )
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
-    elif len(args) == 2:
-        x = args[0]
-        y = args[1]
-        if x.size == y.size:
-            if output.size != x.size:
-                raise Unsupported(
-                    f"size mismatch: {op}({x.size}, {y.size}=>{output.size})"
-                )
-            if (
-                x.device_layout.format != y.device_layout.format
-                or x.device_layout.host_dim_order() != y.device_layout.host_dim_order()
-            ):
-                raise Unsupported(
-                    f"non-broadcasting binop with incompatible formats {op}({x}, {y})"
-                )
-            stl = SpyreTensorLayout(
-                output.size,
-                output.dtype,
-                x.device_layout.host_dim_order(),
-                x.device_layout.format,
-            )
-            return FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
-            )
-        # Broadcasting of a sparse stick dimension is allowed.
-        raise Unsupported("todo: broadcast")
     else:
-        raise Unsupported(f"pointwise: {op} with {len(args)} tensor inputs")
+        output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
+        input_dims = [stride_order_vars(arg.dep.index) for arg in args]
+        input_dim_idx = [0] * len(args)
+        for i in range(len(output_dims)):
+            var = output_dims[i]
+            for j in range(len(args)):
+                if var in input_dims[j]:
+                    print(f"Checking: {i} {j} {var} {input_dims[j][input_dim_idx[j]]}")
+                    if input_dims[j][input_dim_idx[j]] != var:
+                        # TODO: This is overly conservative.
+                        #        SDSCs can support pointwise ops where non-stick dimensions differ in stride order
+                        raise Unsupported(
+                            "pointwise op with non-aligned input dimensions"
+                        )
+                    input_dim_idx[j] += 1
+        output_format = None
+        stick_dim_var = output_dims[-1]
+        for i in range(len(args)):
+            if stick_dim_var in input_dims[i]:
+                if output_format is None:
+                    output_format = args[i].layout.device_layout.format
+                elif output_format != args[i].layout.device_layout.format:
+                    raise Unsupported(
+                        "pointwise op with incompatible input stick formats"
+                    )
+        stl = SpyreTensorLayout(output.size, output.dtype)
+        stl.format = output_format
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
 
 
-def reduction_layout(
-    node: Reduction, args: list[FixedTiledLayout], output: FixedLayout
-) -> FixedTiledLayout:
-    print(f"Convert reduction: {node} {args}")
+def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
+    print(f"Convert reduction: {n} {args}")
     raise Unsupported("TODO")
 
 
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    def input_layouts(n: SchedulerNode) -> list[FixedTiledLayout]:
-        res: list[FixedTiledLayout] = []
+    def mem_deps(n: SchedulerNode) -> list[Arg]:
+        res: list[Arg] = []
         for arg in n.read_writes.reads:
             if isinstance(arg, MemoryDep):
                 buf = V.graph.get_buffer(arg.name)
                 layout = buf.get_layout()
                 if not isinstance(layout, FixedTiledLayout):
                     raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-                res.append(layout)
+                res.append(Arg(arg, layout))
         return res
 
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
@@ -344,19 +366,15 @@ def propagate_spyre_tensor_layouts(
 
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
-    # performed by the node to convert their output FixedLayouts to FixedTiledLayouts.
+    # performed by the node to convert its output FixedLayouts to FixedTiledLayouts.
     for n in nodes:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(
-                    n.node.data, input_layouts(n), n.node.get_layout()
-                )
+                output_layout = pointwise_layout(n, mem_deps(n))
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
-                output_layout = reduction_layout(
-                    n.node.data, input_layouts(n), n.node.get_layout()
-                )
+                output_layout = reduction_layout(n, mem_deps(n))
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")

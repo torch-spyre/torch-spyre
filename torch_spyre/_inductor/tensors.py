@@ -21,7 +21,7 @@ from torch._subclasses.fake_tensor import (
 )
 from torch._inductor.ir import FlexibleLayout, Layout, significant_strides_equal
 from torch._subclasses.fake_impls import fast_detach
-from .stickify import tensor_get_spyre_layout, FixedTiledLayout
+from .stickify import FixedTiledLayout
 from torch_spyre._C import SpyreTensorLayout
 
 orig_from_real_tensor = FakeTensorConverter.from_real_tensor
@@ -30,13 +30,13 @@ orig_from_meta_and_device = FakeTensorConverter.from_meta_and_device
 
 def install_spyre_tensors():
     """Extend Tensor and IR Classes for Spyre Stickification"""
+    """
     torch.Tensor.get_spyre_layout = tensor_get_spyre_layout
     FakeTensorConverter.from_meta_and_device = spyre_ftc_from_meta_and_device
     FakeTensorConverter.from_real_tensor = spyre_ftc_from_real_tensor
     torch._functorch._aot_autograd.dispatch_and_compile_graph._detach_and_copy_item_memo = spyre_detach_and_copy_item_memo
     torch.fx.experimental.proxy_tensor.snapshot_fake = spyre_snapshot_fake
     torch.fx.passes.fake_tensor_prop.snapshot_fake = spyre_snapshot_fake
-    """
     torch._inductor.ir.Buffer.get_layout = spyre_get_layout
     torch._inductor.ir.Buffer.freeze_layout_with_exact_strides = (
         spyre_freeze_layout_with_exact_strides
