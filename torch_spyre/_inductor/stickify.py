@@ -22,7 +22,7 @@ from torch.fx.experimental.symbolic_shapes import (
     is_nested_int,
 )
 
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
 
 
@@ -49,7 +49,7 @@ def stl_spyre_fixed_layout(
 ):
     cur_stride = (
         1
-        if self.format == SpyreTensorLayout.StickFormat.Dense
+        if self.format == StickFormat.Dense
         else 128 // dtype.itemsize  # TODO - get from self.device_strides?
     )
     stride: list[int | torch.SymInt] = [-1] * len(size)
@@ -105,10 +105,7 @@ def spyre_matmul_result_shape(
 ) -> Tuple[Sequence[int], SpyreTensorLayout]:
     x_layout: SpyreTensorLayout = x.get_spyre_layout()
     y_layout: SpyreTensorLayout = y.get_spyre_layout()
-    if (
-        x_layout.format != SpyreTensorLayout.StickFormat.Dense
-        or y_layout.format != SpyreTensorLayout.StickFormat.Dense
-    ):
+    if x_layout.format != StickFormat.Dense or y_layout.format != StickFormat.Dense:
         raise Unsupported(f"matmul on non-dense tensors {x_layout} {y_layout}")
     if x_layout.host_dim_order() != y_layout.host_dim_order():
         raise Unsupported(f"matmul stick dimensions mismatch {x_layout} {y_layout}")
@@ -142,11 +139,7 @@ def spyre_reduction_result_shape(
             res_order = [rd if rd < d else rd - 1 for rd in res_order]
     res_size = [rs for rs in res_size if rs >= 0]
     res_order = [rd for rd in res_order if rd >= 0]
-    res_format = (
-        SpyreTensorLayout.StickFormat.Sparse
-        if is_stick_reduction
-        else SpyreTensorLayout.StickFormat.Dense
-    )
+    res_format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
     res_layout = SpyreTensorLayout(res_size, x.dtype, res_order, format=res_format)
     return res_size, res_layout
 
@@ -195,16 +188,10 @@ def spyre_pointwise_result_shape(
     y_layout = y.get_spyre_layout()
     if x_layout.format == y_layout.format:
         res_format = x_layout.format
-    elif (
-        x_layout.format == SpyreTensorLayout.StickFormat.Dense
-        and y_broadcasted[x_layout.stick_dim()]
-    ):
-        res_format = SpyreTensorLayout.StickFormat.Dense
-    elif (
-        y_layout.format == SpyreTensorLayout.StickFormat.Dense
-        and x_broadcasted[y_layout.stick_dim]
-    ):
-        res_format = SpyreTensorLayout.StickFormat.Dense
+    elif x_layout.format == StickFormat.Dense and y_broadcasted[x_layout.stick_dim()]:
+        res_format = StickFormat.Dense
+    elif y_layout.format == StickFormat.Dense and x_broadcasted[y_layout.stick_dim]:
+        res_format = StickFormat.Dense
     else:
         raise Unsupported(
             f"binop with incompatible DCIs: {x_layout} {y_layout} {x_broadcasted} {y_broadcasted}"

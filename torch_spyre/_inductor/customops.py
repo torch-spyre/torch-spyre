@@ -18,7 +18,7 @@ import torch
 
 from .stickify import spyre_reduction_result_shape
 from . import Unsupported
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, StickFormat
 
 
 @torch.library.custom_op("spyre::compact", mutates_args=())
@@ -51,7 +51,7 @@ def _(input):
         raise Unsupported("swap only implemented for 1-D tensors")
     output = input.new_empty_strided(input.size(), [64])
     output.spyre_layout = SpyreTensorLayout(
-        output.size(), output.dtype, [0], SpyreTensorLayout.StickFormat.Sparse
+        output.size(), output.dtype, [0], StickFormat.Sparse
     )
     return output
 
@@ -109,7 +109,7 @@ def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor: 
 @exx2.register_fake
 def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
     res_size, res_layout = spyre_reduction_result_shape(x, [x.ndim - 1], False)
-    res_layout.format = SpyreTensorLayout.StickFormat.SparseMulti
+    res_layout.format = StickFormat.SparseMulti
     res = x.new_empty(res_size)
     res.spyre_layout = res_layout
     return res
@@ -123,10 +123,10 @@ def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:  # type: ignore
 @layernormscale.register_fake
 def _(x: torch.Tensor, eps: float) -> torch.Tensor:
     x_layout = x.get_spyre_layout()
-    if x_layout.format != SpyreTensorLayout.StickFormat.SparseMulti:
+    if x_layout.format != StickFormat.SparseMulti:
         raise Unsupported(f"layernormscale: Unexpected format {x_layout.format}")
     res_layout = copy.deepcopy(x_layout)
-    res_layout.format = SpyreTensorLayout.StickFormat.Sparse
+    res_layout.format = StickFormat.Sparse
     res_size = list(x.size())
     res = x.new_empty(res_size)
     res.spyre_layout = res_layout

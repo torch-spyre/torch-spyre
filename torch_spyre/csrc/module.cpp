@@ -203,7 +203,7 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
-  py::enum_<spyre::SpyreTensorLayout::StickFormat>(dci_cls, "StickFormat")
+  py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
       .value("Dense", spyre::SpyreTensorLayout::StickFormat::Dense)
       .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse)
       .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
