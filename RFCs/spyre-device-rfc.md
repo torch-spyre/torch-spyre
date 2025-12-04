@@ -85,9 +85,11 @@ To properly measure the success of this feature, requires the following criteria
 - [ ] TBD
 
 ## **Drawbacks**
+
 The main drawback to this new addition is the implementation cost, as interfacing with the Spyre device through the above mechanism is quite different from the current workflow. This requires a lot of re-implementation, and replacement of existing code.
 
 ## **Alternatives**
+
 There are no other alternatives to this method as this method will bring long-term stability. If we do not do this, we would require continuing with the existing stack, which would be much more costly to bring in new features.
 
 ## **Prior Art**
@@ -99,9 +101,6 @@ Prior to this method, we did an eager support POC using the existing software st
 TBD
 
 ## **Unresolved questions**
-* What parts of the design do you expect to resolve through the RFC process before this gets merged?
-* What parts of the design do you expect to resolve through the implementation of this feature before stabilization?
-* What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?
 
 The following are some unresolved questions:
 
@@ -113,6 +112,7 @@ TBD
 
 ### Level of Support
 
+<!--
 Choose one of the following:
 * 1: Overwhelming positive feedback.
 * 2: Positive feedback.
@@ -121,6 +121,7 @@ Choose one of the following:
 * 5: Unclear Resolution.
 * 6: RFC Rejected.
 * 7: RFC Rejected, with Conflicting Feedback.
+-->
 
 #### Additional Context
 
