@@ -16,8 +16,17 @@ from typing import Sequence, Tuple, Union
 
 import torch
 from sympy import Expr
-from torch._inductor.ir import FixedLayout, InputBuffer, StorageBox, TensorBox
-from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    InputBuffer,
+    Pointwise,
+    Reduction,
+    StorageBox,
+    TensorBox,
+)
+from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 from torch._inductor.virtualized import V
 from torch.fx.experimental.symbolic_shapes import (
     guard_size_oblivious,
@@ -25,6 +34,9 @@ from torch.fx.experimental.symbolic_shapes import (
 )
 from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
+
+aten = torch.ops.aten
+spyreop = torch.ops.spyre
 
 
 def stl_host_dim_order(self: SpyreTensorLayout) -> list[int]:
@@ -217,9 +229,93 @@ def spyre_pointwise_result_shape(
     return res_size, SpyreTensorLayout(res_size, x.dtype, dim_order, format=res_format)
 
 
+def pointwise_layout(
+    node: Pointwise, args: list[FixedTiledLayout], output: FixedLayout
+) -> FixedTiledLayout:
+    op = node.get_origin_node().target
+    if len(args) == 1:
+        x = args[0]
+        match op:
+            case spyreop.compact.default:
+                raise Unsupported("TODO: compact")
+            case spyreop.exx2.default:
+                raise Unsupported("TODO: exx2")
+            case spyreop.layernorm.default:
+                raise Unsupported("TODO: layernorm")
+            case spyreop.layernormnorm:
+                raise Unsupported("TODO: layernormnorm")
+            case spyreop.layernormscale:
+                raise Unsupported("TODO: layernormscale")
+            case spyreop.slice.default:
+                raise Unsupported("TODO: slice")
+            case spyreop.swap.default:
+                raise Unsupported("TODO: swap")
+            case _:
+                # Generic pointwise unary: output layout is same as input
+                if not x.size == output.size:
+                    raise Unsupported(
+                        f"size mismatch:  {op}({x.size})=>{output.size}) "
+                    )
+                stl = SpyreTensorLayout(
+                    output.size,
+                    output.dtype,
+                    x.device_layout.host_dim_order(),
+                    x.device_layout.format,
+                )
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
+    elif len(args) == 2:
+        x = args[0]
+        y = args[1]
+        if x.size == y.size:
+            if output.size != x.size:
+                raise Unsupported(
+                    f"size mismatch: {op}({x.size}, {y.size}=>{output.size})"
+                )
+            if (
+                x.device_layout.format != y.device_layout.format
+                or x.device_layout.host_dim_order() != y.device_layout.host_dim_order()
+            ):
+                raise Unsupported(
+                    f"non-broadcasting binop with incompatible formats {op}({x}, {y})"
+                )
+            stl = SpyreTensorLayout(
+                output.size,
+                output.dtype,
+                x.device_layout.host_dim_order(),
+                x.device_layout.format,
+            )
+            return FixedTiledLayout(
+                output.device, output.dtype, output.size, output.stride, stl
+            )
+        # Broadcasting of a sparse stick dimension is allowed.
+        raise Unsupported("todo: broadcast")
+    else:
+        raise Unsupported(f"pointwise: {op} with {len(args)} tensor inputs")
+
+
+def reduction_layout(
+    node: Reduction, args: list[FixedTiledLayout], output: FixedLayout
+) -> FixedTiledLayout:
+    print(f"Convert reduction: {node} {args}")
+    raise Unsupported("TODO")
+
+
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
+    def input_layouts(n: SchedulerNode) -> list[FixedTiledLayout]:
+        res: list[FixedTiledLayout] = []
+        for arg in n.read_writes.reads:
+            if isinstance(arg, MemoryDep):
+                buf = V.graph.get_buffer(arg.name)
+                layout = buf.get_layout()
+                if not isinstance(layout, FixedTiledLayout):
+                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+                res.append(layout)
+        return res
+
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
         if isinstance(real_input, torch.Tensor):
@@ -246,7 +342,26 @@ def propagate_spyre_tensor_layouts(
                 ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
             )
 
+    # Nodes are in topological order (guarenteed by caller).
+    # Visit them and use the inputs' FixedTiledLayouts and the operation being
+    # performed by the node to convert their output FixedLayouts to FixedTiledLayouts.
     for n in nodes:
-        print(f"{n} {type(n.node)} {n.read_writes} {n.outputs_by_name}")
+        if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
+            n.node.decide_layout()
+            if isinstance(n.node.data, Pointwise):
+                output_layout = pointwise_layout(
+                    n.node.data, input_layouts(n), n.node.get_layout()
+                )
+                n.node.layout = output_layout
+            elif isinstance(n.node.data, Reduction):
+                output_layout = reduction_layout(
+                    n.node.data, input_layouts(n), n.node.get_layout()
+                )
+                n.node.layout = output_layout
+            else:
+                print(f"Warning: unhandled node type {type(n.node)}")
+
+        else:
+            print(f"Warning: unhandled scheduler node type {type(n)}")
 
     return nodes
