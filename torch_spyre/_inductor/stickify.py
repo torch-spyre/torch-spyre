@@ -119,10 +119,7 @@ def spyre_bmm_result_shape(
 ) -> Tuple[Sequence[int], SpyreTensorLayout]:
     x_layout: SpyreTensorLayout = x.get_spyre_layout()
     y_layout: SpyreTensorLayout = y.get_spyre_layout()
-    if (
-        x_layout.format != SpyreTensorLayout.StickFormat.Dense
-        or y_layout.format != SpyreTensorLayout.StickFormat.Dense
-    ):
+    if x_layout.format != StickFormat.Dense or y_layout.format != StickFormat.Dense:
         raise Unsupported(f"bmm on non-dense tensors {x_layout} {y_layout}")
     if x_layout.host_dim_order() != y_layout.host_dim_order():
         raise Unsupported(f"bmm stick dimensions mismatch {x_layout} {y_layout}")
