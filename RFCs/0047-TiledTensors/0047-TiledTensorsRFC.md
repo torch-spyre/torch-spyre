@@ -158,46 +158,33 @@ dimension(s). This is an expensive operation, since it involves
 creating a new backing storage on the device and reading/writing all
 bytes of the Tensor to achieve the required memory layout.
 
-### Dynamo / Inductor Compile Time Support
+### Compiler Support
 
 For both correctness and optimization purposes, the on-device memory
 layout of Spyre Tensors must be accurately represented in at least
-some layers of Dynamo and Inductor.
+some layers of Inductor. 
 
 The main ideas of our current implementation approach are:
 
 1. We add a subclass of `FixedLayout` called `FixedTiledLayout` that
 adds a `device_layout` field that contains a `SpyreTensorLayout`.
 
-2. When a `FakeTensor` is created for a graph input that is
-a `SpyreTensorImpl`, we use its `SpyreTensorLayout` to construct the
-corresponding `FixedTiledLayout` instead of the default `FixedLayout`.
+2. We use the `SpyreTensorLayout` of the graph's example inputs to
+construct the `FixedTileLayout` for all `InputBuffers`.
 
-3. Before final code generation from LoopLevelIR, we ensure that
-all realized operations have `FixedTiledLayouts` instead of `FixedLayout`.
+3. We do a topological traversal of the `SchedulerNodes` using the 
+`_pre_fusion_custom_pass` extension point of the `Scheduler` to propagate
+layout constraints and "upgrade" `FixedLayout` to `FixedTiledLayout`
+on all `ComputedBuffers`.  In the process, we detect operations that
+are infeasible on Spyre and raise compile-time errors.  In the future,
+we intend to explore some amount of automated reshaping of intermediate
+tensors to lessen the programmer burden of ensuring feasible operations. 
 
-In our current prototype, we have accomplished `3` by interposing
-fairly  early in Inductor's compilation stages.  In particular, we
-* dynamically add a new field to `FakeTensor` instances that holds an
-  instance of the `SpyreTensorLayout` class
-
-* enhance the code that constructs a `FakeTensor` from a `Tensor` to capture
-the `SpyreTensorLayout` and store it in the `FakeTensor`.
-
-* enhance the `FakeTensor` propagation machinery and fake_ops to use the
-extended layout information on their inputs to compute the extended
-layout information of their outputs.
-
-* use the extended layout information from the fx graph nodes in the
-Spyre backend code generation.
-
-We are also evaluating a less invasive alternative implementation
-in which device layouts are introduced later in Inductor compilation.
-We do this by using the `_pre_fusion_custom_pass` extension point of the `Scheduler`
-to do a pass over the topologically sorted SchedulerNodes and replacing the
-`FixedLayout` of each `ComputedBuffer` with a `SpyreFixedLayout`. We believe
-we should be able to adapt the tiled tensor shape computation which is currently
-being done in fake_ops to run over the LoopLevelIR instead.
+With the `FixedTiledLayout` in place, subsequent passes over the LoopLevelIR
+can be extended to use the device layout information as necessary.
+For example the memory planner can use them to have accurate device tensor sizes
+and the code generator can use them to generate host-code allocation calls and
+kernel loop nests.
 
 ## **Metrics**
  <!--
@@ -236,9 +223,21 @@ early in compilation. We identified several drawbacks of this approach:
   
 Similarly, we could defer exposing the tiled memory representation and extra dimensions
 until Inductor's final code generation (following a similar pattern to how tiling is
-implemented in the Triton backend of Inductor).  This blocks us from effective use of
-Inductor for memory planning and cross-core work division because these optimizations need
-an accurate view of the on-device representation of tensors to perform their tasks.
+implemented in the Triton backend of Inductor).  This is too late, because it blocks
+us from effective use of Inductor for memory planning and cross-core work division
+because these optimizations need an accurate view of the on-device representation of
+tensors to perform their tasks.
+
+We also prototyped adding `FixedTiledLayout` much early in compilation.
+In particular, we enhanced `FakeTensor` and fake functions on the FX graph
+to propagate device memory layouts.  A key advantage of this approach was
+that it enabled a more intuitive description of the constraints and semantics of each
+operation via the well understood fake function mechanism.  However, it required more invasive
+changes to Dynamo and Inductor to preserve/propagate the information through many more
+stages of compilation.  We therefore are abandoning this approach and attempting
+to confine all awareness of tiled device memory layouts to the "middle" and
+"backend" stages of the LoopLevelIR layer of Inductor. 
+
 
 ## **Prior Art**
 <!--
