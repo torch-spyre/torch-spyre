@@ -31,9 +31,9 @@ matching the array dimensions.
 #### Contiguous Tiles
 
 The optimal in-memory format of tensors on an accelerator depends on the
-specifics of the memory subsystems and compute capabilities of the device.
+specifics of the memory subsystems and the compute capabilities of the device.
 Balancing accesses across memory banks, minimizing cache conflicts in set
-associative caches, alignment constraints may all contribute to preferring one
+associative caches, and alignment constraints may all contribute to preferring one
 layout over another. Spyre's optimal memory bandwidth is achieved when
 transferring contiguous sticks in bulk. Tensors are therefore laid out in a
 tiled fashion. Sticks belonging to the same tile are stored contiguously in
@@ -83,16 +83,16 @@ for i in range(4):
 
 #### Padded Tensors
 
-Memory subsystems, SIMD or tiling constraints may result in padding
+Memory subsystems, SIMD, or tiling constraints may result in padding
 requirements. Spyre memory accesses are 128-byte aligned typically requiring the
 innermost dimension (called _stick dimension_) of a tensor to be padded to the
 next multiple of 128 bytes. Concretely a float16 tensor with size `(1000, 200)`
 will be laid out on the device as a 3-D tensor with size `(4, 1000, 64)` so that
 each row of the PyTorch tensor becomes 4 sticks with the last stick of each row
-only comprising the last 8 elements of the row.
+only comprising the last 8 elements of the row and 112 bytes of padding.
 
-Tensors in host memory are typically not padded or not padded as much, so the
-mapping between host and device memory layouts described above is extended to
+Tensors in host memory are typically not padded, or at least not padded as much,
+so the mapping between host and device memory layouts described above is extended to
 account for padding requirements.
 
 #### Operational Constraints
@@ -107,7 +107,7 @@ along the stick dimension, Spyre’s SIMD engine produces results that only
 contain a single element per stick. For a float16 tensor, the stride of the
 output stick dimension is 64.
 
-### Implications of Device Tensor Layouts for PyTorch
+### Implications of Tiled Device Tensor Layouts for PyTorch
 
 To implement host/device memory transfers and device memory allocation for
 accelerators with tiling and/or padding constraints, the runtime representation
@@ -115,13 +115,13 @@ of tensors must accurately capture the mapping of elements required to transform
 the host memory layout to the device memory layout and vice versa.
 
 For correct compilation and optimization, Inductor needs to accurately model the
-device memory layout of tensors. Some key challenges include capturing the
-multiple strides of tiled dimensions (impacts loop simplifications), sparse
+device memory layout of tensors. Two key challenges are capturing the
+multiple strides of tiled dimensions (impacts loop simplifications) and of sparse
 and/or padded layouts (impacts memory planning and backend code generation).
-Inductor has to ensure operands have compatible memory layouts and derive the
-memory layouts of computed tensors.
+Inductor has to ensure operands to an operation have compatible memory layouts
+and derive the memory layouts of computed tensors.
 
-Because layout constraints may be both hard and soft resulting into large search
+Because layout constraints may be both hard and soft, resulting in a large search
 spaces for device memory layouts, the programming model needs to have hooks that
 enable programmers to provide hints or directives to guide or control device
 memory layouts for tensors.
@@ -131,15 +131,15 @@ memory layouts for tensors.
 ### Runtime / Programming Model Support
 
 The torch-spyre plugin implements `SpyreTensorImpl`, a subclass of
-`TensorImpl` that contains a `SpyreDeviceLayout` object with encapsulates
+`TensorImpl` that contains a `SpyreTensorLayout` object with encapsulates
 the device memory layout information.  In our current implementation,
-`SpyreDeviceLayout` stores the device size and strides,
+`SpyreTensorLayout` stores the device size and strides,
 a mapping between host and device dimensions, and padding/stick dimension
 information. The 3 tuples mentioned earlier and needed for DMA operations
-can be derived from `SpyreDeviceLayout` and the host size and strides stored
+can be derived from `SpyreTensorLayout` and the host size and strides stored
 in the `TensorImpl`.
 
-This `SpyreDeviceLayout` is initialized whenever a Tensor is
+This `SpyreTensorLayout` is initialized whenever a Tensor is
 created on the Spyre device (eg. by using `to` to transfer a Tensor to
 the device, by allocating a new empty Tensor on the device, etc).
 
@@ -166,23 +166,23 @@ some layers of Dynamo and Inductor.
 
 The main ideas of our current implementation approach are:
 
-1. We add a subclass of `FixedLayout` called `SpyreFixedLayout` that
-adds a `device_layout` field that contains a SpyreDeviceLayout.
+1. We add a subclass of `FixedLayout` called `FixedTiledLayout` that
+adds a `device_layout` field that contains a `SpyreTensorLayout`.
 
 2. When a `FakeTensor` is created for a graph input that is
-a `SpyreTensorImpl`, we use its `SpyreDeviceLayout` to construct the
-corresponding `SpyreFixedLayout` instead of the default `FixedLayout`.
+a `SpyreTensorImpl`, we use its `SpyreTensorLayout` to construct the
+corresponding `FixedTiledLayout` instead of the default `FixedLayout`.
 
 3. Before final code generation from LoopLevelIR, we ensure that
-all realized operations have `SpyreFixedLayouts` instead of `FixedLayout`.
+all realized operations have `FixedTiledLayouts` instead of `FixedLayout`.
 
 In our current prototype, we have accomplished `3` by interposing
 fairly  early in Inductor's compilation stages.  In particular, we
 * dynamically add a new field to `FakeTensor` instances that holds an
-  instance of the `SpyreDeviceLayout` class
+  instance of the `SpyreTensorLayout` class
 
 * enhance the code that constructs a `FakeTensor` from a `Tensor` to capture
-the `SpyreDeviceLayout` and store it in the `FakeTensor`.
+the `SpyreTensorLayout` and store it in the `FakeTensor`.
 
 * enhance the `FakeTensor` propagation machinery and fake_ops to use the
 extended layout information on their inputs to compute the extended
@@ -223,7 +223,7 @@ TODO
 <!--
 What other designs have been considered? What is the impact of not doing this?
 -->
-As described [above](#background-spyre-tensors), the tiled memory layout of an
+As described [above](#background-sticks-and-tiles), the tiled memory layout of an
 N-dimensional tensors with k stick dimensions could be encoded as an N+k dimensional
 tensor using the existing `size()` and `strides()` APIs. A possible implementation
 would be to simply have the compiler rewrite the FX graph to be in this form relatively
