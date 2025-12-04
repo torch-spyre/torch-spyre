@@ -1,7 +1,7 @@
 # Tiled Tensors
 
 **Authors:**
-* @dgrove-oss
+* @dgrove-oss, @tardieu
 
 ## **Summary**
 
@@ -18,111 +18,112 @@ in PyTorch and to extend PyTorch's APIs and implementation to naturally support 
 
 ## **Motivation**
 
-### Background: Spyre Tensors
+### Background: Sticks and Tiles
 
-Spyre is a SIMD dataflow engine.  All memory and compute operations
-operate on chunks of 128 bytes.  We call this chunk of 128 bytes a
-_stick_.  The in-memory format of tensors on the Spyre device is
-designed to support efficient SIMD computations on sticks of data. In
-particular, one or more of every tensor’s dimensions are designated as
-stick dimensions.  All stick dimensions are padded to be multiples of
-128 bytes.
+Like many AI accelerators, IBM's Spyre is a SIMD engine. Most memory and compute
+operations operate on fixed-sized chunks. On Spyre, we call this chunk of 128
+bytes a _stick_. The importance of tiling for efficient computation is familiar
+from GPUs but even more important for dataflow accelerators built around
+systolic arrays like Spyre. Tensors are processed in fixed-sized _tiles_
+matching the array dimensions.
 
-The importance of memory layout for efficient computation is familiar from
-GPUs, but it is even more important on Spyre.  To compute on the values stored in a stick of a tensor, the stick must
-be loaded from the main on-chip memory to smaller pre-core scratchpad memories.
-Small intermediate tensors may live entirely in scratchpads. The datapath
-between the main on-chip memory and the scratchpad only allows a fixed number
-of outstanding load requests.  A load request may be for a single stick or for multiple
-contiguous sticks.  To optimize memory access performance in the presence of these
-constraints,  stick dimensions are laid out in a tiled
-fashion in the device’s memory (sticks that are consecutive in a stick
-dimension from the perspective of PyTorch-level indexing may not
-actually be assigned consecutive memory addresses on the device).  This places
-tiles of a tensor in contiguous memory, enabling the use of bulk load requests.
+#### Contiguous Tiles
 
-In addition to the memory subsystems constraints described above, the
-compute operations of Spyre’s SIMD dataflow engine impose a number of
-legality constraints on the memory layout of their inputs and the
-layout of the resulting output.
+The optimal in-memory format of tensors on an accelerator depends on the
+specifics of the memory subsystems and compute capabilities of the device.
+Balancing accesses across memory banks, minimizing cache conflicts in set
+associative caches, alignment constraints may all contribute to preferring one
+layout over another. Spyre's optimal memory bandwidth is achieved when
+transferring contiguous sticks in bulk. Tensors are therefore laid out in a
+tiled fashion. Sticks belonging to the same tile are stored contiguously in
+memory. As a consequence, sticks that are consecutive from the perspective of
+PyTorch-level indexing may not actually be consecutive on the device.
 
- As a simple concrete example of a stickified tensor, consider a 2-D
- tensor of float16 with a PyTorch size of `(1024, 256)` where dimension
- `1` is designated as the stick dimension.  Each stick contains 64
- 2-byte float16 values; therefore the 256 elements of each row of
- dimension 1 form exactly 4 sticks.  The picture below shows a logical
- view of this tensor, highlighting how the rows are divided into
- sticks.
+As a simple concrete example of a tiled tensor, consider a 2-D row-major float16
+tensor with a size of `(1024, 256)`. Each stick contains 64 2-byte float16
+values; therefore the 256 elements of each row form exactly 4 sticks. The
+picture below shows a logical view of this tensor, highlighting how the rows are
+divided into sticks.
 
 ![Tensor Logical View](tensor-logical-view.png)
 
-In a standard row-major memory layout, the sticks of the tensor would
-be linearized in memory as shown in the picture below. This is
-represented in PyTorch with a stride of `(256, 1)`.
+In a standard row-major memory layout, the sticks of the tensor would be
+linearized in memory as shown in the picture below. This is represented in
+PyTorch with strides `(256, 1)`.
 
 ![Tensor Host Layout](tensor-host-layout.png)
 
-In contrast, Spyre tiles the sticks of the Tensor so that they are
-linearized in device memory as depicted in the picture below:
+In contrast, Spyre tiles the sticks of the tensor so that they are linearized in
+device memory as depicted in the picture below:
 
 ![Tensor Device Layout](tensor-device-layout.png)
 
-In effect, the 2-D Tensor of size `(1024, 256)` is laid out in device
-memory as if it was a 3-D Tensor of size `(4, 1024, 64)` with a stride
-of `(65536, 64, 1)`.
+In effect, the 2-D tensor of size `(1024, 256)` is laid out in device memory as
+if it were a 3-D tensor of size `(4, 1024, 64)` with strides `(65536, 64, 1)`.
+Each row of the PyTorch tensor is broken into 4 non-consecutive sticks which now
+form the outermost dimension of the 3-D tensor. As a benefit, the tensor on the
+device is conveniently laid out into contiguous `(N, 64)` tiles with `1 <= N <=
+1024`.
 
-Generalizing to N dimensions with k stick dimensions but deferring
-considering padding for the moment, the mapping between host and
-memory layouts can be represented as 3 tuples of N+k integers
-corresponding to the loop ranges, host strides and device strides of
-an N+k loop nest. By convention we order the elements of the three
-tuples from outermost to innermost loop.  Using this notation, the
-concrete example above would have the specification: `(64, 1024, 4)`,
-`(1, 64, 65536)`, `(1, 256, 64)` which corresponds to the loop nest below:
+Generalizing to N dimensions with k tiling dimensions, the mapping between host
+and device layouts can be represented as 3 tuples of N+k integers corresponding
+to the loop ranges, host strides, and device strides of an N+k loop nest. By
+convention we order the elements of the three tuples in decreasing device stride
+order. Using this notation, the concrete example above would have the
+specification: `((4, 1024, 64), (65536, 64, 1), (64, 256, 1))` which corresponds
+to the loop nest below:
 
 ```
-for i in range(64):
+for i in range(4):
   for j in range(1024):
-    for k in range(4):
-      device_memory[device_tensor_address + i*1 + j*64 + k*65536] = host_memory[host_tensor_address + j*256 + (k*64 + i*1) ]
+    for k in range(64):
+      device_memory[device_tensor_address + i*65536 + j*64 + k*1] = host_memory[host_tensor_address + j*256 + (i*64 + k*1)]
 ```
 
-Stickifcation of tensors can add padding to the device memory layout in two ways.
+#### Padded Tensors
 
-If the number of elements in a stick dimension does not divide evenly
-into sticks, then the last partial stick is padded to make the
-dimension evenly divisible.  Compute operations are masked as needed
-so the added elements do not affect their results.  Tensors in host
-memory are not padded, so the mapping between device and host memory
-layouts described above is extended with modulus/floor operations.
+Memory subsystems, SIMD or tiling constraints may result in padding
+requirements. Spyre memory accesses are 128-byte aligned typically requiring the
+innermost dimension (called _stick dimension_) of a tensor to be padded to the
+next multiple of 128 bytes. Concretely a float16 tensor with size `(1000, 200)`
+will be laid out on the device as a 3-D tensor with size `(4, 1000, 64)` so that
+each row of the PyTorch tensor becomes 4 sticks with the last stick of each row
+only comprising the last 8 elements of the row.
 
-When reduction operations are performed on a stick dimension, Spyre’s
-SIMD engine produces results that only contain one element per stick.
-Mappings between host and device memory for the resulting stick-sparse
-tensors can be encoded just in the strides (no modulus/floor is
-needed).
+Tensors in host memory are typically not padded or not padded as much, so the
+mapping between host and device memory layouts described above is extended to
+account for padding requirements.
 
-### Implications of Tiled Tensors for PyTorch
+#### Operational Constraints
 
-To implement host/device memory transfers and device memory allocation
-for Spyre, the runtime representation of Spyre Tensors must accurately
-capture the permutation of elements required to transform the host
-memory layout tensors to the device memory layout and vice versa.
+Accelerators may impose a number of constraints on the input and output memory
+layouts of their operations. Spyre for example requires for optimal performance
+that the two inputs of a dot product have identical memory layout.
 
-For correct compilation and optimization, Inductor needs to
-accurately model the stickified memory layout of Spyre tensors.  Some
-key challenges include capturing the non-contiguity of stick
-dimensions (impacts loop simplifications), the sparse layout of data
-after stick-dimension reductions (impacts memory planning and backend
-code generation), and the need for the operands to binary pointwise
-operations to have compatible memory layout to reflect legality
-constraints imposed by the hardware.
+Operations producing smaller or larger output relative to input sizes may
+consume or produce sparse tensors. When reductions operations are performed
+along the stick dimension, Spyre’s SIMD engine produces results that only
+contain a single element per stick. For a float16 tensor, the stride of the
+output stick dimension is 64.
 
-The programming model needs to have hooks that enable programmers to
-provide hints/directives to fully control the choice and ordering of
-stick dimensions for individual Tensors to enable them to guide the
-compiler/runtime system into making optimal use of the hardware for
-key kernels.
+### Implications of Tensor Layouts for PyTorch
+
+To implement host/device memory transfers and device memory allocation for
+accelerators with tiling and/or padding constraints, the runtime representation
+of tensors must accurately capture the mapping of elements required to transform
+the host memory layout to the device memory layout and vice versa.
+
+For correct compilation and optimization, Inductor needs to accurately model the
+device memory layout of tensors. Some key challenges include capturing the
+non-contiguity of tiled dimensions (impacts loop simplifications), sparse and/or
+padded layouts (impacts memory planning and backend code generation). Inductor
+has to ensure operands have compatible memory layouts and derive the memory
+layouts of computed tensors.
+
+Because layout constraints may be both hard and soft resulting into large search
+spaces for device memory layouts, the programming model needs to have hooks that
+enable programmers to provide hints or directives to guide or control device
+memory layouts for tensors.
 
 ## **Proposed Implementation**
 
