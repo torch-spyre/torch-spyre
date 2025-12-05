@@ -27,7 +27,7 @@
 #include <sendnn/graph/graph_utils.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/tensor_info.hpp>
+#include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <vector>
