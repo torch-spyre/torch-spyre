@@ -273,6 +273,13 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                 raise Unsupported("TODO: slice")
             case spyreop.swap.default:
                 raise Unsupported("TODO: swap")
+            case aten.clone.default:
+                if not x.layout.device_layout.format == StickFormat.Dense:
+                    raise Unsupported("clone on sparse tensor")
+                stl = SpyreTensorLayout(output.size, output.dtype)
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
             case _:
                 # Generic pointwise unary: output layout is same as input
                 if not x.layout.size == output.size:
@@ -313,10 +320,12 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                     raise Unsupported(
                         "pointwise op with incompatible input stick formats"
                     )
-        stl = SpyreTensorLayout(output.size, output.dtype)
+        # TODO: Pretending bools are float16.
+        out_dtype = torch.float16 if output.dtype == torch.bool else output.dtype
+        stl = SpyreTensorLayout(output.size, out_dtype)
         stl.format = output_format
         return FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
+            output.device, out_dtype, output.size, output.stride, stl
         )
 
 
