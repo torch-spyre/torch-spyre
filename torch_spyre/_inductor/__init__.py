@@ -52,7 +52,6 @@ def _autoload():
     import torch_spyre._inductor.decompositions  # noqa: F401  # usort: skip
     import torch_spyre._inductor.lowering  # noqa: F401  # usort: skip
     from .fake_ops import SpyreAotAutograd
-    from .tensors import install_spyre_tensors
 
     # Customize inductor heuristics
     from .choices import SpyreHeuristics
@@ -96,8 +95,3 @@ def _autoload():
 
     # Disable fusing of mm + permute/transpose for now.
     torch._inductor.config.permute_fusion = False
-
-    # Disabled becuase the fake tensor cache doesn't preserve our added spyre_layout field
-    torch._dynamo.config.fake_tensor_cache_enabled = False
-
-    install_spyre_tensors()

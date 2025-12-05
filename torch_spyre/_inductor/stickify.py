@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Sequence, Tuple, Union
+from typing import NamedTuple, Sequence
 
 import sympy
 import torch
@@ -30,10 +30,6 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
-from torch.fx.experimental.symbolic_shapes import (
-    guard_size_oblivious,
-    is_nested_int,
-)
 from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
@@ -108,129 +104,6 @@ class FixedTiledLayout(FixedLayout):
         return self.size
 
     __repr__ = __str__
-
-
-def tensor_get_spyre_layout(self: torch.Tensor) -> SpyreTensorLayout:
-    if not hasattr(self, "spyre_layout"):
-        print(f"Warning: {self} lacks spyre_layout; assuming generic stick layout")
-        self.spyre_layout = SpyreTensorLayout(self.size(), self.dtype)
-    return self.spyre_layout
-
-
-def spyre_matmul_result_shape(
-    x: torch.Tensor, y: torch.Tensor
-) -> Tuple[Sequence[int], SpyreTensorLayout]:
-    x_layout: SpyreTensorLayout = x.get_spyre_layout()
-    y_layout: SpyreTensorLayout = y.get_spyre_layout()
-    if x_layout.format != StickFormat.Dense or y_layout.format != StickFormat.Dense:
-        raise Unsupported(f"matmul on non-dense tensors {x_layout} {y_layout}")
-    if x_layout.host_dim_order() != y_layout.host_dim_order():
-        raise Unsupported(f"matmul stick dimensions mismatch {x_layout} {y_layout}")
-    res_size = [x.size()[0], y.size()[1]]
-    res_layout = SpyreTensorLayout(res_size, x.dtype, x_layout.host_dim_order())
-    return res_size, res_layout
-
-
-def spyre_bmm_result_shape(
-    x: torch.Tensor, y: torch.Tensor
-) -> Tuple[Sequence[int], SpyreTensorLayout]:
-    x_layout: SpyreTensorLayout = x.get_spyre_layout()
-    y_layout: SpyreTensorLayout = y.get_spyre_layout()
-    if x_layout.format != StickFormat.Dense or y_layout.format != StickFormat.Dense:
-        raise Unsupported(f"bmm on non-dense tensors {x_layout} {y_layout}")
-    if x_layout.host_dim_order() != y_layout.host_dim_order():
-        raise Unsupported(f"bmm stick dimensions mismatch {x_layout} {y_layout}")
-    res_size = [x.size()[0], x.size()[1], y.size()[-1]]
-    res_layout = SpyreTensorLayout(res_size, x.dtype, x_layout.host_dim_order())
-    return res_size, res_layout
-
-
-def spyre_reduction_result_shape(
-    x: torch.Tensor, axis: Union[int, list[int]], keepdims: bool = False
-) -> Tuple[Sequence[int], SpyreTensorLayout]:
-    # Normalize axis
-    x_size = x.size()
-    if isinstance(axis, int):
-        axis = [axis]
-    for i in range(len(axis)):
-        if axis[i] < 0:
-            axis[i] += len(x_size) if len(x_size) else 1
-
-    # Compute result shape + DCI
-    x_layout: SpyreTensorLayout = x.get_spyre_layout()
-    is_stick_reduction = x_layout.is_stick_reduction(axis)
-    res_size = list(x_size)
-    res_order = x_layout.host_dim_order()
-    for d in axis:
-        if keepdims:
-            res_size[d] = 1
-        else:
-            res_size[d] = -1
-            res_order[d] = -1
-            res_order = [rd if rd < d else rd - 1 for rd in res_order]
-    res_size = [rs for rs in res_size if rs >= 0]
-    res_order = [rd for rd in res_order if rd >= 0]
-    res_format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
-    res_layout = SpyreTensorLayout(res_size, x.dtype, res_order, format=res_format)
-    return res_size, res_layout
-
-
-def spyre_pointwise_result_shape(
-    x: torch.Tensor, y: torch.Tensor
-) -> Tuple[Sequence[int], SpyreTensorLayout]:
-    """
-    Compute the shape of the result of a pointwise binary operation.
-    The code is based on torch.broadcast_shapes with Spyre enhancements.
-    """
-    x_size = x.size()
-    y_size = y.size()
-    res_size = [1] * max(len(x_size), len(y_size))
-    x_broadcasted = [False] * len(res_size)
-    y_broadcasted = [False] * len(res_size)
-    for i in range(-1, -1 - len(x_size), -1):
-        res_size[i] = x_size[i]
-
-    for i in range(-1, -1 - len(y_size), -1):
-        # NB: handle nested ints specially to avoid invalid guarding on Ne(j0, 1).
-        if is_nested_int(y_size[i]):
-            # Broadcasting is allowed for (j0, 1) or (j0, j0);
-            # not (j0, j1), (j0, 5), etc.
-            if is_nested_int(res_size[i]) and guard_size_oblivious(
-                y_size[i] == res_size[i]
-            ):
-                continue
-        else:
-            if guard_size_oblivious(y_size[i] == res_size[i]):
-                continue
-            if guard_size_oblivious(y_size[i] == 1) and not guard_size_oblivious(
-                res_size[i] == 1
-            ):
-                y_broadcasted[i] = True
-                continue
-
-        if res_size[i] != 1:
-            raise RuntimeError(
-                "Shape mismatch: objects cannot be broadcast to a single shape"
-            )
-        res_size[i] = y_size[i]
-        x_broadcasted[i] = True
-
-    x_layout = x.get_spyre_layout()
-    y_layout = y.get_spyre_layout()
-    if x_layout.format == y_layout.format:
-        res_format = x_layout.format
-    elif x_layout.format == StickFormat.Dense and y_broadcasted[x_layout.stick_dim()]:
-        res_format = StickFormat.Dense
-    elif y_layout.format == StickFormat.Dense and x_broadcasted[y_layout.stick_dim]:
-        res_format = StickFormat.Dense
-    else:
-        raise Unsupported(
-            f"binop with incompatible DCIs: {x_layout} {y_layout} {x_broadcasted} {y_broadcasted}"
-        )
-
-    # TODO: Forcing generic stick dimension order
-    dim_order = list(range(len(res_size)))
-    return res_size, SpyreTensorLayout(res_size, x.dtype, dim_order, format=res_format)
 
 
 def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
