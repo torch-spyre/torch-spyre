@@ -255,6 +255,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_numel",
+            "test_numel_cpu",
+        ): {
+            "param_sets": {
+                "size_1": {
+                    cached_randn(
+                        (
+                            64,
+                            128,
+                        )
+                    ),
+                },
+            }
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -322,6 +337,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_where_cpu(self, cond_op, x, y):
         compare_with_cpu(lambda x, y: torch.where(cond_op(x, y), x, y), x, y)
+
+    def test_numel_cpu(self, x):
+        compare_with_cpu(lambda x: torch.numel(x), x)
 
 
 if __name__ == "__main__":
