@@ -259,20 +259,30 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
     if len(args) == 1:
         x = args[0]
         match op:
-            case spyreop.compact.default:
-                raise Unsupported("TODO: compact")
-            case spyreop.exx2.default:
-                raise Unsupported("TODO: exx2")
-            case spyreop.layer_norm.default:
-                raise Unsupported("TODO: layernorm")
             case spyreop.layernormnorm.default:
                 raise Unsupported("TODO: layernormnorm")
             case spyreop.layernormscale.default:
                 raise Unsupported("TODO: layernormscale")
             case spyreop.slice.default:
-                raise Unsupported("TODO: slice")
+                if x.layout.device_layout.format != StickFormat.Sparse:
+                    raise Unsupported("slice on non-sparse tensor")
+                if len(x.layout.size) != 1:
+                    raise Unsupported("slice on non 1-D tensor")
+                stl = SpyreTensorLayout(output.size, output.dtype)
+                stl.format = StickFormat.Dense
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
             case spyreop.swap.default:
-                raise Unsupported("TODO: swap")
+                if x.layout.device_layout.format != StickFormat.Sparse:
+                    raise Unsupported("swap on non-sparse tensor")
+                if len(x.layout.size) != 1:
+                    raise Unsupported("swap on non 1-D tensor")
+                stl = SpyreTensorLayout(output.size, output.dtype)
+                stl.format = StickFormat.Sparse
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
             case aten.clone.default:
                 if not x.layout.device_layout.format == StickFormat.Dense:
                     raise Unsupported("clone on sparse tensor")
@@ -348,6 +358,12 @@ def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                 f"{red.reduction_type} stick dimensions mismatch {x_stl} {y_stl}"
             )
         stl = SpyreTensorLayout(output.size, output.dtype, x_stl.host_dim_order())
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
+    elif red.reduction_type == "exx2":
+        stl = SpyreTensorLayout(output.size, output.dtype)
+        stl.format = StickFormat.SparseMulti
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
