@@ -176,6 +176,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "dim_1": (1, cached_randn((128, 256))),
             },
         },
+        ("test_max_unsqueeze_cpu", "test_max_unsqueeze_cpu"): {
+            "param_sets": {
+                "dim_0": (0, cached_randn((128, 256))),
+                "dim_1": (1, cached_randn((128, 256))),
+            },
+        },
         (
             "test_alias_operands",
             "test_unary_op",
@@ -313,6 +319,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return z
 
         compare_with_cpu(fn, x)  # eager mode crashes
+
+    def test_max_unsqueeze_cpu(self, dim: int, x):
+        def fn(x):
+            x_max = torch.max(x, dim=dim, keepdim=False)[0]
+            x_compact = torch.ops.spyre.compact(x_max)
+            z = torch.unsqueeze(x_compact, dim=dim)
+            return z
+        #eager mode crashes, test with compare_with_cpu  
+        compare_with_cpu(fn, x) 
 
     def test_transpose_2d_cpu(self, x):
         compare_with_cpu(lambda x: x.t().contiguous(), x)
