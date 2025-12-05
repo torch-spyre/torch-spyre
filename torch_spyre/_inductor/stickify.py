@@ -36,6 +36,8 @@ from torch.fx.experimental.symbolic_shapes import (
 )
 from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
+from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -261,11 +263,11 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                 raise Unsupported("TODO: compact")
             case spyreop.exx2.default:
                 raise Unsupported("TODO: exx2")
-            case spyreop.layernorm.default:
+            case spyreop.layer_norm.default:
                 raise Unsupported("TODO: layernorm")
-            case spyreop.layernormnorm:
+            case spyreop.layernormnorm.default:
                 raise Unsupported("TODO: layernormnorm")
-            case spyreop.layernormscale:
+            case spyreop.layernormscale.default:
                 raise Unsupported("TODO: layernormscale")
             case spyreop.slice.default:
                 raise Unsupported("TODO: slice")
@@ -294,7 +296,6 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
             var = output_dims[i]
             for j in range(len(args)):
                 if var in input_dims[j]:
-                    print(f"Checking: {i} {j} {var} {input_dims[j][input_dim_idx[j]]}")
                     if input_dims[j][input_dim_idx[j]] != var:
                         # TODO: This is overly conservative.
                         #        SDSCs can support pointwise ops where non-stick dimensions differ in stride order
@@ -320,8 +321,37 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
 
 
 def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
-    print(f"Convert reduction: {n} {args}")
-    raise Unsupported("TODO")
+    red: Reduction = n.node.data
+    output: FixedLayout = n.node.get_layout()
+    output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
+    if (
+        red.reduction_type == MATMUL_REDUCTION_OP
+        or red.reduction_type == BATCH_MATMUL_OP
+    ):
+        x_stl = args[0].layout.device_layout
+        y_stl = args[1].layout.device_layout
+        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+            raise Unsupported(
+                f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
+            )
+        if x_stl.host_dim_order() != y_stl.host_dim_order():
+            raise Unsupported(
+                f"{red.reduction_type} stick dimensions mismatch {x_stl} {y_stl}"
+            )
+        stl = SpyreTensorLayout(output.size, output.dtype, x_stl.host_dim_order())
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
+    else:
+        input = args[0]
+        input_dims = stride_order_vars(input.dep.index)
+        stick_var = input_dims[-1]
+        is_stick_reduction = stick_var not in output_dims
+        stl = SpyreTensorLayout(output.size, output.dtype)
+        stl.format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
 
 
 def propagate_spyre_tensor_layouts(
