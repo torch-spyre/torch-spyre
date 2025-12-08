@@ -31,7 +31,7 @@
 #include <sendnn/graph/graph_utils.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/tensor_info.hpp>
+#include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <vector>
@@ -183,6 +183,24 @@ uint32_t encodeConstant(float torch_const, const std::string &data_format) {
   uint32_t sen_const;
   DataFormats df;
   df = FromString<DataFormats>(data_format);
+void convertArtifacts(std::string artifacts_path) {
+  dee::PBD pbd;
+  sendnn::Graph g2;
+
+  setenv("DEEPRT_EXPORT_DIR", artifacts_path.c_str(), 1);
+  senbfcc::GlobalTracedSettings::Get().UpdateValue("DEEPRT_EXPORT_DIR",
+                                                   artifacts_path);
+
+  setenv("SENDNN_SERIALIZER_FORMAT", "CBOR", 1);
+
+  // Convert compiled artifacts to sendnn g2 graph
+  pbd.FromGraph(&g2);
+
+  // Serialize g2 graph
+  sendnn::Serialize(g2, artifacts_path + "/g2");
+
+  return;
+}
 
   if (df == DataFormats::IEEE_FP32) {
     sen_const =
