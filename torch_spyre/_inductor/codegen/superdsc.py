@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from torch_spyre._inductor.constants import MATMUL_REDUCTION_OP, TRANSPOSE_OP
+from torch_spyre._inductor.constants import (
+    MATMUL_REDUCTION_OP,
+    BATCH_MATMUL_OP,
+    TRANSPOSE_OP,
+)
 from torch_spyre._inductor import Unsupported
-from .compute_ops import generate_sfp_op, generate_matmul
+from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (
     generate_slice,
     generate_transpose,
@@ -23,8 +27,19 @@ from .data_ops import (
 
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
+    if len(dimensions) > 3 and op != BATCH_MATMUL_OP:
+        raise Unsupported(f"operation on {len(dimensions)}-D tensor")
     if op == MATMUL_REDUCTION_OP:
         return generate_matmul(
+            pointers,
+            op=op,
+            dimensions=dimensions,
+            inputs=inputs,
+            outputs=outputs,
+            **kwargs,
+        )
+    if op == BATCH_MATMUL_OP:
+        return generate_bmm(
             pointers,
             op=op,
             dimensions=dimensions,
