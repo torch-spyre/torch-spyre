@@ -52,7 +52,6 @@ def _autoload():
     import torch_spyre._inductor.decompositions  # noqa: F401  # usort: skip
     import torch_spyre._inductor.lowering  # noqa: F401  # usort: skip
     from .fake_ops import SpyreAotAutograd
-    from .tensors import install_spyre_tensors
 
     # Customize inductor heuristics
     from .choices import SpyreHeuristics
@@ -61,6 +60,7 @@ def _autoload():
 
     # Customize inductor configuration
     from .passes import CustomPrePasses, CustomPostPasses
+    from .stickify import propagate_spyre_tensor_layouts
 
     torch._inductor.config.triton.use_block_ptr = True
     torch._inductor.config.triton.prefer_nd_tiling = True
@@ -69,6 +69,7 @@ def _autoload():
     torch._inductor.config.benchmark_harness = False
     torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
     torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
+    torch._inductor.config._pre_fusion_custom_pass = propagate_spyre_tensor_layouts
     # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
     torch._inductor.config.unroll_reductions_threshold = 1
@@ -94,8 +95,3 @@ def _autoload():
 
     # Disable fusing of mm + permute/transpose for now.
     torch._inductor.config.permute_fusion = False
-
-    # Disabled becuase the fake tensor cache doesn't preserve our added spyre_layout field
-    torch._dynamo.config.fake_tensor_cache_enabled = False
-
-    install_spyre_tensors()

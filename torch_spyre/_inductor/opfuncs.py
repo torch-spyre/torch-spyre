@@ -22,7 +22,6 @@ def _initialize_opfunc_mapping():
     from .spyre_kernel import SpyreKernelOverrides
 
     # Inductor reduction operations
-    # NOTE: If you add a new op here, you must also update fake_ops.py
     reductions = {
         "argmax": "argmax",
         "argmin": "argmin",
@@ -47,7 +46,6 @@ def _initialize_opfunc_mapping():
         if callable(getattr(SpyreKernelOverrides, attr)) and not attr.startswith("_")
     }
     # Implemented pointwise ops whose opfunc is the same as the inductor op
-    # NOTE: If you add a new op here, you must also update fake_ops.py
     same_name = [
         "abs",
         "add",
@@ -68,7 +66,6 @@ def _initialize_opfunc_mapping():
     for i in same_name:
         pointwise_ops[i] = i
     # Implemented pointwise ops that need to be renamed
-    # NOTE: If you add a new op here, you must also update fake_ops.py
     pointwise_ops["truediv"] = "realdiv"
     pointwise_ops["relu"] = "relufwd"
     pointwise_ops["eq"] = "equal"
