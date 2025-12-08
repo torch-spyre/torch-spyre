@@ -221,6 +221,11 @@ PYBIND11_MODULE(_C, m) {
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("get_sen_data_format", &spyre::getSenDataFormat);
   m.def("convert_artifacts", &spyre::convertArtifacts);
+  m.def("empty_strided_device_layout", &spyre::spyre_empty_strided_layout,
+        py::arg("size"), py::arg("stride"), py::kw_only(),
+        py::arg("device_layout"), py::arg("dtype"), py::arg("layout"),
+        py::arg("device"), py::arg("pin_memory"));
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")

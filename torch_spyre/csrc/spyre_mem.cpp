@@ -713,6 +713,18 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
+at::Tensor spyre_empty_strided_layout(c10::IntArrayRef size,
+                                      c10::IntArrayRef stride,
+                                      SpyreTensorLayout device_layout,
+                                      std::optional<c10::ScalarType> dtype_opt,
+                                      std::optional<c10::Layout> layout_opt,
+                                      std::optional<c10::Device> device_opt,
+                                      std::optional<bool> pin_memory_opt) {
+  // TEMP: forward to empty_strided for now.
+  return spyre_empty_strided(size, stride, dtype_opt, layout_opt, device_opt,
+                             pin_memory_opt);
+}
+
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
