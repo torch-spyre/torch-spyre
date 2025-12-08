@@ -54,7 +54,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             """
                 from torch_spyre._inductor.runtime import ConstantArg, TensorArg, KernelSpec, UnimplementedOp
                 from torch_spyre._inductor.runtime.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import SpyreTensorLayout, StickFormat
+                from torch_spyre._C import SpyreTensorLayout, StickFormat, spyre_empty
                 import subprocess
             """,
             strip=True,
@@ -75,15 +75,19 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
 
         out = (
-            f"{name} = empty_strided("
+            f"{name} = spyre_empty("
             f"{codegen_allocation_shape_tuple}, "
             f"{codegen_stride_tuple}, "
-            f"device='{layout.device.type}', dtype={layout.dtype})"
+            f"{layout.dtype}, "
+            f"SpyreTensorLayout({layout.device_layout.device_size}, "
+            f"{layout.device_layout.device_strides}, "
+            f"{layout.device_layout.dim_map}, "
+            f"{layout.device_layout.num_stick_dims}, "
+            f"{layout.device_layout.format}))"
         )
         if codegen_shape_tuple != codegen_allocation_shape_tuple:
             out = out + f".as_strided({codegen_shape_tuple}, {codegen_stride_tuple})"
 
-        out = out + f" {self.comment} {layout.device_layout}"
         return out
 
 
