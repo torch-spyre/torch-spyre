@@ -15,8 +15,8 @@
 from typing import NamedTuple, Sequence
 
 import sympy
+
 import torch
-from sympy import Expr
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -30,9 +30,11 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
+
 from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from .ir import FixedTiledLayout
 
 
 aten = torch.ops.aten
@@ -76,34 +78,6 @@ setattr(SpyreTensorLayout, "host_dim_order", stl_host_dim_order)
 setattr(SpyreTensorLayout, "stick_dim", stl_stick_dim)
 setattr(SpyreTensorLayout, "is_stick_reduction", stl_is_stick_reduction)
 setattr(SpyreTensorLayout, "spyre_fixed_layout", stl_spyre_fixed_layout)
-
-
-class FixedTiledLayout(FixedLayout):
-    device_layout: SpyreTensorLayout
-
-    def __init__(
-        self,
-        device: torch.device,
-        dtype: torch.dtype,
-        size: list[Expr],
-        stride: list[Expr],
-        device_layout: SpyreTensorLayout,
-    ) -> None:
-        super().__init__(device, dtype, size, stride)
-        self.device_layout = device_layout
-
-    def __str__(self) -> str:
-        device_index_str = "" if self.device.index is None else f":{self.device.index}"
-        return (
-            f"{type(self).__name__}('{self.device.type}{device_index_str}', {self.dtype}, "
-            f"size={self.size}, stride={self.stride}, device_layout={self.device_layout})"
-        )
-
-    def get_allocation_size(self) -> list[Expr]:
-        # TODO: Eventually this will include padding, etc.
-        return self.size
-
-    __repr__ = __str__
 
 
 def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:

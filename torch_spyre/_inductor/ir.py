@@ -18,12 +18,14 @@ from sympy import Expr
 import torch
 from torch._inductor.utils import ir_dataclass
 from torch._inductor.ir import (
+    FixedLayout,
     IRNode,
     Pointwise,
     Reduction,
     ReductionHint,
     TensorBox,
 )
+from torch_spyre._C import SpyreTensorLayout
 
 
 @ir_dataclass
@@ -62,3 +64,31 @@ class SpyreReduction(Reduction):
                 op_info=op_info,
             )
         )
+
+
+class FixedTiledLayout(FixedLayout):
+    device_layout: SpyreTensorLayout
+
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        size: list[Expr],
+        stride: list[Expr],
+        device_layout: SpyreTensorLayout,
+    ) -> None:
+        super().__init__(device, dtype, size, stride)
+        self.device_layout = device_layout
+
+    def __str__(self) -> str:
+        device_index_str = "" if self.device.index is None else f":{self.device.index}"
+        return (
+            f"{type(self).__name__}('{self.device.type}{device_index_str}', {self.dtype}, "
+            f"size={self.size}, stride={self.stride}, device_layout={self.device_layout})"
+        )
+
+    def get_allocation_size(self) -> list[Expr]:
+        # TODO: Eventually this will include padding, etc.
+        return self.size
+
+    __repr__ = __str__

@@ -34,7 +34,7 @@
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/tensor_info.hpp>
+#include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <utility>
@@ -419,7 +419,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
                                                {dci_node}, sub_graph);
       gb.PrimaryOutput("Output", dev_node->OutputPort(0));
     } else {
-      sendnn::NodePtr inp_node = gb.PrimaryInput("Input", dci_ti);
+      sendnn::Node* inp_node = gb.PrimaryInput("Input", dci_ti);
       auto dev_node = gb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
                                                {inp_node}, sub_graph);
       auto dci = generate_dci(dev_tensor, host2device);
@@ -448,9 +448,9 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
     flex::FlexGraphBuilder gb;
 
     sendnn::TensorInfo inp_ti =
-        sendnn::TensorInfo(exec_graph.input_ops_.front()->Output(0));
+        sendnn::TensorInfo(exec_graph.input_ops_.front()->OutputAt(0));
     sendnn::TensorInfo out_ti =
-        sendnn::TensorInfo(exec_graph.output_ops_.front()->Input(0));
+        sendnn::TensorInfo(exec_graph.output_ops_.front()->InputAt(0));
     sendnn::NodeOrIndexedNode inp_node = gb.PrimaryInput("Input", inp_ti);
 
     std::string k_uuid = "dma-network";

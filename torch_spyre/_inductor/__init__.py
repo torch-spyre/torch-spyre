@@ -53,23 +53,25 @@ def _autoload():
     import torch_spyre._inductor.lowering  # noqa: F401  # usort: skip
     from .fake_ops import SpyreAotAutograd
 
+    # Monkey patching this method is our hook for installing additional
+    # Spyre-specific overrides and contexts that are not supported by existing extension points.
+    torch._dynamo.backends.common.aot_autograd = lambda **kwargs: SpyreAotAutograd(
+        **kwargs
+    )
+
     # Customize inductor heuristics
     from .choices import SpyreHeuristics
 
     torch._inductor.virtualized.V.set_choices_handler(SpyreHeuristics())
 
     # Customize inductor configuration
-    from .passes import CustomPrePasses, CustomPostPasses
-    from .stickify import propagate_spyre_tensor_layouts
+    from .passes import CustomPrePasses, CustomPostPasses, scheduler_passes
 
-    torch._inductor.config.triton.use_block_ptr = True
-    torch._inductor.config.triton.prefer_nd_tiling = True
-    torch._inductor.config.triton.codegen_upcast_to_fp32 = False
     torch._inductor.config.split_reductions = False
     torch._inductor.config.benchmark_harness = False
     torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
     torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
-    torch._inductor.config._pre_fusion_custom_pass = propagate_spyre_tensor_layouts
+    torch._inductor.config._pre_fusion_custom_pass = scheduler_passes
     # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
     torch._inductor.config.unroll_reductions_threshold = 1
@@ -86,12 +88,6 @@ def _autoload():
 
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
-
-    # Replacing this method is our hook for installing Spyre-specific
-    # meta functions and lowerings when compiling fxGraphs for the Spyre device.
-    torch._dynamo.backends.common.aot_autograd = lambda **kwargs: SpyreAotAutograd(
-        **kwargs
-    )
 
     # Disable fusing of mm + permute/transpose for now.
     torch._inductor.config.permute_fusion = False

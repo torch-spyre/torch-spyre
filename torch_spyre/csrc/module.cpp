@@ -22,6 +22,7 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <dee_internal/dee_graph_converter.hpp>
 #include <flex/flex_factory.hpp>
 #include <memory>
 #include <sendnn/graph.hpp>
@@ -30,7 +31,7 @@
 #include <sendnn/graph/graph_utils.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/tensor_info.hpp>
+#include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <vector>
@@ -178,6 +179,7 @@ std::string getSenDataFormat(c10::ScalarType torch_dtype) {
       stringToDTDataFormatPair(torchScalarToString[torch_dtype]);
   return EnumsConversion::dataFormatsToString(dtype_dev);
 }
+
 uint32_t encodeConstant(float torch_const, const std::string &data_format) {
   uint32_t sen_const;
   DataFormats df;
@@ -191,6 +193,24 @@ uint32_t encodeConstant(float torch_const, const std::string &data_format) {
   }
   return sen_const;
 }
+void convertArtifacts(std::string artifacts_path) {
+  dee::PBD pbd;
+  sendnn::Graph g2;
+
+  setenv("DEEPRT_EXPORT_DIR", artifacts_path.c_str(), 1);
+  senbfcc::GlobalTracedSettings::Get().UpdateValue("DEEPRT_EXPORT_DIR",
+                                                   artifacts_path);
+
+  setenv("SENDNN_SERIALIZER_FORMAT", "CBOR", 1);
+
+  // Convert compiled artifacts to sendnn g2 graph
+  pbd.FromGraph(&g2);
+
+  // Serialize g2 graph
+  sendnn::Serialize(g2, artifacts_path + "/g2");
+
+  return;
+}
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -200,7 +220,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("get_sen_data_format", &spyre::getSenDataFormat);
-
+  m.def("convert_artifacts", &spyre::convertArtifacts);
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
