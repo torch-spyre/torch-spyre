@@ -54,6 +54,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             """
                 from torch_spyre._inductor.runtime import ConstantArg, TensorArg, KernelSpec, UnimplementedOp
                 from torch_spyre._inductor.runtime.async_compile import SpyreAsyncCompile
+                from torch_spyre._C import SpyreTensorLayout, StickFormat
                 import subprocess
             """,
             strip=True,

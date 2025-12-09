@@ -116,11 +116,11 @@ std::string SpyreTensorLayout::toString() const {
   ss << "], num_stick_dims=";
   ss << this->num_stick_dims;
   if (this->format == StickFormat::Dense) {
-    ss << ", format=\"Dense\"";
+    ss << ", format=StickFormat.Dense";
   } else if (this->format == StickFormat::Sparse) {
-    ss << ", format=\"Sparse\"";
+    ss << ", format=StickFormat.Sparse";
   } else {
-    ss << ", format=\"SparseMulti\"";
+    ss << ", format=StickFormat.SparseMulti";
   }
   ss << ")";
   return ss.str();

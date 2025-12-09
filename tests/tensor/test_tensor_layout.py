@@ -90,7 +90,7 @@ class TestSpyreTensorLayout(TestCase):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
             str(stl),
-            'SpyreTensorLayout(device_size=[4, 512, 64], device_strides=[32768, 64, 1], dim_map =[1, 0, 1], num_stick_dims=1, format="Dense")',
+            "SpyreTensorLayout(device_size=[4, 512, 64], device_strides=[32768, 64, 1], dim_map =[1, 0, 1], num_stick_dims=1, format=StickFormat.Dense)",
         )
 
     def test_device_alloc(self):
