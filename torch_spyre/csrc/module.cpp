@@ -229,8 +229,6 @@ PYBIND11_MODULE(_C, m) {
       .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
 
   dci_cls.def_readwrite("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readwrite("device_strides",
-                     &spyre::SpyreTensorLayout::device_strides)
       .def_readwrite("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readwrite("num_stick_dims",
                      &spyre::SpyreTensorLayout::num_stick_dims)
@@ -239,6 +237,7 @@ PYBIND11_MODULE(_C, m) {
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("__repr__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
@@ -246,11 +245,10 @@ PYBIND11_MODULE(_C, m) {
                     spyre::SpyreTensorLayout::StickFormat>(),
            py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
            py::arg("format") = spyre::SpyreTensorLayout::StickFormat::Dense)
-      .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
-                    std::vector<int32_t>, int32_t,
+      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, int32_t,
                     spyre::SpyreTensorLayout::StickFormat>(),
-           py::arg("device_size"), py::arg("device_strides"),
-           py::arg("dim_map"), py::arg("num_stick_dims"), py::arg("format"));
+           py::arg("device_size"), py::arg("dim_map"),
+           py::arg("num_stick_dims"), py::arg("format"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
 }

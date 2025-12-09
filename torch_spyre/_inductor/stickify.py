@@ -59,25 +59,9 @@ def stl_is_stick_reduction(self: SpyreTensorLayout, axis: list[int]) -> bool:
         return False
 
 
-def stl_spyre_fixed_layout(
-    self: SpyreTensorLayout, device: torch.device, size: torch.Size, dtype: torch.dtype
-):
-    cur_stride = (
-        1
-        if self.format == StickFormat.Dense
-        else 128 // dtype.itemsize  # TODO - get from self.device_strides?
-    )
-    stride: list[int | torch.SymInt] = [-1] * len(size)
-    for d in reversed(self.host_dim_order()):
-        stride[d] = cur_stride
-        cur_stride = cur_stride * size[d]
-    return FixedTiledLayout(device, dtype, list(size), stride, self)
-
-
 setattr(SpyreTensorLayout, "host_dim_order", stl_host_dim_order)
 setattr(SpyreTensorLayout, "stick_dim", stl_stick_dim)
 setattr(SpyreTensorLayout, "is_stick_reduction", stl_is_stick_reduction)
-setattr(SpyreTensorLayout, "spyre_fixed_layout", stl_spyre_fixed_layout)
 
 
 def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
