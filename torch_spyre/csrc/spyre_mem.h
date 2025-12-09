@@ -31,8 +31,8 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
 class SpyreTensorLayout;
-at::Tensor spyre_empty_strided_layout(c10::IntArrayRef size,
-                                      c10::IntArrayRef stride,
-                                      c10::ScalarType dtype,
-                                      SpyreTensorLayout device_layout);
+at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
+                                   c10::IntArrayRef stride,
+                                   c10::ScalarType dtype,
+                                   SpyreTensorLayout device_layout);
 }  // namespace spyre

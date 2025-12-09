@@ -713,10 +713,10 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   return tensor;
 }
 
-at::Tensor spyre_empty_strided_layout(c10::IntArrayRef size,
-                                      c10::IntArrayRef stride,
-                                      c10::ScalarType dtype,
-                                      SpyreTensorLayout device_layout) {
+at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
+                                   c10::IntArrayRef stride,
+                                   c10::ScalarType dtype,
+                                   SpyreTensorLayout device_layout) {
   // TEMP: forward to empty_strided for now.
   return spyre_empty_strided(size, stride, dtype, std::nullopt, std::nullopt,
                              std::nullopt);
