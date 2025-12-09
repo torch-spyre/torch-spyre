@@ -16,7 +16,6 @@ import dataclasses
 from typing import Union
 import torch
 from torch_spyre._C import SpyreTensorLayout
-from torch_spyre._inductor.ir import FixedTiledLayout
 
 
 @dataclasses.dataclass
@@ -26,12 +25,6 @@ class TensorArg:
     dtype: torch.dtype
     host_size: torch.Size
     device_layout: SpyreTensorLayout
-
-    @classmethod
-    def create(cls, is_input: bool, arg_index: int, layout: FixedTiledLayout):
-        return TensorArg(
-            is_input, arg_index, layout.dtype, layout.size, layout.device_layout
-        )
 
 
 @dataclasses.dataclass

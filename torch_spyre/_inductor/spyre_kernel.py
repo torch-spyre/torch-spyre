@@ -70,6 +70,14 @@ class KernelSummary:
     op_info: dict[str, Any]
 
 
+def create_tensor_arg(
+    is_input: bool, arg_index: int, layout: FixedTiledLayout
+) -> TensorArg:
+    return TensorArg(
+        is_input, arg_index, layout.dtype, layout.size, layout.device_layout
+    )
+
+
 class SpyreKernelCSEVariable(CSEVariable):
     undefined_re = re.compile(r"\b(tmp\d+)\[\?\]")
 
@@ -231,7 +239,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                     raise Unsupported(f"matmul: unsupported input {input}")
                 scale = self.analyze_tensor_access(di, input.index)
                 args.append(
-                    TensorArg.create(
+                    create_tensor_arg(
                         True,
                         actuals.index(input.name),
                         input.layout,
@@ -240,7 +248,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 scales.append(scale)
             scale = self.analyze_tensor_access(di, self.compute_output.index)
             args.append(
-                TensorArg.create(
+                create_tensor_arg(
                     False,
                     actuals.index(self.compute_output.name),
                     self.compute_output.layout,
@@ -276,7 +284,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             for input in self.compute_inputs:
                 scale = self.analyze_tensor_access(di, input.index)  # type: ignore[union-attr]
                 args.append(
-                    TensorArg.create(
+                    create_tensor_arg(
                         True,
                         actuals.index(input.name),  # type: ignore[union-attr]
                         input.layout,  # type: ignore[union-attr]
@@ -285,7 +293,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 scales.append(scale)
             scale = self.analyze_tensor_access(di, self.compute_output.index)
             args.append(
-                TensorArg.create(
+                create_tensor_arg(
                     False,
                     actuals.index(self.compute_output.name),
                     self.compute_output.layout,
@@ -303,7 +311,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             input = self.compute_inputs[0]
             scale = self.analyze_tensor_access(di, input.index)
             args.append(
-                TensorArg.create(
+                create_tensor_arg(
                     True,
                     actuals.index(input.name),
                     input.layout,
@@ -312,7 +320,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             scales.append(scale)
             scale = self.analyze_tensor_access(di, self.compute_output.index)
             args.append(
-                TensorArg.create(
+                create_tensor_arg(
                     False,
                     actuals.index(self.compute_output.name),
                     self.compute_output.layout,
@@ -329,7 +337,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                     if self.compute_op == "layernormscale":
                         scale[-1] = -2
                     args.append(
-                        TensorArg.create(
+                        create_tensor_arg(
                             True,
                             actuals.index(input.name),
                             input.layout,
@@ -341,7 +349,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                     scales.append([-1] * len(di))
             scale = self.analyze_tensor_access(di, self.compute_output.index)
             args.append(
-                TensorArg.create(
+                create_tensor_arg(
                     False,
                     actuals.index(self.compute_output.name),
                     self.compute_output.layout,
@@ -370,11 +378,13 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             out_di = self.analyze_index_expr(self.compute_output.index)
             input = self.compute_inputs[0]
             scale = self.analyze_tensor_access(in_di, input.index)
-            args.append(TensorArg.create(True, actuals.index(input.name), input.layout))
+            args.append(
+                create_tensor_arg(True, actuals.index(input.name), input.layout)
+            )
             scales.append(scale)
             scale = self.analyze_tensor_access(out_di, self.compute_output.index)
             args.append(
-                TensorArg.create(
+                create_tensor_arg(
                     False,
                     actuals.index(self.compute_output.name),
                     self.compute_output.layout,
