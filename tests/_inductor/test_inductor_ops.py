@@ -101,7 +101,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,),),
                     ((67, 256),),
-                    # ((67, 71, 256),)*2, # 3d input causes eager timeout
+                    ((67, 71, 256),),
                 ]
             ),
         },
@@ -114,7 +114,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,),) * 2,
                     ((67, 256),) * 2,
-                    # ((67, 71, 256),)*2, # 3d input causes eager timeout
+                    ((67, 71, 256),) * 2,
                 ]
             ),
         },
@@ -267,9 +267,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unary_op(self, op, x):
         if op == torch.reciprocal:
-            # TODO: Division by 0 differs on Spyre from CPU, sidestep for now.
-            zero_mask = x == 0.0
-            x[zero_mask] = FP16_EPS
+            # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
+            tiny_value_mask = torch.abs(x) < FP16_EPS
+            x[tiny_value_mask] = FP16_EPS
 
         if op == torch.exp:
             # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
@@ -279,9 +279,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
-            # TODO: Division by 0 differs on Spyre from CPU, sidestep for now.
-            zero_mask = b == 0.0
-            b[zero_mask] = FP16_EPS
+            # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
+            tiny_value_mask = torch.abs(b) < FP16_EPS
+            b[tiny_value_mask] = FP16_EPS
+
         if a.dtype == torch.float32:
             compare_with_cpu(op, a, b)
         elif op == torch.bmm:

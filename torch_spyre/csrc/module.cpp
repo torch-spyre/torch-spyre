@@ -221,6 +221,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("get_sen_data_format", &spyre::getSenDataFormat);
   m.def("convert_artifacts", &spyre::convertArtifacts);
+  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
