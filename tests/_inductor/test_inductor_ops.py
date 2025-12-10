@@ -144,6 +144,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        ("test_bmm", "test_binary_op"): {
+            "ops_dict": {
+                "bmm": torch.bmm,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((3, 17, 256), (3, 256, 128)),
+                ]
+            ),
+        },
         ("test_reduce_2d", "test_reduce"): {
             "ops_dict": REDUCTION_OPS_DICT,
             "param_sets": {
@@ -231,7 +241,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256,)),
                     cached_randn((256,)),
                 ),
+                "ne": (
+                    lambda x, y: x != y,
+                    cached_randn((256,)),
+                    cached_randn((256,)),
+                ),
             }
+        },
+        (
+            "test_pointwise_binary_op_fp32",
+            "test_binary_op",
+        ): {
+            "ops_dict": POINTWISE_BINARY_OPS_DICT,
+            "param_sets": {
+                "fp32": (
+                    cached_randn((67, 256), dtype=torch.float32),
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+            },
         },
     }
 
@@ -255,7 +282,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # TODO: Division by 0 differs on Spyre from CPU, sidestep for now.
             zero_mask = b == 0.0
             b[zero_mask] = FP16_EPS
-        compare(op, a, b)
+        if a.dtype == torch.float32:
+            compare_with_cpu(op, a, b)
+        elif op == torch.bmm:
+            # TODO: Eager mode mismatch causing cryptic error, sidestep for now.
+            compare_with_cpu(op, a, b)
+        else:
+            compare(op, a, b)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):

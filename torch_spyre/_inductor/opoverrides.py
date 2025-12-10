@@ -42,6 +42,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.fma({x})"
 
     @staticmethod
+    def gelu(x):
+        return f"spyre.gelu({x})"
+
+    @staticmethod
     def layernormnorm(a, b, c, d, e):
         return f"spyre.layernormnorm({a}, {b}, {c}, {d}, {e})"
 
@@ -68,6 +72,10 @@ class SpyreKernelOverrides(OpOverrides):
     @staticmethod
     def sigmoid(x):
         return f"spyre.sigmoid({x})"
+
+    @staticmethod
+    def softplus(x, y, z):
+        return f"spyre.softplus({x}, {y}, {z})"
 
     @staticmethod
     def sqrt(x):

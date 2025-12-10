@@ -19,7 +19,7 @@ import os
 import subprocess
 
 from torch._inductor.runtime.runtime_utils import cache_dir
-
+from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from . import KernelSpec, ConstantArg, UnimplementedOp
@@ -55,12 +55,20 @@ class SpyreAsyncCompile:
                 raise RuntimeError("TOOO: implement SDSC generation for constants")
             elif ts.is_input:
                 inputs.append(
-                    {"name": _argument_names[index], "scale": ks.scales[index]}
+                    {
+                        "name": _argument_names[index],
+                        "scale": ks.scales[index],
+                        "dtype": ts.dtype,
+                    }
                 )
                 arg_mapping.append(ts.arg_index)
             else:
                 outputs.append(
-                    {"name": _argument_names[index], "scale": ks.scales[index]}
+                    {
+                        "name": _argument_names[index],
+                        "scale": ks.scales[index],
+                        "dtype": ts.dtype,
+                    }
                 )
                 arg_mapping.append(ts.arg_index)
         kernel_descriptor = {
@@ -82,6 +90,7 @@ class SpyreAsyncCompile:
             print(f"Generating {file.name}")
             json.dump(dt_sdsc, file, indent=2)
         subprocess.run(["dxp_standalone", "-d", kernel_output_dir], check=True)
+        convert_artifacts(kernel_output_dir)
         return SpyreSDSCKernelRunner(kernel_name, kernel_output_dir, arg_mapping)
 
     def wait(self, scope: dict[str, Any]) -> None:

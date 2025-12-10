@@ -15,6 +15,7 @@
 import dataclasses
 from typing import Union
 import torch
+from torch_spyre._C import SpyreTensorLayout
 
 
 @dataclasses.dataclass
@@ -22,6 +23,8 @@ class TensorArg:
     is_input: bool
     arg_index: int
     dtype: torch.dtype
+    host_size: torch.Size
+    device_layout: SpyreTensorLayout
 
 
 @dataclasses.dataclass

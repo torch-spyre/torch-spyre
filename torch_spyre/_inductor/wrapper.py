@@ -23,7 +23,7 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
-from .stickify import SpyreFixedLayout
+from .stickify import FixedTiledLayout
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
@@ -54,6 +54,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             """
                 from torch_spyre._inductor.runtime import ConstantArg, TensorArg, KernelSpec, UnimplementedOp
                 from torch_spyre._inductor.runtime.async_compile import SpyreAsyncCompile
+                from torch_spyre._C import SpyreTensorLayout, StickFormat
                 import subprocess
             """,
             strip=True,
@@ -63,7 +64,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
     def make_buffer_allocation(self, buffer: BufferLike):
         layout = buffer.get_layout()
-        if not isinstance(layout, SpyreFixedLayout):
+        if not isinstance(layout, FixedTiledLayout):
             return super().make_buffer_allocation(buffer)
 
         name = buffer.get_name()

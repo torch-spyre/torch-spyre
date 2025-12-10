@@ -13,8 +13,10 @@
 # limitations under the License.
 
 MATMUL_REDUCTION_OP = "matmul"
+BATCH_MATMUL_OP = "batchmatmul"
 TRANSPOSE_OP = "transpose"
 DEVICE_NAME = "spyre"
+BYTES_PER_STICK = 128
 
 SEGMENT_OFFSETS = [
     0x0,
@@ -24,4 +26,23 @@ SEGMENT_OFFSETS = [
     0x1000000000,
     0x1400000000,
     0x1800000000,
+]
+
+SPYRE_FP32_OPS = [
+    "add",
+    "sub",
+    "mul",
+    "ge",
+    "le",
+    "eq",
+    "where",
+    "realdiv",
+    "relu",
+    "reciprocal",
+    "layernormscale",
+    "abs",
+    "exp",
+    "sigmoid",
+    "exx2",
+    "layernormnorm",
 ]
