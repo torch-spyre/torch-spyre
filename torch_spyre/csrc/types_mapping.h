@@ -17,12 +17,15 @@
 #pragma once
 
 #include <c10/core/ScalarType.h>
+#include <c10/util/Exception.h>  // TORCH_WARN_ONCE
+#include <module.h>
 #include <util/sendefs.h>
 
 #include <sendnn/tensor/sendatatype.hpp>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 inline std::unordered_map<c10::ScalarType, std::string> torchScalarToString = {
     /* this ensures the same representation regardless of how PyTorch changes
@@ -82,6 +85,21 @@ inline std::pair<DataFormats, DataFormats> stringToDTDataFormatPair(
 
   auto it = type_map.find(type_name);
   if (it != type_map.end()) {
+    if (spyre::get_downcast_warn_enabled()) {
+      std::vector<std::string> allowed = {
+          "int64",
+      };
+      if (std::find(allowed.begin(), allowed.end(), type_name) !=
+          allowed.end()) {
+        TORCH_WARN_ONCE(
+            "Backend Spyre does not support int64; downcasting to int32 may "
+            "change values "
+            "outside the 32-bit range. "
+            "You can silence this via warnings.filterwarnings(...) or "
+            "spyre.set_downcast_warning(False) or " SPYRE_DOWNCAST_ENV
+            " env. variable.");
+      }
+    }
     return it->second;
   }
   return {DataFormats::INVALID, DataFormats::INVALID};

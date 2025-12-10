@@ -32,6 +32,7 @@ device(type='spyre', index=0)
 Controlling logging:
 
 * `TORCH_SPYRE_DEBUG=1` to enable debug logging
+* `TORCH_SPYRE_DOWNCAST_WARN=0` to disable downcast warning (accept: 0/1, true/false, on/off)
 * `DT_DEEPRT_VERBOSE=-1` to reduce Spyre stack logging
 * `DTLOG_LEVEL=error` to reduce Spyre stack logging
 

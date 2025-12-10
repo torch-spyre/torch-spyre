@@ -22,6 +22,7 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <cstdlib>  // std::getenv
 #include <dee_internal/dee_graph_converter.hpp>
 #include <flex/flex_factory.hpp>
 #include <memory>
@@ -43,6 +44,27 @@
 
 namespace spyre {
 
+std::atomic<bool> g_downcast_warn_enabled{true};
+
+bool get_downcast_warn_enabled() {
+  return g_downcast_warn_enabled.load(std::memory_order_relaxed);
+}
+
+void set_downcast_warn_enabled(bool enabled) {
+  g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+// Optional: initialize from env at module init
+static void init_from_env() {
+  if (const char *v = std::getenv(SPYRE_DOWNCAST_ENV)) {
+    // Accept 0/1, true/false, on/off
+    std::string s(v);
+    for (auto &c : s) c = std::tolower(c);
+    bool enable = !(s == "0" || s == "false" || s == "off");
+    g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
+  }
+}
+
 void _startRuntime() {
   DEBUGINFO("starting runtime");
   // TODO(tmhoangt): move sendnn::RuntimeInterface to flex to isolate from
@@ -51,6 +73,7 @@ void _startRuntime() {
   auto s = flex::CreateRuntimeInterface(&base_runtime);
   std::shared_ptr<flex::Runtime> runtime =
       std::dynamic_pointer_cast<flex::Runtime>(base_runtime);
+  init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
     DEBUGINFO(s);
@@ -253,4 +276,8 @@ PYBIND11_MODULE(_C, m) {
            py::arg("num_stick_dims"), py::arg("format"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
+  m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
+        "Return whether downcast warnings are enabled.");
+  m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
+        "Enable/disable downcast warnings for this process.");
 }

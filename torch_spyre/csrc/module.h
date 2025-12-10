@@ -51,5 +51,6 @@ class GlobalRuntime {
     return s;
   }
 };
+bool get_downcast_warn_enabled();
 
 }  // namespace spyre

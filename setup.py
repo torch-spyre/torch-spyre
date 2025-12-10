@@ -192,6 +192,7 @@ if __name__ == "__main__":
                 ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                 ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
                 ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
+                ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
                 ("EAGER_MODE_ENV", '"EAGER_MODE"'),
                 ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
             ],
