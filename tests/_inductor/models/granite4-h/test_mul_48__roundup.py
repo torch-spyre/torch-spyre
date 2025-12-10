@@ -35,7 +35,7 @@ def SimpleIterate(device=None):
     return output.detach()
 
 
-def test_mul_48():
+def test_mul_48__roundup():
     out_cpu = SimpleIterate(device="cpu")
     out_sen = SimpleIterate(device="spyre").to("cpu")
 
@@ -52,4 +52,4 @@ def test_mul_48():
 
 
 if __name__ == "__main__":
-    test_mul_48()
+    test_mul_48__roundup()
