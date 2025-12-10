@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils_inductor import compare, compare_with_cpu, cached_randn
+from utils_inductor import compare, compare_with_cpu, cached_randn, compare_with_pytorch
 
 
 class TestBuildingBlocks(unittest.TestCase):
@@ -114,3 +114,48 @@ class TestBuildingBlocks(unittest.TestCase):
             up_proj_weight,
             down_proj_weight,
         )
+
+    def test_rms_norm(self):
+        F16_EPS = 1e-6
+        T = 128
+        D = 256
+
+        activation = torch.randn(D, T, dtype=torch.float16)
+        weight = torch.randn(D, dtype=torch.float16)
+
+        args = [
+            activation,  # [D, T]
+            weight.reshape(D, 1)
+            .expand(D, T)
+            .contiguous(),  # [D, T] # work around on device broadcast limitation
+            torch.full([T], F16_EPS, dtype=torch.float16),  # [T,] # broadcasted scalar
+            torch.full([T], D, dtype=torch.float16),  # [T,] # broadcasted scalar
+        ]
+
+        # NOTE: To work around reduction dimension restriction,
+        #       this version performs rms_norm along dim 0
+        #       The inputs and the output should be transposed on the host
+        def rms_norm(x, weight, eps, d):
+            x_sq = x * x
+            x_mean_sq = x_sq.mean(dim=0)
+            return (
+                x  # [D, T]
+                * torch.rsqrt(x_mean_sq + eps)[None, :]  # [D, T]
+                * weight
+            )  # [D, T]
+
+        # Compare with pytorch native implementation
+        def pytorch_fn(x, w, eps, d):
+            return F.rms_norm(
+                x.mT,
+                normalized_shape=[
+                    D,
+                ],
+                weight=weight,
+                eps=F16_EPS,
+            ).mT
+
+        compare_with_pytorch(rms_norm, pytorch_fn, *args)
+
+        # Compare with cpu implementation
+        compare_with_cpu(rms_norm, *args)
