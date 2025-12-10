@@ -60,7 +60,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->format = Sparse;
     this->num_stick_dims = 1;
     this->device_size[0] = 1;
-    this->dim_map[0] = -1;  // host_size has no entries!
+    this->dim_map[0] = 0;  // host_size has no entries!
+    this->size_bytes = BYTES_IN_STICK;
     return;
   }
 
@@ -72,9 +73,10 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
               "Invalid arguments: host_size.size() != dim_order.size()");
 
   this->device_size.resize(device_dims);
-  this->dim_map.resize(device_dims);
+  this->dim_map = spyre::get_generic_stick_layout(host_size.size(), dim_order);
   this->format = format;
   this->num_stick_dims = 1;
+  this->size_bytes = BYTES_IN_STICK;
 
   if (host_dims == 1) {
     TORCH_CHECK(dim_map[0] == 0);
@@ -88,6 +90,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     for (; dim_idx < device_dims - 3; dim_idx++) {
       this->dim_map[dim_idx] = dim_order[dim_idx];
       this->device_size[dim_idx] = host_size[dim_order[dim_idx]];
+      this->size_bytes *= this->device_size[dim_idx];
     }
     // The last 2 host dims are tiled into 3 device dims: num_sticks, inner,
     // stick
@@ -98,6 +101,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
         (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
     this->dim_map[dim_idx + 1] = inner_dim;
     this->device_size[dim_idx + 1] = host_size[inner_dim];
+    this->size_bytes *= this->device_size[dim_idx+1];
     this->dim_map[dim_idx + 2] = stick_dim;
     this->device_size[dim_idx + 2] = elems_in_stick;
   }

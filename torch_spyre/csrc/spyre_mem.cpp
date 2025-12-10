@@ -116,8 +116,15 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                             SpyreTensorLayout stl, int stick_size,
                             bool host2device) -> DataConversionStrideInfo {
   DataConversionStrideInfo stride_info;
+  auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
+  bool size_less_than_stick = cpu_shape[stl.dim_map.front()] < stick_size;
+  bool requires_padding = cpu_shape[stl.dim_map.front()] % stick_size != 0;
 
+  stride_info.size_ = stl.device_size;
+  if (size_less_than_stick) {
+    stride_info.size_[0] = cpu_shape[stl.dim_map.front()];
+  }
   stride_info.stride_src_.push_back(1);
   stride_info.stride_dst_.push_back(1);
 
@@ -131,8 +138,11 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
+    if (dim == stl.dim_map.front() && requires_padding &&
+        !size_less_than_stick) {  // stick_dim
+      stride_info.size_[i] -= 1;
+    }
   }
-  stride_info.size_ = stl.device_size;
   stride_info.offset_src_ = 0;
   stride_info.offset_dst_ = 0;
   return stride_info;
@@ -212,7 +222,8 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * @param tensor: tensor to convert
  * @return data conversion information in string
  */
-auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
+auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
+                  bool host2device) -> std::string {
   /*   host2device = true : then 'tensor' is CPU-tensor
    *   host2device = false: then 'tensor' is Spyre-tensor
    * TODO: support strided tensors
@@ -220,9 +231,6 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
   auto str_type = torchScalarToString[tensor->scalar_type()];
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;
-  SpyreTensorLayout stl =
-      static_cast<SpyreTensorImpl*>(tensor->unsafeGetTensorImpl())
-          ->spyre_layout;
   auto cpu_shape = tensor->sizes().vec();
   int stick_size = BYTES_IN_STICK / tensor->element_size();
   DataConversionInfo dci{};
@@ -231,7 +239,6 @@ auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
   dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
   dci.dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
   std::reverse(cpu_shape.begin(), cpu_shape.end());
-  std::reverse(stl.device_size.begin(), stl.device_size.end());
   dci.dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(), stl,
                                       stick_size, host2device);
   dci.input_shape_ = host2device ? cpu_shape : stl.device_size;
@@ -259,9 +266,25 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
   const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
   auto layout = sendnn::TensorLayout::NHWC;
-  SpyreTensorLayout stl =
-      static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl())
-          ->spyre_layout;
+  SpyreTensorLayout stl;
+  try {
+    stl = static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl())
+              ->spyre_layout;
+  }
+  catch (std::bad_alloc e) {  // tensor does not have stl initialized
+    int stick_size = BYTES_IN_STICK / dev_tensor->element_size();
+    // Check if tensor requires padding
+    auto sizes = dev_tensor->sizes().vec();
+    if (sizes.size() == 0) {
+      sizes = {stick_size};
+    } else {
+      auto requires_padding = sizes.back() % stick_size != 0;
+      sizes[sizes.size() - 1] =
+          requires_padding ? ((sizes.back() / stick_size) + 1) * stick_size
+                           : sizes.back();
+    }
+    stl = SpyreTensorLayout(sizes, dev_tensor->scalar_type());
+  }
   sendnn::TensorShape dev_tensor_shape(stl.device_size);
 
   // ti = transfer info
@@ -302,7 +325,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   sendnn::SubGraph exec_graph;
   {  // add above subgraph as part of SenFusedDeviceCompute node
     flex::FlexGraphBuilder gb;
-    auto dci = generate_dci(dev_tensor, host2device);
+    auto dci = generate_dci(cpu_tensor, stl, host2device);
     if (host2device) {
       auto inp_node = gb.PrimaryInput("Input", cpu_ti);
       auto dci_node = gb.SenHostCompute("Host2Sen-HostPrep", {dci_ti},
@@ -519,17 +542,21 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   int stick_size = device_layout.elems_per_stick();
 
   // Check if tensor requires padding
-  auto cpu_sizes = size.vec();
-  auto requires_padding = cpu_sizes.back() % stick_size != 0;
-  cpu_sizes[size.size() - 1] =
-      requires_padding ? ((cpu_sizes.back() / stick_size) + 1) * stick_size
-                       : cpu_sizes.back();
+  auto sizes = size.vec();
+  size_t size_bytes = BYTES_IN_STICK;
+  if (size.size() == 0) {
+    sizes = {1};
+  }
+  auto requires_padding = sizes.back() % stick_size != 0;
+  sizes[sizes.size() - 1] = requires_padding
+                                ? ((sizes.back() / stick_size) + 1) * stick_size
+                                : sizes.back();
 
-  auto device_layout = SpyreTensorLayout(cpu_sizes, scalar_type);
+  auto device_layout = SpyreTensorLayout(sizes, scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
-      c10::StorageImpl::use_byte_size_t(), size_bytes,
+      c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
       &SpyreAllocator::instance(),
       /*resizeable=*/true);
   auto spyre_storage = c10::Storage(spyre_storage_impl);
@@ -548,7 +575,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
     tensorImpl->set_sizes_and_strides(size, stride);
   }
   DEBUGINFO("device shape: ", device_layout.device_size);
-  DEBUGINFO("bytes on spyre: ", size_bytes);
+  DEBUGINFO("bytes on spyre: ", device_layout.size_bytes);
 
   static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
 
