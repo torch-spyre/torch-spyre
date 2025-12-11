@@ -28,7 +28,7 @@ from torch._inductor.codegen.common import (
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import ReductionType, StoreMode, V
-
+from torch._inductor.shape_propagation import BlockShapeType
 
 from .runtime import ConstantArg, TensorArg
 from .constants import (
@@ -86,8 +86,9 @@ class SpyreKernelCSEVariable(CSEVariable):
         name,
         bounds: ValueRanges[Any],
         dtype: Optional[torch.dtype] = None,
+        shape: BlockShapeType = None,
     ) -> None:
-        super().__init__(name, bounds, dtype)
+        super().__init__(name, bounds, dtype, shape)
 
     def update_on_args(self, name, args, kwargs):
         if name == "constant":
@@ -112,8 +113,10 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.compute_inputs: list[TensorAccess | Constant] = []
         self.compute_output: Optional[TensorAccess] = None
 
-    def create_cse_var(self, name, bounds=None, dtype=None):
-        return SpyreKernelCSEVariable(name, bounds, dtype)
+    def create_cse_var(
+        self, name, bounds=None, dtype=None, shape: BlockShapeType = None
+    ):
+        return SpyreKernelCSEVariable(name, bounds, dtype, shape)
 
     def lookup_cse_var(self, name: str):
         return self.cse.varname_map[re.sub(r"\[.*", "", name)]
