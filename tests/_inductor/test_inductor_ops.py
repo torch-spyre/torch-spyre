@@ -297,8 +297,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
-            "test_activation",
-            "test_activation_op",
+            "test_activation_cls",
+            "test_activation_cls",
         ): {
             "ops_dict": {
                 "gelu": torch.nn.GELU,
@@ -309,6 +309,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     {
                         "approximate": "tanh",
                     },
+                    0.01,
+                ),
+            },
+        },
+        (
+            "test_activation_fn",
+            "test_activation_fn",
+        ): {
+            "ops_dict": {
+                "silu": torch.nn.functional.silu,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 128), dtype=torch.float16),
                     0.01,
                 ),
             },
@@ -388,8 +402,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_range_op(self, op, input, min, max, err):
         compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
 
-    def test_activation_op(self, op, input, kwargs, err):
+    def test_activation_cls(self, op, input, kwargs, err):
         compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
+
+    def test_activation_fn(self, op, input, err):
+        compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
 
 
 if __name__ == "__main__":
