@@ -34,8 +34,13 @@ class SpyreTensorLayout {
     SparseMulti,
   };
 
+  /**
+   * The on-device size array for the (Tiled) tensor.
+   * The dimensions are in decreasing stride order with the stick dimension(s)
+   * last.
+   */
   std::vector<int64_t> device_size;
-  std::vector<int64_t> device_strides;
+
   /**
    * Record the mapping from host size to device_size.
    * It has len(device_size) entires whose values are indices in the host size
@@ -45,6 +50,9 @@ class SpyreTensorLayout {
   std::vector<int32_t> dim_map;
   int32_t num_stick_dims;
   StickFormat format;
+
+  SpyreTensorLayout() = default;
+  ~SpyreTensorLayout() = default;
 
   /**
    * Construct a SpyreTensorLayout in generic stick format for the argument
@@ -66,11 +74,9 @@ class SpyreTensorLayout {
   }
 
   SpyreTensorLayout(std::vector<int64_t> device_size,
-                    std::vector<int64_t> device_strides,
                     std::vector<int32_t> dim_map, int32_t num_stick_dims,
                     StickFormat format)
       : device_size(device_size),
-        device_strides(device_strides),
         dim_map(dim_map),
         num_stick_dims(num_stick_dims),
         format(format) {}
@@ -90,16 +96,27 @@ class SpyreTensorLayout {
             std::vector<int32_t> dim_order, StickFormat format = Dense);
 
   std::string toString() const;
+
+  std::vector<int64_t> device_strides(c10::ScalarType dtype);
+
+  bool operator==(const SpyreTensorLayout& other) const {
+    return this->device_size == other.device_size &&
+           this->dim_map == other.dim_map &&
+           this->num_stick_dims == other.num_stick_dims &&
+           this->format == other.format;
+  }
 };
 
 /**
- * An SpyreTensorImpl has extra information needed for Spyre tensors,
- * like what sticks are there.
+ * A SpyreTensorImpl extends TensorImpl by adding a SpyreTensorLayout
+ * that encapsulates the on-device layout of the Tensor.
  */
 class SpyreTensorImpl : public at::TensorImpl {
  public:
   SpyreTensorImpl() = delete;
   ~SpyreTensorImpl() = default;
+
+  SpyreTensorLayout spyre_layout;
 
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
@@ -117,5 +134,7 @@ class SpyreTensorImpl : public at::TensorImpl {
   void shallow_copy_from(
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
+
+SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 
 }  // namespace spyre

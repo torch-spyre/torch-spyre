@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+from torch_spyre._C import get_spyre_tensor_layout
+from torch_spyre._C import SpyreTensorLayout
+
 
 def _patch_tensor_for_spyre():
     import torch
 
-    if getattr(torch.Tensor, "_spyre_repr_patched", False):
+    if getattr(torch.Tensor, "_spyre_tensor_patched", False):
         return
 
     orig_repr = torch.Tensor.__repr__
@@ -44,5 +48,12 @@ def _patch_tensor_for_spyre():
         # Non-spyre tensors use normal behavior
         return orig_repr(self)
 
+    def device_tensor_layout(self: torch.Tensor) -> Optional[SpyreTensorLayout]:
+        if self.device is not None and self.device.type == "spyre":
+            return get_spyre_tensor_layout(self)
+        else:
+            return None
+
     torch.Tensor.__repr__ = spyre_aware_repr
-    torch.Tensor._spyre_repr_patched = True
+    torch.Tensor.device_tensor_layout = device_tensor_layout
+    torch.Tensor._spyre_tensor_patched = True

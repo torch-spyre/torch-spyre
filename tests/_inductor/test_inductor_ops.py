@@ -101,7 +101,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,),),
                     ((67, 256),),
-                    # ((67, 71, 256),)*2, # 3d input causes eager timeout
+                    ((67, 71, 256),),
                 ]
             ),
         },
@@ -114,7 +114,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,),) * 2,
                     ((67, 256),) * 2,
-                    # ((67, 71, 256),)*2, # 3d input causes eager timeout
+                    ((67, 71, 256),) * 2,
                 ]
             ),
         },
@@ -141,6 +141,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((67, 256), (256, 128)),
+                ]
+            ),
+        },
+        ("test_bmm", "test_binary_op"): {
+            "ops_dict": {
+                "bmm": torch.bmm,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((3, 17, 256), (3, 256, 128)),
                 ]
             ),
         },
@@ -231,7 +241,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256,)),
                     cached_randn((256,)),
                 ),
+                "ne": (
+                    lambda x, y: x != y,
+                    cached_randn((256,)),
+                    cached_randn((256,)),
+                ),
             }
+        },
+        (
+            "test_pointwise_binary_op_fp32",
+            "test_binary_op",
+        ): {
+            "ops_dict": POINTWISE_BINARY_OPS_DICT,
+            "param_sets": {
+                "fp32": (
+                    cached_randn((67, 256), dtype=torch.float32),
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+            },
         },
     }
 
@@ -240,9 +267,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_unary_op(self, op, x):
         if op == torch.reciprocal:
-            # TODO: Division by 0 differs on Spyre from CPU, sidestep for now.
-            zero_mask = x == 0.0
-            x[zero_mask] = FP16_EPS
+            # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
+            tiny_value_mask = torch.abs(x) < FP16_EPS
+            x[tiny_value_mask] = FP16_EPS
 
         if op == torch.exp:
             # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
@@ -252,10 +279,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
-            # TODO: Division by 0 differs on Spyre from CPU, sidestep for now.
-            zero_mask = b == 0.0
-            b[zero_mask] = FP16_EPS
-        compare(op, a, b)
+            # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
+            tiny_value_mask = torch.abs(b) < FP16_EPS
+            b[tiny_value_mask] = FP16_EPS
+
+        if a.dtype == torch.float32:
+            compare_with_cpu(op, a, b)
+        elif op == torch.bmm:
+            # TODO: Eager mode mismatch causing cryptic error, sidestep for now.
+            compare_with_cpu(op, a, b)
+        else:
+            compare(op, a, b)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):

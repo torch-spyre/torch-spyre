@@ -10,7 +10,6 @@ repos:
       - id: ruff-check
         args: [--output-format, github, --fix]
       - id: ruff-format
-        args: [--check]
   - repo: https://github.com/jackdewinter/pymarkdown
     rev: v0.9.31
     hooks:

@@ -63,7 +63,7 @@ inline std::pair<DataFormats, DataFormats> stringToDTDataFormatPair(
           {"int8", {DataFormats::SENINT8, DataFormats::SENINT8}},
           {"int16", {DataFormats::SENINT16, DataFormats::SENINT16}},
           {"int32", {DataFormats::IEEE_INT32, DataFormats::IEEE_INT32}},
-          {"int64", {DataFormats::IEEE_INT64, DataFormats::IEEE_INT64}},
+          {"int64", {DataFormats::IEEE_INT64, DataFormats::IEEE_INT32}},
           {"bool", {DataFormats::SENINT8, DataFormats::SENINT8}},
           {"bfloat16", {DataFormats::BFLOAT16, DataFormats::BFLOAT16}},
           {"quint8", {DataFormats::SENUINT32, DataFormats::SENUINT32}},

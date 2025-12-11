@@ -119,12 +119,20 @@ class TestSpyre(TestCase):
         self.assertEqual(b, a + 2)
 
     def test_cross_device_copy_dtypes(self):
-        dtypes = [torch.float8_e4m3fn, torch.int8, torch.float16, torch.float32]
+        dtypes = [
+            torch.float8_e4m3fn,
+            torch.int8,
+            torch.int64,
+            torch.float16,
+            torch.float32,
+        ]
         for dtype in dtypes:
             x = None
             if dtype in [torch.int8]:
                 x = torch.rand(64, 64) * 100
                 x = x.to(dtype=dtype)
+            elif dtype in [torch.int64]:
+                x = torch.randint(-32768, 32767, (64, 64), dtype=dtype)
             elif dtype in [torch.float8_e4m3fn]:
                 x = torch.rand(64, 64)
                 x = x.to(dtype=dtype)

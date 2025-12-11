@@ -96,6 +96,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
     RUNTIME_DIR = Path(os.environ["RUNTIME_INSTALL_DIR"])
     SENLIB_DIR = Path(os.environ["SENLIB_INSTALL_DIR"])
+    DEEPTOOLS_DIR = Path(os.environ["DEEPTOOLS_INSTALL_DIR"])
     INCLUDE_DIRS += [
         RUNTIME_DIR / "include",
     ]
@@ -105,9 +106,12 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     INCLUDE_DIRS += [
         SENLIB_DIR / "include",
     ]
+    INCLUDE_DIRS += [
+        DEEPTOOLS_DIR / "include",
+    ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
 
-LIBRARIES = ["sendnn", "flex"]
+LIBRARIES = ["sendnn", "flex", "dee_internal"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
