@@ -29,11 +29,17 @@ torch._register_device_module(“spyre”, make_spyre_module())
 
 ### Implementing a custom c10::impl::DeviceGuardImplInterface
 
-We will implement a specific SpyreGuardImpl, that will be used for device management, allowing to track current device and synchronization between devices.
+We will implement a specific SpyreGuardImpl, that will be used for device management, allowing to track current device and synchronization between devices. There are open questions here about whether Spyre can support streams, as well as how to properly support device counts/indexes.
 
 ### Implement a custom at::Allocator
 
-In order to properly allocate space on the device and manage tensors, we will implement a custom at::Allocator (SpyreAllocator). As part of this implementation, we will ensure that what is returned to the user (tensor handle) is only an indirect index to the allocated memory, and not the actual pointer (This is a Z security requirement). We plan to allocate memory through the Spyre Flex runtime interface (TryAllocate). The allocator will also be responsible for cleaning up tensor handles that go out of scope.
+In order to properly allocate space on the device and manage tensors, we will implement a custom at::Allocator (SpyreAllocator). Due to Z security requirements, we will ensure that the tensor handle returned to the user must not have a physical pointer to the memory.
+
+With the switch from PF to VF mode (no physical addresses will be present), we will now have a more strict constraint on the number of handles we get from the backend runtime. As such, this requires us to re-think the pytorch allocator as the current design will only allow a small number of handles to resident tensors when in VF mode.
+
+Instead of allocating in the backend runtime on a tensor-by-tensor basis (as is currently the case), allocate large chunks (lazily as necessary). We will continue to use the TryAllocate method from flex to allocate these large chunks. Within the pytorch allocator, we can do our own virtual memory management given the large allocated chunk (similar to the cuda cache allocator). This way, we can create any number of handles in the pytorch allocator, while only holding the large chunk handles from the backend runtime.
+
+For more information, please visit the following [epic](https://github.com/torch-spyre/torch-spyre/issues/200)
 
 ### Implement a custom at::TensorImpl
 
@@ -49,7 +55,7 @@ When creating tensors, either through eager mode with torch factory methods, or 
 
 ### Torch.compile support
 
-In order to support torch.compile using a Spyre device backend, we will implement a method to launch a Spyre kernel. When running torch.compile, the Spyre inductor pathway will generate an artifact for each kernel that will be launched through this method. 
+In order to support torch.compile using a Spyre device backend, we will implement a method to launch a Spyre kernel. When running torch.compile, the Spyre inductor pathway will generate an artifact for each kernel that will be launched through this method.
 
 ```c++
 void launchKernel(std::string g2_path, std::vector<at::Tensor> args);
@@ -72,6 +78,14 @@ def spyre__mm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
     return compiled_mm(self, mat2)
 ```
 
+For more information, please visit [epic](https://github.com/torch-spyre/torch-spyre/issues/183)
+
+#### Handling Symbolic Shapes during eager execution
+
+Our plan to handle symbolic shapes will be to compile for the largest possible practical unit of an op and encapsulate this unit within a Control Block. We plan to build a mechanism (Control Block Stream) which allows the ability to compose a sequence of these control blocks during runtime. In the case where the largest possible unit cannot fit the given shape, we plan to append to this control block stream until the target shape is reached. If the control block / composed control block stream is too large for a given shape, we will build in a mechanism to mask out portions from the result.
+
+<!-- TODO: Larger Design document regarding CBs and CB Streams to be added -->
+
 ### Multi-Device Support
 
 Our plan is to implement the standard torch collective communications APIs similar to NCCL, either through a custom ProcessGroup or using the new TorchComms APIs (all2all, all_reduce, reduce_scatter, all_gather)
@@ -80,13 +94,13 @@ Our plan is to implement the standard torch collective communications APIs simil
 
 To properly measure the success of this feature, requires the following criteria be met:
 
-- [ ] Pytorch upstream tests running to completion with at least 80% passing
-- [ ] Support for transformers model implementations
-- [ ] TBD
+* [ ] Pytorch upstream tests running to completion with at least 80% passing
+* [ ] Support for transformers model implementations
+* [ ] TBD
 
 ## **Drawbacks**
 
-The main drawback to this new addition is the implementation cost, as interfacing with the Spyre device through the above mechanism is quite different from the current workflow. This requires a lot of re-implementation, and replacement of existing code.
+The main drawback to this new addition is the implementation cost, as interfacing with the Spyre device through the above mechanism is quite different from the current workflow. This requires a lot of re-implementation, and replacement of existing code. Some of the problems here are known and have been implemented, but a large portion of this effort still contains open questions. Please visit [Unresolved Questions](#Unresolved-questions) for more details.
 
 ## **Alternatives**
 
@@ -104,7 +118,11 @@ TBD
 
 The following are some unresolved questions:
 
-1. Tensor Allocation - When moving from PF to VF mode on Spyre, large changes may be required in the allocator
+1. Tensor Allocation - When moving from PF to VF mode on Spyre, large changes may be required in the allocator. There may be some performance implications as well that will need to be addressed as part of this new allocator
+2. CUDA Stream Support - Can we support a CUDA Stream like concept using spyre?
+3. Control Block Streams - What level of exposure should we be giving to torch-spyre for Control Block Streams? What should the overall structure be of the Control Block Stream? Will we be caching Control Blocks and composing Control Block Streams on the fly, Or also caching the Control Block Streams as well? Will we need to finalize CB Streams, or can we keep them open?
+4. It is still not fully known the full scope of collective communications APIs we can support with spyre natively.
+5. We will need to see how to expose device indexes and counts from the backend runtime.
 
 ## Resolution
 
