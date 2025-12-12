@@ -19,23 +19,54 @@ in PyTorch and to extend PyTorch's APIs and implementation to naturally support 
 
 ## **Motivation**
 
-### Background: Sticks and Tiles
+Tiling is a well-known and widely used technique for ordering tensor memory accesses to
+exploit spatial and temporal locality.  It improves program performance by enabling
+more effective use of the memory subsystem, for example by matching working set sizes
+to cache sizes, by using loaded values multiple times, and by grouping/ordering memory
+requests to distribute them across memory banks and utilize all available bandwidth.
 
+Tiling is typically realized by carefully arranging the iteration space of loop
+nests to achieve the desired memory access pattern.  This works because the compiler
+(or programmer) maintains a model of the actual linearized memory layout
+of the tensor and uses that model to guide the loop transformations that result
+in tiled memory access patterns.  In PyTorch, this model is represented in
+the `FixedLayout` abstraction of the LoopLevelIR: the combination of `shape` and
+`strides` encode the linearization and this information is used to guide the loop
+reordering and tiling by inductor's Triton codegenerator.  
+
+However, although the memory access patterns are tiled, the actual memory 
+layout of the tensor is not. Logical 2-D tiles are formed from noncontiguous
+chunks of memory.  For memory subsystems with substantial hardware managed caches, 
+this has traditional not been a first order performance concern.  However, there is
+a diversity of AI accelerators that make different tradeoffs in the design of their
+memory subsystems. In particular, for accelerators where there is a signficant
+performance advantage in making bulk loads from contiguous memory addresses the
+standard memory layouts for tensors are inadequate.  Optimizing memory system
+performance (and thus program performance), requires that the tiled memory access patterns
+must be supported by a tiled memory layout.  Therefore we propose an extension to
+`FixedLayout` we call `FixedTiledLayout` that extends `shape` and `strides` with
+an additional mapping to a higher-dimensional tensor that encodes a tiled layout.
+We believe that this abstraction is a clean and extensible way to enable
+the backend of inductor to reason about and exploit richer device memory layouts that
+are essential to optimizing the performance of some classes of accelerators. 
+
+### Background: Spyre
+
+We have been prototyping the concept of Tiled Tensors in the
+context of IBM's Spyre accelerator. 
 Like many AI accelerators, IBM's Spyre is a SIMD engine. Most memory and compute
 operations operate on fixed-sized chunks. On Spyre, we call this chunk of 128
 bytes a _stick_. The importance of tiling for efficient computation is familiar
 from GPUs but even more important for dataflow accelerators built around
 systolic arrays like Spyre. Tensors are processed in fixed-sized _tiles_
-matching the array dimensions.
+matching the array dimensions.  Effective usage of Spyre's memory subsystem
+requires issuing access requests that load multiple contiguous sticks of memory.
+As is typical in such systems, the number of simultaneous memory requests that can
+be handled without stalling is limited. 
 
-#### Contiguous Tiles
+### Contiguous Tiles
 
-The optimal in-memory format of tensors on an accelerator depends on the
-specifics of the memory subsystems and the compute capabilities of the device.
-Balancing accesses across memory banks, minimizing cache conflicts in set
-associative caches, and alignment constraints may all contribute to preferring one
-layout over another. Spyre's optimal memory bandwidth is achieved when
-transferring contiguous sticks in bulk. Tensors are therefore laid out in a
+Tensors are laid out in a
 tiled fashion. Sticks belonging to the same tile are stored contiguously in
 memory. As a consequence, sticks that are consecutive from the perspective of
 PyTorch-level indexing may not actually be consecutive on the device.
@@ -81,7 +112,7 @@ for i in range(4):
       device_memory[device_tensor_address + i*65536 + j*64 + k*1] = host_memory[host_tensor_address + j*256 + (i*64 + k*1)]
 ```
 
-#### Padded Tensors
+### Padded Tensors
 
 Memory subsystems, SIMD, or tiling constraints may result in padding
 requirements. Spyre memory accesses are 128-byte aligned typically requiring the
@@ -95,7 +126,7 @@ Tensors in host memory are typically not padded, or at least not padded as much,
 so the mapping between host and device memory layouts described above is extended to
 account for padding requirements.
 
-#### Operational Constraints
+### Operational Constraints
 
 Accelerators may impose a number of constraints on the input and output memory
 layouts of their operations. Spyre for example requires for optimal performance
