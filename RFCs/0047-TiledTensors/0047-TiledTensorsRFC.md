@@ -1,4 +1,4 @@
-# Tiled Tensors
+# Tensors with Device-Specific Layouts
 
 **Authors:**
 * @dgrove-oss
@@ -14,8 +14,9 @@ Commonly used linearizations including row major (dimension `-1` has stride `1`)
 column major (dimension `0` has stride `1`) can be naturally represented using `strides()`.
 However `strides()` by itself cannot properly represent *tiled* tensors, which break the invariant
 that the stride between every consecutive element in a dimension can be described by a single integer.
-The goal of this RFC is to motivate the need for enabling a tiled memory layout as a first-class concept
-in PyTorch and to extend PyTorch's APIs and implementation to naturally support them.
+The goal of this RFC is to motivate the need for enabling tensors with a tiled device memory layout
+as a first-class concept in PyTorch and to extend PyTorch's APIs and implementation
+to naturally support them.
 
 ## **Motivation**
 
@@ -52,7 +53,7 @@ are essential to optimizing the performance of some classes of accelerators.
 
 ### Background: Spyre
 
-We have been prototyping the concept of tiled tensors in the
+We have been prototyping the concept of a tiled memory layout for tensors in the
 context of IBM's Spyre accelerator.
 
 Like many AI accelerators, IBM's Spyre is a SIMD engine. Most memory and compute
