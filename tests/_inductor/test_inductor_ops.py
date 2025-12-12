@@ -296,6 +296,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_activation",
+            "test_activation_op",
+        ): {
+            "ops_dict": {
+                "gelu": torch.nn.GELU,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 128), dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -370,6 +387,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_range_op(self, op, input, min, max, err):
         compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+
+    def test_activation_op(self, op, input, kwargs, err):
+        compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
 
 
 if __name__ == "__main__":
