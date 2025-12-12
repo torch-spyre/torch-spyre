@@ -231,7 +231,7 @@ def propagate_spyre_tensor_layouts(
                 stl = real_input.device_tensor_layout()
                 if stl is None:
                     # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputes to have them.
+                    # Therefore we expect all graph inputs to have them.
                     raise Unsupported(
                         f"missing device_tensor_layout on graph input {name}"
                     )
