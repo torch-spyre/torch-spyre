@@ -90,6 +90,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.sqrt({x})"
 
     @staticmethod
+    def to_dtype(x, dtype, src_dtype):
+        return f"spyre.to_dtype({x} {dtype} {src_dtype})"
+
+    @staticmethod
     def tanh(x):
         return f"spyre.tanh({x})"
 
