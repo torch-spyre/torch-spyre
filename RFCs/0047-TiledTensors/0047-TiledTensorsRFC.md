@@ -7,8 +7,8 @@
 ## **Summary**
 
 PyTorch tensors have a `size()` that describes their logical dimensionality.
-When a tensor is realized, its elements must be laid out in some specific linerar order
-in memory. In PyTorch, the `strides()` of a tensor encode this linear ordering by specifiying
+When a tensor is realized, its elements must be laid out in some specific linear order
+in memory. In PyTorch, the `strides()` of a tensor encode this linear ordering by specifying
 for each dimension of the tensor the distance between consecutive elements of the dimension.
 Commonly used linearizations including row major (dimension `-1` has stride `1`) and
 column major (dimension `0` has stride `1`) can be naturally represented using `strides()`.
@@ -19,7 +19,7 @@ in PyTorch and to extend PyTorch's APIs and implementation to naturally support 
 
 ## **Motivation**
 
-Tiling is a well-known and widely used technique for ordering tensor memory accesses to
+Tiling is a well-known and widely used technique for ordering memory accesses to
 exploit spatial and temporal locality.  It improves program performance by enabling
 more effective use of the memory subsystem, for example by matching working set sizes
 to cache sizes, by using loaded values multiple times, and by grouping/ordering memory
@@ -31,42 +31,45 @@ nests to achieve the desired memory access pattern.  This works because the comp
 of the tensor and uses that model to guide the loop transformations that result
 in tiled memory access patterns.  In PyTorch, this model is represented in
 the `FixedLayout` abstraction of the LoopLevelIR: the combination of `shape` and
-`strides` encode the linearization and this information is used to guide the loop
-reordering and tiling by inductor's Triton codegenerator.  
+`strides` encode the linearization and this information is used to guide the
+compiler's loop reordering and tiling optimizations.  
 
-However, although the memory access patterns are tiled, the actual memory
-layout of the tensor is not. Logical 2-D tiles are formed from noncontiguous
-chunks of memory.  For memory subsystems with substantial hardware managed caches,
-this has traditional not been a first order performance concern.  However, there is
-a diversity of AI accelerators that make different tradeoffs in the design of their
-memory subsystems. In particular, for accelerators where there is a signficant
+However, even though the memory access patterns are tiled, the actual memory
+layout of the tensor is not. Logically contiguous 2-D tiles are formed by accessing
+non-contiguous chunks of memory.  For memory subsystems with substantial hardware managed caches,
+this has traditionally not been a first order performance concern. However, there is
+a diversity of AI accelerators that make different trade offs in the design of their
+memory subsystems. In particular, for accelerators where there is a significant
 performance advantage in making bulk loads from contiguous memory addresses the
 standard memory layouts for tensors are inadequate.  Optimizing memory system
-performance (and thus program performance), requires that the tiled memory access patterns
-must be supported by a tiled memory layout.  Therefore we propose an extension to
-`FixedLayout` we call `FixedTiledLayout` that extends `shape` and `strides` with
-an additional mapping to a higher-dimensional tensor that encodes a tiled layout.
-We believe that this abstraction is a clean and extensible way to enable
-the backend of inductor to reason about and exploit richer device memory layouts that
+performance (and thus program performance), requires that tiled memory access patterns
+must be matched with a tiled memory layout.  Therefore we propose an extension to
+Inductor's `FixedLayout` we call `FixedTiledLayout`. It augments the `shape` and `strides`
+from `FixedLayout` with an additional mapping to a higher-dimensional tensor
+that encodes a tiled layout. We believe that this abstraction is a clean and extensible
+way to enable the backend of inductor to reason about and exploit richer device memory layouts that
 are essential to optimizing the performance of some classes of accelerators.
 
 ### Background: Spyre
 
-We have been prototyping the concept of Tiled Tensors in the
+We have been prototyping the concept of tiled tensors in the
 context of IBM's Spyre accelerator.
+
 Like many AI accelerators, IBM's Spyre is a SIMD engine. Most memory and compute
 operations operate on fixed-sized chunks. On Spyre, we call this chunk of 128
 bytes a _stick_. The importance of tiling for efficient computation is familiar
-from GPUs but even more important for dataflow accelerators built around
-systolic arrays like Spyre. Tensors are processed in fixed-sized _tiles_
-matching the array dimensions.  Effective usage of Spyre's memory subsystem
-requires issuing access requests that load multiple contiguous sticks of memory.
+from GPUs but is even more important for dataflow accelerators built around
+systolic arrays of SIMD units. Tensors are processed in fixed-sized _tiles_
+matching the systolic array's dimensions.
+
+Effective usage of Spyre's memory subsystem requires issuing access requests that
+load multiple contiguous sticks of memory.
 As is typical in such systems, the number of simultaneous memory requests that can
 be handled without stalling is limited.
 
 ### Contiguous Tiles
 
-Tensors are laid out in a
+To maximize system performance, tensors are laid out in device memory in a
 tiled fashion. Sticks belonging to the same tile are stored contiguously in
 memory. As a consequence, sticks that are consecutive from the perspective of
 PyTorch-level indexing may not actually be consecutive on the device.
@@ -85,7 +88,7 @@ PyTorch with strides `(256, 1)`.
 
 ![Tensor Host Layout](tensor-host-layout.png)
 
-In contrast, Spyre tiles the sticks of the tensor so that they are linearized in
+In contrast, using tiled tensors the sticks of the tensor would be linearized in
 device memory as depicted in the picture below:
 
 ![Tensor Device Layout](tensor-device-layout.png)
@@ -130,7 +133,7 @@ account for padding requirements.
 
 Accelerators may impose a number of constraints on the input and output memory
 layouts of their operations. Spyre for example requires for optimal performance
-that the two inputs of a dot product have identical memory layout.
+that the two inputs of a dot product have identical memory layouts.
 
 Operations producing smaller or larger output relative to input sizes may
 consume or produce sparse tensors. When reductions operations are performed
@@ -159,11 +162,26 @@ memory layouts for tensors.
 
 ## **Proposed Implementation**
 
+We describe our current implementation in `torch-spyre`. We use `Spyre`
+to indicate a device-specific subclass or specialization of an abstract
+`Device` or `device_` API.
+
 ### Runtime / Programming Model Support
 
-The torch-spyre plugin implements `SpyreTensorImpl`, a subclass of
-`TensorImpl` that contains a `SpyreTensorLayout` object with encapsulates
-the device memory layout information.  In our current implementation,
+We assume that each device plugin implements a `DeviceTensorImpl` which
+is a subclass of `TensorImpl`. This subclass extends `TensorImpl` with
+any additional data fields necessary to encode the on device memory layout
+of the tensor.  This encoding is sufficient to allocate device memory for the tensor
+and to implement the `to` and `cpu` operations to transfer tensor data between
+the host and device memories.  It is exposed to the programmer as a `DeviceTensorLayout`.
+
+APIs such as `to` and `new_empty` are extended to optionally take a `DeviceTensorLayout`
+as an argument to enable the programmer (or compiler) to control the device memory
+layout of a tensor.  If the optional argument is not given, the device runtime
+will use its preferred default memory layout for the tensor.
+
+In our implementation, we define a `SpyreTensorLayout` class and embed an instance
+of it in the `SpyreTensorImpl` class.
 `SpyreTensorLayout` stores the device size and strides,
 a mapping between host and device dimensions, and padding/stick dimension
 information. The 3 tuples mentioned earlier and needed for DMA operations
@@ -173,35 +191,33 @@ in the `TensorImpl`.
 This `SpyreTensorLayout` is initialized whenever a Tensor is
 created on the Spyre device (eg. by using `to` to transfer a Tensor to
 the device, by allocating a new empty Tensor on the device, etc).
+We also provide a python API for `SpyreTensorLayout` that enable programmers
+to easily create instances of it that describe commonly used device
+memory layouts.
 
-By default, dimension N-1 is designated as the stick dimension (and is
-padded as needed to evenly divide into sticks).  The `to` operation is
-extended to optionally take a list of stick dimensions to enable the
-programmer to override the default stick dimension.  Similarly, Tensor
-allocation operations are extended to allow optional explicit
-specification of the stick dimension(s) when Tensors are created on
-the device (the default is used if no explicit specification is
-given). The runtime uses this data to implement Tensor data transfers
-to/from the host and Spyre device.  A custom `restickify` operation is
-provided that allows the programmer or compiler to explicitly
-transform the on-chip memory layout of a Tensor to change the stick
-dimension(s). This is an expensive operation, since it involves
-creating a new backing storage on the device and reading/writing all
-bytes of the Tensor to achieve the required memory layout.
+Instead of extending `to` and `new_empty`, our implementation currently provide alternative
+functions `torch_spyre.to_with_layout` and `torch_spyre.new_empty_with_layout`.
+These functions allow the programmer/compiler to provide a `SpyreTensorLayout`
+that specifies the desired device memory layout.
+
+We also provide custom operations such as `torch_spyre.restickify` that enable
+the programmer to create a copy of a tensor changing its stick dimension (thus
+having a different `DeviceTensorLayout` than the source tensor).
 
 ### Compiler Support
 
 For both correctness and optimization purposes, the on-device memory
-layout of Spyre Tensors must be accurately represented in at least
-some layers of Inductor.
+layout of a tensor must be accurately represented in at least some layers of Inductor.
 
-The main ideas of our current implementation approach are:
+The main ideas of our prototype implementation are:
 
 1. We add a subclass of `FixedLayout` called `FixedTiledLayout` that
-adds a `device_layout` field that contains a `SpyreTensorLayout`.
+adds a `device_layout` field that contains a `DeviceTensorLayout`.
 
-2. We use the `SpyreTensorLayout` of the graph's example inputs to
-construct the `FixedTileLayout` for all `InputBuffers`.
+2. We use the `DeviceTensorLayout` of the graph's example inputs to
+construct the `FixedTileLayout` for all `InputBuffers`.  If example
+inputs are not available, we generate code that assumes our default
+on-device memory layout for tensor inputs.
 
 3. We do a topological traversal of the `SchedulerNodes` using the
 `_pre_fusion_custom_pass` extension point of the `Scheduler` to propagate
@@ -241,7 +257,17 @@ TODO
 <!--
 What other designs have been considered? What is the impact of not doing this?
 -->
-As described [above](#background-sticks-and-tiles), the tiled memory layout of an
+We initially prototyped adding `FixedTiledLayout` much early in compilation.
+In particular, we enhanced `FakeTensor` and fake functions on the FX graph
+to propagate device memory layouts.  A key advantage of this approach was
+that it enabled a more intuitive description of the constraints and semantics of each
+operation via the well understood fake function mechanism.  However, it required more invasive
+changes to Dynamo and Inductor to preserve/propagate the information through many more
+stages of compilation.  We therefore are abandoning this approach and switched
+to the approach described [above](#compiler-support) that confines all awareness
+of tiled device memory layouts to the "middle" and "backend" stages of the LoopLevelIR layer of Inductor.
+
+As described [above](#contiguous-tiles), the tiled memory layout of an
 N-dimensional tensors with k stick dimensions could be encoded as an N+k dimensional
 tensor using the existing `size()` and `strides()` APIs. A possible implementation
 would be to simply have the compiler rewrite the FX graph to be in this form relatively
@@ -258,16 +284,6 @@ implemented in the Triton backend of Inductor).  This is too late, because it bl
 us from effective use of Inductor for memory planning and cross-core work division
 because these optimizations need an accurate view of the on-device representation of
 tensors to perform their tasks.
-
-We also prototyped adding `FixedTiledLayout` much early in compilation.
-In particular, we enhanced `FakeTensor` and fake functions on the FX graph
-to propagate device memory layouts.  A key advantage of this approach was
-that it enabled a more intuitive description of the constraints and semantics of each
-operation via the well understood fake function mechanism.  However, it required more invasive
-changes to Dynamo and Inductor to preserve/propagate the information through many more
-stages of compilation.  We therefore are abandoning this approach and attempting
-to confine all awareness of tiled device memory layouts to the "middle" and
-"backend" stages of the LoopLevelIR layer of Inductor.
 
 ## **Prior Art**
 <!--
