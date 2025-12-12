@@ -310,8 +310,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         "approximate": "tanh",
                     },
                     0.01,
-            "test_pointwise_range_op",
-            "test_range_op",
+                ),
+            },
         },
     }
 
@@ -390,6 +390,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_activation_op(self, op, input, kwargs, err):
         compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
+
 
 if __name__ == "__main__":
     unittest.main()
