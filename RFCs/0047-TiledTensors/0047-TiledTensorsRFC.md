@@ -34,9 +34,9 @@ the `FixedLayout` abstraction of the LoopLevelIR: the combination of `shape` and
 `strides` encode the linearization and this information is used to guide the loop
 reordering and tiling by inductor's Triton codegenerator.  
 
-However, although the memory access patterns are tiled, the actual memory 
+However, although the memory access patterns are tiled, the actual memory
 layout of the tensor is not. Logical 2-D tiles are formed from noncontiguous
-chunks of memory.  For memory subsystems with substantial hardware managed caches, 
+chunks of memory.  For memory subsystems with substantial hardware managed caches,
 this has traditional not been a first order performance concern.  However, there is
 a diversity of AI accelerators that make different tradeoffs in the design of their
 memory subsystems. In particular, for accelerators where there is a signficant
@@ -48,12 +48,12 @@ must be supported by a tiled memory layout.  Therefore we propose an extension t
 an additional mapping to a higher-dimensional tensor that encodes a tiled layout.
 We believe that this abstraction is a clean and extensible way to enable
 the backend of inductor to reason about and exploit richer device memory layouts that
-are essential to optimizing the performance of some classes of accelerators. 
+are essential to optimizing the performance of some classes of accelerators.
 
 ### Background: Spyre
 
 We have been prototyping the concept of Tiled Tensors in the
-context of IBM's Spyre accelerator. 
+context of IBM's Spyre accelerator.
 Like many AI accelerators, IBM's Spyre is a SIMD engine. Most memory and compute
 operations operate on fixed-sized chunks. On Spyre, we call this chunk of 128
 bytes a _stick_. The importance of tiling for efficient computation is familiar
@@ -62,7 +62,7 @@ systolic arrays like Spyre. Tensors are processed in fixed-sized _tiles_
 matching the array dimensions.  Effective usage of Spyre's memory subsystem
 requires issuing access requests that load multiple contiguous sticks of memory.
 As is typical in such systems, the number of simultaneous memory requests that can
-be handled without stalling is limited. 
+be handled without stalling is limited.
 
 ### Contiguous Tiles
 
@@ -193,7 +193,7 @@ bytes of the Tensor to achieve the required memory layout.
 
 For both correctness and optimization purposes, the on-device memory
 layout of Spyre Tensors must be accurately represented in at least
-some layers of Inductor. 
+some layers of Inductor.
 
 The main ideas of our current implementation approach are:
 
@@ -203,13 +203,13 @@ adds a `device_layout` field that contains a `SpyreTensorLayout`.
 2. We use the `SpyreTensorLayout` of the graph's example inputs to
 construct the `FixedTileLayout` for all `InputBuffers`.
 
-3. We do a topological traversal of the `SchedulerNodes` using the 
+3. We do a topological traversal of the `SchedulerNodes` using the
 `_pre_fusion_custom_pass` extension point of the `Scheduler` to propagate
 layout constraints and "upgrade" `FixedLayout` to `FixedTiledLayout`
 on all `ComputedBuffers`.  In the process, we detect operations that
 are infeasible on Spyre and raise compile-time errors.  In the future,
 we intend to explore some amount of automated reshaping of intermediate
-tensors to lessen the programmer burden of ensuring feasible operations. 
+tensors to lessen the programmer burden of ensuring feasible operations.
 
 With the `FixedTiledLayout` in place, subsequent passes over the LoopLevelIR
 can be extended to use the device layout information as necessary.
@@ -267,8 +267,7 @@ operation via the well understood fake function mechanism.  However, it required
 changes to Dynamo and Inductor to preserve/propagate the information through many more
 stages of compilation.  We therefore are abandoning this approach and attempting
 to confine all awareness of tiled device memory layouts to the "middle" and
-"backend" stages of the LoopLevelIR layer of Inductor. 
-
+"backend" stages of the LoopLevelIR layer of Inductor.
 
 ## **Prior Art**
 <!--
