@@ -32,7 +32,7 @@ nests to achieve the desired memory access pattern.  This works because the comp
 of the tensor and uses that model to guide the loop transformations that result
 in tiled memory access patterns.  In PyTorch, this model is represented in
 the `FixedLayout` abstraction of the LoopLevelIR: the combination of `shape` and
-`strides` encode the linearization and this information is used to guide the
+`strides` encode the linearization and this information is used to inform the
 compiler's loop reordering and tiling optimizations.  
 
 However, even though the memory access patterns are tiled, the actual memory
@@ -41,11 +41,11 @@ non-contiguous chunks of memory.  For memory subsystems with substantial hardwar
 this has traditionally not been a first order performance concern. However, there is
 a diversity of AI accelerators that make different trade offs in the design of their
 memory subsystems. In particular, for accelerators where there is a significant
-performance advantage in making bulk loads from contiguous memory addresses the
+performance advantage in making bulk loads from contiguous memory addresses, the
 standard memory layouts for tensors are inadequate.  Optimizing memory system
 performance (and thus program performance), requires that tiled memory access patterns
 must be matched with a tiled memory layout.  Therefore we propose an extension to
-Inductor's `FixedLayout` we call `FixedTiledLayout`. It augments the `shape` and `strides`
+Inductor's `FixedLayout` that we call `FixedTiledLayout`. It augments the `shape` and `strides`
 from `FixedLayout` with an additional mapping to a higher-dimensional tensor
 that encodes a tiled layout. We believe that this abstraction is a clean and extensible
 way to enable the backend of inductor to reason about and exploit richer device memory layouts that
@@ -64,16 +64,16 @@ systolic arrays of SIMD units. Tensors are processed in fixed-sized _tiles_
 matching the systolic array's dimensions.
 
 Effective usage of Spyre's memory subsystem requires issuing access requests that
-load multiple contiguous sticks of memory.
-As is typical in such systems, the number of simultaneous memory requests that can
-be handled without stalling is limited.
+load multiple contiguous sticks of memory. This is necessary because in Spyre,
+as is typical in such systems, the number of simultaneously outstanding memory
+requests is limited.
 
 ### Contiguous Tiles
 
 To maximize system performance, tensors are laid out in device memory in a
 tiled fashion. Sticks belonging to the same tile are stored contiguously in
 memory. As a consequence, sticks that are consecutive from the perspective of
-PyTorch-level indexing may not actually be consecutive on the device.
+PyTorch-level indexing (host `strides`) may not actually be consecutive on the device.
 
 As a simple concrete example of a tiled tensor, consider a 2-D row-major float16
 tensor with a size of `(1024, 256)`. Each stick contains 64 2-byte float16
@@ -139,8 +139,7 @@ that the two inputs of a dot product have identical memory layouts.
 Operations producing smaller or larger output relative to input sizes may
 consume or produce sparse tensors. When reductions operations are performed
 along the stick dimension, Spyre’s SIMD engine produces results that only
-contain a single element per stick. For a float16 tensor, the stride of the
-output stick dimension is 64.
+contain a single element per stick.
 
 ### Implications of Tiled Device Tensor Layouts for PyTorch
 
@@ -163,9 +162,9 @@ memory layouts for tensors.
 
 ## **Proposed Implementation**
 
-We describe our current implementation in `torch-spyre`. We use `Spyre`
-to indicate a device-specific subclass or specialization of an abstract
-`Device` or `device_` API.
+We describe our current implementation in `torch-spyre`. In the description we
+use `Spyre` or `spyre_` to indicate a device-specific subclass or specialization
+of an abstract `Device` or `device_` API.
 
 ### Runtime / Programming Model Support
 
@@ -199,7 +198,7 @@ memory layouts.
 Instead of extending `to` and `new_empty`, our implementation currently provide alternative
 functions `torch_spyre.to_with_layout` and `torch_spyre.new_empty_with_layout`.
 These functions allow the programmer/compiler to provide a `SpyreTensorLayout`
-that specifies the desired device memory layout.
+that specifies the desired device memory layout of the tensor.
 
 We also provide custom operations such as `torch_spyre.restickify` that enable
 the programmer to create a copy of a tensor changing its stick dimension (thus
@@ -232,7 +231,7 @@ With the `FixedTiledLayout` in place, subsequent passes over the LoopLevelIR
 can be extended to use the device layout information as necessary.
 For example the memory planner can use them to have accurate device tensor sizes
 and the code generator can use them to generate host-code allocation calls and
-kernel loop nests.
+optimized kernel loop nests.
 
 ## **Metrics**
  <!--
@@ -264,7 +263,7 @@ to propagate device memory layouts.  A key advantage of this approach was
 that it enabled a more intuitive description of the constraints and semantics of each
 operation via the well understood fake function mechanism.  However, it required more invasive
 changes to Dynamo and Inductor to preserve/propagate the information through many more
-stages of compilation.  We therefore are abandoning this approach and switched
+stages of compilation.  We therefore abandoned this approach and switched
 to the approach described [above](#compiler-support) that confines all awareness
 of tiled device memory layouts to the "middle" and "backend" stages of the LoopLevelIR layer of Inductor.
 
