@@ -186,7 +186,9 @@ def compare_with_eager(fn, *args, atol=0, rtol=0):
 def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
     device_args = [arg.to(DEVICE) for arg in args]
-    result = torch.compile(fn)(*device_args).cpu()
+    result = torch.compile(fn)(*device_args)
+    if not isinstance(result, int):
+        result = result.cpu()
     cpu_result = fn(*args)
     torch.testing.assert_close(
         result,
