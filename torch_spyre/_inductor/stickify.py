@@ -225,28 +225,31 @@ def propagate_spyre_tensor_layouts(
         return res
 
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
-    for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
-        if isinstance(real_input, torch.Tensor):
-            stl = real_input.device_tensor_layout()
-            if stl is None:
-                # All spyre tensors are created with device layouts.
-                # Therefore we expect all graph inputes to have them.
-                raise Unsupported(f"missing device_tensor_layout on graph input {name}")
-            tb = V.graph.graph_inputs[name]
-            if (
-                not isinstance(tb, TensorBox)
-                or not isinstance(tb.data, StorageBox)
-                or not isinstance(tb.data.data, InputBuffer)
-            ):
-                raise Unsupported(
-                    "graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+    if len(V.graph.graph_input_names) > 0:
+        for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
+            if isinstance(real_input, torch.Tensor):
+                stl = real_input.device_tensor_layout()
+                if stl is None:
+                    # All spyre tensors are created with device layouts.
+                    # Therefore we expect all graph inputs to have them.
+                    raise Unsupported(
+                        f"missing device_tensor_layout on graph input {name}"
+                    )
+                tb = V.graph.graph_inputs[name]
+                if (
+                    not isinstance(tb, TensorBox)
+                    or not isinstance(tb.data, StorageBox)
+                    or not isinstance(tb.data.data, InputBuffer)
+                ):
+                    raise Unsupported(
+                        "graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                    )
+                ptl = tb.data.data.layout
+                if not isinstance(ptl, FixedLayout):
+                    raise Unsupported("graph input {name} does not have a FixedLayout")
+                tb.data.data.layout = FixedTiledLayout(
+                    ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
                 )
-            ptl = tb.data.data.layout
-            if not isinstance(ptl, FixedLayout):
-                raise Unsupported("graph input {name} does not have a FixedLayout")
-            tb.data.data.layout = FixedTiledLayout(
-                ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
-            )
 
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being

@@ -51,12 +51,17 @@ def _autoload():
     import torch_spyre._inductor.customops  # noqa: F401  # usort: skip
     import torch_spyre._inductor.decompositions  # noqa: F401  # usort: skip
     import torch_spyre._inductor.lowering  # noqa: F401  # usort: skip
-    from .fake_ops import SpyreAotAutograd
+    from .patches import SpyreAotAutograd, spyre_compile_to_module
 
-    # Monkey patching this method is our hook for installing additional
-    # Spyre-specific overrides and contexts that are not supported by existing extension points.
+    # Monkey patching these two methods let us install Spyre-specific overrides
+    # and contexts that are not supported by existing extension points.
+    # We need to hook both, because a user may directly compile a module for spyre without going through AotAutograd.
     torch._dynamo.backends.common.aot_autograd = lambda **kwargs: SpyreAotAutograd(
         **kwargs
+    )
+    orig_compile_to_module = torch._inductor.graph.GraphLowering.compile_to_module
+    torch._inductor.graph.GraphLowering.compile_to_module = (
+        lambda graph: spyre_compile_to_module(graph, orig_compile_to_module)
     )
 
     # Customize inductor heuristics
