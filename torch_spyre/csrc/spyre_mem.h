@@ -20,6 +20,7 @@
 #include <c10/util/intrusive_ptr.h>
 
 namespace spyre {
+
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                                std::optional<c10::ScalarType> dtype_opt,
                                std::optional<c10::Layout> layout_opt,
@@ -28,4 +29,10 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
+
+class SpyreTensorLayout;
+at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
+                                   c10::IntArrayRef stride,
+                                   c10::ScalarType dtype,
+                                   SpyreTensorLayout device_layout);
 }  // namespace spyre

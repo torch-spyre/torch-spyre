@@ -23,12 +23,13 @@ from .data_ops import (
     generate_slice,
     generate_transpose,
     generate_transpose_3d_stick,
+    generate_transpose_4d_stick,
 )
 
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
-    if len(dimensions) > 3 and op != BATCH_MATMUL_OP:
-        raise Unsupported(f"operation on {len(dimensions)}-D tensor")
+    if len(dimensions) > 3 and (op != BATCH_MATMUL_OP and op != TRANSPOSE_OP):
+        raise Unsupported(f"{op} on {len(dimensions)}-D tensor")
     if op == MATMUL_REDUCTION_OP:
         return generate_matmul(
             pointers,
@@ -94,6 +95,26 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
         else:
             # Non-stick transpose currently unsupported
             raise Unsupported("Transposition not changing the stick dimension")
+    if op == TRANSPOSE_OP and len(dimensions) == 4:
+        transposed_dims = [
+            dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
+        ]
+        # TODO: add support for other stick transpose variants (1-3 and 2-3)
+        is_supported = (0 in transposed_dims) and 3 in transposed_dims
+        if is_supported:
+            return generate_transpose_4d_stick(
+                pointers,
+                op=op,
+                dimensions=dimensions,
+                inputs=inputs,
+                outputs=outputs,
+                transposed_dims=transposed_dims,
+                **kwargs,
+            )
+        else:
+            raise Unsupported(
+                f"4D transposition on dimensions {transposed_dims[0]} and {transposed_dims[1]}"
+            )
     return generate_sfp_op(
         pointers,
         op=op,

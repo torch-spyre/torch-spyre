@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch_spyre.fallbacks  # noqa: F401
 
 
 @torch.library.register_kernel("aten::mm", ["spyre"])

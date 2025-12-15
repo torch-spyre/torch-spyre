@@ -119,12 +119,20 @@ class TestSpyre(TestCase):
         self.assertEqual(b, a + 2)
 
     def test_cross_device_copy_dtypes(self):
-        dtypes = [torch.float8_e4m3fn, torch.int8, torch.float16, torch.float32]
+        dtypes = [
+            torch.float8_e4m3fn,
+            torch.int8,
+            torch.int64,
+            torch.float16,
+            torch.float32,
+        ]
         for dtype in dtypes:
             x = None
             if dtype in [torch.int8]:
                 x = torch.rand(64, 64) * 100
                 x = x.to(dtype=dtype)
+            elif dtype in [torch.int64]:
+                x = torch.randint(-32768, 32767, (64, 64), dtype=dtype)
             elif dtype in [torch.float8_e4m3fn]:
                 x = torch.rand(64, 64)
                 x = x.to(dtype=dtype)
@@ -187,6 +195,44 @@ class TestSpyre(TestCase):
                 torch.testing.assert_close(x, x_cpu),
                 f"round trip copy produces incorrect results for dtype={dtype}",
             )
+
+    def test_default_on_import(self):
+        import torch_spyre  # noqa: F401
+
+        assert torch.spyre.get_downcast_warning() is True
+
+    def test_set_get_roundtrip(self):
+        import torch_spyre  # noqa: F401
+
+        torch.spyre.set_downcast_warning(False)
+        assert torch.spyre.get_downcast_warning() is False
+        torch.spyre.set_downcast_warning(True)
+        assert torch.spyre.get_downcast_warning() is True
+
+    def test_warning_emitted_when_enabled(self):
+        import torch_spyre  # noqa: F401
+        import warnings
+
+        torch.set_warn_always(True)
+        t = torch.randint(-32768, 32767, (64, 64), dtype=torch.int64)
+        torch.spyre.set_downcast_warning(True)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            t2 = t.to(device="spyre")  # noqa: F841
+        # At least one UserWarning captured
+        assert any("does not support int64" in str(w.message) for w in rec)
+
+    def test_warning_suppressed_when_disabled(self):
+        import torch_spyre  # noqa: F401
+        import warnings
+
+        torch.set_warn_always(True)
+        torch.spyre.set_downcast_warning(False)
+        t = torch.randint(-32768, 32767, (64, 64), dtype=torch.int64)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            t2 = t.to(device="spyre")  # noqa: F841
+        assert len(rec) == 0
 
 
 if __name__ == "__main__":

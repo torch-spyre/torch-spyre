@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-from torch._dynamo.device_interface import DeviceInterface, _device_t
+from torch._dynamo.device_interface import DeviceInterface
 from typing import Any
 from dataclasses import dataclass
 
@@ -36,11 +36,13 @@ class SpyreInterface(DeviceInterface):
         return torch.spyre.is_available()  # type: ignore[attr-defined]
 
     @classmethod
-    def get_device_properties(cls, device: _device_t = None) -> SpyreDeviceProperties:
+    def get_device_properties(
+        cls, device: torch.types.Device = None
+    ) -> SpyreDeviceProperties:
         return cls.Worker.get_device_properties(device)
 
     @staticmethod
-    def get_compute_capability(device: _device_t = None) -> Any:
+    def get_compute_capability(device: torch.types.Device = None) -> Any:
         # TODO (tmhoangt): read this from cache
         # as worker process don't get access to device due to driver limitation
         return ""
@@ -56,7 +58,7 @@ class SpyreInterface(DeviceInterface):
             return 0
 
         @staticmethod
-        def get_device_properties(device: _device_t = None):
+        def get_device_properties(device: torch.types.Device = None):
             # TODO (tmhoangt): read this from cache
             # as worker process don't get access to device due to driver limitation
             return SpyreDeviceProperties(type="dd2", index=0, multi_processor_count=32)

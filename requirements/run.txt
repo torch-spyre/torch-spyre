@@ -22,9 +22,9 @@ setuptools==75.8.2
     # via torch
 sympy==1.14.0
     # via torch
-torch==2.7.1 ; sys_platform == 'darwin'
+torch==2.9.1 ; sys_platform == 'darwin'
     # via torch-spyre
-torch==2.7.1+cpu ; sys_platform != 'darwin'
+torch==2.9.1+cpu ; sys_platform != 'darwin'
     # via torch-spyre
 typing-extensions==4.15.0
     # via torch

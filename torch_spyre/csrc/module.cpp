@@ -22,6 +22,8 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <cstdlib>  // std::getenv
+#include <dee_internal/dee_graph_converter.hpp>
 #include <flex/flex_factory.hpp>
 #include <memory>
 #include <sendnn/graph.hpp>
@@ -30,7 +32,7 @@
 #include <sendnn/graph/graph_utils.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/tensor_info.hpp>
+#include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <vector>
@@ -42,6 +44,27 @@
 
 namespace spyre {
 
+std::atomic<bool> g_downcast_warn_enabled{true};
+
+bool get_downcast_warn_enabled() {
+  return g_downcast_warn_enabled.load(std::memory_order_relaxed);
+}
+
+void set_downcast_warn_enabled(bool enabled) {
+  g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+// Optional: initialize from env at module init
+static void init_from_env() {
+  if (const char *v = std::getenv(SPYRE_DOWNCAST_ENV)) {
+    // Accept 0/1, true/false, on/off
+    std::string s(v);
+    for (auto &c : s) c = std::tolower(c);
+    bool enable = !(s == "0" || s == "false" || s == "off");
+    g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
+  }
+}
+
 void _startRuntime() {
   DEBUGINFO("starting runtime");
   // TODO(tmhoangt): move sendnn::RuntimeInterface to flex to isolate from
@@ -50,6 +73,7 @@ void _startRuntime() {
   auto s = flex::CreateRuntimeInterface(&base_runtime);
   std::shared_ptr<flex::Runtime> runtime =
       std::dynamic_pointer_cast<flex::Runtime>(base_runtime);
+  init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
     DEBUGINFO(s);
@@ -178,6 +202,7 @@ std::string getSenDataFormat(c10::ScalarType torch_dtype) {
       stringToDTDataFormatPair(torchScalarToString[torch_dtype]);
   return EnumsConversion::dataFormatsToString(dtype_dev);
 }
+
 uint32_t encodeConstant(float torch_const, const std::string &data_format) {
   uint32_t sen_const;
   DataFormats df;
@@ -191,6 +216,24 @@ uint32_t encodeConstant(float torch_const, const std::string &data_format) {
   }
   return sen_const;
 }
+void convertArtifacts(std::string artifacts_path) {
+  dee::PBD pbd;
+  sendnn::Graph g2;
+
+  setenv("DEEPRT_EXPORT_DIR", artifacts_path.c_str(), 1);
+  senbfcc::GlobalTracedSettings::Get().UpdateValue("DEEPRT_EXPORT_DIR",
+                                                   artifacts_path);
+
+  setenv("SENDNN_SERIALIZER_FORMAT", "CBOR", 1);
+
+  // Convert compiled artifacts to sendnn g2 graph
+  pbd.FromGraph(&g2);
+
+  // Serialize g2 graph
+  sendnn::Serialize(g2, artifacts_path + "/g2");
+
+  return;
+}
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -200,6 +243,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("get_sen_data_format", &spyre::getSenDataFormat);
+  m.def("convert_artifacts", &spyre::convertArtifacts);
+  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
@@ -209,23 +254,30 @@ PYBIND11_MODULE(_C, m) {
       .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
 
   dci_cls.def_readwrite("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readwrite("device_strides",
-                     &spyre::SpyreTensorLayout::device_strides)
       .def_readwrite("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readwrite("num_stick_dims",
                      &spyre::SpyreTensorLayout::num_stick_dims)
       .def_readwrite("format", &spyre::SpyreTensorLayout::format)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("__repr__",
+           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def(py::self == py::self)
-      .def(py::init<std::vector<int64_t>, c10::ScalarType>())
+      .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
+           py::arg("host_size"), py::arg("dtype"))
       .def(py::init<std::vector<int64_t>, c10::ScalarType, std::vector<int32_t>,
                     spyre::SpyreTensorLayout::StickFormat>(),
            py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
            py::arg("format") = spyre::SpyreTensorLayout::StickFormat::Dense)
-      .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
-                    std::vector<int32_t>, int32_t,
-                    spyre::SpyreTensorLayout::StickFormat>());
+      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, int32_t,
+                    spyre::SpyreTensorLayout::StickFormat>(),
+           py::arg("device_size"), py::arg("dim_map"),
+           py::arg("num_stick_dims"), py::arg("format"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
+  m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
+        "Return whether downcast warnings are enabled.");
+  m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
+        "Enable/disable downcast warnings for this process.");
 }

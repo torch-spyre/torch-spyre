@@ -86,3 +86,25 @@ def spyre_softplus(
 
 
 torch.nn.functional.softplus = spyre_softplus
+
+orig_clamp = torch.clamp
+
+
+def spyre_clamp(
+    input: torch.Tensor,
+    min: Optional[torch.types.Number] = None,
+    max: Optional[torch.types.Number] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if input.device.type == "spyre":
+        res = torch.ops.spyre.clamp(input, min, max)
+        if out is not None:
+            out.copy_(res)
+            return out
+        return res
+    else:
+        return orig_clamp(input, min, max, out=out)
+
+
+torch.clamp = spyre_clamp

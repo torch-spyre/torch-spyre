@@ -43,12 +43,10 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(1);
-    this->device_strides.resize(1);
     this->dim_map.resize(1);
     this->format = Sparse;
     this->num_stick_dims = 1;
     this->device_size[0] = 1;
-    this->device_strides[0] = 1;
     this->dim_map[0] = -1;  // host_size has no entries!
     return;
   }
@@ -56,13 +54,12 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + 1;
   auto elem_bytes = c10::elementSize(dtype);
-  auto elems_in_stick = BYTES_IN_STICK / elem_bytes;
+  auto elems_in_stick = format == Dense ? BYTES_IN_STICK / elem_bytes : 1;
 
   TORCH_CHECK(host_size.size() == dim_order.size(),
               "Invalid arguments: host_size.size() != dim_order.size()");
 
   this->device_size.resize(device_dims);
-  this->device_strides.resize(device_dims);
   this->dim_map.resize(device_dims);
   this->format = format;
   this->num_stick_dims = 1;
@@ -80,13 +77,22 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->dim_map[i] = dim_order[i - 1];
     this->device_size[i] = host_size[dim_order[i - 1]];
   }
+}
 
-  int64_t cur_stride = elems_in_stick;
-  device_strides[device_dims - 1] = 1;
+std::vector<int64_t> SpyreTensorLayout::device_strides(c10::ScalarType dtype) {
+  int device_dims = static_cast<int>(this->device_size.size());
+  std::vector<int64_t> strides(device_dims);
+
+  // Stick dim
+  int64_t cur_stride = BYTES_IN_STICK / c10::elementSize(dtype);
+  strides[device_dims - 1] = 1;
+
+  // Non-stick dims
   for (int i = device_dims - 2; i >= 0; i--) {
-    this->device_strides[i] = cur_stride;
+    strides[i] = cur_stride;
     cur_stride = cur_stride * this->device_size[i];
   }
+  return strides;
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -96,13 +102,6 @@ std::string SpyreTensorLayout::toString() const {
   for (size_t i = 0; i < this->device_size.size(); i++) {
     ss << this->device_size[i];
     if (i < this->device_size.size() - 1) {
-      ss << ", ";
-    }
-  }
-  ss << "], device_strides=[";
-  for (size_t i = 0; i < this->device_strides.size(); i++) {
-    ss << this->device_strides[i];
-    if (i < this->device_strides.size() - 1) {
       ss << ", ";
     }
   }
@@ -116,11 +115,11 @@ std::string SpyreTensorLayout::toString() const {
   ss << "], num_stick_dims=";
   ss << this->num_stick_dims;
   if (this->format == StickFormat::Dense) {
-    ss << ", format=\"Dense\"";
+    ss << ", format=StickFormat.Dense";
   } else if (this->format == StickFormat::Sparse) {
-    ss << ", format=\"Sparse\"";
+    ss << ", format=StickFormat.Sparse";
   } else {
-    ss << ", format=\"SparseMulti\"";
+    ss << ", format=StickFormat.SparseMulti";
   }
   ss << ")";
   return ss.str();

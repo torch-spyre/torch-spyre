@@ -17,7 +17,6 @@ import threading
 import types
 import importlib
 from .constants import DEVICE_NAME
-from ._monkey_patch import _patch_tensor_for_spyre
 
 _runtime_init_lock = threading.Lock()
 
@@ -60,6 +59,15 @@ class _SpyreImpl:
             # this will create the allocator
             self._C.start_runtime()
             self._initialized = True
+
+            ## Run patch on import
+            from ._monkey_patch import _patch_tensor_for_spyre
+
+            _patch_tensor_for_spyre()
+
+            from torch_spyre._inductor import _autoload as ts_autoload
+
+            ts_autoload()
 
     def _is_in_bad_fork(self) -> bool:
         return self._in_bad_fork
@@ -125,6 +133,10 @@ def make_spyre_module() -> types.ModuleType:
 
     # Optional: forward unknown attrs to the impl or _C for convenience
     def __getattr__(name):
+        if name in ["__file__"]:
+            # Important: raising AttributeError ensures hasattr() returns False
+            # without triggering our lazy loader.
+            raise AttributeError(name)
         if hasattr(impl, name):
             return getattr(impl, name)
         if not hasattr(impl, "_C"):
@@ -149,13 +161,9 @@ def _autoload():
 
     import torch  # noqa: E402
 
-    # Run patch on import
-    _patch_tensor_for_spyre()
-
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
-
     import torch_spyre.ops  # noqa: F401
 
     # set the default backend debugging to quiet
@@ -163,7 +171,3 @@ def _autoload():
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
-
-    from torch_spyre._inductor import _autoload as ts_autoload
-
-    ts_autoload()

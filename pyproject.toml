@@ -11,7 +11,7 @@ requires = [
     "pyyaml~=6.0.0", # needed for codegen
     "regex~=2025.11.3",
     "setuptools<=75.8.2",
-    "torch~=2.7.1",  # Needed to use BuildExtension
+    "torch~=2.9.1",  # Needed to use BuildExtension
     "wheel~=0.45.1"
 ]
 build-backend = "setuptools.build_meta"
@@ -25,7 +25,7 @@ description = "PyTorch-Spyre out of tree registration"
 dependencies = [
     "numpy~=2.3.4",
     "regex~=2025.11.3",
-    "torch~=2.7.1",
+    "torch~=2.9.1",
     "psutil~=7.1.0"
 ]
 requires-python = ">=3.11"
@@ -44,7 +44,7 @@ build = [ # no-isolation build
     "pyyaml~=6.0.0", # needed for codegen
     "regex~=2025.11.3",
     "setuptools<=75.8.2",
-    "torch~=2.7.1",  # Needed to use BuildExtension
+    "torch~=2.9.1",  # Needed to use BuildExtension
     "wheel~=0.45.1"
 ]
 test = [

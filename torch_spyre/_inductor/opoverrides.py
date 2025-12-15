@@ -30,6 +30,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.abs({x})"
 
     @staticmethod
+    def clamp(input, min=None, max=None):
+        return f"spyre.clamp({input} {min} {max})"
+
+    @staticmethod
     def exp(x):
         return f"spyre.exp({x})"
 
