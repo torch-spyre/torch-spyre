@@ -22,7 +22,7 @@ mypy==1.13.0
     # via torch-spyre
 mypy-extensions==1.1.0
     # via mypy
-networkx==3.5
+networkx==3.6.1
     # via torch
 nodeenv==1.9.1
     # via pre-commit
