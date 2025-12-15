@@ -53,7 +53,7 @@ test = [
     "transformers~=4.57.1"
 ]
 lint = [
-    "mypy~=1.13.0",
+    "mypy~=1.19.1",
     "pre-commit~=4.5.0",
     "types-PyYAML~=6.0.12.20250915",
     "uv~=0.9.10",
