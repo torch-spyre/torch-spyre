@@ -22,8 +22,10 @@ DEVICE = torch.device("spyre")
 # to avoid using the same cached tensor of the same shape, add a unique
 # differentiation argument
 @functools.lru_cache(maxsize=None)
-def cached_randn(shape, differentiation=None, abs=False, dtype=torch.float16):
-    out = torch.randn(shape, dtype=dtype)
+def cached_randn(
+    shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
+):
+    out = torch.randn(shape, dtype=dtype) * scale
     return out if not abs else torch.abs(out)
 
 

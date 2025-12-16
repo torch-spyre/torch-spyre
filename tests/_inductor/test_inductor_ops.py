@@ -154,22 +154,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        ("test_reduce_2d", "test_reduce"): {
-            "ops_dict": REDUCTION_OPS_DICT,
-            "param_sets": {
-                "dim_0": (0, cached_randn((67, 256))),
-                # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
-                # "dim_1": (1, cached_randn((67, 256))),
-            },
-        },
-        ("test_reduce_2d_cpu", "test_reduce_cpu"): {
-            "ops_dict": REDUCTION_OPS_DICT,
-            "param_sets": {
-                "dim_0": (0, cached_randn((67, 256))),
-                # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
-                # "dim_1": (1, cached_randn((67, 256))),
-            },
-        },
+        # ("test_reduce_2d", "test_reduce"): {
+        #     "ops_dict": REDUCTION_OPS_DICT,
+        #     "param_sets": {
+        #         "dim_0": (0, cached_randn((67, 256))),
+        #         # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
+        #         # "dim_1": (1, cached_randn((67, 256))),
+        #     },
+        # },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
                 "dim_0": (0, cached_randn((128, 256))),
@@ -194,17 +186,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        # skipping these - not working yet
-        # ("test_reduce_3d",
-        #  "test_reduce"
-        # ):{
-        #     "ops_dict": REDUCTION_OPS_DICT,
-        #     "param_sets": {
-        #         "dim_0": (0, cached_randn((67, 71, 256))),
-        #         "dim_1": (1, cached_randn((67, 71, 256))),
-        #         "dim_2": (2, cached_randn((67, 71, 256))),
-        #     }
-        # },
+        # Compare with cpu for now to avoid hitting eager mode coverage issue
+        ("test_max", "test_reduce_cpu"): {
+            "ops_dict": {
+                "sum": torch.max,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
+                "3d_dim_1": (1, cached_randn((67, 71, 256))),
+                # "3d_dim_2": (2, cached_randn((67, 71, 256))), # sparse tensor output
+            },
+        },
+        ("test_sum", "test_reduce_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                # "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)), # layout needs repermutation
+                "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.01)),
+                # "3d_dim_2": (2, cached_randn((67, 71, 256), scale=0.01)), # sparse tensor output
+                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
+                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)),
+            },
+        },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
             "param_sets": make_param_dict(
                 [
@@ -376,18 +385,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_add_broadcast_cpu(self, x, y):
         compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
 
-    @unittest.skip("eager mode crashes")
-    def test_reduce(self, op, dim: int, x):
-        if op == torch.max:
-            compare(lambda x: op(x, dim=dim)[0], x)
-        else:
-            compare(lambda x: op(x, dim=dim), x)
+    # @unittest.skip("eager mode crashes")
+    # def test_reduce(self, op, dim: int, x):
+    #     if op == torch.max:
+    #         compare(lambda x: op(x, dim=dim)[0], x)
+    #     else:
+    #         compare(lambda x: op(x, dim=dim), x)
 
     def test_reduce_cpu(self, op, dim: int, x):
+        # Special case workaround:
+        # torch-spyre returns 1d single element tensor while torch-cpu
+        # returns 0d scalar tensor
+        keepdim = isinstance(dim, list) and (len(dim) == x.ndim)
+
         if op == torch.max:
-            compare_with_cpu(lambda x: op(x, dim=dim)[0], x)
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim)[0], x)
         else:
-            compare_with_cpu(lambda x: op(x, dim=dim), x)
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
 
     def test_max_sub_broadcast_cpu(self, dim: int, x):
         def fn(x):
