@@ -16,6 +16,7 @@ MATMUL_REDUCTION_OP = "matmul"
 BATCH_MATMUL_OP = "batchmatmul"
 TRANSPOSE_OP = "transpose"
 DEVICE_NAME = "spyre"
+CLONE_OP = "clone"
 BYTES_PER_STICK = 128
 
 SEGMENT_OFFSETS = [

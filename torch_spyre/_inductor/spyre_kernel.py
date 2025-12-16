@@ -31,12 +31,7 @@ from torch._inductor.virtualized import ReductionType, StoreMode, V
 from torch._inductor.shape_propagation import BlockShapeType
 
 from .runtime import ConstantArg, TensorArg
-from .constants import (
-    MATMUL_REDUCTION_OP,
-    TRANSPOSE_OP,
-    SPYRE_FP32_OPS,
-    BATCH_MATMUL_OP,
-)
+from .constants import MATMUL_REDUCTION_OP, SPYRE_FP32_OPS, BATCH_MATMUL_OP, CLONE_OP
 from . import Unsupported
 from .opoverrides import SpyreKernelOverrides
 from .opfuncs import UNIMPLEMENTED, get_spyre_op
@@ -366,7 +361,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 raise Unsupported(f"data op has {len(self.compute_inputs)} inputs")
             if not isinstance(self.compute_inputs[0], TensorAccess):
                 raise Unsupported(f"data op unexpected input: {self.compute_inputs[0]}")
-            self.spyre_op = TRANSPOSE_OP
+            self.spyre_op = CLONE_OP  # default to clone
             input_stride = list(
                 self.get_strides(self.compute_inputs[0].index).values()
             )[0]

@@ -886,3 +886,164 @@ def generate_transpose_4d_stick(
             ],
         }
     }
+
+
+def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    d2 = len(dimensions) >= 2
+    d3 = len(dimensions) >= 3
+    inp_range = range(dimensions[-1] // 64)
+    out_range = range(dimensions[-1] // 64)
+
+    if d2:
+        inp_range = range(dimensions[-1] * dimensions[0] // 4096)
+        out_range = range(dimensions[-1] * dimensions[0] // 4096)
+    if d3:
+        inp_range = range(dimensions[-1] * dimensions[0] * dimensions[1] // 4096)
+        out_range = range(dimensions[-1] * dimensions[0] * dimensions[1] // 4096)
+
+    return {
+        "clone": {
+            "numCoresUsed_": 1,
+            "dscs_": [],
+            "coreIdToDscSchedule": {"0": [[0, -1, 0, 0]]},
+            "datadscs_": [
+                {
+                    "clone": {
+                        "coreIdsUsed_": [0],
+                        "dimPool_": ["mb", "out"],
+                        "primaryDs_": [{"name_": "pds0", "dimNames": ["mb", "out"]}],
+                        "labeledDs_": [
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": ["mb", "out"],
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": {
+                                    "mb": dimensions[0] if d2 else 0,
+                                    "out": dimensions[-1],
+                                },
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": {
+                                    "mb": [[dimensions[0], 0]] if d2 else [[1, 0]],
+                                    "out": [[dimensions[-1], 0]],
+                                },
+                                "PieceInfo": [
+                                    {
+                                        "key_": f"p{i}",
+                                        "dimToSize_": {
+                                            "mb": 64 if d2 or d3 else 0,
+                                            "out": 64,
+                                        },
+                                        "validGap_": {
+                                            "mb": [[64, 0]] if d2 else [[1, 0]],
+                                            "out": [[64, 0]],
+                                        },
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[inputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [0],
+                                            },
+                                        ],
+                                    }
+                                    for i in range(
+                                        dimensions[0] * dimensions[1] // 4096
+                                    )
+                                ],
+                                "hbmStartAddress_": pointers[inputs[0]["name"]] // 128,
+                            },
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": ["mb", "out"],
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": {
+                                    "mb": dimensions[0] if d2 else 0,
+                                    "out": dimensions[-1],
+                                },
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": {
+                                    "mb": [[dimensions[0], 0]] if d2 else [[1, 0]],
+                                    "out": [[dimensions[-1], 0]],
+                                },
+                                "PieceInfo": [
+                                    {
+                                        "key_": f"p{i}",
+                                        "dimToSize_": {
+                                            "mb": 64 if d2 or d3 else 0,
+                                            "out": 64,
+                                        },
+                                        "validGap_": {
+                                            "mb": [[64, 0]] if d2 else [[1, 0]],
+                                            "out": [[64, 0]],
+                                        },
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[outputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [16384],
+                                            },
+                                        ],
+                                    }
+                                    for i in range(
+                                        dimensions[0] * dimensions[1] // 4096
+                                    )
+                                ],
+                                "hbmStartAddress_": pointers[outputs[0]["name"]] // 128,
+                            },
+                        ],
+                        "op": {
+                            "name": "STCDPOpHBM",
+                            "gtrIdsUsed": [],
+                            "coreIDtoANInfo": {
+                                "0": {
+                                    "loopCount": {
+                                        "out": dimensions[-1] // 64,
+                                        "mb": dimensions[0] // 64 if d2 or d3 else 0,
+                                    },
+                                    "loopCountL3SU": {},
+                                    "addr_info_": {
+                                        "l3lu": {
+                                            "type_": "stride",
+                                            "offset_": {
+                                                "mb": 64,
+                                                "out": dimensions[0],
+                                            },
+                                        },
+                                        "l3su": {
+                                            "type_": "stride",
+                                            "offset_": {
+                                                "mb": 64,
+                                                "out": dimensions[0],
+                                            },
+                                        },
+                                    },
+                                    "inpPieceOrder": [f"p{i}" for i in inp_range],
+                                    "outPieceOrder": [f"p{i}" for i in out_range],
+                                }
+                            },
+                            "numClToUse": 1,
+                            "cl0ToLxOffsetLU": 0,
+                            "cl0ToLxOffsetSU": 0,
+                        },
+                    }
+                }
+            ],
+        }
+    }
