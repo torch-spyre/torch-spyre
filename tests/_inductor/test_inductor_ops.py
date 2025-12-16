@@ -327,6 +327,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_clone",
+            "test_clone",
+        ): {
+            "param_sets": {
+                "1d": (cached_randn((128,), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -407,6 +417,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_activation_fn(self, op, input, err):
         compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
+
+    def test_clone(self, x):
+        compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
 
 
 if __name__ == "__main__":
