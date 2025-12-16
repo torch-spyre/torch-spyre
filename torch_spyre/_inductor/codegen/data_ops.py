@@ -889,58 +889,63 @@ def generate_transpose_4d_stick(
 
 
 def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
-    d1 = len(dimensions) == 1
-    d2 = len(dimensions) == 2
-
-    dim_map = {}
-    offsets = {}
-    loop_counts = {}
-    piece_valid_gaps = {}
-    valid_gaps = {}
-    piece_sizes = {}
-    layout = []
-    piece_count = dimensions[-1] // 64
-
-    if d1:
+    ndims = len(dimensions)
+    if ndims == 1:
         layout = ["out"]
-        dim_map["out"] = dimensions[0]
-    elif d2:
+        dim_map = {"out": dimensions[0]}
+        offsets = {"out": 1}
+        loop_counts = {"out": dimensions[0] // 64}
+        piece_valid_gaps = {"out": [[64, 0]]}
+        piece_sizes = {"out": 64}
+        valid_gaps = {"out": [[dimensions[0], 0]]}
+        piece_count = dimensions[0] // 64
+    elif ndims == 2:
         layout = ["mb", "out"]
-        dim_map["mb"] = dimensions[0]
-        dim_map["out"] = dimensions[1]
+        dim_map = {"mb": dimensions[0], "out": dimensions[-1]}
+        offsets = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": dimensions[0]}
+        loop_counts = {
+            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
+            "out": dimensions[-1] // 64,
+        }
+        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64}
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+        }
+        valid_gaps = {"mb": [[dimensions[0], 0]], "out": [[dimensions[-1], 0]]}
+        piece_count = (
+            dimensions[0] * dimensions[-1] // (4096 if dimensions[0] % 64 == 0 else 64)
+        )
     else:
         layout = ["mb", "out", "x"]
-        dim_map["mb"] = dimensions[0]
-        dim_map["out"] = dimensions[2]
-        dim_map["x"] = dimensions[1]
-
-    for name, size in dim_map.items():
-        if name == "mb":
-            offsets[name] = 64 if size % 64 == 0 else 1
-            loop_counts[name] = size // 64 if size % 64 == 0 else size
-            piece_valid_gaps[name] = [[64 if size % 64 == 0 else 1, 0]]
-            piece_sizes[name] = 64 if size % 64 == 0 else 1
-            valid_gaps[name] = [[size, 0]]
-            piece_count *= size // 64 if size % 64 == 0 else size
-        elif name == "x":
-            offsets[name] = (
-                dimensions[-1] * 2
-                if dimensions[-1] > dimensions[0]
-                else dimensions[0] * 2
-            )
-            loop_counts[name] = size
-            piece_valid_gaps[name] = [[1, 0]]
-            piece_sizes[name] = 1
-            valid_gaps[name] = [[size, 0]]
-            piece_count *= size
-        else:  # out
-            offsets[name] = 1 if d1 else dimensions[0]
-            piece_valid_gaps[name] = size // 64
-            piece_valid_gaps[name] = [[64, 0]]
-            valid_gaps[name] = [[size, 0]]
-            piece_sizes[name] = 64
-            loop_counts[name] = size // 64
-
+        dim_map = {"mb": dimensions[0], "out": dimensions[-1], "x": dimensions[1]}
+        offsets = {
+            "mb": 64 if dimensions[0] % 64 == 0 else 1,
+            "out": dimensions[0],
+            "x": dimensions[-1] * dimensions[0] // 64,
+        }
+        loop_counts = {
+            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
+            "out": dimensions[-1] // 64,
+            "x": dimensions[1],
+        }
+        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64, "x": 1}
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+            "x": [[piece_sizes["x"], 0]],
+        }
+        valid_gaps = {
+            "mb": [[dimensions[0], 0]],
+            "out": [[dimensions[-1], 0]],
+            "x": [[dimensions[1], 0]],
+        }
+        piece_count = (
+            dimensions[0]
+            * dimensions[1]
+            * dimensions[-1]
+            // (4096 if dimensions[0] % 64 == 0 else 64)
+        )
     return {
         "clone": {
             "numCoresUsed_": 1,

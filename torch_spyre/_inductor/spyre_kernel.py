@@ -406,7 +406,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
-            print()
             return ks
 
     def codegen_kernel(self):
