@@ -889,17 +889,57 @@ def generate_transpose_4d_stick(
 
 
 def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
-    d2 = len(dimensions) >= 2
-    d3 = len(dimensions) >= 3
-    inp_range = range(dimensions[-1] // 64)
-    out_range = range(dimensions[-1] // 64)
+    d1 = len(dimensions) == 1
+    d2 = len(dimensions) == 2
 
-    if d2:
-        inp_range = range(dimensions[-1] * dimensions[0] // 4096)
-        out_range = range(dimensions[-1] * dimensions[0] // 4096)
-    if d3:
-        inp_range = range(dimensions[-1] * dimensions[0] * dimensions[1] // 4096)
-        out_range = range(dimensions[-1] * dimensions[0] * dimensions[1] // 4096)
+    dim_map = {}
+    offsets = {}
+    loop_counts = {}
+    piece_valid_gaps = {}
+    valid_gaps = {}
+    piece_sizes = {}
+    layout = []
+    piece_count = dimensions[-1] // 64
+
+    if d1:
+        layout = ["out"]
+        dim_map["out"] = dimensions[0]
+    elif d2:
+        layout = ["mb", "out"]
+        dim_map["mb"] = dimensions[0]
+        dim_map["out"] = dimensions[1]
+    else:
+        layout = ["mb", "out", "x"]
+        dim_map["mb"] = dimensions[0]
+        dim_map["out"] = dimensions[2]
+        dim_map["x"] = dimensions[1]
+
+    for name, size in dim_map.items():
+        if name == "mb":
+            offsets[name] = 64 if size % 64 == 0 else 1
+            loop_counts[name] = size // 64 if size % 64 == 0 else size
+            piece_valid_gaps[name] = [[64 if size % 64 == 0 else 1, 0]]
+            piece_sizes[name] = 64 if size % 64 == 0 else 1
+            valid_gaps[name] = [[size, 0]]
+            piece_count *= size // 64 if size % 64 == 0 else size
+        elif name == "x":
+            offsets[name] = (
+                dimensions[-1] * 2
+                if dimensions[-1] > dimensions[0]
+                else dimensions[0] * 2
+            )
+            loop_counts[name] = size
+            piece_valid_gaps[name] = [[1, 0]]
+            piece_sizes[name] = 1
+            valid_gaps[name] = [[size, 0]]
+            piece_count *= size
+        else:  # out
+            offsets[name] = 1 if d1 else dimensions[0]
+            piece_valid_gaps[name] = size // 64
+            piece_valid_gaps[name] = [[64, 0]]
+            valid_gaps[name] = [[size, 0]]
+            piece_sizes[name] = 64
+            loop_counts[name] = size // 64
 
     return {
         "clone": {
@@ -910,35 +950,23 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                 {
                     "clone": {
                         "coreIdsUsed_": [0],
-                        "dimPool_": ["mb", "out"],
-                        "primaryDs_": [{"name_": "pds0", "dimNames": ["mb", "out"]}],
+                        "dimPool_": layout,
+                        "primaryDs_": [{"name_": "pds0", "dimNames": layout}],
                         "labeledDs_": [
                             {
                                 "pdsName_": "pds0",
                                 "wordLength": 2,
                                 "dataformat": "SEN169_FP16",
-                                "layoutDimOrder_": ["mb", "out"],
+                                "layoutDimOrder_": layout,
                                 "stickDimOrder_": ["out"],
-                                "dimToLayoutSize_": {
-                                    "mb": dimensions[0] if d2 else 0,
-                                    "out": dimensions[-1],
-                                },
+                                "dimToLayoutSize_": dim_map,
                                 "dimToStickSize_": {"out": 64},
-                                "validGap_": {
-                                    "mb": [[dimensions[0], 0]] if d2 else [[1, 0]],
-                                    "out": [[dimensions[-1], 0]],
-                                },
+                                "validGap_": valid_gaps,
                                 "PieceInfo": [
                                     {
                                         "key_": f"p{i}",
-                                        "dimToSize_": {
-                                            "mb": 64 if d2 or d3 else 0,
-                                            "out": 64,
-                                        },
-                                        "validGap_": {
-                                            "mb": [[64, 0]] if d2 else [[1, 0]],
-                                            "out": [[64, 0]],
-                                        },
+                                        "dimToSize_": piece_sizes,
+                                        "validGap_": piece_valid_gaps,
                                         "PlacementInfo": [
                                             {
                                                 "type": "hbm",
@@ -954,9 +982,7 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                             },
                                         ],
                                     }
-                                    for i in range(
-                                        dimensions[0] * dimensions[1] // 4096
-                                    )
+                                    for i in range(piece_count)
                                 ],
                                 "hbmStartAddress_": pointers[inputs[0]["name"]] // 128,
                             },
@@ -964,28 +990,16 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "pdsName_": "pds0",
                                 "wordLength": 2,
                                 "dataformat": "SEN169_FP16",
-                                "layoutDimOrder_": ["mb", "out"],
+                                "layoutDimOrder_": layout,
                                 "stickDimOrder_": ["out"],
-                                "dimToLayoutSize_": {
-                                    "mb": dimensions[0] if d2 else 0,
-                                    "out": dimensions[-1],
-                                },
+                                "dimToLayoutSize_": dim_map,
                                 "dimToStickSize_": {"out": 64},
-                                "validGap_": {
-                                    "mb": [[dimensions[0], 0]] if d2 else [[1, 0]],
-                                    "out": [[dimensions[-1], 0]],
-                                },
+                                "validGap_": valid_gaps,
                                 "PieceInfo": [
                                     {
                                         "key_": f"p{i}",
-                                        "dimToSize_": {
-                                            "mb": 64 if d2 or d3 else 0,
-                                            "out": 64,
-                                        },
-                                        "validGap_": {
-                                            "mb": [[64, 0]] if d2 else [[1, 0]],
-                                            "out": [[64, 0]],
-                                        },
+                                        "dimToSize_": piece_sizes,
+                                        "validGap_": piece_valid_gaps,
                                         "PlacementInfo": [
                                             {
                                                 "type": "hbm",
@@ -1001,9 +1015,7 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                             },
                                         ],
                                     }
-                                    for i in range(
-                                        dimensions[0] * dimensions[1] // 4096
-                                    )
+                                    for i in range(piece_count)
                                 ],
                                 "hbmStartAddress_": pointers[outputs[0]["name"]] // 128,
                             },
@@ -1013,29 +1025,21 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             "gtrIdsUsed": [],
                             "coreIDtoANInfo": {
                                 "0": {
-                                    "loopCount": {
-                                        "out": dimensions[-1] // 64,
-                                        "mb": dimensions[0] // 64 if d2 or d3 else 0,
-                                    },
+                                    "loopCount": loop_counts,
                                     "loopCountL3SU": {},
                                     "addr_info_": {
                                         "l3lu": {
                                             "type_": "stride",
-                                            "offset_": {
-                                                "mb": 64,
-                                                "out": dimensions[0],
-                                            },
+                                            "offset_": offsets,
                                         },
-                                        "l3su": {
-                                            "type_": "stride",
-                                            "offset_": {
-                                                "mb": 64,
-                                                "out": dimensions[0],
-                                            },
-                                        },
+                                        "l3su": {"type_": "stride", "offset_": offsets},
                                     },
-                                    "inpPieceOrder": [f"p{i}" for i in inp_range],
-                                    "outPieceOrder": [f"p{i}" for i in out_range],
+                                    "inpPieceOrder": [
+                                        f"p{i}" for i in range(piece_count)
+                                    ],
+                                    "outPieceOrder": [
+                                        f"p{i}" for i in range(piece_count)
+                                    ],
                                 }
                             },
                             "numClToUse": 1,
