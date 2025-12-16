@@ -251,3 +251,31 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
     )
     pw.realize()
     return pw
+
+
+lowering.register_op_dtype_propagation_rules(
+    "clamp", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
+)
+
+
+@lowering.register_lowering(torch.ops.spyre.clamp)
+def lower_clamp(x, min=None, max=None):
+    op_info = {
+        "constants": {
+            "clipMin": min,
+            "clipMax": max,
+        }
+    }
+    pw = SpyrePointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
+            x.make_loader()(index), min, max
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+        op_info=op_info,
+    )
+    pw.realize()
+    return pw

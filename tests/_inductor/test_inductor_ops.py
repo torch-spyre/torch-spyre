@@ -280,6 +280,53 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_pointwise_range_op",
+            "test_range_op",
+        ): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 256), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                    FP16_EPS,
+                ),
+            },
+        },
+        (
+            "test_activation_cls",
+            "test_activation_cls",
+        ): {
+            "ops_dict": {
+                "gelu": torch.nn.GELU,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 128), dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+            },
+        },
+        (
+            "test_activation_fn",
+            "test_activation_fn",
+        ): {
+            "ops_dict": {
+                "silu": torch.nn.functional.silu,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 128), dtype=torch.float16),
+                    0.01,
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -351,6 +398,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_where_cpu(self, cond_op, x, y):
         compare_with_cpu(lambda x, y: torch.where(cond_op(x, y), x, y), x, y)
+
+    def test_range_op(self, op, input, min, max, err):
+        compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+
+    def test_activation_cls(self, op, input, kwargs, err):
+        compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
+
+    def test_activation_fn(self, op, input, err):
+        compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
 
 
 if __name__ == "__main__":
