@@ -71,6 +71,7 @@ def _initialize_opfunc_mapping():
     pointwise_ops["eq"] = "equal"
     pointwise_ops["ne"] = "notequal"
     pointwise_ops["ge"] = "greaterequal"
+    pointwise_ops["le"] = "lesserequal"
     pointwise_ops["where"] = "where3"
     pointwise_ops["clamp"] = "clip"
 

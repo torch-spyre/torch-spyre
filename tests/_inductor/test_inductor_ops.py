@@ -256,13 +256,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256,)),
                     cached_randn((256,)),
                 ),
+                "ne": (
+                    lambda x, y: x != y,
+                    cached_randn((256,)),
+                    cached_randn((256,)),
+                ),
                 "ge": (
                     lambda x, y: x >= y,
                     cached_randn((256,)),
                     cached_randn((256,)),
                 ),
-                "ne": (
-                    lambda x, y: x != y,
+                "le": (
+                    lambda x, y: x <= y,
                     cached_randn((256,)),
                     cached_randn((256,)),
                 ),
