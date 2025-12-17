@@ -162,13 +162,11 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     raise Unsupported(
                         "pointwise op with incompatible input stick formats"
                     )
-        # TODO: Pretending bools are float16.
-        out_dtype = torch.float16 if output.dtype == torch.bool else output.dtype
         stl = SpyreTensorLayout(
-            output.size, out_dtype, list(range(len(output.size))), output_format
+            output.size, output.dtype, list(range(len(output.size))), output_format
         )
         return FixedTiledLayout(
-            output.device, out_dtype, output.size, output.stride, stl
+            output.device, output.dtype, output.size, output.stride, stl
         )
 
 

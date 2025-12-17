@@ -63,6 +63,7 @@ def _initialize_opfunc_mapping():
         "sqrt",
         "sub",
         "tanh",
+        "to_dtype",
     ]
     for i in same_name:
         pointwise_ops[i] = i
