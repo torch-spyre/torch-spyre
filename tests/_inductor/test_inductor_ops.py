@@ -187,7 +187,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
-        ("test_max", "test_reduce_cpu"): {
+        ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {
                 "sum": torch.max,
             },
@@ -199,19 +199,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "3d_dim_2": (2, cached_randn((67, 71, 256))), # sparse tensor output
             },
         },
-        ("test_sum", "test_reduce_cpu"): {
+        ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {
+                "sum": torch.max,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
+                "3d_dim_0": (0, cached_randn((67, 71, 256))),
+                "3d_dim_1": (1, cached_randn((67, 71, 256))),
+                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
+            },
+        },
+        ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {
                 "sum": torch.sum,
             },
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
                 # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
-                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                # "2d_dim_01": ([0, 1], cached_randn((67, 256))), # spyre scalar represented as 1d instead of 0d
                 # "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.01)),
                 # "3d_dim_2": (2, cached_randn((67, 71, 256), scale=0.01)), # sparse tensor output
                 "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
-                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)),
+                # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)), # spyre scalar represented as 1d instead of 0d
+            },
+        },
+        ("test_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
+                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
+                "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.1)),
+                "3d_dim_2": (
+                    2,
+                    cached_randn((67, 71, 256), scale=0.1),
+                ),  # sparse tensor output
+                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
+                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
             },
         },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
@@ -392,16 +422,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     #     else:
     #         compare(lambda x: op(x, dim=dim), x)
 
-    def test_reduce_cpu(self, op, dim: int, x):
-        # Special case workaround:
-        # torch-spyre returns 1d single element tensor while torch-cpu
-        # returns 0d scalar tensor
-        keepdim = isinstance(dim, list) and (len(dim) == x.ndim)
-
+    def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         if op == torch.max:
-            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim)[0], x)
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False)[0], x)
         else:
-            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x)
+
+    def test_reduce_keepdim1_cpu(self, op, dim: int, x):
+        if op == torch.max:
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True)[0], x)
+        else:
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
     def test_max_sub_broadcast_cpu(self, dim: int, x):
         def fn(x):
