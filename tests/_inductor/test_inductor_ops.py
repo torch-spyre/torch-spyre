@@ -408,6 +408,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "size_1": (
                     cached_randn((64, 256)),
                     ([64, 256]),
+                )
+            },
+        },
+        (
+            "test_to_dtype",
+            "test_to_dtype",
+        ): {
+            "param_sets": {
+                "1d_bool_f16": (
+                    torch.randint(0, 2, (128,), dtype=torch.bool),
+                    torch.float16,
+                ),
+                "2d_bool_f16": (
+                    torch.randint(0, 2, (256, 128), dtype=torch.bool),
+                    torch.float16,
                 ),
             },
         },
@@ -527,6 +542,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_new_ones_cpu(self, x, y):
         compare_with_cpu(lambda x: x.new_ones((x.size())), x)
+
+    def test_to_dtype(self, x, dtype):
+        compare_with_cpu(lambda x: x.to(dtype=dtype), x)
 
 
 if __name__ == "__main__":
