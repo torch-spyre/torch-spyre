@@ -64,18 +64,30 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->format = format;
   this->num_stick_dims = 1;
 
-  // Stick dim
-  auto stick_dim = dim_order[host_dims - 1];
-  this->dim_map[0] = stick_dim;
-  this->dim_map[device_dims - 1] = stick_dim;
-  this->device_size[0] =
-      (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
-  this->device_size[device_dims - 1] = elems_in_stick;
-
-  // Non-stick dims
-  for (int i = 1; i < device_dims - 1; i++) {
-    this->dim_map[i] = dim_order[i - 1];
-    this->device_size[i] = host_size[dim_order[i - 1]];
+  if (host_dims == 1) {
+    TORCH_CHECK(dim_map[0] == 0);
+    this->dim_map[0] = 0;
+    this->dim_map[1] = 0;
+    this->device_size[0] = (host_size[0] + elems_in_stick - 1) / elems_in_stick;
+    this->device_size[1] = elems_in_stick;
+  } else {
+    int dim_idx = 0;
+    // Outer dimensions
+    for (; dim_idx < device_dims - 3; dim_idx++) {
+      this->dim_map[dim_idx] = dim_order[dim_idx];
+      this->device_size[dim_idx] = host_size[dim_order[dim_idx]];
+    }
+    // The last 2 host dims are tiled into 3 device dims: num_sticks, inner,
+    // stick
+    auto stick_dim = dim_order[host_dims - 1];
+    auto inner_dim = dim_order[host_dims - 2];
+    this->dim_map[dim_idx] = stick_dim;
+    this->device_size[dim_idx] =
+        (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
+    this->dim_map[dim_idx + 1] = inner_dim;
+    this->device_size[dim_idx + 1] = host_size[inner_dim];
+    this->dim_map[dim_idx + 2] = stick_dim;
+    this->device_size[dim_idx + 2] = elems_in_stick;
   }
 }
 
