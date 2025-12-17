@@ -33,9 +33,10 @@ from torch._inductor.shape_propagation import BlockShapeType
 from .runtime import ConstantArg, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
-    TRANSPOSE_OP,
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
+    TRANSPOSE_OP,
+    CLONE_OP,
 )
 from . import Unsupported
 from .opoverrides import SpyreKernelOverrides
@@ -366,20 +367,15 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 raise Unsupported(f"data op has {len(self.compute_inputs)} inputs")
             if not isinstance(self.compute_inputs[0], TensorAccess):
                 raise Unsupported(f"data op unexpected input: {self.compute_inputs[0]}")
-            self.spyre_op = TRANSPOSE_OP
             input_stride = list(
                 self.get_strides(self.compute_inputs[0].index).values()
             )[0]
             output_stride = list(self.get_strides(self.compute_output.index).values())[
                 0
             ]
-            if input_stride == 64 and output_stride == 64:
-                self.spyre_op = "swap"
-            if input_stride == 64 and output_stride == 1:
-                self.spyre_op = "slice"
+            input = self.compute_inputs[0]
             in_di = self.analyze_index_expr(self.compute_inputs[0].index)
             out_di = self.analyze_index_expr(self.compute_output.index)
-            input = self.compute_inputs[0]
             scale = self.analyze_tensor_access(in_di, input.index)
             args.append(
                 create_tensor_arg(True, actuals.index(input.name), input.layout)
@@ -394,6 +390,17 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                 )
             )
             scales.append(scale)
+
+            # Determine data op based on tensor arg and scales
+            if args[0].device_layout.device_size != args[1].device_layout.device_size:  # type: ignore[union-attr]
+                self.spyre_op = TRANSPOSE_OP
+            elif input_stride == 64 and output_stride == 64:
+                self.spyre_op = "swap"
+            elif input_stride == 64 and output_stride == 1:
+                self.spyre_op = "slice"
+            else:
+                self.spyre_op = CLONE_OP  # default to clone
+
             ks = KernelSummary(in_di, scales, args, self.op_info)
             if in_di != out_di:
                 ks.op_info["transposed_dims"] = [
