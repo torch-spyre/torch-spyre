@@ -433,7 +433,11 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                             and self.spyre_op not in SPYRE_FP32_OPS
                         ):
                             raise Unsupported(f"{self.spyre_op} on {arg.dtype} dtype")
-                        elif arg.dtype != torch.float16 and arg.dtype != torch.float32:
+                        elif arg.dtype not in [
+                            torch.bool,
+                            torch.float16,
+                            torch.float32,
+                        ]:
                             raise Unsupported(f"operations on {arg.dtype} dtype")
                 buf.writeline("]")
             buf.writeline(")")
