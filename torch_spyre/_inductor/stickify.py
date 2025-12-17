@@ -100,7 +100,6 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                 if len(x.layout.size) != 1:
                     raise Unsupported("slice on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype)
-                stl.format = StickFormat.Dense
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
@@ -109,8 +108,9 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                     raise Unsupported("swap on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("swap on non 1-D tensor")
-                stl = SpyreTensorLayout(output.size, output.dtype)
-                stl.format = StickFormat.Sparse
+                stl = SpyreTensorLayout(
+                    output.size, output.dtype, [0], StickFormat.Sparse
+                )
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
@@ -163,8 +163,9 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                     )
         # TODO: Pretending bools are float16.
         out_dtype = torch.float16 if output.dtype == torch.bool else output.dtype
-        stl = SpyreTensorLayout(output.size, out_dtype)
-        stl.format = output_format
+        stl = SpyreTensorLayout(
+            output.size, out_dtype, list(range(len(output.size))), output_format
+        )
         return FixedTiledLayout(
             output.device, out_dtype, output.size, output.stride, stl
         )
@@ -193,8 +194,10 @@ def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
             output.device, output.dtype, output.size, output.stride, stl
         )
     elif red.reduction_type == "exx2":
-        stl = SpyreTensorLayout(output.size, output.dtype)
-        stl.format = StickFormat.SparseMulti
+        x_stl = args[0].layout.device_layout
+        stl = SpyreTensorLayout(
+            output.size, output.dtype, x_stl.host_dim_order(), StickFormat.SparseMulti
+        )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
@@ -203,8 +206,10 @@ def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
         input_dims = stride_order_vars(input.dep.index)
         stick_var = input_dims[-1]
         is_stick_reduction = stick_var not in output_dims
-        stl = SpyreTensorLayout(output.size, output.dtype)
-        stl.format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        stl = SpyreTensorLayout(
+            output.size, output.dtype, list(range(len(output.size))), format
+        )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )

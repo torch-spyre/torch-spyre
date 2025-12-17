@@ -253,11 +253,10 @@ PYBIND11_MODULE(_C, m) {
       .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse)
       .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
 
-  dci_cls.def_readwrite("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readwrite("dim_map", &spyre::SpyreTensorLayout::dim_map)
-      .def_readwrite("num_stick_dims",
-                     &spyre::SpyreTensorLayout::num_stick_dims)
-      .def_readwrite("format", &spyre::SpyreTensorLayout::format)
+  dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
+      .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
+      .def_readonly("num_stick_dims", &spyre::SpyreTensorLayout::num_stick_dims)
+      .def_readonly("format", &spyre::SpyreTensorLayout::format)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("__repr__",
