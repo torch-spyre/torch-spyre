@@ -266,25 +266,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
   const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
   auto layout = sendnn::TensorLayout::NHWC;
-  SpyreTensorLayout stl;
-  try {
-    stl = static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl())
-              ->spyre_layout;
-  }
-  catch (std::bad_alloc e) {  // tensor does not have stl initialized
-    int stick_size = BYTES_IN_STICK / dev_tensor->element_size();
-    // Check if tensor requires padding
-    auto sizes = dev_tensor->sizes().vec();
-    if (sizes.size() == 0) {
-      sizes = {stick_size};
-    } else {
-      auto requires_padding = sizes.back() % stick_size != 0;
-      sizes[sizes.size() - 1] =
-          requires_padding ? ((sizes.back() / stick_size) + 1) * stick_size
-                           : sizes.back();
-    }
-    stl = SpyreTensorLayout(sizes, dev_tensor->scalar_type());
-  }
+  SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
   sendnn::TensorShape dev_tensor_shape(stl.device_size);
 
   // ti = transfer info
@@ -586,11 +568,31 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::IntArrayRef stride,
                                    c10::ScalarType dtype,
                                    SpyreTensorLayout device_layout) {
-  // TEMP: forward to empty_strided for now.
   return spyre_empty_strided(size, stride, dtype, std::nullopt, std::nullopt,
                              std::nullopt);
-}
+  at::detail::check_size_nonnegative(size);
+  c10::Device device =
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
 
+  auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+      &SpyreAllocator::instance(),
+      /*resizeable=*/true);
+  auto spyre_storage = c10::Storage(spyre_storage_impl);
+
+  // Create the Spyre Tensor
+  const c10::DeviceGuard device_guard(device);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      std::move(spyre_storage), pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  auto tensorImpl = tensor.unsafeGetTensorImpl();
+  tensorImpl->set_sizes_and_strides(size, stride);
+
+  static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
+
+  return tensor;
+}
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
