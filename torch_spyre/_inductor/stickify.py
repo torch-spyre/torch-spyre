@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Sequence
+from typing import Sequence
 
 import sympy
 
 import torch
-from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -35,6 +34,7 @@ from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
+from .pass_utils import SchedNodeArg, get_mem_deps
 
 
 aten = torch.ops.aten
@@ -78,12 +78,7 @@ def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
     return [item[0] for item in ordered_strides]
 
 
-class Arg(NamedTuple):
-    dep: MemoryDep
-    layout: FixedTiledLayout
-
-
-def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
+def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     op = pw.get_origin_node().target
@@ -171,7 +166,7 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
         )
 
 
-def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
+def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
@@ -218,17 +213,6 @@ def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    def mem_deps(n: SchedulerNode) -> list[Arg]:
-        res: list[Arg] = []
-        for arg in n.read_writes.reads:
-            if isinstance(arg, MemoryDep):
-                buf = V.graph.get_buffer(arg.name)
-                layout = buf.get_layout()
-                if not isinstance(layout, FixedTiledLayout):
-                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-                res.append(Arg(arg, layout))
-        return res
-
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
@@ -263,10 +247,10 @@ def propagate_spyre_tensor_layouts(
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, mem_deps(n))
+                output_layout = pointwise_layout(n, get_mem_deps(n))
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
-                output_layout = reduction_layout(n, mem_deps(n))
+                output_layout = reduction_layout(n, get_mem_deps(n))
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
