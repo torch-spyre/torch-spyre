@@ -21,6 +21,7 @@ from torch._inductor.custom_graph_pass import (
 )
 from torch._inductor.scheduler import BaseSchedulerNode
 from .stickify import propagate_spyre_tensor_layouts
+from .core_division import core_division_planning
 
 
 class CustomPrePasses(CustomGraphPass):
@@ -72,4 +73,5 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     The returned list of nodes must also be in topological order.
     """
     nodes = propagate_spyre_tensor_layouts(nodes)
+    nodes = core_division_planning(nodes)
     return nodes
