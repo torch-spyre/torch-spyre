@@ -16,3 +16,5 @@ updates:
       interval: weekly
     ignore:
       - dependency-name: torch
+    exclude-paths:
+      - requirements/*
