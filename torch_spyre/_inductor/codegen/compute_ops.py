@@ -62,7 +62,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             for s in t["scale"]:
                 if s != 1:
                     cores = 1
-    // TODO: fix multicore codegen for constants
+    # TODO: fix constant generation with multiple cores
     if "op_info" in kwargs and "constants" in kwargs["op_info"]:
         cores = 1
 
