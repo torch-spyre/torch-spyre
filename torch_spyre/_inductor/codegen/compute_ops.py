@@ -40,19 +40,28 @@ def generate_constant_info(data_format, **kwargs):
     return constant_info
 
 
+def core_split(size):
+    size = (size + 63) // 64 * 64
+    max_cores = int(os.getenv("SENCORES", "1"))
+    for i in range(max_cores, 0, -1):
+        if size // 64 % i == 0:
+            return i
+
+
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
 
     data_format = get_sen_data_format(inputs[0]["dtype"])
 
     # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
-    cores = int(os.getenv("SENCORES", "1"))
-    if cores > 1:
-        assert len(dimensions) == 1
-        assert dimensions[0] // 64 // cores > 0
+    if len(dimensions) > 1:
+        cores = 1
+    else:
+        cores = core_split(dimensions[-1])
         for t in tensors:
             for s in t["scale"]:
-                assert s == 1
+                if s != 1:
+                    cores = 1
 
     d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
@@ -387,6 +396,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
 def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     # [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
+
+    cores = core_split(dimensions[-1])
+
     return {
         op: {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -395,19 +407,21 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                 "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
                 "data_": {"[0]": "0"},
             },
-            "coreFoldProp_": {"factor_": 1, "label_": "core"},
+            "coreFoldProp_": {"factor_": cores, "label_": "core"},
             "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-            "numCoresUsed_": 1,
-            "coreIdToDsc_": {"0": 0},
-            "numWkSlicesPerDim_": {"mb": 1, "in": 1, "out": 1},
-            "coreIdToWkSlice_": {"0": {"mb": 0, "in": 0, "out": 0}},
-            "coreIdToDscSchedule": {"0": [[-1, 0, 0, 0]]},
+            "numCoresUsed_": cores,
+            "coreIdToDsc_": {str(i): 0 for i in range(cores)},
+            "numWkSlicesPerDim_": {"mb": 1, "in": 1, "out": cores},
+            "coreIdToWkSlice_": {
+                str(i): {"in": 0, "out": i, "mb": 0} for i in range(cores)
+            },
+            "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
             "dscs_": [
                 {
                     op: {
-                        "numCoresUsed_": 1,
+                        "numCoresUsed_": cores,
                         "numCoreletsUsed_": 1,
-                        "coreIdsUsed_": [0],
+                        "coreIdsUsed_": [i for i in range(cores)],
                         "N_": {
                             "name_": "n",
                             "mb_": dimensions[0],
@@ -420,13 +434,13 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     "name_": "core",
                                     "mb_": dimensions[0],
                                     "in_": dimensions[1],
-                                    "out_": dimensions[2],
+                                    "out_": dimensions[2] // cores,
                                 },
                                 "el_": {
                                     "name_": "core",
                                     "mb_": dimensions[0],
                                     "in_": dimensions[1],
-                                    "out_": dimensions[2],
+                                    "out_": dimensions[2] // cores,
                                 },
                             }
                         },
@@ -469,26 +483,27 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": 1, "label_": "core"},
+                                        {"factor_": cores, "label_": "core"},
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        "[0, 0, 0]": str(pointers[inputs[0]["name"]])
+                                        f"[{i}, 0, 0]": str(pointers[inputs[0]["name"]])
+                                        for i in range(cores)
                                     },
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        name: {
+                                        "mb": {
                                             "spatial": 3,
                                             "temporal": 0,
-                                            "elemArr": 2,
+                                            "elemArr": 1,
                                             "padding": "nopad",
                                             "folds": {
                                                 "dim_prop_func": [
                                                     {
                                                         "Affine": {
-                                                            "alpha_": size,
+                                                            "alpha_": dimensions[0],
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -501,26 +516,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                     {
                                                         "Affine": {
                                                             "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": (
-                                                                BYTES_PER_STICK
-                                                                // inputs[0][
-                                                                    "dtype"
-                                                                ].itemsize
-                                                            )
-                                                            if size
-                                                            % (
-                                                                BYTES_PER_STICK
-                                                                // inputs[0][
-                                                                    "dtype"
-                                                                ].itemsize
-                                                            )
-                                                            == 0
-                                                            else 1,
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -545,49 +540,74 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size
-                                                        // (
-                                                            BYTES_PER_STICK
-                                                            // inputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        if size
-                                                        % (
-                                                            BYTES_PER_STICK
-                                                            // inputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        == 0
-                                                        else size,
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": (
-                                                            BYTES_PER_STICK
-                                                            // inputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        if size
-                                                        % (
-                                                            BYTES_PER_STICK
-                                                            // inputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        == 0
-                                                        else 1,
+                                                        "factor_": dimensions[0],
                                                         "label_": "elem_arr_0",
                                                     },
                                                 ],
                                             },
-                                        }
-                                        for name, size in zip(
-                                            ["mb", "in"],
-                                            [dimensions[0], dimensions[1]],
-                                        )
+                                        },
+                                        "in": {
+                                            "spatial": 3,
+                                            "temporal": 0,
+                                            "elemArr": 2,
+                                            "padding": "nopad",
+                                            "folds": {
+                                                "dim_prop_func": [
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": dimensions[1],
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 0,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 0,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 64,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 1,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                ],
+                                                "dim_prop_attr": [
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "core_fold",
+                                                    },
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "corelet_fold",
+                                                    },
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "row_fold",
+                                                    },
+                                                    {
+                                                        "factor_": dimensions[1] // 64,
+                                                        "label_": "elem_arr_1",
+                                                    },
+                                                    {
+                                                        "factor_": 64,
+                                                        "label_": "elem_arr_0",
+                                                    },
+                                                ],
+                                            },
+                                        },
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -607,26 +627,34 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": 1, "label_": "core"},
+                                        {"factor_": cores, "label_": "core"},
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        "[0, 0, 0]": str(pointers[inputs[1]["name"]])
+                                        f"[{i}, 0, 0]": str(
+                                            pointers[inputs[1]["name"]]
+                                            + i
+                                            * dimensions[1]
+                                            * dimensions[2]
+                                            * inputs[1]["dtype"].itemsize
+                                            // cores
+                                        )
+                                        for i in range(cores)
                                     },
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        name: {
+                                        "in": {
                                             "spatial": 3,
                                             "temporal": 0,
-                                            "elemArr": 2,
+                                            "elemArr": 1,
                                             "padding": "nopad",
                                             "folds": {
                                                 "dim_prop_func": [
                                                     {
                                                         "Affine": {
-                                                            "alpha_": size,
+                                                            "alpha_": dimensions[1],
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -639,26 +667,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                     {
                                                         "Affine": {
                                                             "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": (
-                                                                BYTES_PER_STICK
-                                                                // inputs[1][
-                                                                    "dtype"
-                                                                ].itemsize
-                                                            )
-                                                            if size
-                                                            % (
-                                                                BYTES_PER_STICK
-                                                                // inputs[1][
-                                                                    "dtype"
-                                                                ].itemsize
-                                                            )
-                                                            == 0
-                                                            else 1,
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -683,49 +691,77 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size
-                                                        // (
-                                                            BYTES_PER_STICK
-                                                            // inputs[1][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        if size
-                                                        % (
-                                                            BYTES_PER_STICK
-                                                            // inputs[1][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        == 0
-                                                        else size,
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": (
-                                                            BYTES_PER_STICK
-                                                            // inputs[1][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        if size
-                                                        % (
-                                                            BYTES_PER_STICK
-                                                            // inputs[1][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        == 0
-                                                        else 1,
+                                                        "factor_": dimensions[1],
                                                         "label_": "elem_arr_0",
                                                     },
                                                 ],
                                             },
-                                        }
-                                        for name, size in zip(
-                                            ["in", "out"],
-                                            [dimensions[1], dimensions[2]],
-                                        )
+                                        },
+                                        "out": {
+                                            "spatial": 3,
+                                            "temporal": 0,
+                                            "elemArr": 2,
+                                            "padding": "nopad",
+                                            "folds": {
+                                                "dim_prop_func": [
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": dimensions[2]
+                                                            // cores,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 0,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 0,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 64,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 1,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                ],
+                                                "dim_prop_attr": [
+                                                    {
+                                                        "factor_": cores,
+                                                        "label_": "core_fold",
+                                                    },
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "corelet_fold",
+                                                    },
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "row_fold",
+                                                    },
+                                                    {
+                                                        "factor_": dimensions[2]
+                                                        // cores
+                                                        // 64,
+                                                        "label_": "elem_arr_1",
+                                                    },
+                                                    {
+                                                        "factor_": 64,
+                                                        "label_": "elem_arr_0",
+                                                    },
+                                                ],
+                                            },
+                                        },
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -745,26 +781,34 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": 1, "label_": "core"},
+                                        {"factor_": cores, "label_": "core"},
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        "[0, 0, 0]": str(pointers[outputs[0]["name"]])
+                                        f"[{i}, 0, 0]": str(
+                                            pointers[outputs[0]["name"]]
+                                            + i
+                                            * dimensions[0]
+                                            * dimensions[2]
+                                            * outputs[0]["dtype"].itemsize
+                                            // cores
+                                        )
+                                        for i in range(cores)
                                     },
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        name: {
+                                        "mb": {
                                             "spatial": 3,
                                             "temporal": 0,
-                                            "elemArr": 2,
+                                            "elemArr": 1,
                                             "padding": "nopad",
                                             "folds": {
                                                 "dim_prop_func": [
                                                     {
                                                         "Affine": {
-                                                            "alpha_": size,
+                                                            "alpha_": dimensions[0],
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -777,26 +821,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                     {
                                                         "Affine": {
                                                             "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": (
-                                                                BYTES_PER_STICK
-                                                                // outputs[0][
-                                                                    "dtype"
-                                                                ].itemsize
-                                                            )
-                                                            if size
-                                                            % (
-                                                                BYTES_PER_STICK
-                                                                // outputs[0][
-                                                                    "dtype"
-                                                                ].itemsize
-                                                            )
-                                                            == 0
-                                                            else 1,
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -821,49 +845,77 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size
-                                                        // (
-                                                            BYTES_PER_STICK
-                                                            // outputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        if size
-                                                        % (
-                                                            BYTES_PER_STICK
-                                                            // outputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        == 0
-                                                        else size,
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": (
-                                                            BYTES_PER_STICK
-                                                            // outputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        if size
-                                                        % (
-                                                            BYTES_PER_STICK
-                                                            // outputs[0][
-                                                                "dtype"
-                                                            ].itemsize
-                                                        )
-                                                        == 0
-                                                        else 1,
+                                                        "factor_": dimensions[0],
                                                         "label_": "elem_arr_0",
                                                     },
                                                 ],
                                             },
-                                        }
-                                        for name, size in zip(
-                                            ["mb", "out"],
-                                            [dimensions[0], dimensions[2]],
-                                        )
+                                        },
+                                        "out": {
+                                            "spatial": 3,
+                                            "temporal": 0,
+                                            "elemArr": 2,
+                                            "padding": "nopad",
+                                            "folds": {
+                                                "dim_prop_func": [
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": dimensions[2]
+                                                            // cores,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 0,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 0,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 64,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                    {
+                                                        "Affine": {
+                                                            "alpha_": 1,
+                                                            "beta_": 0,
+                                                        }
+                                                    },
+                                                ],
+                                                "dim_prop_attr": [
+                                                    {
+                                                        "factor_": cores,
+                                                        "label_": "core_fold",
+                                                    },
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "corelet_fold",
+                                                    },
+                                                    {
+                                                        "factor_": 1,
+                                                        "label_": "row_fold",
+                                                    },
+                                                    {
+                                                        "factor_": dimensions[2]
+                                                        // cores
+                                                        // 64,
+                                                        "label_": "elem_arr_1",
+                                                    },
+                                                    {
+                                                        "factor_": 64,
+                                                        "label_": "elem_arr_0",
+                                                    },
+                                                ],
+                                            },
+                                        },
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
