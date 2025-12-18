@@ -21,6 +21,21 @@ import torch._inductor.lowering as lowering
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import SpyrePointwise, SpyreReduction
 
+# Implicit fallback to an eager op does not become effective when lowering of
+# the op is registered by default. Here, we unregister ops that are falling back
+# to eager ops
+lowerings_to_exclude = [torch.ops.aten.cos.default, torch.ops.aten.sin.default]
+
+
+def unregister_lowering(op, lowering_dict=lowering.lowerings):
+    if op not in lowering_dict:
+        raise RuntimeError(f"lowering of {op} is not registered")
+    del lowering_dict[op]
+
+
+for op in lowerings_to_exclude:
+    unregister_lowering(op)
+
 
 @lowering.register_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
