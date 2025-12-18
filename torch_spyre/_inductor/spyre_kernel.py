@@ -130,6 +130,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.compute_op_is_reduction = is_reduction
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             self.op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
+        if hasattr(self.current_node, "spyre_core_division"):
+            self.op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
