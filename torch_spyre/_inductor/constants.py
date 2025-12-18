@@ -42,6 +42,7 @@ SPYRE_FP32_OPS = [
     "reciprocal",
     "layernormscale",
     "abs",
+    "neg",
     "exp",
     "sigmoid",
     "exx2",

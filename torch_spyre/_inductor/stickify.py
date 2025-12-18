@@ -19,14 +19,20 @@ import sympy
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
+    FallbackKernel,
     FixedLayout,
     InputBuffer,
+    MultiOutput,
     Pointwise,
     Reduction,
     StorageBox,
     TensorBox,
 )
-from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    SchedulerNode,
+    ExternKernelSchedulerNode,
+)
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
@@ -210,6 +216,15 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         )
 
 
+def fallback_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
+    output: FixedLayout = n.node.get_layout()
+    # Use the generic stick format
+    stl = SpyreTensorLayout(output.size, output.dtype)
+    return FixedTiledLayout(
+        output.device, output.dtype, output.size, output.stride, stl
+    )
+
+
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -243,7 +258,9 @@ def propagate_spyre_tensor_layouts(
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayouts to FixedTiledLayouts.
-    for n in nodes:
+
+    it = iter(nodes)
+    for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
@@ -254,7 +271,19 @@ def propagate_spyre_tensor_layouts(
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
+        elif isinstance(n, ExternKernelSchedulerNode):
+            if isinstance(n.node, FallbackKernel):
+                n = next(it, None)
+                if not (
+                    isinstance(n, ExternKernelSchedulerNode)
+                    and isinstance(n.node, MultiOutput)
+                ):
+                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
+                output_layout = fallback_layout(n)
+                n.node.layout = output_layout
+            else:
+                print(f"Warning: unhandled node type {type(n.node)}")
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 

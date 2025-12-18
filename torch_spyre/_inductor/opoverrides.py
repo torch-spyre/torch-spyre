@@ -62,6 +62,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.log({x})"
 
     @staticmethod
+    def neg(x):
+        return f"spyre.neg({x})"
+
+    @staticmethod
     def reciprocal(x):
         return f"spyre.reciprocal({x})"
 

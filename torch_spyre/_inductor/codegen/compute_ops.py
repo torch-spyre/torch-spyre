@@ -53,8 +53,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     data_format = get_sen_data_format(inputs[0]["dtype"])
 
-    # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
-    if len(dimensions) > 1:
+    # implement core division for non-broadcasting 1-d and 2-d pointwise ops
+    if len(dimensions) > 2:
         cores = 1
     else:
         cores = core_split(dimensions[-1])
@@ -62,6 +62,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             for s in t["scale"]:
                 if s != 1:
                     cores = 1
+    # TODO: fix constant generation with multiple cores
+    if "op_info" in kwargs and "constants" in kwargs["op_info"]:
+        cores = 1
 
     d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
@@ -153,7 +156,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "data_": {
                                         f"[{i}, 0, 0]": str(
                                             pointers[tensor["name"]]
-                                            + i * math.prod(dimensions) * 2 // cores
+                                            + i
+                                            * math.prod(dimensions)
+                                            * tensor["dtype"].itemsize
+                                            // cores
                                         )
                                         for i in range(cores)
                                     },
