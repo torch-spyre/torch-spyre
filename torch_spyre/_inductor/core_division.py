@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -22,6 +23,8 @@ from torch._inductor.ir import (
 )
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 
+from . import Unsupported
+from .constants import MATMUL_REDUCTION_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps
 
@@ -33,41 +36,70 @@ spyreop = torch.ops.spyre
 def no_division(args: list[SchedNodeArg], output: FixedTiledLayout) -> list[list[int]]:
     result = []
     for a in args:
-        result.append([1] * len(a.layout.size))
+        result.append([1] * len(a.layout.device_layout.device_size))
+    result.append([1] * len(output.device_layout.device_size))
     return result
 
 
-def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg]):
+def core_split(size, max_cores):
+    for i in range(max_cores, 0, -1):
+        if size % i == 0:
+            return i
+
+
+def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     # pw: Pointwise = n.node.data
     # op = pw.get_origin_node().target
     output: FixedTiledLayout = n.node.get_layout()
+    n.spyre_core_division = no_division(args, output)
 
-    division = no_division(args, output)
-    # TODO: Here is where we look for cases we support and update divsion
+    if max_cores == 1:
+        return
 
-    n.spyre_core_division = division
+    if len(output.size) > 2:
+        # Core division currently only implemented for 1 or 2 tensors
+        return
+
+    for a in args:
+        if a.layout.size != output.size:
+            # Core division not supported if there are broadcasts
+            return
+
+    device_size = output.device_layout.device_size
+    split_idx = -2 if len(device_size) == 2 else -3
+    num_cores = core_split(device_size[split_idx], max_cores)
+    if num_cores > 1:
+        for cd in n.spyre_core_division:
+            cd[split_idx] = num_cores
 
 
-def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg]):
-    # red: Reduction = n.node.data
+def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
+    red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
+    n.spyre_core_division = no_division(args, output)
 
-    division = no_division(args, output)
-    # TODO: Here is where we look for cases we support and update divsion
+    if max_cores == 1:
+        return
 
-    n.spyre_core_division = division
+    if red.reduction_type == MATMUL_REDUCTION_OP:
+        pass
+        # TODO: Here is where we look for matmul cases we support and update divsion
 
 
 def core_division_planning(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
     # Nodes are in topological order (guarenteed by caller).
+    max_cores = int(os.getenv("SENCORES", "1"))
+    if max_cores > 32 or max_cores < 1:
+        raise Unsupported(f"invalid SENCORES value {max_cores}")
+
     for n in nodes:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             if isinstance(n.node.data, Pointwise):
-                divide_pointwise_op(n, get_mem_deps(n))
+                divide_pointwise_op(n, get_mem_deps(n), max_cores)
             elif isinstance(n.node.data, Reduction):
-                divide_reduction_op(n, get_mem_deps(n))
+                divide_reduction_op(n, get_mem_deps(n), max_cores)
             else:
                 # Core division not supported on other IRNode types
                 pass
