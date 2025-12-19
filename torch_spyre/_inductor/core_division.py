@@ -82,8 +82,11 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         return
 
     if red.reduction_type == MATMUL_REDUCTION_OP:
-        pass
-        # TODO: Here is where we look for matmul cases we support and update divsion
+        device_size = output.device_layout.device_size
+        num_cores = core_split(device_size[-3], max_cores)
+        if num_cores > 1:
+            for cd in n.spyre_core_division:
+                cd[-3] = num_cores
 
 
 def core_division_planning(

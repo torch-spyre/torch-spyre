@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-import os
 from torch_spyre._C import encode_constant
 from torch_spyre._inductor.constants import BYTES_PER_STICK
 
@@ -40,28 +39,16 @@ def generate_constant_info(data_format, **kwargs):
     return constant_info
 
 
-def core_split(size):
-    size = (size + 63) // 64 * 64
-    max_cores = int(os.getenv("SENCORES", "1"))
-    for i in range(max_cores, 0, -1):
-        if size // 64 % i == 0:
-            return i
-
-
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
 
     data_format = inputs[0]["ddtype"]
 
-    # implement core division for non-broadcasting 1-d and 2-d pointwise ops
-    if len(dimensions) > 2:
-        cores = 1
-    else:
-        cores = core_split(dimensions[-1])
-        for t in tensors:
-            for s in t["scale"]:
-                if s != 1:
-                    cores = 1
+    # implement core division on stick dimension
+    cores = 1
+    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
+        cores = kwargs["op_info"]["core_division"][-1][0]
+
     # TODO: fix constant generation with multiple cores
     if "op_info" in kwargs and "constants" in kwargs["op_info"]:
         cores = 1
@@ -403,7 +390,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     # [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
 
-    cores = core_split(dimensions[-1])
+    # implement core division on stick dimension
+    cores = 1
+    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
+        cores = kwargs["op_info"]["core_division"][-1][0]
 
     return {
         op: {
