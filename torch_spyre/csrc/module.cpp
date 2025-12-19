@@ -17,6 +17,7 @@
 #include "module.h"
 
 #include <c10/core/ScalarType.h>
+#include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <util/sen_data_convert.h>
@@ -246,6 +247,28 @@ PYBIND11_MODULE(_C, m) {
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
 
+  py::native_enum<DataFormats>(m, "DataFormats", "enum.Enum")
+      .value("SEN169_FP16", DataFormats::SEN169_FP16)
+      .value("IEEE_FP32", DataFormats::IEEE_FP32)
+      .value("INVALID", DataFormats::INVALID)
+      .value("SEN143_FP8", DataFormats::SEN143_FP8)
+      .value("SEN152_FP8", DataFormats::SEN152_FP8)
+      .value("SEN153_FP9", DataFormats::SEN153_FP9)
+      .value("SENINT2", DataFormats::SENINT2)
+      .value("SENINT4", DataFormats::SENINT4)
+      .value("SENINT8", DataFormats::SENINT8)
+      .value("SENINT16", DataFormats::SENINT16)
+      .value("SENINT24", DataFormats::SENINT24)
+      .value("IEEE_INT64", DataFormats::IEEE_INT64)
+      .value("IEEE_INT32", DataFormats::IEEE_INT32)
+      .value("SENUINT32", DataFormats::SENUINT32)
+      .value("SENUINT2", DataFormats::SENUINT2)
+      .value("IEEE_FP16", DataFormats::IEEE_FP16)
+      .value("BOOL", DataFormats::BOOL)
+      .value("BFLOAT16", DataFormats::BFLOAT16)
+      .value("SEN18F_FP24", DataFormats::SEN18F_FP24)
+      .finalize();
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
@@ -262,6 +285,7 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
+      .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
@@ -270,9 +294,10 @@ PYBIND11_MODULE(_C, m) {
            py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
            py::arg("format") = spyre::SpyreTensorLayout::StickFormat::Dense)
       .def(py::init<std::vector<int64_t>, std::vector<int32_t>, int32_t,
-                    spyre::SpyreTensorLayout::StickFormat>(),
+                    spyre::SpyreTensorLayout::StickFormat, DataFormats>(),
            py::arg("device_size"), py::arg("dim_map"),
-           py::arg("num_stick_dims"), py::arg("format"));
+           py::arg("num_stick_dims"), py::arg("format"),
+           py::arg("device_dtype"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,

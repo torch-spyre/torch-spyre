@@ -21,10 +21,9 @@
 #include <vector>
 
 #include "logging.h"
+#include "types_mapping.h"
 
 namespace spyre {
-
-#define BYTES_IN_STICK 128
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
@@ -40,6 +39,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order,
                              StickFormat format) {
+  auto str_type = torchScalarToString[dtype];
+  const auto [sen_dtype_cpu, sen_dtype_dev] =
+      stringToDTDataFormatPair(str_type);
+  this->device_dtype = sen_dtype_dev;
+
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(1);
@@ -53,8 +57,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + 1;
-  auto elem_bytes = c10::elementSize(dtype);
-  auto elems_in_stick = format == Dense ? BYTES_IN_STICK / elem_bytes : 1;
+  auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
 
   TORCH_CHECK(host_size.size() == dim_order.size(),
               "Invalid arguments: host_size.size() != dim_order.size()");
@@ -91,12 +94,12 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
 }
 
-std::vector<int64_t> SpyreTensorLayout::device_strides(c10::ScalarType dtype) {
+std::vector<int64_t> SpyreTensorLayout::device_strides() {
   int device_dims = static_cast<int>(this->device_size.size());
   std::vector<int64_t> strides(device_dims);
 
   // Stick dim
-  int64_t cur_stride = BYTES_IN_STICK / c10::elementSize(dtype);
+  int64_t cur_stride = this->elems_per_stick();
   strides[device_dims - 1] = 1;
 
   // Non-stick dims
@@ -105,6 +108,10 @@ std::vector<int64_t> SpyreTensorLayout::device_strides(c10::ScalarType dtype) {
     cur_stride = cur_stride * this->device_size[i];
   }
   return strides;
+}
+
+int64_t SpyreTensorLayout::elems_per_stick() {
+  return static_cast<int64_t>(dataFormatToStickSize[this->device_dtype]);
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -127,12 +134,14 @@ std::string SpyreTensorLayout::toString() const {
   ss << "], num_stick_dims=";
   ss << this->num_stick_dims;
   if (this->format == StickFormat::Dense) {
-    ss << ", format=StickFormat.Dense";
+    ss << ", format=StickFormat.Dense, ";
   } else if (this->format == StickFormat::Sparse) {
-    ss << ", format=StickFormat.Sparse";
+    ss << ", format=StickFormat.Sparse, ";
   } else {
-    ss << ", format=StickFormat.SparseMulti";
+    ss << ", format=StickFormat.SparseMulti, ";
   }
+  ss << "device_dtype=DataFormats."
+     << EnumsConversion::dataFormatsToString(this->device_dtype);
   ss << ")";
   return ss.str();
 }

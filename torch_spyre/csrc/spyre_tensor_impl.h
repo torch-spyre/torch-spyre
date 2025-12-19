@@ -18,6 +18,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
+#include <util/sendefs.h>
 
 #include <string>
 #include <vector>
@@ -50,6 +51,7 @@ class SpyreTensorLayout {
   std::vector<int32_t> dim_map;
   int32_t num_stick_dims;
   StickFormat format;
+  DataFormats device_dtype;
 
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
@@ -75,11 +77,12 @@ class SpyreTensorLayout {
 
   SpyreTensorLayout(std::vector<int64_t> device_size,
                     std::vector<int32_t> dim_map, int32_t num_stick_dims,
-                    StickFormat format)
+                    StickFormat format, DataFormats device_dtype)
       : device_size(device_size),
         dim_map(dim_map),
         num_stick_dims(num_stick_dims),
-        format(format) {}
+        format(format),
+        device_dtype(device_dtype) {}
 
   /**
    * Initialize a SpyreTensorLayout in generic stick format for the argument
@@ -97,13 +100,16 @@ class SpyreTensorLayout {
 
   std::string toString() const;
 
-  std::vector<int64_t> device_strides(c10::ScalarType dtype);
+  std::vector<int64_t> device_strides();
+
+  int64_t elems_per_stick();
 
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
            this->dim_map == other.dim_map &&
            this->num_stick_dims == other.num_stick_dims &&
-           this->format == other.format;
+           this->format == other.format &&
+           this->device_dtype == other.device_dtype;
   }
 };
 
