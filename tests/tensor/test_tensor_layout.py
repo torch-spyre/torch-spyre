@@ -16,7 +16,7 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import SpyreTensorLayout, StickFormat
+from torch_spyre._C import SpyreTensorLayout, StickFormat, DataFormats
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -27,21 +27,21 @@ class TestSpyreTensorLayout(TestCase):
     def test_generic_stick(self):
         stl = SpyreTensorLayout([128], torch.float16)
         self.assertEqual(stl.device_size, [2, 64])
-        self.assertEqual(stl.device_strides(torch.float16), [64, 1])
+        self.assertEqual(stl.device_strides(), [64, 1])
         self.assertEqual(stl.dim_map, [0, 0])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
 
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.device_strides(torch.float16), [32768, 64, 1])
+        self.assertEqual(stl.device_strides(), [32768, 64, 1])
         self.assertEqual(stl.dim_map, [1, 0, 1])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
 
         stl = SpyreTensorLayout([512, 8, 256], torch.float16)
         self.assertEqual(stl.device_size, [512, 4, 8, 64])
-        self.assertEqual(stl.device_strides(torch.float16), [2048, 512, 64, 1])
+        self.assertEqual(stl.device_strides(), [2048, 512, 64, 1])
         self.assertEqual(stl.dim_map, [0, 2, 1, 2])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
@@ -49,14 +49,14 @@ class TestSpyreTensorLayout(TestCase):
     def test_dim_order(self):
         stl = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
         self.assertEqual(stl.device_size, [8, 256, 64])
-        self.assertEqual(stl.device_strides(torch.float16), [16384, 64, 1])
+        self.assertEqual(stl.device_strides(), [16384, 64, 1])
         self.assertEqual(stl.dim_map, [0, 1, 0])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
 
         stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
         self.assertEqual(stl.device_size, [256, 8, 8, 64])
-        self.assertEqual(stl.device_strides(torch.float16), [4096, 512, 64, 1])
+        self.assertEqual(stl.device_strides(), [4096, 512, 64, 1])
         self.assertEqual(stl.dim_map, [2, 0, 1, 0])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
@@ -64,25 +64,17 @@ class TestSpyreTensorLayout(TestCase):
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
         stl_y = SpyreTensorLayout(
-            [4, 512, 64],
-            [1, 0, 1],
-            1,
-            StickFormat.Dense,
+            [4, 512, 64], [1, 0, 1], 1, StickFormat.Dense, DataFormats.SEN169_FP16
         )
         self.assertEqual(stl_x.format, stl_y.format)
         self.assertEqual(stl_x.num_stick_dims, stl_y.num_stick_dims)
         self.assertEqual(stl_x.dim_map, stl_y.dim_map)
-        self.assertEqual(
-            stl_x.device_strides(torch.float16), stl_y.device_strides(torch.float16)
-        )
+        self.assertEqual(stl_x.device_strides(), stl_y.device_strides())
         self.assertEqual(stl_x.device_size, stl_y.device_size)
 
     def test_sparse_stl_constructor(self):
         stl = SpyreTensorLayout(
-            [256, 512, 1],
-            [1, 0, 1],
-            1,
-            StickFormat.Sparse,
+            [256, 512, 1], [1, 0, 1], 1, StickFormat.Sparse, DataFormats.SEN169_FP16
         )
         self.assertEqual(stl.format, StickFormat.Sparse)
 
@@ -90,14 +82,14 @@ class TestSpyreTensorLayout(TestCase):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
             str(stl),
-            "SpyreTensorLayout(device_size=[4, 512, 64], dim_map =[1, 0, 1], num_stick_dims=1, format=StickFormat.Dense)",
+            "SpyreTensorLayout(device_size=[4, 512, 64], dim_map =[1, 0, 1], num_stick_dims=1, format=StickFormat.Dense, device_dtype=DataFormats.SEN169_FP16)",
         )
 
     def test_device_alloc(self):
         x = torch.rand([512, 256], dtype=torch.float16).to("spyre")
         stl = x.device_tensor_layout()
         self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.device_strides(torch.float16), [32768, 64, 1])
+        self.assertEqual(stl.device_strides(), [32768, 64, 1])
         self.assertEqual(stl.dim_map, [1, 0, 1])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
