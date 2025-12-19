@@ -27,6 +27,8 @@
 
 namespace spyre {
 
+int64_t elems_per_stick(const DataFormats& df);
+
 class SpyreTensorLayout {
  public:
   enum StickFormat {
@@ -102,7 +104,9 @@ class SpyreTensorLayout {
 
   std::vector<int64_t> device_strides();
 
-  int64_t elems_per_stick();
+  int64_t elems_per_stick() {
+    return spyre::elems_per_stick(this->device_dtype);
+  }
 
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&

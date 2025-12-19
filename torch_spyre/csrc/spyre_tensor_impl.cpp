@@ -25,6 +25,15 @@
 
 namespace spyre {
 
+int64_t elems_per_stick(const DataFormats& df) {
+  // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
+  if (df == DataFormats::IEEE_INT32) {
+    return 32;
+  }
+  auto fp_elems = dataFormatToStickSize[df];
+  return static_cast<int64_t>(fp_elems);
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
@@ -108,15 +117,6 @@ std::vector<int64_t> SpyreTensorLayout::device_strides() {
     cur_stride = cur_stride * this->device_size[i];
   }
   return strides;
-}
-
-int64_t SpyreTensorLayout::elems_per_stick() {
-  // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
-  if (this->device_dtype == DataFormats::IEEE_INT32) {
-    return 32;
-  }
-  auto fp_elems = dataFormatToStickSize[this->device_dtype];
-  return static_cast<int64_t>(fp_elems);
 }
 
 std::string SpyreTensorLayout::toString() const {

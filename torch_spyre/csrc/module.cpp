@@ -239,7 +239,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
 
-  py::native_enum<DataFormats>(m, "DataFormats", "enum.Enum")
+  py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
       .value("IEEE_FP32", DataFormats::IEEE_FP32)
       .value("INVALID", DataFormats::INVALID)
@@ -259,7 +259,8 @@ PYBIND11_MODULE(_C, m) {
       .value("BOOL", DataFormats::BOOL)
       .value("BFLOAT16", DataFormats::BFLOAT16)
       .value("SEN18F_FP24", DataFormats::SEN18F_FP24)
-      .finalize();
+      .def("elems_per_stick",
+           [](const DataFormats &df) { return spyre::elems_per_stick(df); });
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
