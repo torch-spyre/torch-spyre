@@ -111,7 +111,12 @@ std::vector<int64_t> SpyreTensorLayout::device_strides() {
 }
 
 int64_t SpyreTensorLayout::elems_per_stick() {
-  return static_cast<int64_t>(dataFormatToStickSize[this->device_dtype]);
+  // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
+  if (this->device_dtype == DataFormats::IEEE_INT32) {
+    return 32;
+  }
+  auto fp_elems = dataFormatToStickSize[this->device_dtype];
+  return static_cast<int64_t>(fp_elems);
 }
 
 std::string SpyreTensorLayout::toString() const {
