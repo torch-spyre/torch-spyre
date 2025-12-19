@@ -624,13 +624,11 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
   auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
   constexpr auto bytesPerStick = 128;
+  int stick_size = device_layout.elems_per_stick();
   size_t size_bytes;
-  size_t dev_elementsize_in_bytes = c10::elementSize(scalar_type);
-  int stick_size = bytesPerStick / dev_elementsize_in_bytes;
   if (size.size() == 0) {
     size_bytes = bytesPerStick;
   } else {
-    // int stick_size = 64;  // 128 / word size
     auto dev_sizes = get_device_shape(size, stick_size);
     size_bytes = bytesPerStick;
     for (auto it = dev_sizes.begin(); it != dev_sizes.end() - 1; ++it) {
