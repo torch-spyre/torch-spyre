@@ -113,9 +113,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 + ["out"]
                                 + (["x"] if d3 else []),
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    BYTES_PER_STICK // inputs[0]["dtype"].itemsize
-                                ],
+                                "stickSize_": [inputs[0]["ddtype"].elems_per_stick()],
                             }
                         },
                         "scheduleTree_": [
@@ -181,8 +179,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                     },
                                                     {
                                                         "Affine": {
-                                                            "alpha_": BYTES_PER_STICK
-                                                            // tensor["dtype"].itemsize,
+                                                            "alpha_": tensor[
+                                                                "ddtype"
+                                                            ].elems_per_stick(),
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -208,16 +207,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                     },
                                                     {
                                                         "factor_": dimensions[-1]
-                                                        // (
-                                                            BYTES_PER_STICK
-                                                            // tensor["dtype"].itemsize
-                                                        )
+                                                        // tensor[
+                                                            "ddtype"
+                                                        ].elems_per_stick()
                                                         // cores,
                                                         "label_": "elem_arr_1",
                                                     },
                                                     {
-                                                        "factor_": BYTES_PER_STICK
-                                                        // tensor["dtype"].itemsize,
+                                                        "factor_": tensor[
+                                                            "ddtype"
+                                                        ].elems_per_stick(),
                                                         "label_": "elem_arr_0",
                                                     },
                                                 ],
@@ -349,7 +348,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     else []
                                 )
                                 + tensor["scale"][1:-1],
-                                "wordLength": tensor["dtype"].itemsize,
+                                "wordLength": BYTES_PER_STICK
+                                // tensor["ddtype"].elems_per_stick(),
                                 "dataFormat_": tensor["ddtype"].name,
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
@@ -444,23 +444,17 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             "INPUT": {
                                 "layoutDimOrder_": ["mb", "in"],
                                 "stickDimOrder_": ["in"],
-                                "stickSize_": [
-                                    BYTES_PER_STICK // inputs[0]["dtype"].itemsize
-                                ],
+                                "stickSize_": [inputs[0]["ddtype"].elems_per_stick()],
                             },
                             "OUTPUT": {
                                 "layoutDimOrder_": ["mb", "out"],
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    BYTES_PER_STICK // outputs[0]["dtype"].itemsize
-                                ],
+                                "stickSize_": [outputs[0]["ddtype"].elems_per_stick()],
                             },
                             "KERNEL": {
                                 "layoutDimOrder_": ["in", "out"],
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    BYTES_PER_STICK // inputs[1]["dtype"].itemsize
-                                ],
+                                "stickSize_": [inputs[1]["ddtype"].elems_per_stick()],
                             },
                         },
                         "scheduleTree_": [
