@@ -58,7 +58,6 @@ class SpyreAsyncCompile:
                     {
                         "name": _argument_names[index],
                         "scale": ks.scales[index],
-                        "dtype": ts.dtype,
                         "ddtype": ts.device_layout.device_dtype,
                     }
                 )
@@ -68,7 +67,6 @@ class SpyreAsyncCompile:
                     {
                         "name": _argument_names[index],
                         "scale": ks.scales[index],
-                        "dtype": ts.dtype,
                         "ddtype": ts.device_layout.device_dtype,
                     }
                 )
