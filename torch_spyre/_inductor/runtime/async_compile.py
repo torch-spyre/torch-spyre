@@ -59,6 +59,7 @@ class SpyreAsyncCompile:
                         "name": _argument_names[index],
                         "scale": ks.scales[index],
                         "dtype": ts.dtype,
+                        "ddtype": ts.device_layout.device_dtype,
                     }
                 )
                 arg_mapping.append(ts.arg_index)
@@ -68,6 +69,7 @@ class SpyreAsyncCompile:
                         "name": _argument_names[index],
                         "scale": ks.scales[index],
                         "dtype": ts.dtype,
+                        "ddtype": ts.device_layout.device_dtype,
                     }
                 )
                 arg_mapping.append(ts.arg_index)

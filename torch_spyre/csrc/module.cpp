@@ -198,16 +198,9 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
 
   return;
 }
-std::string getSenDataFormat(c10::ScalarType torch_dtype) {
-  const auto [dtype_cpu, dtype_dev] =
-      stringToDTDataFormatPair(torchScalarToString[torch_dtype]);
-  return EnumsConversion::dataFormatsToString(dtype_dev);
-}
 
-uint32_t encodeConstant(float torch_const, const std::string &data_format) {
+uint32_t encodeConstant(float torch_const, DataFormats df) {
   uint32_t sen_const;
-  DataFormats df;
-  df = FromString<DataFormats>(data_format);
 
   if (df == DataFormats::IEEE_FP32) {
     sen_const =
@@ -243,7 +236,6 @@ PYBIND11_MODULE(_C, m) {
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
-  m.def("get_sen_data_format", &spyre::getSenDataFormat);
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
 
@@ -280,6 +272,7 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readonly("num_stick_dims", &spyre::SpyreTensorLayout::num_stick_dims)
       .def_readonly("format", &spyre::SpyreTensorLayout::format)
+      .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("__repr__",
