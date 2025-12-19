@@ -345,11 +345,3 @@ stringToSenDatatypePair(const std::string& type_name) {
   return {sendnn::sen_datatype_enum::dt_undef,
           sendnn::sen_datatype_enum::dt_undef};
 }
-
-inline size_t spyre_element_size(c10::ScalarType dtype) {
-  if (dtype == c10::kBool) {
-    return 2;
-  } else {
-    return c10::elementSize(dtype);
-  }
-}
