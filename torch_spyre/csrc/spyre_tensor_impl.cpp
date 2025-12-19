@@ -73,7 +73,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
               "Invalid arguments: host_size.size() != dim_order.size()");
 
   this->device_size.resize(device_dims);
-  this->dim_map = spyre::get_generic_stick_layout(host_size.size(), dim_order);
+  this->dim_map.resize(device_dims);
   this->format = format;
   this->num_stick_dims = 1;
   this->size_bytes = BYTES_IN_STICK;
@@ -83,7 +83,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->dim_map[0] = 0;
     this->dim_map[1] = 0;
     this->device_size[0] = (host_size[0] + elems_in_stick - 1) / elems_in_stick;
-    this->device_size[1] = elems_in_stick;
+    this->device_size[1] = format == Dense ? BYTES_IN_STICK / elem_bytes : 1;
   } else {
     int dim_idx = 0;
     // Outer dimensions
@@ -101,9 +101,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
         (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
     this->dim_map[dim_idx + 1] = inner_dim;
     this->device_size[dim_idx + 1] = host_size[inner_dim];
-    this->size_bytes *= this->device_size[dim_idx+1];
     this->dim_map[dim_idx + 2] = stick_dim;
     this->device_size[dim_idx + 2] = elems_in_stick;
+
+    this->size_bytes *= this->device_size[dim_idx + 1];
+    this->size_bytes *= this->device_size[dim_idx];
   }
 }
 
@@ -196,12 +198,19 @@ void SpyreTensorImpl::shallow_copy_from(
   at::TensorImpl::shallow_copy_from(impl);
 }
 
+int32_t get_device_size_in_bytes(SpyreTensorLayout stl) {
+  int32_t size_bytes = BYTES_IN_STICK;
+  for (int i = 0; i < stl.device_size.size() - 1; i++) {
+    size_bytes *= stl.device_size[i];
+  }
+  return size_bytes;
+}
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   auto* tensorImpl =
       static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
 
-  if (!tensorImpl->spyre_layout.has_value()) {
+  if (!tensorImpl->spyre_layout.has_value()) {  // Initialize default layout
     int stick_size = BYTES_IN_STICK / tensor.element_size();
     auto sizes = tensor.sizes().vec();
     if (sizes.empty()) {
@@ -210,7 +219,7 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
       sizes.back() =
           ((sizes.back() + stick_size - 1) / stick_size) * stick_size;
     }
-    tensorImpl->spyre_layout = SpyreTensorLayout(sizes, tensor.scalar_type());
+    return SpyreTensorLayout(sizes, tensor.scalar_type());
   }
   return tensorImpl->spyre_layout.value();
 }

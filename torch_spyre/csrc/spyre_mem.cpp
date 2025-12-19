@@ -238,6 +238,8 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
   dci.dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
+  std::reverse(stl.device_size.begin(), stl.device_size.end());
+  std::reverse(stl.dim_map.begin(), stl.dim_map.end());
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   dci.dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(), stl,
                                       stick_size, host2device);
@@ -527,7 +529,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   auto sizes = size.vec();
   size_t size_bytes = BYTES_IN_STICK;
   if (size.size() == 0) {
-    sizes = {1};
+    sizes = {stick_size};
   }
   auto requires_padding = sizes.back() % stick_size != 0;
   sizes[sizes.size() - 1] = requires_padding
@@ -568,12 +570,13 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::IntArrayRef stride,
                                    c10::ScalarType dtype,
                                    SpyreTensorLayout device_layout) {
-  return spyre_empty_strided(size, stride, dtype, std::nullopt, std::nullopt,
-                             std::nullopt);
   at::detail::check_size_nonnegative(size);
   c10::Device device =
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
 
+  if (device_layout.size_bytes == 0) {
+    device_layout.size_bytes = spyre::get_device_size_in_bytes(device_layout);
+  }
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
       c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
       &SpyreAllocator::instance(),
