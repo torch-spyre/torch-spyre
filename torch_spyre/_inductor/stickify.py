@@ -12,22 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Sequence
+from typing import Sequence
 
 import sympy
 
 import torch
-from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
+    FallbackKernel,
     FixedLayout,
     InputBuffer,
+    MultiOutput,
     Pointwise,
     Reduction,
     StorageBox,
     TensorBox,
 )
-from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    SchedulerNode,
+    ExternKernelSchedulerNode,
+)
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
@@ -35,6 +40,7 @@ from torch_spyre._C import SpyreTensorLayout, StickFormat
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
+from .pass_utils import SchedNodeArg, get_mem_deps
 
 
 aten = torch.ops.aten
@@ -78,12 +84,7 @@ def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
     return [item[0] for item in ordered_strides]
 
 
-class Arg(NamedTuple):
-    dep: MemoryDep
-    layout: FixedTiledLayout
-
-
-def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
+def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
     op = pw.get_origin_node().target
@@ -100,7 +101,6 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                 if len(x.layout.size) != 1:
                     raise Unsupported("slice on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype)
-                stl.format = StickFormat.Dense
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
@@ -109,8 +109,9 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                     raise Unsupported("swap on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("swap on non 1-D tensor")
-                stl = SpyreTensorLayout(output.size, output.dtype)
-                stl.format = StickFormat.Sparse
+                stl = SpyreTensorLayout(
+                    output.size, output.dtype, [0], StickFormat.Sparse
+                )
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
@@ -161,16 +162,15 @@ def pointwise_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
                     raise Unsupported(
                         "pointwise op with incompatible input stick formats"
                     )
-        # TODO: Pretending bools are float16.
-        out_dtype = torch.float16 if output.dtype == torch.bool else output.dtype
-        stl = SpyreTensorLayout(output.size, out_dtype)
-        stl.format = output_format
+        stl = SpyreTensorLayout(
+            output.size, output.dtype, list(range(len(output.size))), output_format
+        )
         return FixedTiledLayout(
-            output.device, out_dtype, output.size, output.stride, stl
+            output.device, output.dtype, output.size, output.stride, stl
         )
 
 
-def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
+def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
@@ -193,8 +193,10 @@ def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
             output.device, output.dtype, output.size, output.stride, stl
         )
     elif red.reduction_type == "exx2":
-        stl = SpyreTensorLayout(output.size, output.dtype)
-        stl.format = StickFormat.SparseMulti
+        x_stl = args[0].layout.device_layout
+        stl = SpyreTensorLayout(
+            output.size, output.dtype, x_stl.host_dim_order(), StickFormat.SparseMulti
+        )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
@@ -203,27 +205,27 @@ def reduction_layout(n: SchedulerNode, args: list[Arg]) -> FixedTiledLayout:
         input_dims = stride_order_vars(input.dep.index)
         stick_var = input_dims[-1]
         is_stick_reduction = stick_var not in output_dims
-        stl = SpyreTensorLayout(output.size, output.dtype)
-        stl.format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        stl = SpyreTensorLayout(
+            output.size, output.dtype, list(range(len(output.size))), format
+        )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
 
 
+def fallback_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
+    output: FixedLayout = n.node.get_layout()
+    # Use the generic stick format
+    stl = SpyreTensorLayout(output.size, output.dtype)
+    return FixedTiledLayout(
+        output.device, output.dtype, output.size, output.stride, stl
+    )
+
+
 def propagate_spyre_tensor_layouts(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    def mem_deps(n: SchedulerNode) -> list[Arg]:
-        res: list[Arg] = []
-        for arg in n.read_writes.reads:
-            if isinstance(arg, MemoryDep):
-                buf = V.graph.get_buffer(arg.name)
-                layout = buf.get_layout()
-                if not isinstance(layout, FixedTiledLayout):
-                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-                res.append(Arg(arg, layout))
-        return res
-
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
@@ -254,18 +256,32 @@ def propagate_spyre_tensor_layouts(
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed by the node to convert its output FixedLayouts to FixedTiledLayouts.
-    for n in nodes:
+
+    it = iter(nodes)
+    for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             n.node.decide_layout()
             if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, mem_deps(n))
+                output_layout = pointwise_layout(n, get_mem_deps(n))
                 n.node.layout = output_layout
             elif isinstance(n.node.data, Reduction):
-                output_layout = reduction_layout(n, mem_deps(n))
+                output_layout = reduction_layout(n, get_mem_deps(n))
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
+        elif isinstance(n, ExternKernelSchedulerNode):
+            if isinstance(n.node, FallbackKernel):
+                n = next(it, None)
+                if not (
+                    isinstance(n, ExternKernelSchedulerNode)
+                    and isinstance(n.node, MultiOutput)
+                ):
+                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
+                output_layout = fallback_layout(n)
+                n.node.layout = output_layout
+            else:
+                print(f"Warning: unhandled node type {type(n.node)}")
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 
