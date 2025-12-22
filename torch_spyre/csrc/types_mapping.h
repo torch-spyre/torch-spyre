@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+namespace spyre {
+
 inline std::unordered_map<c10::ScalarType, std::string> torchScalarToString = {
     /* this ensures the same representation regardless of how PyTorch changes
        its type names we will use this to map to DT and SenDnn names
@@ -345,3 +347,17 @@ stringToSenDatatypePair(const std::string& type_name) {
   return {sendnn::sen_datatype_enum::dt_undef,
           sendnn::sen_datatype_enum::dt_undef};
 }
+inline std::pair<size_t, size_t> elementSize(const c10::ScalarType& dtype) {
+  /* return size (bytes) on CPU and on Spyre*/
+  static const std::unordered_map<c10::ScalarType, std::pair<size_t, size_t>>
+      itemsize_map = {
+          {c10::kBool, {1, 2}},
+      };
+  auto it = itemsize_map.find(dtype);
+  if (it != itemsize_map.end()) {
+    return it->second;
+  }
+  auto val = c10::elementSize(dtype);
+  return {val, val};
+}
+}  // namespace spyre

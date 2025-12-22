@@ -142,6 +142,7 @@ class TestSpyre(TestCase):
             torch.int64,
             torch.float16,
             torch.float32,
+            torch.bool,
         ]
         for dtype in dtypes:
             x = None
@@ -149,6 +150,8 @@ class TestSpyre(TestCase):
             if dtype in [torch.int8]:
                 x = torch.rand(64, 64) * 100
                 x = x.to(dtype=dtype)
+            elif dtype in [torch.bool]:
+                x = torch.randint(0, 2, (64, 64), dtype=dtype)
             elif dtype in [torch.int64]:
                 expect_warning = True
                 x = torch.randint(-32768, 32767, (64, 64), dtype=dtype)
