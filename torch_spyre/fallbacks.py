@@ -13,6 +13,48 @@
 # limitations under the License.
 
 
+# How to add a CPU fallback operator:
+#
+# Step 1. Check if the target operator has a default decomposition.
+#    - If yes, verify whether the decomposition expands into sub-ops that:
+#        * Can be compiled, OR
+#        * Correctly fall back to CPU.
+#      If both conditions hold, no further action is needed.
+#
+#    - If some sub-ops cannot compile or fall back to CPU:
+#        * Option A: Disable the default decomposition and proceed to Step 2.
+#        * Option B: Repeat Step 1 for each unsupported sub-op.
+#
+#    To disable a decomposition, unregister it in:
+#        torch_spyre/_inductor/preload.py
+#
+#    Example:
+#      aten.arange decomposes into prims.iota, which only supports integer
+#      dtypes. This requires int-to-float conversion, which Spyre does not
+#      fully support yet. In this case, disable the default decomposition.
+#      See: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_refs/__init__.py#L5124-L5222
+#
+# Step 2. If the operator has a default lowering, unregister it in:
+#        torch_spyre/_inductor/lowering.py
+#
+#    Notes:
+#      - If a default lowering exists, implicit fallback will not apply.
+#        Disabling the lowering ensures the fallback kernel is used.
+#      - Operators with a default decomposition may not have a lowering.
+#
+# Step 3. Define an eager CPU fallback in: torch_spyre/fallbacks.py
+#
+#    Example:
+#    @register_fallback(["aten::sin", "aten::sin.out"])
+#    def spyre__sin(input, **kwargs):
+#        return torch.sin(input, **kwargs)
+#
+#    Note: You can identify the ATen operator schema name (e.g., aten::sin) by:
+#      * torch.ops.aten.sin.overloads() # lists overloads like ['default', 'out']
+#      * torch.ops.aten.sin.default     # OpOverload object for 'default'
+#      * torch.ops.aten.sin._schema     # shows the dispatcher schema
+
+
 import functools
 import os
 import torch
@@ -27,7 +69,11 @@ class FallbackWarning(UserWarning):
 
 
 warnings.simplefilter("once", FallbackWarning)
-_warn_skips = (os.path.dirname(__file__), os.path.dirname(torch.__file__))
+_warn_skips = (
+    os.path.dirname(__file__),
+    os.path.dirname(torch.__file__),
+    torch._inductor.runtime.cache_dir_utils.cache_dir(),
+)
 
 
 def register_fallback(ops, device="cpu"):
