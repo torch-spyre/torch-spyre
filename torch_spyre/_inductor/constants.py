@@ -16,7 +16,7 @@ MATMUL_REDUCTION_OP = "matmul"
 BATCH_MATMUL_OP = "batchmatmul"
 TRANSPOSE_OP = "transpose"
 DEVICE_NAME = "spyre"
-BYTES_PER_STICK = 128
+CLONE_OP = "clone"
 
 SEGMENT_OFFSETS = [
     0x0,
@@ -41,6 +41,7 @@ SPYRE_FP32_OPS = [
     "reciprocal",
     "layernormscale",
     "abs",
+    "neg",
     "exp",
     "sigmoid",
     "exx2",

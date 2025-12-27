@@ -62,6 +62,10 @@ class SpyreKernelOverrides(OpOverrides):
         return f"spyre.log({x})"
 
     @staticmethod
+    def neg(x):
+        return f"spyre.neg({x})"
+
+    @staticmethod
     def reciprocal(x):
         return f"spyre.reciprocal({x})"
 
@@ -84,6 +88,10 @@ class SpyreKernelOverrides(OpOverrides):
     @staticmethod
     def sqrt(x):
         return f"spyre.sqrt({x})"
+
+    @staticmethod
+    def to_dtype(x, dtype, src_dtype):
+        return f"spyre.to_dtype({x} {dtype} {src_dtype})"
 
     @staticmethod
     def tanh(x):

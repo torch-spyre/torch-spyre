@@ -886,3 +886,173 @@ def generate_transpose_4d_stick(
             ],
         }
     }
+
+
+def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    ndims = len(dimensions)
+    if ndims == 1:
+        layout = ["out"]
+        dim_map = {"out": dimensions[0]}
+        offsets = {"out": 1}
+        loop_counts = {"out": dimensions[0] // 64}
+        piece_valid_gaps = {"out": [[64, 0]]}
+        piece_sizes = {"out": 64}
+        valid_gaps = {"out": [[dimensions[0], 0]]}
+        piece_count = dimensions[0] // 64
+    elif ndims == 2:
+        layout = ["mb", "out"]
+        dim_map = {"mb": dimensions[0], "out": dimensions[-1]}
+        offsets = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": dimensions[0]}
+        loop_counts = {
+            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
+            "out": dimensions[-1] // 64,
+        }
+        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64}
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+        }
+        valid_gaps = {"mb": [[dimensions[0], 0]], "out": [[dimensions[-1], 0]]}
+        piece_count = (
+            dimensions[0] * dimensions[-1] // (4096 if dimensions[0] % 64 == 0 else 64)
+        )
+    else:
+        layout = ["mb", "out", "x"]
+        dim_map = {"mb": dimensions[0], "out": dimensions[-1], "x": dimensions[1]}
+        offsets = {
+            "mb": 64 if dimensions[0] % 64 == 0 else 1,
+            "out": dimensions[0],
+            "x": dimensions[-1] * dimensions[0] // 64,
+        }
+        loop_counts = {
+            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
+            "out": dimensions[-1] // 64,
+            "x": dimensions[1],
+        }
+        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64, "x": 1}
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+            "x": [[piece_sizes["x"], 0]],
+        }
+        valid_gaps = {
+            "mb": [[dimensions[0], 0]],
+            "out": [[dimensions[-1], 0]],
+            "x": [[dimensions[1], 0]],
+        }
+        piece_count = (
+            dimensions[0]
+            * dimensions[1]
+            * dimensions[-1]
+            // (4096 if dimensions[0] % 64 == 0 else 64)
+        )
+    return {
+        "clone": {
+            "numCoresUsed_": 1,
+            "dscs_": [],
+            "coreIdToDscSchedule": {"0": [[0, -1, 0, 0]]},
+            "datadscs_": [
+                {
+                    "clone": {
+                        "coreIdsUsed_": [0],
+                        "dimPool_": layout,
+                        "primaryDs_": [{"name_": "pds0", "dimNames": layout}],
+                        "labeledDs_": [
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": layout,
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": dim_map,
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": valid_gaps,
+                                "PieceInfo": [
+                                    {
+                                        "key_": f"p{i}",
+                                        "dimToSize_": piece_sizes,
+                                        "validGap_": piece_valid_gaps,
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[inputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [0],
+                                            },
+                                        ],
+                                    }
+                                    for i in range(piece_count)
+                                ],
+                                "hbmStartAddress_": pointers[inputs[0]["name"]] // 128,
+                            },
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": layout,
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": dim_map,
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": valid_gaps,
+                                "PieceInfo": [
+                                    {
+                                        "key_": f"p{i}",
+                                        "dimToSize_": piece_sizes,
+                                        "validGap_": piece_valid_gaps,
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[outputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [16384],
+                                            },
+                                        ],
+                                    }
+                                    for i in range(piece_count)
+                                ],
+                                "hbmStartAddress_": pointers[outputs[0]["name"]] // 128,
+                            },
+                        ],
+                        "op": {
+                            "name": "STCDPOpHBM",
+                            "gtrIdsUsed": [],
+                            "coreIDtoANInfo": {
+                                "0": {
+                                    "loopCount": loop_counts,
+                                    "loopCountL3SU": {},
+                                    "addr_info_": {
+                                        "l3lu": {
+                                            "type_": "stride",
+                                            "offset_": offsets,
+                                        },
+                                        "l3su": {"type_": "stride", "offset_": offsets},
+                                    },
+                                    "inpPieceOrder": [
+                                        f"p{i}" for i in range(piece_count)
+                                    ],
+                                    "outPieceOrder": [
+                                        f"p{i}" for i in range(piece_count)
+                                    ],
+                                }
+                            },
+                            "numClToUse": 1,
+                            "cl0ToLxOffsetLU": 0,
+                            "cl0ToLxOffsetSU": 0,
+                        },
+                    }
+                }
+            ],
+        }
+    }

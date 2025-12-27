@@ -26,14 +26,10 @@ class _SpyreImpl:
         self._initialized = False
         self._in_bad_fork = False
 
-        import psutil
-
-        ppid = os.getppid()
-        parent = psutil.Process(ppid)
-        if "python" in parent.name():
-            os.environ["SPYRE_IN_USE"] = "1"
-
-        if os.getenv("SPYRE_IN_USE") == "1":
+        # When spawning a supprocess from inductor, ensure that IS_INDUCTOR_SPAWNED_SUBPROCESS=1
+        # This will avoid additional initialization when processes are spawned from torch inductor (This happens in Triton pathway)
+        # TODO: This may require monkey-patching the method where torch-inductor spawns a subprocess
+        if int(os.getenv("IS_INDUCTOR_SPAWNED_SUBPROCESS", "0")):
             # NOTE (tmhoangt): currently, Spyre can't be used by more than one process
             # so, we want only the main process can have access to the actual device
             self._in_bad_fork = True
@@ -165,6 +161,7 @@ def _autoload():
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
     import torch_spyre.ops  # noqa: F401
+    import torch_spyre._inductor.preload  # noqa: F401
 
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging
