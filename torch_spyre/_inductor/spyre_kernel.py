@@ -13,18 +13,24 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Self, Sequence, Union
 import regex as re
 
 import torch
 import sympy
 
 from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils import _pytree as pytree
 from torch._inductor.codegen.common import (
+    CSEProxy,
     CSEVariable,
     DeferredLine,
     IndentedBuffer,
+    Kernel,
 )
+from torch._inductor.ops_handler import OpsHandler
+from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
+from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import ReductionType, StoreMode, V
@@ -98,6 +104,57 @@ class SpyreKernelCSEVariable(CSEVariable):
             V.kernel.record_compute_op(name, False)
 
 
+class SpyreCSEProxy(CSEProxy):
+    def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
+        super().__init__(kernel, parent_handler)
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        bounds = self._bound_variable(name, *args, **kwargs)
+
+        value = getattr(self.parent_handler, name)(*args, **kwargs)
+        dtype_handler = DtypePropagationOpsHandler()
+        shape_handler = ShapePropagationOpsHandler()
+        shape_op = getattr(shape_handler, name)
+        dtype_op = getattr(dtype_handler, name)
+        output_dtype = dtype_op(*args, **kwargs)
+        output_shape = shape_op(*args, **kwargs)
+
+        assert output_dtype is not None
+
+        output_idx = 0
+
+        def do_cse(v: Union[str, CSEVariable]) -> CSEVariable:
+            # we tree_map over the output, so we need to fetch corresponding dtype
+            nonlocal output_idx
+            var_shape: BlockShapeType = (
+                output_shape[output_idx]  # type: ignore[assignment]
+                if isinstance(output_shape, (list, tuple))
+                and len(output_shape) > 0
+                and isinstance(output_shape[0], (list, tuple))
+                else output_shape
+            )
+            output_idx += 1
+
+            # some cpp op implementations don't set the dtype
+            if isinstance(v, CSEVariable):
+                if v.shape is None:
+                    v.shape = var_shape
+
+            csevar = V.kernel.cse.generate(
+                V.kernel.compute,
+                v,
+                bounds=bounds,
+                dtype=output_dtype,
+                shape=output_shape,
+            )
+
+            csevar.update_on_args(name, args, kwargs)
+
+            return csevar
+
+        return pytree.tree_map(do_cse, value)
+
+
 class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
     overrides = SpyreKernelOverrides  # type: ignore[assignment]
 
@@ -114,13 +171,17 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.compute_inputs: list[TensorAccess | Constant] = []
         self.compute_output: Optional[TensorAccess] = None
 
+    def __enter__(self) -> Self:
+        super().__enter__()
+        self.exit_stack.enter_context(
+            V.set_ops_handler(SpyreCSEProxy(self, SpyreKernelOverrides))
+        )
+        return self
+
     def create_cse_var(
         self, name, bounds=None, dtype=None, shape: BlockShapeType = None
     ):
         return SpyreKernelCSEVariable(name, bounds, dtype, shape)
-
-    def lookup_cse_var(self, name: str):
-        return self.cse.varname_map[re.sub(r"\[.*", "", name)]
 
     def record_compute_op(self, op: str, is_reduction: bool):
         if V.kernel.compute_op != "":

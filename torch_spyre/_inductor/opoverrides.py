@@ -179,6 +179,10 @@ class SpyreKernelOverrides(SpyreBasicMathMixins, SpyreCustomOps, OpsHandler[Any]
         return f"spyre.sqrt({x})"
 
     @staticmethod
+    def square(x):
+        return f"{x} * {x}"
+
+    @staticmethod
     def to_dtype(x, dtype, src_dtype):
         return f"spyre.to_dtype({x} {dtype} {src_dtype})"
 
