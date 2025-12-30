@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Self, Sequence, TypeAlias, Union
 import regex as re
 
@@ -24,7 +24,6 @@ import sympy
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch._inductor.codegen.common import (
     CSEVariable,
-    DeferredLine,
     IndentedBuffer,
     Kernel,
 )
@@ -43,7 +42,6 @@ from .constants import (
     CLONE_OP,
 )
 from . import Unsupported
-from .opoverrides import SpyreOpFuncs
 from .opfuncs import UNIMPLEMENTED, get_spyre_op
 from .ir import FixedTiledLayout
 
@@ -65,12 +63,14 @@ class Constant:
 class PointwiseOp:
     op: str
     arguments: list[RValue]
+    op_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class ReductionOp:
     op: str
     arguments: list[RValue]
+    op_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -98,18 +98,136 @@ def create_tensor_arg(
 RValue: TypeAlias = Union[TensorAccess, Constant, PointwiseOp, ReductionOp]
 
 
-class SpyreKernelCSEVariable(CSEVariable):
-    undefined_re = re.compile(r"\b(tmp\d+)\[\?\]")
+class SpyreOpFuncs(OpsHandler[Any]):
+    """
+    Torch ops that are directly supported by the backend compiler for the Spyre device.
 
-    def __init__(
-        self,
-        name,
-        bounds: ValueRanges[Any],
-        dtype: Optional[torch.dtype] = None,
-        shape: BlockShapeType = None,
-    ) -> None:
-        super().__init__(name, bounds, dtype, shape)
-        raise RuntimeError("Spyre does not use CSEProxy")
+    Keep these methods sorted in alphabetical order!
+    """
+
+    @staticmethod
+    def abs(x):
+        return f"spyre.abs({x})"
+
+    @staticmethod
+    def add(a, b):
+        return PointwiseOp("add", [a, b])
+
+    @staticmethod
+    def clamp(input, min=None, max=None):
+        return f"spyre.clamp({input} {min} {max})"
+
+    @staticmethod
+    def eq(a, b):
+        return f"{a} == {b}"
+
+    @staticmethod
+    def exp(x):
+        return f"spyre.exp({x})"
+
+    @staticmethod
+    def exx2(a, b, c):
+        return f"spyre.exx2({a} {b} {c})"
+
+    @staticmethod
+    def fma(x):
+        return f"spyre.fma({x})"
+
+    @staticmethod
+    def ge(a, b):
+        return f"{a} >= {b}"
+
+    @staticmethod
+    def gelu(x):
+        return f"spyre.gelu({x})"
+
+    @staticmethod
+    def gt(a, b):
+        return f"{a} > {b}"
+
+    @staticmethod
+    def layernormscale(x, y):
+        return f"spyre.layernormscale({x}, {y})"
+
+    @staticmethod
+    def layernormnorm(a, b, c, d, e):
+        return f"spyre.layernormnorm({a}, {b}, {c}, {d}, {e})"
+
+    @staticmethod
+    def le(a, b):
+        return f"{a} <= {b}"
+
+    @staticmethod
+    def log(x):
+        return f"spyre.log({x})"
+
+    @staticmethod
+    def lt(a, b):
+        return f"{a} < {b}"
+
+    @staticmethod
+    def mul(a, b):
+        return f"{a} * {b}"
+
+    @staticmethod
+    def ne(a, b):
+        return f"{a} != {b}"
+
+    @staticmethod
+    def neg(a):
+        return f"-{a}"
+
+    @staticmethod
+    def pow(a, b):
+        return f"{a} ** {b}"
+
+    @staticmethod
+    def reciprocal(x):
+        return f"spyre.reciprocal({x})"
+
+    @staticmethod
+    def relu(x):
+        return f"spyre.relu({x})"
+
+    @staticmethod
+    def rsqrt(x):
+        return f"spyre.rsqrt({x})"
+
+    @staticmethod
+    def sigmoid(x):
+        return f"spyre.sigmoid({x})"
+
+    @staticmethod
+    def softplus(x, y, z):
+        return f"spyre.softplus({x}, {y}, {z})"
+
+    @staticmethod
+    def sqrt(x):
+        return f"spyre.sqrt({x})"
+
+    @staticmethod
+    def square(x):
+        return f"{x} * {x}"
+
+    @staticmethod
+    def sub(a, b):
+        return PointwiseOp("sub", [a, b])
+
+    @staticmethod
+    def tanh(x):
+        return f"spyre.tanh({x})"
+
+    @staticmethod
+    def to_dtype(x, dtype, src_dtype):
+        return f"spyre.to_dtype({x} {dtype} {src_dtype})"
+
+    @staticmethod
+    def truediv(a, b):
+        return f"{a} / {b}"
+
+    @staticmethod
+    def where(x, y, z):
+        return f"spyre.where({x}, {y}, {z})"
 
 
 class SpyreKernelOpsHandler(DefaultHandler):
@@ -166,6 +284,20 @@ class SpyreKernelOpsHandler(DefaultHandler):
         return self.kernel.scan(dtypes, combine_fn, values)
 
 
+class SpyreKernelCSEVariable(CSEVariable):
+    undefined_re = re.compile(r"\b(tmp\d+)\[\?\]")
+
+    def __init__(
+        self,
+        name,
+        bounds: ValueRanges[Any],
+        dtype: Optional[torch.dtype] = None,
+        shape: BlockShapeType = None,
+    ) -> None:
+        super().__init__(name, bounds, dtype, shape)
+        raise RuntimeError("Spyre does not use CSEProxy")
+
+
 class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -181,7 +313,8 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.op_info: dict[str, Any] = {}
         self.compute_inputs: list[TensorAccess | Constant] = []
         self.compute_output: Optional[TensorAccess] = None
-        self.rvalues: dict[SpyreKernelCSEVariable, RValue] = {}
+
+        self.kernel_summaries: list[KernelSummary] = []
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -193,6 +326,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
     def create_cse_var(
         self, name, bounds=None, dtype=None, shape: BlockShapeType = None
     ):
+        # TODO: This is unreachable code
         return SpyreKernelCSEVariable(name, bounds, dtype, shape)
 
     def record_compute_op(self, op: str, is_reduction: bool):
@@ -222,20 +356,60 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self,
         name: str,
         index: sympy.Expr,
-        value: CSEVariable,
+        value: RValue,
         mode: StoreMode = None,
     ) -> None:
-        """Codegen a store to an OutputBuffer"""
-        var = self.args.output(name)
+        _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        if self.compute_output is not None:
-            raise Unsupported(f"multi-output kernel {self.compute_output.name} {name}")
-        self.compute_output = TensorAccess(name, index, layout)
-        self.body.writeline(DeferredLine(name, f"{var}"))
+        dst = TensorAccess(name, index, layout)
+
+        actuals = self.args.python_argdefs()[1]
+        args: list[TensorArg | ConstantArg] = []
+        scales = []
+        op_info = {}
+        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
+            op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
+        if hasattr(self.current_node, "spyre_core_division"):
+            op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
+
+        if isinstance(value, PointwiseOp):
+            # Pointwise compute ops are defined by the output's index
+            di = self.analyze_index_expr(dst.index)
+            for input in value.arguments:
+                if isinstance(input, TensorAccess):
+                    scale = self.analyze_tensor_access(di, input.index)
+                    if value.op == "layernormscale":
+                        scale[-1] = -2
+                    args.append(
+                        create_tensor_arg(
+                            True,
+                            actuals.index(input.name),
+                            input.layout,
+                        )
+                    )
+                    scales.append(scale)
+                elif isinstance(input, Constant):
+                    args.append(ConstantArg(input.value, input.dtype))
+                    scales.append([-1] * len(di))
+                else:
+                    raise Unsupported(f"unexpected argument {input} to {value.op}")
+            scale = self.analyze_tensor_access(di, dst.index)
+            args.append(
+                create_tensor_arg(
+                    False,
+                    actuals.index(dst.name),
+                    dst.layout,
+                )
+            )
+            scales.append(scale)
+            op_info.update(value.op_info)
+            self.kernel_summaries.append(KernelSummary(di, scales, args, op_info))
+        else:
+            raise RuntimeError("TODO!")
 
     def reduction(
         self,
@@ -455,7 +629,9 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         if self.spyre_op == UNIMPLEMENTED:
             buf.writeline(f"UnimplementedOp(op='{self.compute_op}')")
         else:
-            ks = self.analyze_kernel()
+            if len(self.kernel_summaries) != 1:
+                raise Unsupported(f"found {len(self.kernel_summaries)} KernelSummaries")
+            ks = self.kernel_summaries[0]
             buf.writeline("KernelSpec(")
             with buf.indent():
                 buf.writeline(f"op='{self.spyre_op}',")
