@@ -19,7 +19,7 @@ opfunc_mapping: dict[str, str] = {}
 
 
 def _initialize_opfunc_mapping():
-    from .spyre_kernel import SpyreKernelOverrides
+    from .spyre_kernel import SpyreOpFuncs
 
     # Inductor reduction operations
     reductions = {
@@ -42,8 +42,8 @@ def _initialize_opfunc_mapping():
     # Default all Inductor ops to UNIMPLEMENTED
     pointwise_ops = {
         attr: UNIMPLEMENTED
-        for attr in dir(SpyreKernelOverrides)
-        if callable(getattr(SpyreKernelOverrides, attr)) and not attr.startswith("_")
+        for attr in dir(SpyreOpFuncs)
+        if callable(getattr(SpyreOpFuncs, attr)) and not attr.startswith("_")
     }
     # Implemented pointwise ops whose opfunc is the same as the inductor op
     same_name = [

@@ -43,7 +43,7 @@ from .constants import (
     CLONE_OP,
 )
 from . import Unsupported
-from .opoverrides import SpyreKernelOverrides
+from .opoverrides import SpyreOpFuncs
 from .opfuncs import UNIMPLEMENTED, get_spyre_op
 from .ir import FixedTiledLayout
 
@@ -113,7 +113,7 @@ class SpyreKernelCSEVariable(CSEVariable):
 
 
 class SpyreKernelOpsHandler(DefaultHandler):
-    name = "SpyreCSEProxy"
+    name = "SpyreKernelOpsHandler"
 
     def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
         super().__init__()
@@ -166,7 +166,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
 
 
 class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
-    overrides = SpyreKernelOverrides  # type: ignore[assignment]
+    overrides = SpyreOpFuncs  # type: ignore[assignment]
 
     def __init__(
         self,
@@ -185,7 +185,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
     def __enter__(self) -> Self:
         super().__enter__()
         self.exit_stack.enter_context(
-            V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreKernelOverrides))
+            V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreOpFuncs))
         )
         return self
 
@@ -207,6 +207,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
+        _ = self.args.input(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
