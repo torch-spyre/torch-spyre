@@ -81,8 +81,8 @@ class DimensionInfo:
 
 @dataclass
 class KernelSummary:
-    opfunc: str
-    op: list[DimensionInfo]
+    op: str
+    dims: list[DimensionInfo]
     scales: list[list[int]]
     arguments: list[TensorArg | ConstantArg]
     op_info: dict[str, Any]
@@ -624,20 +624,17 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             ks = self.kernel_summaries[0]
             buf.writeline("KernelSpec(")
             with buf.indent():
-                buf.writeline(f"op='{ks.opfunc}',")
+                buf.writeline(f"op='{ks.op}',")
                 buf.writeline(f"is_reduction={self.compute_op_is_reduction},")
-                buf.writeline(f"dimensions={[dmd.numel for dmd in ks.op]!r},")
+                buf.writeline(f"dimensions={[dmd.numel for dmd in ks.dims]!r},")
                 buf.writeline(f"scales={ks.scales!r},")
                 buf.writeline(f"op_info={ks.op_info!r},")
                 buf.writeline("args=[")
                 with buf.indent():
                     for arg in ks.arguments:
                         buf.writeline(f"{arg!r},")
-                        if (
-                            arg.dtype == torch.float32
-                            and ks.opfunc not in SPYRE_FP32_OPS
-                        ):
-                            raise Unsupported(f"{ks.opfunc} on {arg.dtype} dtype")
+                        if arg.dtype == torch.float32 and ks.op not in SPYRE_FP32_OPS:
+                            raise Unsupported(f"{ks.op} on {arg.dtype} dtype")
                         elif arg.dtype not in [
                             torch.bool,
                             torch.float16,
