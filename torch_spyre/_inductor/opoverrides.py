@@ -16,47 +16,11 @@ from typing import Any
 from torch._inductor.ops_handler import OpsHandler
 
 
-class SpyreBasicMathMixins:
-    """
-    This class replaces op_handlers.BasicMathOpsMixin.
-    Keep methods in the same order as the upstream class.
-    """
-
-    @staticmethod
-    def floordiv(a, b):
-        return f"{a} // {b}"
-
-    @staticmethod
-    def mod(a, b):
-        # careful, depending on target semantics varies
-        return f"{a} % {b}"
-
-    @staticmethod
-    def lshift(a, b):
-        return f"{a} << {b}"
-
-    @staticmethod
-    def rshift(a, b):
-        return f"{a} >> {b}"
-
-    @staticmethod
-    def and_(a, b):
-        return f"{a} & {b}"
-
-    @staticmethod
-    def or_(a, b):
-        return f"{a} | {b}"
-
-    @staticmethod
-    def xor(a, b):
-        return f"{a} ^ {b}"
-
-
-class SpyreOpFuncs(SpyreBasicMathMixins, OpsHandler[Any]):
+class SpyreOpFuncs(OpsHandler[Any]):
     """
     Torch ops that are directly supported by the backend compiler for the Spyre device.
 
-    Keep these ops sorted in alphabetical order!
+    Keep these methods sorted in alphabetical order!
     """
 
     @staticmethod
