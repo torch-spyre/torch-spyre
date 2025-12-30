@@ -20,7 +20,6 @@ import torch
 import sympy
 
 from torch.utils._sympy.value_ranges import ValueRanges
-from torch.utils import _pytree as pytree
 from torch._inductor.codegen.common import (
     CSEProxy,
     CSEVariable,
@@ -107,6 +106,9 @@ class SpyreKernelCSEVariable(CSEVariable):
 class SpyreCSEProxy(CSEProxy):
     def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
         super().__init__(kernel, parent_handler)
+        self.kernel_summaries: dict[
+            SpyreKernelCSEVariable, str
+        ] = {}  # TODO: Correct typing!
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         bounds = self._bound_variable(name, *args, **kwargs)
@@ -121,38 +123,14 @@ class SpyreCSEProxy(CSEProxy):
 
         assert output_dtype is not None
 
-        output_idx = 0
+        csevar: SpyreKernelCSEVariable = V.kernel.cse.newvar(
+            bounds, output_dtype, output_shape
+        )
+        csevar.update_on_args(name, args, kwargs)
 
-        def do_cse(v: Union[str, CSEVariable]) -> CSEVariable:
-            # we tree_map over the output, so we need to fetch corresponding dtype
-            nonlocal output_idx
-            var_shape: BlockShapeType = (
-                output_shape[output_idx]  # type: ignore[assignment]
-                if isinstance(output_shape, (list, tuple))
-                and len(output_shape) > 0
-                and isinstance(output_shape[0], (list, tuple))
-                else output_shape
-            )
-            output_idx += 1
+        self.kernel_summaries[csevar] = value
 
-            # some cpp op implementations don't set the dtype
-            if isinstance(v, CSEVariable):
-                if v.shape is None:
-                    v.shape = var_shape
-
-            csevar = V.kernel.cse.generate(
-                V.kernel.compute,
-                v,
-                bounds=bounds,
-                dtype=output_dtype,
-                shape=output_shape,
-            )
-
-            csevar.update_on_args(name, args, kwargs)
-
-            return csevar
-
-        return pytree.tree_map(do_cse, value)
+        return csevar
 
 
 class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
