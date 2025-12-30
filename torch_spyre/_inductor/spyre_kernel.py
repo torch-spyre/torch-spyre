@@ -13,21 +13,21 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Self, Sequence, Union
+from typing import Any, Callable, Optional, Self, Sequence, Union
 import regex as re
 
 import torch
 import sympy
 
 from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._sympy.symbol import free_symbol_is_type, SymT
 from torch._inductor.codegen.common import (
-    CSEProxy,
     CSEVariable,
     DeferredLine,
     IndentedBuffer,
     Kernel,
 )
-from torch._inductor.ops_handler import OpsHandler
+from torch._inductor.ops_handler import OpsHandler, DefaultHandler
 from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.codegen.simd import SIMDKernel
@@ -103,9 +103,13 @@ class SpyreKernelCSEVariable(CSEVariable):
             V.kernel.record_compute_op(name, False)
 
 
-class SpyreCSEProxy(CSEProxy):
+class SpyreCSEProxy(DefaultHandler):
+    name = "SpyreCSEProxy"
+
     def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
-        super().__init__(kernel, parent_handler)
+        super().__init__()
+        self.kernel = kernel
+        self.parent_handler = parent_handler
         self.kernel_summaries: dict[
             SpyreKernelCSEVariable, str
         ] = {}  # TODO: Correct typing!
@@ -131,6 +135,59 @@ class SpyreCSEProxy(CSEProxy):
         self.kernel_summaries[csevar] = value
 
         return csevar
+
+    def _bound_variable(self, name: str, *args: Any, **kwargs: Any) -> ValueRanges[Any]:
+        """
+        If the variable comes from an FX node, we forward the bound we have already computed
+        Else, if the variable when codegen'ing another op, we try to compute its bounds
+        """
+        fx_node = V.interpreter.current_node
+        if fx_node.target == name and self.kernel.node_to_bounds is not None:
+            assert isinstance(self.kernel.node_to_bounds, dict), type(
+                self.kernel.node_to_bounds
+            )
+            return self.kernel.node_to_bounds.get(fx_node, ValueRanges.unknown())
+
+        return ValueRanges.unknown()
+
+    def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        if free_symbol_is_type(index, SymT.TMP):
+            return self.kernel.indirect_load(name, index)
+        out = self.kernel.load(name, index)
+        if out.use_count == 1:
+            self.kernel.num_load += 1
+        return out
+
+    def store(
+        self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
+    ) -> None:
+        self.kernel.store_buffer_names.add(name)
+        self.kernel.store(name, index, value, mode=mode)
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        self.kernel.store_buffer_names.add(name)
+        return self.kernel.store_reduction(name, index, value)
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type: ReductionType,
+        value: Union[CSEVariable, tuple[CSEVariable, ...]],
+    ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
+        self.kernel.num_reduction += 1
+        return self.kernel.reduction(dtype, src_dtype, reduction_type, value)
+
+    def scan(
+        self,
+        dtypes: tuple[torch.dtype, ...],
+        combine_fn: Callable[
+            [tuple[CSEVariable, ...], tuple[CSEVariable, ...]],
+            tuple[CSEVariable, ...],
+        ],
+        values: tuple[CSEVariable, ...],
+    ) -> tuple[CSEVariable, ...]:
+        return self.kernel.scan(dtypes, combine_fn, values)
 
 
 class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
