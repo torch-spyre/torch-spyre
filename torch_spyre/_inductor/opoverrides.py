@@ -54,7 +54,7 @@ class SpyreBasicMathMixins:
 
 class SpyreOpFuncs(SpyreBasicMathMixins, OpsHandler[Any]):
     """
-    Torch ops that are directly supported by the Spyre device.
+    Torch ops that are directly supported by the backend compiler for the Spyre device.
 
     Keep these ops sorted in alphabetical order!
     """

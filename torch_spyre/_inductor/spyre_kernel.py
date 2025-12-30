@@ -122,12 +122,13 @@ class SpyreKernelOpsHandler(DefaultHandler):
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         value = getattr(self.parent_handler, name)(*args, **kwargs)
-        if name == "constant":
-            V.kernel.compute_inputs.append(Constant(args[0], args[1]))
-        else:
-            V.kernel.record_compute_op(name, False)
-
+        V.kernel.record_compute_op(name, False)
         return value
+
+    def constant(value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
+        c = Constant(value, dtype)
+        V.kernel.compute_inputs.append(c)
+        return c
 
     def load(self, name: str, index: sympy.Expr) -> Any:
         out = self.kernel.load(name, index)
