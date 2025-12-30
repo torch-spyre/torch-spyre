@@ -258,26 +258,9 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         args: list[TensorArg | ConstantArg] = []
         scales = []
         if self.spyre_op == MATMUL_REDUCTION_OP:
-            # MATMUL is specially constructed by our lowering operation.
-            # It has exactly 2 tensor inputs and 1 tensor output.
-            if (
-                (not len(self.range_trees) == 2)
-                or (not self.range_trees[0].name == "xindex")
-                or (not len(self.range_trees[0].var_list) == 2)
-                or (not self.range_trees[1].name == "r0_index")
-                or (not len(self.range_trees[1].var_list) == 1)
-            ):
-                raise Unsupported(f"matmul range trees {self.range_trees}")
-            idx_rt = self.range_trees[0]
-            red_rt = self.range_trees[1]
-            x_0 = idx_rt.var_list[0]
-            x_1 = idx_rt.var_list[1]
-            r_0 = red_rt.var_list[0]
-            di = [
-                DimensionInfo(x_1, int(idx_rt.var_ranges[x_1])),
-                DimensionInfo(r_0, int(red_rt.var_ranges[r_0])),
-                DimensionInfo(x_0, int(idx_rt.var_ranges[x_0])),
-            ]
+            di_x = self.analyze_index_expr(self.compute_inputs[0].index)  # type: ignore[union-attr]
+            di_y = self.analyze_index_expr(self.compute_inputs[1].index)  # type: ignore[union-attr]
+            di = [di_x[0], di_x[1], di_y[1]]
 
             for input in self.compute_inputs:
                 if not isinstance(input, TensorAccess):
