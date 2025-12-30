@@ -81,6 +81,7 @@ class DimensionInfo:
 
 @dataclass
 class KernelSummary:
+    opfunc: str
     op: list[DimensionInfo]
     scales: list[list[int]]
     arguments: list[TensorArg | ConstantArg]
@@ -107,7 +108,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def abs(x):
-        return f"spyre.abs({x})"
+        return PointwiseOp("abs", [x])
 
     @staticmethod
     def add(a, b):
@@ -119,31 +120,23 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def eq(a, b):
-        return f"{a} == {b}"
+        return PointwiseOp("equal", [a, b])
 
     @staticmethod
     def exp(x):
-        return f"spyre.exp({x})"
+        return PointwiseOp("eq", [x])
 
     @staticmethod
     def exx2(a, b, c):
         return f"spyre.exx2({a} {b} {c})"
 
     @staticmethod
-    def fma(x):
-        return f"spyre.fma({x})"
-
-    @staticmethod
     def ge(a, b):
-        return f"{a} >= {b}"
+        return PointwiseOp("greaterequal", [a, b])
 
     @staticmethod
     def gelu(x):
-        return f"spyre.gelu({x})"
-
-    @staticmethod
-    def gt(a, b):
-        return f"{a} > {b}"
+        return PointwiseOp("gelu", [x])
 
     @staticmethod
     def layernormscale(x, y):
@@ -159,23 +152,19 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def log(x):
-        return f"spyre.log({x})"
-
-    @staticmethod
-    def lt(a, b):
-        return f"{a} < {b}"
+        return PointwiseOp("log", [x])
 
     @staticmethod
     def mul(a, b):
-        return f"{a} * {b}"
+        return PointwiseOp("mul", [a, b])
 
     @staticmethod
     def ne(a, b):
-        return f"{a} != {b}"
+        return PointwiseOp("notequal", [a, b])
 
     @staticmethod
     def neg(a):
-        return f"-{a}"
+        return PointwiseOp("neg", [a])
 
     @staticmethod
     def pow(a, b):
@@ -183,19 +172,19 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def reciprocal(x):
-        return f"spyre.reciprocal({x})"
+        return PointwiseOp("reciprocal", [x])
 
     @staticmethod
     def relu(x):
-        return f"spyre.relu({x})"
+        return PointwiseOp("relufwd", [x])
 
     @staticmethod
     def rsqrt(x):
-        return f"spyre.rsqrt({x})"
+        return PointwiseOp("rsqrt", [x])
 
     @staticmethod
     def sigmoid(x):
-        return f"spyre.sigmoid({x})"
+        return PointwiseOp("sigmoid", [x])
 
     @staticmethod
     def softplus(x, y, z):
@@ -203,7 +192,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def sqrt(x):
-        return f"spyre.sqrt({x})"
+        return PointwiseOp("sqrt", [x])
 
     @staticmethod
     def square(x):
@@ -215,7 +204,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def tanh(x):
-        return f"spyre.tanh({x})"
+        return PointwiseOp("tanh", [x])
 
     @staticmethod
     def to_dtype(x, dtype, src_dtype):
@@ -223,11 +212,11 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def truediv(a, b):
-        return f"{a} / {b}"
+        return PointwiseOp("realdiv", [a, b])
 
     @staticmethod
     def where(x, y, z):
-        return f"spyre.where({x}, {y}, {z})"
+        return PointwiseOp("where3", [x, y, z])
 
 
 class SpyreKernelOpsHandler(DefaultHandler):
@@ -240,7 +229,6 @@ class SpyreKernelOpsHandler(DefaultHandler):
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         value = getattr(self.parent_handler, name)(*args, **kwargs)
-        V.kernel.record_compute_op(name, False)
         return value
 
     def constant(value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
@@ -407,7 +395,9 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             )
             scales.append(scale)
             op_info.update(value.op_info)
-            self.kernel_summaries.append(KernelSummary(di, scales, args, op_info))
+            self.kernel_summaries.append(
+                KernelSummary(value.op, di, scales, args, op_info)
+            )
         else:
             raise RuntimeError("TODO!")
 
@@ -634,7 +624,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             ks = self.kernel_summaries[0]
             buf.writeline("KernelSpec(")
             with buf.indent():
-                buf.writeline(f"op='{self.spyre_op}',")
+                buf.writeline(f"op='{ks.opfunc}',")
                 buf.writeline(f"is_reduction={self.compute_op_is_reduction},")
                 buf.writeline(f"dimensions={[dmd.numel for dmd in ks.op]!r},")
                 buf.writeline(f"scales={ks.scales!r},")
@@ -645,9 +635,9 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
                         buf.writeline(f"{arg!r},")
                         if (
                             arg.dtype == torch.float32
-                            and self.spyre_op not in SPYRE_FP32_OPS
+                            and ks.opfunc not in SPYRE_FP32_OPS
                         ):
-                            raise Unsupported(f"{self.spyre_op} on {arg.dtype} dtype")
+                            raise Unsupported(f"{ks.opfunc} on {arg.dtype} dtype")
                         elif arg.dtype not in [
                             torch.bool,
                             torch.float16,

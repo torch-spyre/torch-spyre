@@ -47,33 +47,14 @@ def _initialize_opfunc_mapping():
     }
     # Implemented pointwise ops whose opfunc is the same as the inductor op
     same_name = [
-        "abs",
-        "add",
-        "exp",
-        "gelu",
         "layernormnorm",
         "layernormscale",
-        "log",
-        "mul",
-        "neg",
-        "reciprocal",
-        "rsqrt",
-        "sigmoid",
         "softplus",
-        "sqrt",
-        "sub",
-        "tanh",
         "to_dtype",
     ]
     for i in same_name:
         pointwise_ops[i] = i
     # Implemented pointwise ops that need to be renamed
-    pointwise_ops["truediv"] = "realdiv"
-    pointwise_ops["relu"] = "relufwd"
-    pointwise_ops["eq"] = "equal"
-    pointwise_ops["ne"] = "notequal"
-    pointwise_ops["ge"] = "greaterequal"
-    pointwise_ops["where"] = "where3"
     pointwise_ops["clamp"] = "clip"
 
     return pointwise_ops | reductions
