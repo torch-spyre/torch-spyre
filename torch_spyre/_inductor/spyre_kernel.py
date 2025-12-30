@@ -285,28 +285,10 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             scales.append(scale)
             return KernelSummary(di, scales, args, self.op_info)
         elif self.spyre_op == BATCH_MATMUL_OP:
-            # BATCH_MATMUL is specially constructed by our lowering operation.
-            # It has exactly 2 tensor inputs and 1 tensor output.
-            if (
-                (not len(self.range_trees) == 2)
-                or (not self.range_trees[0].name == "xindex")
-                or (not len(self.range_trees[0].var_list) == 3)  # FIXME: generalize
-                or (not self.range_trees[1].name == "r0_index")
-                or (not len(self.range_trees[1].var_list) == 1)
-            ):
-                raise Unsupported(f"batchmatmul range trees {self.range_trees}")
-            idx_rt = self.range_trees[0]
-            red_rt = self.range_trees[1]
-            x_0 = idx_rt.var_list[0]
-            x_1 = idx_rt.var_list[1]
-            x_2 = idx_rt.var_list[2]
-            r_0 = red_rt.var_list[0]
-            di = [
-                DimensionInfo(x_2, int(idx_rt.var_ranges[x_2])),  # x
-                DimensionInfo(x_1, int(idx_rt.var_ranges[x_1])),  # mb
-                DimensionInfo(r_0, int(red_rt.var_ranges[r_0])),  # in
-                DimensionInfo(x_0, int(idx_rt.var_ranges[x_0])),  # out
-            ]
+            di_x = self.analyze_index_expr(self.compute_inputs[0].index)  # type: ignore[union-attr]
+            di_y = self.analyze_index_expr(self.compute_inputs[1].index)  # type: ignore[union-attr]
+            di = [di_x[0], di_x[1], di_x[2], di_y[2]]
+
             args = []
             scales = []
             for input in self.compute_inputs:
