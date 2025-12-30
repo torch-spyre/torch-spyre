@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Self, Sequence, Union
+from typing import Any, Callable, Optional, Self, Sequence, TypeAlias, Union
 import regex as re
 
 import torch
 import sympy
 
 from torch.utils._sympy.value_ranges import ValueRanges
-from torch.utils._sympy.symbol import free_symbol_is_type, SymT
 from torch._inductor.codegen.common import (
     CSEVariable,
     DeferredLine,
@@ -28,8 +29,6 @@ from torch._inductor.codegen.common import (
     Kernel,
 )
 from torch._inductor.ops_handler import OpsHandler, DefaultHandler
-from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
-from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import ReductionType, StoreMode, V
@@ -63,6 +62,18 @@ class Constant:
 
 
 @dataclass
+class PointwiseOp:
+    op: str
+    arguments: list[RValue]
+
+
+@dataclass
+class ReductionOp:
+    op: str
+    arguments: list[RValue]
+
+
+@dataclass
 class DimensionInfo:
     var: sympy.Symbol
     numel: int
@@ -84,6 +95,9 @@ def create_tensor_arg(
     )
 
 
+RValue: TypeAlias = Union[TensorAccess, Constant, PointwiseOp, ReductionOp]
+
+
 class SpyreKernelCSEVariable(CSEVariable):
     undefined_re = re.compile(r"\b(tmp\d+)\[\?\]")
 
@@ -95,67 +109,28 @@ class SpyreKernelCSEVariable(CSEVariable):
         shape: BlockShapeType = None,
     ) -> None:
         super().__init__(name, bounds, dtype, shape)
-
-    def update_on_args(self, name, args, kwargs):
-        if name == "constant":
-            V.kernel.compute_inputs.append(Constant(args[0], args[1]))
-        else:
-            V.kernel.record_compute_op(name, False)
+        raise RuntimeError("Spyre does not use CSEProxy")
 
 
-class SpyreCSEProxy(DefaultHandler):
+class SpyreKernelOpsHandler(DefaultHandler):
     name = "SpyreCSEProxy"
 
     def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
         super().__init__()
         self.kernel = kernel
         self.parent_handler = parent_handler
-        self.kernel_summaries: dict[
-            SpyreKernelCSEVariable, str
-        ] = {}  # TODO: Correct typing!
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        bounds = self._bound_variable(name, *args, **kwargs)
-
         value = getattr(self.parent_handler, name)(*args, **kwargs)
-        dtype_handler = DtypePropagationOpsHandler()
-        shape_handler = ShapePropagationOpsHandler()
-        shape_op = getattr(shape_handler, name)
-        dtype_op = getattr(dtype_handler, name)
-        output_dtype = dtype_op(*args, **kwargs)
-        output_shape = shape_op(*args, **kwargs)
+        if name == "constant":
+            V.kernel.compute_inputs.append(Constant(args[0], args[1]))
+        else:
+            V.kernel.record_compute_op(name, False)
 
-        assert output_dtype is not None
+        return value
 
-        csevar: SpyreKernelCSEVariable = V.kernel.cse.newvar(
-            bounds, output_dtype, output_shape
-        )
-        csevar.update_on_args(name, args, kwargs)
-
-        self.kernel_summaries[csevar] = value
-
-        return csevar
-
-    def _bound_variable(self, name: str, *args: Any, **kwargs: Any) -> ValueRanges[Any]:
-        """
-        If the variable comes from an FX node, we forward the bound we have already computed
-        Else, if the variable when codegen'ing another op, we try to compute its bounds
-        """
-        fx_node = V.interpreter.current_node
-        if fx_node.target == name and self.kernel.node_to_bounds is not None:
-            assert isinstance(self.kernel.node_to_bounds, dict), type(
-                self.kernel.node_to_bounds
-            )
-            return self.kernel.node_to_bounds.get(fx_node, ValueRanges.unknown())
-
-        return ValueRanges.unknown()
-
-    def load(self, name: str, index: sympy.Expr) -> CSEVariable:
-        if free_symbol_is_type(index, SymT.TMP):
-            return self.kernel.indirect_load(name, index)
+    def load(self, name: str, index: sympy.Expr) -> Any:
         out = self.kernel.load(name, index)
-        if out.use_count == 1:
-            self.kernel.num_load += 1
         return out
 
     def store(
@@ -205,11 +180,12 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         self.op_info: dict[str, Any] = {}
         self.compute_inputs: list[TensorAccess | Constant] = []
         self.compute_output: Optional[TensorAccess] = None
+        self.rvalues: dict[SpyreKernelCSEVariable, RValue] = {}
 
     def __enter__(self) -> Self:
         super().__enter__()
         self.exit_stack.enter_context(
-            V.set_ops_handler(SpyreCSEProxy(self, SpyreKernelOverrides))
+            V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreKernelOverrides))
         )
         return self
 
@@ -231,14 +207,14 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
-        var = self.args.input(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        self.compute_inputs.append(TensorAccess(name, index, layout))
-        return self.cse.generate(self.body, f"{var}")
+        ta = TensorAccess(name, index, layout)
+        self.compute_inputs.append(ta)
+        return ta
 
     def store(
         self,
