@@ -25,7 +25,7 @@ from torch._inductor.codegen.common import (
     IndentedBuffer,
     Kernel,
 )
-from torch._inductor.ops_handler import OpsHandler, DefaultHandler
+from torch._inductor.ops_handler import DefaultHandler
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
@@ -95,7 +95,7 @@ class KernelSummary:
     op_info: dict[str, Any]
 
 
-class SpyreOpFuncs(OpsHandler[Any]):
+class SpyreOpFuncs:
     """
     Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
 
@@ -227,7 +227,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
 
     name = "SpyreKernelOpsHandler"
 
-    def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
+    def __init__(self, kernel: Kernel[Any], parent_handler: SpyreOpFuncs):
         super().__init__()
         self.kernel = kernel
         self.parent_handler = parent_handler
@@ -235,8 +235,10 @@ class SpyreKernelOpsHandler(DefaultHandler):
     def _default(
         self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> RValue:
-        value = getattr(self.parent_handler, name)(*args, **kwargs)
-        return value
+        if hasattr(self.parent_handler, name):
+            return getattr(self.parent_handler, name)(*args, **kwargs)
+        else:
+            return UnimplementedOp(name)
 
     def constant(value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
         return Constant(value, dtype)
@@ -310,7 +312,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
     def __enter__(self) -> Self:
         super().__enter__()
         self.exit_stack.enter_context(
-            V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreOpFuncs))
+            V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreOpFuncs()))
         )
         return self
 
@@ -344,7 +346,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if hasattr(self.current_node, "spyre_core_division"):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
 
-        if isinstance(value, PointwiseOp):
+        if isinstance(value, UnimplementedOp):
+            self.kernel_summaries.append(value)
+        elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.analyze_index_expr(dst.index)
             args: list[TensorArg | ConstantArg] = []
