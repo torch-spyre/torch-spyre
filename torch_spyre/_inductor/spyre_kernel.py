@@ -391,8 +391,45 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             self.kernel_summaries.append(
                 KernelSummary(value.op, False, di, scales, args, op_info)
             )
+        elif isinstance(value, TensorAccess):
+            # Reshapes, transposes, and other dataops
+            input_stride = list(self.get_strides(value.index).values())[0]
+            output_stride = list(self.get_strides(dst.index).values())[0]
+            in_di = self.analyze_index_expr(value.index)
+            out_di = self.analyze_index_expr(dst.index)
+            scale = self.analyze_tensor_access(in_di, value.index)
+            args.append(
+                create_tensor_arg(True, actuals.index(value.name), value.layout)
+            )
+            scales.append(scale)
+            scale = self.analyze_tensor_access(out_di, index)
+            args.append(
+                create_tensor_arg(
+                    False,
+                    actuals.index(dst.name),
+                    dst.layout,
+                )
+            )
+            scales.append(scale)
+
+            # Determine data op based on tensor arg and scales
+            if args[0].device_layout.device_size != args[1].device_layout.device_size:  # type: ignore[union-attr]
+                op = TRANSPOSE_OP
+            elif input_stride == 64 and output_stride == 64:
+                op = "swap"
+            elif input_stride == 64 and output_stride == 1:
+                op = "slice"
+            else:
+                op = CLONE_OP  # default to clone
+
+            ks = KernelSummary(op, False, in_di, scales, args, op_info)
+            if in_di != out_di:
+                ks.op_info["transposed_dims"] = [
+                    d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
+                ]
+            self.kernel_summaries.append(ks)
         else:
-            raise RuntimeError("TODO!")
+            raise Unsupported(f"store value of unexpected type {type(value)}")
 
     def store_reduction(self, name: str, index: sympy.Expr, value: ReductionOp) -> None:
         _ = self.args.output(name)
