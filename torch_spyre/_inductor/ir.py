@@ -20,17 +20,11 @@ from torch._inductor.utils import ir_dataclass
 from torch._inductor.ir import (
     FixedLayout,
     IRNode,
-    Pointwise,
     Reduction,
     ReductionHint,
     TensorBox,
 )
 from torch_spyre._C import SpyreTensorLayout
-
-
-@ir_dataclass
-class SpyrePointwise(Pointwise):
-    op_info: Any
 
 
 @ir_dataclass
