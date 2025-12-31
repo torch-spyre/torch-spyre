@@ -15,13 +15,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Self, Sequence, TypeAlias, Union
-import regex as re
+from typing import Any, Callable, Self, Sequence, TypeAlias, Union
 
 import torch
 import sympy
 
-from torch.utils._sympy.value_ranges import ValueRanges
 from torch._inductor.codegen.common import (
     CSEVariable,
     IndentedBuffer,
@@ -31,7 +29,6 @@ from torch._inductor.ops_handler import OpsHandler, DefaultHandler
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
-from torch._inductor.shape_propagation import BlockShapeType
 
 from .runtime import ConstantArg, TensorArg
 from .constants import (
@@ -219,6 +216,10 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
 
 class SpyreKernelOpsHandler(DefaultHandler):
+    """
+    This class plays the same role for SpyreKernel as common.CSEProxy does for SIMDKernel/Kernel
+    """
+
     name = "SpyreKernelOpsHandler"
 
     def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
@@ -282,21 +283,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
-class SpyreKernelCSEVariable(CSEVariable):
-    undefined_re = re.compile(r"\b(tmp\d+)\[\?\]")
-
-    def __init__(
-        self,
-        name,
-        bounds: ValueRanges[Any],
-        dtype: Optional[torch.dtype] = None,
-        shape: BlockShapeType = None,
-    ) -> None:
-        super().__init__(name, bounds, dtype, shape)
-        raise RuntimeError("Spyre does not use CSEProxy")
-
-
-class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
+class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
     def __init__(
@@ -313,12 +300,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreOpFuncs))
         )
         return self
-
-    def create_cse_var(
-        self, name, bounds=None, dtype=None, shape: BlockShapeType = None
-    ):
-        # TODO: This is unreachable code
-        return SpyreKernelCSEVariable(name, bounds, dtype, shape)
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
