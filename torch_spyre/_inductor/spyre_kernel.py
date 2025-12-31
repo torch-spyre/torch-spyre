@@ -77,6 +77,11 @@ class UnimplementedOp:
     op: str
 
 
+RValue: TypeAlias = Union[
+    Constant, TensorAccess, PointwiseOp, ReductionOp, UnimplementedOp
+]
+
+
 @dataclass
 class DimensionInfo:
     var: sympy.Symbol
@@ -99,11 +104,6 @@ def create_tensor_arg(
     return TensorArg(
         is_input, arg_index, layout.dtype, layout.size, layout.device_layout
     )
-
-
-RValue: TypeAlias = Union[
-    Constant, TensorAccess, PointwiseOp, ReductionOp, UnimplementedOp
-]
 
 
 class SpyreOpFuncs(OpsHandler[Any]):
