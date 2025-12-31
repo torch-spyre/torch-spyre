@@ -40,7 +40,6 @@ from .constants import (
     BATCH_MATMUL_OP,
     TRANSPOSE_OP,
     CLONE_OP,
-    UNIMPLEMENTED_OP,
 )
 from . import Unsupported
 from .ir import FixedTiledLayout
@@ -90,7 +89,7 @@ class KernelSummary:
     is_reduction: bool
     dims: list[DimensionInfo]
     scales: list[list[int]]
-    arguments: list[TensorArg | ConstantArg]
+    arguments: Sequence[TensorArg | ConstantArg]
     op_info: dict[str, Any]
 
 
@@ -102,7 +101,9 @@ def create_tensor_arg(
     )
 
 
-RValue: TypeAlias = Union[TensorAccess, Constant, PointwiseOp, ReductionOp]
+RValue: TypeAlias = Union[
+    Constant, TensorAccess, PointwiseOp, ReductionOp, UnimplementedOp
+]
 
 
 class SpyreOpFuncs(OpsHandler[Any]):
@@ -273,11 +274,11 @@ class SpyreKernelOpsHandler(DefaultHandler):
         self,
         dtypes: tuple[torch.dtype, ...],
         combine_fn: Callable[
-            [tuple[CSEVariable, ...], tuple[CSEVariable, ...]],
-            tuple[CSEVariable, ...],
+            [tuple[RValue, ...], tuple[RValue, ...]],
+            tuple[RValue, ...],
         ],
-        values: tuple[CSEVariable, ...],
-    ) -> tuple[CSEVariable, ...]:
+        values: tuple[RValue, ...],
+    ) -> tuple[RValue, ...]:
         raise NotImplementedError
 
 
@@ -304,9 +305,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         **kwargs,
     ) -> None:
         super().__init__(tiling, **kwargs)
-        self.compute_op: str = ""
-        self.spyre_op: str = ""
-
         self.kernel_summaries: list[KernelSummary | UnimplementedOp] = []
 
     def __enter__(self) -> Self:
@@ -446,92 +444,72 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
 
         actuals = self.args.python_argdefs()[1]
-        args: list[TensorArg] = []
-        scales = []
         if value.op == MATMUL_REDUCTION_OP:
-            di_x = self.analyze_index_expr(value.arguments[0].index)
-            di_y = self.analyze_index_expr(value.arguments[1].index)
+            if (
+                len(value.arguments) != 2
+                or (not isinstance(value.arguments[0], TensorAccess))
+                or (not isinstance(value.arguments[1], TensorAccess))
+            ):
+                raise Unsupported(f"invalid matmul arguments {value.arguments}")
+            x = value.arguments[0]
+            y = value.arguments[1]
+            di_x = self.analyze_index_expr(x.index)
+            di_y = self.analyze_index_expr(y.index)
             di = [di_x[0], di_x[1], di_y[1]]
-
-            for input in value.arguments:
-                if not isinstance(input, TensorAccess):
-                    raise Unsupported(f"matmul: unsupported input {input}")
-                scale = self.analyze_tensor_access(di, input.index)
-                args.append(
-                    create_tensor_arg(
-                        True,
-                        actuals.index(input.name),
-                        input.layout,
-                    )
-                )
-                scales.append(scale)
-            scale = self.analyze_tensor_access(di, dst.index)
-            args.append(
-                create_tensor_arg(
-                    False,
-                    actuals.index(dst.name),
-                    dst.layout,
-                )
-            )
-            scales.append(scale)
+            args = [
+                create_tensor_arg(True, actuals.index(x.name), x.layout),
+                create_tensor_arg(True, actuals.index(y.name), y.layout),
+                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+            ]
+            scales = [
+                self.analyze_tensor_access(di, x.index),
+                self.analyze_tensor_access(di, y.index),
+                self.analyze_tensor_access(di, dst.index),
+            ]
             self.kernel_summaries.append(
                 KernelSummary(value.op, True, di, scales, args, op_info)
             )
         elif value.op == BATCH_MATMUL_OP:
-            di_x = self.analyze_index_expr(value.arguments[0].index)  # type: ignore[union-attr]
-            di_y = self.analyze_index_expr(value.arguments[1].index)  # type: ignore[union-attr]
+            if (
+                len(value.arguments) != 2
+                or (not isinstance(value.arguments[0], TensorAccess))
+                or (not isinstance(value.arguments[1], TensorAccess))
+            ):
+                raise Unsupported(f"invalid batchmatmul arguments {value.arguments}")
+            x = value.arguments[0]
+            y = value.arguments[1]
+            di_x = self.analyze_index_expr(x.index)  # type: ignore[union-attr]
+            di_y = self.analyze_index_expr(y.index)  # type: ignore[union-attr]
             di = [di_x[0], di_x[1], di_x[2], di_y[2]]
-
-            args = []
-            scales = []
-            for input in value.arguments:
-                scale = self.analyze_tensor_access(di, input.index)  # type: ignore[union-attr]
-                args.append(
-                    create_tensor_arg(
-                        True,
-                        actuals.index(input.name),  # type: ignore[union-attr]
-                        input.layout,  # type: ignore[union-attr]
-                    )
-                )
-                scales.append(scale)
-            scale = self.analyze_tensor_access(di, dst.index)
-            args.append(
-                create_tensor_arg(
-                    False,
-                    actuals.index(dst.name),
-                    dst.layout,
-                )
-            )
-            scales.append(scale)
+            args = [
+                create_tensor_arg(True, actuals.index(x.name), x.layout),
+                create_tensor_arg(True, actuals.index(y.name), y.layout),
+                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+            ]
+            scales = [
+                self.analyze_tensor_access(di, x.index),
+                self.analyze_tensor_access(di, y.index),
+                self.analyze_tensor_access(di, dst.index),
+            ]
             self.kernel_summaries.append(
                 KernelSummary(value.op, True, di, scales, args, op_info)
             )
         else:
-            # Reductions are defined by the sole input's index
+            # All other reductions have exactly one input which is a tensor
             if (not len(value.arguments) == 1) or (
                 not isinstance(value.arguments[0], TensorAccess)
             ):
                 raise Unsupported(f"reduction operands: {value.arguments}")
-            input = value.arguments[0]
-            di = self.analyze_index_expr(input.index)
-            scale = self.analyze_tensor_access(di, input.index)
-            args.append(
-                create_tensor_arg(
-                    True,
-                    actuals.index(input.name),
-                    input.layout,
-                )
-            )
-            scales.append(scale)
-            scale = self.analyze_tensor_access(di, dst.index)
-            args.append(
-                create_tensor_arg(
-                    False,
-                    actuals.index(dst.name),
-                    dst.layout,
-                )
-            )
-            scales.append(scale)
+            x = value.arguments[0]
+            di = self.analyze_index_expr(x.index)
+            args = [
+                create_tensor_arg(True, actuals.index(x.name), x.layout),
+                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+            ]
+            scales = [
+                self.analyze_tensor_access(di, x.index),
+                self.analyze_tensor_access(di, dst.index),
+            ]
             self.kernel_summaries.append(
                 KernelSummary(value.op, True, di, scales, args, op_info)
             )
@@ -572,12 +550,12 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by constructing its KernelSpec"""
         buf = IndentedBuffer()
-        if self.spyre_op == UNIMPLEMENTED_OP:
-            buf.writeline(f"UnimplementedOp(op='{self.compute_op}')")
+        if len(self.kernel_summaries) != 1:
+            raise Unsupported(f"found {len(self.kernel_summaries)} KernelSummaries")
+        ks = self.kernel_summaries[0]
+        if isinstance(ks, UnimplementedOp):
+            buf.writeline(f"UnimplementedOp(op='{ks.op}')")
         else:
-            if len(self.kernel_summaries) != 1:
-                raise Unsupported(f"found {len(self.kernel_summaries)} KernelSummaries")
-            ks = self.kernel_summaries[0]
             buf.writeline("KernelSpec(")
             with buf.indent():
                 buf.writeline(f"op='{ks.op}',")
