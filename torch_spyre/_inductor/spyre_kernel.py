@@ -95,14 +95,6 @@ class KernelSummary:
     op_info: dict[str, Any]
 
 
-def create_tensor_arg(
-    is_input: bool, arg_index: int, layout: FixedTiledLayout
-) -> TensorArg:
-    return TensorArg(
-        is_input, arg_index, layout.dtype, layout.size, layout.device_layout
-    )
-
-
 class SpyreOpFuncs(OpsHandler[Any]):
     """
     Torch ops that are directly supported by the backend compiler for the Spyre device.
@@ -217,7 +209,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
 class SpyreKernelOpsHandler(DefaultHandler):
     """
-    This class plays the same role for SpyreKernel as common.CSEProxy does for SIMDKernel/Kernel
+    This class plays the same role for SpyreKernel as common.CSEProxy does for SIMDKernel and Kernel
     """
 
     name = "SpyreKernelOpsHandler"
@@ -281,6 +273,14 @@ class SpyreKernelOpsHandler(DefaultHandler):
         values: tuple[RValue, ...],
     ) -> tuple[RValue, ...]:
         raise NotImplementedError
+
+
+def create_tensor_arg(
+    is_input: bool, arg_index: int, layout: FixedTiledLayout
+) -> TensorArg:
+    return TensorArg(
+        is_input, arg_index, layout.dtype, layout.size, layout.device_layout
+    )
 
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
