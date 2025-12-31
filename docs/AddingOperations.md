@@ -5,16 +5,14 @@ in the Inductor Spyre backend.
 
 ### Direct mapping from ATen to OpFunc
 
-If a core ATen operation can be implemented with a single Spyre OpFunc,
-then adding it to our backend requires:
-+ adding an entry to `opfunc_mapping` in [opfuncs.py](../torch_spyre/_inductor/opfuncs.py)
-Cannonical examples are `aten.add` for a pointwise operation and
-`aten.sum` for a reduction.
+If a pointwise ATen operation can be implemented with a single Spyre OpFunc,
+then adding it to our backend just requires
+adding a method to `SpyreOpFuncs` in [spyre_kernel.py](../torch_spyre/_inductor/spyre_kernel.py).
+Cannonical examples are `add` for a pointwise operation.
 
-Some ATen operations that can be directly mapped to a Spyre OpFunc
-have default decompositions defined by Inductor. To disable the default
-decompostion in addition to the two steps above, we also add a
-method to `OpOverrides` in [opoverrides.py](../torch_spyre/_inductor/opoverrides.py).
+Some pointwise ATen operations that could be directly mapped to a Spyre OpFunc
+have default decompositions defined by Inductor. We disable the default
+decomposition by adding a method to `SpyreOpFuncs` in [spyre_kernel.py](../torch_spyre/_inductor/spyre_kernel.py).
 Cannonical examples are `reciprocal` and `sigmoid`.
 
 ### Spyre-specific lowerings
@@ -38,7 +36,10 @@ the `@torch.library.custom_op` decorator to define a new operation in
 + defining its fake function (using the `@opname.register_fake` that is defined as part of the `@custom_op`)
 
 In addition when defining a custom op, you will also need to do one of:
-+ register a lowering for the custom op (eg `aten.mm.default`) and add method to `OpOverrides` in [opoverrides.py](../torch_spyre/_inductor/opoverrides.py).
-+ register a decomposition for the custom op (eg `spyre.compact`)
++ register a lowering for the custom op in [lowering.py](../torch_spyre/_inductor/lowering.py) and
+  adding a method to `SpyreOpFuncs` in [spyre_kernel.py](../torch_spyre/_inductor/spyre_kernel.py).
+  A cannonical example is `spyre.clamp`.
++ register a decomposition for the custom op in [decompositions.py](../torch_spyre/_inductor/decompositions.py).
+  A cannonical example is `spyre.compact`.
 + define a CustomPrePass or CustomPostPass that defines a more general graph
-  rewrite that removes the custom op
+  rewrite that removes the custom op. We currently have no custom ops that use this option.

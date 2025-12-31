@@ -97,7 +97,7 @@ class KernelSummary:
 
 class SpyreOpFuncs(OpsHandler[Any]):
     """
-    Torch ops that are directly supported by the backend compiler for the Spyre device.
+    Pointwise torch ops that are directly supported by the backend compiler for the Spyre device.
 
     Keep these methods sorted in alphabetical order!
     """
@@ -112,7 +112,13 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def clamp(x, min, max):
-        return PointwiseOp("clip", [x])
+        op_info = {
+            "constants": {
+                "clipMin": min,
+                "clipMax": max,
+            }
+        }
+        return PointwiseOp("clip", [x], op_info)
 
     @staticmethod
     def eq(a, b):
@@ -140,7 +146,8 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def layernormscale(x, eps):
-        return PointwiseOp("layernormscale", [x])
+        op_info = {"constants": {"eps": eps}}
+        return PointwiseOp("layernormscale", [x], op_info)
 
     @staticmethod
     def log(x):
@@ -176,7 +183,13 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def softplus(x, beta, threshold):
-        return PointwiseOp("softplus", [x])
+        op_info = {
+            "constants": {
+                "softplusBeta": beta,
+                "softplusThresh": threshold,
+            }
+        }
+        return PointwiseOp("softplus", [x], op_info)
 
     @staticmethod
     def sqrt(x):
@@ -328,8 +341,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
         actuals = self.args.python_argdefs()[1]
         op_info = {}
-        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
-            op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
         if hasattr(self.current_node, "spyre_core_division"):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
 
