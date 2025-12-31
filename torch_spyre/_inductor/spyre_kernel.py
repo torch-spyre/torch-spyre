@@ -327,8 +327,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         dst = TensorAccess(name, index, layout)
 
         actuals = self.args.python_argdefs()[1]
-        args: list[TensorArg | ConstantArg] = []
-        scales = []
         op_info = {}
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
@@ -338,6 +336,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.analyze_index_expr(dst.index)
+            args: list[TensorArg | ConstantArg] = []
+            scales = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     scale = self.analyze_tensor_access(di, input.index)
@@ -375,20 +375,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             output_stride = list(self.get_strides(dst.index).values())[0]
             in_di = self.analyze_index_expr(value.index)
             out_di = self.analyze_index_expr(dst.index)
-            scale = self.analyze_tensor_access(in_di, value.index)
-            args.append(
-                create_tensor_arg(True, actuals.index(value.name), value.layout)
-            )
-            scales.append(scale)
-            scale = self.analyze_tensor_access(out_di, index)
-            args.append(
-                create_tensor_arg(
-                    False,
-                    actuals.index(dst.name),
-                    dst.layout,
-                )
-            )
-            scales.append(scale)
+            args = [
+                create_tensor_arg(True, actuals.index(value.name), value.layout),
+                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+            ]
+            scales = [
+                self.analyze_tensor_access(in_di, value.index),
+                self.analyze_tensor_access(out_di, index),
+            ]
 
             # Determine data op based on tensor arg and scales
             if args[0].device_layout.device_size != args[1].device_layout.device_size:  # type: ignore[union-attr]
