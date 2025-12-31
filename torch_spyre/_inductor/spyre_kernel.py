@@ -414,7 +414,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
 
-    def store_reduction(self, name: str, index: sympy.Expr, value: ReductionOp) -> None:
+    def store_reduction(
+        self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
+    ) -> None:
         _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
@@ -422,6 +424,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
+
+        if isinstance(value, UnimplementedOp):
+            self.kernel_summaries.append(value)
+            return
 
         op_info = {}
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]

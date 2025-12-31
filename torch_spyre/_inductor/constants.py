@@ -16,8 +16,6 @@ BATCH_MATMUL_OP = "batchmatmul"
 CLONE_OP = "clone"
 MATMUL_REDUCTION_OP = "matmul"
 TRANSPOSE_OP = "transpose"
-UNIMPLEMENTED_OP = "unimplemented"
-
 
 DEVICE_NAME = "spyre"
 
