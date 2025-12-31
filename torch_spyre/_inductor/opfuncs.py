@@ -46,16 +46,6 @@ def _initialize_opfunc_mapping():
         if callable(getattr(SpyreOpFuncs, attr)) and not attr.startswith("_")
     }
     # Implemented pointwise ops whose opfunc is the same as the inductor op
-    same_name = [
-        "layernormnorm",
-        "layernormscale",
-        "softplus",
-        "to_dtype",
-    ]
-    for i in same_name:
-        pointwise_ops[i] = i
-    # Implemented pointwise ops that need to be renamed
-    pointwise_ops["clamp"] = "clip"
 
     return pointwise_ops | reductions
 

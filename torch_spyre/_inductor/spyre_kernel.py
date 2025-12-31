@@ -116,8 +116,8 @@ class SpyreOpFuncs(OpsHandler[Any]):
         return PointwiseOp("add", [a, b])
 
     @staticmethod
-    def clamp(input, min=None, max=None):
-        return f"spyre.clamp({input} {min} {max})"
+    def clamp(x, min, max):
+        return PointwiseOp("clip", [x])
 
     @staticmethod
     def eq(a, b):
@@ -140,16 +140,12 @@ class SpyreOpFuncs(OpsHandler[Any]):
         return PointwiseOp("gelu", [x])
 
     @staticmethod
-    def layernormscale(x, y):
-        return f"spyre.layernormscale({x}, {y})"
+    def layernormnorm(*args):
+        return PointwiseOp("layernormnorm", list(args))
 
     @staticmethod
-    def layernormnorm(a, b, c, d, e):
-        return f"spyre.layernormnorm({a}, {b}, {c}, {d}, {e})"
-
-    @staticmethod
-    def le(a, b):
-        return f"{a} <= {b}"
+    def layernormscale(x, eps):
+        return PointwiseOp("layernormscale", [x])
 
     @staticmethod
     def log(x):
@@ -168,10 +164,6 @@ class SpyreOpFuncs(OpsHandler[Any]):
         return PointwiseOp("neg", [a])
 
     @staticmethod
-    def pow(a, b):
-        return f"{a} ** {b}"
-
-    @staticmethod
     def reciprocal(x):
         return PointwiseOp("reciprocal", [x])
 
@@ -188,8 +180,8 @@ class SpyreOpFuncs(OpsHandler[Any]):
         return PointwiseOp("sigmoid", [x])
 
     @staticmethod
-    def softplus(x, y, z):
-        return f"spyre.softplus({x}, {y}, {z})"
+    def softplus(x, beta, threshold):
+        return PointwiseOp("softplus", [x])
 
     @staticmethod
     def sqrt(x):
@@ -197,7 +189,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def square(x):
-        return f"{x} * {x}"
+        return PointwiseOp("mul", [x, x])
 
     @staticmethod
     def sub(a, b):
@@ -209,7 +201,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def to_dtype(x, dtype, src_dtype):
-        return f"spyre.to_dtype({x} {dtype} {src_dtype})"
+        return PointwiseOp("to_dtype", [x])
 
     @staticmethod
     def truediv(a, b):
@@ -440,6 +432,12 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
 
+        op_info = {}
+        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
+            op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
+        if hasattr(self.current_node, "spyre_core_division"):
+            op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
+
         actuals = self.args.python_argdefs()[1]
         args: list[TensorArg] = []
         scales = []
@@ -470,7 +468,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             )
             scales.append(scale)
             self.kernel_summaries.append(
-                KernelSummary(value.op, True, di, scales, args, self.op_info)
+                KernelSummary(value.op, True, di, scales, args, op_info)
             )
         elif value.op == BATCH_MATMUL_OP:
             di_x = self.analyze_index_expr(value.arguments[0].index)  # type: ignore[union-attr]
@@ -499,7 +497,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             )
             scales.append(scale)
             self.kernel_summaries.append(
-                KernelSummary(value.op, True, di, scales, args, self.op_info)
+                KernelSummary(value.op, True, di, scales, args, op_info)
             )
         else:
             # Reductions are defined by the sole input's index
@@ -528,7 +526,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             )
             scales.append(scale)
             self.kernel_summaries.append(
-                KernelSummary(value.op, True, di, scales, args, self.op_info)
+                KernelSummary(value.op, True, di, scales, args, op_info)
             )
 
     def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
