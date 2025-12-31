@@ -30,7 +30,7 @@ from torch._inductor.codegen.common import (
 from torch._inductor.ops_handler import OpsHandler, DefaultHandler
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
-from torch._inductor.virtualized import ReductionType, StoreMode, V
+from torch._inductor.virtualized import StoreMode, V
 from torch._inductor.shape_propagation import BlockShapeType
 
 from .runtime import ConstantArg, TensorArg
@@ -42,7 +42,7 @@ from .constants import (
     CLONE_OP,
 )
 from . import Unsupported
-from .opfuncs import UNIMPLEMENTED, get_spyre_op
+from .opfuncs import UNIMPLEMENTED
 from .ir import FixedTiledLayout
 
 
@@ -82,6 +82,7 @@ class DimensionInfo:
 @dataclass
 class KernelSummary:
     op: str
+    is_reduction: bool
     dims: list[DimensionInfo]
     scales: list[list[int]]
     arguments: list[TensorArg | ConstantArg]
@@ -124,7 +125,7 @@ class SpyreOpFuncs(OpsHandler[Any]):
 
     @staticmethod
     def exp(x):
-        return PointwiseOp("eq", [x])
+        return PointwiseOp("exp", [x])
 
     @staticmethod
     def exx2(a, b, c):
@@ -227,38 +228,41 @@ class SpyreKernelOpsHandler(DefaultHandler):
         self.kernel = kernel
         self.parent_handler = parent_handler
 
-    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    def _default(
+        self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> RValue:
         value = getattr(self.parent_handler, name)(*args, **kwargs)
         return value
 
     def constant(value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
-        c = Constant(value, dtype)
-        V.kernel.compute_inputs.append(c)
-        return c
+        return Constant(value, dtype)
 
-    def load(self, name: str, index: sympy.Expr) -> Any:
-        out = self.kernel.load(name, index)
-        return out
+    def load(self, name: str, index: sympy.Expr) -> RValue:
+        self.kernel.num_load += 1
+        return self.kernel.load(name, index)
 
     def store(
-        self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
+        self, name: str, index: sympy.Expr, value: RValue, mode: StoreMode = None
     ) -> None:
         self.kernel.store_buffer_names.add(name)
         self.kernel.store(name, index, value, mode=mode)
 
-    def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+    def store_reduction(self, name: str, index: sympy.Expr, value: ReductionOp) -> None:
         self.kernel.store_buffer_names.add(name)
-        return self.kernel.store_reduction(name, index, value)
+        self.kernel.store_reduction(name, index, value)
 
     def reduction(
         self,
         dtype: torch.dtype,
         src_dtype: torch.dtype,
-        reduction_type: ReductionType,
-        value: Union[CSEVariable, tuple[CSEVariable, ...]],
-    ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
+        reduction_type: str,
+        value: Union[RValue, tuple[RValue, ...]],
+    ) -> RValue:
         self.kernel.num_reduction += 1
-        return self.kernel.reduction(dtype, src_dtype, reduction_type, value)
+        if isinstance(value, tuple):
+            return ReductionOp(reduction_type, list(value))
+        else:
+            return ReductionOp(reduction_type, [value])
 
     def scan(
         self,
@@ -269,7 +273,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
         ],
         values: tuple[CSEVariable, ...],
     ) -> tuple[CSEVariable, ...]:
-        return self.kernel.scan(dtypes, combine_fn, values)
+        raise NotImplementedError
 
 
 class SpyreKernelCSEVariable(CSEVariable):
@@ -316,17 +320,6 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
     ):
         # TODO: This is unreachable code
         return SpyreKernelCSEVariable(name, bounds, dtype, shape)
-
-    def record_compute_op(self, op: str, is_reduction: bool):
-        if V.kernel.compute_op != "":
-            raise Unsupported(f"multi-op kernel: {V.kernel.compute_op} {op}")
-        self.compute_op = op
-        self.spyre_op = get_spyre_op(op)
-        self.compute_op_is_reduction = is_reduction
-        if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
-            self.op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
-        if hasattr(self.current_node, "spyre_core_division"):
-            self.op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
@@ -396,20 +389,110 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             scales.append(scale)
             op_info.update(value.op_info)
             self.kernel_summaries.append(
-                KernelSummary(value.op, di, scales, args, op_info)
+                KernelSummary(value.op, False, di, scales, args, op_info)
             )
         else:
             raise RuntimeError("TODO!")
 
-    def reduction(
-        self,
-        dtype: torch.dtype,
-        src_dtype: torch.dtype,
-        reduction_type: ReductionType,
-        value: Union[CSEVariable, tuple[CSEVariable, ...]],
-    ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
-        self.record_compute_op(reduction_type, True)
-        return ()
+    def store_reduction(self, name: str, index: sympy.Expr, value: ReductionOp) -> None:
+        _ = self.args.output(name)
+        buf = V.graph.get_buffer(name)
+        layout = buf.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            raise Unsupported(f"{name} does not have FixedTiledLayout")
+        index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+        dst = TensorAccess(name, index, layout)
+
+        actuals = self.args.python_argdefs()[1]
+        args: list[TensorArg] = []
+        scales = []
+        if value.op == MATMUL_REDUCTION_OP:
+            di_x = self.analyze_index_expr(value.arguments[0].index)
+            di_y = self.analyze_index_expr(value.arguments[1].index)
+            di = [di_x[0], di_x[1], di_y[1]]
+
+            for input in value.arguments:
+                if not isinstance(input, TensorAccess):
+                    raise Unsupported(f"matmul: unsupported input {input}")
+                scale = self.analyze_tensor_access(di, input.index)
+                args.append(
+                    create_tensor_arg(
+                        True,
+                        actuals.index(input.name),
+                        input.layout,
+                    )
+                )
+                scales.append(scale)
+            scale = self.analyze_tensor_access(di, dst.index)
+            args.append(
+                create_tensor_arg(
+                    False,
+                    actuals.index(dst.name),
+                    dst.layout,
+                )
+            )
+            scales.append(scale)
+            self.kernel_summaries.append(
+                KernelSummary(value.op, True, di, scales, args, self.op_info)
+            )
+        elif value.op == BATCH_MATMUL_OP:
+            di_x = self.analyze_index_expr(value.arguments[0].index)  # type: ignore[union-attr]
+            di_y = self.analyze_index_expr(value.arguments[1].index)  # type: ignore[union-attr]
+            di = [di_x[0], di_x[1], di_x[2], di_y[2]]
+
+            args = []
+            scales = []
+            for input in value.arguments:
+                scale = self.analyze_tensor_access(di, input.index)  # type: ignore[union-attr]
+                args.append(
+                    create_tensor_arg(
+                        True,
+                        actuals.index(input.name),  # type: ignore[union-attr]
+                        input.layout,  # type: ignore[union-attr]
+                    )
+                )
+                scales.append(scale)
+            scale = self.analyze_tensor_access(di, dst.index)
+            args.append(
+                create_tensor_arg(
+                    False,
+                    actuals.index(dst.name),
+                    dst.layout,
+                )
+            )
+            scales.append(scale)
+            self.kernel_summaries.append(
+                KernelSummary(value.op, True, di, scales, args, self.op_info)
+            )
+        else:
+            # Reductions are defined by the sole input's index
+            if (not len(value.arguments) == 1) or (
+                not isinstance(value.arguments[0], TensorAccess)
+            ):
+                raise Unsupported(f"reduction operands: {value.arguments}")
+            input = value.arguments[0]
+            di = self.analyze_index_expr(input.index)
+            scale = self.analyze_tensor_access(di, input.index)
+            args.append(
+                create_tensor_arg(
+                    True,
+                    actuals.index(input.name),
+                    input.layout,
+                )
+            )
+            scales.append(scale)
+            scale = self.analyze_tensor_access(di, dst.index)
+            args.append(
+                create_tensor_arg(
+                    False,
+                    actuals.index(dst.name),
+                    dst.layout,
+                )
+            )
+            scales.append(scale)
+            self.kernel_summaries.append(
+                KernelSummary(value.op, True, di, scales, args, self.op_info)
+            )
 
     def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
         """
@@ -625,7 +708,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             buf.writeline("KernelSpec(")
             with buf.indent():
                 buf.writeline(f"op='{ks.op}',")
-                buf.writeline(f"is_reduction={self.compute_op_is_reduction},")
+                buf.writeline(f"is_reduction={ks.is_reduction},")
                 buf.writeline(f"dimensions={[dmd.numel for dmd in ks.dims]!r},")
                 buf.writeline(f"scales={ks.scales!r},")
                 buf.writeline(f"op_info={ks.op_info!r},")
