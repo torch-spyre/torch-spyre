@@ -29,6 +29,15 @@ from torch_spyre._C import SpyreTensorLayout
 
 @ir_dataclass
 class SpyreReduction(Reduction):
+    """
+    This class extends Reduction with an op_info to enable spyre-specific information
+    to be passed from lowering to codegen for reduction operations.
+
+    We believe this is needed because reduction operations do not go through the same
+    virtualized ops API as pointwise operations do after lowering.
+    TODO: validate this belief.
+    """
+
     op_info: Any
 
     @classmethod
@@ -61,6 +70,12 @@ class SpyreReduction(Reduction):
 
 
 class FixedTiledLayout(FixedLayout):
+    """
+    A Tensor layout for a tensor that is on a Spyre device.
+    It augments FixedLayout (the "host" tensor layout) with
+    the device tensor layout and the information needed to map between them.
+    """
+
     device_layout: SpyreTensorLayout
 
     def __init__(

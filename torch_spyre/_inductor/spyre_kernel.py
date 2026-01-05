@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Any, Callable, Self, Sequence, TypeAlias, Union
+from typing import Any, Callable, Self, Sequence, Union
+from abc import ABC
 
 import torch
 import sympy
@@ -42,41 +41,42 @@ from . import Unsupported
 from .ir import FixedTiledLayout
 
 
+class RValue(ABC):
+    """
+    An RValue is an expression that can appear on the right hand side of an assignment.
+    """
+
+
 @dataclass
-class TensorAccess:
+class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
 
 
 @dataclass
-class Constant:
+class Constant(RValue):
     value: Union[bool, float, int]
     dtype: torch.dtype
 
 
 @dataclass
-class PointwiseOp:
+class PointwiseOp(RValue):
     op: str
     arguments: list[RValue]
     op_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class ReductionOp:
+class ReductionOp(RValue):
     op: str
     arguments: list[RValue]
     op_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class UnimplementedOp:
+class UnimplementedOp(RValue):
     op: str
-
-
-RValue: TypeAlias = Union[
-    Constant, TensorAccess, PointwiseOp, ReductionOp, UnimplementedOp
-]
 
 
 @dataclass
@@ -222,7 +222,7 @@ class SpyreOpFuncs:
 
 class SpyreKernelOpsHandler(DefaultHandler):
     """
-    This class plays the same role for SpyreKernel as common.CSEProxy does for SIMDKernel and Kernel
+    This class plays the same role for SpyreKernel as common.CSEProxy does for SIMDKernel and Kernel.
     """
 
     name = "SpyreKernelOpsHandler"
@@ -253,7 +253,9 @@ class SpyreKernelOpsHandler(DefaultHandler):
         self.kernel.store_buffer_names.add(name)
         self.kernel.store(name, index, value, mode=mode)
 
-    def store_reduction(self, name: str, index: sympy.Expr, value: ReductionOp) -> None:
+    def store_reduction(
+        self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
+    ) -> None:
         self.kernel.store_buffer_names.add(name)
         self.kernel.store_reduction(name, index, value)
 
@@ -421,6 +423,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
     def store_reduction(
         self, name: str, index: sympy.Expr, value: ReductionOp | UnimplementedOp
     ) -> None:
+        """Convert an RValue"""
         _ = self.args.output(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
