@@ -29,7 +29,7 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
-from .runtime import ConstantArg, TensorArg
+from .runtime import ConstantArg, KernelSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -83,16 +83,6 @@ class UnimplementedOp(RValue):
 class DimensionInfo:
     var: sympy.Symbol
     numel: int
-
-
-@dataclass
-class KernelSummary:
-    op: str
-    is_reduction: bool
-    dims: list[DimensionInfo]
-    scales: list[list[int]]
-    arguments: Sequence[TensorArg | ConstantArg]
-    op_info: dict[str, Any]
 
 
 class SpyreOpFuncs:
@@ -300,6 +290,26 @@ def create_tensor_arg(
     )
 
 
+def create_kernel_spec(
+    op: str,
+    is_reduction: bool,
+    dims: list[DimensionInfo],
+    args: Sequence[TensorArg | ConstantArg],
+    scales: list[list[int]],
+    op_info: dict[str, Any],
+) -> KernelSpec:
+    for arg in args:
+        if arg.dtype == torch.float32 and op not in SPYRE_FP32_OPS:
+            raise Unsupported(f"{op} on {arg.dtype} dtype")
+        elif arg.dtype not in [
+            torch.bool,
+            torch.float16,
+            torch.float32,
+        ]:
+            raise Unsupported(f"operations on {arg.dtype} dtype")
+    return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
+
+
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -309,7 +319,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         **kwargs,
     ) -> None:
         super().__init__(tiling, **kwargs)
-        self.kernel_summaries: list[KernelSummary | UnimplementedOp] = []
+        self.kernel_specs: list[KernelSpec | UnimplementedOp] = []
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -349,7 +359,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
 
         if isinstance(value, UnimplementedOp):
-            self.kernel_summaries.append(value)
+            self.kernel_specs.append(value)
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.analyze_index_expr(dst.index)
@@ -383,8 +393,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             )
             scales.append(scale)
             op_info.update(value.op_info)
-            self.kernel_summaries.append(
-                KernelSummary(value.op, False, di, scales, args, op_info)
+            self.kernel_specs.append(
+                create_kernel_spec(value.op, False, di, args, scales, op_info)
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
@@ -411,12 +421,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             else:
                 op = CLONE_OP  # default to clone
 
-            ks = KernelSummary(op, False, in_di, scales, args, op_info)
+            ks = create_kernel_spec(op, False, in_di, args, scales, op_info)
             if in_di != out_di:
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
-            self.kernel_summaries.append(ks)
+            self.kernel_specs.append(ks)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
 
@@ -433,7 +443,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         dst = TensorAccess(name, index, layout)
 
         if isinstance(value, UnimplementedOp):
-            self.kernel_summaries.append(value)
+            self.kernel_specs.append(value)
             return
 
         op_info = {}
@@ -465,8 +475,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(di, y.index),
                 self.analyze_tensor_access(di, dst.index),
             ]
-            self.kernel_summaries.append(
-                KernelSummary(value.op, True, di, scales, args, op_info)
+            self.kernel_specs.append(
+                create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
         elif value.op == BATCH_MATMUL_OP:
             if (
@@ -490,8 +500,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(di, y.index),
                 self.analyze_tensor_access(di, dst.index),
             ]
-            self.kernel_summaries.append(
-                KernelSummary(value.op, True, di, scales, args, op_info)
+            self.kernel_specs.append(
+                create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
         else:
             # All other reductions have exactly one input which is a tensor
@@ -509,8 +519,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(di, x.index),
                 self.analyze_tensor_access(di, dst.index),
             ]
-            self.kernel_summaries.append(
-                KernelSummary(value.op, True, di, scales, args, op_info)
+            self.kernel_specs.append(
+                create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
 
     def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
@@ -547,11 +557,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         return result
 
     def codegen_kernel(self):
-        """Codegen the body of this kernel by constructing its KernelSpec"""
+        """Codegen the body of this kernel by pretty printing its KernelSpec"""
         buf = IndentedBuffer()
-        if len(self.kernel_summaries) != 1:
-            raise Unsupported(f"found {len(self.kernel_summaries)} KernelSummaries")
-        ks = self.kernel_summaries[0]
+        if len(self.kernel_specs) != 1:
+            raise Unsupported(f"found {len(self.kernel_specs)} KernelSpecs")
+        ks = self.kernel_specs[0]
         if isinstance(ks, UnimplementedOp):
             buf.writeline(f"UnimplementedOp(op='{ks.op}')")
         else:
@@ -559,21 +569,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             with buf.indent():
                 buf.writeline(f"op='{ks.op}',")
                 buf.writeline(f"is_reduction={ks.is_reduction},")
-                buf.writeline(f"dimensions={[dmd.numel for dmd in ks.dims]!r},")
+                buf.writeline(f"dimensions={ks.dimensions!r},")
                 buf.writeline(f"scales={ks.scales!r},")
                 buf.writeline(f"op_info={ks.op_info!r},")
                 buf.writeline("args=[")
                 with buf.indent():
-                    for arg in ks.arguments:
+                    for arg in ks.args:
                         buf.writeline(f"{arg!r},")
-                        if arg.dtype == torch.float32 and ks.op not in SPYRE_FP32_OPS:
-                            raise Unsupported(f"{ks.op} on {arg.dtype} dtype")
-                        elif arg.dtype not in [
-                            torch.bool,
-                            torch.float16,
-                            torch.float32,
-                        ]:
-                            raise Unsupported(f"operations on {arg.dtype} dtype")
                 buf.writeline("]")
             buf.writeline(")")
 
