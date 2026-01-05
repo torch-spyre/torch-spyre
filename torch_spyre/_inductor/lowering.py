@@ -42,8 +42,8 @@ def lower_mm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1 = index
         (r0,) = reduction_index
-        tmp1 = ops.load(x.get_name(), x.get_layout().stride[0] * i0 + r0)
-        tmp2 = ops.load(y.get_name(), i1 + y.get_layout().stride[0] * r0)
+        tmp1 = ops.load(x.get_name(), x.get_size()[1] * i0 + r0)
+        tmp2 = ops.load(y.get_name(), i1 + y.get_size()[1] * r0)
         return (tmp1, tmp2)
 
     result = Reduction.create(
@@ -66,14 +66,14 @@ def lower_mm(x, y):
 def lower_bmm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1, i2 = index
-        x_layout = x.get_layout()
-        y_layout = y.get_layout()
         (r0,) = reduction_index
         tmp1 = ops.load(
-            x.get_name(), x_layout.stride[0] * i0 + x_layout.stride[1] * i1 + r0
+            x.get_name(),
+            x.get_size()[2] * x.get_size()[1] * i0 + x.get_size()[1] * i1 + r0,
         )
         tmp2 = ops.load(
-            y.get_name(), y_layout.stride[0] * i0 + y_layout.stride[1] * r0 + i2
+            y.get_name(),
+            y.get_size()[2] * y.get_size()[1] * i0 + y.get_size()[1] * r0 + i2,
         )
         return (tmp1, tmp2)
 
