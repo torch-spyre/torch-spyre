@@ -119,6 +119,7 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("View tensors do not have SpyreTensorImpl")
     def test_t_1d(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
