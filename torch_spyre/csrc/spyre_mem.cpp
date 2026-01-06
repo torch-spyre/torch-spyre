@@ -21,6 +21,7 @@
 #include <ATen/ops/as_strided_cpu_dispatch.h>
 #include <ATen/ops/set_cpu_dispatch.h>
 #include <c10/core/Allocator.h>
+#include <c10/core/MemoryFormat.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
 #include <torch/library.h>
@@ -238,6 +239,7 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
   dci.dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
+  // Reverse PyTorch ordering
   std::reverse(stl.device_size.begin(), stl.device_size.end());
   std::reverse(stl.dim_map.begin(), stl.dim_map.end());
   std::reverse(cpu_shape.begin(), cpu_shape.end());
@@ -245,8 +247,8 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
                                       stick_size, host2device);
   dci.input_shape_ = host2device ? cpu_shape : stl.device_size;
   dci.output_shape_ = host2device ? stl.device_size : cpu_shape;
-
   dci.exportJson(s);
+  DEBUGINFO("DataConversionInfo: ", s.str());
   return s.str();
 }
 
@@ -256,6 +258,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   /* self = source
    * dst  = destination
    */
+
   const at::Tensor* dev_tensor;
   const at::Tensor* cpu_tensor;
   if (host2device) {
@@ -265,10 +268,14 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
     cpu_tensor = &dst;
     dev_tensor = &self;
   }
+
+  DEBUGINFO("DevTensor: ", dev_tensor->sizes());
+  DEBUGINFO("CPUTensor: ", cpu_tensor->sizes());
+
   auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
   const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
   auto layout = sendnn::TensorLayout::NHWC;
-  SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
+  SpyreTensorLayout stl = get_spyre_tensor_layout(host2device ? dst : self);
   sendnn::TensorShape dev_tensor_shape(stl.device_size);
 
   // ti = transfer info
@@ -497,9 +504,32 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
   TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
               "Pin memory can only be on CPU");
   const c10::DeviceGuard device_guard(device);
+  // Check if tensor requires padding
+  int stick_size = BYTES_IN_STICK / c10::elementSize(dtype);
+  auto sizes = size.vec();
+  size_t size_bytes = BYTES_IN_STICK;
+  if (size.size() == 0) {
+    sizes = {stick_size};
+  }
+  auto requires_padding = sizes.back() % stick_size != 0;
+  sizes[sizes.size() - 1] = requires_padding
+                                ? ((sizes.back() / stick_size) + 1) * stick_size
+                                : sizes.back();
+
+  auto device_layout = SpyreTensorLayout(sizes, dtype);
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
-  return at::detail::empty_generic(size, &SpyreAllocator::instance(), pu1_dks,
-                                   dtype, memory_format_opt);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
+          c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+          &SpyreAllocator::instance(),
+          /*resizeable=*/true)),
+      pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  tensor.unsafeGetTensorImpl()->set_sizes_contiguous(size);
+  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  return tensor;
 }
 
 /**
@@ -553,16 +583,19 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
   auto tensorImpl = tensor.unsafeGetTensorImpl();
   if (size.size() == 0) {
-    c10::IntArrayRef one({1});
-    tensorImpl->set_sizes_and_strides(one, one);
+    DEBUGINFO("SCALAR");
+    std::vector<int64_t> one = {1};
+    c10::IntArrayRef tmp_size(one);
+    c10::IntArrayRef tmp_stride(one);
+    tensorImpl->set_sizes_and_strides(tmp_size, tmp_stride);
+
   } else {
     tensorImpl->set_sizes_and_strides(size, stride);
   }
-  DEBUGINFO("device shape: ", device_layout.device_size);
-  DEBUGINFO("bytes on spyre: ", device_layout.size_bytes);
 
   static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
-
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  DEBUGINFO("Size:", tensor.sizes());
   return tensor;
 }
 
@@ -573,7 +606,6 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   at::detail::check_size_nonnegative(size);
   c10::Device device =
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
-
   if (device_layout.size_bytes == 0) {
     device_layout.size_bytes = spyre::get_device_size_in_bytes(device_layout);
   }
@@ -593,13 +625,14 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   tensorImpl->set_sizes_and_strides(size, stride);
 
   static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
-
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
   // Metadata-only change so we re-use the cpu impl
+  DEBUGINFO("as_strided")
   return at::cpu::as_strided(self, size, stride, storage_offset_);
 }
 
