@@ -258,7 +258,6 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   /* self = source
    * dst  = destination
    */
-
   const at::Tensor* dev_tensor;
   const at::Tensor* cpu_tensor;
   if (host2device) {
@@ -268,9 +267,6 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
     cpu_tensor = &dst;
     dev_tensor = &self;
   }
-
-  DEBUGINFO("DevTensor: ", dev_tensor->sizes());
-  DEBUGINFO("CPUTensor: ", cpu_tensor->sizes());
 
   auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
   const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
@@ -316,7 +312,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   sendnn::SubGraph exec_graph;
   {  // add above subgraph as part of SenFusedDeviceCompute node
     flex::FlexGraphBuilder gb;
-    auto dci = generate_dci(cpu_tensor, stl, host2device);
+    auto dci = generate_dci(dev_tensor, stl, host2device);
     if (host2device) {
       auto inp_node = gb.PrimaryInput("Input", cpu_ti);
       auto dci_node = gb.SenHostCompute("Host2Sen-HostPrep", {dci_ti},
@@ -583,7 +579,6 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
   auto tensorImpl = tensor.unsafeGetTensorImpl();
   if (size.size() == 0) {
-    DEBUGINFO("SCALAR");
     std::vector<int64_t> one = {1};
     c10::IntArrayRef tmp_size(one);
     c10::IntArrayRef tmp_stride(one);
@@ -595,7 +590,6 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
 
   static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
-  DEBUGINFO("Size:", tensor.sizes());
   return tensor;
 }
 
@@ -631,9 +625,38 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
-  // Metadata-only change so we re-use the cpu impl
-  DEBUGINFO("as_strided")
-  return at::cpu::as_strided(self, size, stride, storage_offset_);
+  c10::Device device =
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
+  const auto dtype = self.scalar_type();
+  TORCH_CHECK(device.is_privateuseone());
+  const c10::DeviceGuard device_guard(device);
+  // Check if tensor requires padding
+  int stick_size = BYTES_IN_STICK / c10::elementSize(dtype);
+  auto sizes = size.vec();
+  size_t size_bytes = BYTES_IN_STICK;
+  if (size.size() == 0) {
+    sizes = {stick_size};
+  }
+  auto requires_padding = sizes.back() % stick_size != 0;
+  sizes[sizes.size() - 1] = requires_padding
+                                ? ((sizes.back() / stick_size) + 1) * stick_size
+                                : sizes.back();
+
+  auto device_layout = SpyreTensorLayout(sizes, dtype);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
+          c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+          &SpyreAllocator::instance(),
+          /*resizeable=*/true)),
+      pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride,
+                                                      storage_offset_);
+  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  return tensor;
 }
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
