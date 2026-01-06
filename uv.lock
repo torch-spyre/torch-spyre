@@ -235,14 +235,14 @@ wheels = [
 
 [[package]]
 name = "hypothesis"
-version = "6.148.2"
+version = "6.149.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "sortedcontainers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4a/99/a3c6eb3fdd6bfa01433d674b0f12cd9102aa99630689427422d920aea9c6/hypothesis-6.148.2.tar.gz", hash = "sha256:07e65d34d687ddff3e92a3ac6b43966c193356896813aec79f0a611c5018f4b1", size = 469984, upload-time = "2025-11-18T20:21:17.047Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/8d/b332c373c2571996d33b8721f3b35788fac8dc3770fe7958f639f2a0f24e/hypothesis-6.149.1.tar.gz", hash = "sha256:abe36199df3f068f72db85bd5f347a9032b79044a27bd9d2eb016179e5313069", size = 474274, upload-time = "2026-01-05T22:31:06.476Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/d2/c2673aca0127e204965e0e9b3b7a0e91e9b12993859ac8758abd22669b89/hypothesis-6.148.2-py3-none-any.whl", hash = "sha256:bf8ddc829009da73b321994b902b1964bcc3e5c3f0ed9a1c1e6a1631ab97c5fa", size = 536986, upload-time = "2025-11-18T20:21:15.212Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/de/49d680ea2e43237a06adadce52cc1f7042551295240a3c7eaeaca9f8c009/hypothesis-6.149.1-py3-none-any.whl", hash = "sha256:48d7ea77cae8b83c6c3c9f50ac683ae3b1673c1c306909410ea348e4e97aeb77", size = 541691, upload-time = "2026-01-05T22:31:03.853Z" },
 ]
 
 [[package]]
@@ -981,7 +981,7 @@ requires-dist = [
     { name = "build", marker = "extra == 'build'", specifier = "~=1.3.0" },
     { name = "cmake", marker = "extra == 'build'", specifier = ">=3.26.1,<4.0.0" },
     { name = "expecttest", marker = "extra == 'build'", specifier = "~=0.3.0" },
-    { name = "hypothesis", marker = "extra == 'build'", specifier = "~=6.148.1" },
+    { name = "hypothesis", marker = "extra == 'build'", specifier = "~=6.149.1" },
     { name = "jinja2", marker = "extra == 'build'", specifier = "~=3.1.6" },
     { name = "mypy", marker = "extra == 'lint'", specifier = "~=1.13.0" },
     { name = "ninja", marker = "extra == 'build'", specifier = "~=1.13.0" },

@@ -18,7 +18,7 @@ filelock==3.20.0
     #   virtualenv
 fsspec==2025.10.0
     # via torch
-hypothesis==6.148.2
+hypothesis==6.149.1
     # via torch-spyre
 identify==2.6.15
     # via pre-commit

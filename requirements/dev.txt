@@ -35,7 +35,7 @@ huggingface-hub==0.36.0
     # via
     #   tokenizers
     #   transformers
-hypothesis==6.148.2
+hypothesis==6.149.1
     # via torch-spyre
 identify==2.6.15
     # via pre-commit
