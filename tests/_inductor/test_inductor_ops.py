@@ -190,6 +190,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        (
+            "test_alias_operands_cpu",
+            "test_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "pow": lambda x: torch.pow(x, 2),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),),
+                    ((67, 256),),
+                ]
+            ),
+        },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {
@@ -449,6 +463,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare_with_cpu(op, x)
         else:
             compare(op, x)
+
+    def test_unary_op_cpu(self, op, x):
+        compare_with_cpu(op, x)
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
