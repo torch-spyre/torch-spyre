@@ -516,7 +516,7 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
-          c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+          c10::StorageImpl::use_byte_size_t(), size_bytes,
           &SpyreAllocator::instance(),
           /*resizeable=*/true)),
       pu1_dks, c10::scalarTypeToTypeMeta(dtype));
@@ -548,12 +548,10 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
-  auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
-  int stick_size = device_layout.elems_per_stick();
+  int stick_size = BYTES_IN_STICK / c10::elementSize(scalar_type);
 
   // Check if tensor requires padding
   auto sizes = size.vec();
-  size_t size_bytes = BYTES_IN_STICK;
   if (size.size() == 0) {
     sizes = {stick_size};
   }
@@ -561,12 +559,12 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   sizes[sizes.size() - 1] = requires_padding
                                 ? ((sizes.back() / stick_size) + 1) * stick_size
                                 : sizes.back();
-
+  DEBUGINFO("Size:", sizes, ", Stride: ", stride, " on device ", device);
   auto device_layout = SpyreTensorLayout(sizes, scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
-      c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+      c10::StorageImpl::use_byte_size_t(), size_bytes,
       &SpyreAllocator::instance(),
       /*resizeable=*/true);
   auto spyre_storage = c10::Storage(spyre_storage_impl);
@@ -600,11 +598,9 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   at::detail::check_size_nonnegative(size);
   c10::Device device =
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
-  if (device_layout.size_bytes == 0) {
-    device_layout.size_bytes = spyre::get_device_size_in_bytes(device_layout);
-  }
+  size_t size_bytes = get_device_size_in_bytes(device_layout);
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
-      c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+      c10::StorageImpl::use_byte_size_t(), size_bytes,
       &SpyreAllocator::instance(),
       /*resizeable=*/true);
   auto spyre_storage = c10::Storage(spyre_storage_impl);
@@ -646,7 +642,7 @@ at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
-          c10::StorageImpl::use_byte_size_t(), device_layout.size_bytes,
+          c10::StorageImpl::use_byte_size_t(), size_bytes,
           &SpyreAllocator::instance(),
           /*resizeable=*/true)),
       pu1_dks, c10::scalarTypeToTypeMeta(dtype));

@@ -42,7 +42,7 @@ class SpyreTensorLayout {
    * The dimensions are in decreasing stride order with the stick dimension(s)
    * last.
    */
-  std::vector<int64_t> device_size = {};
+  std::vector<int64_t> device_size;
 
   /**
    * Record the mapping from host size to device_size.

@@ -25,6 +25,8 @@
 
 namespace spyre {
 
+#define BYTES_IN_STICK 128
+
 int64_t elems_per_stick(const DataFormats& df) {
   // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
   if (df == DataFormats::IEEE_INT32) {
@@ -89,13 +91,14 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->num_stick_dims = 1;
     this->device_size[0] = 1;
     this->dim_map[0] = 0;  // host_size has no entries!
-    this->size_bytes = BYTES_IN_STICK;
+
     return;
   }
 
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + 1;
-  auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
+  auto elems_in_stick =
+      format == Dense ? this->elems_per_stick() : this->elems_per_stick();
 
   TORCH_CHECK(host_size.size() == dim_order.size(),
               "Invalid arguments: host_size.size() != dim_order.size()");
@@ -104,10 +107,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->dim_map = spyre::get_generic_stick_layout(host_size.size(), dim_order);
   this->format = format;
   this->num_stick_dims = 1;
-  this->size_bytes = BYTES_IN_STICK;
 
   // Stick dim
-  auto stick_dim = dim_order[host_dims - 1];
+  auto stick_dim = this->dim_map[0];
   this->device_size[0] = elems_in_stick;
 
   // Non-stick dims
@@ -115,13 +117,10 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     auto dim = this->dim_map[i];
     if (dim == stick_dim) {
       this->device_size[i] =
-          format == Dense
-              ? (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick
-              : host_size[stick_dim];
+          (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
     } else {
       this->device_size[i] = host_size[dim];
     }
-    this->size_bytes *= this->device_size[i];
   }
   std::reverse(this->dim_map.begin(), this->dim_map.end());
   std::reverse(this->device_size.begin(), this->device_size.end());
