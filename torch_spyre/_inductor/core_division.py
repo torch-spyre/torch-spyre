@@ -17,11 +17,17 @@ import os
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
+    FallbackKernel,
     FixedLayout,
+    MultiOutput,
     Pointwise,
     Reduction,
 )
-from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    ExternKernelSchedulerNode,
+    SchedulerNode,
+)
 
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP
@@ -97,7 +103,8 @@ def core_division_planning(
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
 
-    for n in nodes:
+    it = iter(nodes)
+    for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             if isinstance(n.node.data, Pointwise):
                 divide_pointwise_op(n, get_mem_deps(n), max_cores)
@@ -106,7 +113,19 @@ def core_division_planning(
             else:
                 # Core division not supported on other IRNode types
                 pass
+        elif isinstance(n, ExternKernelSchedulerNode):
+            if isinstance(n.node, FallbackKernel):
+                n = next(it, None)
+                if not (
+                    isinstance(n, ExternKernelSchedulerNode)
+                    and isinstance(n.node, MultiOutput)
+                ):
+                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
+                # Core division not supported on fallback kernels
+                pass
+            else:
+                print(f"Warning: unhandled node type {type(n.node)}")
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 
