@@ -621,38 +621,8 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
-  c10::Device device =
-      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
-  const auto dtype = self.scalar_type();
-  TORCH_CHECK(device.is_privateuseone());
-  const c10::DeviceGuard device_guard(device);
-  // Check if tensor requires padding
-  int stick_size = BYTES_IN_STICK / c10::elementSize(dtype);
-  auto sizes = size.vec();
-  size_t size_bytes = BYTES_IN_STICK;
-  if (size.size() == 0) {
-    sizes = {stick_size};
-  }
-  auto requires_padding = sizes.back() % stick_size != 0;
-  sizes[sizes.size() - 1] = requires_padding
-                                ? ((sizes.back() / stick_size) + 1) * stick_size
-                                : sizes.back();
-
-  auto device_layout = SpyreTensorLayout(sizes, dtype);
-  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
-  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
-      c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
-          c10::StorageImpl::use_byte_size_t(), size_bytes,
-          &SpyreAllocator::instance(),
-          /*resizeable=*/true)),
-      pu1_dks, c10::scalarTypeToTypeMeta(dtype));
-
-  tensor.unsafeGetTensorImpl()->set_sizes_and_strides(size, stride,
-                                                      storage_offset_);
-  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
-      device_layout;
-  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
-  return tensor;
+  // Metadata-only change so we re-use the cpu impl
+  return at::cpu::as_strided(self, size, stride, storage_offset_);
 }
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
