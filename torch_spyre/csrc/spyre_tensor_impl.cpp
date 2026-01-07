@@ -87,9 +87,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(1);
     this->dim_map.resize(1);
-    this->format = Sparse;
+    this->format = Dense;
     this->num_stick_dims = 1;
-    this->device_size[0] = 1;
+    this->device_size[0] = this->elems_per_stick();
     this->dim_map[0] = 0;  // host_size has no entries!
 
     return;
@@ -110,6 +110,13 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   // Stick dim
   auto stick_dim = this->dim_map[this->dim_map.size() - 1];
   this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();
+
+  // Pad stick dimension if necessary
+  auto requires_padding = host_size[stick_dim] % elems_in_stick != 0;
+  host_size[stick_dim] =
+      requires_padding
+          ? ((host_size[stick_dim] / elems_in_stick) + 1) * elems_in_stick
+          : host_size[stick_dim];
 
   // Non-stick dims
   for (int i = 0; i < this->dim_map.size() - 1; i++) {

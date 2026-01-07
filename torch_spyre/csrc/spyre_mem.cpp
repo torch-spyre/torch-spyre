@@ -48,7 +48,6 @@
 #include "types_mapping.h"
 
 namespace spyre {
-#define BYTES_IN_STICK 128
 
 using DataConversionStrideInfo = data_conversion_stride_info;
 using DataConversionInfo = data_conversion_info;
@@ -233,7 +232,6 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;
   auto cpu_shape = tensor->sizes().vec();
-  int stick_size = BYTES_IN_STICK / tensor->element_size();
   DataConversionInfo dci{};
   dci.dci_dsName_ = "DCI-Tensor-0";
   dci.isHostToSen_ = host2device;
@@ -244,7 +242,7 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   std::reverse(stl.dim_map.begin(), stl.dim_map.end());
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   dci.dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(), stl,
-                                      stick_size, host2device);
+                                      stl.elems_per_stick(), host2device);
   dci.input_shape_ = host2device ? cpu_shape : stl.device_size;
   dci.output_shape_ = host2device ? stl.device_size : cpu_shape;
   dci.exportJson(s);
@@ -500,19 +498,9 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
   TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
               "Pin memory can only be on CPU");
   const c10::DeviceGuard device_guard(device);
-  // Check if tensor requires padding
-  int stick_size = BYTES_IN_STICK / c10::elementSize(dtype);
-  auto sizes = size.vec();
-  size_t size_bytes = BYTES_IN_STICK;
-  if (size.size() == 0) {
-    sizes = {stick_size};
-  }
-  auto requires_padding = sizes.back() % stick_size != 0;
-  sizes[sizes.size() - 1] = requires_padding
-                                ? ((sizes.back() / stick_size) + 1) * stick_size
-                                : sizes.back();
 
-  auto device_layout = SpyreTensorLayout(sizes, dtype);
+  auto device_layout = SpyreTensorLayout(size.vec(), dtype);
+  size_t size_bytes = get_device_size_in_bytes(device_layout);
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
@@ -548,19 +536,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
-  int stick_size = BYTES_IN_STICK / c10::elementSize(scalar_type);
-
-  // Check if tensor requires padding
-  auto sizes = size.vec();
-  if (size.size() == 0) {
-    sizes = {stick_size};
-  }
-  auto requires_padding = sizes.back() % stick_size != 0;
-  sizes[sizes.size() - 1] = requires_padding
-                                ? ((sizes.back() / stick_size) + 1) * stick_size
-                                : sizes.back();
-  DEBUGINFO("Size:", sizes, ", Stride: ", stride, " on device ", device);
-  auto device_layout = SpyreTensorLayout(sizes, scalar_type);
+  auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
