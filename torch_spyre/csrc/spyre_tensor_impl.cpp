@@ -50,12 +50,12 @@ auto get_generic_stick_layout(int rank, std::vector<int32_t> host_dim_order)
       dim_map = {host_dim_order[1], host_dim_order[0], host_dim_order[1]};
       break;
     case 3:
-      dim_map = {host_dim_order[2], host_dim_order[0], host_dim_order[2],
-                 host_dim_order[1]};
+      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[0],
+                 host_dim_order[2]};
       break;
     case 4:
-      dim_map = {host_dim_order[3], host_dim_order[2], host_dim_order[1],
-                 host_dim_order[3], host_dim_order[0]};
+      dim_map = {host_dim_order[0], host_dim_order[3], host_dim_order[1],
+                 host_dim_order[2], host_dim_order[3]};
       break;
     default:
       std::stringstream ss;
@@ -109,11 +109,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->num_stick_dims = 1;
 
   // Stick dim
-  auto stick_dim = this->dim_map[0];
-  this->device_size[0] = elems_in_stick;
+  auto stick_dim = this->dim_map[this->dim_map.size() - 1];
+  this->device_size[this->dim_map.size() - 1] = elems_in_stick;
 
   // Non-stick dims
-  for (int i = 1; i < this->dim_map.size(); i++) {
+  for (int i = 0; i < this->dim_map.size() - 1; i++) {
     auto dim = this->dim_map[i];
     if (dim == stick_dim) {
       this->device_size[i] =
@@ -122,8 +122,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] = host_size[dim];
     }
   }
-  std::reverse(this->dim_map.begin(), this->dim_map.end());
-  std::reverse(this->device_size.begin(), this->device_size.end());
 }
 
 std::vector<int64_t> SpyreTensorLayout::device_strides() {
