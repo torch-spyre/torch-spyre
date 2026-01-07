@@ -223,23 +223,8 @@ int32_t get_device_size_in_bytes(SpyreTensorLayout stl) {
 }
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
-  auto* tensorImpl =
-      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
-
-  if (tensorImpl->spyre_layout.has_value()) {
-    return tensorImpl->spyre_layout.value();
-  } else {  // Initialize default layout
-    int stick_size = BYTES_IN_STICK / tensor.element_size();
-    auto sizes = tensor.sizes().vec();
-    if (sizes.empty()) {
-      sizes = {stick_size};
-    } else if (sizes.back() % stick_size != 0) {
-      sizes.back() =
-          ((sizes.back() + stick_size - 1) / stick_size) * stick_size;
-    }
-    tensorImpl->spyre_layout = SpyreTensorLayout(sizes, tensor.scalar_type());
-    return tensorImpl->spyre_layout.value();
-  }
+  return static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())
+      ->spyre_layout;
 }
 
 };  // namespace spyre

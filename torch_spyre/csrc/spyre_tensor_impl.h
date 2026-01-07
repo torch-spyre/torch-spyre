@@ -126,7 +126,7 @@ class SpyreTensorImpl : public at::TensorImpl {
   SpyreTensorImpl() = delete;
   ~SpyreTensorImpl() = default;
 
-  std::optional<SpyreTensorLayout> spyre_layout = std::nullopt;
+  SpyreTensorLayout spyre_layout;
 
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
