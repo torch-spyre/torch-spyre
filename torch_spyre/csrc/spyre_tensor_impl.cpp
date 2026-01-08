@@ -183,7 +183,7 @@ std::string SpyreTensorLayout::toString() const {
   return ss.str();
 }
 
-SpyreTensorImpl::SpyreTensorImpl(c10::Storage storage,
+SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
                                  c10::DispatchKeySet key_set,
                                  const caffe2::TypeMeta& dtype)
     : TensorImpl(std::move(storage), key_set, dtype) {
