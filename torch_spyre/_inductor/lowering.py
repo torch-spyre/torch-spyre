@@ -152,8 +152,8 @@ def lower_layernormnorm(x, mean, norm_mean, weight, bias):
     def inner_fn(index):
         loaded_inputs = [
             x.make_loader()(index),
-            mean.make_loader()(index[-1:]),
-            norm_mean.make_loader()(index[-1:]),
+            mean.make_loader()(index[:-1]),
+            norm_mean.make_loader()(index[:-1]),
         ]
         if weight is not None:
             loaded_inputs.append(weight.make_loader()(index[-1:]))
