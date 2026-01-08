@@ -39,6 +39,9 @@ decomps_to_exclude = [
     # The default decomposition for torch.full (defined in pytorch/torch/refs/__init__.py)
     # is duplicated with the decomposition in torch_spyre/_inductor/decompositions.py.
     torch.ops.aten.full,
+    # We use a custom decomposition that relies on a Spyre-specific custom op for
+    # batch_norm, instead of the default decomposition.
+    torch.ops.aten._native_batch_norm_legit_no_training.default,
 ]
 
 # Remove the selected decompositions from Inductor's registry for Spyre.

@@ -102,6 +102,10 @@ class SpyreOpFuncs:
         return PointwiseOp("add", [a, b])
 
     @staticmethod
+    def batchnormfwd(input, a, b):
+        return PointwiseOp("batchnormfwd", [input, a, b])
+
+    @staticmethod
     def clamp(x, min, max):
         op_info = {
             "constants": {

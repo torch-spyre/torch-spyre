@@ -194,3 +194,21 @@ def _(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(size, dtype=dtype, device="spyre")
+
+
+@torch.library.custom_op("spyre::batchnormfwd", mutates_args=(), device_types="spyre")
+def batchnormfwd(
+    input: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@batchnormfwd.register_fake
+def _(
+    input: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+):
+    return input.new_empty(input.size())

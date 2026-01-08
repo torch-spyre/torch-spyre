@@ -287,3 +287,34 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
+
+
+lowering.register_op_dtype_propagation_rules(
+    "batchnormfwd", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
+)
+
+
+@lowering.register_lowering(torch.ops.spyre.batchnormfwd)
+def lower_batchnormfwd(input, a, b):
+    fn = lowering.ops_wrapper(torch.ops.spyre.batchnormfwd.__name__)
+
+    size = a.get_size()
+    assert b.get_size() == size
+
+    def inner_fn(index):
+        return fn(
+            input.make_loader()(index),
+            a.make_loader()(index[1 : 1 + len(size)]),
+            b.make_loader()(index[1 : 1 + len(size)]),
+        )
+
+    pw = Pointwise.create(
+        device=input.get_device(),
+        dtype=input.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=input.get_size(),
+        origin_node=input.get_origin_node(),
+        traceback=input.get_traceback(),
+    )
+    pw.realize()
+    return pw

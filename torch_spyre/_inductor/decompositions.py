@@ -153,3 +153,54 @@ def lt_decomp(
     out_le = torch.le(input, other).to(dtype=torch.float16)
     out_ne = torch.ne(input, other).to(dtype=torch.float16)
     return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
+
+
+@register_decomposition([torch.ops.aten._native_batch_norm_legit_no_training.default])
+def _native_batch_norm_legit_no_training(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    momentum: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scale = weight
+    offset = bias
+    mean = running_mean
+    var = running_var
+    epsilon = eps
+
+    e = torch.full(
+        var.size(),
+        epsilon,
+        dtype=var.dtype,
+        device=var.device,
+    )
+    v = torch.add(var, e)
+    s = torch.sqrt(v)
+    factor = torch.reciprocal(s)
+    a = torch.mul(scale, factor)
+    x = torch.mul(scale, mean)
+    y = torch.mul(x, factor)
+    b = torch.sub(offset, y)
+
+    # Example inputs here
+    #   input: size: (1, 2048, 844)
+    #   a: size: (2048)
+    #   b: size: (2048)
+    #
+    # Shapes of a and b should be update as follows.
+    #
+    # a = a.unsqueeze(-1)
+    # b = b.unsqueeze(-1)
+    #
+    #   a: size: (2048, 1), strides: (1, 1)
+    #   b: size (2048, 1), strides: (1, 1)
+    #
+    # Can we achieve this via custom lowering and/or superDSC?
+
+    # a and b need to be broadcasted to the shape of input
+    output = torch.ops.spyre.batchnormfwd(input, a, b)
+
+    return (output, mean, factor)
