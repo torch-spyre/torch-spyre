@@ -203,7 +203,10 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     elif red.reduction_type == "exx2":
         x_stl = args[0].layout.device_layout
         stl = SpyreTensorLayout(
-            output.size, output.dtype, x_stl.host_dim_order(), StickFormat.SparseMulti
+            output.size,
+            output.dtype,
+            x_stl.host_dim_order()[:-1],
+            StickFormat.SparseMulti,
         )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
