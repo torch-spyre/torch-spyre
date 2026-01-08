@@ -487,6 +487,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare(op, x)
 
+    def test_bool(self):
+        # torch._dynamo.config.dynamic_shapes = False
+        dtype = torch.bool
+        x = torch.randint(0, 2, (2, 64), dtype=dtype)
+        x_spyre = x.to("spyre")
+        y = torch.randint(0, 2, (2, 64), dtype=dtype)
+        y_spyre = y.to("spyre")
+        result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
+        torch.testing.assert_close(result, torch.eq(x, y))
+
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
 
