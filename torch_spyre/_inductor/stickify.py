@@ -99,10 +99,20 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     if len(args) == 1:
         x = args[0]
         match op:
-            case spyreop.layernormnorm.default:
-                raise Unsupported("TODO: layernormnorm")
             case spyreop.layernormscale.default:
-                raise Unsupported("TODO: layernormscale")
+                if not x.layout.size == output.size:
+                    raise Unsupported(
+                        f"size mismatch:  layernormscale({x.layout.size})=>{output.size}) "
+                    )
+                stl = SpyreTensorLayout(
+                    output.size,
+                    output.dtype,
+                    x.layout.device_layout.host_dim_order(),
+                    x.layout.device_layout.format,
+                )
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
             case spyreop.slice.default:
                 if x.layout.device_layout.format != StickFormat.Sparse:
                     raise Unsupported("slice on non-sparse tensor")
@@ -145,6 +155,21 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
+    elif op == spyreop.layernormnorm.default:
+        x = args[0]
+        if not x.layout.size == output.size:
+            raise Unsupported(
+                f"size mismatch:  layernormnorm({x.layout.size})=>{output.size}) "
+            )
+        stl = SpyreTensorLayout(
+            output.size,
+            output.dtype,
+            x.layout.device_layout.host_dim_order(),
+            x.layout.device_layout.format,
+        )
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
     else:
         output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
         input_dims = [stride_order_vars(arg.dep.index) for arg in args]
