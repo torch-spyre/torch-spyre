@@ -283,7 +283,9 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
                             sendnn::TensorLocation::HOST());
   //  STAGE 1: execution graph
   sendnn::SubGraph sub_graph;
-  int64_t xfer_size = dev_tensor_shape.Volume() * cpu_tensor->element_size();
+  const auto [elem_bytes_cpu, elem_bytes_spyre] =
+      spyre::elementSize(cpu_tensor->scalar_type());
+  int64_t xfer_size = dev_tensor_shape.Volume() * elem_bytes_spyre;
   {
     flex::FlexGraphBuilder gb;
     DMAParameters dma_param{xfer_size, 0, 0};
@@ -535,7 +537,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
+  DEBUGINFO("Tensor info on CPU (Size:", size, ", Stride: ", stride,
+            ", dtype: ", dtype, ") to be mapped onto device ", device);
   auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 

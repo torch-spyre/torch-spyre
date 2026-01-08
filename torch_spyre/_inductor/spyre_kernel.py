@@ -579,7 +579,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 buf.writeline("args=[")
                 with buf.indent():
                     for arg in ks.args:
+                        old_dtype = None
+                        if arg.dtype == torch.bool:
+                            old_dtype = torch.bool
+                            arg.dtype = torch.float16
                         buf.writeline(f"{arg!r},")
+                        if old_dtype is not None:
+                            arg.dtype = old_dtype
                 buf.writeline("]")
             buf.writeline(")")
 
