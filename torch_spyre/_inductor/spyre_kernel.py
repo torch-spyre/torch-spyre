@@ -230,7 +230,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
         else:
             return UnimplementedOp(name)
 
-    def constant(value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
         return Constant(value, dtype)
 
     def load(self, name: str, index: sympy.Expr) -> RValue:
