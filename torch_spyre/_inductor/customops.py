@@ -152,3 +152,21 @@ def gelu(
 @gelu.register_fake
 def _(input: torch.Tensor, approximate: str = "none"):
     return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::clamp", mutates_args=(), device_types="spyre")
+def clamp(
+    input: torch.Tensor,
+    min: Optional[torch.types.Number] = None,
+    max: Optional[torch.types.Number] = None,
+) -> torch.Tensor:
+    pass
+
+
+@clamp.register_fake
+def _(
+    input: torch.Tensor,
+    min: Optional[torch.types.Number] = None,
+    max: Optional[torch.types.Number] = None,
+):
+    return input.new_empty(input.size())

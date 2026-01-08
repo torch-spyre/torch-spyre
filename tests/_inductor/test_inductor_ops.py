@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import unittest
 import torch
 
@@ -24,9 +25,12 @@ from utils_inductor import compare, compare_with_cpu
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
+    "cos": torch.cos,
     "exp": torch.exp,
+    "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "sin": torch.sin,
     "tanh": torch.tanh,
 }
 
@@ -154,22 +158,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        ("test_reduce_2d", "test_reduce"): {
-            "ops_dict": REDUCTION_OPS_DICT,
-            "param_sets": {
-                "dim_0": (0, cached_randn((67, 256))),
-                # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
-                # "dim_1": (1, cached_randn((67, 256))),
-            },
-        },
-        ("test_reduce_2d_cpu", "test_reduce_cpu"): {
-            "ops_dict": REDUCTION_OPS_DICT,
-            "param_sets": {
-                "dim_0": (0, cached_randn((67, 256))),
-                # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
-                # "dim_1": (1, cached_randn((67, 256))),
-            },
-        },
+        # ("test_reduce_2d", "test_reduce"): {
+        #     "ops_dict": REDUCTION_OPS_DICT,
+        #     "param_sets": {
+        #         "dim_0": (0, cached_randn((67, 256))),
+        #         # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
+        #         # "dim_1": (1, cached_randn((67, 256))),
+        #     },
+        # },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
                 "dim_0": (0, cached_randn((128, 256))),
@@ -194,17 +190,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        # skipping these - not working yet
-        # ("test_reduce_3d",
-        #  "test_reduce"
-        # ):{
-        #     "ops_dict": REDUCTION_OPS_DICT,
-        #     "param_sets": {
-        #         "dim_0": (0, cached_randn((67, 71, 256))),
-        #         "dim_1": (1, cached_randn((67, 71, 256))),
-        #         "dim_2": (2, cached_randn((67, 71, 256))),
-        #     }
-        # },
+        (
+            "test_alias_operands_cpu",
+            "test_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "pow": lambda x: torch.pow(x, 2),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),),
+                    ((67, 256),),
+                ]
+            ),
+        },
+        # Compare with cpu for now to avoid hitting eager mode coverage issue
+        ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {
+                "sum": torch.max,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
+                "3d_dim_1": (1, cached_randn((67, 71, 256))),
+                # "3d_dim_2": (2, cached_randn((67, 71, 256))), # sparse tensor output
+            },
+        },
+        ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {
+                "sum": torch.max,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
+                "3d_dim_0": (0, cached_randn((67, 71, 256))),
+                "3d_dim_1": (1, cached_randn((67, 71, 256))),
+                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
+            },
+        },
+        ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                # "2d_dim_01": ([0, 1], cached_randn((67, 256))), # spyre scalar represented as 1d instead of 0d
+                # "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)), # layout needs repermutation
+                "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.01)),
+                # "3d_dim_2": (2, cached_randn((67, 71, 256), scale=0.01)), # sparse tensor output
+                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
+                # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)), # spyre scalar represented as 1d instead of 0d
+            },
+        },
+        ("test_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {
+                "sum": torch.sum,
+            },
+            "param_sets": {
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
+                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
+                "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.1)),
+                "3d_dim_2": (
+                    2,
+                    cached_randn((67, 71, 256), scale=0.1),
+                ),  # sparse tensor output
+                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
+                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
+            },
+        },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
             "param_sets": make_param_dict(
                 [
@@ -224,6 +281,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     cached_randn((512, 256, 128), abs=True),
                 ),
+            }
+        },
+        ("test_transpose_4d_cpu", "test_transpose_4d_cpu"): {
+            "param_sets": {
+                "dim_0_3": (
+                    0,
+                    3,
+                    cached_randn((256, 3, 17, 64), abs=True),
+                ),
+                # skipping these - not working yet
+                # "dim_1_3": (
+                #     1,
+                #     3,
+                #     cached_randn((3, 256, 17, 64), abs=True),
+                # ),
+                # "dim_2_3": (
+                #     2,
+                #     3,
+                #     cached_randn((3, 17, 256, 64), abs=True),
+                # ),
             }
         },
         (
@@ -260,22 +337,135 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_pointwise_range_op",
+            "test_range_op",
+        ): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 256), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                    FP16_EPS,
+                ),
+            },
+        },
+        (
+            "test_activation_cls",
+            "test_activation_cls",
+        ): {
+            "ops_dict": {
+                "gelu": torch.nn.GELU,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 128), dtype=torch.float16),
+                    {
+                        "approximate": "tanh",
+                    },
+                    0.01,
+                ),
+            },
+        },
+        (
+            "test_activation_fn",
+            "test_activation_fn",
+        ): {
+            "ops_dict": {
+                "silu": torch.nn.functional.silu,
+            },
+            "param_sets": {
+                "fp16": (
+                    cached_randn((128, 128), dtype=torch.float16),
+                    0.01,
+                ),
+            },
+        },
+        (
+            "test_clone",
+            "test_clone",
+        ): {
+            "param_sets": {
+                "1d": (cached_randn((128,), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_fallback",
+            "test_fallback_cpu",
+        ): {
+            "param_sets": {
+                "1d": (cached_randn((128,), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_arange",
+            "test_arange_cpu",
+        ): {
+            "param_sets": {
+                "end": (64.0,),
+                "start_end": (64.0, 128.0),
+                "start_end_step": (0.0, 128.0, 2.0),
+            },
+        },
+        (
+            "test_new_ones",
+            "test_new_ones_cpu",
+        ): {
+            "param_sets": {
+                "size_1": (
+                    cached_randn((64, 256)),
+                    ([64, 256]),
+                ),
+            },
+        },
+        (
+            "test_numel",
+            "test_numel_cpu",
+        ): {
+            "param_sets": {
+                "size_1": {
+                    cached_randn(
+                        (
+                            64,
+                            128,
+                        )
+                    ),
+                },
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):
         if op == torch.reciprocal:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
 
-        if op == torch.exp:
-            # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
+        cpu_ops = {
+            torch.cos,  # CPU fallback
+            torch.exp,  # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
+            torch.sin,  # CPU fallback
+        }
+        if op in cpu_ops:
+            compare_with_cpu(op, x)
+        elif op == torch.neg:
             compare_with_cpu(op, x)
         else:
             compare(op, x)
+
+    def test_unary_op_cpu(self, op, x):
+        compare_with_cpu(op, x)
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
@@ -299,18 +489,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_add_broadcast_cpu(self, x, y):
         compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
 
-    @unittest.skip("eager mode crashes")
-    def test_reduce(self, op, dim: int, x):
-        if op == torch.max:
-            compare(lambda x: op(x, dim=dim)[0], x)
-        else:
-            compare(lambda x: op(x, dim=dim), x)
+    # @unittest.skip("eager mode crashes")
+    # def test_reduce(self, op, dim: int, x):
+    #     if op == torch.max:
+    #         compare(lambda x: op(x, dim=dim)[0], x)
+    #     else:
+    #         compare(lambda x: op(x, dim=dim), x)
 
-    def test_reduce_cpu(self, op, dim: int, x):
+    def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         if op == torch.max:
-            compare_with_cpu(lambda x: op(x, dim=dim)[0], x)
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False)[0], x)
         else:
-            compare_with_cpu(lambda x: op(x, dim=dim), x)
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x)
+
+    def test_reduce_keepdim1_cpu(self, op, dim: int, x):
+        if op == torch.max:
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True)[0], x)
+        else:
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
     def test_max_sub_broadcast_cpu(self, dim: int, x):
         def fn(x):
@@ -326,8 +522,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
         compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
 
+    def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
+
     def test_where_cpu(self, cond_op, x, y):
         compare_with_cpu(lambda x, y: torch.where(cond_op(x, y), x, y), x, y)
+
+    def test_range_op(self, op, input, min, max, err):
+        compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+
+    def test_activation_cls(self, op, input, kwargs, err):
+        compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
+
+    def test_activation_fn(self, op, input, err):
+        compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
+
+    def test_clone(self, x):
+        compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_fallback_cpu(self, x):
+        def fn(t):
+            t = torch.exp(t)  # compiled op
+            t = torch.sin(t)  # fallback op
+            t = torch.exp(t)  # compiled op
+            return t
+
+        compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_arange_cpu(self, *args):
+        def fn(device=None):
+            return torch.arange(*args, dtype=torch.float16, device=device)
+
+        compare_with_cpu(fn, needs_device=True)
+
+    def test_new_ones_cpu(self, x, y):
+        compare_with_cpu(lambda x: x.new_ones((x.size())), x)
+
+    def test_numel_cpu(self, x):
+        compare_with_cpu(lambda x: torch.numel(x), x)
 
 
 if __name__ == "__main__":

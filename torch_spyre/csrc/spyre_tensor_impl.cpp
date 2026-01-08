@@ -21,10 +21,18 @@
 #include <vector>
 
 #include "logging.h"
+#include "types_mapping.h"
 
 namespace spyre {
 
-#define BYTES_IN_STICK 128
+int64_t elems_per_stick(const DataFormats& df) {
+  // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
+  if (df == DataFormats::IEEE_INT32) {
+    return 32;
+  }
+  auto fp_elems = dataFormatToStickSize[df];
+  return static_cast<int64_t>(fp_elems);
+}
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
@@ -40,6 +48,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order,
                              StickFormat format) {
+  auto str_type = torchScalarToString[dtype];
+  const auto [sen_dtype_cpu, sen_dtype_dev] =
+      stringToDTDataFormatPair(str_type);
+  this->device_dtype = sen_dtype_dev;
+
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(1);
@@ -53,8 +66,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + 1;
-  auto elem_bytes = c10::elementSize(dtype);
-  auto elems_in_stick = format == Dense ? BYTES_IN_STICK / elem_bytes : 1;
+  auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
 
   TORCH_CHECK(host_size.size() == dim_order.size(),
               "Invalid arguments: host_size.size() != dim_order.size()");
@@ -64,27 +76,39 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->format = format;
   this->num_stick_dims = 1;
 
-  // Stick dim
-  auto stick_dim = dim_order[host_dims - 1];
-  this->dim_map[0] = stick_dim;
-  this->dim_map[device_dims - 1] = stick_dim;
-  this->device_size[0] =
-      (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
-  this->device_size[device_dims - 1] = elems_in_stick;
-
-  // Non-stick dims
-  for (int i = 1; i < device_dims - 1; i++) {
-    this->dim_map[i] = dim_order[i - 1];
-    this->device_size[i] = host_size[dim_order[i - 1]];
+  if (host_dims == 1) {
+    TORCH_CHECK(dim_map[0] == 0);
+    this->dim_map[0] = 0;
+    this->dim_map[1] = 0;
+    this->device_size[0] = (host_size[0] + elems_in_stick - 1) / elems_in_stick;
+    this->device_size[1] = elems_in_stick;
+  } else {
+    int dim_idx = 0;
+    // Outer dimensions
+    for (; dim_idx < device_dims - 3; dim_idx++) {
+      this->dim_map[dim_idx] = dim_order[dim_idx];
+      this->device_size[dim_idx] = host_size[dim_order[dim_idx]];
+    }
+    // The last 2 host dims are tiled into 3 device dims: num_sticks, inner,
+    // stick
+    auto stick_dim = dim_order[host_dims - 1];
+    auto inner_dim = dim_order[host_dims - 2];
+    this->dim_map[dim_idx] = stick_dim;
+    this->device_size[dim_idx] =
+        (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
+    this->dim_map[dim_idx + 1] = inner_dim;
+    this->device_size[dim_idx + 1] = host_size[inner_dim];
+    this->dim_map[dim_idx + 2] = stick_dim;
+    this->device_size[dim_idx + 2] = elems_in_stick;
   }
 }
 
-std::vector<int64_t> SpyreTensorLayout::device_strides(c10::ScalarType dtype) {
+std::vector<int64_t> SpyreTensorLayout::device_strides() {
   int device_dims = static_cast<int>(this->device_size.size());
   std::vector<int64_t> strides(device_dims);
 
   // Stick dim
-  int64_t cur_stride = BYTES_IN_STICK / c10::elementSize(dtype);
+  int64_t cur_stride = this->elems_per_stick();
   strides[device_dims - 1] = 1;
 
   // Non-stick dims
@@ -115,12 +139,14 @@ std::string SpyreTensorLayout::toString() const {
   ss << "], num_stick_dims=";
   ss << this->num_stick_dims;
   if (this->format == StickFormat::Dense) {
-    ss << ", format=StickFormat.Dense";
+    ss << ", format=StickFormat.Dense, ";
   } else if (this->format == StickFormat::Sparse) {
-    ss << ", format=StickFormat.Sparse";
+    ss << ", format=StickFormat.Sparse, ";
   } else {
-    ss << ", format=StickFormat.SparseMulti";
+    ss << ", format=StickFormat.SparseMulti, ";
   }
+  ss << "device_dtype=DataFormats."
+     << EnumsConversion::dataFormatsToString(this->device_dtype);
   ss << ")";
   return ss.str();
 }
