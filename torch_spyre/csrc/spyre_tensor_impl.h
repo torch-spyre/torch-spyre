@@ -128,18 +128,25 @@ class SpyreTensorImpl : public at::TensorImpl {
 
   SpyreTensorLayout spyre_layout;
 
-  SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
+  SpyreTensorImpl(c10::Storage storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
 
+  SpyreTensorImpl(c10::Storage storage, c10::DispatchKeySet key_set,
+                  const caffe2::TypeMeta& dtype, SpyreTensorLayout stl);
   const at::Storage& storage() const override;
 
-  c10::intrusive_ptr<at::TensorImpl> shallow_copy_and_detach(
+  c10::intrusive_ptr<c10::TensorImpl> shallow_copy_and_detach(
       const c10::VariableVersion& version_counter,
       bool allow_tensor_metadata_change) const override;
 
-  c10::intrusive_ptr<at::TensorImpl> shallow_copy_and_detach(
+  c10::intrusive_ptr<c10::TensorImpl> shallow_copy_and_detach(
       c10::VariableVersion&& version_counter,
       bool allow_tensor_metadata_change) const override;
+
+  template <typename VariableVersion>
+  c10::intrusive_ptr<TensorImpl> shallow_copy_and_detach_core(
+      const VariableVersion& version_counter,
+      bool allow_tensor_metadata_change) const;
 
   void shallow_copy_from(
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;

@@ -16,6 +16,9 @@
 
 #include "spyre_tensor_impl.h"
 
+#include <c10/core/DispatchKey.h>
+#include <c10/core/DispatchKeySet.h>
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -180,11 +183,20 @@ std::string SpyreTensorLayout::toString() const {
   return ss.str();
 }
 
-SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
+SpyreTensorImpl::SpyreTensorImpl(c10::Storage storage,
                                  c10::DispatchKeySet key_set,
                                  const caffe2::TypeMeta& dtype)
     : TensorImpl(std::move(storage), key_set, dtype) {
   set_custom_sizes_strides(c10::TensorImpl::SizesStridesPolicy::Default);
+}
+
+SpyreTensorImpl::SpyreTensorImpl(c10::Storage storage,
+                                 c10::DispatchKeySet key_set,
+                                 const caffe2::TypeMeta& dtype,
+                                 SpyreTensorLayout stl)
+    : TensorImpl(std::move(storage), key_set, dtype) {
+  set_custom_sizes_strides(c10::TensorImpl::SizesStridesPolicy::Default);
+  this->spyre_layout = stl;
 }
 
 // FIXME: This is currently returning cpu storage as other methods use it, but
@@ -193,24 +205,44 @@ const at::Storage& SpyreTensorImpl::storage() const {
   return storage_;
 }
 
-// FIXME: This is a temporary implementation to get the Spyre Tensor with CPU
-// storage basic operation (view) to work
-c10::intrusive_ptr<at::TensorImpl> SpyreTensorImpl::shallow_copy_and_detach(
-    const c10::VariableVersion& version_counter,
+template <typename VariableVersion>
+c10::intrusive_ptr<c10::TensorImpl>
+SpyreTensorImpl::shallow_copy_and_detach_core(
+    const VariableVersion& version_counter,
     bool allow_tensor_metadata_change) const {
-  DEBUGINFO("Parent's implementation");
-  return at::TensorImpl::shallow_copy_and_detach(version_counter,
-                                                 allow_tensor_metadata_change);
+  if (key_set_.has(c10::DispatchKey::Python) &&
+      !c10::impl::tls_is_dispatch_key_excluded(c10::DispatchKey::Python)) {
+    auto r = pyobj_slot_.load_pyobj_interpreter()->detach(this);
+    if (r) {
+      r->set_version_counter(version_counter);
+      r->set_allow_tensor_metadata_change(allow_tensor_metadata_change);
+      return r;
+    }
+  }
+  auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
+                                                   data_type_, spyre_layout);
+
+  copy_tensor_metadata(
+      /*src_impl=*/this,
+      /*dest_impl=*/impl.get(),
+      /*version_counter=*/version_counter,
+      /*allow_tensor_metadata_change=*/allow_tensor_metadata_change);
+
+  return impl;
 }
 
-// FIXME: This is a temporary implementation to get the Spyre Tensor with CPU
-// storage basic operation (view) to work
-at::intrusive_ptr<at::TensorImpl> SpyreTensorImpl::shallow_copy_and_detach(
+c10::intrusive_ptr<c10::TensorImpl> SpyreTensorImpl::shallow_copy_and_detach(
+    const c10::VariableVersion& version_counter,
+    bool allow_tensor_metadata_change) const {
+  return shallow_copy_and_detach_core(version_counter,
+                                      allow_tensor_metadata_change);
+}
+
+at::intrusive_ptr<c10::TensorImpl> SpyreTensorImpl::shallow_copy_and_detach(
     c10::VariableVersion&& version_counter,
     bool allow_tensor_metadata_change) const {
-  DEBUGINFO("Parent's implementation");
-  return at::TensorImpl::shallow_copy_and_detach(version_counter,
-                                                 allow_tensor_metadata_change);
+  return shallow_copy_and_detach_core(std::move(version_counter),
+                                      allow_tensor_metadata_change);
 }
 
 // FIXME: This is a temporary implementation to get the Spyre Tensor with CPU
