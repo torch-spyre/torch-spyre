@@ -55,7 +55,7 @@ def full_decomp(
     pin_memory: Optional[bool] = None,
 ) -> torch.Tensor:
     assert layout == torch.strided or layout is None, f"dosn't support layout={layout}"
-    assert pin_memory == False or pin_memory is None, (
+    assert not pin_memory or pin_memory is None, (
         f"dosn't support pin_memory={pin_memory}"
     )
     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
