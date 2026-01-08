@@ -230,7 +230,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
         else:
             return UnimplementedOp(name)
 
-    def constant(value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> RValue:
         return Constant(value, dtype)
 
     def load(self, name: str, index: sympy.Expr) -> RValue:
@@ -379,8 +379,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     )
                     scales.append(scale)
                 elif isinstance(input, Constant):
-                    args.append(ConstantArg(input.value, input.dtype))
-                    scales.append([-1] * len(di))
+                    # TODO: Re-enable these lines once support for ConstantArg is implemented.
+                    # args.append(ConstantArg(input.value, input.dtype))
+                    # scales.append([-1] * len(di))
+                    pass
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             scale = self.analyze_tensor_access(di, dst.index)
