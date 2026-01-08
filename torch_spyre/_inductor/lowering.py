@@ -19,7 +19,7 @@ from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
-from .ir import SpyrePointwise, SpyreReduction
+from .ir import SpyreReduction
 
 # Implicit fallback to an eager op does not become effective when lowering of
 # the op is registered by default. Here, we unregister ops that are falling back
@@ -42,8 +42,8 @@ def lower_mm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1 = index
         (r0,) = reduction_index
-        tmp1 = ops.load(x.get_name(), x.get_layout().stride[0] * i0 + r0)
-        tmp2 = ops.load(y.get_name(), i1 + y.get_layout().stride[0] * r0)
+        tmp1 = ops.load(x.get_name(), x.get_size()[1] * i0 + r0)
+        tmp2 = ops.load(y.get_name(), i1 + y.get_size()[1] * r0)
         return (tmp1, tmp2)
 
     result = Reduction.create(
@@ -66,14 +66,14 @@ def lower_mm(x, y):
 def lower_bmm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1, i2 = index
-        x_layout = x.get_layout()
-        y_layout = y.get_layout()
         (r0,) = reduction_index
         tmp1 = ops.load(
-            x.get_name(), x_layout.stride[0] * i0 + x_layout.stride[1] * i1 + r0
+            x.get_name(),
+            x.get_size()[2] * x.get_size()[1] * i0 + x.get_size()[1] * i1 + r0,
         )
         tmp2 = ops.load(
-            y.get_name(), y_layout.stride[0] * i0 + y_layout.stride[1] * r0 + i2
+            y.get_name(),
+            y.get_size()[2] * y.get_size()[1] * i0 + y.get_size()[1] * r0 + i2,
         )
         return (tmp1, tmp2)
 
@@ -186,14 +186,13 @@ def lower_layernormscale(x, eps):
     def inner_fn(index):
         return fn(x.make_loader()(index), eps)
 
-    pw = SpyrePointwise.create(
+    pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
-        op_info={"constants": {"eps": eps}},
     )
     pw.realize()
     return pw
@@ -243,26 +242,18 @@ lowering.register_op_dtype_propagation_rules(
 
 @lowering.register_lowering(torch.ops.spyre.softplus)
 def lower_softplus(x, beta=1.0, threshold=20.0):
-    op_info = {
-        "constants": {
-            "softplusBeta": beta,
-            "softplusThresh": threshold,
-        }
-    }
-
     fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)
 
     def inner_fn(index):
         return fn(x.make_loader()(index), beta, threshold)
 
-    pw = SpyrePointwise.create(
+    pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
-        op_info=op_info,
     )
     pw.realize()
     return pw
@@ -275,13 +266,7 @@ lowering.register_op_dtype_propagation_rules(
 
 @lowering.register_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
-    op_info = {
-        "constants": {
-            "clipMin": min,
-            "clipMax": max,
-        }
-    }
-    pw = SpyrePointwise.create(
+    pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
@@ -290,7 +275,6 @@ def lower_clamp(x, min=None, max=None):
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
-        op_info=op_info,
     )
     pw.realize()
     return pw
