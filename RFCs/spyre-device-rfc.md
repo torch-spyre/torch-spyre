@@ -14,7 +14,7 @@ The goals of this proposal are as follows:
 1. User friendly interface to the Spyre Device
 2. Support proper tensor residency
 3. Improved developer productivity
-4. Support existing out-of-the-box pytorch implementations
+4. Support existing out-of-the-box Pytorch implementations
 5. Improve stability of the software stack
 6. Explicit over implicit whereever possible
 
@@ -35,9 +35,9 @@ We will implement a specific SpyreGuardImpl, that will be used for device manage
 
 In order to properly allocate space on the device and manage tensors, we will implement a custom at::Allocator (SpyreAllocator). Due to Z security requirements, we will ensure that the tensor handle returned to the user must not have a physical pointer to the memory.
 
-With the switch from PF to VF mode (no physical addresses will be present), we will now have a more strict constraint on the number of handles we get from the backend runtime. As such, this requires us to re-think the pytorch allocator as the current design will only allow a small number of handles to resident tensors when in VF mode.
+With the switch from PF to VF mode (no physical addresses will be present), we will now have a more strict constraint on the number of handles we get from the backend runtime. As such, this requires us to re-think the Pytorch allocator as the current design will only allow a small number of handles to resident tensors when in VF mode.
 
-Instead of allocating in the backend runtime on a tensor-by-tensor basis (as is currently the case), allocate large chunks (lazily as necessary). We will continue to use the TryAllocate method from flex to allocate these large chunks. Within the pytorch allocator, we can do our own virtual memory management given the large allocated chunk (similar to the cuda cache allocator). This way, we can create any number of handles in the pytorch allocator, while only holding the large chunk handles from the backend runtime.
+Instead of allocating in the backend runtime on a tensor-by-tensor basis (as is currently the case), allocate large chunks (lazily as necessary). We will continue to use the TryAllocate method from flex to allocate these large chunks. Within the Pytorch allocator, we can do our own virtual memory management given the large allocated chunk (similar to the cuda cache allocator). This way, we can create any number of handles in the Pytorch allocator, while only holding the large chunk handles from the backend runtime.
 
 For more information, please visit the following [epic](https://github.com/torch-spyre/torch-spyre/issues/200)
 
