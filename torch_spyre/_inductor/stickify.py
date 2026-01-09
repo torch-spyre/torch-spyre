@@ -225,8 +225,6 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     elif red.reduction_type == BATCH_MATMUL_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
-        print(f"x: {args[0].layout}")
-        print(f"y: {args[1].layout}")
         if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
             raise Unsupported(
                 f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
