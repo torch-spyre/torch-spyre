@@ -1132,7 +1132,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                 "dim_prop_attr": [
                                                     {
                                                         "factor_": 1
-                                                        if name != "out"
+                                                        if name != "mb"
                                                         else cores,
                                                         "label_": "core_fold",
                                                     },
@@ -1354,7 +1354,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                 "dim_prop_attr": [
                                                     {
                                                         "factor_": 1
-                                                        if name != "out"
+                                                        if name != "mb"
                                                         else cores,
                                                         "label_": "core_fold",
                                                     },
