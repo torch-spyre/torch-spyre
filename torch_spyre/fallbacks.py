@@ -76,6 +76,14 @@ _warn_skips = (
 )
 
 
+def warn_fallback(op, fallback_device="cpu"):
+    warnings.warn(
+        f"{op} is falling back to {fallback_device}",
+        category=FallbackWarning,
+        skip_file_prefixes=_warn_skips,
+    )
+
+
 def register_fallback(ops, device="cpu"):
     """
     Decorator to register a CPU-fallback kernel for each op.
@@ -183,11 +191,7 @@ def register_fallback(ops, device="cpu"):
 
             @functools.wraps(fn)
             def _wrapped(*args, **kwargs):
-                warnings.warn(
-                    f"{op} is falling back to {fallback_device}",
-                    category=FallbackWarning,
-                    skip_file_prefixes=_warn_skips,
-                )
+                warn_fallback(op, fallback_device)
                 return _fallback(fn, *args, **kwargs)
 
             torch.library.register_kernel(op, ["spyre"])(_wrapped)

@@ -14,6 +14,7 @@
 
 from typing import Optional, Sequence
 import torch
+from torch_spyre.fallbacks import warn_fallback
 
 from . import Unsupported
 
@@ -179,6 +180,8 @@ def spyre_full(
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    # Fall back to CPU.
+    warn_fallback("torch.ops.spyre.full")
     tmp = torch.full(size, fill_value, dtype=dtype, device="cpu")
     return tmp.to(device)
 
