@@ -17,6 +17,8 @@
 import os
 import unittest
 import psutil
+import warnings
+from contextlib import contextmanager
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -119,6 +121,21 @@ class TestSpyre(TestCase):
         self.assertEqual(b, a + 2)
 
     def test_cross_device_copy_dtypes(self):
+        @contextmanager
+        def check_downcast_warning(expect_warning=False):
+            with warnings.catch_warnings(record=True) as rec:
+                warnings.simplefilter("always")
+                yield
+
+            msg = "does not support int64"
+            recorded = [str(w.message) for w in rec]
+            if expect_warning:
+                assert len(rec) == 1 and msg in str(rec[0].message), (
+                    f"Expected one warning containing '{msg}', got: {recorded}"
+                )
+            else:
+                assert len(rec) == 0, f"Expected no warnings, got: {recorded}"
+
         dtypes = [
             torch.float8_e4m3fn,
             torch.int8,
@@ -128,10 +145,12 @@ class TestSpyre(TestCase):
         ]
         for dtype in dtypes:
             x = None
+            expect_warning = False
             if dtype in [torch.int8]:
                 x = torch.rand(64, 64) * 100
                 x = x.to(dtype=dtype)
             elif dtype in [torch.int64]:
+                expect_warning = True
                 x = torch.randint(-32768, 32767, (64, 64), dtype=dtype)
             elif dtype in [torch.float8_e4m3fn]:
                 x = torch.rand(64, 64)
@@ -139,7 +158,10 @@ class TestSpyre(TestCase):
             else:
                 x = torch.rand(64, 64, dtype=dtype)
             assert x.device.type == "cpu", "initial device is not cpu"
-            x_spyre = x.to("spyre")
+
+            with check_downcast_warning(expect_warning):
+                x_spyre = x.to("spyre")
+
             assert x_spyre.device.type == "spyre", "to device is not spyre"
             assert x_spyre.dtype == x.dtype
             x_cpu = x_spyre.to("cpu")
@@ -195,6 +217,42 @@ class TestSpyre(TestCase):
                 torch.testing.assert_close(x, x_cpu),
                 f"round trip copy produces incorrect results for dtype={dtype}",
             )
+
+    def test_default_on_import(self):
+        import torch_spyre  # noqa: F401
+
+        assert torch.spyre.get_downcast_warning() is True
+
+    def test_set_get_roundtrip(self):
+        import torch_spyre  # noqa: F401
+
+        torch.spyre.set_downcast_warning(False)
+        assert torch.spyre.get_downcast_warning() is False
+        torch.spyre.set_downcast_warning(True)
+        assert torch.spyre.get_downcast_warning() is True
+
+    def test_warning_emitted_when_enabled(self):
+        import torch_spyre  # noqa: F401
+
+        torch.set_warn_always(True)
+        t = torch.randint(-32768, 32767, (64, 64), dtype=torch.int64)
+        torch.spyre.set_downcast_warning(True)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            t2 = t.to(device="spyre")  # noqa: F841
+        # At least one UserWarning captured
+        assert any("does not support int64" in str(w.message) for w in rec)
+
+    def test_warning_suppressed_when_disabled(self):
+        import torch_spyre  # noqa: F401
+
+        torch.set_warn_always(True)
+        torch.spyre.set_downcast_warning(False)
+        t = torch.randint(-32768, 32767, (64, 64), dtype=torch.int64)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            t2 = t.to(device="spyre")  # noqa: F841
+        assert len(rec) == 0
 
 
 if __name__ == "__main__":

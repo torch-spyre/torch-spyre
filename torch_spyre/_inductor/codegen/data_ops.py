@@ -628,3 +628,431 @@ def generate_slice(pointers, *, op, dimensions, inputs, outputs, **kwargs):
             ],
         }
     }
+
+
+def generate_transpose_4d_stick(
+    pointers, *, op, dimensions, inputs, outputs, transposed_dims, **kwargs
+):
+    transpose_0_3 = 0 in transposed_dims
+    transpose_1_3 = 1 in transposed_dims
+    transpose_2_3 = 2 in transposed_dims
+    return {
+        "reshape": {
+            "numCoresUsed_": 1,
+            "dscs_": [],
+            "datadscs_": [
+                {
+                    "reshape": {
+                        "coreIdsUsed_": [0],
+                        "dimPool_": ["mb", "out", "x", "y"],
+                        "primaryDs_": [
+                            {
+                                "name_": "pds0",
+                                "dimNames": ["mb", "out", "y", "x"],
+                            }
+                        ],
+                        "labeledDs_": [
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": ["mb", "x", "out", "y"],
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": {
+                                    "mb": dimensions[2],
+                                    "out": dimensions[-1],
+                                    "x": dimensions[1],
+                                    "y": dimensions[0],
+                                },
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": {
+                                    "mb": [[dimensions[2], 0]],
+                                    "out": [[dimensions[-1], 0]],
+                                    "x": [[dimensions[1], 0]],
+                                    "y": [[dimensions[0], 0]],
+                                },
+                                "PieceInfo": [
+                                    {
+                                        "key_": "p0",
+                                        "dimToSize_": {
+                                            "mb": 64 if transpose_2_3 else 1,
+                                            "out": 64,
+                                            "x": 64 if transpose_1_3 else 1,
+                                            "y": 64 if transpose_0_3 else 1,
+                                        },
+                                        "validGap_": {
+                                            "out": [[64, 0]],
+                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "x": [[64 if transpose_1_3 else 1, 0]],
+                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                        },
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[inputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [0],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "key_": "p1",
+                                        "dimToSize_": {
+                                            "mb": 64 if transpose_2_3 else 1,
+                                            "out": 64,
+                                            "x": 64 if transpose_1_3 else 1,
+                                            "y": 64 if transpose_0_3 else 1,
+                                        },
+                                        "validGap_": {
+                                            "out": [[64, 0]],
+                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "x": [[64 if transpose_1_3 else 1, 0]],
+                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                        },
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [0],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [8192],
+                                            },
+                                        ],
+                                    },
+                                ],
+                                "hbmStartAddress_": pointers[inputs[0]["name"]] // 128,
+                            },
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": ["mb", "x", "y", "out"],
+                                "stickDimOrder_": ["y"],
+                                "dimToLayoutSize_": {
+                                    "mb": dimensions[2],
+                                    "out": dimensions[-1],
+                                    "x": dimensions[1],
+                                    "y": dimensions[0],
+                                },
+                                "dimToStickSize_": {"y": 64},
+                                "validGap_": {
+                                    "mb": [[dimensions[2], 0]],
+                                    "out": [[dimensions[-1], 0]],
+                                    "x": [[dimensions[1], 0]],
+                                    "y": [[dimensions[0], 0]],
+                                },
+                                "PieceInfo": [
+                                    {
+                                        "key_": "p0",
+                                        "dimToSize_": {
+                                            "mb": 64 if transpose_2_3 else 1,
+                                            "out": 64,
+                                            "x": 64 if transpose_1_3 else 1,
+                                            "y": 64 if transpose_0_3 else 1,
+                                        },
+                                        "validGap_": {
+                                            "out": [[64, 0]],
+                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "x": [[64 if transpose_1_3 else 1, 0]],
+                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                        },
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[outputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [16384],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "key_": "p1",
+                                        "dimToSize_": {
+                                            "mb": 64 if transpose_2_3 else 1,
+                                            "out": 64,
+                                            "x": 64 if transpose_1_3 else 1,
+                                            "y": 64 if transpose_0_3 else 1,
+                                        },
+                                        "validGap_": {
+                                            "out": [[64, 0]],
+                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "x": [[64 if transpose_1_3 else 1, 0]],
+                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                        },
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [0],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [24576],
+                                            },
+                                        ],
+                                    },
+                                ],
+                                "hbmStartAddress_": pointers[outputs[0]["name"]] // 128,
+                            },
+                        ],
+                        "op": {
+                            "name": "ReStickifyOpWithPTHBM",
+                            "coreIDtoANInfo": {
+                                "0": {
+                                    "loopCount": {
+                                        "out": dimensions[-1] // 64,
+                                        "mb": dimensions[2],
+                                        "x": dimensions[1],
+                                        "y": dimensions[0] // 64
+                                        if transpose_0_3
+                                        else dimensions[0],
+                                    },
+                                    "loopCountL3SU": {
+                                        "out": dimensions[-1] // 64,
+                                        "mb": dimensions[2],
+                                        "x": dimensions[1],
+                                        "y": dimensions[0] // 64
+                                        if transpose_0_3
+                                        else dimensions[0],
+                                    },
+                                    "addr_info_": {
+                                        "l3lu": {
+                                            "type_": "stride",
+                                            "offset_": {
+                                                "mb": 1,
+                                                "out": dimensions[2] * dimensions[1],
+                                                "y": dimensions[2]
+                                                * dimensions[1]
+                                                * dimensions[-1],
+                                                "x": dimensions[2],
+                                            },
+                                        },
+                                        "l3su": {
+                                            "type_": "stride",
+                                            "offset_": {
+                                                "mb": 1,
+                                                "out": dimensions[0]
+                                                * dimensions[1]
+                                                * dimensions[2],
+                                                "y": dimensions[2] * dimensions[1],
+                                                "x": dimensions[2],
+                                            },
+                                        },
+                                    },
+                                    "inpPieceOrder": [
+                                        f"p{i % 2}"
+                                        for i in range(
+                                            dimensions[0]
+                                            * dimensions[1]
+                                            * dimensions[2]
+                                            * dimensions[-1]
+                                            // (64 * 64)
+                                        )
+                                    ],
+                                    "outPieceOrder": [
+                                        f"p{i % 2}"
+                                        for i in range(
+                                            dimensions[0]
+                                            * dimensions[1]
+                                            * dimensions[2]
+                                            * dimensions[-1]
+                                            // (64 * 64)
+                                        )
+                                    ],
+                                }
+                            },
+                            "numClToUse": 1,
+                            "cl0ToLxOffsetLU": 0,
+                            "cl0ToLxOffsetSU": 0,
+                        },
+                    }
+                }
+            ],
+        }
+    }
+
+
+def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    ndims = len(dimensions)
+    if ndims == 1:
+        layout = ["out"]
+        dim_map = {"out": dimensions[0]}
+        offsets = {"out": 1}
+        loop_counts = {"out": dimensions[0] // 64}
+        piece_valid_gaps = {"out": [[64, 0]]}
+        piece_sizes = {"out": 64}
+        valid_gaps = {"out": [[dimensions[0], 0]]}
+        piece_count = dimensions[0] // 64
+    elif ndims == 2:
+        layout = ["mb", "out"]
+        dim_map = {"mb": dimensions[0], "out": dimensions[-1]}
+        offsets = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": dimensions[0]}
+        loop_counts = {
+            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
+            "out": dimensions[-1] // 64,
+        }
+        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64}
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+        }
+        valid_gaps = {"mb": [[dimensions[0], 0]], "out": [[dimensions[-1], 0]]}
+        piece_count = (
+            dimensions[0] * dimensions[-1] // (4096 if dimensions[0] % 64 == 0 else 64)
+        )
+    else:
+        layout = ["mb", "out", "x"]
+        dim_map = {"mb": dimensions[0], "out": dimensions[-1], "x": dimensions[1]}
+        offsets = {
+            "mb": 64 if dimensions[0] % 64 == 0 else 1,
+            "out": dimensions[0],
+            "x": dimensions[-1] * dimensions[0] // 64,
+        }
+        loop_counts = {
+            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
+            "out": dimensions[-1] // 64,
+            "x": dimensions[1],
+        }
+        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64, "x": 1}
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+            "x": [[piece_sizes["x"], 0]],
+        }
+        valid_gaps = {
+            "mb": [[dimensions[0], 0]],
+            "out": [[dimensions[-1], 0]],
+            "x": [[dimensions[1], 0]],
+        }
+        piece_count = (
+            dimensions[0]
+            * dimensions[1]
+            * dimensions[-1]
+            // (4096 if dimensions[0] % 64 == 0 else 64)
+        )
+    return {
+        "clone": {
+            "numCoresUsed_": 1,
+            "dscs_": [],
+            "coreIdToDscSchedule": {"0": [[0, -1, 0, 0]]},
+            "datadscs_": [
+                {
+                    "clone": {
+                        "coreIdsUsed_": [0],
+                        "dimPool_": layout,
+                        "primaryDs_": [{"name_": "pds0", "dimNames": layout}],
+                        "labeledDs_": [
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": layout,
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": dim_map,
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": valid_gaps,
+                                "PieceInfo": [
+                                    {
+                                        "key_": f"p{i}",
+                                        "dimToSize_": piece_sizes,
+                                        "validGap_": piece_valid_gaps,
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[inputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [0],
+                                            },
+                                        ],
+                                    }
+                                    for i in range(piece_count)
+                                ],
+                                "hbmStartAddress_": pointers[inputs[0]["name"]] // 128,
+                            },
+                            {
+                                "pdsName_": "pds0",
+                                "wordLength": 2,
+                                "dataformat": "SEN169_FP16",
+                                "layoutDimOrder_": layout,
+                                "stickDimOrder_": ["out"],
+                                "dimToLayoutSize_": dim_map,
+                                "dimToStickSize_": {"out": 64},
+                                "validGap_": valid_gaps,
+                                "PieceInfo": [
+                                    {
+                                        "key_": f"p{i}",
+                                        "dimToSize_": piece_sizes,
+                                        "validGap_": piece_valid_gaps,
+                                        "PlacementInfo": [
+                                            {
+                                                "type": "hbm",
+                                                "memId": [-1],
+                                                "startAddr": [
+                                                    pointers[outputs[0]["name"]] // 128
+                                                ],
+                                            },
+                                            {
+                                                "type": "lx",
+                                                "memId": [0],
+                                                "startAddr": [16384],
+                                            },
+                                        ],
+                                    }
+                                    for i in range(piece_count)
+                                ],
+                                "hbmStartAddress_": pointers[outputs[0]["name"]] // 128,
+                            },
+                        ],
+                        "op": {
+                            "name": "STCDPOpHBM",
+                            "gtrIdsUsed": [],
+                            "coreIDtoANInfo": {
+                                "0": {
+                                    "loopCount": loop_counts,
+                                    "loopCountL3SU": {},
+                                    "addr_info_": {
+                                        "l3lu": {
+                                            "type_": "stride",
+                                            "offset_": offsets,
+                                        },
+                                        "l3su": {"type_": "stride", "offset_": offsets},
+                                    },
+                                    "inpPieceOrder": [
+                                        f"p{i}" for i in range(piece_count)
+                                    ],
+                                    "outPieceOrder": [
+                                        f"p{i}" for i in range(piece_count)
+                                    ],
+                                }
+                            },
+                            "numClToUse": 1,
+                            "cl0ToLxOffsetLU": 0,
+                            "cl0ToLxOffsetSU": 0,
+                        },
+                    }
+                }
+            ],
+        }
+    }

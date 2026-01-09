@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import dataclasses
-from typing import Union
+from typing import Any, Sequence, Union
 import torch
 from torch_spyre._C import SpyreTensorLayout
 
@@ -38,9 +38,9 @@ class KernelSpec:
     op: str
     is_reduction: bool
     dimensions: list[int]
-    args: list[TensorArg | ConstantArg]
+    args: Sequence[TensorArg | ConstantArg]
     scales: list[list[int]]
-    op_info: dict[list, str]
+    op_info: dict[str, Any]
 
 
 @dataclasses.dataclass
