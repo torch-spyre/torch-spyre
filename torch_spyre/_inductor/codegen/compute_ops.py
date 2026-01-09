@@ -983,6 +983,12 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 
 def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     # [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
+
+    # implement core division on stick dimension
+    cores = 1
+    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
+        cores = kwargs["op_info"]["core_division"][-1][0]  # mb_nsplit of the output
+
     return {
         op: {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -991,19 +997,21 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                 "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
                 "data_": {"[0]": "0"},
             },
-            "coreFoldProp_": {"factor_": 1, "label_": "core"},
+            "coreFoldProp_": {"factor_": cores, "label_": "core"},
             "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-            "numCoresUsed_": 1,
-            "coreIdToDsc_": {"0": 0},
-            "numWkSlicesPerDim_": {"in": 1, "out": 1, "mb": 1, "x": 1},
-            "coreIdToWkSlice_": {"0": {"in": 0, "out": 0, "mb": 0, "x": 0}},
-            "coreIdToDscSchedule": {"0": [[-1, 0, 0, 0]]},
+            "numCoresUsed_": cores,
+            "coreIdToDsc_": {str(i): 0 for i in range(cores)},
+            "numWkSlicesPerDim_": {"in": 1, "out": 1, "mb": cores, "x": 1},
+            "coreIdToWkSlice_": {
+                str(i): {"in": 0, "out": 0, "mb": i, "x": 0} for i in range(cores)
+            },
+            "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
             "dscs_": [
                 {
                     op: {
-                        "numCoresUsed_": 1,
+                        "numCoresUsed_": cores,
                         "numCoreletsUsed_": 1,
-                        "coreIdsUsed_": [0],
+                        "coreIdsUsed_": list(range(cores)),
                         "N_": {
                             "name_": "n",
                             "in_": dimensions[2],
@@ -1017,14 +1025,14 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     "name_": "core",
                                     "in_": dimensions[2],
                                     "out_": dimensions[3],
-                                    "mb_": dimensions[1],
+                                    "mb_": dimensions[1] // cores,
                                     "x_": dimensions[0],
                                 },
                                 "el_": {
                                     "name_": "core",
                                     "in_": dimensions[2],
                                     "out_": dimensions[3],
-                                    "mb_": dimensions[1],
+                                    "mb_": dimensions[1] // cores,
                                     "x_": dimensions[0],
                                 },
                             }
@@ -1062,12 +1070,21 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": 1, "label_": "core"},
+                                        {"factor_": cores, "label_": "core"},
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        "[0, 0, 0]": str(pointers[inputs[0]["name"]])
+                                        f"[{i}, 0, 0]": str(
+                                            pointers[inputs[0]["name"]]
+                                            + i
+                                            * dimensions[1]
+                                            * dimensions[2]
+                                            * dimensions[0]
+                                            * num_bytes(inputs[0]["ddtype"])
+                                            // cores
+                                        )
+                                        for i in range(cores)
                                     },
                                 },
                                 "coordinates_": {
@@ -1114,7 +1131,9 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                 ],
                                                 "dim_prop_attr": [
                                                     {
-                                                        "factor_": 1,
+                                                        "factor_": 1
+                                                        if name != "mb"
+                                                        else cores,
                                                         "label_": "core_fold",
                                                     },
                                                     {
@@ -1143,7 +1162,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         for name, size in zip(
                                             ["mb", "in", "x"],
                                             [
-                                                dimensions[1],
+                                                dimensions[1] // cores,
                                                 dimensions[2],
                                                 dimensions[0],
                                             ],
@@ -1167,12 +1186,13 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": 1, "label_": "core"},
+                                        {"factor_": cores, "label_": "core"},
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        "[0, 0, 0]": str(pointers[inputs[1]["name"]])
+                                        f"[{i}, 0, 0]": str(pointers[inputs[1]["name"]])
+                                        for i in range(cores)
                                     },
                                 },
                                 "coordinates_": {
@@ -1272,12 +1292,21 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"Const": {}},
                                     ],
                                     "dim_prop_attr": [
-                                        {"factor_": 1, "label_": "core"},
+                                        {"factor_": cores, "label_": "core"},
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        "[0, 0, 0]": str(pointers[outputs[0]["name"]])
+                                        f"[{i}, 0, 0]": str(
+                                            pointers[outputs[0]["name"]]
+                                            + i
+                                            * dimensions[0]
+                                            * dimensions[1]
+                                            * dimensions[3]
+                                            * num_bytes(outputs[0]["ddtype"])
+                                            // cores
+                                        )
+                                        for i in range(cores)
                                     },
                                 },
                                 "coordinates_": {
@@ -1324,7 +1353,9 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                 ],
                                                 "dim_prop_attr": [
                                                     {
-                                                        "factor_": 1,
+                                                        "factor_": 1
+                                                        if name != "mb"
+                                                        else cores,
                                                         "label_": "core_fold",
                                                     },
                                                     {
@@ -1353,7 +1384,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         for name, size in zip(
                                             ["mb", "out", "x"],
                                             [
-                                                dimensions[1],
+                                                dimensions[1] // cores,
                                                 dimensions[3],
                                                 dimensions[0],
                                             ],

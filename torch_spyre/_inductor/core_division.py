@@ -30,7 +30,7 @@ from torch._inductor.scheduler import (
 )
 
 from . import Unsupported
-from .constants import MATMUL_REDUCTION_OP
+from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps
 
@@ -93,6 +93,15 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         if num_cores > 1:
             for cd in n.spyre_core_division:
                 cd[-3] = num_cores
+
+    if red.reduction_type == BATCH_MATMUL_OP:
+        # [mb, out//64, x, 64]
+        device_size = output.device_layout.device_size
+        # try split along mb first
+        mb_nsplit = core_split(device_size[0], max_cores)
+        if mb_nsplit > 1:
+            for cd in n.spyre_core_division:
+                cd[0] = mb_nsplit
 
 
 def core_division_planning(
