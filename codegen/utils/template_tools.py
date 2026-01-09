@@ -69,11 +69,11 @@ def generate_replacements(
     all_declarations, all_schemas, metadata, action="skip", only_req=False
 ):
     """
-    Generates replacement data for pytorch ops (specified in declaration and schema files)
+    Generates replacement data for PyTorch ops (specified in declaration and schema files)
 
     Args:
-        all_declarations (list): list of dicts parsed from pytorch Declarations.yaml
-        all_schemas (list): list of dicts parsed from pytorch RegistrationDeclarations.yaml (indices match with declarations)
+        all_declarations (list): list of dicts parsed from PyTorch Declarations.yaml
+        all_schemas (list): list of dicts parsed from PyTorch RegistrationDeclarations.yaml (indices match with declarations)
         metadata (dict): dict of metadata for each operator (contains sendnn_func_name, template_name and arg_mapping) parsed from Metadata.yaml
         action (str): what to do if the operator is not supported, options: 'skip', 'fallback', 'native_call'
         only_req (bool): set true to enable filtering with (dispatch=True, default=False)

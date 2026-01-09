@@ -1,6 +1,6 @@
 # Torch Spyre Device Enablement
 
-This project contains the Pytorch layer C++ and Python code for supporting the [IBM Spyre device](https://www.ibm.com/new/announcements/ibm-spyre-accelerator-and-telum-ii-processor-capturing-ai-value-at-a-trusted-enterprise-level) as a new device, named `spyre`, in PyTorch.
+This project contains the PyTorch layer C++ and Python code for supporting the [IBM Spyre device](https://www.ibm.com/new/announcements/ibm-spyre-accelerator-and-telum-ii-processor-capturing-ai-value-at-a-trusted-enterprise-level) as a new device, named `spyre`, in PyTorch.
 
 ## Setup and Build
 
@@ -38,7 +38,7 @@ Controlling logging:
 
 ## Description
 
-This implementation of a Pytorch backend for IBM Spyre device is based on the self-contained example of a Pytorch out-of-tree backend leveraging the "PrivateUse1" backend from core. For that project, you can visit this [link](https://github.com/pytorch/pytorch/tree/v2.9.1/test/cpp_extensions/open_registration_extension).
+This implementation of a PyTorch backend for IBM Spyre device is based on the self-contained example of a PyTorch out-of-tree backend leveraging the "PrivateUse1" backend from core. For that project, you can visit this [link](https://github.com/pytorch/pytorch/tree/v2.9.1/test/cpp_extensions/open_registration_extension).
 
 Unlike open_registration_extension, most of the code for this will be done in C++ utilizing the lower level spyre repositories.
 
@@ -48,4 +48,4 @@ This project contains 2 main folders for development:
 
 * `torch_spyre`: This will contain all required Python code to enable eager (currently this is being updated). This [link](https://github.com/pytorch/pytorch/tree/v2.9.1/test/cpp_extensions/open_registration_extension) describes the design principles we follows. For the most part, all that will be necessary from a Python standpoint is registering the device with PrivateUse1.
 
-* `torch_spyre/csrc`: This will be where all of the Spyre-specific implementations of pytorch tensor ops / management functions will be.
+* `torch_spyre/csrc`: This will be where all of the Spyre-specific implementations of PyTorch tensor ops / management functions will be.
