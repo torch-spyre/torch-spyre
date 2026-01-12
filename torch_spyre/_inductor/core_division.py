@@ -62,7 +62,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
 
-    if len(output.size) > 2:
+    if len(n.node.get_outputs()) > 2:
         # Core division currently only implemented for 1 or 2 tensors
         return
 
@@ -72,7 +72,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             return
 
     device_size = output.device_layout.device_size
-    split_idx = -2 if len(device_size) == 2 else -3
+    split_idx = -2 if len(device_size) == 2 else -3  # split along stick dim
     num_cores = core_split(device_size[split_idx], max_cores)
     if num_cores > 1:
         for cd in n.spyre_core_division:

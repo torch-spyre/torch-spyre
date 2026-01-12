@@ -51,17 +51,18 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     data_format = inputs[0]["ddtype"]
 
+    d2 = len(dimensions) >= 2
+    d3 = len(dimensions) >= 3
+
     # implement core division on stick dimension
     cores = 1
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
-        cores = kwargs["op_info"]["core_division"][-1][0]
+        split_idx = -2 if not d3 else -3
+        cores = kwargs["op_info"]["core_division"][-1][split_idx]
 
     # TODO: fix constant generation with multiple cores
     if "op_info" in kwargs and "constants" in kwargs["op_info"]:
         cores = 1
-
-    d2 = len(dimensions) >= 2
-    d3 = len(dimensions) >= 3
 
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
@@ -150,6 +151,15 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             pointers[tensor["name"]]
                                             + i
                                             * math.prod(dimensions)
+                                            * num_bytes(tensor["ddtype"])
+                                            // cores
+                                        )
+                                        if not d3
+                                        else str(
+                                            pointers[tensor["name"]]
+                                            + i
+                                            * dimensions[0]
+                                            * dimensions[-1]  # mb * out
                                             * num_bytes(tensor["ddtype"])
                                             // cores
                                         )
