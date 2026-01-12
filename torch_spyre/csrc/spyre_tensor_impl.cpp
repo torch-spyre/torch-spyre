@@ -100,12 +100,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   int host_dims = static_cast<int>(host_size.size());
   int device_dims = host_dims + 1;
-  auto elems_in_stick = this->elems_per_stick();
-  if (format == Sparse) {
-    elems_in_stick = 1;
-  } else if (format == SparseMulti) {
-    elems_in_stick = 2;
-  }
+  auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
 
   TORCH_CHECK(host_size.size() == dim_order.size(),
               "Invalid arguments: host_size.size() != dim_order.size()");
@@ -117,7 +112,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   // Stick dim
   auto stick_dim = this->dim_map[this->dim_map.size() - 1];
-  this->device_size[this->dim_map.size() - 1] = elems_in_stick;
+  this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();
 
   // Pad stick dimension if necessary
   auto requires_padding = host_size[stick_dim] % elems_in_stick != 0;
@@ -133,7 +128,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] =
           format == Dense
               ? (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick
-              : host_size[stick_dim] * elems_in_stick;
+              : host_size[stick_dim];
     } else {
       this->device_size[i] = host_size[dim];
     }
@@ -259,7 +254,7 @@ void SpyreTensorImpl::shallow_copy_from(
 }
 
 int32_t get_device_size_in_bytes(SpyreTensorLayout stl) {
-  int32_t size_bytes = 128;
+  int32_t size_bytes = BYTES_IN_STICK;
   for (int i = stl.device_size.size() - 2; i >= 0; i--) {
     size_bytes *= stl.device_size[i];
   }
