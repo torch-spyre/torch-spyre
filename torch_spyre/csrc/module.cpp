@@ -235,6 +235,14 @@ void convertArtifacts(std::string artifacts_path) {
 
   return;
 }
+
+int64_t get_elem_in_stick(c10::ScalarType torch_dtype) {
+  auto str_type = torchScalarToString[torch_dtype];
+  const auto [sen_dtype_cpu, sen_dtype_dev] =
+      stringToDTDataFormatPair(str_type);
+  return elems_per_stick(sen_dtype_dev);
+}
+
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -305,4 +313,5 @@ PYBIND11_MODULE(_C, m) {
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
         "Enable/disable downcast warnings for this process.");
+  m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
 }

@@ -19,6 +19,7 @@ from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from torch_spyre._C import get_elem_in_stick
 from .ir import SpyreReduction
 
 # Implicit fallback to an eager op does not become effective when lowering of
@@ -123,13 +124,9 @@ def lower_slice(x):
 
 @lowering.register_lowering(torch.ops.spyre.exx2)
 def lower_exx2(x, exx2Scale, useZeroMean):
-    def inner_fn(index, reduction_index):
-        i0, _ = index
-        (r0,) = reduction_index
-        tmp1 = ops.load(x.get_name(), r0 + x.get_size()[-1] * i0)
-
-        return tmp1
-
+    kwargs = lowering._make_reduction_inner(
+        x, axis=[-1], keepdims=True, dtype=x.dtype, override_return_dtype=None
+    )
     op_info = {
         "constants": {
             "exx2scale": exx2Scale,
@@ -142,9 +139,9 @@ def lower_exx2(x, exx2Scale, useZeroMean):
         device=x.get_device(),
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size()[:-1] + [64],
-        reduction_ranges=[x.get_size()[-1]],
+        inner_fn=kwargs["inner_fn"],
+        ranges=x.get_size()[:-1] + [get_elem_in_stick(x.get_dtype())],
+        reduction_ranges=kwargs["reduction_ranges"],
         op_info=op_info,
     )
     result.realize()
