@@ -242,7 +242,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         stl = SpyreTensorLayout(
             output.size,
             output.dtype,
-            x_stl.host_dim_order()[:-1],
+            x_stl.host_dim_order(),
             StickFormat.SparseMulti,
         )
         return FixedTiledLayout(

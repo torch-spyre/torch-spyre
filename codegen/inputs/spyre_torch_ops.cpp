@@ -51,7 +51,8 @@ namespace {
 // Adapted from CUDA
 at::Tensor spyre__view(const at::Tensor &self, c10::SymIntArrayRef size) {
   DEBUGINFO("self is on:", self.device());
-  return at::native::view(self, C10_AS_INTARRAYREF_SLOW(size));
+  auto result = spyre_empty_strided(C10_AS_INTARRAYREF_SLOW(size));
+  return result;
 }
 
 // Adapted from CUDA

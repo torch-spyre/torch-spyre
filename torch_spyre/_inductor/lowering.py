@@ -123,9 +123,13 @@ def lower_slice(x):
 
 @lowering.register_lowering(torch.ops.spyre.exx2)
 def lower_exx2(x, exx2Scale, useZeroMean):
-    kwargs = lowering._make_reduction_inner(
-        x, axis=[-1], keepdims=False, dtype=x.dtype, override_return_dtype=None
-    )
+    def inner_fn(index, reduction_index):
+        i0, _ = index
+        (r0,) = reduction_index
+        tmp1 = ops.load(x.get_name(), r0 + x.get_size()[-1] * i0)
+
+        return tmp1
+
     op_info = {
         "constants": {
             "exx2scale": exx2Scale,
@@ -133,7 +137,15 @@ def lower_exx2(x, exx2Scale, useZeroMean):
         }
     }
     result = SpyreReduction.create(
-        reduction_type="exx2", input_node=x, op_info=op_info, **kwargs
+        reduction_type="exx2",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=x.get_size()[:-1] + [64],
+        reduction_ranges=[x.get_size()[-1]],
+        op_info=op_info,
     )
     result.realize()
     return result
@@ -152,8 +164,8 @@ def lower_layernormnorm(x, mean, norm_mean, weight, bias):
     def inner_fn(index):
         loaded_inputs = [
             x.make_loader()(index),
-            mean.make_loader()(index[:-1]),
-            norm_mean.make_loader()(index[:-1]),
+            mean.make_loader()(index),
+            norm_mean.make_loader()(index),
         ]
         if weight is not None:
             loaded_inputs.append(weight.make_loader()(index[-1:]))
