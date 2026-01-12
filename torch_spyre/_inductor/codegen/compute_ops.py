@@ -57,7 +57,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     # implement core division on stick dimension
     cores = 1
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
-        split_idx = -2 if not d3 else -3
+        if reduction:  # FIXME: reduction doesn't support work division yet
+            split_idx = 0
+        else:
+            split_idx = -2 if not d3 else -3
         cores = kwargs["op_info"]["core_division"][-1][split_idx]
 
     # TODO: fix constant generation with multiple cores
