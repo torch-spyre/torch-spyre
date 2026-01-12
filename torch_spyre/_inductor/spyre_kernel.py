@@ -416,7 +416,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ]
 
             # Determine data op based on tensor arg and scales
-            if args[0].device_layout.device_size != args[1].device_layout.device_size:  # type: ignore[union-attr]
+            if (
+                isinstance(args[0], TensorArg)
+                and isinstance(args[1], TensorArg)
+                and args[0].device_layout.device_size
+                != args[1].device_layout.device_size
+            ) or in_di != out_di:
                 op = TRANSPOSE_OP
             elif input_stride == 64 and output_stride == 64:
                 op = "swap"
