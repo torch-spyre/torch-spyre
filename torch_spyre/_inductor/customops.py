@@ -86,7 +86,7 @@ def layer_norm(
         raise Unsupported(
             f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
         )
-    return torch.native_layer_norm(x, normalized_shape, weight, bias, eps)[0]
+    return torch.native_layer_norm(x, normalized_shape, weight, bias, eps)[0].clone()
 
 
 @layer_norm.register_fake
