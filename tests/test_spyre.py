@@ -23,10 +23,41 @@ from contextlib import contextmanager
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
+from unittest.mock import patch
+
+from torch_spyre import _SpyreImpl
+
 
 class TestSpyre(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
+
+    @patch.dict(os.environ, {"IS_INDUCTOR_SPAWNED_SUBPROCESS": "1"})
+    @patch("torch_spyre._SpyreImpl._lazy_init", lambda self: None)
+    def test_spyre_subprocess_init(self):
+        impl = _SpyreImpl
+
+        self.assertTrue(impl.is_initialized)
+        self.assertTrue(impl._is_in_bad_fork)
+
+    @patch.dict(os.environ, {"IS_INDUCTOR_SPAWNED_SUBPROCESS": "1"})
+    @patch("torch_spyre._SpyreImpl._lazy_init", lambda self: None)
+    @patch("torch_spyre._SpyreImpl.device_count", return_value=2)
+    def test_autograd_init_subprocess(self, mock_device_count):
+        t = torch.ones(2, device="spyre")
+
+        impl = _SpyreImpl
+
+        num_devices = impl.device_count()
+        self.assertEqual(num_devices, 2)
+
+        pid = os.getpid()
+        task_path = f"/proc/{pid}/task"
+        all_threads = psutil.Process(pid).threads()
+        all_thread_names = {open(f"{task_path}/{t.id}/comm").read().strip() for t in all_threads}
+
+        for i in range(num_devices):
+            self.assertNotIn(f"pt_autograd_{i}", all_thread_names)
 
     @unittest.skip("Skip for now")
     def test_autograd_init(self):
