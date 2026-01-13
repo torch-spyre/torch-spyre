@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+namespace spyre {
+
 inline std::unordered_map<c10::ScalarType, std::string> torchScalarToString = {
     /* this ensures the same representation regardless of how PyTorch changes
        its type names we will use this to map to DT and SenDnn names
@@ -67,7 +69,7 @@ inline std::pair<DataFormats, DataFormats> stringToDTDataFormatPair(
           {"int16", {DataFormats::SENINT16, DataFormats::SENINT16}},
           {"int32", {DataFormats::IEEE_INT32, DataFormats::IEEE_INT32}},
           {"int64", {DataFormats::IEEE_INT64, DataFormats::IEEE_INT32}},
-          {"bool", {DataFormats::SENINT8, DataFormats::SEN169_FP16}},
+          {"bool", {DataFormats::BOOL, DataFormats::SEN169_FP16}},
           {"bfloat16", {DataFormats::BFLOAT16, DataFormats::BFLOAT16}},
           {"quint8", {DataFormats::SENUINT32, DataFormats::SENUINT32}},
           {"qint8", {DataFormats::SENINT8, DataFormats::SENINT8}},
@@ -345,3 +347,17 @@ stringToSenDatatypePair(const std::string& type_name) {
   return {sendnn::sen_datatype_enum::dt_undef,
           sendnn::sen_datatype_enum::dt_undef};
 }
+inline std::pair<size_t, size_t> elementSize(const c10::ScalarType& dtype) {
+  /* return size (bytes) on CPU and on Spyre*/
+  static const std::unordered_map<c10::ScalarType, std::pair<size_t, size_t>>
+      itemsize_map = {
+          {c10::kBool, {1, 2}},
+      };
+  auto it = itemsize_map.find(dtype);
+  if (it != itemsize_map.end()) {
+    return it->second;
+  }
+  auto val = c10::elementSize(dtype);
+  return {val, val};
+}
+}  // namespace spyre

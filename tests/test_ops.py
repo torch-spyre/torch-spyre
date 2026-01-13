@@ -157,6 +157,16 @@ class TestOps(TestCase):
         y = x_spyre.permute(1, 0).to("cpu")
         torch.testing.assert_close(y, x.permute(1, 0), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("Need to update eager-mode graph to work with bool")
+    def test_bool(self):
+        dtype = torch.bool
+        x = torch.randint(0, 2, (2, 64), dtype=dtype)
+        x_spyre = x.to("spyre")
+        y = torch.randint(0, 2, (2, 64), dtype=dtype)
+        y_spyre = y.to("spyre")
+        result = torch.eq(x_spyre, y_spyre).cpu()
+        torch.testing.assert_close(result, torch.eq(x, y))
+
     def test_eq(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         y = torch.tensor([0, -2, 4], dtype=self.dtype)
