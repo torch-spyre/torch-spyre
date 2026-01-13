@@ -207,10 +207,22 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
-    if (
-        red.reduction_type == MATMUL_REDUCTION_OP
-        or red.reduction_type == BATCH_MATMUL_OP
-    ):
+    if red.reduction_type == MATMUL_REDUCTION_OP:
+        x_stl = args[0].layout.device_layout
+        y_stl = args[1].layout.device_layout
+        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+            raise Unsupported(f"matmul on non-dense tensors {x_stl} {y_stl}")
+        if x_stl.stick_dim() == 0 and y_stl.stick_dim() == 0:
+            out_host_dim_order = [1, 0]
+        elif x_stl.stick_dim() != 0 and y_stl.stick_dim() != 0:
+            out_host_dim_order = [0, 1]
+        else:
+            raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
+        stl = SpyreTensorLayout(output.size, output.dtype, out_host_dim_order)
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
+    elif red.reduction_type == BATCH_MATMUL_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
         if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
@@ -230,7 +242,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         stl = SpyreTensorLayout(
             output.size,
             output.dtype,
-            x_stl.host_dim_order()[:-1],
+            x_stl.host_dim_order(),
             StickFormat.SparseMulti,
         )
         return FixedTiledLayout(

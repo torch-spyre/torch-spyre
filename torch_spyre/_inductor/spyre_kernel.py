@@ -368,8 +368,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     scale = self.analyze_tensor_access(di, input.index)
-                    if value.op == "layernormscale":
-                        scale[-1] = -2
+                    if value.op == "layernormscale" or (
+                        value.op == "layernormnorm"
+                        and (len(args) == 1 or len(args) == 2)
+                    ):
+                        scale[-1] = -1
+
                     args.append(
                         create_tensor_arg(
                             True,

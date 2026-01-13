@@ -19,6 +19,7 @@ from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from torch_spyre._C import get_elem_in_stick
 from .ir import SpyreReduction
 
 # Implicit fallback to an eager op does not become effective when lowering of
@@ -124,7 +125,7 @@ def lower_slice(x):
 @lowering.register_lowering(torch.ops.spyre.exx2)
 def lower_exx2(x, exx2Scale, useZeroMean):
     kwargs = lowering._make_reduction_inner(
-        x, axis=[-1], keepdims=False, dtype=x.dtype, override_return_dtype=None
+        x, axis=[-1], keepdims=True, dtype=x.dtype, override_return_dtype=None
     )
     op_info = {
         "constants": {
@@ -133,7 +134,15 @@ def lower_exx2(x, exx2Scale, useZeroMean):
         }
     }
     result = SpyreReduction.create(
-        reduction_type="exx2", input_node=x, op_info=op_info, **kwargs
+        reduction_type="exx2",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=kwargs["inner_fn"],
+        ranges=x.get_size()[:-1] + [get_elem_in_stick(x.get_dtype())],
+        reduction_ranges=kwargs["reduction_ranges"],
+        op_info=op_info,
     )
     result.realize()
     return result
@@ -152,8 +161,8 @@ def lower_layernormnorm(x, mean, norm_mean, weight, bias):
     def inner_fn(index):
         loaded_inputs = [
             x.make_loader()(index),
-            mean.make_loader()(index[:-1]),
-            norm_mean.make_loader()(index[:-1]),
+            mean.make_loader()(index),
+            norm_mean.make_loader()(index),
         ]
         if weight is not None:
             loaded_inputs.append(weight.make_loader()(index[-1:]))
