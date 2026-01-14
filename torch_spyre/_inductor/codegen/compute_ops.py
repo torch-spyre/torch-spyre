@@ -65,7 +65,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         if not reduction:
             split_idx = -3 if d3 else 0  # split along stick dim
             cores = kwargs["op_info"]["core_division"][-1][split_idx]
-            # FIXME: cores should be the inner product of list of splits
+            # FIXME: cores should be the product of list of splits
 
     # TODO: fix constant generation with multiple cores
     if "op_info" in kwargs and "constants" in kwargs["op_info"]:
