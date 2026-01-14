@@ -287,3 +287,24 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
+
+lowering.register_op_dtype_propagation_rules(
+    "where", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
+)
+
+
+@lowering.register_lowering(torch.ops.spyre.where)
+def lower_where(x, approximate="none"):
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.where.__name__)(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+ 

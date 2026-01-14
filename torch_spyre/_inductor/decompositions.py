@@ -133,3 +133,18 @@ def spyre_clamp(
 
 
 torch.clamp = spyre_clamp
+
+
+orig_where = torch.where
+
+def spyre_where(
+    condition: torch.BoolTensor, 
+    input: torch.Tensor,
+    other: torch.Tensor,
+) -> torch.Tensor:
+    if input.device.type == "spyre":
+        return torch.ops.spyre.where(condition, input, other)
+    else:
+        return orig_softplus(condition, input, other)
+
+torch.where = spyre_where

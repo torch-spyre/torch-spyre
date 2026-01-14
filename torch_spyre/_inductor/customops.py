@@ -194,3 +194,18 @@ def _(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(size, dtype=dtype, device="spyre")
+
+
+@torch.library.custom_op("spyre::where", mutates_args=(), device_types="spyre")
+def where(
+    condition: torch.Tensor,
+    input: torch.Tensor,
+    other: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+@where.register_fake
+def _(condition: torch.Tensor, 
+    input: torch.Tensor,
+    other: torch.Tensor,):
+    return input.new_empty(input.size())
