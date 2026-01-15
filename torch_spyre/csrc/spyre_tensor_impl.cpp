@@ -263,9 +263,9 @@ int32_t get_device_size_in_bytes(SpyreTensorLayout stl) {
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorLayout stl;
-  if (dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
-    stl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())
-              ->spyre_layout;
+  SpyreTensorImpl *impl;
+  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
+    stl = impl->spyre_layout;
   } else {
     DEBUGINFO("Warning: Device tensor does not have SpyreTensorImpl");
     stl = SpyreTensorLayout(tensor.sizes().vec(),
