@@ -17,6 +17,15 @@ from dataclasses import dataclass
 from torch_spyre._C import encode_constant, DataFormats
 
 
+@dataclass
+class DimInfo:
+    label: str
+    index: int
+    nsplits: int
+    size: int
+    split_size: int
+
+
 def num_bytes(df: DataFormats) -> int:
     """Try to avoid using this method; it is a bad API due to sub-byte datatypes"""
     num_elems = df.elems_per_stick()
@@ -47,13 +56,132 @@ def generate_constant_info(data_format, **kwargs):
     return constant_info
 
 
-@dataclass
-class DimInfo:
-    label: str
-    index: int
-    nsplits: int
-    size: int
-    split_size: int
+def gen_coord_info_value(
+    size: int, nsplits: int, elems_per_stick: int, is_stick_dim: bool
+):
+    return (
+        {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 1,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {
+                        "Affine": {
+                            "alpha_": size,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0,
+                        }
+                    },
+                ],
+                "dim_prop_attr": [
+                    {
+                        "factor_": nsplits,
+                        "label_": "core_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "corelet_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "row_fold",
+                    },
+                    {
+                        "factor_": size,
+                        "label_": "elem_arr_0",
+                    },
+                ],
+            },
+        }
+        if not is_stick_dim
+        else {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 2,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {
+                        "Affine": {
+                            "alpha_": size,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 0,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": elems_per_stick
+                            if (size % elems_per_stick == 0)
+                            else 1,
+                            "beta_": 0,
+                        }
+                    },
+                    {
+                        "Affine": {
+                            "alpha_": 1,
+                            "beta_": 0,
+                        }
+                    },
+                ],
+                "dim_prop_attr": [
+                    {
+                        "factor_": nsplits,
+                        "label_": "core_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "corelet_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "row_fold",
+                    },
+                    {
+                        "factor_": (size // elems_per_stick)
+                        if (size % elems_per_stick == 0)
+                        else (size),
+                        "label_": "elem_arr_1",
+                    },
+                    {
+                        "factor_": elems_per_stick
+                        if (size % elems_per_stick == 0)
+                        else 1,
+                        "label_": "elem_arr_0",
+                    },
+                ],
+            },
+        }
+    )
 
 
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
@@ -202,154 +330,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        di.label: {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 2,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": di.split_size,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": tensor[
-                                                                "ddtype"
-                                                            ].elems_per_stick()
-                                                            if (
-                                                                di.split_size
-                                                                % tensor[
-                                                                    "ddtype"
-                                                                ].elems_per_stick()
-                                                                == 0
-                                                            )
-                                                            else 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": di.nsplits,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": di.split_size
-                                                        // tensor[
-                                                            "ddtype"
-                                                        ].elems_per_stick()
-                                                        if (
-                                                            di.split_size
-                                                            % tensor[
-                                                                "ddtype"
-                                                            ].elems_per_stick()
-                                                            == 0
-                                                        )
-                                                        else (di.split_size),
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": tensor[
-                                                            "ddtype"
-                                                        ].elems_per_stick()
-                                                        if (
-                                                            di.split_size
-                                                            % tensor[
-                                                                "ddtype"
-                                                            ].elems_per_stick()
-                                                            == 0
-                                                        )
-                                                        else 1,
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        }
-                                        if tensor["scale"][di.index] == 1
-                                        else {
-                                            # For reduction dimension
-                                            # TODO: different logic for -2?
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 1,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        }
+                                        di.label: gen_coord_info_value(
+                                            size=di.split_size
+                                            if (tensor["scale"][di.index] == 1)
+                                            else 1,
+                                            nsplits=di.nsplits,
+                                            elems_per_stick=tensor[
+                                                "ddtype"
+                                            ].elems_per_stick(),
+                                            is_stick_dim=(di.label == "out"),
+                                        )
                                         for di in dim_info
                                     },
                                     "coreIdToWkSlice_": {},
