@@ -122,8 +122,9 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                 new sendnn::Node(sendnn::opcodes::PrimaryInput, {tensor}));
             exec_graph.NewEdge(edge_count, node, 0,
                                exec_graph.input_ops_[edge_count]);
-            sub_graph.NewEdge(edge_count++, compute_node, 0,
+            sub_graph.NewEdge(edge_count, compute_node, 0,
                               sub_graph.input_ops_[edge_count]);
+            edge_count++;
           } else {
             auto tensor = sendnn::Tensor(getTensorInfo(arg));
             exec_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
