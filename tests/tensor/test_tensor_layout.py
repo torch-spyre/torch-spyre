@@ -16,7 +16,7 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import SpyreTensorLayout, StickFormat, DataFormats
+from torch_spyre._C import SpyreTensorLayout, StickFormat, DataFormats, to_spyre_layout
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -100,6 +100,12 @@ class TestSpyreTensorLayout(TestCase):
         z = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
         self.assertEqual(x, y)
         self.assertNotEqual(y, z)
+
+    def test_to_spyre_layout(self):
+        x = torch.rand([512, 256], dtype=torch.float16)
+        stl = SpyreTensorLayout([512, 256], torch.float16)
+        x_dev = to_spyre_layout(x, stl)
+        self.assertEqual(x_dev, x_dev.cpu())
 
 
 if __name__ == "__main__":
