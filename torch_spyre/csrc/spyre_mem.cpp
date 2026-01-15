@@ -660,6 +660,13 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     return at::_copy_from(self, dst, non_blocking);
   }
 }
+at::Tensor to_spyre_layout(const at::Tensor& self,
+                           SpyreTensorLayout device_layout) {
+  auto dst = spyre_empty_with_layout(self.sizes(), self.strides(),
+                                     c10::typeMetaToScalarType(self.dtype()),
+                                     device_layout);
+  return spyre_copy_from(self, dst, false);
+}
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));

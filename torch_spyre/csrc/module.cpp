@@ -254,6 +254,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
+  m.def("to_spyre_layout", &spyre::to_spyre_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
