@@ -464,8 +464,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
-            "test_dropout",
-            "test_dropout",
+            "test_dropout_functional",
+            "test_dropout_functional",
         ): {
             "param_sets": {
                 "value_3d": (
@@ -596,7 +596,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
 
-    def test_dropout(self, input, kwargs):
+    def test_dropout_functional(self, input, kwargs):
         compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
