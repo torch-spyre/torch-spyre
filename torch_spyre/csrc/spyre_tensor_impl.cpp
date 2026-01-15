@@ -262,8 +262,16 @@ int32_t get_device_size_in_bytes(SpyreTensorLayout stl) {
 }
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
-  return static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())
-      ->spyre_layout;
+  SpyreTensorLayout stl;
+  if (dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
+    stl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())
+              ->spyre_layout;
+  } else {
+    DEBUGINFO("Warning: Device tensor does not have SpyreTensorLayout");
+    stl = SpyreTensorLayout(tensor.sizes().vec(),
+                            c10::typeMetaToScalarType(tensor.dtype()));
+  }
+  return stl;
 }
 
 };  // namespace spyre
