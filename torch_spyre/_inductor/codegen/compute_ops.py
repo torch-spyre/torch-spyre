@@ -93,7 +93,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             str(i): {"mb": 0, "x": 0, "out": i} for i in range(cores)
         }
 
-    dim_info = list(zip(dim_labels, dim_sizes, dim_splits))
+    split_sizes = [size // split for size, split in zip(dim_sizes, dim_splits)]
+    dim_info = list(zip(dim_labels, dim_sizes, dim_splits, split_sizes))
 
     return {
         op: {
@@ -106,20 +107,20 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             "coreFoldProp_": {"factor_": cores, "label_": "core"},
             "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
             "numCoresUsed_": cores,
-            "coreIdToDsc_": {str(i): 0 for i in range(cores)},
-            "numWkSlicesPerDim_": {label: splits for label, _, splits in dim_info},
+            "coreIdToDsc_": {str(c): 0 for c in range(cores)},
+            "numWkSlicesPerDim_": {label: splits for label, _, splits, _ in dim_info},
             "coreIdToWkSlice_": core_id_to_wk_slice,
-            "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
+            "coreIdToDscSchedule": {str(c): [[-1, 0, 0, 0]] for c in range(cores)},
             "dscs_": [
                 {
                     op: {
                         "numCoresUsed_": cores,
                         "numCoreletsUsed_": 1,
-                        "coreIdsUsed_": [i for i in range(cores)],
+                        "coreIdsUsed_": [c for c in range(cores)],
                         "N_": {
                             "name_": "n",
                             **{
-                                label + "_": size for label, size, _ in dim_info
+                                label + "_": size for label, size, _, _ in dim_info
                             },  # dim sizes before split
                         },
                         "dataStageParam_": {
@@ -127,16 +128,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "ss_": {
                                     "name_": "core",
                                     **{
-                                        label + "_": size // splits
-                                        for label, size, splits in dim_info
-                                    },  # split sizes
+                                        label + "_": split_size
+                                        for label, _, _, split_size in dim_info
+                                    },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
-                                        label + "_": size // splits
-                                        for label, size, splits in dim_info
-                                    },  # split sizes
+                                        label + "_": split_size
+                                        for label, _, _, split_size in dim_info
+                                    },
                                 },
                             }
                         },
@@ -168,16 +169,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        f"[{i}, 0, 0]": str(
+                                        f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
-                                            + i
+                                            + c
                                             # calculate the prod of dim sizes
                                             # less significant than chosen split dim i.e. the stick
                                             * math.prod(dim_sizes[:2])
                                             * num_bytes(tensor["ddtype"])
                                             // cores
                                         )
-                                        for i in range(cores)
+                                        for c in range(cores)
                                     },
                                 },
                                 "coordinates_": {
@@ -191,7 +192,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 "dim_prop_func": [
                                                     {
                                                         "Affine": {
-                                                            "alpha_": size // splits,
+                                                            "alpha_": split_size,
                                                             "beta_": 0,
                                                         }
                                                     },
@@ -213,8 +214,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                                 "ddtype"
                                                             ].elems_per_stick()
                                                             if (
-                                                                size
-                                                                // splits
+                                                                split_size
                                                                 % tensor[
                                                                     "ddtype"
                                                                 ].elems_per_stick()
@@ -245,20 +245,18 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                         "label_": "row_fold",
                                                     },
                                                     {
-                                                        "factor_": size
+                                                        "factor_": split_size
                                                         // tensor[
                                                             "ddtype"
                                                         ].elems_per_stick()
-                                                        // splits
                                                         if (
-                                                            size
-                                                            // splits
+                                                            split_size
                                                             % tensor[
                                                                 "ddtype"
                                                             ].elems_per_stick()
                                                             == 0
                                                         )
-                                                        else (size // splits),
+                                                        else (split_size),
                                                         "label_": "elem_arr_1",
                                                     },
                                                     {
@@ -266,8 +264,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                             "ddtype"
                                                         ].elems_per_stick()
                                                         if (
-                                                            size
-                                                            // splits
+                                                            split_size
                                                             % tensor[
                                                                 "ddtype"
                                                             ].elems_per_stick()
@@ -279,7 +276,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 ],
                                             },
                                         }
-                                        for dim_label, size, splits in dim_info
+                                        for dim_label, _, splits, split_size in dim_info
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
