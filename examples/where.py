@@ -15,9 +15,75 @@
 # this import will start the runtime
 import torch
 
-x = torch.tensor([1, 2], dtype=torch.float16, device="spyre")
-cond = torch.tensor([True, False], device="spyre")
+# Integer condition (non-bool)
+condition_int = torch.tensor(
+    [[1, 0],
+     [0, 2]],
+    device="spyre"
+)
 
-print(f"x device is {x.device}")
+# Explicitly convert to boolean
+condition = condition_int != 0
 
-eager_result = torch.where(x > 0, 1.0, 0.0)
+# Inputs
+a = torch.tensor(
+    [[10, 10],
+     [10, 10]],
+    dtype=torch.float16,
+    device="spyre"
+)
+
+b = torch.tensor(
+    [[20, 20],
+     [20, 20]],
+    dtype=torch.float16,
+    device="spyre"
+)
+
+# torch.where with boolean condition
+out = torch.where(condition, a, b)
+
+print("condition_int:")
+print(condition_int)
+
+print("condition (bool):")
+print(condition)
+
+print("output:")
+print(out)
+
+print("With CPU:")
+
+condition_int_cpu = torch.tensor(
+    [[1, 0],
+     [0, 2]],
+    device="cpu"
+)
+
+# Inputs
+a_cpu = torch.tensor(
+    [[10, 10],
+     [10, 10]],
+    dtype=torch.float16,
+    device="cpu"
+)
+
+b_cpu = torch.tensor(
+    [[20, 20],
+     [20, 20]],
+    dtype=torch.float16,
+    device="cpu"
+)
+
+condition_cpu = condition_int_cpu != 0
+# torch.where with boolean condition
+out_cpu = torch.where(condition_cpu, a_cpu, b_cpu)
+
+print("condition_int_cpu:")
+print(condition_int_cpu)
+
+print("condition (bool):")
+print(condition_cpu)
+
+print("output:")
+print(out_cpu)

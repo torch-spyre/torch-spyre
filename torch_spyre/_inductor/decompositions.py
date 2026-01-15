@@ -145,6 +145,6 @@ def spyre_where(
     if input.device.type == "spyre":
         return torch.ops.spyre.where(condition, input, other)
     else:
-        return orig_softplus(condition, input, other)
+        return orig_where(condition, input, other)
 
 torch.where = spyre_where
