@@ -224,7 +224,12 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         dim_splits = [1, cores]
         core_id_to_wk_slice = {str(i): {"mb": 0, "out": i} for i in range(cores)}
     else:  # ndim == 3
-        dim_labels = ["mb", "out", "x"]  # correct 3d layoutDimOrder
+        # NOTE: Pytorch host tensor shape is [mb, x, out] from the most to the
+        #       least significant dimension. Here when filling in the
+        #       layoutDimOrder, we use 3d generic stick layout on device
+        #       [mb, out, x] from the least to the most significant
+        #       dimension.
+        dim_labels = ["mb", "out", "x"]
         dim_indices = [0, 2, 1]
         dim_splits = [1, cores, 1]
         core_id_to_wk_slice = {
