@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+import warnings
 
 import torch
 from torch._dynamo.backends.common import AotAutograd
@@ -39,17 +40,28 @@ class SpyreAotAutograd(AotAutograd):
         super().__init__(**kwargs)
 
     def __call__(self, gm: torch.fx.GraphModule, example_inputs, **kwargs):
-        if any(
-            isinstance(t, torch.Tensor) and t.device.type == "spyre"
-            for t in example_inputs
-        ):
-            with (
-                spyre_data_types(),
-                V.set_real_inputs(example_inputs),
+        # TODO: Remove this warning suppression once the issue causing the following
+        # warning is fixed:
+        #   UserWarning: undefined OpHandler.<op name>, please add missing op schema
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                action="ignore",
+                category=UserWarning,
+                module="torch._inductor.ops_handler",
+                message="^undefined OpHandler",
+            )
+
+            if any(
+                isinstance(t, torch.Tensor) and t.device.type == "spyre"
+                for t in example_inputs
             ):
+                with (
+                    spyre_data_types(),
+                    V.set_real_inputs(example_inputs),
+                ):
+                    return super().__call__(gm, example_inputs, **kwargs)
+            else:
                 return super().__call__(gm, example_inputs, **kwargs)
-        else:
-            return super().__call__(gm, example_inputs, **kwargs)
 
 
 def spyre_compile_to_module(graph: GraphLowering, original_compile_to_module):
