@@ -140,6 +140,10 @@ class SpyreOpFuncs:
         return PointwiseOp("layernormscale", [x], op_info)
 
     @staticmethod
+    def le(a, b):
+        return PointwiseOp("lesserequal", [a, b])
+
+    @staticmethod
     def log(x):
         return PointwiseOp("log", [x])
 

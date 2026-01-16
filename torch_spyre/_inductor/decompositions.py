@@ -133,3 +133,23 @@ def spyre_clamp(
 
 
 torch.clamp = spyre_clamp
+
+
+@register_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
+def gt_decomp(
+    input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # TODO: Implement greaterthan in the backend compiler
+    out_ge = torch.ge(input, other).to(dtype=torch.float16)
+    out_ne = torch.ne(input, other).to(dtype=torch.float16)
+    return torch.mul(out_ge, out_ne, out=out).to(dtype=torch.bool)
+
+
+@register_decomposition([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Tensor_out])
+def lt_decomp(
+    input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # TODO: Implement lessthan in the backend compiler
+    out_le = torch.le(input, other).to(dtype=torch.float16)
+    out_ne = torch.ne(input, other).to(dtype=torch.float16)
+    return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
