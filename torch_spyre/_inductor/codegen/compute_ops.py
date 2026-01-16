@@ -189,7 +189,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     data_format = inputs[0]["ddtype"]
 
-    d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
 
     ndim = len(dimensions)
@@ -358,13 +357,19 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "ldsIdx_": i,
                                 "dsName_": f"Tensor{i}",
                                 "dsType_": "OUTPUT",
-                                "scale_": [tensor["scale"][0]]
-                                + (
-                                    [-2 if tensor["scale"][-1] == -1 else 1]
-                                    if d2
-                                    else []
-                                )
-                                + tensor["scale"][1:-1],
+                                "scale_": [
+                                    (
+                                        tensor["scale"][di.index]
+                                        # TODO: to remove special case pending
+                                        #       change in deeptools
+                                        if not (
+                                            di.label == "out"
+                                            and tensor["scale"][di.index] == -1
+                                        )
+                                        else -2
+                                    )
+                                    for di in dim_info
+                                ],
                                 "wordLength": num_bytes(tensor["ddtype"]),
                                 "dataFormat_": tensor["ddtype"].name,
                                 "memOrg_": {
