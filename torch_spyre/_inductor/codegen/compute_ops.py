@@ -1110,11 +1110,11 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": "allocate_bmm-Input0_hbm",  # input0
+                                "name_": node_name,
                                 "prev_": "",
-                                "ldsIdx_": 0,
+                                "ldsIdx_": idx,
                                 "component_": "hbm",
-                                "layoutDimOrder_": input_layoutDimOrder,
+                                "layoutDimOrder_": layout_dim_order,
                                 "maxDimSizes_": [-1, -1, -1],
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
@@ -1128,17 +1128,20 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
+                                        # TODO: generalize this to avoid special case handling
                                         f"[{c}, 0, 0]": str(
-                                            pointers[inputs[0]["name"]]
+                                            pointers[tensor["name"]]
                                             + c
                                             * math.prod(
                                                 [
                                                     dim_info_dict[label].split_size
-                                                    for label in input_layoutDimOrder
+                                                    for label in layout_dim_order
                                                 ]
                                             )
-                                            * num_bytes(inputs[0]["ddtype"])
+                                            * num_bytes(tensor["ddtype"])
                                         )
+                                        if idx != 1
+                                        else str(pointers[tensor["name"]])
                                         for c in range(cores)
                                     },
                                 },
@@ -1146,124 +1149,51 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     "coordInfo": {
                                         label: gen_coord_info_value(
                                             size=di.split_size
-                                            if (inputs[0]["scale"][di.index] == 1)
+                                            if (tensor["scale"][di.index] == 1)
                                             else 1,
                                             nsplits=di.nsplits,
-                                            elems_per_stick=inputs[0][
+                                            elems_per_stick=tensor[
                                                 "ddtype"
                                             ].elems_per_stick(),
-                                            is_stick_dim=(di.label == "in"),
+                                            is_stick_dim=(di.label == stick_label),
                                         )
-                                        for label in input_layoutDimOrder
+                                        for label in layout_dim_order
                                         if (di := dim_info_dict[label])
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
-                            },
-                            {
-                                "nodeType_": "allocate",
-                                "name_": "allocate_bmm-Input1_hbm",  # input1
-                                "prev_": "",
-                                "ldsIdx_": 1,
-                                "component_": "hbm",
-                                "layoutDimOrder_": kernel_layoutDimOrder,
-                                "maxDimSizes_": [-1, -1, -1],
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
+                            }
+                            for idx, (
+                                node_name,
+                                tensor,
+                                layout_dim_order,
+                                stick_label,
+                            ) in enumerate(
+                                zip(
+                                    [
+                                        "allocate_bmm-Input0_hbm",
+                                        "allocate_bmm-Input1_hbm",
+                                        "allocate_bmm_out_hbm",
                                     ],
-                                    "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
+                                    inputs + outputs,
+                                    [
+                                        input_layoutDimOrder,
+                                        kernel_layoutDimOrder,
+                                        output_layoutDimOrder,
                                     ],
-                                    "data_": {
-                                        f"[{c}, 0, 0]": str(pointers[inputs[1]["name"]])
-                                        for c in range(cores)
-                                    },
-                                },
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        label: gen_coord_info_value(
-                                            size=di.split_size
-                                            if (inputs[1]["scale"][di.index] == 1)
-                                            else 1,
-                                            nsplits=di.nsplits,
-                                            elems_per_stick=inputs[1][
-                                                "ddtype"
-                                            ].elems_per_stick(),
-                                            is_stick_dim=(di.label == "out"),
-                                        )
-                                        for label in kernel_layoutDimOrder
-                                        if (di := dim_info_dict[label])
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            },
-                            {
-                                "nodeType_": "allocate",
-                                "name_": "allocate_bmm_out_hbm",  # output
-                                "prev_": "",
-                                "ldsIdx_": 2,
-                                "component_": "hbm",
-                                "layoutDimOrder_": output_layoutDimOrder,
-                                "maxDimSizes_": [-1, -1, -1],
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
-                                    ],
-                                    "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
-                                    ],
-                                    "data_": {
-                                        f"[{c}, 0, 0]": str(
-                                            pointers[outputs[0]["name"]]
-                                            + c
-                                            * math.prod(
-                                                [
-                                                    dim_info_dict[label].split_size
-                                                    for label in output_layoutDimOrder
-                                                ]
-                                            )
-                                            * num_bytes(outputs[0]["ddtype"])
-                                        )
-                                        for c in range(cores)
-                                    },
-                                },
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        label: gen_coord_info_value(
-                                            size=di.split_size
-                                            if (outputs[0]["scale"][di.index] == 1)
-                                            else 1,
-                                            nsplits=di.nsplits,
-                                            elems_per_stick=outputs[0][
-                                                "ddtype"
-                                            ].elems_per_stick(),
-                                            is_stick_dim=(di.label == "out"),
-                                        )
-                                        for label in output_layoutDimOrder
-                                        if (di := dim_info_dict[label])
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            },
+                                    ["in", "out", "out"],
+                                )
+                            )
                         ],
                         "labeledDs_": [
                             {
                                 "ldsIdx_": idx,
                                 "dsName_": f"Tensor{idx}",
-                                "dsType_": dsType,
+                                "dsType_": ds_type,
                                 # permute scale values according to layoutDimOrder
                                 "scale_": [
                                     tensor["scale"][di.index]
-                                    for label in layoutDimOrder
+                                    for label in layout_dim_order
                                     if (di := dim_info_dict[label])
                                 ],
                                 "wordLength": 2,
@@ -1273,7 +1203,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     "lx": {"isPresent": 1},
                                 },
                             }
-                            for idx, (dsType, tensor, layoutDimOrder) in enumerate(
+                            for idx, (ds_type, tensor, layout_dim_order) in enumerate(
                                 zip(
                                     ["INPUT", "KERNEL", "OUTPUT"],
                                     inputs + outputs,
