@@ -101,3 +101,18 @@ class FixedTiledLayout(FixedLayout):
         return self.size
 
     __repr__ = __str__
+
+    def make_indexer(self) -> Callable[[Sequence[Expr]], Expr]:
+        """
+        Ignore the host-view of strides when creating the indexer (ie force row-major).
+        This virtual indexing allows us to reliably match variables in index expressions
+        back to the operation dimension in spyre_kernel codegen.
+        TODO: Redesign to do this more directly from the IRNode.
+        """
+        strides: list[Expr] = []
+        cur_stride = 1
+        for v in reversed(self.size):
+            strides = [cur_stride] + strides
+            # Virtually pad trivial dimensions to ensure total ordering
+            cur_stride = cur_stride * (2 if v == 1 else v)
+        return torch._inductor.ir._fixed_indexer(self.size, strides, self.offset)
