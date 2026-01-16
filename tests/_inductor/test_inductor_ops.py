@@ -266,6 +266,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((1088, 320),),
+                    ((320, 320),),
                 ]
             ),
         },
@@ -280,6 +281,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     2,
                     cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_0_2_same_dim": (
+                    0,
+                    2,
+                    cached_randn((128, 128, 128), abs=True),
                 ),
             }
         },
