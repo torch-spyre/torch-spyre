@@ -31,7 +31,7 @@
 #include <sendnn/graph/graph_serializer.hpp>
 #include <sendnn/graph/graph_utils.hpp>
 #include <sendnn/graph/senparms.hpp>
-#include <sendnn/runtime/graph_loader.hpp>
+#include <sendnn/interface/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>

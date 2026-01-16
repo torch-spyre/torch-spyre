@@ -20,6 +20,10 @@ from typing import cast
 os.environ.setdefault(
     "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
 )  # must be before torch import
+os.environ.setdefault(
+    "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "senbfcc")
+)
+
 
 import glob
 
@@ -82,7 +86,7 @@ INCLUDE_DIRS = [
 LIBRARY_DIRS = []
 
 
-INCLUDE_DIRS += [maybe_download_nlohmann_json()]
+INCLUDE_DIRS += [maybe_download_nlohmann_json(), os.environ["SEN_COMMON_HEADERS"]]
 
 cmake_include_path = os.environ.get("CMAKE_INCLUDE_PATH", "")
 extra_include_dirs = cmake_include_path.split(":") if cmake_include_path else []
