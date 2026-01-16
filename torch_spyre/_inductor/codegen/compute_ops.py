@@ -1042,9 +1042,6 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     output_layoutDimOrder = ["x", "out", "mb"]
     kernel_layoutDimOrder = ["x", "out", "in"]
 
-    def label2index(label: str):
-        return dim_info_dict[label].index
-
     return {
         op: {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
