@@ -184,6 +184,26 @@ def gen_coord_info_value(
     )
 
 
+def get_ordered_dim_info_list(
+    dim_labels: list[str],
+    dim_indices: list[int],
+    dim_sizes: list[int],
+    dim_splits: list[int],
+):
+    return [
+        DimInfo(
+            label=label,
+            index=index,
+            nsplits=nsplits,
+            size=size,
+            split_size=(size // nsplits),
+        )
+        for label, index, size, nsplits in zip(
+            dim_labels, dim_indices, dim_sizes, dim_splits
+        )
+    ]
+
+
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
 
@@ -235,20 +255,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             str(i): {"mb": 0, "x": 0, "out": i} for i in range(cores)
         }
 
-    # reorder dim_sizes according to layoutDimOrder
+    # reorder sizes according to layoutDimOrder
     dim_sizes = [dimensions[i] for i in dim_indices]
-    dim_info = [
-        DimInfo(
-            label=label,
-            index=index,
-            nsplits=nsplits,
-            size=size,
-            split_size=(size // nsplits),
-        )
-        for label, index, size, nsplits in zip(
-            dim_labels, dim_indices, dim_sizes, dim_splits
-        )
-    ]
+    dim_info = get_ordered_dim_info_list(
+        dim_labels,
+        dim_indices,
+        dim_sizes,
+        dim_splits,
+    )
 
     return {
         op: {
