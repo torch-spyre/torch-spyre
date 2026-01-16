@@ -236,6 +236,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             str(i): {"mb": 0, "x": 0, "out": i} for i in range(cores)
         }
 
+    # reorder dim_sizes according to layoutDimOrder
     dim_sizes = [dimensions[i] for i in dim_indices]
     dim_info = [
         DimInfo(
