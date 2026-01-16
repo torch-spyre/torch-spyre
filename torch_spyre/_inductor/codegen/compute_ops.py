@@ -1039,8 +1039,8 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     }
 
     input_layoutDimOrder = ["x", "in", "mb"]
-    output_layoutDimOrder = ["x", "out", "mb"]
     kernel_layoutDimOrder = ["x", "out", "in"]
+    output_layoutDimOrder = ["x", "out", "mb"]
 
     return {
         op: {
@@ -1248,7 +1248,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                             ].elems_per_stick(),
                                             is_stick_dim=(di.label == "out"),
                                         )
-                                        for label in kernel_layoutDimOrder
+                                        for label in output_layoutDimOrder
                                         if (di := dim_info_dict[label])
                                     },
                                     "coreIdToWkSlice_": {},
