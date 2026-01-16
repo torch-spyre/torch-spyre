@@ -660,8 +660,14 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     return at::_copy_from(self, dst, non_blocking);
   }
 }
-at::Tensor to_spyre_layout(const at::Tensor& self,
-                           SpyreTensorLayout device_layout) {
+at::Tensor to_with_layout(const at::Tensor& self,
+                          SpyreTensorLayout device_layout) {
+  DEBUGINFO(
+      "Tensor info on CPU (Size:", self.sizes(), ", Stride: ", self.strides(),
+      ", dtype: ", c10::typeMetaToScalarType(self.dtype()),
+      ") and to be mapped onto device ",
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice(),
+      " with layout ", device_layout.toString());
   auto dst = spyre_empty_with_layout(self.sizes(), self.strides(),
                                      c10::typeMetaToScalarType(self.dtype()),
                                      device_layout);
