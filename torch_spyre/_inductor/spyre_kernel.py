@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Union
 from abc import ABC
+from collections import Counter
 
 import torch
 import sympy
@@ -79,7 +80,7 @@ class UnimplementedOp(RValue):
     op: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class DimensionInfo:
     var: sympy.Symbol
     numel: int
@@ -138,6 +139,10 @@ class SpyreOpFuncs:
     def layernormscale(x, eps):
         op_info = {"constants": {"eps": eps}}
         return PointwiseOp("layernormscale", [x], op_info)
+
+    @staticmethod
+    def le(a, b):
+        return PointwiseOp("lesserequal", [a, b])
 
     @staticmethod
     def log(x):
@@ -414,22 +419,41 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(in_di, value.index),
                 self.analyze_tensor_access(out_di, index),
             ]
-
-            # Determine data op based on tensor arg and scales
-            if args[0].device_layout.device_size != args[1].device_layout.device_size:  # type: ignore[union-attr]
-                op = TRANSPOSE_OP
-            elif input_stride == 64 and output_stride == 64:
-                op = "swap"
-            elif input_stride == 64 and output_stride == 1:
-                op = "slice"
+            if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
+                # Determine data op based on tensor arg and scales
+                if (
+                    Counter(args[0].host_size) == Counter(args[1].host_size)
+                    and args[0].host_size != args[1].host_size
+                ):
+                    # Transpose: check that the input / output sizes are the same, but in different order.
+                    # Device sizes have the stick dimension split
+                    op = TRANSPOSE_OP
+                elif Counter(in_di) == Counter(out_di) and in_di != out_di:
+                    # Transpose: check that the input / output DimensionInfo are the same, but in different order.
+                    op = TRANSPOSE_OP
+                elif input_stride == 64 and output_stride == 64:
+                    op = "swap"
+                elif input_stride == 64 and output_stride == 1:
+                    op = "slice"
+                elif (
+                    args[1].device_layout.device_size
+                    == args[0].device_layout.device_size
+                ):
+                    # Clone: check that device layout is the same.
+                    op = CLONE_OP
+                else:
+                    # Unsupported data operation on TensorArg
+                    raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
             else:
-                op = CLONE_OP  # default to clone
+                # Unsupported data operation on ConstantArg
+                raise Unsupported(f"Data operation on {type(args[0])}")
 
             ks = create_kernel_spec(op, False, in_di, args, scales, op_info)
             if in_di != out_di:
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
+
             self.kernel_specs.append(ks)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
