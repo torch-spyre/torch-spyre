@@ -141,9 +141,14 @@ def spyre_where(
     condition: torch.BoolTensor, 
     input: torch.Tensor,
     other: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input.device.type == "spyre":
-        return torch.ops.spyre.where(condition, input, other)
+        res = torch.ops.spyre.where(condition, input, other)
+        if out is not None:
+            out.copy_(res)
+            return out
+        return res
     else:
         return orig_where(condition, input, other)
 
