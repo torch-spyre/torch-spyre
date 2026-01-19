@@ -294,13 +294,13 @@ lowering.register_op_dtype_propagation_rules(
 
 
 @lowering.register_lowering(torch.ops.spyre.where)
-def lower_where(x, y, z):
+def lower_where(condition, x, other):
     fn = lowering.ops_wrapper(torch.ops.spyre.where.__name__)
     def inner_fn(index):
         loaded_inputs = [
+            condition.make_loader()(index),
             x.make_loader()(index),
-            y.make_loader()(index),
-            z.make_loader()(index),
+            other.make_loader()(index),
         ]
         return fn(*loaded_inputs)
     pw = Pointwise.create(
