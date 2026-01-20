@@ -521,7 +521,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "ldsIdx_": idx,
                                 "component_": "hbm",
                                 "layoutDimOrder_": layout_dim_order,
-                                "maxDimSizes_": [-1] * len(dim_labels),
+                                "maxDimSizes_": [-1] * len(layout_dim_order),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -749,7 +749,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "ldsIdx_": idx,
                                 "component_": "hbm",
                                 "layoutDimOrder_": layout_dim_order,
-                                "maxDimSizes_": [-1] * len(dim_labels),
+                                "maxDimSizes_": [-1] * len(layout_dim_order),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
