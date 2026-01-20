@@ -424,6 +424,30 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
         cores = kwargs["op_info"]["core_division"][-1][0]
 
+    dim_labels = ["mb", "in", "out"]
+    dim_indices = [0, 1, 2]
+    dim_sizes = dimensions
+    dim_splits = [1, 1, cores]
+    dim_split_sizes = [size // nsplits for size, nsplits in zip(dim_sizes, dim_splits)]
+
+    # map label to dim_info
+    dim_info_dict = {
+        label: DimInfo(
+            label=label,
+            index=index,
+            nsplits=nsplits,
+            size=size,
+            split_size=split_size,
+        )
+        for label, index, nsplits, size, split_size in zip(
+            dim_labels, dim_indices, dim_splits, dim_sizes, dim_split_sizes
+        )
+    }
+
+    input_layoutDimOrder = ["mb", "in"]
+    kernel_layoutDimOrder = ["in", "out"]
+    output_layoutDimOrder = ["mb", "out"]
+
     return {
         op: {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -449,39 +473,42 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         "coreIdsUsed_": [i for i in range(cores)],
                         "N_": {
                             "name_": "n",
-                            "mb_": dimensions[0],
-                            "in_": dimensions[1],
-                            "out_": dimensions[2],
+                            **{
+                                label + "_": di.size
+                                for label, di in dim_info_dict.items()
+                            },
                         },
                         "dataStageParam_": {
                             "0": {
                                 "ss_": {
                                     "name_": "core",
-                                    "mb_": dimensions[0],
-                                    "in_": dimensions[1],
-                                    "out_": dimensions[2] // cores,
+                                    **{
+                                        label + "_": di.split_size
+                                        for label, di in dim_info_dict.items()
+                                    },
                                 },
                                 "el_": {
                                     "name_": "core",
-                                    "mb_": dimensions[0],
-                                    "in_": dimensions[1],
-                                    "out_": dimensions[2] // cores,
+                                    **{
+                                        label + "_": di.split_size
+                                        for label, di in dim_info_dict.items()
+                                    },
                                 },
                             }
                         },
                         "primaryDsInfo_": {
                             "INPUT": {
-                                "layoutDimOrder_": ["mb", "in"],
+                                "layoutDimOrder_": input_layoutDimOrder,
                                 "stickDimOrder_": ["in"],
                                 "stickSize_": [inputs[0]["ddtype"].elems_per_stick()],
                             },
                             "OUTPUT": {
-                                "layoutDimOrder_": ["mb", "out"],
+                                "layoutDimOrder_": output_layoutDimOrder,
                                 "stickDimOrder_": ["out"],
                                 "stickSize_": [outputs[0]["ddtype"].elems_per_stick()],
                             },
                             "KERNEL": {
-                                "layoutDimOrder_": ["in", "out"],
+                                "layoutDimOrder_": kernel_layoutDimOrder,
                                 "stickDimOrder_": ["out"],
                                 "stickSize_": [inputs[1]["ddtype"].elems_per_stick()],
                             },
@@ -489,12 +516,12 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": "allocate-Tensor0_hbm",
+                                "name_": node_name,
                                 "prev_": "",
-                                "ldsIdx_": 0,
+                                "ldsIdx_": idx,
                                 "component_": "hbm",
-                                "layoutDimOrder_": ["mb", "in"],
-                                "maxDimSizes_": [-1, -1],
+                                "layoutDimOrder_": layout_dim_order,
+                                "maxDimSizes_": [-1] * len(dim_labels),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -507,479 +534,92 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        f"[{i}, 0, 0]": str(pointers[inputs[0]["name"]])
-                                        for i in range(cores)
-                                    },
-                                },
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        "mb": {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 1,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": dimensions[0],
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": dimensions[0],
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        },
-                                        "in": {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 2,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": dimensions[1],
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 64,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": dimensions[1] // 64,
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": 64,
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        },
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            },
-                            {
-                                "nodeType_": "allocate",
-                                "name_": "allocate-Tensor1_hbm",
-                                "prev_": "",
-                                "ldsIdx_": 1,
-                                "component_": "hbm",
-                                "layoutDimOrder_": ["in", "out"],
-                                "maxDimSizes_": [-1, -1],
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
-                                    ],
-                                    "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
-                                    ],
-                                    "data_": {
-                                        f"[{i}, 0, 0]": str(
-                                            pointers[inputs[1]["name"]]
-                                            + i
-                                            * dimensions[1]
-                                            * dimensions[2]
-                                            * num_bytes(inputs[1]["ddtype"])
-                                            // cores
+                                        # TODO: generalize this to avoid special case handling
+                                        f"[{c}, 0, 0]": str(
+                                            pointers[tensor["name"]]
+                                            + c
+                                            * math.prod(
+                                                [
+                                                    dim_info_dict[label].split_size
+                                                    for label in layout_dim_order
+                                                ]
+                                            )
+                                            * num_bytes(tensor["ddtype"])
                                         )
-                                        for i in range(cores)
+                                        if idx != 0  # duplicated tensor
+                                        else str(pointers[tensor["name"]])
+                                        for c in range(cores)
                                     },
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        "in": {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 1,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": dimensions[1],
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": dimensions[1],
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        },
-                                        "out": {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 2,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": dimensions[2]
-                                                            // cores,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 64,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": cores,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": dimensions[2]
-                                                        // cores
-                                                        // 64,
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": 64,
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        },
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            },
-                            {
-                                "nodeType_": "allocate",
-                                "name_": "allocate-Tensor2_hbm",
-                                "prev_": "",
-                                "ldsIdx_": 2,
-                                "component_": "hbm",
-                                "layoutDimOrder_": ["mb", "out"],
-                                "maxDimSizes_": [-1, -1],
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
-                                    ],
-                                    "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
-                                    ],
-                                    "data_": {
-                                        f"[{i}, 0, 0]": str(
-                                            pointers[outputs[0]["name"]]
-                                            + i
-                                            * dimensions[0]
-                                            * dimensions[2]
-                                            * num_bytes(outputs[0]["ddtype"])
-                                            // cores
+                                        label: gen_coord_info_value(
+                                            size=di.split_size
+                                            if (tensor["scale"][di.index] == 1)
+                                            else 1,
+                                            nsplits=di.nsplits,
+                                            elems_per_stick=tensor[
+                                                "ddtype"
+                                            ].elems_per_stick(),
+                                            is_stick_dim=(di.label == stick_label),
                                         )
-                                        for i in range(cores)
-                                    },
-                                },
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        "mb": {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 1,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": dimensions[0],
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": dimensions[0],
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        },
-                                        "out": {
-                                            "spatial": 3,
-                                            "temporal": 0,
-                                            "elemArr": 2,
-                                            "padding": "nopad",
-                                            "folds": {
-                                                "dim_prop_func": [
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": dimensions[2]
-                                                            // cores,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 0,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 64,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                    {
-                                                        "Affine": {
-                                                            "alpha_": 1,
-                                                            "beta_": 0,
-                                                        }
-                                                    },
-                                                ],
-                                                "dim_prop_attr": [
-                                                    {
-                                                        "factor_": cores,
-                                                        "label_": "core_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "corelet_fold",
-                                                    },
-                                                    {
-                                                        "factor_": 1,
-                                                        "label_": "row_fold",
-                                                    },
-                                                    {
-                                                        "factor_": dimensions[2]
-                                                        // cores
-                                                        // 64,
-                                                        "label_": "elem_arr_1",
-                                                    },
-                                                    {
-                                                        "factor_": 64,
-                                                        "label_": "elem_arr_0",
-                                                    },
-                                                ],
-                                            },
-                                        },
+                                        for label in layout_dim_order
+                                        if (di := dim_info_dict[label])
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
-                            },
+                            }
+                            for idx, (
+                                node_name,
+                                tensor,
+                                layout_dim_order,
+                                stick_label,
+                            ) in enumerate(
+                                zip(
+                                    [
+                                        "allocate_bmm-Input0_hbm",
+                                        "allocate_bmm-Input1_hbm",
+                                        "allocate_bmm_out_hbm",
+                                    ],
+                                    inputs + outputs,
+                                    [
+                                        input_layoutDimOrder,
+                                        kernel_layoutDimOrder,
+                                        output_layoutDimOrder,
+                                    ],
+                                    ["in", "out", "out"],
+                                )
+                            )
                         ],
                         "labeledDs_": [
                             {
-                                "ldsIdx_": 0,
-                                "dsName_": "Tensor0",
-                                "dsType_": "INPUT",
-                                "scale_": inputs[0]["scale"][0:2],
-                                "wordLength": num_bytes(inputs[0]["ddtype"]),
-                                "dataFormat_": inputs[0]["ddtype"].name,
-                                "memOrg_": {
-                                    "hbm": {"isPresent": 1},
-                                    "lx": {"isPresent": 1},
-                                },
-                            },
-                            {
-                                "ldsIdx_": 1,
-                                "dsName_": "Tensor1",
-                                "dsType_": "KERNEL",
-                                "scale_": inputs[1]["scale"][1:3],
-                                "wordLength": num_bytes(inputs[1]["ddtype"]),
-                                "dataFormat_": inputs[1]["ddtype"].name,
-                                "memOrg_": {
-                                    "hbm": {"isPresent": 1},
-                                    "lx": {"isPresent": 1},
-                                },
-                            },
-                            {
-                                "ldsIdx_": 2,
-                                "dsName_": "Tensor2",
-                                "dsType_": "OUTPUT",
+                                "ldsIdx_": idx,
+                                "dsName_": f"Tensor{idx}",
+                                "dsType_": ds_type,
+                                # permute scale values according to layoutDimOrder
                                 "scale_": [
-                                    outputs[0]["scale"][0],
-                                    outputs[0]["scale"][2],
+                                    tensor["scale"][di.index]
+                                    for label in layout_dim_order
+                                    if (di := dim_info_dict[label])
                                 ],
-                                "wordLength": num_bytes(outputs[0]["ddtype"]),
-                                "dataFormat_": outputs[0]["ddtype"].name,
+                                "wordLength": num_bytes(tensor["ddtype"]),
+                                "dataFormat_": tensor["ddtype"].name,
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
                                 },
-                            },
+                            }
+                            for idx, (ds_type, tensor, layout_dim_order) in enumerate(
+                                zip(
+                                    ["INPUT", "KERNEL", "OUTPUT"],
+                                    inputs + outputs,
+                                    [
+                                        input_layoutDimOrder,
+                                        kernel_layoutDimOrder,
+                                        output_layoutDimOrder,
+                                    ],
+                                )
+                            )
                         ],
                         "computeOp_": [
                             {
@@ -1088,17 +728,17 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             "INPUT": {
                                 "layoutDimOrder_": input_layoutDimOrder,
                                 "stickDimOrder_": ["in"],
-                                "stickSize_": [64],
+                                "stickSize_": [inputs[0]["ddtype"].elems_per_stick()],
                             },
                             "OUTPUT": {
                                 "layoutDimOrder_": output_layoutDimOrder,
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [64],
+                                "stickSize_": [outputs[0]["ddtype"].elems_per_stick()],
                             },
                             "KERNEL": {
                                 "layoutDimOrder_": kernel_layoutDimOrder,
                                 "stickDimOrder_": ["out"],
-                                "stickSize_": [64],
+                                "stickSize_": [inputs[1]["ddtype"].elems_per_stick()],
                             },
                         },
                         "scheduleTree_": [
@@ -1109,7 +749,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "ldsIdx_": idx,
                                 "component_": "hbm",
                                 "layoutDimOrder_": layout_dim_order,
-                                "maxDimSizes_": [-1, -1, -1],
+                                "maxDimSizes_": [-1] * len(dim_labels),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -1134,10 +774,8 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                             )
                                             * num_bytes(tensor["ddtype"])
                                         )
-                                        if idx != 1
-                                        else str(
-                                            pointers[tensor["name"]]
-                                        )  # duplicated tensor
+                                        if idx != 1  # duplicated tensor
+                                        else str(pointers[tensor["name"]])
                                         for c in range(cores)
                                     },
                                 },
@@ -1192,8 +830,8 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     for label in layout_dim_order
                                     if (di := dim_info_dict[label])
                                 ],
-                                "wordLength": 2,
-                                "dataFormat_": "SEN169_FP16",
+                                "wordLength": num_bytes(tensor["ddtype"]),
+                                "dataFormat_": tensor["ddtype"].name,
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
@@ -1216,7 +854,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "exUnit": "pt",
                                 "opFuncName": op,
                                 "attributes_": {
-                                    "dataFormat_": "SEN169_FP16",
+                                    "dataFormat_": inputs[0]["ddtype"].name,
                                     "fidelity_": "regular",
                                 },
                                 "location": "Inner",
