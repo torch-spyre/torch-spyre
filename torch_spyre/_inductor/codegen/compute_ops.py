@@ -140,9 +140,7 @@ def gen_coord_info_value(
                     },
                     {
                         "Affine": {
-                            "alpha_": elems_per_stick
-                            if (size % elems_per_stick == 0)
-                            else 1,
+                            "alpha_": elems_per_stick,
                             "beta_": 0,
                         }
                     },
@@ -167,15 +165,11 @@ def gen_coord_info_value(
                         "label_": "row_fold",
                     },
                     {
-                        "factor_": (size // elems_per_stick)
-                        if (size % elems_per_stick == 0)
-                        else (size),
+                        "factor_": (size // elems_per_stick),
                         "label_": "elem_arr_1",
                     },
                     {
-                        "factor_": elems_per_stick
-                        if (size % elems_per_stick == 0)
-                        else 1,
+                        "factor_": elems_per_stick,
                         "label_": "elem_arr_0",
                     },
                 ],
@@ -374,8 +368,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "scale_": [
                                     (
                                         tensor["scale"][di.index]
-                                        # TODO: to remove special case pending
-                                        #       change in deeptools
+                                        # TODO: revisit whether this special case can be removed
+                                        #       pending change in deeptools
                                         if not (
                                             di.label == "out"
                                             and tensor["scale"][di.index] == -1
@@ -1141,7 +1135,9 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                             * num_bytes(tensor["ddtype"])
                                         )
                                         if idx != 1
-                                        else str(pointers[tensor["name"]])
+                                        else str(
+                                            pointers[tensor["name"]]
+                                        )  # duplicated tensor
                                         for c in range(cores)
                                     },
                                 },
