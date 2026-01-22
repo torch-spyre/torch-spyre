@@ -57,7 +57,11 @@ def generate_constant_info(data_format, **kwargs):
 
 
 def gen_coord_info_value(
-    size: int, nsplits: int, elems_per_stick: int, is_stick_dim: bool
+    size: int,
+    nsplits: int,
+    elems_per_stick: int,
+    is_stick_dim: bool,
+    is_stick_reduction: bool,
 ):
     return (
         {
@@ -122,7 +126,7 @@ def gen_coord_info_value(
                 "dim_prop_func": [
                     {
                         "Affine": {
-                            "alpha_": size,
+                            "alpha_": elems_per_stick if is_stick_reduction else size,
                             "beta_": 0,
                         }
                     },
@@ -146,7 +150,7 @@ def gen_coord_info_value(
                     },
                     {
                         "Affine": {
-                            "alpha_": 1,
+                            "alpha_": 0 if is_stick_reduction else 1,
                             "beta_": 0,
                         }
                     },
@@ -165,7 +169,9 @@ def gen_coord_info_value(
                         "label_": "row_fold",
                     },
                     {
-                        "factor_": (size // elems_per_stick),
+                        "factor_": 1
+                        if is_stick_reduction
+                        else (size // elems_per_stick),
                         "label_": "elem_arr_1",
                     },
                     {
@@ -352,6 +358,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 "ddtype"
                                             ].elems_per_stick(),
                                             is_stick_dim=(di.label == "out"),
+                                            is_stick_reduction=(
+                                                di.label == "out"
+                                                and tensor["scale"][di.index] == -1
+                                            ),
                                         )
                                         for di in dim_info
                                     },
@@ -562,6 +572,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                 "ddtype"
                                             ].elems_per_stick(),
                                             is_stick_dim=(di.label == stick_label),
+                                            is_stick_reduction=False,
                                         )
                                         for label in layout_dim_order
                                         if (di := dim_info_dict[label])
@@ -790,6 +801,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                                 "ddtype"
                                             ].elems_per_stick(),
                                             is_stick_dim=(di.label == stick_label),
+                                            is_stick_reduction=False,
                                         )
                                         for label in layout_dim_order
                                         if (di := dim_info_dict[label])
