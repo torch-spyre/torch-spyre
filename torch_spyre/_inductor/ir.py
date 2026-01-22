@@ -107,12 +107,13 @@ class FixedTiledLayout(FixedLayout):
         NOTE:   For the purposes of representing an access in the LoopLevelIR,
                 we use a stride of 1 for the stick dimension.
                 This is not true, because the sticks are actually tiled in memory.
-                If we needed this indexer to compute the real offset in memory, we would do something like:
+                If we needed this indexer to compute the real offset in memory, the stick dimension
+                compuation would actually need to be something like:
                     result = result + ((index[stick_dim] // 64) * stride[-2] + (index[stick_dim] % 64)
-                However, all SpyreKernel needs to build a KernelSpec is for the indexer function to
-                robustly capture the dimension ordering of the dim_map and the use off all index variables.
-                Ignoring tiling here enables us to stride-order the free variables in the index expression and
-                map those variables back to the host dimensions.
+                However, all SpyreKernel needs from this indexer to be able to build a KernelSpec
+                is for the indexer function to robustly capture the relationship between dim_map and
+                the free variables in the index expression.
+                By using a simpler expression it is easier to recover this relationship by stride-ordering the variables.
         """
         offset = self.offset
         stl = self.device_layout
