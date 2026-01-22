@@ -47,19 +47,6 @@ aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
 
-def stl_host_dim_order(self: SpyreTensorLayout) -> list[int]:
-    ndim = len(self.device_size)
-    assert ndim <= 5
-    if ndim <= 3:
-        order = self.dim_map[1:]
-    elif ndim == 4:
-        order = [self.dim_map[-2], self.dim_map[0], self.dim_map[-1]]
-    else:  # 4d
-        order = [self.dim_map[0]] + self.dim_map[2:]
-    assert len(order) == len(set(order))
-    return order
-
-
 def stl_stick_dim(self: SpyreTensorLayout) -> int:
     return self.dim_map[-1]
 
@@ -74,7 +61,6 @@ def stl_is_stick_reduction(self: SpyreTensorLayout, axis: list[int]) -> bool:
         return False
 
 
-setattr(SpyreTensorLayout, "host_dim_order", stl_host_dim_order)
 setattr(SpyreTensorLayout, "stick_dim", stl_stick_dim)
 setattr(SpyreTensorLayout, "is_stick_reduction", stl_is_stick_reduction)
 
@@ -232,7 +218,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
             )
         if len(x_stl.device_size) != len(output.size) + 1:
-            output_host_dim_order = stl_host_dim_order(x_stl)[:-1]
+            output_host_dim_order = x_stl.host_dim_order()[:-1]
         if x_stl.host_dim_order() != y_stl.host_dim_order():
             raise Unsupported(
                 f"{red.reduction_type} stick dimensions mismatch {x_stl} {y_stl}"

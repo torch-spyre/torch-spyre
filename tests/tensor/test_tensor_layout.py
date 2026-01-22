@@ -120,6 +120,18 @@ class TestSpyreTensorLayout(TestCase):
         z_dev = to_with_layout(z, z_stl)
         self.assertEqual(z_dev, z_dev.cpu())
 
+    def test_dim_order_round_trip(self):
+        """Tests the pattern used by inductor to propagate dim order from inputs to outputs"""
+        x_2 = SpyreTensorLayout([3, 256], torch.float16)
+        y_2 = SpyreTensorLayout([3, 256], torch.float16, x_2.host_dim_order())
+        self.assertEqual(x_2, y_2)
+        x_3 = SpyreTensorLayout([3, 64, 256], torch.float16)
+        y_3 = SpyreTensorLayout([3, 64, 256], torch.float16, x_3.host_dim_order())
+        self.assertEqual(x_3, y_3)
+        x_4 = SpyreTensorLayout([7, 3, 64, 256], torch.float16)
+        y_4 = SpyreTensorLayout([7, 3, 64, 256], torch.float16, x_4.host_dim_order())
+        self.assertEqual(x_4, y_4)
+
 
 if __name__ == "__main__":
     run_tests()

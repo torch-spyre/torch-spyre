@@ -297,6 +297,7 @@ PYBIND11_MODULE(_C, m) {
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
+      .def("host_dim_order", &spyre::SpyreTensorLayout::host_dim_order)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
