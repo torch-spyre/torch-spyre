@@ -311,6 +311,5 @@ def lower_where(condition, x, other):
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
     )
-    pw.realize()
-    return pw
+    return pw.realize()
  

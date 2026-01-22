@@ -202,7 +202,8 @@ def where(
     input: torch.Tensor,
     other: torch.Tensor,
 ) -> torch.Tensor:
-    pass
+    return input.clone()
+
 
 @where.register_fake
 def _(condition: torch.Tensor, 
