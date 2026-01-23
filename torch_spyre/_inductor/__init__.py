@@ -81,9 +81,6 @@ def _autoload():
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
     torch._inductor.config.unroll_reductions_threshold = 1
 
-    # Do not force output tensor strides to conform to eager strides -- hack for dealing with stickified tensors for now.
-    torch._inductor.config.keep_output_stride = False
-
     from torch._inductor.ir import Loops
 
     # Force all operations to be realized when LoopLevel IR is initially constructed
