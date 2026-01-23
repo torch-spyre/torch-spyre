@@ -19,25 +19,34 @@ from torch_spyre._C import encode_constant, DataFormats
 
 @dataclass
 class DimInfo:
-
-    def __init__(self, label: str, index: int, nsplits: int, unpadded_size: int, elems_per_stick: int, stick_dims: list):
+    def __init__(
+        self,
+        label: str,
+        index: int,
+        nsplits: int,
+        unpadded_size: int,
+        elems_per_stick: int,
+        stick_dims: list,
+    ):
         self.label = label
         self.index = index
         self.unpadded_size = unpadded_size
         self.nsplits = nsplits
 
-        self.is_stick_dim = label in stick_dims  
+        self.is_stick_dim = label in stick_dims
 
         self.compute_padding(elems_per_stick)
-        self.split_size = self.size // nsplits # Must come after padding
-        
+        self.split_size = self.size // nsplits  # Must come after padding
+
     def compute_padding(self, elems_per_stick: int):
         if self.is_stick_dim:
-            self.padding = (-self.unpadded_size) & (elems_per_stick-1)  # pad to multiple of elems_per_stick
+            self.padding = (-self.unpadded_size) & (
+                elems_per_stick - 1
+            )  # pad to multiple of elems_per_stick
             self.size = self.unpadded_size + self.padding
         else:
             self.padding = 0
-        
+
         self.size = self.unpadded_size + self.padding
 
 
@@ -82,10 +91,10 @@ def add_constant(kwargs, name, value) -> int:
         kwargs["op_info"] = {}
     if "constants" not in kwargs["op_info"]:
         kwargs["op_info"]["constants"] = {}
-    
+
     index = len(kwargs["op_info"]["constants"])
     kwargs["op_info"]["constants"][name] = value
-    
+
     return index
 
 
@@ -217,25 +226,34 @@ def gen_coord_info_value(
     )
 
 
-def create_dim_infos(dim_labels: list[str], dim_indices: list[int], dim_sizes: list[int], dim_splits: list[int], elems_per_stick: int, stick_dims: list) -> (list[DimInfo], dict):
+def create_dim_infos(
+    dim_labels: list[str],
+    dim_indices: list[int],
+    dim_sizes: list[int],
+    dim_splits: list[int],
+    elems_per_stick: int,
+    stick_dims: list,
+) -> tuple[list[DimInfo], dict[str, DimInfo]]:
     dims_list = []
     dims_dict = {}
 
-    for label, index, size, nsplits in zip(dim_labels, dim_indices, dim_sizes, dim_splits):
-        dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims) 
+    for label, index, size, nsplits in zip(
+        dim_labels, dim_indices, dim_sizes, dim_splits
+    ):
+        dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims)
         dims_list.append(dim_info)
         dims_dict[label] = dim_info
-    
-    return dims_list, dims_dict
-    
 
-def create_padding_mask_info(dims_list: list[DimInfo], kwargs) -> (tuple[dict, int]):
+    return dims_list, dims_dict
+
+
+def create_padding_mask_info(dims_list: list[DimInfo], kwargs) -> tuple[dict, int]:
     coordinateMasking = {}
     maskingConstId = -1
-    
+
     for di in dims_list:
         if di.padding > 0:
-            coordinateMasking [di.label] = [[di.unpadded_size, di.padding]]
+            coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
     if coordinateMasking:
         maskingConstId = add_constant(kwargs, "samv-maskvalue", 0)
 
@@ -296,7 +314,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # reorder sizes according to layoutDimOrder
     dim_sizes = [dimensions[i] for i in dim_indices]
-    dims_list, _ = create_dim_infos(dim_labels, dim_indices, dim_sizes, dim_splits, elems_per_stick, stick_dims=["out"])   
+    dims_list, _ = create_dim_infos(
+        dim_labels,
+        dim_indices,
+        dim_sizes,
+        dim_splits,
+        elems_per_stick,
+        stick_dims=["out"],
+    )
 
     coordinateMasking, maskingConstId = create_padding_mask_info(dims_list, kwargs)
 
@@ -327,20 +352,22 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 di.label + "_": di.size for di in dims_list
                             },  # dim sizes before split
                         },
-                        "coordinateMasking_" : coordinateMasking,  
-                        "maskingConstId_" : maskingConstId,
+                        "coordinateMasking_": coordinateMasking,
+                        "maskingConstId_": maskingConstId,
                         "dataStageParam_": {
                             "0": {
                                 "ss_": {
                                     "name_": "core",
                                     **{
-                                        di.label + "_": di.split_size for di in dims_list
+                                        di.label + "_": di.split_size
+                                        for di in dims_list
                                     },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
-                                        di.label + "_": di.split_size for di in dims_list
+                                        di.label + "_": di.split_size
+                                        for di in dims_list
                                     },
                                 },
                             }
@@ -469,7 +496,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 
     data_format = inputs[0]["ddtype"]
     elems_per_stick = data_format.elems_per_stick()
-    
 
     # implement core division on stick dimension
     cores = 1
@@ -480,8 +506,15 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     dim_indices = [0, 1, 2]
     dim_sizes = dimensions
     dim_splits = [1, 1, cores]
-  
-    dims_list, dim_info_dict = create_dim_infos(dim_labels, dim_indices, dim_sizes, dim_splits, elems_per_stick, stick_dims=["in", "out"])   
+
+    dims_list, dim_info_dict = create_dim_infos(
+        dim_labels,
+        dim_indices,
+        dim_sizes,
+        dim_splits,
+        elems_per_stick,
+        stick_dims=["in", "out"],
+    )
 
     coordinateMasking, maskingConstId = create_padding_mask_info(dims_list, kwargs)
 
@@ -521,8 +554,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             "i_": 1,
                             "j_": 1,
                         },
-                        #"coordinateMasking_" : coordinateMasking,  
-                        #"maskingConstId_" : maskingConstId,
+                        # "coordinateMasking_" : coordinateMasking,
+                        # "maskingConstId_" : maskingConstId,
                         "dataStageParam_": {
                             "0": {
                                 "ss_": {
@@ -695,7 +728,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 
     data_format = inputs[0]["ddtype"]
     elems_per_stick = data_format.elems_per_stick()
-    
+
     # implement core division on stick dimension
     cores = 1
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
@@ -706,7 +739,14 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     dim_sizes = dimensions
     dim_splits = [1, cores, 1, 1]
 
-    dims_list, dim_info_dict = create_dim_infos(dim_labels, dim_indices, dim_sizes, dim_splits, elems_per_stick, stick_dims=["in", "out"])   
+    dims_list, dim_info_dict = create_dim_infos(
+        dim_labels,
+        dim_indices,
+        dim_sizes,
+        dim_splits,
+        elems_per_stick,
+        stick_dims=["in", "out"],
+    )
 
     input_layoutDimOrder = ["x", "in", "mb"]
     kernel_layoutDimOrder = ["x", "out", "in"]
