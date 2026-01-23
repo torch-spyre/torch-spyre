@@ -551,11 +551,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 label + "_": di.size
                                 for label, di in dim_info_dict.items()
                             },
-                            "i_": 1,
-                            "j_": 1,
                         },
-                        # "coordinateMasking_" : coordinateMasking,
-                        # "maskingConstId_" : maskingConstId,
                         "dataStageParam_": {
                             "0": {
                                 "ss_": {
