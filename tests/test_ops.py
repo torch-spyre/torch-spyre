@@ -468,6 +468,14 @@ class TestOps(TestCase):
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
+    def test_pow(self):
+        x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
+        x_spyre = x.to("spyre")
+        y1 = torch.pow(x_spyre, 2).to("cpu")
+        torch.testing.assert_close(
+            y1, torch.pow(x, 2), rtol=self.rtol, atol=self.atol
+        )
+
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):
         def test_op(declaration):

@@ -69,7 +69,7 @@ def get_args_with_default_vals(schema_string):
 def format_python_signature(arguments):
     """
     Convert argument list to Python function signature string.
-    
+
     Example:
         [{'name': 'self', 'type': 'Tensor'}, {'name': 'mat2', 'type': 'Tensor'}]
         -> "self: torch.Tensor, mat2: torch.Tensor"
@@ -91,7 +91,7 @@ def format_python_signature(arguments):
 def format_default_value(default_val):
     """
     Format default value for Python.
-    
+
     Examples:
         c10::nullopt -> None
         true -> True
@@ -198,7 +198,7 @@ def extract_base_op_name(op_name):
     # Remove common suffixes
     base_name = op_name
 
-    strip_list = ["_names", "_out", "_Tensor", "_default", "_mode", "_dims", "_dimname", "_dim", "_Dimname", "_int"]
+    strip_list = ["_names", "_out", "_Scalar", "_Tensor", "_default", "_mode", "_dims", "_dimname", "_dim", "_Dimname", "_int"]
     for st in strip_list:
         if st in base_name:
             base_name = base_name.replace(st, "")
@@ -216,20 +216,20 @@ def enhance_replacement_data(rep_data):
     arguments = rep_data.get('arguments', [])
     returns = rep_data.get('returns', [])
     schema_string = rep_data.get('schema_string', [])
-    
+
     # Generate Python signature
     rep_data['signature_in'] = format_python_signature(arguments)
     rep_data['signature_out'] = format_python_return_type(returns)
-    
+
     # Generate argument name lists
     rep_data['arg_names'] = get_argument_names(arguments, schema_string)
     rep_data['out_arg_name'] = get_out_argument_name(arguments)
-    
+
     # Extract base operation name
     if 'template_data' in rep_data:
         op_name = rep_data['template_data'].get('op_name', '')
         rep_data['template_data']['base_op_name'] = extract_base_op_name(op_name)
-    
+
     return rep_data
 
 
