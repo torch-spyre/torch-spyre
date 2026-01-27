@@ -88,6 +88,7 @@ class FixedTiledLayout(FixedLayout):
     ) -> None:
         super().__init__(device, dtype, size, stride)
         self.device_layout = device_layout
+        self.allocation: dict[str, Any] = {}
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
@@ -97,8 +98,11 @@ class FixedTiledLayout(FixedLayout):
         )
 
     def get_allocation_size(self) -> list[Expr]:
-        # TODO: Eventually this will include padding, etc.
-        return self.size
+        stl: SpyreTensorLayout = self.device_layout
+        alloc_size = [1] * len(self.size)
+        for size, dm in zip(stl.device_size, stl.dim_map):
+            alloc_size[dm] *= size
+        return alloc_size
 
     def make_indexer(self) -> Callable[[Sequence[Expr]], Expr]:
         """

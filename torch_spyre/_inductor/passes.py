@@ -22,6 +22,7 @@ from torch._inductor.custom_graph_pass import (
 from torch._inductor.scheduler import BaseSchedulerNode
 from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
+from .scratchpad import scratchpad_planning
 from .constants import DEVICE_NAME
 
 
@@ -88,4 +89,5 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     nodes = propagate_spyre_tensor_layouts(nodes)
     nodes = core_division_planning(nodes)
+    nodes = scratchpad_planning(nodes)
     return nodes

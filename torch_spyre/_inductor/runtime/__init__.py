@@ -24,6 +24,7 @@ class TensorArg:
     arg_index: int
     dtype: torch.dtype
     host_size: torch.Size
+    allocation: Any
     device_layout: SpyreTensorLayout
 
 
