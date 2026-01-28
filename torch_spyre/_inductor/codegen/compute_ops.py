@@ -516,7 +516,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         stick_dims=["in", "out"],
     )
 
-    coordinateMasking, maskingConstId = create_padding_mask_info(dims_list, kwargs)
+    #coordinateMasking, maskingConstId = create_padding_mask_info(dims_list, kwargs)
 
     input_layoutDimOrder = ["mb", "in"]
     kernel_layoutDimOrder = ["in", "out"]
