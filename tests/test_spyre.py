@@ -257,6 +257,12 @@ class TestSpyre(TestCase):
             t2 = t.to(device="spyre")  # noqa: F841
         assert len(rec) == 0
 
+    def test_hooks_on_import(self):
+        import torch
+
+        dev = torch._C._get_accelerator()
+        assert str(dev) == "spyre"
+
 
 if __name__ == "__main__":
     run_tests()

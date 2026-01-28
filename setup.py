@@ -181,13 +181,22 @@ if __name__ == "__main__":
     sources = list(CSRC_DIR.glob("*.cpp"))
     if OUTPUT_CODEGEN_DIR:
         sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
-    sources = [str(p.relative_to(ROOT_DIR).as_posix()) for p in sorted(sources)]
-    sources = sorted([str(s) for s in sources])
+
+    # Filenames that belong to the tiny hooks module
+    hook_files = {"spyre_hooks.cpp"}
+    hooks_src_paths = [p for p in sources if p.name in hook_files]
+    core_src_paths = [p for p in sources if p.name not in hook_files]
+    hooks_src_paths = [
+        p.relative_to(ROOT_DIR).as_posix() for p in sorted(hooks_src_paths)
+    ]
+    core_src_paths = [
+        p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
+    ]
 
     ext_modules = [
         CppExtension(
             name=f"{PACKAGE_NAME}._C",
-            sources=sources,
+            sources=core_src_paths,
             include_dirs=[str(p) for p in INCLUDE_DIRS],
             library_dirs=[str(p) for p in LIBRARY_DIRS],
             libraries=LIBRARIES,
@@ -200,7 +209,23 @@ if __name__ == "__main__":
                 ("EAGER_MODE_ENV", '"EAGER_MODE"'),
                 ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
             ],
-        )
+        ),
+        CppExtension(
+            name=f"{PACKAGE_NAME}._hooks",
+            sources=hooks_src_paths,
+            include_dirs=[str(p) for p in INCLUDE_DIRS],
+            library_dirs=[str(p) for p in LIBRARY_DIRS],
+            libraries=LIBRARIES,
+            extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
+            define_macros=[
+                ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+                ("MODULE_NAME", f'"{PACKAGE_NAME}._hooks"'),
+                ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
+                ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
+                ("EAGER_MODE_ENV", '"EAGER_MODE"'),
+                ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
+            ],
+        ),
     ]
 
     setup(
