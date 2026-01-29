@@ -315,6 +315,7 @@ def create_kernel_spec(
             torch.bool,
             torch.float16,
             torch.float32,
+            torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)

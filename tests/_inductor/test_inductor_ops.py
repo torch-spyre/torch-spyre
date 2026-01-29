@@ -468,9 +468,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_clone",
         ): {
             "param_sets": {
-                "1d": (cached_randn((128,), dtype=torch.float16),),
-                "2d": (cached_randn((256, 128), dtype=torch.float16),),
-                "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "int64_1d": (torch.randint(1000, (128,)),),
+                "int64_2d": (torch.randint(1000, (256, 128)),),
+                "int_3d": (torch.randint(1000, (8, 16, 256)),),
+                "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
+                "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
+                "fp32_3d": (cached_randn((8, 16, 256), dtype=torch.float32),),
+                "bool_1d": (
+                    torch.rand(
+                        (128,),
+                    )
+                    > 0.5,
+                ),
+                "bool_2d": (
+                    torch.rand(
+                        (
+                            256,
+                            128,
+                        ),
+                    )
+                    > 0.5,
+                ),
+                "bool_3d": (
+                    torch.rand(
+                        (
+                            8,
+                            16,
+                            256,
+                        ),
+                    )
+                    > 0.5,
+                ),
             },
         },
         (
@@ -675,6 +706,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_activation_fn(self, op, input, err):
         compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
 
+    @pytest.mark.filterwarnings(
+        "ignore:Backend Spyre does not support int64:UserWarning"
+    )
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
 

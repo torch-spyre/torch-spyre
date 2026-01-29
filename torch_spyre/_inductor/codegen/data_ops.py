@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from torch_spyre._inductor.codegen.compute_ops import num_bytes
+
 
 def generate_transpose(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     return {
@@ -892,46 +894,71 @@ def generate_transpose_4d_stick(
 
 def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     ndims = len(dimensions)
+    # Get data type information from inputs
+    input_dtype = inputs[0]["ddtype"]
+    word_length = num_bytes(input_dtype)
+    data_format = input_dtype.name
+    elems_per_stick = input_dtype.elems_per_stick()
     if ndims == 1:
         layout = ["out"]
         dim_map = {"out": dimensions[0]}
         offsets = {"out": 1}
-        loop_counts = {"out": dimensions[0] // 64}
-        piece_valid_gaps = {"out": [[64, 0]]}
-        piece_sizes = {"out": 64}
+        loop_counts = {"out": dimensions[0] // elems_per_stick}
+        piece_valid_gaps = {"out": [[elems_per_stick, 0]]}
+        piece_sizes = {"out": elems_per_stick}
         valid_gaps = {"out": [[dimensions[0], 0]]}
-        piece_count = dimensions[0] // 64
+        piece_count = dimensions[0] // elems_per_stick
     elif ndims == 2:
         layout = ["mb", "out"]
         dim_map = {"mb": dimensions[0], "out": dimensions[-1]}
-        offsets = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": dimensions[0]}
-        loop_counts = {
-            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
-            "out": dimensions[-1] // 64,
+        offsets = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": dimensions[0],
         }
-        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64}
+        loop_counts = {
+            "mb": dimensions[0] // elems_per_stick
+            if dimensions[0] % elems_per_stick == 0
+            else dimensions[0],
+            "out": dimensions[-1] // elems_per_stick,
+        }
+        piece_sizes = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": elems_per_stick,
+        }
         piece_valid_gaps = {
             "mb": [[piece_sizes["mb"], 0]],
             "out": [[piece_sizes["out"], 0]],
         }
         valid_gaps = {"mb": [[dimensions[0], 0]], "out": [[dimensions[-1], 0]]}
         piece_count = (
-            dimensions[0] * dimensions[-1] // (4096 if dimensions[0] % 64 == 0 else 64)
+            dimensions[0]
+            * dimensions[-1]
+            // (
+                elems_per_stick * elems_per_stick
+                if dimensions[0] % elems_per_stick == 0
+                else elems_per_stick
+            )
         )
     else:
         layout = ["mb", "out", "x"]
         dim_map = {"mb": dimensions[0], "out": dimensions[-1], "x": dimensions[1]}
         offsets = {
-            "mb": 64 if dimensions[0] % 64 == 0 else 1,
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
             "out": dimensions[0],
-            "x": dimensions[-1] * dimensions[0] // 64,
+            "x": dimensions[-1] * dimensions[0] // elems_per_stick,
         }
         loop_counts = {
-            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
-            "out": dimensions[-1] // 64,
+            "mb": dimensions[0] // elems_per_stick
+            if dimensions[0] % elems_per_stick == 0
+            else dimensions[0],
+            "out": dimensions[-1] // elems_per_stick,
             "x": dimensions[1],
         }
-        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64, "x": 1}
+        piece_sizes = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": elems_per_stick,
+            "x": 1,
+        }
         piece_valid_gaps = {
             "mb": [[piece_sizes["mb"], 0]],
             "out": [[piece_sizes["out"], 0]],
@@ -946,7 +973,11 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
             dimensions[0]
             * dimensions[1]
             * dimensions[-1]
-            // (4096 if dimensions[0] % 64 == 0 else 64)
+            // (
+                elems_per_stick * elems_per_stick
+                if dimensions[0] % elems_per_stick == 0
+                else elems_per_stick
+            )
         )
     return {
         "clone": {
@@ -962,12 +993,12 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         "labeledDs_": [
                             {
                                 "pdsName_": "pds0",
-                                "wordLength": 2,
-                                "dataformat": "SEN169_FP16",
+                                "wordLength": word_length,
+                                "dataformat": data_format,
                                 "layoutDimOrder_": layout,
                                 "stickDimOrder_": ["out"],
                                 "dimToLayoutSize_": dim_map,
-                                "dimToStickSize_": {"out": 64},
+                                "dimToStickSize_": {"out": elems_per_stick},
                                 "validGap_": valid_gaps,
                                 "PieceInfo": [
                                     {
@@ -995,12 +1026,12 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             },
                             {
                                 "pdsName_": "pds0",
-                                "wordLength": 2,
-                                "dataformat": "SEN169_FP16",
+                                "wordLength": word_length,
+                                "dataformat": data_format,
                                 "layoutDimOrder_": layout,
                                 "stickDimOrder_": ["out"],
                                 "dimToLayoutSize_": dim_map,
-                                "dimToStickSize_": {"out": 64},
+                                "dimToStickSize_": {"out": elems_per_stick},
                                 "validGap_": valid_gaps,
                                 "PieceInfo": [
                                     {
