@@ -98,11 +98,8 @@ class FixedTiledLayout(FixedLayout):
         )
 
     def get_allocation_size(self) -> list[Expr]:
-        stl: SpyreTensorLayout = self.device_layout
-        alloc_size = [1] * len(self.size)
-        for size, dm in zip(stl.device_size, stl.dim_map):
-            alloc_size[dm] *= size
-        return alloc_size
+        # TODO: Eventually this will include padding, etc.
+        return self.size
 
     def make_indexer(self) -> Callable[[Sequence[Expr]], Expr]:
         """
