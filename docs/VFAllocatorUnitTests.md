@@ -37,6 +37,7 @@ class TestFramework {
 
 #### 1. **TEST Macro**
 Defines individual test cases:
+
 ```cpp
 TEST(TestName) {
   // Test implementation
@@ -56,6 +57,7 @@ The tests validate three fundamental allocator structures:
 
 ### 1. FreeInterval
 Represents contiguous free memory regions:
+
 ```cpp
 struct FreeInterval {
   size_t start;  // Starting byte offset
@@ -63,23 +65,27 @@ struct FreeInterval {
   bool operator<(const FreeInterval& other) const;
 };
 ```
+
 - Ordered by `start` position
 - Used to track available memory ranges
 - Must not overlap with other intervals
 
 ### 2. BlockInfo
 Tracks allocated memory blocks:
+
 ```cpp
 struct BlockInfo {
   size_t offset_init;  // Block start offset
   size_t offset_end;   // Block end offset
 };
 ```
+
 - Records allocation boundaries
 - Used for deallocation and memory tracking
 
 ### 3. SegmentInfo
 Manages entire memory segments (8GB each):
+
 ```cpp
 struct SegmentInfo {
   int segment_id;                          // Unique identifier
@@ -98,6 +104,7 @@ struct SegmentInfo {
 **Purpose:** Validates that `FreeInterval` objects are correctly ordered by their start position.
 
 **Test Case:**
+
 ```cpp
 FreeInterval a{100, 200};  // [100, 200)
 FreeInterval b{200, 300};  // [200, 300)
@@ -120,6 +127,7 @@ FreeInterval c{50, 100};   // [50, 100)
 **Test Cases:**
 
 1. **Default Construction:**
+
    ```cpp
    BlockInfo empty;
    // offset_init == 0
@@ -127,7 +135,8 @@ FreeInterval c{50, 100};   // [50, 100)
    ```
 
 2. **Parameterized Construction:**
-   ```cpp
+  
+```cpp
    BlockInfo block{100, 200};
    // offset_init == 100
    // offset_end == 200
@@ -148,9 +157,11 @@ FreeInterval c{50, 100};   // [50, 100)
 **Test Cases:**
 
 1. **Single Segment Creation:**
+
    ```cpp
    SegmentInfo seg(0, 8GB);
    ```
+
    Validates:
    - Correct ID assignment
    - Total size = 8GB
@@ -158,15 +169,17 @@ FreeInterval c{50, 100};   // [50, 100)
    - Empty collections (no allocations yet)
 
 2. **Multiple Segments:**
-   ```cpp
+  
+```cpp
    for (int i = 0; i < 8; i++) {
      segments.emplace_back(i, 8GB);
    }
    ```
-   Validates:
-   - Sequential ID assignment (0-7)
-   - Each segment has 8GB capacity
-   - Total capacity: 64GB across 8 segments
+  
+Validates:
+- Sequential ID assignment (0-7)
+- Each segment has 8GB capacity
+- Total capacity: 64GB across 8 segments
 
 **Why It Matters:** These are realistic production values for VF device memory management. 8GB segments align with hardware memory boundaries and provide efficient large-scale allocation.
 
@@ -177,6 +190,7 @@ FreeInterval c{50, 100};   // [50, 100)
 **Purpose:** Tests memory alignment to 128-byte boundaries.
 
 **Alignment Strategy:**
+
 ```cpp
 aligned_size = ⌈nbytes / 128⌉ × 128
 ```
@@ -192,7 +206,7 @@ aligned_size = ⌈nbytes / 128⌉ × 128
 | 129 bytes  | 256 bytes    | Round to next boundary |
 | 256 bytes  | 256 bytes    | Already aligned |
 
-**Why It Matters:** 
+**Why It Matters:**
 - Prevents memory fragmentation
 - Ensures efficient hardware access patterns
 - Matches typical cache line sizes
@@ -207,6 +221,7 @@ aligned_size = ⌈nbytes / 128⌉ × 128
 **Scenario:**
 
 **Initial State:**
+
 ```
 Free: [0, 100), [200, 300)
 Allocated: [100, 200)
@@ -223,6 +238,7 @@ Allocated: [100, 200)
 4. Result: Single merged interval [0, 300)
 
 **Implementation Highlights:**
+
 ```cpp
 auto it = free_intervals.lower_bound(new_range);
 
@@ -250,6 +266,7 @@ if (it != end() && it->start == new_range.end) {
 ### Prerequisites
 
 Ensure you are in the project root directory:
+
 ```bash
 cd /path/to/torch-spyre
 ```
@@ -259,21 +276,25 @@ cd /path/to/torch-spyre
 This is the default and recommended approach for testing VF allocator components without external dependencies.
 
 **Compilation:**
+
 ```bash
 g++ -std=c++17 -DTEST_VF_ALLOCATOR torch_spyre/csrc/test_vf_allocator.cpp -o build/test_vf_allocator
 ```
 
 **Running Tests:**
+
 ```bash
 ./build/test_vf_allocator
 ```
 
 Or with environment variable explicitly set:
+
 ```bash
 FLEX_DEVICE=VF ./build/test_vf_allocator
 ```
 
 **Expected Output:**
+
 ```
 Running VF Allocator C++ Unit Tests
 ====================================

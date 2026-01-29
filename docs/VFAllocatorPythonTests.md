@@ -41,6 +41,7 @@ class TestVFAllocatorStandalone(unittest.TestCase):
 
 #### 1. **Test Methods**
 Each test method validates a specific aspect of allocator behavior:
+
 ```python
 def test_basic_allocation(self):
     """Test basic memory allocation in VF mode."""
@@ -48,12 +49,14 @@ def test_basic_allocation(self):
 
 #### 2. **Environment Setup**
 Tests require `FLEX_DEVICE=VF` environment variable:
+
 ```bash
 FLEX_DEVICE=VF python -m pytest tests/test_vf_allocator_standalone.py
 ```
 
 #### 3. **Tensor Operations**
 Tests use PyTorch's `torch.empty()`, `torch.tensor()`, and `.to()` methods:
+
 ```python
 x = torch.empty(100, device="spyre", dtype=torch.float16)
 y = x.to("cpu")
@@ -129,6 +132,7 @@ tests/test_vf_allocator_standalone.py::TestVFAllocatorStandalone::test_allocatio
 **Purpose:** Verify that VF mode is correctly detected from environment variable.
 
 **Implementation:**
+
 ```python
 def test_vf_mode_detection(self):
     self.assertEqual(os.environ.get("FLEX_DEVICE"), "VF")
@@ -147,6 +151,7 @@ def test_vf_mode_detection(self):
 **Purpose:** Test basic memory allocation for a single tensor.
 
 **Implementation:**
+
 ```python
 def test_basic_allocation(self):
     x = torch.empty(100, device="spyre", dtype=torch.float16)
@@ -170,6 +175,7 @@ def test_basic_allocation(self):
 **Purpose:** Verify all allocations are aligned to 128-byte boundaries.
 
 **Test Sizes:**
+
 ```
 1 byte → 128 bytes
 50 bytes → 128 bytes
@@ -181,6 +187,7 @@ def test_basic_allocation(self):
 ```
 
 **Implementation:**
+
 ```python
 for size in [1, 50, 100, 127, 128, 129, 200, 255, 256]:
     x = torch.empty(size, device="spyre", dtype=torch.float16)
@@ -206,6 +213,7 @@ for size in [1, 50, 100, 127, 128, 129, 200, 255, 256]:
 4. Verify new allocations succeed
 
 **Implementation:**
+
 ```python
 tensors = []
 for i in range(5):
@@ -233,6 +241,7 @@ for i in range(5):
 **Purpose:** Test behavior with zero-size tensors.
 
 **Implementation:**
+
 ```python
 x = torch.empty(0, device="spyre", dtype=torch.float16)
 self.assertEqual(x.device.type, "spyre")
@@ -250,6 +259,7 @@ self.assertEqual(x.numel(), 0)
 **Purpose:** Verify allocation with different data types.
 
 **Data Types Tested:**
+
 ```python
 dtypes = [
     torch.float16,  # 2 bytes
@@ -270,6 +280,7 @@ dtypes = [
 **Purpose:** Test sequential allocate-deallocate patterns.
 
 **Scenario:**
+
 ```
 Iteration 1: Allocate → Use → Deallocate
 Iteration 2: Allocate → Use → Deallocate
@@ -278,6 +289,7 @@ Iteration 5: Allocate → Use → Deallocate
 ```
 
 **Implementation:**
+
 ```python
 for iteration in range(5):
     x = torch.empty(500, device="spyre", dtype=torch.float16)
@@ -300,6 +312,7 @@ for iteration in range(5):
 **Purpose:** Test allocation patterns with selective deallocation.
 
 **Scenario:**
+
 ```
 1. Allocate: t1 (200), t2 (200), t3 (200)
 2. Deallocate: t2 (creates free gap)
@@ -308,6 +321,7 @@ for iteration in range(5):
 ```
 
 **Implementation:**
+
 ```python
 t1 = torch.empty(200, device="spyre", dtype=torch.float16)
 t2 = torch.empty(200, device="spyre", dtype=torch.float16)
@@ -330,6 +344,7 @@ batch2 = [torch.empty(200, device="spyre", dtype=torch.float16) for _ in range(2
 **Purpose:** Test coalescing of adjacent free memory blocks.
 
 **Scenario:**
+
 ```
 Initial: [t1=1000] [t2=1000] [t3=1000]
          Allocated  Allocated  Allocated
@@ -346,6 +361,7 @@ Allocate large tensor (3000 elements) - should succeed
 ```
 
 **Implementation:**
+
 ```python
 t1 = torch.empty(1000, device="spyre", dtype=torch.float16)
 t2 = torch.empty(1000, device="spyre", dtype=torch.float16)
@@ -376,6 +392,7 @@ self.assertEqual(large.numel(), 3000)
 **Purpose:** Test minimum-size allocation behavior.
 
 **Implementation:**
+
 ```python
 x = torch.empty(1, device="spyre", dtype=torch.float16)
 self.assertEqual(x.numel(), 1)
@@ -396,6 +413,7 @@ self.assertEqual(storage_size % 128, 0)
 **Purpose:** Stress test allocator with many deallocation cycles.
 
 **Scenario:**
+
 ```
 for i in 1 to 50:
     Allocate tensor (100 elements)
@@ -406,6 +424,7 @@ Finally: Allocate one more tensor to verify still working
 ```
 
 **Implementation:**
+
 ```python
 for _ in range(50):
     t = torch.empty(100, device="spyre", dtype=torch.float16)
@@ -432,6 +451,7 @@ self.assertEqual(final.numel(), 100)
 **Purpose:** Test allocations with variable sizes to stress block management.
 
 **Allocation Pattern:**
+
 ```
 Sizes: [10, 100, 1000, 10000, 100000]
 
@@ -439,6 +459,7 @@ Allocate all → Delete 100 and 10000 → Allocate new 100 and 10000
 ```
 
 **Implementation:**
+
 ```python
 sizes = [10, 100, 1000, 10000, 100000]
 tensors = []
@@ -466,6 +487,7 @@ t_new2 = torch.empty(10000, device="spyre", dtype=torch.float16)
 **Purpose:** Test multiple simultaneous tensor allocations.
 
 **Scenario:**
+
 ```
 Allocate 20 tensors (100 elements each)
 Fill each with its index value
@@ -473,6 +495,7 @@ Verify all are valid and have correct values
 ```
 
 **Implementation:**
+
 ```python
 tensors = []
 num_tensors = 20
@@ -500,6 +523,7 @@ for i, t in enumerate(tensors):
 **Purpose:** Test allocation of very large tensors.
 
 **Implementation:**
+
 ```python
 large_size = 10 * 1024 * 1024  # ~160MB for float16
 x = torch.empty(large_size, device="spyre", dtype=torch.float16)
@@ -523,6 +547,7 @@ self.assertTrue((x_cpu == 1.0).all())
 **Purpose:** Test that tensor arithmetic operations work on spyre device.
 
 **Operations Tested:**
+
 ```python
 z = x + y      # Addition
 w = x * y      # Element-wise multiplication
@@ -530,6 +555,7 @@ v = torch.sum(x)  # Reduction operation
 ```
 
 **Implementation:**
+
 ```python
 x = torch.randn(100, dtype=torch.float16).to("spyre")
 y = torch.randn(100, dtype=torch.float16).to("spyre")
@@ -556,6 +582,7 @@ self.assertEqual(z_cpu.numel(), 100)
 **Purpose:** Simulate a realistic real-world memory management scenario.
 
 **Scenario (18 steps):**
+
 ```
 1. Allocate a (1 element)
 2. Allocate b (1 element)
@@ -573,6 +600,7 @@ self.assertEqual(z_cpu.numel(), 100)
 ```
 
 **Implementation:**
+
 ```python
 print("---------- allocate tensor a -------------")
 a = torch.tensor([0], dtype=torch.float16, device="spyre")
@@ -611,6 +639,7 @@ self.assertEqual(k.device.type, "spyre")
 - Fragmentation handling
 
 **Output Example:**
+
 ```
 ---------- allocate tensor a -------------
 ---------- allocate tensor b -------------
@@ -634,12 +663,14 @@ All tensors verified successfully!
 
 ### 1. **Device Management Pattern**
 Always specify device and dtype:
+
 ```python
 x = torch.empty(size, device="spyre", dtype=torch.float16)
 ```
 
 ### 2. **Garbage Collection Pattern**
 Trigger GC after deletions to ensure deallocation:
+
 ```python
 del x
 gc.collect()
@@ -647,6 +678,7 @@ gc.collect()
 
 ### 3. **Device Transfer Pattern**
 For operations not supported on spyre, use CPU:
+
 ```python
 # Create on CPU, transfer to device
 x = torch.randn(100, dtype=torch.float16).to("spyre")
@@ -657,6 +689,7 @@ x_cpu = x.cpu()
 
 ### 4. **Storage Size Verification Pattern**
 Check alignment of allocations:
+
 ```python
 storage_size = x.untyped_storage().nbytes()
 self.assertEqual(storage_size % 128, 0)
@@ -664,6 +697,7 @@ self.assertEqual(storage_size % 128, 0)
 
 ### 5. **Batch Operations Pattern**
 Test multiple allocations:
+
 ```python
 tensors = [torch.empty(size, device="spyre", dtype=torch.float16) 
            for _ in range(count)]

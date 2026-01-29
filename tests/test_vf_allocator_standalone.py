@@ -46,10 +46,12 @@ import gc
 FLEX_DEVICE = os.environ.get("FLEX_DEVICE")
 if FLEX_DEVICE != "VF":
     print(f"Warning: FLEX_DEVICE is '{FLEX_DEVICE}', tests require 'VF'")
-    print("Please run with: FLEX_DEVICE=VF python tests/test_vf_allocator_standalone.py")
+    print(
+        "Please run with: FLEX_DEVICE=VF python tests/test_vf_allocator_standalone.py"
+    )
     sys.exit(0)
 
-import torch
+import torch  # noqa: E402
 
 
 class TestVFAllocatorStandalone(unittest.TestCase):
@@ -58,7 +60,7 @@ class TestVFAllocatorStandalone(unittest.TestCase):
     def test_vf_mode_detection(self):
         """Test that VF mode is correctly detected from environment variable."""
         self.assertEqual(os.environ.get("FLEX_DEVICE"), "VF")
-        
+
         # Create a tensor to verify allocator works
         x = torch.empty(10, device="spyre", dtype=torch.float16)
         self.assertEqual(x.device.type, "spyre")
@@ -145,7 +147,9 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         del t2
         gc.collect()
 
-        batch2 = [torch.empty(200, device="spyre", dtype=torch.float16) for _ in range(2)]
+        batch2 = [
+            torch.empty(200, device="spyre", dtype=torch.float16) for _ in range(2)
+        ]
 
         self.assertEqual(t1.numel(), 200)
         self.assertEqual(t3.numel(), 200)
@@ -258,7 +262,7 @@ class TestVFAllocatorStandalone(unittest.TestCase):
 
     def test_realistic_allocation_pattern(self):
         """Test a realistic sequence of allocations and deallocations with various tensor sizes.
-        
+
         This test simulates a real-world scenario with:
         - Initial allocations
         - Selective deallocations (moving to CPU)
@@ -273,7 +277,7 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         self.assertEqual(a.device.type, "spyre")
 
         print("\n\n---------- allocate tensor b -------------")
-        b = torch.tensor([0.], dtype=torch.float16, device="spyre")
+        b = torch.tensor([0.0], dtype=torch.float16, device="spyre")
         self.assertEqual(b.numel(), 1)
         self.assertEqual(b.device.type, "spyre")
 
@@ -300,12 +304,14 @@ class TestVFAllocatorStandalone(unittest.TestCase):
 
         print("\n\n---------- allocate tensor e -------------")
         e = torch.tensor(
-            [[1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
-             [1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
-             [1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
-             [1., 0., -1., 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]],
+            [
+                [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+                [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+                [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+                [1.0, 0.0, -1.0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+            ],
             dtype=torch.float16,
-            device="spyre"
+            device="spyre",
         )
         self.assertEqual(e.numel(), 64)
         self.assertEqual(e.device.type, "spyre")
@@ -327,9 +333,9 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         self.assertEqual(j.device.type, "spyre")
 
         print("\n\n---------- allocate tensor l (from freed space) -------------")
-        l = torch.tensor([7, 0, 4, 9], dtype=torch.float16, device="spyre")
-        self.assertEqual(l.numel(), 4)
-        self.assertEqual(l.device.type, "spyre")
+        tensor_l = torch.tensor([7, 0, 4, 9], dtype=torch.float16, device="spyre")
+        self.assertEqual(tensor_l.numel(), 4)
+        self.assertEqual(tensor_l.device.type, "spyre")
 
         print("\n\n---------- allocate tensor f (from freed space) -------------")
         f = torch.tensor([6, 6, 6], dtype=torch.float16, device="spyre")
@@ -340,7 +346,7 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         self.assertEqual(e.device.type, "spyre")
         self.assertEqual(k.device.type, "spyre")
         self.assertEqual(j.device.type, "spyre")
-        self.assertEqual(l.device.type, "spyre")
+        self.assertEqual(tensor_l.device.type, "spyre")
         self.assertEqual(f.device.type, "spyre")
         print("All tensors verified successfully!")
 

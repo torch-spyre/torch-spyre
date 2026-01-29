@@ -19,8 +19,11 @@
 #include <pybind11/pybind11.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include <cstdint>
 #include <flex/runtime.hpp>
 #include <memory>
+#include <set>
+#include <unordered_map>
 
 namespace spyre {
 
@@ -37,8 +40,7 @@ struct BlockInfo {
   size_t offset_end;
 
   BlockInfo() : offset_init(0), offset_end(0) {}
-  BlockInfo(size_t x, size_t y)
-    : offset_init(x), offset_end(y) {}
+  BlockInfo(size_t x, size_t y) : offset_init(x), offset_end(y) {}
 };
 
 struct FreeInterval {
@@ -48,7 +50,7 @@ struct FreeInterval {
   size_t end;  // one past last byte
 
   bool operator<(const FreeInterval& other) const {
-    return start < other.start;   // for std::set ordering
+    return start < other.start;  // for std::set ordering
   }
 };
 
@@ -56,18 +58,22 @@ struct SegmentInfo {
   // One contiguous allocation on Spyre, via TryAllocate. VF only.
   // Allocated memory is subdivided into Blocks and FreeIntervals.
 
-  unsigned long segment_id;  // same as alloc_idx. Type: AIUMsg::V1::AllocationIndex = senlib::v2::LittleEndian<unsigned long>
-  flex::DeviceMemoryAllocationPtr data;  // in common across all ShareOwnerCtx associated with the same Segment
+  uint64_t segment_id;  // same as alloc_idx. Type: AIUMsg::V1::AllocationIndex
+                        // = senlib::v2::LittleEndian<uint64_t>
+  flex::DeviceMemoryAllocationPtr data;  // in common across all ShareOwnerCtx
+                                         // associated with the same Segment
 
   size_t total_size;
   size_t free_size;
 
-  std::unordered_map<void*, BlockInfo> blocks;  // map ShareOwnerCtx ptr -> BlockInfo
+  std::unordered_map<void*, BlockInfo>
+      blocks;                             // map ShareOwnerCtx ptr -> BlockInfo
   std::set<FreeInterval> free_intervals;  // track available memory
-  std::multiset<size_t> free_interval_sizes;  // track sizes of all free intervals
+  std::multiset<size_t>
+      free_interval_sizes;  // track sizes of all free intervals
 
-  SegmentInfo(unsigned long idx, size_t sz)
-    : segment_id(idx), total_size(sz), free_size(sz) {}
+  SegmentInfo(uint64_t idx, size_t sz)
+      : segment_id(idx), total_size(sz), free_size(sz) {}
 };
 
 class GlobalRuntime {

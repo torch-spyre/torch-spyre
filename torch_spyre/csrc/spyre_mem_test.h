@@ -18,10 +18,13 @@
 
 // Test-only header for accessing internal allocator methods
 // This header should only be included in test files
-// 
+//
 // Usage: Include this header in your test files to access private
 // SpyreAllocator members and methods. The SpyreAllocator class
 // declares this as a friend class.
+
+#include <unordered_map>
+#include <vector>
 
 #include "module.h"
 
@@ -40,21 +43,27 @@ struct SpyreAllocator;
 class SpyreAllocatorTestInterface {
  public:
   // Access to internal methods for testing
-  static size_t setMinSpyreAllocation(const SpyreAllocator& allocator, size_t nbytes);
-  static SpyreAllocator::AllocationResult findFreeBlock(SpyreAllocator& allocator, size_t nbytes);
-  static void allocateInSegment(SpyreAllocator& allocator, SegmentInfo* seg, 
-                                 FreeInterval range, size_t nbytes, size_t& vf_offset);
-  static SegmentInfo& createNewSegment(SpyreAllocator& allocator, size_t nbytes,
-                                       flex::DeviceMemoryAllocatorPtr allocator_ptr,
-                                       size_t& vf_offset);
-  static void deallocateBlock(SpyreAllocator& allocator, SegmentInfo& seg, void* ctx_void);
-  
+  static size_t setMinSpyreAllocation(const SpyreAllocator& allocator,
+                                      size_t nbytes);
+  static SpyreAllocator::AllocationResult findFreeBlock(
+      SpyreAllocator& allocator, size_t nbytes);
+  static void allocateInSegment(SpyreAllocator& allocator, SegmentInfo* seg,
+                                FreeInterval range, size_t nbytes,
+                                size_t& vf_offset);
+  static SegmentInfo& createNewSegment(
+      SpyreAllocator& allocator, size_t nbytes,
+      flex::DeviceMemoryAllocatorPtr allocator_ptr, size_t& vf_offset);
+  static void deallocateBlock(SpyreAllocator& allocator, SegmentInfo& seg,
+                              void* ctx_void);
+
   // Access to internal state for verification
-  static const std::vector<SegmentInfo>& getSegments(const SpyreAllocator& allocator);
+  static const std::vector<SegmentInfo>& getSegments(
+      const SpyreAllocator& allocator);
   static size_t getSegmentSize(const SpyreAllocator& allocator);
   static bool isVFMode(const SpyreAllocator& allocator);
   static size_t getMinAllocBytes(const SpyreAllocator& allocator);
-  static const std::unordered_map<void*, SegmentInfo*>& getBlockToSegmentMap(const SpyreAllocator& allocator);
+  static const std::unordered_map<void*, SegmentInfo*>& getBlockToSegmentMap(
+      const SpyreAllocator& allocator);
 };
 
 }  // namespace test
