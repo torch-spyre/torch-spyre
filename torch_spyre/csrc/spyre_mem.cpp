@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// cpplint: disable=readability/braces
+
 #include "spyre_mem.h"
 
 #include <ATen/EmptyTensor.h>
@@ -64,6 +66,7 @@ struct DMAParameters {
   const int64_t size_bytes;
   const off64_t src_offset;
   const off64_t dst_offset;
+  // NOLINTNEXTLINE(readability/braces)
 };
 /*
  * CPU stride for a dimension.
@@ -346,7 +349,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::Segment::INVALID,
       sendnn::Segment::INVALID,
       sendnn::Segment::PROGRAM(128),
-  };
+  };  // NOLINT
   // STAGE 2: SenSuperNodeV2 graph
   sendnn::Graph sn_graph;  // sn = supernode
   {                        // SenSuperNodeV2 graph
@@ -446,37 +449,15 @@ struct SpyreAllocator final : public at::Allocator {
   static constexpr size_t DEFAULT_N_SEGMENTS = 8;
   static constexpr size_t MIN_ALLOC_BYTES = 128;  // Spyre requirement
 
-<<<<<<< HEAD
-  SpyreAllocator(size_t seg_sz = size_t{12} * 1024 * 1024 *
-                                 1024,  // 12 GB Segment size (14 GB fails)
-                 int n_seg = 8)
-      : segment_size(seg_sz), n_segments(n_seg) {
-    /* This constructor determines if using VF of PF mode based on FLEX_DEVICE
-     * env var. Alternatively to the following method, we could check if
-     * allocator attribute vfw_ is nullptr. If so, PF is in use, otherwise VF.
-     * However, this requires allocator object of type
-     * flex::DeviceMemoryAllocatorPtr to exist, which doesn't yet in this
-     * constructor. Can be checked within allocate() method though. However,
-     * vfw_ is private and needs a getter created in Flex.
-     */
-
-=======
   bool get_function_mode() {
->>>>>>> andrea/vf_alloc
     const char* fmode_envvar = std::getenv("FLEX_DEVICE");
     TORCH_CHECK(fmode_envvar != nullptr, "FLEX_DEVICE env var is not set!")
 
     std::string fmode = fmode_envvar;
     if (fmode == "VF") {
-<<<<<<< HEAD
-      use_pf = false;
-    } else if (fmode == "PF") {
-      use_pf = true;
-=======
       return false;
     } else if (fmode == "PF") {
       return true;
->>>>>>> andrea/vf_alloc
     } else {
       TORCH_CHECK(false, "Unsupported FLEX_DEVICE env var value: ", fmode);
     }
@@ -515,14 +496,8 @@ struct SpyreAllocator final : public at::Allocator {
      */
 
     DEBUGINFO("PF allocation");
-<<<<<<< HEAD
-    flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-    allocator->TryAllocate(&data, nbytes,
-                           0);  // memory allocation request to Spyre
-=======
     flex::DeviceMemoryAllocationPtr data;      // a smart-pointer object
     allocator->TryAllocate(&data, nbytes, 0);  // allocation request to Spyre
->>>>>>> andrea/vf_alloc
     TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
 
     // Instantiate object to live beyond SpyreAllocator scope
@@ -543,34 +518,13 @@ struct SpyreAllocator final : public at::Allocator {
      * at this time.
      */
 
-<<<<<<< HEAD
-    flex::DeviceMemoryAllocationPtr data;           // a smart-pointer object
-    AllocationInfo alloc_info{nullptr, {}, false};  // VF Mode allocation info
-=======
     flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
->>>>>>> andrea/vf_alloc
 
     if (segments.empty()) initializeSegments(allocator);
 
     size_t aligned_nbytes = setMinSpyreAllocation(nbytes);
     AllocationInfo alloc_info = findFreeBlock(aligned_nbytes);
 
-<<<<<<< HEAD
-    if (!alloc_info.found) {
-      throw std::runtime_error(
-          "Unable to find enough free memory for allocation. All " +
-          std::to_string(n_segments) + " segments are full.");
-    }
-
-    DEBUGINFO(">>> VF block allocation");
-    allocateInSegment(alloc_info.segment, alloc_info.interval, aligned_nbytes,
-                      vf_offset);
-    data = alloc_info.segment
-               ->data;  // DeviceMemoryAllocationPtr shared within Segment
-    logSegmentState(*alloc_info.segment,
-                    "After block allocation");  // [AF] very verbose
-
-=======
     TORCH_CHECK(alloc_info.found,
                 "Unable to find enough free memory for allocation. All ",
                 n_segments, " segments are full.");
@@ -584,7 +538,6 @@ struct SpyreAllocator final : public at::Allocator {
     if (alloc_debug)
       logSegmentState(*alloc_info.segment, "After block allocation");
 
->>>>>>> andrea/vf_alloc
     TORCH_CHECK(data, "Failed to allocate ", aligned_nbytes,
                 " bytes on Spyre device.");
 
@@ -611,14 +564,7 @@ struct SpyreAllocator final : public at::Allocator {
     for (int i = 0; i < n_segments; i++) {
       flex::DeviceMemoryAllocationPtr data;
       allocator->TryAllocate(&data, segment_size, 0);
-<<<<<<< HEAD
-      if (!data) {
-        throw std::runtime_error("Failed to allocate segment " +
-                                 std::to_string(i));
-      }
-=======
       TORCH_CHECK(data, "Failed to allocate segment ", i);
->>>>>>> andrea/vf_alloc
       segments.emplace_back(data->AllocIndex(), segment_size);
       segments.back().data = data;
       segments.back().free_intervals.insert(FreeInterval{0, segment_size});
@@ -629,18 +575,10 @@ struct SpyreAllocator final : public at::Allocator {
   size_t setMinSpyreAllocation(size_t nbytes) const {
     /* Adjust allocation according to Spyre requirement. */
 
-<<<<<<< HEAD
-    if (nbytes % min_alloc_bytes !=
-        0)  // [AF] unclear if this check triggers: can nbytes request ever be
-            // misaligned?
-      return ((nbytes + min_alloc_bytes - 1) / min_alloc_bytes) *
-             min_alloc_bytes;
-=======
     // [AF] can nbytes request be ever misaligned?
     if (nbytes % MIN_ALLOC_BYTES != 0)
       return ((nbytes + MIN_ALLOC_BYTES - 1) / MIN_ALLOC_BYTES) *
              MIN_ALLOC_BYTES;
->>>>>>> andrea/vf_alloc
     return nbytes;
   }
 
@@ -648,22 +586,14 @@ struct SpyreAllocator final : public at::Allocator {
     SegmentInfo* segment;
     FreeInterval interval;
     bool found;
-  };
+  };  // NOLINT(readability/braces)
 
   AllocationInfo findFreeBlock(size_t nbytes) {
     /* Locate first memory interval that can accommodate a block of size nbytes.
      */
 
-<<<<<<< HEAD
-    if (nbytes > segment_size) {
-      throw std::runtime_error(
-          "Requested allocation (" + std::to_string(nbytes) + " bytes) " +
-          "exceeds segment size (" + std::to_string(segment_size) + " bytes)");
-    }
-=======
     TORCH_CHECK(nbytes <= segment_size, "Requested allocation (", nbytes,
                 " bytes) exceeds segment size (", segment_size, " bytes)");
->>>>>>> andrea/vf_alloc
 
     SegmentInfo* best_seg = nullptr;
     size_t max_free_size = 0;
@@ -901,12 +831,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-<<<<<<< HEAD
-  // DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);  //
-  // [AF] to be restored
-=======
   DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
->>>>>>> andrea/vf_alloc
   auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
@@ -934,12 +859,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   }
 
   static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
-<<<<<<< HEAD
-  // DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());  // [AF] to be
-  // restored
-=======
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
->>>>>>> andrea/vf_alloc
   return tensor;
 }
 
@@ -992,14 +912,8 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
-<<<<<<< HEAD
-  // DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());  //
-  // [AF] to be restored DEBUGINFO("dst (", dst.scalar_type(), ") on:",
-  // dst.device());  // [AF] to be restored
-=======
   DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());
   DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
->>>>>>> andrea/vf_alloc
   at::Storage source_storage;
   at::Storage dest_storage;
 
@@ -1060,5 +974,4 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
 }
-
 }  // namespace spyre
