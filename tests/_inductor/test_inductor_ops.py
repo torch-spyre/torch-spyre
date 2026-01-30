@@ -583,45 +583,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_softmax", "test_softmax_cpu"): {
+        ("test_softmax", "test_dim_op_cpu"): {
+            "ops_dict": {
+                "softmax": lambda dim, x: torch.softmax(x, dim=dim),
+            },
             "param_sets": {
-                "2d_dim0": (
-                    0,
-                    cached_randn((512, 1024), dtype=torch.float16),
-                ),
-                "2d_dim1": (
-                    1,
-                    cached_randn((512, 1024), dtype=torch.float16),
-                ),
-                "3d_dim0": (
-                    0,
-                    cached_randn((256, 64, 128), dtype=torch.float16),
-                ),
-                "3d_dim1": (
-                    1,
-                    cached_randn((256, 64, 128), dtype=torch.float16),
-                ),
-                "3d_dim2": (
-                    2,
-                    cached_randn((256, 64, 128), dtype=torch.float16),
-                ),
-                "4d_dim0": (
-                    0,
-                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
-                ),
-                "4d_dim1": (
-                    1,
-                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
-                ),
-                "4d_dim2": (
-                    2,
-                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
-                ),
-                "4d_dim3": (
-                    3,
-                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
-                ),
-            }
+                "2d_dim0": (0, cached_randn((512, 1024), dtype=torch.float16)),
+                "2d_dim1": (1, cached_randn((512, 1024), dtype=torch.float16)),
+                "3d_dim0": (0, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim1": (1, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim2": (2, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "4d_dim0": (0, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim1": (1, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim2": (2, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim3": (3, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+            },
         },
         (
             "test_size_one",
@@ -711,6 +687,93 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(128, dtype=torch.float16),  # float tensor
                     cached_randn((128,)) > 0,  # bool tensor
                 ),
+            },
+        },
+        (
+            "test_squeeze",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "single": lambda dim, x: torch.squeeze(x, dim),
+                "combined": lambda dim, x: torch.exp(torch.squeeze(x, dim)),
+            },
+            "param_sets": {
+                "2d0": (0, cached_randn((1, 128))),
+                "2d1": (1, cached_randn((4, 1))),
+                "3d0": (0, cached_randn((1, 4, 128))),
+                "3d1": (1, cached_randn((3, 1, 128))),
+                "3d2": (2, cached_randn((3, 4, 1))),
+                "4d0": (0, cached_randn((1, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 1, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 1, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 1))),
+            },
+        },
+        (
+            "test_squeeze_reduction",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "sum": lambda dim, x: torch.squeeze(
+                    torch.sum(x, dim, keepdim=True), dim
+                ),
+            },
+            "param_sets": {
+                "2d0": (0, cached_randn((4, 128))),
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "4d0": (0, cached_randn((2, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 3, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 4, 128))),
+                # TODO: Support sparse tensors
+                # "3d2": (2, cached_randn((3, 4, 128))),
+                # "2d1": (1, cached_randn((4, 128))),
+                # "4d3": (3, cached_randn((2, 3, 4, 128))),
+            },
+        },
+        (
+            "test_unsqueeze",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "single": lambda dim, x: torch.unsqueeze(x, dim),
+                "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((128,))),
+                "1d1": (1, cached_randn((128,))),
+                "2d0": (0, cached_randn((4, 128))),
+                "2d1": (1, cached_randn((4, 128))),
+                "2d2": (2, cached_randn((4, 128))),
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "3d2": (2, cached_randn((3, 4, 128))),
+                "3d3": (3, cached_randn((3, 4, 128))),
+                "4d0": (0, cached_randn((2, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 3, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 4, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 128))),
+                "4d4": (4, cached_randn((2, 3, 4, 128))),
+            },
+        },
+        (
+            "test_unsqueeze_broadcast",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "add": lambda dim, x, y: torch.add(x, torch.unsqueeze(y, dim)),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((4, 128)), cached_randn((128,))),
+                "2d0": (0, cached_randn((3, 4, 128)), cached_randn((4, 128))),
+                "2d1": (1, cached_randn((3, 4, 128)), cached_randn((3, 128))),
+                "3d0": (0, cached_randn((2, 3, 4, 128)), cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((2, 3, 4, 128)), cached_randn((2, 4, 128))),
+                "3d2": (2, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 128))),
+                # TODO: Support dim=-1 for broadcasting. See: #598
+                # "1d1": (1, cached_randn((4, 128)), cached_randn((4,))),
+                # "2d2": (2, cached_randn((3, 4, 128)), cached_randn((3, 4))),
+                # "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
             },
         },
     }
@@ -871,8 +934,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
-    def test_softmax_cpu(self, dim, x):
-        compare_with_cpu(lambda x: torch.softmax(x, dim=dim), x)
+    def test_dim_op_cpu(self, op, dim, *args):
+        def fn(*args):
+            return op(dim, *args)
+
+        compare_with_cpu(fn, *args)
 
 
 if __name__ == "__main__":

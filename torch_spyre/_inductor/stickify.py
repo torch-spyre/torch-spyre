@@ -64,46 +64,51 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 stl = SpyreTensorLayout(
                     x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
                 )
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
+
             case spyreop.slice.default:
                 if not is_sparse(x_stl):
                     raise Unsupported("slice on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("slice on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype)
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
+
             case spyreop.swap.default:
                 if not is_sparse(x_stl):
                     raise Unsupported("swap on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("swap on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
+
             case aten.clone.default:
                 if is_sparse(x_stl):
                     raise Unsupported("clone on sparse tensor")
                 # FIXME: Blindly using dense generic stick layout. Should derive from inputs
                 stl = SpyreTensorLayout(output.size, output.dtype)
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
+
             case _:
-                # Generic pointwise unary: output dim order is same as input
-                if not x.layout.size == output.size:
-                    raise Unsupported(
-                        f"size mismatch:  {op}({x.layout.size})=>{output.size}) "
+                in_size = x.layout.size
+                out_size = output.size
+
+                if in_size == out_size:
+                    # Generic pointwise unary: output dim order is same as input
+                    stl = SpyreTensorLayout(
+                        x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
                     )
-                # FIXME: Blindly using dense generic stick layout. Should derive from inputs
-                stl = SpyreTensorLayout(output.size, output.dtype)
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
-                )
+                elif [s for s in in_size if s != 1] == [s for s in out_size if s != 1]:
+                    # squeeze or unsqueeze
+
+                    # FIXME: Assume the generic stick layout
+                    dim_order = list(range(len(out_size)))
+                    if x_stl.dim_map[-1] == -1:
+                        dim_order += [-1]
+                    stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+
+                else:
+                    raise Unsupported(f"size mismatch: {op}({in_size})=>{out_size}) ")
+
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
     elif op == spyreop.layernormnorm.default:
         x = args[0]
         x_stl = x.layout.device_layout
