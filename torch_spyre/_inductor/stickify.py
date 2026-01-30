@@ -228,7 +228,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         input_dims = stride_order_vars(input.dep.index)
         stick_var = input_dims[-1]
         is_stick_reduction = stick_var not in output_dims
-        format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        keep_dim = len(input.layout.size) == len(output.size)
+        format = (
+            StickFormat.Sparse
+            if is_stick_reduction and not keep_dim
+            else StickFormat.Dense
+        )
         stl = SpyreTensorLayout(
             output.size, output.dtype, list(range(len(output.size))), format
         )
