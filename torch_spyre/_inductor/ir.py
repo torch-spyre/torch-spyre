@@ -88,6 +88,7 @@ class FixedTiledLayout(FixedLayout):
     ) -> None:
         super().__init__(device, dtype, size, stride)
         self.device_layout = device_layout
+        self.allocation: dict[str, Any] = {}
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
@@ -99,5 +100,36 @@ class FixedTiledLayout(FixedLayout):
     def get_allocation_size(self) -> list[Expr]:
         # TODO: Eventually this will include padding, etc.
         return self.size
+
+    def make_indexer(self) -> Callable[[Sequence[Expr]], Expr]:
+        """
+        A closure containing math to read a given element.
+
+        NOTE:   For the purposes of representing an access in the LoopLevelIR,
+                we use a stride of 1 for the stick dimension.
+                This is not true, because the sticks are actually tiled in memory.
+                If we needed this indexer to compute the real offset in memory, the stick dimension
+                compuation would actually need to be something like:
+                    result = result + ((index[stick_dim] // 64) * stride[-2] + (index[stick_dim] % 64)
+                However, all SpyreKernel needs from this indexer to be able to build a KernelSpec
+                is for the indexer function to robustly capture the relationship between dim_map and
+                the free variables in the index expression.
+                By using a simpler expression it is easier to recover this relationship by stride-ordering the variables.
+        """
+        offset = self.offset
+        stl = self.device_layout
+
+        def indexer(index: Sequence[Expr]) -> Expr:
+            for d in stl.dim_map:
+                assert d < len(index)
+            result = offset
+            stick_dim = stl.dim_map[-1]
+            for hd, stride in zip(stl.dim_map, stl.device_strides()):
+                if hd != stick_dim:
+                    result = result + (index[hd] * stride)
+            result = result + index[stick_dim]  # stride of 1!
+            return result
+
+        return indexer
 
     __repr__ = __str__

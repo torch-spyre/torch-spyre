@@ -156,6 +156,7 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+    from . import _hooks  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)

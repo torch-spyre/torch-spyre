@@ -291,7 +291,12 @@ def create_tensor_arg(
     is_input: bool, arg_index: int, layout: FixedTiledLayout
 ) -> TensorArg:
     return TensorArg(
-        is_input, arg_index, layout.dtype, layout.size, layout.device_layout
+        is_input,
+        arg_index,
+        layout.dtype,
+        layout.size,
+        layout.allocation,
+        layout.device_layout,
     )
 
 

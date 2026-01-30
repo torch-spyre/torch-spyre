@@ -41,6 +41,7 @@ int64_t elems_per_stick(const DataFormats& df) {
 
 /* Returns default ordering of tensor dimensions on the device (generic stick).
  * Non-stick dimensions appear once, stick dimensions appear twice.
+ * Must be kept in synch with host_dim_order below.
  */
 auto get_generic_stick_layout(int rank, std::vector<int32_t> host_dim_order)
     -> std::vector<int32_t> {
@@ -67,6 +68,34 @@ auto get_generic_stick_layout(int rank, std::vector<int32_t> host_dim_order)
   }
   return dim_map;
 }
+
+/* This is the inverse function of get_generic_stick_layout.  Keep in sync
+ */
+std::vector<int32_t> SpyreTensorLayout::host_dim_order() {
+  auto rank = this->dim_map.size() - 1;
+  std::vector<int32_t> host_dim_order;
+  switch (rank) {
+    case 1:
+      host_dim_order = {this->dim_map[1]};
+      break;
+    case 2:
+      host_dim_order = {this->dim_map[1], this->dim_map[2]};
+      break;
+    case 3:
+      host_dim_order = {this->dim_map[2], this->dim_map[0], this->dim_map[3]};
+      break;
+    case 4:
+      host_dim_order = {this->dim_map[0], this->dim_map[2], this->dim_map[3],
+                        this->dim_map[4]};
+      break;
+    default:
+      std::stringstream ss;
+      ss << "Unsupported tensor rank: " << std::to_string(rank);
+      throw std::runtime_error(ss.str());
+  }
+  return host_dim_order;
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
