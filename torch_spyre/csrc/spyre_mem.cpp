@@ -228,6 +228,9 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
    *   host2device = false: then 'tensor' is Spyre-tensor
    * TODO: support strided tensors
    */
+  if (stl.format != SpyreTensorLayout::StickFormat::Dense) {
+    throw std::runtime_error("Unsupported: DCI for stick-sparse tensors");
+  }
   auto str_type = torchScalarToString[tensor->scalar_type()];
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;
