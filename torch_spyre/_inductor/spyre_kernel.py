@@ -214,6 +214,10 @@ class SpyreOpFuncs:
     def where(x, y, z):
         return PointwiseOp("where3", [x, y, z])
 
+    @staticmethod
+    def unsqueeze(x, dim):
+        return f"spyre.unsqueeze({x} {dim})"
+
 
 class SpyreKernelOpsHandler(DefaultHandler):
     """

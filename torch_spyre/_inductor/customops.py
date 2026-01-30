@@ -194,3 +194,20 @@ def _(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(size, dtype=dtype, device="spyre")
+
+
+@torch.library.custom_op("spyre::unsqueeze", mutates_args=(), device_types="spyre")
+def spyre_unsqueeze(input: torch.Tensor, dim: int) -> torch.Tensor:
+    warn_fallback("torch.ops.spyre.unsqueeze")
+    # Falling back to CPU
+    tmp = input.cpu()
+    tmp = torch.unsqueeze(tmp, dim)
+    return tmp.to(input.device)
+
+
+@spyre_unsqueeze.register_fake
+def _(input: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = dim if dim >= 0 else dim + input.dim() + 1
+    size = list(input.size())
+    size = size[0:dim] + [1] + size[dim : input.dim()]
+    return torch.empty(size, dtype=input.dtype, device=input.device)

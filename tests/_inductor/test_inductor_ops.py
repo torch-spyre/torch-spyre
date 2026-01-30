@@ -565,6 +565,61 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_unsqueeze_1",
+            "test_unsqueeze_cpu",
+        ): {
+            "ops_dict": {
+                "single": lambda dim, x: torch.unsqueeze(x, dim),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((128,))),
+                "1d1": (1, cached_randn((128,))),
+                "2d0": (0, cached_randn((4, 128))),
+                "2d1": (1, cached_randn((4, 128))),
+                "2d2": (2, cached_randn((4, 128))),
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "3d2": (2, cached_randn((3, 4, 128))),
+                "3d3": (3, cached_randn((3, 4, 128))),
+                "4d0": (0, cached_randn((2, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 3, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 4, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 128))),
+                "4d4": (4, cached_randn((2, 3, 4, 128))),
+            },
+        },
+        (
+            "test_unsqueeze_2",
+            "test_unsqueeze_cpu",
+        ): {
+            "ops_dict": {
+                "combined": lambda dim, x: torch.square(torch.unsqueeze(x, dim)),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((128,))),
+                # "1d1": (1, cached_randn((128,))),  # Disabled due to #402
+                "2d0": (0, cached_randn((4, 128))),
+                "2d1": (1, cached_randn((4, 128))),
+                # "2d2": (2, cached_randn((4, 128))),  # Disabled due to #402
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "3d2": (2, cached_randn((3, 4, 128))),
+                # "3d3": (3, cached_randn((3, 4, 128))),  # Disabled due to #402
+            },
+        },
+        (
+            "test_unsqueeze_3",
+            "test_unsqueeze_cpu",
+        ): {
+            "ops_dict": {
+                "broadcast": lambda dim, x, y: torch.add(x, torch.unsqueeze(y, dim)),
+            },
+            "param_sets": {
+                "1d": (-1, cached_randn((4, 128)), cached_randn((4,))),
+                "2d": (-1, cached_randn((3, 4, 128)), cached_randn((3, 4))),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -646,6 +701,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_max_sub_broadcast_cpu(self, dim: int, x):
         def fn(x):
             x_max = torch.max(x, dim=dim)[0]
@@ -710,6 +766,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.full(*args, dtype=torch.float16, device=device)
 
         compare_with_cpu(fn, needs_device=True)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_unsqueeze_cpu(self, op, dim, *args):
+        def fn(*args):
+            return op(dim, *args)
+
+        compare_with_cpu(fn, *args)
 
 
 if __name__ == "__main__":

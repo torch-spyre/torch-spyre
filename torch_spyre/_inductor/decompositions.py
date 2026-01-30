@@ -153,3 +153,18 @@ def lt_decomp(
     out_le = torch.le(input, other).to(dtype=torch.float16)
     out_ne = torch.ne(input, other).to(dtype=torch.float16)
     return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
+
+
+def spyre_unsqueeze(orig_fn):
+    def fn(input: torch.Tensor, dim: int) -> torch.Tensor:
+        if input.device.type != "spyre":
+            return orig_fn(input, dim)
+
+        # Falling back to CPU
+        return torch.ops.spyre.unsqueeze(input, dim)
+
+    return fn
+
+
+torch.unsqueeze = spyre_unsqueeze(torch.unsqueeze)
+torch.Tensor.unsqueeze = spyre_unsqueeze(torch.Tensor.unsqueeze)
