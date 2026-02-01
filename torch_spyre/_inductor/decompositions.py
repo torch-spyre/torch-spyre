@@ -25,9 +25,6 @@ def where_decomp(
     input: torch.Tensor,
     other: torch.Tensor,
 ) -> torch.Tensor:
-    # Decompose where into: condition * input + other - condition * other
-    # Equivalent to: condition * input + (1 - condition) * other
-    # Avoids rsub which backend doesn't support properly
     return condition * input + other - condition * other
 
 

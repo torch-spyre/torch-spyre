@@ -202,9 +202,6 @@ def where(
     input: torch.Tensor,
     other: torch.Tensor,
 ) -> torch.Tensor:
-    # Eager implementation using decomposition: condition * input + (1 - condition) * other
-    # Avoid rsub by using: condition * input + other - condition * other
-    # This is equivalent: cond*input + other*(1-cond) = cond*input + other - cond*other
     return condition * input + other - condition * other
 
 
