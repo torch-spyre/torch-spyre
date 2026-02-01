@@ -159,7 +159,7 @@ class SpyreTensorImpl : public at::TensorImpl {
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
 
-int32_t get_device_size_in_bytes(SpyreTensorLayout stl);
+uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 
 }  // namespace spyre

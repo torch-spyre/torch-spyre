@@ -282,8 +282,8 @@ void SpyreTensorImpl::shallow_copy_from(
   at::TensorImpl::shallow_copy_from(impl);
 }
 
-int32_t get_device_size_in_bytes(SpyreTensorLayout stl) {
-  int32_t size_bytes = BYTES_IN_STICK;
+uint64_t get_device_size_in_bytes(SpyreTensorLayout stl) {
+  uint64_t size_bytes = BYTES_IN_STICK;
   for (int i = stl.device_size.size() - 2; i >= 0; i--) {
     size_bytes *= stl.device_size[i];
   }

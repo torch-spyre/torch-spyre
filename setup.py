@@ -121,7 +121,12 @@ LIBRARIES = ["sendnn", "flex", "dee_internal"]
 # - we need to fix there
 # Note that we always compile with debug info
 # EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Werror", "-Wno-deprecated"]
+# Set TORCH_SPYRE_DEBUG=1 to build with -O0 for easier debugging
+NO_OPT_BUILD = os.environ.get("TORCH_SPYRE_DEBUG", "0") == "1"
+
 EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
+if NO_OPT_BUILD:
+    EXTRA_CXX_FLAGS += ["-O0"]
 
 
 class clean(Command):
