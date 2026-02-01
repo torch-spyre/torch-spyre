@@ -467,6 +467,36 @@ class TestOps(TestCase):
         torch.testing.assert_close(
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
+    
+    def test_where(self):
+        condition = torch.tensor(
+            [[1., 0.],
+            [0., 1.]],
+            dtype=torch.float16
+        )
+
+        a = torch.tensor(
+            [[10., 10.],
+            [10., 10.]],
+            dtype=torch.float16
+        )
+
+        b = torch.tensor(
+            [[20., 20.],
+            [20., 20.]],
+            dtype=torch.float16
+        )
+
+        condition = condition != 0
+        a_spyre = a.to("spyre")
+        b_spyre = b.to("spyre")
+        condition_spyre = condition.to("spyre")
+        out_spyre = torch.where(condition_spyre, a_spyre, b_spyre)
+
+        out_cpu = torch.where(condition, a, b)
+        torch.testing.assert_close(
+            out_spyre.cpu(), out_cpu, rtol=self.rtol, atol=self.atol
+        )
 
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):

@@ -202,7 +202,17 @@ def where(
     input: torch.Tensor,
     other: torch.Tensor,
 ) -> torch.Tensor:
-    return input.clone()
+    # Fallback implementation for eager execution
+    # During compilation, this will be lowered to the custom backend
+    import torch._ops
+
+    aten_where = torch._ops.ops.aten.where.self
+    cond_cpu = condition.cpu().to(torch.bool) if condition.dtype != torch.bool else condition.cpu()
+    input_cpu = input.cpu()
+    other_cpu = other.cpu()
+    result_cpu = aten_where(cond_cpu, input_cpu, other_cpu)
+    result = result_cpu.to(input.device)
+    return result
 
 
 @where.register_fake

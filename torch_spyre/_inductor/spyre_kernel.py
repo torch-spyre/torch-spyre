@@ -211,8 +211,8 @@ class SpyreOpFuncs:
         return PointwiseOp("realdiv", [a, b])
 
     @staticmethod
-    def where(x, y, z):
-        return PointwiseOp("where3", [x, y, z])
+    def where(condition, x, y):
+        return PointwiseOp("where3", [condition, x, y])
 
 
 class SpyreKernelOpsHandler(DefaultHandler):
