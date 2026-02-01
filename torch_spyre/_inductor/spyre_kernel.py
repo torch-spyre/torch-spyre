@@ -212,7 +212,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def where(condition, x, y):
-        return PointwiseOp("where3", [condition, x, y])
+        return PointwiseOp("where3", [x, y, condition])
 
 
 class SpyreKernelOpsHandler(DefaultHandler):

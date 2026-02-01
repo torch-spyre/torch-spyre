@@ -467,25 +467,13 @@ class TestOps(TestCase):
         torch.testing.assert_close(
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
-    
+
     def test_where(self):
-        condition = torch.tensor(
-            [[1., 0.],
-            [0., 1.]],
-            dtype=torch.float16
-        )
+        condition = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float16)
 
-        a = torch.tensor(
-            [[10., 10.],
-            [10., 10.]],
-            dtype=torch.float16
-        )
+        a = torch.tensor([[10.0, 10.0], [10.0, 10.0]], dtype=torch.float16)
 
-        b = torch.tensor(
-            [[20., 20.],
-            [20., 20.]],
-            dtype=torch.float16
-        )
+        b = torch.tensor([[20.0, 20.0], [20.0, 20.0]], dtype=torch.float16)
 
         condition = condition != 0
         a_spyre = a.to("spyre")

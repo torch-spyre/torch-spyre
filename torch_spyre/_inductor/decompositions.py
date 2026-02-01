@@ -137,8 +137,9 @@ torch.clamp = spyre_clamp
 
 orig_where = torch.where
 
+
 def spyre_where(
-    condition: torch.BoolTensor, 
+    condition: torch.BoolTensor,
     input: torch.Tensor,
     other: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -152,7 +153,9 @@ def spyre_where(
     else:
         return orig_where(condition, input, other)
 
+
 torch.where = spyre_where
+
 
 @register_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
 def gt_decomp(

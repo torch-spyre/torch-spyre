@@ -203,11 +203,15 @@ def where(
     other: torch.Tensor,
 ) -> torch.Tensor:
     # Fallback implementation for eager execution
-    # During compilation, this will be lowered to the custom backend
+    # During compilation, this will be lowered to the spyre backend
     import torch._ops
 
     aten_where = torch._ops.ops.aten.where.self
-    cond_cpu = condition.cpu().to(torch.bool) if condition.dtype != torch.bool else condition.cpu()
+    cond_cpu = (
+        condition.cpu().to(torch.bool)
+        if condition.dtype != torch.bool
+        else condition.cpu()
+    )
     input_cpu = input.cpu()
     other_cpu = other.cpu()
     result_cpu = aten_where(cond_cpu, input_cpu, other_cpu)
@@ -216,7 +220,9 @@ def where(
 
 
 @where.register_fake
-def _(condition: torch.Tensor, 
+def _(
+    condition: torch.Tensor,
     input: torch.Tensor,
-    other: torch.Tensor,):
+    other: torch.Tensor,
+):
     return input.new_empty(input.size())

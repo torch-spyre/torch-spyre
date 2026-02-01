@@ -316,6 +316,7 @@ def lower_clamp(x, min=None, max=None):
     pw.realize()
     return pw
 
+
 lowering.register_op_dtype_propagation_rules(
     "where", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
 )
@@ -324,6 +325,7 @@ lowering.register_op_dtype_propagation_rules(
 @lowering.register_lowering(torch.ops.spyre.where)
 def lower_where(condition, x, other):
     fn = lowering.ops_wrapper(torch.ops.spyre.where.__name__)
+
     def inner_fn(index):
         loaded_inputs = [
             condition.make_loader()(index),
@@ -331,6 +333,7 @@ def lower_where(condition, x, other):
             other.make_loader()(index),
         ]
         return fn(*loaded_inputs)
+
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
