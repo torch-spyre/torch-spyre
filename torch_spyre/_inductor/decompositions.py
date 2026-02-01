@@ -19,6 +19,18 @@ import torch
 from torch._inductor.decomposition import register_decomposition
 
 
+@register_decomposition([torch.ops.spyre.where])
+def where_decomp(
+    condition: torch.Tensor,
+    input: torch.Tensor,
+    other: torch.Tensor,
+) -> torch.Tensor:
+    # Decompose where into: condition * input + other - condition * other
+    # Equivalent to: condition * input + (1 - condition) * other
+    # Avoids rsub which backend doesn't support properly
+    return condition * input + other - condition * other
+
+
 @register_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))

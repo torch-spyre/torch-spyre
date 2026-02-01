@@ -202,21 +202,10 @@ def where(
     input: torch.Tensor,
     other: torch.Tensor,
 ) -> torch.Tensor:
-    # Fallback implementation for eager execution
-    # During compilation, this will be lowered to the spyre backend
-    import torch._ops
-
-    aten_where = torch._ops.ops.aten.where.self
-    cond_cpu = (
-        condition.cpu().to(torch.bool)
-        if condition.dtype != torch.bool
-        else condition.cpu()
-    )
-    input_cpu = input.cpu()
-    other_cpu = other.cpu()
-    result_cpu = aten_where(cond_cpu, input_cpu, other_cpu)
-    result = result_cpu.to(input.device)
-    return result
+    # Eager implementation using decomposition: condition * input + (1 - condition) * other
+    # Avoid rsub by using: condition * input + other - condition * other
+    # This is equivalent: cond*input + other*(1-cond) = cond*input + other - cond*other
+    return condition * input + other - condition * other
 
 
 @where.register_fake
