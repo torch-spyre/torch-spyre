@@ -33,46 +33,47 @@ struct SharedOwnerCtx {
   signed char device_id;
 };
 
-struct BlockInfo {
-  // Contiguous interval of reserved memory within a Segment. VF only.
+struct MemoryBlock {
+  // Contiguous interval of memory within a Segment (either free or occupied).
+  // VF only.
 
-  size_t offset_init;
-  size_t offset_end;
+  size_t start;  // block starting offset
+  size_t end;    // block ending offset (one past last byte)
+  bool is_free;  // block represents memory occupied or free
+  MemoryBlock() : start(0), end(0), is_free(true) {}
+  MemoryBlock(size_t s, size_t e, bool free = true, void* ctx = nullptr)
+      : start(s), end(e), is_free(free) {}
 
-  BlockInfo() : offset_init(0), offset_end(0) {}
-  BlockInfo(size_t x, size_t y) : offset_init(x), offset_end(y) {}
-};
+  size_t size() const {
+    return end - start;
+  }
 
-struct FreeInterval {
-  // Contiguous interval of free memory within a Segment. VF only.
-
-  size_t start;
-  size_t end;  // one past last byte
-
-  bool operator<(const FreeInterval& other) const {
+  bool operator<(const MemoryBlock& other) const {
     return start < other.start;  // for std::set ordering
   }
 };
 
-struct SegmentInfo {
+struct MemorySegment {
   // One contiguous allocation on Spyre, via TryAllocate. VF only.
-  // Allocated memory is subdivided into Blocks and FreeIntervals.
+  // Allocated memory is subdivided into MemoryBlocks (free or occupied).
 
-  uint64_t segment_id;  // same as alloc_idx. Type: AIUMsg::V1::AllocationIndex
-                        // = senlib::v2::LittleEndian<uint64_t>
-  flex::DeviceMemoryAllocationPtr data;  // in common across all ShareOwnerCtx
-                                         // associated with the same Segment
+  size_t segment_id;  // same as alloc_idx. Type: AIUMsg::V1::AllocationIndex =
+                      // senlib::v2::LittleEndian<unsigned long>
+  flex::DeviceMemoryAllocationPtr
+      data;  // in common across all ShareOwnerCtx associated with the same
+             // MemorySegment
 
-  size_t total_size;
-  size_t free_size;
+  size_t total_size;  // total allocated memory for this Segment
+  size_t free_size;   // total available memory
 
-  std::unordered_map<void*, BlockInfo>
-      blocks;                             // map ShareOwnerCtx ptr -> BlockInfo
-  std::set<FreeInterval> free_intervals;  // track available memory
+  std::set<MemoryBlock>
+      blocks;  // all memory blocks (free and occupied), ordered by start offset
+  std::unordered_map<SharedOwnerCtx*, MemoryBlock*>
+      ctx_to_block;  // quick lookup from context to occupied block
   std::multiset<size_t>
-      free_interval_sizes;  // track sizes of all free intervals
+      free_sizes;  // track sizes of all free blocks for quick lookup
 
-  SegmentInfo(uint64_t idx, size_t sz)
+  MemorySegment(size_t idx, size_t sz)
       : segment_id(idx), total_size(sz), free_size(sz) {}
 };
 

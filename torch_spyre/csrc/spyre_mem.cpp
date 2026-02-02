@@ -34,6 +34,7 @@
 #include <cstdlib>  // check env vars
 #include <flex/flex_graph_builder.hpp>
 #include <memory>
+#include <mutex>
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/interface/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
@@ -437,19 +438,24 @@ struct SpyreAllocator final : public at::Allocator {
         ->GetDeviceMemoryAllocator();
   }
 
-  bool use_pf = false;
-  bool alloc_debug = false;
-  std::vector<SegmentInfo> segments;
+  bool use_pf = false;       // PF or VF Mode
+  bool alloc_debug = false;  // control debug printouts
+
+  // Segments and Blocks storage/handling
+  std::vector<MemorySegment> segments;
   size_t segment_size;
   int n_segments;
-  size_t vf_offset = 0;
-  std::unordered_map<void*, SegmentInfo*> block_to_segment;
-  // Segment size fixed to 12 GB (14 fails)
+  std::unordered_map<SharedOwnerCtx*, MemorySegment*> block_to_segment;
+
+  // Mutex to protect shared state in VF mode
+  mutable std::mutex allocator_mutex;
+
+  // Segment size fixed to 12 GB for now (14 fails)
   static constexpr size_t DEFAULT_SEGMENT_SIZE = 12ULL * 1024 * 1024 * 1024;
   static constexpr size_t DEFAULT_N_SEGMENTS = 8;
   static constexpr size_t MIN_ALLOC_BYTES = 128;  // Spyre requirement
 
-  bool get_function_mode() {
+  bool is_pf_mode() {
     const char* fmode_envvar = std::getenv("FLEX_DEVICE");
     TORCH_CHECK(fmode_envvar != nullptr, "FLEX_DEVICE env var is not set!")
 
@@ -463,13 +469,12 @@ struct SpyreAllocator final : public at::Allocator {
     }
   }
 
-  bool get_alloc_debug() {
+  bool is_alloc_debug() {
     const char* alloc_envvar = std::getenv("TORCH_SPYRE_ALLOC_DEBUG");
     if (alloc_envvar == nullptr) return false;
 
     std::string alloc_debug_str = alloc_envvar;
-    if (alloc_debug_str == "1") return true;
-    return false;
+    return alloc_debug_str == "1";
   }
 
   SpyreAllocator(size_t seg_sz = DEFAULT_SEGMENT_SIZE,
@@ -484,8 +489,8 @@ struct SpyreAllocator final : public at::Allocator {
      * vfw_ is private and needs a getter created in Flex.
      */
 
-    use_pf = get_function_mode();
-    alloc_debug = get_alloc_debug();
+    use_pf = is_pf_mode();
+    alloc_debug = is_alloc_debug();
   }
 
   at::DataPtr pf_allocation(flex::DeviceMemoryAllocatorPtr allocator,
@@ -500,7 +505,8 @@ struct SpyreAllocator final : public at::Allocator {
     allocator->TryAllocate(&data, nbytes, 0);  // allocation request to Spyre
     TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
 
-    // Instantiate object to live beyond SpyreAllocator scope
+    // Instantiate object to live beyond SpyreAllocator scope.
+    // vf_offset is set to 0 and not used in PF Mode
     auto* ctx = new SharedOwnerCtx{std::move(data), 0, device_id};
     void* ctx_void = static_cast<void*>(ctx);
     void* data_void = static_cast<void*>(ctx->owner.get());
@@ -513,14 +519,17 @@ struct SpyreAllocator final : public at::Allocator {
                             unsigned int device_id) {
     /* VF allocation implementation. A fixed number of Segments are
      * pre-allocated upon first call. Blocks are inserted into Segments
-     * following round-robin strategy (memory-balanced), starting from vf_offset
-     * = 0 and progressively increasing. No sub-Segment balancing is implemented
-     * at this time.
+     * following a memory-balanced strategy that relies on:
+     * - selecting the Segment with most available free memory
+     * - assigning a Block to the first (= lowest offset) free memory block that
+     *   can fit the requested allocation
+     * No further sub-Segment balancing is implemented at this time.
      */
 
-    flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
+    std::lock_guard<std::mutex> lock(allocator_mutex);
 
-    if (segments.empty()) initializeSegments(allocator);
+    if (segments.empty())
+      initializeSegments(allocator);  // on-chip memory allocation request
 
     size_t aligned_nbytes = setMinSpyreAllocation(nbytes);
     AllocationInfo alloc_info = findFreeBlock(aligned_nbytes);
@@ -529,26 +538,24 @@ struct SpyreAllocator final : public at::Allocator {
                 "Unable to find enough free memory for allocation. All ",
                 n_segments, " segments are full.");
 
-    allocateInSegment(alloc_info.segment, alloc_info.interval, aligned_nbytes,
-                      vf_offset);
+    MemoryBlock* new_block =
+        allocateInSegment(alloc_info.segment, alloc_info.block, aligned_nbytes);
 
-    // DeviceMemoryAllocationPtr shared within Segment
-    data = alloc_info.segment->data;
+    flex::DeviceMemoryAllocationPtr data = alloc_info.segment->data;
+    TORCH_CHECK(data, "Failed to allocate ", aligned_nbytes,
+                " bytes on Spyre device.");
 
     if (alloc_debug)
       logSegmentState(*alloc_info.segment, "After block allocation");
 
-    TORCH_CHECK(data, "Failed to allocate ", aligned_nbytes,
-                " bytes on Spyre device.");
-
     // Instantiate object to live beyond SpyreAllocator scope
-    auto* ctx = new SharedOwnerCtx{std::move(data), vf_offset, device_id};
+    auto* ctx =
+        new SharedOwnerCtx{std::move(data), new_block->start, device_id};
     void* ctx_void = static_cast<void*>(ctx);
     void* data_void = static_cast<void*>(ctx->owner.get());
 
-    alloc_info.segment->blocks[ctx_void] =
-        BlockInfo(vf_offset, vf_offset + aligned_nbytes);
-    block_to_segment[ctx_void] = alloc_info.segment;
+    alloc_info.segment->ctx_to_block[ctx] = const_cast<MemoryBlock*>(new_block);
+    block_to_segment[ctx] = alloc_info.segment;
 
     return at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
   }
@@ -563,19 +570,21 @@ struct SpyreAllocator final : public at::Allocator {
 
     for (int i = 0; i < n_segments; i++) {
       flex::DeviceMemoryAllocationPtr data;
-      allocator->TryAllocate(&data, segment_size, 0);
+      allocator->TryAllocate(&data, segment_size,
+                             0);  // on-chip allocation request
       TORCH_CHECK(data, "Failed to allocate segment ", i);
       segments.emplace_back(data->AllocIndex(), segment_size);
       segments.back().data = data;
-      segments.back().free_intervals.insert(FreeInterval{0, segment_size});
-      segments.back().free_interval_sizes.insert(segment_size);
+
+      // Initialize with one large free block covering entire segment
+      segments.back().blocks.insert(MemoryBlock{0, segment_size, true});
+      segments.back().free_sizes.insert(segment_size);
     }
   }
 
   size_t setMinSpyreAllocation(size_t nbytes) const {
     /* Adjust allocation according to Spyre requirement. */
 
-    // [AF] can nbytes request be ever misaligned?
     if (nbytes % MIN_ALLOC_BYTES != 0)
       return ((nbytes + MIN_ALLOC_BYTES - 1) / MIN_ALLOC_BYTES) *
              MIN_ALLOC_BYTES;
@@ -583,24 +592,24 @@ struct SpyreAllocator final : public at::Allocator {
   }
 
   struct AllocationInfo {
-    SegmentInfo* segment;
-    FreeInterval interval;
+    MemorySegment* segment;
+    MemoryBlock block;
     bool found;
   };  // NOLINT(readability/braces)
 
   AllocationInfo findFreeBlock(size_t nbytes) {
-    /* Locate first memory interval that can accommodate a block of size nbytes.
+    /* Locate first memory block that can accommodate a block of size nbytes.
      */
 
     TORCH_CHECK(nbytes <= segment_size, "Requested allocation (", nbytes,
                 " bytes) exceeds segment size (", segment_size, " bytes)");
 
-    SegmentInfo* best_seg = nullptr;
+    MemorySegment* best_seg = nullptr;
     size_t max_free_size = 0;
 
-    for (SegmentInfo& seg : segments) {
-      if (seg.free_size < nbytes || seg.free_interval_sizes.empty() ||
-          *seg.free_interval_sizes.rbegin() < nbytes)
+    for (MemorySegment& seg : segments) {
+      if (seg.free_size < nbytes || seg.free_sizes.empty() ||
+          *seg.free_sizes.rbegin() < nbytes)
         continue;
 
       // Track segment with most free memory
@@ -610,75 +619,109 @@ struct SpyreAllocator final : public at::Allocator {
       }
     }
 
-    if (best_seg == nullptr) return {nullptr, {}, false};
+    if (best_seg == nullptr)
+      return {nullptr, {}, false};  // not enough free memory
 
-    for (const FreeInterval& r : best_seg->free_intervals) {
-      if (r.end - r.start >= nbytes)
-        return {best_seg, r, true};  // free Block found
+    for (const MemoryBlock& r : best_seg->blocks) {
+      if (r.is_free && r.size() >= nbytes)
+        return {best_seg, r, true};  // free block found
     }
 
-    return {nullptr, {}, false};  // free Block not found
+    return {nullptr, {}, false};  // free block not found
   }
 
-  void allocateInSegment(SegmentInfo* seg, FreeInterval range, size_t nbytes,
-                         size_t& vf_offset) {
-    /* Given a predetermined Segment and a free memory range that accomodates at
-     * least nbytes, mark this memory occupied, recalculate free range, and
+  MemoryBlock* allocateInSegment(MemorySegment* seg, MemoryBlock block,
+                                 size_t nbytes) {
+    /* Given a predetermined Segment and a free memory block that accommodates
+     * at least nbytes, mark this memory occupied, split block if needed, and
      * update total Segment free memory.
      */
 
     DEBUGINFO("VF block allocation");
-    vf_offset = range.start;
-    seg->free_intervals.erase(
-        range);  // remove FreeInterval selected to contain the new Block
-    seg->free_interval_sizes.erase(range.end - range.start);
+    seg->blocks.erase(block);  // remove the free block
 
-    if (range.end - range.start >
-        nbytes) {  // if some space remains after Block creation
-      FreeInterval new_range{range.start + nbytes, range.end};
-      seg->free_intervals.insert(new_range);
-      seg->free_interval_sizes.insert(range.end - range.start - nbytes);
+    // Update free sizes, removing a single value from it (not all)
+    auto size_it = seg->free_sizes.find(block.size());
+    seg->free_sizes.erase(size_it);
+
+    // Insert occupied block
+    MemoryBlock occupied{block.start, block.start + nbytes, false};
+    auto [block_it, inserted] = seg->blocks.insert(occupied);
+
+    // If there's remaining space, create a new free block
+    if (block.size() > nbytes) {
+      MemoryBlock remaining{block.start + nbytes, block.end, true};
+      seg->blocks.insert(remaining);
+      seg->free_sizes.insert(remaining.size());
     }
+
     seg->free_size -= nbytes;
+
+    return const_cast<MemoryBlock*>(&(*block_it));
   }
 
-  void deallocateBlock(SegmentInfo& seg, void* ctx_void) {
+  void deallocateBlock(MemorySegment& seg, SharedOwnerCtx* ctx) {
     /* Deallocate a block from a segment and return its memory to the free pool.
-     * Merges adjacent free intervals to reduce fragmentation. Updates segment's
+     * Merges adjacent free blocks to reduce fragmentation. Updates segment's
      * free memory tracking and removes block from registry.
      */
 
-    auto it = seg.blocks.find(ctx_void);
-    if (it == seg.blocks.end()) return;
+    auto ctx_it = seg.ctx_to_block.find(ctx);
+    if (ctx_it == seg.ctx_to_block.end()) return;
 
     DEBUGINFO("VF block deallocation");
-    FreeInterval new_range{it->second.offset_init, it->second.offset_end};
+    MemoryBlock* occupied_block = ctx_it->second;
+    size_t freed_start = occupied_block->start;
+    size_t freed_end = occupied_block->end;
+    size_t freed_size = freed_end - freed_start;
 
-    auto& fr = seg.free_intervals;
-    auto fr_low = fr.lower_bound(new_range);
+    // Find the occupied block in the set and remove it
+    auto block_it = seg.blocks.find(*occupied_block);
+    if (block_it == seg.blocks.end()) return;
+    seg.blocks.erase(block_it);
 
-    // Merge with previous interval if touching at new_range.start
-    if (fr_low != fr.begin()) {
-      auto prev = std::prev(fr_low);
-      if (prev->end == new_range.start) {
-        new_range.start = prev->start;
-        new_range.end = std::max(prev->end, new_range.end);
-        seg.free_interval_sizes.erase(prev->end - prev->start);
-        fr.erase(prev);
+    // Merge with previous free block if adjacent
+    // 1. find block (as iterator) *at or beyond* the position that was freed
+    // 2. move to pointer to previous block (blocks are ordered by offset)
+    // 3. if selected block is free and adjacent to freed block:
+    //    - move new starting offset at the start of selected block
+    //    - remove selected block size from free_sizes
+    //    - remove selected block from set of all blocks
+    auto freed_pos =
+        seg.blocks.lower_bound(MemoryBlock{freed_start, freed_end, false});
+    if (freed_pos != seg.blocks.begin()) {
+      auto prev_it = std::prev(freed_pos);
+      if (prev_it->is_free && prev_it->end == freed_start) {
+        freed_start = prev_it->start;
+
+        // iterator-based erasure to remove a single value
+        auto prev_size_it = seg.free_sizes.find(prev_it->size());
+        seg.free_sizes.erase(prev_size_it);
+
+        seg.blocks.erase(prev_it);
       }
     }
 
-    // Merge with next interval if touching at new_range.end
-    if (fr_low != fr.end() && fr_low->start == new_range.end) {
-      new_range.end = std::max(fr_low->end, new_range.end);
-      seg.free_interval_sizes.erase(fr_low->end - fr_low->start);
-      fr.erase(fr_low);
+    // Merge with next free block if adjacent
+    // 1. reusing iterator that points to block *at or beyond* the freed one
+    // 2. if selected block is free and adjacent to freed block:
+    //    - move new ending offset at the _start_ of selected block
+    //    - remove selected block size from free_sizes
+    //    - remove selected block from set of all blocks
+    if (freed_pos != seg.blocks.end() && freed_pos->is_free &&
+        freed_pos->start == freed_end) {
+      freed_end = freed_pos->end;
+      auto next_size_it = seg.free_sizes.find(freed_pos->size());
+      seg.free_sizes.erase(next_size_it);
+      seg.blocks.erase(freed_pos);
     }
 
-    fr.insert(new_range);
-    seg.free_interval_sizes.insert(new_range.end - new_range.start);
-    seg.free_size += it->second.offset_end - it->second.offset_init;
-    seg.blocks.erase(it);
+    // Insert the merged free block (with updated start/end)
+    MemoryBlock new_free{freed_start, freed_end, true};
+    seg.blocks.insert(new_free);
+    seg.free_sizes.insert(new_free.size());
+    seg.free_size += freed_size;
+    seg.ctx_to_block.erase(ctx_it);
   }
 
   static void ReportAndDelete(void* ctx_void) {
@@ -689,14 +732,15 @@ struct SpyreAllocator final : public at::Allocator {
     auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
     if (!SpyreAllocator::instance().use_pf) {
       auto& allocator = SpyreAllocator::instance();
+      std::lock_guard<std::mutex> lock(allocator.allocator_mutex);
 
       if (allocator.alloc_debug)
         allocator.logAllSegments("Pre deallocation", true);
 
       // Using lookup map for blocks into segments (O(1))
-      auto seg_it = allocator.block_to_segment.find(ctx_void);
+      auto seg_it = allocator.block_to_segment.find(ctx);
       if (seg_it != allocator.block_to_segment.end()) {
-        allocator.deallocateBlock(*seg_it->second, ctx_void);
+        allocator.deallocateBlock(*seg_it->second, ctx);
         allocator.block_to_segment.erase(seg_it);
       }
 
@@ -707,26 +751,38 @@ struct SpyreAllocator final : public at::Allocator {
     delete ctx;
   }
 
-  void logSegmentState(const SegmentInfo& seg, const char* context,
+  void logSegmentState(const MemorySegment& seg, const char* context,
                        bool include_blocks = false) {
     /* Log free and used memory in the specified Segment. */
 
     DEBUGINFO(context, "seg id", seg.segment_id, "free mem", seg.free_size);
+
     if (include_blocks) {
-      for (const auto& [soc_ptr, block] : seg.blocks)
-        DEBUGINFO("    ctx addr", soc_ptr,
-                  "-> block bounds:", block.offset_init, block.offset_end);
+      // ctx_to_block only tracks *occupied* blocks (via their pointer)
+      // and the corresponding SharedOwnerCtx pointer
+      for (const auto& [soc_ptr, block_ptr] : seg.ctx_to_block) {
+        DEBUGINFO("    occupied block: [", block_ptr->start, ",",
+                  block_ptr->end, ") size:", block_ptr->size(),
+                  "ctx:", soc_ptr);
+      }
+
+      // seg.blocks includes both free and occupied blocks
+      for (const MemoryBlock& block : seg.blocks) {
+        if (block.is_free) {
+          DEBUGINFO("  free block: [", block.start, ",", block.end,
+                    ") size:", block.size());
+        }
+      }
     }
-    for (const size_t& sz : seg.free_interval_sizes) DEBUGINFO("  free sz", sz);
-    for (const FreeInterval& r : seg.free_intervals)
-      DEBUGINFO("  free idx", r.start, "to", r.end);
+
+    for (const size_t& sz : seg.free_sizes) DEBUGINFO("  free sz", sz);
   }
 
   void logAllSegments(const char* context, bool include_blocks = false) {
     /* Log free and used memory of all Segments. */
 
     DEBUGINFO(context);
-    for (const SegmentInfo& seg : segments) {
+    for (const MemorySegment& seg : segments) {
       logSegmentState(seg, "", include_blocks);
     }
   }
@@ -831,7 +887,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   caffe2::TypeMeta dtype = c10::scalarTypeToTypeMeta(scalar_type);
   c10::Device device = device_opt.value_or(
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
-  DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", device);
+  DEBUGINFO("Tensor info on CPU (Size:", size, ", Stride: ", stride,
+            ", dtype: ", dtype, ") to be mapped onto device ", device);
   auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
