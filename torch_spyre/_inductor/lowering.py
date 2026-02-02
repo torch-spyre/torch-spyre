@@ -20,6 +20,7 @@ import torch._inductor.lowering as lowering
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from torch_spyre._C import get_elem_in_stick
+from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
 
 
@@ -54,17 +55,17 @@ def register_spyre_lowering(
 # Implicit fallback to an eager op does not become effective when lowering of
 # the op is registered by default. Here, we unregister ops that are falling back
 # to eager ops
-lowerings_to_exclude = [torch.ops.aten.cos.default, torch.ops.aten.sin.default]
+# Note: If an op has a decomposition defined, a lowering is not registered
+def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=False):
+    for overload in lowering.get_overloads(op):
+        if overload in lowering_dict:
+            del lowering_dict[overload]
+        elif not allow_missing:
+            raise RuntimeError(f"lowering of {overload} is not registered")
 
 
-def unregister_lowering(op, lowering_dict=lowering.lowerings):
-    if op not in lowering_dict:
-        raise RuntimeError(f"lowering of {op} is not registered")
-    del lowering_dict[op]
-
-
-for op in lowerings_to_exclude:
-    unregister_lowering(op)
+for op in fallback_ops:
+    unregister_lowering(op, allow_missing=True)
 
 
 def ensure_default_handler(op_name):
