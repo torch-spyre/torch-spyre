@@ -21,6 +21,7 @@ from torch._inductor.graph import GraphLowering
 
 from .lowering import enable_spyre_lowerings
 
+
 @contextmanager
 def spyre_data_types():
     saved = torch._prims_common._computation_dtype_map

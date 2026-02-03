@@ -29,9 +29,10 @@ from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
 
-# The specific spyre lowerings will be registered into this dictionary 
+# The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
 spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
+
 
 def register_spyre_lowering(
     op,
@@ -84,7 +85,9 @@ def enable_spyre_lowerings():
     try:
         for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
             if spyre_lowering_op in lowering.lowerings:
-                saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[spyre_lowering_op]
+                saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[
+                    spyre_lowering_op
+                ]
             lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
         yield
     except Exception as e:
@@ -94,7 +97,9 @@ def enable_spyre_lowerings():
         # Reset the saved in-tree lowerings if needed
         for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
             if spyre_lowering_op in saved_intree_lowerings:
-                lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[spyre_lowering_op]
+                lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[
+                    spyre_lowering_op
+                ]
             else:
                 lowering.lowerings.pop(spyre_lowering_op, None)
 
