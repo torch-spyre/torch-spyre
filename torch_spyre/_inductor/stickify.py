@@ -50,7 +50,8 @@ def is_sparse(stl: SpyreTensorLayout) -> bool:
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
-    op = pw.get_origin_node().target
+    origin_node = next(iter(pw.origins))
+    op = origin_node.target
     if len(args) == 1:
         x = args[0]
         x_stl = x.layout.device_layout

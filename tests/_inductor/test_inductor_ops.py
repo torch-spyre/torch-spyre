@@ -505,31 +505,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
                 "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
                 "fp32_3d": (cached_randn((8, 16, 256), dtype=torch.float32),),
-                "bool_1d": (
-                    torch.rand(
-                        (128,),
-                    )
-                    > 0.5,
-                ),
-                "bool_2d": (
-                    torch.rand(
-                        (
-                            256,
-                            128,
-                        ),
-                    )
-                    > 0.5,
-                ),
-                "bool_3d": (
-                    torch.rand(
-                        (
-                            8,
-                            16,
-                            256,
-                        ),
-                    )
-                    > 0.5,
-                ),
+                "bool_1d": (torch.rand((128,)) > 0.5,),
+                "bool_2d": (torch.rand((256, 128)) > 0.5,),
+                "bool_3d": (torch.rand((8, 16, 256)) > 0.5,),
             },
         },
         (
@@ -568,14 +546,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_numel_cpu",
         ): {
             "param_sets": {
-                "size_1": {
-                    cached_randn(
-                        (
-                            64,
-                            128,
-                        )
-                    ),
-                },
+                "size_1": (cached_randn((64, 128)),),
             },
         },
         (
@@ -583,22 +554,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_full_cpu",
         ): {
             "param_sets": {
-                "value_1": (
-                    ([64, 128]),
-                    -65472.0,
-                ),
-                "value_2": (
-                    ([64, 128]),
-                    -65504.0,
-                ),
-                "tuple": (
-                    ((64, 64)),
-                    1024.0,
-                ),
-                "size": (
-                    torch.Size([64, 128]),
-                    1024.0,
-                ),
+                "value_1": (([64, 128]), -65472.0),
+                "value_2": (([64, 128]), -65504.0),
+                "tuple": (((64, 64)), 1024.0),
+                "size": (torch.Size([64, 128]), 1024.0),
             },
         },
         (
@@ -694,6 +653,64 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d013": {cached_randn((1, 1, 4, 1), dtype=torch.float16)},
                 "4d023": {cached_randn((1, 3, 1, 1), dtype=torch.float16)},
                 "4d123": {cached_randn((2, 1, 1, 1), dtype=torch.float16)},
+            },
+        },
+        (
+            "test_inplace_op",
+            "test_inplace_op_cpu",
+        ): {
+            "ops_dict": {
+                "add": torch.Tensor.add_,
+                "mul": torch.Tensor.mul_,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.zeros(128, dtype=torch.float16),
+                    cached_randn((128,)),
+                ),
+                "2d": (
+                    torch.zeros(4, 128, dtype=torch.float16),
+                    cached_randn((4, 128)),
+                ),
+                "3d": (
+                    torch.zeros(3, 4, 128, dtype=torch.float16),
+                    cached_randn((3, 4, 128)),
+                ),
+            },
+        },
+        (
+            "test_inplace_copy",
+            "test_inplace_op_cpu",
+        ): {
+            "ops_dict": {
+                "copy": torch.Tensor.copy_,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.zeros(128, dtype=torch.float16),
+                    cached_randn((128,)),
+                ),
+                "2d": (
+                    torch.zeros(4, 128, dtype=torch.float16),
+                    cached_randn((4, 128)),
+                ),
+                "3d": (
+                    torch.zeros(3, 4, 128, dtype=torch.float16),
+                    cached_randn((3, 4, 128)),
+                ),
+                "bool": (
+                    torch.zeros(128, dtype=torch.bool),  # bool tensor
+                    (cached_randn((128,)) > 0),  # bool tensor
+                ),
+                # TODO: Copying bool tensors to host is not working yet. See issue #488.
+                # "float2bool": (
+                #     torch.zeros(128, dtype=torch.bool),  # bool tensor
+                #     (cached_randn((128,)) > 0).to(dtype=torch.float16),  # float tensor
+                # ),
+                "bool2float": (
+                    torch.zeros(128, dtype=torch.float16),  # float tensor
+                    cached_randn((128,)) > 0,  # bool tensor
+                ),
             },
         },
     }
@@ -814,6 +831,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_dropout_functional(self, input, kwargs):
         compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
+
+    def test_inplace_op_cpu(self, op, dst, src):
+        def fn(dst, src):
+            dst = dst.clone()
+            result = op(dst, src)
+            assert id(result) == id(dst)
+            return result
+
+        compare_with_cpu(fn, dst, src)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
