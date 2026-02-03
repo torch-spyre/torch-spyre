@@ -61,7 +61,7 @@ While the PyTorch layout of a tensor may or may not be described in canonical
 form, in the sequel we always assume it is, implicitly canonicalizing the
 PyTorch layout if necessary.
 
-A Spyre tensor layout consists of a _device\_size_ vector and a _dim\_map_
+A Spyre tensor layout consists of a _device\_size_ vector, a _dim\_map_
 vector with the same number of elements called _device\_rank_.
 
 The device_rank is always greater than or equal to the rank of the
@@ -113,6 +113,22 @@ be used for a PyTorch tensor of size `[100, 200, 500]` in which case coordinates
 in the Spyre tensor layout that do not map to valid coordinates in the PyTorch
 tensor layout represent padding.
 
-## Default Spyre Tensor Layouts
+## Access patterns
+
+- Dividing tensor access across cores
+
+## Default Layouts and Layout Compatibility
+
+- Default layouts for input tensors
+- Operation validation and layouts for computed tensors
+
+## Generating DCIs and SuperDSCs
 
 TODO
+
+## Future Extensions
+
+- Gaps
+- Multiple stick dimensions
+- Multiple memory spaces
+- RoPE
