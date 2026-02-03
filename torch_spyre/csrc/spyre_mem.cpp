@@ -75,7 +75,7 @@ auto get_dim_cpu_stride(int dim, int stick_size,
                         std::vector<int32_t> dev_dim_order,
                         std::vector<int64_t> cpu_strides) {
   int cpu_stride;
-  if (dim == dev_dim_order.front()) {  // stick_dim
+  if (dim == dev_dim_order.back()) {  // stick_dim
     cpu_stride = stick_size;
   } else {
     cpu_stride = cpu_strides[dim];
@@ -92,13 +92,14 @@ auto get_dim_cpu_stride(int dim, int stick_size,
  * @param dev_shape: shape of tensor on device
  * @return device stride of the dimension
  */
-auto get_dim_device_stride(int dim, int stick_size, SpyreTensorLayout stl,
+auto get_dim_device_stride(int dim, int stick_size,
+                           std::vector<int64_t> dev_size,
                            std::vector<int64_t> dev_strides) {
   int dev_stride;
   if (dev_strides.size() == 1) {
     dev_stride = stick_size;
   } else {
-    dev_stride = dev_strides.back() * stl.device_size[dev_strides.size() - 1];
+    dev_stride = dev_strides.back() * dev_size[dev_strides.size() - 1];
   }
   return dev_stride;
 }
@@ -109,41 +110,44 @@ auto get_dim_device_stride(int dim, int stick_size, SpyreTensorLayout stl,
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
  * @param stick_size: stick length for the dtype
+ * @param device_sizes: dimesion sizes of dev tensor
  * @param host2device: direction of data conversion
  * @return description of data conversion
  */
 auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                             SpyreTensorLayout stl, int stick_size,
-                            bool host2device) -> DataConversionStrideInfo {
+                            std::vector<int64_t> device_sizes, bool host2device)
+    -> DataConversionStrideInfo {
   DataConversionStrideInfo stride_info;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
 
   // sparse tensors need no padding of the stick dimension
-  bool sparse = stl.dim_map.front() >= cpu_shape.size();
+  bool sparse = stl.dim_map.back() >= cpu_shape.size();
   bool requires_padding =
-      !sparse && cpu_shape[stl.dim_map.front()] % stick_size != 0;
+      !sparse && cpu_shape[stl.dim_map.back()] % stick_size != 0;
   bool size_less_than_stick =
-      !sparse && cpu_shape[stl.dim_map.front()] < stick_size;
+      !sparse && cpu_shape[stl.dim_map.back()] < stick_size;
 
-  stride_info.size_ = stl.device_size;
+  stride_info.size_ = device_sizes;
+
   if (size_less_than_stick) {
-    stride_info.size_[0] = cpu_shape[stl.dim_map.front()];
+    stride_info.size_[0] = cpu_shape[stl.dim_map.back()];
   }
   stride_info.stride_src_.push_back(1);
   stride_info.stride_dst_.push_back(1);
 
   for (int i = 1; i < stl.dim_map.size(); i++) {
-    auto& dim = stl.dim_map[i];
+    auto& dim = stl.dim_map[(stl.dim_map.size() - 1) - i];
     auto cpu_stride =
         get_dim_cpu_stride(dim, stick_size, stl.dim_map, cpu_strides);
     auto dev_stride = get_dim_device_stride(
-        dim, stick_size, stl,
+        dim, stick_size, device_sizes,
         host2device ? stride_info.stride_dst_ : stride_info.stride_src_);
 
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
-    if (dim == stl.dim_map.front() && requires_padding &&
+    if (dim == stl.dim_map.back() && requires_padding &&
         !size_less_than_stick) {  // stick_dim
       stride_info.size_[i] -= 1;
     }
@@ -182,27 +186,27 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
  * @param dev_shape: shape of tensor on device
- * @param stick_size: stick length for the dtype
  * @param host2device: direction of data conversion
  * @return descriptions of data conversions for the tensor
  */
 auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                             SpyreTensorLayout stl, int stick_size,
-                             bool host2device)
+                             SpyreTensorLayout stl,
+                             std::vector<int64_t> dev_shape, bool host2device)
     -> std::vector<DataConversionStrideInfo> {
   std::vector<DataConversionStrideInfo> dcsi;
   auto cpu_shape = sizes.vec();
+  int stick_size = stl.elems_per_stick();
 
   // sparse tensors need no padding of the stick dimension
-  bool sparse = stl.dim_map.front() >= cpu_shape.size();
+  bool sparse = stl.dim_map.back() >= cpu_shape.size();
   bool requires_padding =
-      !sparse && cpu_shape[stl.dim_map.front()] % stick_size != 0;
+      !sparse && cpu_shape[stl.dim_map.back()] % stick_size != 0;
   bool size_less_than_stick =
-      !sparse && cpu_shape[stl.dim_map.front()] < stick_size;
+      !sparse && cpu_shape[stl.dim_map.back()] < stick_size;
   DataConversionStrideInfo stride_info;
 
-  stride_info =
-      get_device_stride_info(sizes, strides, stl, stick_size, host2device);
+  stride_info = get_device_stride_info(sizes, strides, stl, stick_size,
+                                       dev_shape, host2device);
   dcsi.push_back(stride_info);
 
   if (requires_padding && !size_less_than_stick) {
@@ -216,13 +220,13 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
     // Update host and device offsets
     for (int i = 1; i < stl.dim_map.size(); i++) {
-      auto& dim = stl.dim_map[i];
+      auto& dim = stl.dim_map[(stl.dim_map.size() - 1) - i];
       dev_offset *= pad_stride_info.size_[i];
-      if (dim == stl.dim_map.front()) {
+      if (dim == stl.dim_map.back()) {
         cpu_offset *= pad_stride_info.size_[i];
         // Stick dimension is the size of the remainder of cpu_shape/stick_size
         pad_stride_info.size_[i] = 1;
-        pad_stride_info.size_[0] = cpu_shape[stl.dim_map.front()] % stick_size;
+        pad_stride_info.size_[0] = cpu_shape[stl.dim_map.back()] % stick_size;
         break;
       }
     }
@@ -257,13 +261,14 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
   dci.dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
   // Reverse PyTorch ordering
-  std::reverse(stl.device_size.begin(), stl.device_size.end());
-  std::reverse(stl.dim_map.begin(), stl.dim_map.end());
+  auto dev_shape = stl.device_size;
   std::reverse(cpu_shape.begin(), cpu_shape.end());
+  std::reverse(dev_shape.begin(), dev_shape.end());
   dci.dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(), stl,
-                                      stl.elems_per_stick(), host2device);
-  dci.input_shape_ = host2device ? cpu_shape : stl.device_size;
-  dci.output_shape_ = host2device ? stl.device_size : cpu_shape;
+                                      dev_shape, host2device);
+
+  dci.input_shape_ = host2device ? cpu_shape : dev_shape;
+  dci.output_shape_ = host2device ? dev_shape : cpu_shape;
   dci.exportJson(s);
   DEBUGINFO("DataConversionInfo: ", s.str());
   return s.str();
