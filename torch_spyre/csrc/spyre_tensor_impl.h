@@ -34,7 +34,6 @@ class SpyreTensorLayout {
   enum StickFormat {
     Dense = 0,
     Sparse,
-    SparseMulti,
   };
 
   /**
@@ -51,7 +50,6 @@ class SpyreTensorLayout {
    * appear once.
    */
   std::vector<int32_t> dim_map;
-  int32_t num_stick_dims;
   StickFormat format;
   DataFormats device_dtype;
 
@@ -78,11 +76,10 @@ class SpyreTensorLayout {
   }
 
   SpyreTensorLayout(std::vector<int64_t> device_size,
-                    std::vector<int32_t> dim_map, int32_t num_stick_dims,
-                    StickFormat format, DataFormats device_dtype)
+                    std::vector<int32_t> dim_map, StickFormat format,
+                    DataFormats device_dtype)
       : device_size(device_size),
         dim_map(dim_map),
-        num_stick_dims(num_stick_dims),
         format(format),
         device_dtype(device_dtype) {}
 
@@ -105,6 +102,11 @@ class SpyreTensorLayout {
   std::vector<int64_t> device_strides();
 
   /**
+   * Return the number of dimensions that are in a stick.
+   */
+  int32_t num_stick_dims();
+
+  /**
    * Return the host_dim_order that can be used as an argument to
    * SpyreTensorLayout::init to create a new SpyreTensorLayout that
    * will have the same dim_map as this SpyreTensorLayout.
@@ -117,9 +119,7 @@ class SpyreTensorLayout {
 
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
-           this->dim_map == other.dim_map &&
-           this->num_stick_dims == other.num_stick_dims &&
-           this->format == other.format &&
+           this->dim_map == other.dim_map && this->format == other.format &&
            this->device_dtype == other.device_dtype;
   }
 };

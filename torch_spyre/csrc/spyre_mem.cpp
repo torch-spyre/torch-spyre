@@ -118,8 +118,13 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   DataConversionStrideInfo stride_info;
   auto cpu_shape = sizes.vec();
   auto cpu_strides = strides.vec();
-  bool size_less_than_stick = cpu_shape[stl.dim_map.front()] < stick_size;
-  bool requires_padding = cpu_shape[stl.dim_map.front()] % stick_size != 0;
+
+  // sparse tensors need no padding of the stick dimension
+  bool sparse = stl.dim_map.front() >= cpu_shape.size();
+  bool requires_padding =
+      !sparse && cpu_shape[stl.dim_map.front()] % stick_size != 0;
+  bool size_less_than_stick =
+      !sparse && cpu_shape[stl.dim_map.front()] < stick_size;
 
   stride_info.size_ = stl.device_size;
   if (size_less_than_stick) {
@@ -145,6 +150,12 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   }
   stride_info.offset_src_ = 0;
   stride_info.offset_dst_ = 0;
+
+  // pull single value from stick if sparse tensor
+  if (sparse) {
+    stride_info.size_[0] = 1;
+  }
+
   return stride_info;
 }
 /*
@@ -181,8 +192,13 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     -> std::vector<DataConversionStrideInfo> {
   std::vector<DataConversionStrideInfo> dcsi;
   auto cpu_shape = sizes.vec();
-  bool requires_padding = cpu_shape[stl.dim_map.front()] % stick_size != 0;
-  bool size_less_than_stick = cpu_shape[stl.dim_map.front()] < stick_size;
+
+  // sparse tensors need no padding of the stick dimension
+  bool sparse = stl.dim_map.front() >= cpu_shape.size();
+  bool requires_padding =
+      !sparse && cpu_shape[stl.dim_map.front()] % stick_size != 0;
+  bool size_less_than_stick =
+      !sparse && cpu_shape[stl.dim_map.front()] < stick_size;
   DataConversionStrideInfo stride_info;
 
   stride_info =
