@@ -15,7 +15,7 @@ informally referred to as sizes and strides as a shorthand for per-dimension
 sizes and strides.
 
 The stride vector makes it possible to map a tuple of rank coordinates to an
-offset, hence to order the tensor elements in 1d contiguous memory space.
+offset, hence to order the tensor elements in a 1d contiguous memory space.
 
 ```
 offset = lambda coordinates : np.dot(coordinates, stride)
@@ -49,8 +49,9 @@ A number of operations on Spyre produce _sparse_ tensors, i.e., tensors with a
 single element per 128-byte _stick_ of tensor data. In order to describe sparse
 tensor layouts we permit Spyre tensor layouts to optionally include a single
 synthetic dimension that does not correspond to any dimension of the PyTorch
-layout. This synthetic dimension associated with a stride equal to the number of
-elements per stick will ensure that the sparse tensor has a single element per
+layout. This synthetic inner dimension associated with a size equal to the
+maximal number of elements per stick for the tensor data type will ensure that
+the sparse tensor has a single element of the corresponding PyTorch tensor per
 stick.
 
 ## Spyre Tensor Layouts
@@ -81,8 +82,8 @@ stride[i] = math.prod(size[i+1:device_rank])
 For now a Spyre tensor layout has a unique _stick dimension_, which is dimension
 device_rank-1. Elements in an 128-byte-aligned 128-byte _stick_ of tensor data
 (in a 128-byte-aligned tensor) share the same coordinates for dimensions 0 to
-device_rank-2. The device_size of the stick dimension is always the number of
-element per stick (for the tensor data type).
+device_rank-2. The device_size of the stick dimension is always the maximal
+number of element per stick for the tensor data type.
 
 The dim_map vector maps the dimensions in the Spyre tensor layout to the
 dimensions in the PyTorch tensor layout. The elements of this vector are
@@ -97,12 +98,21 @@ tensor of size `[128, 256, 512]`, a dim_map `[1, 2, 0, 2]` and device_size
 `[256, 8, 128, 64]` specifies that dimension 2 of the PyTorch tensor is tiled
 with dimension 0, whereas dimension 1 of the PyTorch tensor becomes the
 outermost dimension of the Spyre tensor layout. The element with coordinates
-`(a, b, c, d)` in the Spyre tensor maps to element `(c, a, b*64 + d)`.
+`(a, b, c, d)` in the Spyre tensor corresponds to the PyTorch element `(c, a,
+b*64 + d)`. The coordinates of a tiled dimension are always combined into a
+PyTorch coordinate with strides increasing right-to-left akin to the implicit
+strides of the whole Spyre tensor layout.
+
+The stride of the PyTorch layout does not play a role when mapping Spyre
+coordinates to PyTorch coordinates but of course it matters to mapping the
+PyTorch coordinates to an offset from the base address of the PyTorch tensor.
 
 Dimensions in device_size may be padded. For example the previous Spyre tensor
-layout with `[1, 2, 0, 2]` and device_size `[256, 8, 128, 64]` may also be used
-for a PyTorch tensor of size `[100, 200, 500]` in which case coordinates in the
-Spyre tensor layout that do not map to valid coordinates in the PyTorch tensor
-layout represent padding.
+layout with dim_map `[1, 2, 0, 2]` and device_size `[256, 8, 128, 64]` may also
+be used for a PyTorch tensor of size `[100, 200, 500]` in which case coordinates
+in the Spyre tensor layout that do not map to valid coordinates in the PyTorch
+tensor layout represent padding.
 
 ## Default Spyre Tensor Layouts
+
+TODO
