@@ -58,8 +58,17 @@ auto get_generic_stick_layout(int rank, std::vector<int32_t> host_dim_order)
                  host_dim_order[2]};
       break;
     case 4:
-      dim_map = {host_dim_order[0], host_dim_order[3], host_dim_order[1],
-                 host_dim_order[2], host_dim_order[3]};
+      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
+                 host_dim_order[0], host_dim_order[3]};
+      break;
+    case 5:
+      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
+                 host_dim_order[4], host_dim_order[0], host_dim_order[4]};
+      break;
+    case 6:
+      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
+                 host_dim_order[4], host_dim_order[5], host_dim_order[0],
+                 host_dim_order[5]};
       break;
     default:
       std::stringstream ss;
@@ -85,8 +94,16 @@ std::vector<int32_t> SpyreTensorLayout::host_dim_order() {
       host_dim_order = {this->dim_map[2], this->dim_map[0], this->dim_map[3]};
       break;
     case 4:
-      host_dim_order = {this->dim_map[0], this->dim_map[2], this->dim_map[3],
+      host_dim_order = {this->dim_map[3], this->dim_map[0], this->dim_map[1],
                         this->dim_map[4]};
+      break;
+    case 5:
+      host_dim_order = {this->dim_map[4], this->dim_map[0], this->dim_map[1],
+                        this->dim_map[2], this->dim_map[5]};
+      break;
+    case 6:
+      host_dim_order = {this->dim_map[5], this->dim_map[0], this->dim_map[1],
+                        this->dim_map[2], this->dim_map[3], this->dim_map[6]};
       break;
     default:
       std::stringstream ss;

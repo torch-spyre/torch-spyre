@@ -322,6 +322,7 @@ def create_kernel_spec(
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
+    wildcard = sympy.Symbol("*")
 
     def __init__(
         self,
@@ -573,7 +574,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         Return the scale implied by the given iteration space and indexing expression
         """
-        return [1 if di.var in index.free_symbols else -1 for di in op_dimensions]
+        return [
+            1 if (di.var == self.wildcard) or (di.var in index.free_symbols) else -1
+            for di in op_dimensions
+        ]
 
     def analyze_index_expr(self, index: sympy.Expr) -> list[DimensionInfo]:
         """
@@ -583,11 +587,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         ordered_strides: Sequence[tuple[sympy.Symbol, sympy.Expr]] = sorted(
             strides.items(), key=lambda item: item[1], reverse=True
         )
-        result = []
         var_ranges = self.var_ranges()
-        for v, _ in ordered_strides:
-            result.append(DimensionInfo(v, int(var_ranges[v])))
-        return result
+        if var_ranges:
+            result = []
+            for v, _ in ordered_strides:
+                result.append(DimensionInfo(v, int(var_ranges[v])))
+            return result
+        else:
+            return [DimensionInfo(self.wildcard, 1)]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its KernelSpec"""
