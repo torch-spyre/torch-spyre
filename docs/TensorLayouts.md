@@ -79,7 +79,7 @@ in the implicit stride vector are always decreasing obtained by formula:
 stride[i] = math.prod(size[i+1:device_rank])
 ```
 
-For now a Spyre tensor layout has a unique _stick dimension_, which is dimension
+For now a Spyre tensor layout has a unique _stick dimension_, which is always dimension
 device_rank-1. Elements in an 128-byte-aligned 128-byte _stick_ of tensor data
 (in a 128-byte-aligned tensor) share the same coordinates for dimensions 0 to
 device_rank-2. The device_size of the stick dimension is always the maximal
