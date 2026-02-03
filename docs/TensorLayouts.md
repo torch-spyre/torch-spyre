@@ -28,11 +28,13 @@ tensors. Because of this limitation we introduce Spyre tensor layouts with
 higher ranks than their PyTorch counterparts. Intuitively by breaking PyTorch
 dimensions into pieces, we can build tiles and tensors from these tiles.
 
-While strides make it possible to express padding in input tensors, computed
-tensors typically are not padded, irrespective of input padding. Because of this
-limitation we introduce padded sizes in Spyre tensor layouts maintained
+While strides make it possible to express padding in PyTorch tensor layouts,
+because Spyre tensor layouts have more dimensions, we need more dimensions of
+padding. Therefore, we introduce padded sizes in Spyre tensor layouts maintained
 separately from Pytorch sizes. Since PyTorch already maintains sizes, we only
-include padded sizes in a Spyre tensor layout.
+include padded sizes in a Spyre tensor layout. While we could work with strides
+instead, we find it easier to reason about padded sizes and order of dimensions
+separately rather than combining them into strides.
 
 PyTorch eliminates tensor dimensions with per-dimension size 1 whenever
 possible, for instance replacing layout `(size=[512, 1, 256], stride=[256, 256,
@@ -61,8 +63,8 @@ While the PyTorch layout of a tensor may or may not be described in canonical
 form, in the sequel we always assume it is, implicitly canonicalizing the
 PyTorch layout if necessary.
 
-A Spyre tensor layout consists of a _device\_size_ vector, a _dim\_map_
-vector with the same number of elements called _device\_rank_.
+A Spyre tensor layout consists of a _device\_size_ vector, a _dim\_map_ vector
+with the same number of elements called _device\_rank_.
 
 The device_rank is always greater than or equal to the rank of the
 (canonicalized) PyTorch tensor layout.
@@ -79,11 +81,11 @@ in the implicit stride vector are always decreasing obtained by formula:
 stride[i] = math.prod(size[i+1:device_rank])
 ```
 
-For now a Spyre tensor layout has a unique _stick dimension_, which is always dimension
-device_rank-1. Elements in an 128-byte-aligned 128-byte _stick_ of tensor data
-(in a 128-byte-aligned tensor) share the same coordinates for dimensions 0 to
-device_rank-2. The device_size of the stick dimension is always the maximal
-number of element per stick for the tensor data type.
+For now a Spyre tensor layout has a unique _stick dimension_, which is always
+dimension device_rank-1. Elements in an 128-byte-aligned 128-byte _stick_ of
+tensor data (in a 128-byte-aligned tensor) share the same coordinates for
+dimensions 0 to device_rank-2. The device_size of the stick dimension is always
+the maximal number of element per stick for the tensor data type.
 
 The dim_map vector maps the dimensions in the Spyre tensor layout back to the
 dimensions in the PyTorch tensor layout. The elements of this vector are
@@ -97,11 +99,11 @@ Repeated dimensions in dim_map encode tiling. For example, for a 3d PyTorch
 tensor of size `[128, 256, 512]`, a dim_map `[1, 2, 0, 2]` and device_size
 `[256, 8, 128, 64]` specifies that dimension 2 of the PyTorch tensor is tiled
 with dimension 0, whereas dimension 1 of the PyTorch tensor becomes the
-outermost dimension of the Spyre tensor layout. In this example, the element with coordinates
-`(a, b, c, d)` in the Spyre tensor corresponds to the PyTorch element `(c, a,
-b*64 + d)`. The coordinates of a tiled dimension are always combined into a
-PyTorch coordinate with strides increasing right-to-left akin to the implicit
-strides of the whole Spyre tensor layout.
+outermost dimension of the Spyre tensor layout. In this example, the element
+with coordinates `(a, b, c, d)` in the Spyre tensor corresponds to the PyTorch
+element `(c, a, b*64 + d)`. The coordinates of a tiled dimension are always
+combined into a PyTorch coordinate with strides increasing right-to-left akin to
+the implicit strides of the whole Spyre tensor layout.
 
 The stride of the PyTorch layout does not play a role when mapping Spyre
 coordinates to PyTorch coordinates but of course it matters to mapping the
