@@ -224,9 +224,9 @@ std::string SpyreTensorLayout::toString() const {
   }
   ss << "], ";
   if (this->format == StickFormat::Dense) {
-    ss << ", format=StickFormat.Dense, ";
+    ss << "format=StickFormat.Dense, ";
   } else {
-    ss << ", format=StickFormat.Sparse, ";
+    ss << "format=StickFormat.Sparse, ";
   }
   ss << "device_dtype=DataFormats."
      << EnumsConversion::dataFormatsToString(this->device_dtype);
