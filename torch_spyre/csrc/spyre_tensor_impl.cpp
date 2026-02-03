@@ -137,7 +137,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->device_size.resize(1);
     this->dim_map.resize(1);
     this->format = Dense;
-    this->num_stick_dims = 1;
     this->device_size[0] = this->elems_per_stick();
     this->dim_map[0] = 0;  // host_size has no entries!
 
@@ -154,7 +153,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   this->device_size.resize(device_dims);
   this->dim_map = spyre::get_generic_stick_layout(host_size.size(), dim_order);
   this->format = format;
-  this->num_stick_dims = 1;
 
   // Stick dim
   auto stick_dim = this->dim_map[this->dim_map.size() - 1];
@@ -197,6 +195,16 @@ std::vector<int64_t> SpyreTensorLayout::device_strides() {
   return strides;
 }
 
+int32_t SpyreTensorLayout::num_stick_dims() {
+  int32_t num_stick_dims = 0;
+  int64_t stick_elems = 1;
+  auto device_rank = this->device_size.size();
+  for (; stick_elems < this->elems_per_stick(); num_stick_dims++) {
+    stick_elems *= this->device_size[device_rank - 1 - num_stick_dims];
+  }
+  return num_stick_dims;
+}
+
 std::string SpyreTensorLayout::toString() const {
   std::stringstream ss;
   ss << "SpyreTensorLayout(";
@@ -214,12 +222,11 @@ std::string SpyreTensorLayout::toString() const {
       ss << ", ";
     }
   }
-  ss << "], num_stick_dims=";
-  ss << this->num_stick_dims;
+  ss << "], ";
   if (this->format == StickFormat::Dense) {
-    ss << ", format=StickFormat.Dense, ";
+    ss << "format=StickFormat.Dense, ";
   } else {
-    ss << ", format=StickFormat.Sparse, ";
+    ss << "format=StickFormat.Sparse, ";
   }
   ss << "device_dtype=DataFormats."
      << EnumsConversion::dataFormatsToString(this->device_dtype);

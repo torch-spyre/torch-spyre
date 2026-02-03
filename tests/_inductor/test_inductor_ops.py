@@ -235,10 +235,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
-                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                "2d_dim_1": (1, cached_randn((67, 256))),  #  sparse tensor output
                 # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256))),
-                # "3d_dim_2": (2, cached_randn((67, 71, 256))), # sparse tensor output
+                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -259,11 +259,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
-                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
                 # "2d_dim_01": ([0, 1], cached_randn((67, 256))), # spyre scalar represented as 1d instead of 0d
                 # "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.01)),
-                # "3d_dim_2": (2, cached_randn((67, 71, 256), scale=0.01)), # sparse tensor output
+                "3d_dim_2": (
+                    2,
+                    cached_randn((67, 71, 256), scale=0.01),
+                ),  # sparse tensor output
                 "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
                 # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)), # spyre scalar represented as 1d instead of 0d
             },
