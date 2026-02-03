@@ -34,7 +34,6 @@ class SpyreTensorLayout {
   enum StickFormat {
     Dense = 0,
     Sparse,
-    SparseMulti,
   };
 
   /**

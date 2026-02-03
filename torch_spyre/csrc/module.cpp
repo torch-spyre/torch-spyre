@@ -284,8 +284,7 @@ PYBIND11_MODULE(_C, m) {
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
       .value("Dense", spyre::SpyreTensorLayout::StickFormat::Dense)
-      .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse)
-      .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
+      .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse);
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)

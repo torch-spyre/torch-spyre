@@ -219,7 +219,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.size,
             output.dtype,
             x_stl.host_dim_order(),
-            StickFormat.SparseMulti,
+            StickFormat.Sparse,
         )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
