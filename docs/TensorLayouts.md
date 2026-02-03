@@ -85,7 +85,7 @@ device_rank-1. Elements in an 128-byte-aligned 128-byte _stick_ of tensor data
 device_rank-2. The device_size of the stick dimension is always the maximal
 number of element per stick for the tensor data type.
 
-The dim_map vector maps the dimensions in the Spyre tensor layout to the
+The dim_map vector maps the dimensions in the Spyre tensor layout back to the
 dimensions in the PyTorch tensor layout. The elements of this vector are
 integers in the range `range(rank+1)` where elements in range `range(rank)`
 represent dimensions of the PyTorch tensor layout and `rank` if present
