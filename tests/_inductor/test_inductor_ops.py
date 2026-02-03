@@ -451,6 +451,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {
                 "silu": torch.nn.functional.silu,
+                "sigmoid": torch.sigmoid,
             },
             "param_sets": {
                 "fp16": (
