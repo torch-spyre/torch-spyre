@@ -22,11 +22,8 @@
 #      If both conditions hold, no further action is needed.
 #
 #    - If some sub-ops cannot compile or fall back to CPU:
-#        * Option A: Disable the default decomposition and proceed to Step 2.
+#        * Option A: Proceed to Step 2.
 #        * Option B: Repeat Step 1 for each unsupported sub-op.
-#
-#    To disable a decomposition, unregister it in:
-#        torch_spyre/_inductor/preload.py
 #
 #    Example:
 #      aten.arange decomposes into prims.iota, which only supports integer
@@ -34,22 +31,14 @@
 #      fully support yet. In this case, disable the default decomposition.
 #      See: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_refs/__init__.py#L5124-L5222
 #
-# Step 2. If the operator has a default lowering, unregister it in:
-#        torch_spyre/_inductor/lowering.py
-#
-#    Notes:
-#      - If a default lowering exists, implicit fallback will not apply.
-#        Disabling the lowering ensures the fallback kernel is used.
-#      - Operators with a default decomposition may not have a lowering.
-#
-# Step 3. Define an eager CPU fallback in: torch_spyre/fallbacks.py
+# Step 2. Define an eager CPU fallback in: torch_spyre/fallbacks.py
 #
 #    Example:
-#    @register_fallback(["aten::sin", "aten::sin.out"])
+#    @register_fallback([aten.sin.default, aten.sin.out])
 #    def spyre__sin(input, **kwargs):
 #        return torch.sin(input, **kwargs)
 #
-#    Note: You can identify the ATen operator schema name (e.g., aten::sin) by:
+#    Note: You can identify the ATen operator name (e.g., aten.sin.default) by:
 #      * torch.ops.aten.sin.overloads() # lists overloads like ['default', 'out']
 #      * torch.ops.aten.sin.default     # OpOverload object for 'default'
 #      * torch.ops.aten.sin._schema     # shows the dispatcher schema
@@ -57,8 +46,13 @@
 
 import functools
 import os
-import torch
 import warnings
+
+import torch
+
+aten = torch._ops.ops.aten
+
+fallback_ops = list()
 
 
 class FallbackWarning(UserWarning):
@@ -194,6 +188,8 @@ def register_fallback(ops, device="cpu"):
                 warn_fallback(op, fallback_device)
                 return _fallback(fn, *args, **kwargs)
 
+            fallback_ops.append(op)
+
             torch.library.register_kernel(op, ["spyre"])(_wrapped)
         return fn
 
@@ -203,22 +199,22 @@ def register_fallback(ops, device="cpu"):
 #  CPU-fallback eager operators
 
 
-@register_fallback(["aten::arange", "aten::arange.start", "aten::arange.start_step"])
+@register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
 def spyre__arange(*args, **kwargs):
     return torch.arange(*args, **kwargs)
 
 
-@register_fallback(["aten::arange.out", "aten::arange.start_out"])
+@register_fallback([aten.arange.out, aten.arange.start_out])
 def spyre__arange_out(*args, out, **kwargs):
     kwargs.update({"device": "cpu", "dtype": out.dtype, "layout": out.layout})
     return torch.arange(*args, **kwargs)
 
 
-@register_fallback(["aten::sin", "aten::sin.out"])
+@register_fallback([aten.sin.default, aten.sin.out])
 def spyre__sin(input, **kwargs):
     return torch.sin(input, **kwargs)
 
 
-@register_fallback(["aten::cos", "aten::cos.out"])
+@register_fallback([aten.cos.default, aten.cos.out])
 def spyre__cos(input, **kwargs):
     return torch.cos(input, **kwargs)

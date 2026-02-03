@@ -72,7 +72,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             return
 
     device_size = output.device_layout.device_size
-    split_idx = -2 if len(device_size) == 2 else -3  # split along stick dim
+    split_idx = -3 if len(device_size) == 4 else 0  # split along stick dim
     num_cores = core_split(device_size[split_idx], max_cores)
     if num_cores > 1:
         for cd in n.spyre_core_division:

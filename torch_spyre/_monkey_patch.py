@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from typing import Optional
-from torch_spyre._C import get_spyre_tensor_layout
+from torch_spyre._C import get_spyre_tensor_layout, to_with_layout, empty_with_layout
 from torch_spyre._C import SpyreTensorLayout
 
 
@@ -24,6 +24,8 @@ def _patch_tensor_for_spyre():
         return
 
     orig_repr = torch.Tensor.__repr__
+    orig_to = torch.Tensor.to
+    orig_empty = torch.empty
 
     def spyre_aware_repr(self):
         dev = getattr(self, "device", None)
@@ -54,6 +56,45 @@ def _patch_tensor_for_spyre():
         else:
             return None
 
+    def spyre_to(self, *args, device_layout=None, **kwargs):
+        if (
+            device_layout is None
+        ):  # use original implementation if no layout is provided
+            return orig_to(self, *args, **kwargs)
+        else:
+            return to_with_layout(self, device_layout)
+
+    def spyre_empty(
+        *args,
+        device_layout=None,
+        out=None,
+        dtype=None,
+        layout=torch.strided,
+        device=None,
+        requires_grad=False,
+        pin_memory=False,
+        memory_format=torch.contiguous_format,
+    ):
+        if (
+            device_layout is None
+        ):  # use original implementation if no layout is provided
+            return orig_empty(
+                *args,
+                out=out,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                requires_grad=requires_grad,
+                pin_memory=pin_memory,
+                memory_format=memory_format,
+            )
+        else:
+            return empty_with_layout(
+                *args, device_layout, dtype, None, device, pin_memory, memory_format
+            )
+
     torch.Tensor.__repr__ = spyre_aware_repr
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True
+    torch.Tensor.to = spyre_to
+    torch.empty = spyre_empty

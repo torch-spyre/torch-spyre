@@ -656,35 +656,35 @@ def generate_transpose_4d_stick(
                                 "pdsName_": "pds0",
                                 "wordLength": 2,
                                 "dataformat": "SEN169_FP16",
-                                "layoutDimOrder_": ["mb", "x", "out", "y"],
+                                "layoutDimOrder_": ["mb", "out", "x", "y"],
                                 "stickDimOrder_": ["out"],
                                 "dimToLayoutSize_": {
-                                    "mb": dimensions[2],
+                                    "mb": dimensions[0],
                                     "out": dimensions[-1],
                                     "x": dimensions[1],
-                                    "y": dimensions[0],
+                                    "y": dimensions[2],
                                 },
                                 "dimToStickSize_": {"out": 64},
                                 "validGap_": {
-                                    "mb": [[dimensions[2], 0]],
+                                    "mb": [[dimensions[0], 0]],
                                     "out": [[dimensions[-1], 0]],
                                     "x": [[dimensions[1], 0]],
-                                    "y": [[dimensions[0], 0]],
+                                    "y": [[dimensions[2], 0]],
                                 },
                                 "PieceInfo": [
                                     {
                                         "key_": "p0",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -704,16 +704,16 @@ def generate_transpose_4d_stick(
                                     {
                                         "key_": "p1",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -735,35 +735,35 @@ def generate_transpose_4d_stick(
                                 "pdsName_": "pds0",
                                 "wordLength": 2,
                                 "dataformat": "SEN169_FP16",
-                                "layoutDimOrder_": ["mb", "x", "y", "out"],
-                                "stickDimOrder_": ["y"],
+                                "layoutDimOrder_": ["out", "mb", "x", "y"],
+                                "stickDimOrder_": ["mb"],
                                 "dimToLayoutSize_": {
-                                    "mb": dimensions[2],
+                                    "mb": dimensions[0],
                                     "out": dimensions[-1],
                                     "x": dimensions[1],
-                                    "y": dimensions[0],
+                                    "y": dimensions[2],
                                 },
-                                "dimToStickSize_": {"y": 64},
+                                "dimToStickSize_": {"mb": 64},
                                 "validGap_": {
-                                    "mb": [[dimensions[2], 0]],
+                                    "mb": [[dimensions[0], 0]],
                                     "out": [[dimensions[-1], 0]],
                                     "x": [[dimensions[1], 0]],
-                                    "y": [[dimensions[0], 0]],
+                                    "y": [[dimensions[2], 0]],
                                 },
                                 "PieceInfo": [
                                     {
                                         "key_": "p0",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -783,16 +783,16 @@ def generate_transpose_4d_stick(
                                     {
                                         "key_": "p1",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -816,42 +816,44 @@ def generate_transpose_4d_stick(
                             "coreIDtoANInfo": {
                                 "0": {
                                     "loopCount": {
-                                        "out": dimensions[-1] // 64,
-                                        "mb": dimensions[2],
+                                        "out": dimensions[0] // 64,
+                                        "mb": dimensions[-1] // 64,
                                         "x": dimensions[1],
-                                        "y": dimensions[0] // 64
-                                        if transpose_0_3
-                                        else dimensions[0],
+                                        "y": dimensions[2],
                                     },
                                     "loopCountL3SU": {
-                                        "out": dimensions[-1] // 64,
-                                        "mb": dimensions[2],
+                                        "out": dimensions[0] // 64,
+                                        "mb": dimensions[-1] // 64,
                                         "x": dimensions[1],
-                                        "y": dimensions[0] // 64
-                                        if transpose_0_3
-                                        else dimensions[0],
+                                        "y": dimensions[2],
                                     },
                                     "addr_info_": {
                                         "l3lu": {
                                             "type_": "stride",
                                             "offset_": {
-                                                "mb": 1,
-                                                "out": dimensions[2] * dimensions[1],
-                                                "y": dimensions[2]
+                                                "mb": dimensions[0],
+                                                "out": 64,
+                                                "y": dimensions[0]
                                                 * dimensions[1]
-                                                * dimensions[-1],
-                                                "x": dimensions[2],
+                                                * dimensions[-1]
+                                                // 64,
+                                                "x": dimensions[-1]
+                                                * dimensions[0]
+                                                // 64,
                                             },
                                         },
                                         "l3su": {
                                             "type_": "stride",
                                             "offset_": {
-                                                "mb": 1,
-                                                "out": dimensions[0]
+                                                "mb": 64,
+                                                "out": dimensions[-1],
+                                                "y": dimensions[0]
                                                 * dimensions[1]
-                                                * dimensions[2],
-                                                "y": dimensions[2] * dimensions[1],
-                                                "x": dimensions[2],
+                                                * dimensions[-1]
+                                                // 64,
+                                                "x": dimensions[-1]
+                                                * dimensions[0]
+                                                // 64,
                                             },
                                         },
                                     },

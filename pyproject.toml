@@ -19,9 +19,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "torch_spyre"
 authors = [
-    {name = "PyTorch-Spyre Core Team"}
+    {name = "Torch-Spyre Core Team"}
 ]
-description = "PyTorch-Spyre out of tree registration"
+description = "Torch-Spyre out of tree registration"
 dependencies = [
     "numpy~=2.3.4",
     "regex~=2025.11.3",

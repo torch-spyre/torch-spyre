@@ -19,8 +19,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-// #include <sendnn/runtime_factory.hpp>
-// #include <sendnn/util/status.hpp>
 namespace py = pybind11;
 
 namespace spyre {
@@ -31,10 +29,14 @@ namespace {
 struct SpyreHooksArgs : public at::PrivateUse1HooksArgs {};
 
 struct SpyreHooksInterface : public at::PrivateUse1HooksInterface {
+  SpyreHooksInterface() = default;
   explicit SpyreHooksInterface(SpyreHooksArgs) {}
   ~SpyreHooksInterface() override = default;
 
   bool hasPrimaryContext(c10::DeviceIndex device_index) const override {
+    return true;
+  }
+  bool isAvailable() const override {
     return true;
   }
 };
@@ -47,6 +49,13 @@ C10_DEFINE_REGISTRY(PrivateUse1HooksRegistry, SpyreHooksInterface,
 // PrivateUse1HooksRegistry class.
 C10_REGISTER_TYPED_CLASS(PrivateUse1HooksRegistry, "SpyreHooks",
                          SpyreHooksInterface);
+
+PYBIND11_MODULE(_hooks, m) {
+  static auto* hooks = new SpyreHooksInterface();
+  at::RegisterPrivateUse1HooksInterface(hooks);
+  m.doc() =
+      "Spyre bootstrap: registers PrivateUse1 hooks only (no heavy init).";
+}
 
 c10::Device current_device = c10::Device(c10::DeviceType::PrivateUse1, 0);
 

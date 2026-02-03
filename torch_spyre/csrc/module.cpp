@@ -31,7 +31,7 @@
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/graph/graph_deserializer.hpp>
 #include <sendnn/graph/graph_utils.hpp>
-#include <sendnn/runtime/graph_loader.hpp>
+#include <sendnn/interface/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
@@ -122,8 +122,9 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                 new sendnn::Node(sendnn::opcodes::PrimaryInput, {tensor}));
             exec_graph.NewEdge(edge_count, node, 0,
                                exec_graph.input_ops_[edge_count]);
-            sub_graph.NewEdge(edge_count++, compute_node, 0,
+            sub_graph.NewEdge(edge_count, compute_node, 0,
                               sub_graph.input_ops_[edge_count]);
+            edge_count++;
           } else {
             auto tensor = sendnn::Tensor(getTensorInfo(arg));
             exec_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
@@ -253,6 +254,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
+  m.def("to_with_layout", &spyre::to_with_layout);
+  m.def("empty_with_layout", &spyre::empty_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
@@ -295,6 +298,7 @@ PYBIND11_MODULE(_C, m) {
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
+      .def("host_dim_order", &spyre::SpyreTensorLayout::host_dim_order)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))

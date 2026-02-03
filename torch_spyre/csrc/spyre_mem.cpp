@@ -32,7 +32,7 @@
 #include <flex/flex_graph_builder.hpp>
 #include <memory>
 #include <sendnn/graph/graph_builder.hpp>
-#include <sendnn/runtime/graph_loader.hpp>
+#include <sendnn/interface/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
@@ -228,6 +228,9 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
    *   host2device = false: then 'tensor' is Spyre-tensor
    * TODO: support strided tensors
    */
+  if (stl.format != SpyreTensorLayout::StickFormat::Dense) {
+    throw std::runtime_error("Unsupported: DCI for stick-sparse tensors");
+  }
   auto str_type = torchScalarToString[tensor->scalar_type()];
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;
@@ -569,7 +572,6 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
-
 at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
                                    c10::IntArrayRef stride,
                                    c10::ScalarType dtype,
@@ -660,7 +662,52 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     return at::_copy_from(self, dst, non_blocking);
   }
 }
+at::Tensor to_with_layout(const at::Tensor& self,
+                          SpyreTensorLayout device_layout) {
+  DEBUGINFO(
+      "Tensor info on CPU (Size:", self.sizes(), ", Stride: ", self.strides(),
+      ", dtype: ", c10::typeMetaToScalarType(self.dtype()),
+      ") and to be mapped onto device ",
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice(),
+      " with layout ", device_layout.toString());
+  auto dst = spyre_empty_with_layout(self.sizes(), self.strides(),
+                                     c10::typeMetaToScalarType(self.dtype()),
+                                     device_layout);
+  return spyre_copy_from(self, dst, false);
+}
 
+at::Tensor empty_with_layout(
+    c10::IntArrayRef size, SpyreTensorLayout device_layout,
+    std::optional<c10::ScalarType> dtype_opt,
+    std::optional<c10::Layout> layout_opt,
+    std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
+    std::optional<c10::MemoryFormat> memory_format_opt) {
+  c10::Device device = device_opt.value_or(
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
+  DEBUGINFO("shape=", size, " on Spyre ", device);
+  const auto dtype = c10::dtype_or_default(dtype_opt);
+  TORCH_CHECK(device.is_privateuseone());
+  TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
+              "Non strided layout not supported");
+  TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
+              "Pin memory can only be on CPU");
+  const c10::DeviceGuard device_guard(device);
+
+  size_t size_bytes = get_device_size_in_bytes(device_layout);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
+          c10::StorageImpl::use_byte_size_t(), size_bytes,
+          &SpyreAllocator::instance(),
+          /*resizeable=*/true)),
+      pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  tensor.unsafeGetTensorImpl()->set_sizes_contiguous(size);
+  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  return tensor;
+}
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));

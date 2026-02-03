@@ -145,6 +145,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((67, 256), (256, 128)),
+                    # Fails for now, pending deeptools reduce fixes
+                    # ((67, 67,), (67, 67)),
+                    # ((67, 255), (255, 128)),
                 ]
             ),
         },
@@ -166,6 +169,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #         # "dim_1": (1, cached_randn((67, 256))),
         #     },
         # },
+        ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": {
+                "2d_0": (0, cached_randn((63, 129))),
+                "2d_1": (1, cached_randn((63, 129))),
+                "2d_01": ((0, 1), cached_randn((63, 129))),
+                "3d_0": (0, cached_randn((3, 7, 9))),
+                "3d_1": (1, cached_randn((3, 7, 9))),
+                "3d_2": (2, cached_randn((3, 7, 9))),
+                "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+            },
+        },
+        ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"amin": torch.amin},
+            "param_sets": {
+                "dim_0": (0, torch.ones((3, 7), dtype=torch.float16)),
+                #  Disabled because torch-sendnn fails
+                # "dim_1": (1, torch.ones((3, 7), dtype=torch.float16)),
+                # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
+            },
+        },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
                 "dim_0": (0, cached_randn((128, 256))),
@@ -266,6 +290,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((1088, 320),),
+                    ((320, 320),),
                 ]
             ),
         },
@@ -280,6 +305,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     2,
                     cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_0_2_same_dim": (
+                    0,
+                    2,
+                    cached_randn((128, 128, 128), abs=True),
                 ),
             }
         },
@@ -303,27 +333,72 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # ),
             }
         },
+        ("test_cmp", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "ge": torch.ge,
+                "le": torch.le,
+                "gt": torch.gt,
+                "lt": torch.lt,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "2d": (
+                    torch.ceil(cached_randn((64, 128), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((64, 128), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "3d": (
+                    torch.ceil(cached_randn((2, 32, 128), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((2, 32, 128), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "broadcast": (
+                    torch.ceil(cached_randn((256, 256), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
         ): {
+            "ops_dict": {
+                "eq": lambda x, y: x == y,
+                "ne": lambda x, y: x != y,
+                "ge": lambda x, y: x >= y,
+                "le": lambda x, y: x <= y,
+                "gt": lambda x, y: x > y,
+                "lt": lambda x, y: x < y,
+            },
             "param_sets": {
-                "eq": (
-                    lambda x, y: x == y,
-                    cached_randn((256,)),
-                    cached_randn((256,)),
+                "1d256": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
                 ),
-                "ge": (
-                    lambda x, y: x >= y,
-                    cached_randn((256,)),
-                    cached_randn((256,)),
-                ),
-                "ne": (
-                    lambda x, y: x != y,
-                    cached_randn((256,)),
-                    cached_randn((256,)),
-                ),
-            }
+            },
         },
         (
             "test_pointwise_binary_op_fp32",
@@ -463,6 +538,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_dropout_functional",
+            "test_dropout_functional",
+        ): {
+            "param_sets": {
+                "value_3d": (
+                    cached_randn((64, 11, 2048)),
+                    {
+                        "p": 0.5,
+                        "training": False,
+                        "inplace": False,
+                    },
+                ),
+                "value_4d": (
+                    cached_randn((1, 64, 11, 2048)),
+                    {
+                        "p": 0.0,
+                        "training": False,
+                        "inplace": False,
+                    },
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -513,6 +611,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare_with_cpu(op, a, b)
         else:
             compare(op, a, b)
+
+    def test_binary_op_cpu(self, op, x, y):
+        compare_with_cpu(op, x, y)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -572,6 +673,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
+
+    def test_dropout_functional(self, input, kwargs):
+        compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):

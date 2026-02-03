@@ -104,6 +104,13 @@ class SpyreTensorLayout {
 
   std::vector<int64_t> device_strides();
 
+  /**
+   * Return the host_dim_order that can be used as an argument to
+   * SpyreTensorLayout::init to create a new SpyreTensorLayout that
+   * will have the same dim_map as this SpyreTensorLayout.
+   */
+  std::vector<int32_t> host_dim_order();
+
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);
   }
@@ -152,7 +159,7 @@ class SpyreTensorImpl : public at::TensorImpl {
       const c10::intrusive_ptr<at::TensorImpl>& impl) override;
 };
 
-int32_t get_device_size_in_bytes(SpyreTensorLayout stl);
+uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
 
 }  // namespace spyre
