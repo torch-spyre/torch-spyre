@@ -97,7 +97,7 @@ Repeated dimensions in dim_map encode tiling. For example, for a 3d PyTorch
 tensor of size `[128, 256, 512]`, a dim_map `[1, 2, 0, 2]` and device_size
 `[256, 8, 128, 64]` specifies that dimension 2 of the PyTorch tensor is tiled
 with dimension 0, whereas dimension 1 of the PyTorch tensor becomes the
-outermost dimension of the Spyre tensor layout. The element with coordinates
+outermost dimension of the Spyre tensor layout. In this example, the element with coordinates
 `(a, b, c, d)` in the Spyre tensor corresponds to the PyTorch element `(c, a,
 b*64 + d)`. The coordinates of a tiled dimension are always combined into a
 PyTorch coordinate with strides increasing right-to-left akin to the implicit
