@@ -13,98 +13,22 @@
 # limitations under the License.
 
 - operator_name: abs
-  sendnn_func_name: Abs
   template_name: base
 - operator_name: add
-  sendnn_func_name: Add
   template_name: base
-- operator_name: addmm
-  sendnn_func_name: AddMm
-  template_name: custom
-  out_shape_stride_expr: matmul
-- operator_name: arange
-  sendnn_func_name: Arange
-  template_name: custom
-- operator_name: avg_pool2d
-  sendnn_func_name: AvgPooling
-  template_name: custom
 - operator_name: bitwise_not
-  sendnn_func_name: LogicalNot
   template_name: base
-- operator_name: bmm
-  sendnn_func_name: BatchMatMul
-  template_name: custom
-  out_shape_stride_expr: matmul
-  extra_arguments:
-  - name: transpose_1
-    type: bool
-    default: False
-  - name: transpose_2
-    type: bool
-    default: False
 - operator_name: cat
-  sendnn_func_name: Concat
-  template_name: list_inp
-- operator_name: clamp
-  sendnn_func_name: Clip
-  template_name: custom
-  extra_arguments:
-  - name: min
-    type: float
-    default: std::numeric_limits<float>::min()
-  - name: max
-    type: float
-    default: std::numeric_limits<float>::max()
-- operator_name: clamp_min
-  sendnn_func_name: Clip
-  template_name: custom
-  extra_arguments:
-  - name: min
-    type: float
-    default: std::numeric_limits<float>::min()
-  - name: max
-    type: float
-    default: std::numeric_limits<float>::max()
-- operator_name: clone
-  sendnn_func_name: Identity
-  template_name: custom
-- operator_name: convolution
-  sendnn_func_name: Convolution
-  template_name: custom
+  template_name: base
 - operator_name: cumsum
-  sendnn_func_name: CumSum
-  template_name: custom
-  extra_arguments:
-  - name: arg_1
-    type: bool
-    default: False
-  - name: arg_2
-    type: bool
-    default: False
+  template_name: view
 - operator_name: div
-  sendnn_func_name: RealDiv
   template_name: base
-- operator_name: dropout
-  sendnn_func_name: Dropout
-  template_name: custom
-- operator_name: native_dropout
-  sendnn_func_name: Dropout
-  template_name: custom
-- operator_name: native_dropout_backward
-  sendnn_func_name: DropoutBackward
-  template_name: base
-- operator_name: embedding_dense_backward
-  sendnn_func_name: EmbeddingBackward
-  template_name: custom
-- operator_name: full
-  sendnn_func_name: Fill
-  template_name: custom
 - operator_name: eq
-  sendnn_func_name: Equal
   template_name: base
 - operator_name: embedding
-  sendnn_func_name: Gather
   template_name: base
+  torch_prefix: torch.nn.functional
   extra_arguments:
   - name: padding_idx
     type: int64_t
@@ -114,235 +38,80 @@
     type: int
     default: 0
 - operator_name: expand
-  sendnn_func_name: BroadcastTo
   template_name: view
 - operator_name: exp
-  sendnn_func_name: Exp
   template_name: base
 - operator_name: ge
-  sendnn_func_name: GreaterEqual
   template_name: base
 - operator_name: gelu
-  sendnn_func_name: Gelu
   template_name: base
+  torch_prefix: torch.nn.functional
   extra_arguments:
   - name: approximate
     type: bool
     default: False
     overwrite: True
-- operator_name: gelu_backward
-  sendnn_func_name: GeluBackward
-  template_name: custom
-- operator_name: lift_fresh_copy
-  sendnn_func_name: LiftFreshCopy
-  template_name: custom
 - operator_name: linalg_vector_norm
-  sendnn_func_name: ReduceEuclideanNorm
   template_name: base
+  torch_prefix: torch.linalg
+  torch_func_name: vector_norm
   out_shape_stride_expr: reduce
 - operator_name: log
-  sendnn_func_name: Log
   template_name: base
-- operator_name: _log_softmax
-  sendnn_func_name: LogSoftmax
-  template_name: custom
-- operator_name: _log_softmax_backward_data
-  sendnn_func_name: LogSoftmaxBackward
-  template_name: custom
 - operator_name: logical_not
-  sendnn_func_name: LogicalNot
   template_name: base
 - operator_name: lt
-  sendnn_func_name: Less
   template_name: base
-- operator_name: index
-  sendnn_func_name: Gather
-  template_name: custom
-- operator_name: max_pool2d_with_indices
-  sendnn_func_name: MaxPooling
-  template_name: custom
 - operator_name: maximum
-  sendnn_func_name: Maximum
   template_name: base
-- operator_name: mean
-  sendnn_func_name: ReduceMean
-  template_name: custom
-  out_shape_stride_expr: reduce
 - operator_name: mish
-  sendnn_func_name: Mish
   template_name: base
-- operator_name: mm
-  sendnn_func_name: MatMul
-  template_name: custom
-  out_shape_stride_expr: matmul
-  extra_arguments:
-  - name: transpose_1
-    type: bool
-    default: False
-  - name: transpose_2
-    type: bool
-    default: False
+  torch_prefix: torch.nn.functional
 - operator_name: mul
-  sendnn_func_name: Multiply
   template_name: base
-- operator_name: _native_batch_norm_legit_functional
-  sendnn_func_name: FusedBatchNorm
-  template_name: custom
-- operator_name: _native_batch_norm_legit_no_training
-  sendnn_func_name: FusedBatchNorm
-  template_name: custom
-- operator_name: native_layer_norm
-  sendnn_func_name: LayerNorm
-  template_name: custom
-- operator_name: native_layer_norm_backward
-  sendnn_func_name: LayerNormBackward
-  template_name: custom
-- operator_name: ne
-  sendnn_func_name: NotEqual
-  template_name: custom
 - operator_name: neg
-  sendnn_func_name: Negative
   template_name: base
-- operator_name: new_empty
-  sendnn_func_name: Empty
-  template_name: custom
-- operator_name: new_full
-  sendnn_func_name: Fill
-  template_name: custom
-- operator_name: new_ones
-  sendnn_func_name: Ones
-  template_name: custom
-- operator_name: new_zeros
-  sendnn_func_name: Zeros
-  template_name: custom
-- operator_name: nll_loss_forward
-  sendnn_func_name: NllLossSum
-  template_name: custom
-- operator_name: nll_loss_backward
-  sendnn_func_name: NllLossSumBackward
-  template_name: custom
-- operator_name: nll_loss2d_forward
-  sendnn_func_name: NllLossSum
-  template_name: custom
-- operator_name: nll_loss2d_backward
-  sendnn_func_name: NllLossSumBackward
-  template_name: custom
-- operator_name: ones
-  sendnn_func_name: Ones
-  template_name: custom
 - operator_name: permute
-  sendnn_func_name: Transpose
   template_name: view
 - operator_name: pow
-  sendnn_func_name: Pow
   template_name: base
 - operator_name: reciprocal
-  sendnn_func_name: Reciprocal
   template_name: base
 - operator_name: relu
-  sendnn_func_name: Relu
   template_name: base
 - operator_name: repeat
-  sendnn_func_name: Tile
-  template_name: view
-- operator_name: Reshape
-  sendnn_func_name: Tile
   template_name: view
 - operator_name: rsqrt
-  sendnn_func_name: Rsqrt
   template_name: base
-- operator_name: scalar_tensor
-  sendnn_func_name: ConstInput
-  template_name: custom
-- operator_name: slice
-  sendnn_func_name: StridedSlice
-  template_name: custom
-- operator_name: slice_backward
-  sendnn_func_name: StridedSliceBackward
-  template_name: custom
-- operator_name: select_backward
-  sendnn_func_name: SelectBackward
-  template_name: custom
 - operator_name: sigmoid
-  sendnn_func_name: Sigmoid
   template_name: base
+  torch_prefix: torch.nn.functional
 - operator_name: silu
-  sendnn_func_name: Silu
   template_name: base
-- operator_name: _safe_softmax
-  sendnn_func_name: Softmax
-  template_name: custom
+  torch_prefix: torch.nn.functional
 - operator_name: _softmax
-  sendnn_func_name: Softmax
   template_name: base
-- operator_name: _softmax_backward_data
-  sendnn_func_name: SoftmaxBackward
-  template_name: custom
-- operator_name: split
-  sendnn_func_name: Split
-  template_name: custom
-- operator_name: split_with_sizes
-  sendnn_func_name: Split
-  template_name: custom
+  torch_prefix: torch.ops.aten
 - operator_name: sqrt
-  sendnn_func_name: Sqrt
   template_name: base
 - operator_name: squeeze
-  sendnn_func_name: Squeeze
   template_name: view
 - operator_name: stack
-  sendnn_func_name: Stack
-  template_name: list_inp
+  template_name: base
 - operator_name: sub
-  sendnn_func_name: Subtract
   template_name: base
-- operator_name: sum
-  sendnn_func_name: ReduceSum
-  template_name: base
-  out_shape_stride_expr: reduce
-- operator_name: sym_size
-  sendnn_func_name: ConstInput
-  template_name: custom
 - operator_name: t
-  sendnn_func_name: Transpose
   template_name: view
 - operator_name: tanh
-  sendnn_func_name: Tanh
   template_name: base
-- operator_name: tanh_backward
-  sendnn_func_name: TanhBackward
-  template_name: custom
-- operator_name: _to_copy
-  sendnn_func_name: Identity
-  template_name: custom
 - operator_name: transpose
-  sendnn_func_name: Transpose
   template_name: view
   out_shape_stride_expr: transpose
 - operator_name: tril
-  sendnn_func_name: Trilu
   template_name: base
 - operator_name: _unsafe_view
-  sendnn_func_name: Reshape
   template_name: view
 - operator_name: unsqueeze
-  sendnn_func_name: ExpandDims
   template_name: view
-- operator_name: upsample_nearest2d
-  sendnn_func_name: ResizeNearestNeighbor
-  template_name: base
 - operator_name: view
-  sendnn_func_name: Reshape
-  template_name: view
-- operator_name: where
-  sendnn_func_name: Where3
-  template_name: custom
-- operator_name: zeros
-  sendnn_func_name: Zeros
-  template_name: custom
-- operator_name: zeros_like
-  sendnn_func_name: ZerosLike
-  template_name: custom
-- operator_name: _reshape_alias
-  sendnn_func_name: Reshape
   template_name: view

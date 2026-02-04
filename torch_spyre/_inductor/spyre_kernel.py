@@ -499,17 +499,26 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             y = value.arguments[1]
             di_x = self.analyze_index_expr(x.index)
             di_y = self.analyze_index_expr(y.index)
-            di = [di_x[0], di_x[1], di_y[1]]
+            if len(di_x) == 2 and len(di_y) == 2:
+                di = [di_x[0], di_x[1], di_y[1]]
+            elif len(di_x) == 1 and len(di_y) == 2:
+                di = [di_x[0], DimensionInfo(self.wildcard, 1), di_y[1]]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
+            elif len(di_x) == 2 and len(di_y) == 1:
+                di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1)]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
+            else:
+                raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
-            scales = [
-                self.analyze_tensor_access(di, x.index),
-                self.analyze_tensor_access(di, y.index),
-                self.analyze_tensor_access(di, dst.index),
-            ]
+            scales = [[1, 1, -1], [-1, 1, 1], [1, -1, 1]]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
