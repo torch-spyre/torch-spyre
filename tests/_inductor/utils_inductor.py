@@ -194,6 +194,9 @@ def compare_with_cpu(
         device_args = [arg.to(device) for arg in args]
         device_kwargs = {"device": device} if needs_device else {}
         result = torch.compile(fn)(*device_args, **device_kwargs)
+        assert result.device.type == device.type, (
+            f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
+        )
         if not isinstance(result, int):
             result = result.cpu()
         return result
@@ -207,12 +210,12 @@ def compare_with_cpu(
         equal_nan=True,
         atol=atol,
         rtol=rtol,
-        msg=lambda msg: f"cpu mismatch\n\n{msg}\n",
+        msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
     )
 
     if cpu_compile:
         # Test against compiled cpu function
-        cpu_compiled_result = _run_compiled_device("cpu")
+        cpu_compiled_result = _run_compiled_device(torch.device("cpu"))
 
         torch.testing.assert_close(
             spyre_compiled_result,
@@ -220,7 +223,7 @@ def compare_with_cpu(
             equal_nan=True,
             atol=atol,
             rtol=rtol,
-            msg=lambda msg: f"cpu mismatch\n\n{msg}\n",
+            msg=lambda msg: f"compiled spyre <-> compiled cpu mismatch\n\n{msg}\n",
         )
 
 
