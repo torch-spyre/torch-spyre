@@ -167,7 +167,7 @@ def _autoload():
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config
 
-    # Increasing the default number fo graphs from 8 to 1024
+    # Increasing the default number of graphs from 8 to 1024
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024

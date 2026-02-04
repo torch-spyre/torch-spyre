@@ -91,7 +91,7 @@
   torch_prefix: torch.nn.functional
 - operator_name: _softmax
   template_name: base
-  torch_prefix: torch.nn.functional
+  torch_prefix: torch.ops.aten
 - operator_name: sqrt
   template_name: base
 - operator_name: squeeze

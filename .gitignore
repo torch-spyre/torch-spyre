@@ -385,6 +385,7 @@ android/pytorch_android_torchvision/.cxx
 # codegen outputs
 codegen/outputs
 torch_spyre/csrc/external
+torch_spyre/codegen_ops.py
 
 # test outputs
 test/logs/*
