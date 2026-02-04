@@ -219,24 +219,6 @@ uint32_t encodeConstant(float torch_const, DataFormats df) {
   }
   return sen_const;
 }
-void convertArtifacts(std::string artifacts_path) {
-  dee::PBD pbd;
-  sendnn::Graph g2;
-
-  setenv("DEEPRT_EXPORT_DIR", artifacts_path.c_str(), 1);
-  senbfcc::GlobalTracedSettings::Get().UpdateValue("DEEPRT_EXPORT_DIR",
-                                                   artifacts_path);
-
-  setenv("SENDNN_SERIALIZER_FORMAT", "CBOR", 1);
-
-  // Convert compiled artifacts to sendnn g2 graph
-  pbd.FromGraph(&g2);
-
-  // Serialize g2 graph
-  sendnn::Serialize(g2, artifacts_path + "/g2");
-
-  return;
-}
 
 int64_t get_elem_in_stick(c10::ScalarType torch_dtype) {
   auto str_type = torchScalarToString[torch_dtype];
@@ -260,7 +242,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
-  m.def("convert_artifacts", &spyre::convertArtifacts);
+  m.def("convert_artifacts", &dee::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::empty_with_layout);
