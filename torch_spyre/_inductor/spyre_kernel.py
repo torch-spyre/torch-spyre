@@ -503,8 +503,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 di = [di_x[0], di_x[1], di_y[1]]
             elif len(di_x) == 1 and len(di_y) == 2:
                 di = [di_x[0], DimensionInfo(self.wildcard, 1), di_y[1]]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
             elif len(di_x) == 2 and len(di_y) == 1:
                 di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1)]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
             else:
                 raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
