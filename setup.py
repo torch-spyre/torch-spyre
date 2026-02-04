@@ -115,7 +115,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
 
-LIBRARIES = ["sendnn", "flex", "dee_internal"]
+LIBRARIES = ["sendnn", "sendnn_interface", "flex", "dee_internal"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
