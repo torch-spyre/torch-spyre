@@ -194,10 +194,10 @@ def compare_with_cpu(
         device_args = [arg.to(device) for arg in args]
         device_kwargs = {"device": device} if needs_device else {}
         result = torch.compile(fn)(*device_args, **device_kwargs)
-        assert result.device.type == device.type, (
-            f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
-        )
         if not isinstance(result, int):
+            assert result.device.type == device.type, (
+                f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
+            )
             result = result.cpu()
         return result
 

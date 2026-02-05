@@ -736,14 +736,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: x.new_ones((x.size())), x)
 
     def test_numel_cpu(self, x):
-        compare_with_cpu(lambda x: torch.numel(x), x)
+        compare_with_cpu(lambda x: torch.numel(x), x, cpu_compile=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
 
-        compare_with_cpu(fn, needs_device=True)
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
 
 if __name__ == "__main__":
