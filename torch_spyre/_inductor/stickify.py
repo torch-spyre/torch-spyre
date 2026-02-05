@@ -234,9 +234,11 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         sparse_tensor = is_stick_reduction and not keep_dim
         # add extra dim of size 1 if sparse tensor
         fixed_size = output.size + ([1] if sparse_tensor else [])
-        stl = SpyreTensorLayout(
-            fixed_size, output.dtype, list(range(len(fixed_size))), format
-        )
+        # filter dim_order to remove all non-stick dimensions of size 1's
+        dim_order = [i for i, size in enumerate(fixed_size[:-1]) if size != 1]
+        dim_order += [len(fixed_size) - 1]
+
+        stl = SpyreTensorLayout(fixed_size, output.dtype, dim_order, format)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )

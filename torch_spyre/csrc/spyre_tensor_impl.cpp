@@ -117,10 +117,19 @@ std::vector<int32_t> SpyreTensorLayout::host_dim_order() {
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
+
+  // PyTorch expects to be able to freely add/remove size 1 dimensions
+  // without changing the memory layout of a tensor.  We enable this by
+  // filtering dim_order to remove all non-stick dimensions of size 1's
+  // before we compute the device_size (ie, on-device tiled memory layout).
   std::vector<int32_t> dim_order;
-  for (int32_t i = 0; i < host_dims; i++) {
-    dim_order.push_back(i);
+  for (int32_t i = 0; i < host_dims - 1; i++) {
+    if (host_size[i] != 1) {
+      dim_order.push_back(i);
+    }
   }
+  dim_order.push_back(host_dims - 1);
+
   init(host_size, dtype, dim_order, Dense);
 }
 
@@ -128,8 +137,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order,
                              StickFormat format) {
-  TORCH_CHECK(host_size.size() == dim_order.size(),
-              "Invalid arguments: host_size.size() != dim_order.size()");
+  TORCH_CHECK(host_size.size() >= dim_order.size(),
+              "Invalid arguments: host_size.size() < dim_order.size()");
 
   auto str_type = torchScalarToString[dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
@@ -147,23 +156,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     return;
   }
 
-  // PyTorch expects to be able to freely add/remove size 1 dimensions
-  // without changing the memory layout of a tensor.  We enable this by
-  // filtering dim_order to remove all non-stick dimensions of size 1's
-  // before we compute the device_size (ie, on-device tiled memory layout).
-  std::vector<int32_t> filtered_dim_order;
-  for (auto i = 0; i < (dim_order.size() - 1); i++) {
-    if (host_size[dim_order[i]] != 1) {
-      filtered_dim_order.push_back(dim_order[i]);
-    }
-  }
-  filtered_dim_order.push_back(dim_order[dim_order.size() - 1]);
-
-  int device_dims = static_cast<int>(filtered_dim_order.size()) + 1;
+  int device_dims = static_cast<int>(dim_order.size()) + 1;
   auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
 
   this->device_size.resize(device_dims);
-  this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
+  this->dim_map = spyre::get_generic_stick_layout(dim_order);
   this->format = format;
 
   // Stick dim
