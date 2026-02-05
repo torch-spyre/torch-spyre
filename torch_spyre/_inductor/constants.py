@@ -45,4 +45,5 @@ SPYRE_FP32_OPS = [
     "sigmoid",
     "exx2",
     "layernormnorm",
+    "clone",
 ]

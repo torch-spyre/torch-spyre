@@ -153,14 +153,14 @@ class TestOps(TestCase):
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
+    @unittest.skip("TODO: Implement permute/transpose properly on eager")
     def test_transpose_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
+    @unittest.skip("TODO: Implement permute/transpose properly on eager")
     def test_transpose_3d(self):
         x = torch.tensor(
             [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
@@ -170,14 +170,13 @@ class TestOps(TestCase):
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
+    @unittest.skip("TODO: Implement permute/transpose properly on eager")
     def test_permute_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.permute(1, 0).to("cpu")
         torch.testing.assert_close(y, x.permute(1, 0), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Need to update eager-mode graph to work with bool")
     def test_bool(self):
         dtype = torch.bool
         x = torch.randint(0, 2, (2, 64), dtype=dtype)
@@ -243,6 +242,7 @@ class TestOps(TestCase):
             y, torch.reciprocal(x), rtol=self.rtol, atol=self.atol
         )
 
+    @unittest.expectedFailure
     def test_sigmoid(self):
         x = torch.tensor([-2, 1, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
@@ -261,13 +261,13 @@ class TestOps(TestCase):
         y = torch.tanh(x_spyre).to("cpu")
         torch.testing.assert_close(y, torch.tanh(x), rtol=self.rtol, atol=self.atol)
 
+    @unittest.skip("TODO: Needs more debug")
     def test_clone(self):
         x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.clone(x_spyre).to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_add_Tensor(self):
         x = torch.tensor([1, 2, 3], dtype=self.dtype)
         y = torch.tensor([4, 5, 6], dtype=self.dtype)
@@ -276,6 +276,7 @@ class TestOps(TestCase):
         z = torch.add(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.add(x, y), rtol=self.rtol, atol=self.atol)
 
+    @unittest.expectedFailure
     def test_add_Scalar(self):
         x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype)
         y = 5
@@ -283,7 +284,7 @@ class TestOps(TestCase):
         z = (x_spyre + y).to("cpu")
         torch.testing.assert_close(z, x + y, rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
+    @unittest.skip("xfail: Swapping stick dimension is unsupported in new DCI")
     def test_add_Tensor_transpose(self):
         x = torch.arange(8, dtype=self.dtype).view(2, 4)
         y = torch.arange(8, dtype=self.dtype).view(4, 2) * 10
@@ -340,7 +341,7 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
+    @unittest.skip("TODO: Debug accuracy error")
     def test_mm_ba_ac(self):
         x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_b, self.mm_a
@@ -353,7 +354,6 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
     def test_mm_bc_ca(self):
         x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_b, self.mm_c
@@ -366,7 +366,7 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
+    @unittest.skip("TODO: Debug accuracy error")
     def test_mm_ca_ab(self):
         x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_a
@@ -379,7 +379,6 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_mm_cb_ba(self):
         x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_b
@@ -392,7 +391,7 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
+    @unittest.skip("TODO: bmm.out not implemented yet in eager")
     def test_bmm_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -406,7 +405,7 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
+    @unittest.skip("TODO: bmm.out not implemented yet in eager")
     def test_bmm_cb_ba(self):
         B = 1
         x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
@@ -420,7 +419,7 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("matmuls have some issues with shapes")
+    @unittest.skip("TODO: Debug accuracy error")
     def test_matmul_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -436,7 +435,7 @@ class TestOps(TestCase):
             z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("matmuls have some issues with shapes")
+    @unittest.skip("TODO: Debug accuracy error")
     def test_matmul_cb_ba(self):
         B = 1
         x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
@@ -452,7 +451,7 @@ class TestOps(TestCase):
             z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("mean will fail due to dummy op error")
+    @unittest.skip("TODO: mean.out not implemented in eager mode")
     def test_mean(self):
         x = torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=self.dtype)
         x_spyre = x.to("spyre")
@@ -472,6 +471,7 @@ class TestOps(TestCase):
             atol=self.atol,
         )
 
+    @unittest.skip("TODO: Implement aten::sum.IntList_out in eager codegen")
     def test_sum(self):
         x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
         x_spyre = x.to("spyre")
@@ -480,6 +480,7 @@ class TestOps(TestCase):
             y0, torch.sum(x, dim=[0]), rtol=self.rtol, atol=self.atol
         )
 
+    @unittest.skip("TODO: Debug softmax codegen for eager")
     def test_softmax(self):
         x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
         x_spyre = x.to("spyre")

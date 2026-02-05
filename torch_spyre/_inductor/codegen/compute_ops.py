@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import takewhile
 import math
 from dataclasses import dataclass
 from torch_spyre._C import encode_constant, DataFormats
@@ -48,6 +49,54 @@ class DimInfo:
             self.padding = 0
 
         self.size = self.unpadded_size + self.padding
+
+
+@dataclass
+class DimInfos:
+    def __init__(
+        self,
+        dim_labels: list[str],
+        dim_indices: list[int],
+        dim_sizes: list[int],
+        dim_splits: list[int],
+        elems_per_stick: int,
+        stick_dims: list,
+        new_indices_order: list[int] = [],
+    ):
+        self.dim_infos_list = []
+        self.dim_infos_dict = {}
+
+        self.dim_labels = dim_labels
+        self.dim_indices = dim_indices
+        self.dim_sizes = dim_sizes
+        self.dim_splits = dim_splits
+
+        if new_indices_order:
+            self.reorder_all_indices(new_indices_order)
+
+        for label, index, size, nsplits in zip(
+            self.dim_labels, self.dim_indices, self.dim_sizes, self.dim_splits
+        ):
+            dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims)
+            self.dim_infos_list.append(dim_info)
+            self.dim_infos_dict[label] = dim_info
+
+    def as_list(self) -> list:
+        return self.dim_infos_list
+
+    def as_dict(self) -> dict[str, DimInfo]:
+        return self.dim_infos_dict
+
+    # Convenience function for construction for per-tensor dim infos.
+    # Todo: this is a bit awkward.  Make this simpler as we refine dims abstraction
+    def reorder_all_indices(self, new_indices_order):
+        self.dim_labels = self.reorder_indices(self.dim_labels, new_indices_order)
+        self.dim_sizes = self.reorder_indices(self.dim_sizes, new_indices_order)
+        self.dim_splits = self.reorder_indices(self.dim_splits, new_indices_order)
+        self.dim_indices = new_indices_order
+
+    def reorder_indices(self, cur_list, new_indices):
+        return [cur_list[self.dim_indices.index(i)] for i in new_indices]
 
 
 def num_bytes(df: DataFormats) -> int:
@@ -226,32 +275,11 @@ def gen_coord_info_value(
     )
 
 
-def create_dim_infos(
-    dim_labels: list[str],
-    dim_indices: list[int],
-    dim_sizes: list[int],
-    dim_splits: list[int],
-    elems_per_stick: int,
-    stick_dims: list,
-) -> tuple[list[DimInfo], dict[str, DimInfo]]:
-    dims_list = []
-    dims_dict = {}
-
-    for label, index, size, nsplits in zip(
-        dim_labels, dim_indices, dim_sizes, dim_splits
-    ):
-        dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims)
-        dims_list.append(dim_info)
-        dims_dict[label] = dim_info
-
-    return dims_list, dims_dict
-
-
-def create_padding_mask_info(dims_list: list[DimInfo], kwargs) -> tuple[dict, int]:
+def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     coordinateMasking = {}
     maskingConstId = -1
 
-    for di in dims_list:
+    for di in dim_infos.as_list():
         if di.padding > 0:
             coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
     if coordinateMasking:
@@ -314,7 +342,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # reorder sizes according to layoutDimOrder
     dim_sizes = [dimensions[i] for i in dim_indices]
-    dims_list, _ = create_dim_infos(
+    op_dim_infos = DimInfos(
         dim_labels,
         dim_indices,
         dim_sizes,
@@ -323,7 +351,43 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         stick_dims=["out"],
     )
 
-    coordinateMasking, maskingConstId = create_padding_mask_info(dims_list, kwargs)
+    coordinateMasking, maskingConstId = create_padding_mask_info(op_dim_infos, kwargs)
+
+    # Compute tensor-specific dimension info
+    for i, tensor in enumerate(tensors):
+        # Adjust for output tensors that have leading dimensions of size 1
+        # These dimensions do not exist on the device, and the tiling is different
+        # Compute the number of leading missing dims (-1)
+        missing_dims = sum(1 for _ in takewhile(lambda x: x == -1, tensor["scale"]))
+        if missing_dims > 0 and ndim >= 3:
+            # Convert to compressed device indices
+            # TODO: Compute this by rotating the number of missing dims, but right now ndim > 3 never happens
+            tensor_dim_indices = [1, 2, 0]
+
+            # TODO: Dynamically create these "INPUT" and "OUTPUT" labels (and input_layoutDimOrder/output_layoutDimOrder)
+            # when the indices order is different.
+            # For example, we should be able to support two inputs with different shapes.
+            # For now assert that only OUTPUT changes.
+            assert i == (len(tensors) - 1)
+            tensor["ds_type"] = "OUTPUT"
+        else:
+            # Indices and order unchanged
+            tensor_dim_indices = dim_indices
+            tensor["ds_type"] = "INPUT"
+
+        # Create dim infos specific to this tensor, reordered if necessary
+        tensor["dim_infos"] = DimInfos(
+            dim_labels,
+            dim_indices,
+            dim_sizes,
+            dim_splits,
+            elems_per_stick,
+            stick_dims=["out"],
+            new_indices_order=tensor_dim_indices,
+        )
+
+    input_layoutDimOrder = tensors[0]["dim_infos"].dim_labels
+    output_layoutDimOrder = tensors[-1]["dim_infos"].dim_labels
 
     return {
         op: {
@@ -337,7 +401,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
             "numCoresUsed_": cores,
             "coreIdToDsc_": {str(c): 0 for c in range(cores)},
-            "numWkSlicesPerDim_": {di.label: di.nsplits for di in dims_list},
+            "numWkSlicesPerDim_": {
+                di.label: di.nsplits for di in op_dim_infos.as_list()
+            },
             "coreIdToWkSlice_": core_id_to_wk_slice,
             "coreIdToDscSchedule": {str(c): [[-1, 0, 0, 0]] for c in range(cores)},
             "dscs_": [
@@ -349,7 +415,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                         "N_": {
                             "name_": "n",
                             **{
-                                di.label + "_": di.size for di in dims_list
+                                di.label + "_": di.size for di in op_dim_infos.as_list()
                             },  # dim sizes before split
                         },
                         "coordinateMasking_": coordinateMasking,
@@ -360,24 +426,29 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "name_": "core",
                                     **{
                                         di.label + "_": di.split_size
-                                        for di in dims_list
+                                        for di in op_dim_infos.as_list()
                                     },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
                                         di.label + "_": di.split_size
-                                        for di in dims_list
+                                        for di in op_dim_infos.as_list()
                                     },
                                 },
                             }
                         },
                         "primaryDsInfo_": {
-                            "OUTPUT": {
-                                "layoutDimOrder_": dim_labels,
+                            "INPUT": {  # INPUT is is unnecessary when INPUT and OUTPUT are identical. TODO: create this list dynamically
+                                "layoutDimOrder_": input_layoutDimOrder,
                                 "stickDimOrder_": ["out"],
                                 "stickSize_": [inputs[0]["ddtype"].elems_per_stick()],
-                            }
+                            },
+                            "OUTPUT": {
+                                "layoutDimOrder_": output_layoutDimOrder,
+                                "stickDimOrder_": ["out"],
+                                "stickSize_": [inputs[0]["ddtype"].elems_per_stick()],
+                            },
                         },
                         "scheduleTree_": [
                             {
@@ -386,7 +457,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "prev_": "",
                                 "ldsIdx_": i,
                                 "component_": "hbm",
-                                "layoutDimOrder_": dim_labels,
+                                "layoutDimOrder_": tensor["dim_infos"].dim_labels,
                                 "maxDimSizes_": [-1] * len(dim_labels),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
@@ -428,7 +499,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 and tensor["scale"][di.index] == -1
                                             ),
                                         )
-                                        for di in dims_list
+                                        for di in tensor["dim_infos"].as_list()
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -439,7 +510,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                             {
                                 "ldsIdx_": i,
                                 "dsName_": f"Tensor{i}",
-                                "dsType_": "OUTPUT",
+                                "dsType_": tensor["ds_type"],
                                 "scale_": [
                                     (
                                         tensor["scale"][di.index]
@@ -451,7 +522,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         )
                                         else -2
                                     )
-                                    for di in dims_list
+                                    for di in tensor["dim_infos"].as_list()
                                 ],
                                 "wordLength": num_bytes(tensor["ddtype"]),
                                 "dataFormat_": tensor["ddtype"].name,
@@ -507,7 +578,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     dim_sizes = dimensions
     dim_splits = [1, 1, cores]
 
-    dims_list, dim_info_dict = create_dim_infos(
+    op_dim_infos = DimInfos(
         dim_labels,
         dim_indices,
         dim_sizes,
@@ -515,6 +586,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         elems_per_stick,
         stick_dims=["in", "out"],
     )
+    dim_info_dict = op_dim_infos.as_dict()
 
     input_layoutDimOrder = ["mb", "in"]
     kernel_layoutDimOrder = ["in", "out"]
@@ -733,7 +805,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     dim_sizes = dimensions
     dim_splits = [1, cores, 1, 1]
 
-    dims_list, dim_info_dict = create_dim_infos(
+    op_dim_infos = DimInfos(
         dim_labels,
         dim_indices,
         dim_sizes,
@@ -741,6 +813,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         elems_per_stick,
         stick_dims=["in", "out"],
     )
+    dim_info_dict = op_dim_infos.as_dict()
 
     input_layoutDimOrder = ["x", "in", "mb"]
     kernel_layoutDimOrder = ["x", "out", "in"]
