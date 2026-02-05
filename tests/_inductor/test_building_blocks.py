@@ -34,6 +34,15 @@ class TestBuildingBlocks(unittest.TestCase):
         compare_with_cpu(lambda x: torch.softmax(x, dim=0), cached_randn((512, 1024)))
         compare_with_cpu(lambda x: torch.softmax(x, dim=1), cached_randn((512, 1024)))
         compare_with_cpu(lambda x: torch.softmax(x, dim=-1), cached_randn((512, 1024)))
+        compare_with_cpu(
+            lambda x: torch.softmax(x, dim=0), cached_randn((256, 64, 128))
+        )
+        compare_with_cpu(
+            lambda x: torch.softmax(x, dim=1), cached_randn((256, 64, 128))
+        )
+        compare_with_cpu(
+            lambda x: torch.softmax(x, dim=-1), cached_randn((256, 64, 128))
+        )
 
     def test_softplus(self):
         # beta * x >= threshold ? x : (log(1 + exp(-abs(beta * x)) + relu(beta * x)
