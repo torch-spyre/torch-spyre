@@ -47,3 +47,5 @@ SPYRE_FP32_OPS = [
     "layernormnorm",
     "clone",
 ]
+
+LAYOUT_TYPE = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]

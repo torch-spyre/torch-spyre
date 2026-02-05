@@ -895,7 +895,7 @@ def generate_transpose_4d_stick(
 def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     ndims = len(dimensions)
     # Get data type information from inputs
-    input_dtype = inputs[0]["ddtype"]
+    input_dtype = inputs[0]["device_layout"].device_dtype
     word_length = num_bytes(input_dtype)
     data_format = input_dtype.name
     elems_per_stick = input_dtype.elems_per_stick()
