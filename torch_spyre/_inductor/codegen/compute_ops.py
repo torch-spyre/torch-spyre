@@ -15,7 +15,8 @@
 import math
 from dataclasses import dataclass
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import LAYOUT_TYPE
+from torch_spyre._inductor.constants import LAYOUT_LABELS
+from itertools import takewhile
 
 
 @dataclass
@@ -358,11 +359,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         # Adjust for output tensors that have leading dimensions of size 1
         # These dimensions do not exist on the device, and the tiling is different
         # Compute the number of leading missing dims (-1)
-        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-        missing_dims = list(set(dim_indices) - set(dev_dim_order))
-        if len(missing_dims) != 0:
+        missing_dims = sum(1 for _ in takewhile(lambda x: x == -1, tensor["scale"]))
+        if missing_dims > 0 and ndim >= 3:
             # Add missing dimensions to end of device dimension order
-            tensor_dim_indices = dev_dim_order + missing_dims
+            # Compute the number of leading missing dims (-1)
+            dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+            tensor_dim_indices = dev_dim_order + list(
+                set(dim_indices) - set(dev_dim_order)
+            )
         else:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices
@@ -383,8 +387,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                 tensor["ds_type"] = label
                 break
         if tensor["ds_type"] is None:
-            tensor["ds_type"] = LAYOUT_TYPE[len(layouts.keys())]
-            layouts[LAYOUT_TYPE[len(layouts.keys())]] = tensor["dim_infos"].dim_labels
+            tensor["ds_type"] = LAYOUT_LABELS[len(layouts.keys())]
+            layouts[LAYOUT_LABELS[len(layouts.keys())]] = tensor["dim_infos"].dim_labels
 
     return {
         op: {
