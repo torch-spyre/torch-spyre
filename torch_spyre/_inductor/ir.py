@@ -118,17 +118,17 @@ class FixedTiledLayout(FixedLayout):
         """
         offset = self.offset
         stl = self.device_layout
+        host_size = self.size
 
         def indexer(index: Sequence[Expr]) -> Expr:
-            for d in stl.dim_map:
-                assert d < len(index)
-            result = offset
-            stick_dim = stl.dim_map[-1]
-            for hd, stride in zip(stl.dim_map, stl.device_strides()):
+            stick_dim = stl.host_stick_dim()
+            expr = index[stick_dim] + offset
+            stride = stl.elems_per_stick()
+            for hd in reversed(stl.dim_map[:-1]):
                 if hd != stick_dim:
-                    result = result + (index[hd] * stride)
-            result = result + index[stick_dim]  # stride of 1!
-            return result
+                    expr = (index[hd] * stride) + expr
+                    stride = stride * host_size[hd]
+            return expr
 
         return indexer
 
