@@ -326,11 +326,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
 
-    # MRA TODO: Move to contants file?
+    # MRA TODO: Extend these to all supported deeptools dimension labels
     input_labels = ["mb", "x"]
     output_labels = ["out"]
 
-    # TODO: What is the correct way to get the dim order for an operation, given a list of tensors?
+    # MRA TODO: What is the correct way to get the dim order for an operation, given a list of tensors?
     # For now using the longest dim order, and it works for our current test cases
     dim_indices = max([t["device_layout"].dim_map[::-1][1:] for t in tensors], key=len)
     dim_labels = input_labels[:ndim-1] + output_labels[:1]
@@ -379,6 +379,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             stick_dims=["out"],
             scales=tensor["scale"],
         )
+
         # primaryDsInfo_ requires each unique layout order to have a name.
         # Reuse the same label for tensors with the same layout, for compactness
         tensor["ds_type"] = None
