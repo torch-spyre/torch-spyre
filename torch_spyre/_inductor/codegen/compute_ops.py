@@ -306,7 +306,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     d3 = len(dimensions) >= 3
 
     ndim = len(dimensions)
-    assert ndim <= 3
 
     # implement core division on stick dimension
     cores = 1
@@ -314,7 +313,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
         # enable work division for non-reduction only for now
         if not reduction:
-            split_idx = -3 if d3 else 0  # split along stick dim
+            split_idx = len(dimensions) * -1 if d3 else 0  # split along stick dim
             cores = kwargs["op_info"]["core_division"][-1][split_idx]
             # FIXME: cores should be the product of list of splits
 
@@ -369,14 +368,36 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         # Adjust for output tensors that have leading dimensions of size 1
         # These dimensions do not exist on the device, and the tiling is different
         # Compute the number of leading missing dims (-1)
-        missing_dims = sum(1 for _ in takewhile(lambda x: x == -1, tensor["scale"]))
-        if missing_dims > 0 and ndim >= 3:
+        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+        missing_dims = list(set(dim_indices) - set(dev_dim_order))
+        if len(missing_dims) > 0 and ndim == 3:
             # Add missing dimensions to end of device dimension order
             # Compute the number of leading missing dims (-1)
-            dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
             tensor_dim_indices = dev_dim_order + list(
                 set(dim_indices) - set(dev_dim_order)
             )
+        elif len(missing_dims) > 0 and ndim == 4:
+            if (
+                tensor["scale"][missing_dims[0]] != -1 and tensor["scale"][0] == -1
+            ):  # keepdim=False
+                tensor_dim_indices = [0, 3, 1, 2]
+            elif tensor["scale"][missing_dims[0]] != -1:  # keepdim=False
+                tensor_dim_indices = dim_indices
+            elif (
+                ndim == 4
+                and missing_dims[0] == 0
+                and tensor["scale"][missing_dims[0]] == -1
+            ):
+                tensor_dim_indices = [1, 3, 0, 2]
+            elif (
+                ndim == 4
+                and missing_dims[0] == 3
+                and tensor["scale"][missing_dims[0]] == -1
+            ):
+                tensor_dim_indices = [0, 2, 1, 3]
+            else:
+                # Indices and order unchanged
+                tensor_dim_indices = dim_indices
         else:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices
