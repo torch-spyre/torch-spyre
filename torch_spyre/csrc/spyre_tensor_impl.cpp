@@ -83,6 +83,17 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
   return dim_map;
 }
 
+int32_t SpyreTensorLayout::host_stick_dim() {
+  // NOTE: dim_map[rank-1] is -1 for a sparse tensor.
+  //       Return the other entry for the stick so we get a real host dim.
+  auto rank = this->dim_map.size();
+  if (rank == 2) {
+    return this->dim_map[rank - 2];
+  } else {
+    return this->dim_map[rank - 3];
+  }
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
@@ -140,22 +151,6 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] = host_size[dim];
     }
   }
-}
-
-std::vector<int64_t> SpyreTensorLayout::device_strides() {
-  int device_dims = static_cast<int>(this->device_size.size());
-  std::vector<int64_t> strides(device_dims);
-
-  // Stick dim
-  int64_t cur_stride = this->elems_per_stick();
-  strides[device_dims - 1] = 1;
-
-  // Non-stick dims
-  for (int i = device_dims - 2; i >= 0; i--) {
-    strides[i] = cur_stride;
-    cur_stride = cur_stride * this->device_size[i];
-  }
-  return strides;
 }
 
 std::string SpyreTensorLayout::toString() const {

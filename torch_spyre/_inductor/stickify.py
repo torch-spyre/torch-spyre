@@ -37,7 +37,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout, StickFormat
+from torch_spyre._C import SpyreTensorLayout
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
@@ -62,6 +62,10 @@ def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
     return [item[0] for item in ordered_strides]
 
 
+def is_sparse(stl: SpyreTensorLayout) -> bool:
+    return stl.device_size[-1] == -1
+
+
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
@@ -84,7 +88,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case spyreop.slice.default:
-                if x.layout.device_layout.format != StickFormat.Sparse:
+                if not is_sparse(x.layout.device_layout):
                     raise Unsupported("slice on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("slice on non 1-D tensor")
@@ -93,18 +97,20 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case spyreop.swap.default:
-                if x.layout.device_layout.format != StickFormat.Sparse:
+                if not is_sparse(x.layout.device_layout):
                     raise Unsupported("swap on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("swap on non 1-D tensor")
                 stl = SpyreTensorLayout(
-                    output.size, output.dtype, [0], StickFormat.Sparse
+                    output.size,
+                    output.dtype,
+                    [0],  # StickFormat.Sparse
                 )
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case aten.clone.default:
-                if not x.layout.device_layout.format == StickFormat.Dense:
+                if is_sparse(x.layout.device_layout):
                     raise Unsupported("clone on sparse tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype)
                 return FixedTiledLayout(
@@ -183,7 +189,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     if red.reduction_type == MATMUL_REDUCTION_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
-        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+        if is_sparse(x_stl) or is_sparse(y_stl):
             raise Unsupported(f"matmul on non-dense tensors {x_stl} {y_stl}")
         if stick_dim(x_stl) == 0 and stick_dim(y_stl) == 0:
             out_host_dim_order = [1, 0]
@@ -199,7 +205,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
         output_host_dim_order = x_stl.host_dim_order()
-        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+        if is_sparse(x_stl) or is_sparse(y_stl):
             raise Unsupported(
                 f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
             )
@@ -219,7 +225,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.size,
             output.dtype,
             x_stl.host_dim_order(),
-            StickFormat.Sparse,
+            # StickFormat.Sparse,
         )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
@@ -230,7 +236,6 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         stick_var = input_dims[-1]
         is_stick_reduction = stick_var not in output_dims
         keep_dim = len(input.layout.size) == len(output.size)
-        format = StickFormat.Dense
         sparse_tensor = is_stick_reduction and not keep_dim
         # add extra dim of size 1 if sparse tensor
         fixed_size = output.size + ([1] if sparse_tensor else [])

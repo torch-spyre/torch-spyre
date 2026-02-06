@@ -91,8 +91,6 @@ class SpyreTensorLayout {
 
   std::string toString() const;
 
-  std::vector<int64_t> device_strides();
-
   /**
    * Return the host_dim that is considered to be the stick dimension.
    */
