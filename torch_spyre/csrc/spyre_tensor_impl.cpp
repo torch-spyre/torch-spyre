@@ -107,6 +107,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order) {
+  TORCH_CHECK((host_size.size() == dim_order.size()) ||
+                  (((host_size.size() + 1) == dim_order.size()) &&
+                   dim_order.back() == -1),
+              "Incompatible host_size and dim_order");
+
   auto str_type = torchScalarToString[dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
@@ -121,14 +126,11 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     return;
   }
 
-  bool sparse = dim_order.back() == -1;
-  TORCH_CHECK((host_size.size() + (sparse ? 1 : 0)) == dim_order.size(),
-              "Incompatible host_size and dim_order");
-
   // PyTorch expects to be able to freely add/remove size 1 dimensions
   // without changing the memory layout of a tensor.
   // To enable this to be true for Spyre tensors
   // we filter dim_order to remove trivial dimensions before tiling.
+  bool sparse = dim_order.back() == -1;
   std::vector<int32_t> filtered_dim_order;
   for (auto i = 0; i < dim_order.size(); i++) {
     if ((dim_order[i] == -1) || (host_size[dim_order[i]] != 1)) {
