@@ -16,9 +16,8 @@ from itertools import zip_longest
 import math
 from dataclasses import dataclass
 
-import torch
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import LAYOUT_LABELS
+from torch_spyre._inductor.constants import LAYOUT_LABELS, INPUT_DIM_LABELS, OUTPUT_DIM_LABELS
 from itertools import takewhile
 
 
@@ -326,14 +325,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
 
-    # MRA TODO: Extend these to all supported deeptools dimension labels
-    input_labels = ["mb", "x"]
-    output_labels = ["out"]
-
-    # MRA TODO: What is the correct way to get the dim order for an operation, given a list of tensors?
+    # TODO: Temp code to get the dim order for an operation, from a list of tensors.
     # For now using the longest dim order, and it works for our current test cases
+    # Will fix once additional information is passed via SpyreTensorLayout
     dim_indices = max([t["device_layout"].dim_map[::-1][1:] for t in tensors], key=len)
-    dim_labels = input_labels[:ndim-1] + output_labels[:1]
+    dim_labels = INPUT_DIM_LABELS[:ndim-1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim-1)+ [cores]
     
     core_id_to_wk_slice = {}
