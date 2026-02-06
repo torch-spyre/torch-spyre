@@ -17,7 +17,11 @@ import math
 from dataclasses import dataclass
 
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import LAYOUT_LABELS, INPUT_DIM_LABELS, OUTPUT_DIM_LABELS
+from torch_spyre._inductor.constants import (
+    LAYOUT_LABELS,
+    INPUT_DIM_LABELS,
+    OUTPUT_DIM_LABELS,
+)
 from itertools import takewhile
 
 
@@ -66,6 +70,7 @@ class DimInfos:
     Class to help iterate over dimension information in various formats
     Input lists are in host order, but are immediately reordered according to the dim_indices position map
     """
+
     def __init__(
         self,
         dim_labels: list[str],
@@ -74,7 +79,7 @@ class DimInfos:
         dim_splits: list[int],
         elems_per_stick: int,
         stick_dims: list,
-        scales: list[int] = []
+        scales: list[int] = [],
     ):
         self.dim_infos_list = []
         self.dim_infos_dict = {}
@@ -88,9 +93,15 @@ class DimInfos:
         self.do_reordering()
 
         for label, index, size, nsplits, scale in zip_longest(
-            self.dim_labels, self.dim_indices, self.dim_sizes, self.dim_splits, self.scales,
+            self.dim_labels,
+            self.dim_indices,
+            self.dim_sizes,
+            self.dim_splits,
+            self.scales,
         ):
-            dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims, scale)
+            dim_info = DimInfo(
+                label, index, nsplits, size, elems_per_stick, stick_dims, scale
+            )
             self.dim_infos_list.append(dim_info)
             self.dim_infos_dict[label] = dim_info
 
@@ -106,7 +117,8 @@ class DimInfos:
         self.dim_sizes = reorder_dims(self.dim_sizes, self.dim_indices)
         self.dim_splits = reorder_dims(self.dim_splits, self.dim_indices)
         if self.scales:
-            self.scales = reorder_dims(self.scales, self.dim_indices) 
+            self.scales = reorder_dims(self.scales, self.dim_indices)
+
 
 def num_bytes(df: DataFormats) -> int:
     """Try to avoid using this method; it is a bad API due to sub-byte datatypes"""
@@ -329,13 +341,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     # For now using the longest dim order, and it works for our current test cases
     # Will fix once additional information is passed via SpyreTensorLayout
     dim_indices = max([t["device_layout"].dim_map[::-1][1:] for t in tensors], key=len)
-    dim_labels = INPUT_DIM_LABELS[:ndim-1] + OUTPUT_DIM_LABELS[:1]
-    dim_splits = [1] * (ndim-1)+ [cores]
-    
+    dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+    dim_splits = [1] * (ndim - 1) + [cores]
+
     core_id_to_wk_slice = {}
     for i in range(cores):
-        core_id_to_wk_slice[str(i)] = {str(s): i if s == "out" else 0 for s in dim_labels}
-
+        core_id_to_wk_slice[str(i)] = {
+            str(s): i if s == "out" else 0 for s in dim_labels
+        }
 
     op_dim_infos = DimInfos(
         dim_labels,
@@ -491,8 +504,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             ].device_dtype.elems_per_stick(),
                                             is_stick_dim=(di.label == "out"),
                                             is_stick_reduction=(
-                                                di.label == "out"
-                                                and di.scale == -1  
+                                                di.label == "out" and di.scale == -1
                                             ),
                                         )
                                         for di in tensor["dim_infos"].as_list()
@@ -512,10 +524,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         di.scale
                                         # TODO: revisit whether this special case can be removed
                                         #       pending change in deeptools
-                                        if not (
-                                            di.label == "out"
-                                            and di.scale == -1
-                                        )
+                                        if not (di.label == "out" and di.scale == -1)
                                         else -2
                                     )
                                     for di in tensor["dim_infos"].as_list()

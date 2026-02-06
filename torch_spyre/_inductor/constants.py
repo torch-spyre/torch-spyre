@@ -51,5 +51,5 @@ SPYRE_FP32_OPS = [
 LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
 
 # TODO: Populate more valid labels here
-INPUT_DIM_LABELS =  ["mb", "x", "y", "i", "j"]
+INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j"]
 OUTPUT_DIM_LABELS = ["out"]
