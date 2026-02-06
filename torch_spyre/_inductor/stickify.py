@@ -118,11 +118,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     raise Unsupported(
                         f"size mismatch:  {op}({x.layout.size})=>{output.size}) "
                     )
-                if not x.layout.dtype == output.dtype:
-                    raise Unsupported(f"stickify for type conversions {op}")
-                stl = SpyreTensorLayout(
-                    x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
-                )
+                # FIXME: Blindly using dense generic stick layout. Should derive from inputs
+                stl = SpyreTensorLayout(output.size, output.dtype)
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
@@ -186,7 +183,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             raise Unsupported(
                 f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
             )
-        if x_stl.dim_map() != y_stl.dim_map():
+        if x_stl.dim_map != y_stl.dim_map:
             raise Unsupported(f"{red.reduction_type} layout mismatch {x_stl} {y_stl}")
         # TODO: FIXME forcing generic stick layout. Should compute the output device_size and dim_map directly from input STL
         stl = SpyreTensorLayout(output.size, output.dtype)
