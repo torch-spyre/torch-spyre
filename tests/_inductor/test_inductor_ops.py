@@ -174,11 +174,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_0": (0, cached_randn((63, 129))),
                 "2d_1": (1, cached_randn((63, 129))),
-                "2d_01": ((0, 1), cached_randn((63, 129))),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "2d_01": ((0, 1), cached_randn((63, 129))),
                 "3d_0": (0, cached_randn((3, 7, 9))),
                 "3d_1": (1, cached_randn((3, 7, 9))),
                 "3d_2": (2, cached_randn((3, 7, 9))),
-                "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
             },
         },
         ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -267,7 +269,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     cached_randn((67, 71, 256), scale=0.01),
                 ),  # sparse tensor output
-                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
                 # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)), # spyre scalar represented as 1d instead of 0d
             },
         },
@@ -278,15 +281,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
                 "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
-                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "2d_dim_01": ([0, 1], cached_randn((67, 256))),
                 "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.1)),
                 "3d_dim_2": (
                     2,
                     cached_randn((67, 71, 256), scale=0.1),
                 ),  # sparse tensor output
-                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
-                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
+                # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
             },
         },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
