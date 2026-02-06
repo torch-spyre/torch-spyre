@@ -512,13 +512,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "dsType_": tensor["ds_type"],
                                 "scale_": [
                                     (
-                                        # tensor["scale"][di.index]
                                         di.scale
                                         # TODO: revisit whether this special case can be removed
                                         #       pending change in deeptools
                                         if not (
                                             di.label == "out"
-                                            # and tensor["scale"][di.index] == -1
                                             and di.scale == -1
                                         )
                                         else -2
