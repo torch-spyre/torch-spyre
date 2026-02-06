@@ -106,9 +106,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             case aten.clone.default:
                 if is_sparse(x_stl):
                     raise Unsupported("clone on sparse tensor")
-                stl = SpyreTensorLayout(
-                    x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
-                )
+                # FIXME: Blindly using dense generic stick layout. Should derive from inputs
+                stl = SpyreTensorLayout(output.size, output.dtype)
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
