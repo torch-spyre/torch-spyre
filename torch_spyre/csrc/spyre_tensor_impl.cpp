@@ -138,6 +138,12 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     }
   }
 
+  // Special case: a tensor all of whose dimensions are size 1 keeps dim 0
+  if ((filtered_dim_order.size() == 0) ||
+      ((filtered_dim_order.size() == 1) && (filtered_dim_order.back() == -1))) {
+    filtered_dim_order.insert(filtered_dim_order.begin(), 0);
+  }
+
   // Computing tiling
   this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
   this->device_size.resize(this->dim_map.size());
