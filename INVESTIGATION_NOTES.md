@@ -19,8 +19,9 @@ The segmentation fault stems from a **use-after-free vulnerability** in the glob
 1. When Python shuts down, the global `unique_ptr<SpyreAllocator>` may be destroyed
 2. **BUT** some tensor storage objects still have pending `ReportAndDelete` callbacks
 3. These callbacks try to access the already-destroyed allocator's members:
+   
    ```cpp
-   static void ReportAndDelete(void* ctx_void) {
+static void ReportAndDelete(void* ctx_void) {
      VFSpyreAllocator* allocator = instance_ptr.load();
      // <-- allocator might be nullptr here (OK)
      // BUT if it's not nullptr, it might point to freed memory (NOT OK)
@@ -43,14 +44,16 @@ The VF allocator is particularly vulnerable because:
    - ReportAndDelete tries to use these stale pointers
 
 3. **Destructor Implementation** (lines 851-853):
+   
    ```cpp
-   ~VFSpyreAllocator() override {
+~VFSpyreAllocator() override {
      instance_ptr.store(nullptr, std::memory_order_release);  // Just sets to nullptr
      // NO cleanup of segments, ctx_to_block, or other state!
    }
    ```
-   - Destructor only clears `instance_ptr`, doesn't clean up resources properly
-   - Doesn't drain pending operations or callbacks
+
+- Destructor only clears `instance_ptr`, doesn't clean up resources properly
+- Doesn't drain pending operations or callbacks
 
 ## Files Involved
 
@@ -73,6 +76,7 @@ The VF allocator is particularly vulnerable because:
 **Problem**: Accessing `allocator->allocator_mutex` and `allocator->` members after allocator destruction
 
 **Solution**: Add robust null/validity checks:
+
 ```cpp
 static void ReportAndDelete(void* ctx_void) {
   if (!ctx_void) return;
@@ -105,6 +109,7 @@ static void ReportAndDelete(void* ctx_void) {
 **Problem**: Destructor doesn't clean up resources properly
 
 **Solution**: Implement proper cleanup:
+
 ```cpp
 ~VFSpyreAllocator() override {
   {
@@ -124,6 +129,7 @@ static void ReportAndDelete(void* ctx_void) {
 **Problem**: No way to know if allocator is in process of being destroyed
 
 **Solution**: Add a validity flag:
+
 ```cpp
 struct VFSpyreAllocator final : public SpyreAllocator {
  private:
@@ -161,6 +167,7 @@ struct VFSpyreAllocator final : public SpyreAllocator {
 **Problem**: Global unique_ptr destruction is unpredictable
 
 **Solution**: Use a controlled shutdown mechanism:
+
 ```cpp
 // Add a function to safely shutdown the allocator
 void safe_shutdown_allocator() {
@@ -186,6 +193,7 @@ void safe_shutdown_allocator() {
 ## Testing
 
 After implementing fixes, verify with:
+
 ```bash
 FLEX_DEVICE=VF python -m pytest tests/test_vf_allocator_standalone.py -v
 FLEX_DEVICE=VF python tests/test_vf_allocator_standalone.py TestVFAllocatorStandalone.test_realistic_allocation_pattern
