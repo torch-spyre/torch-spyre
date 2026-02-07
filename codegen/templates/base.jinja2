@@ -24,10 +24,10 @@ def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length >
     {% endif %}
     {% if "out" in overload_name %}
     # Out variant
-    compiled_{{ template_data.base_op_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
-    return compiled_{{ template_data.base_op_name }}({{ arg_names }}, out=out)
+    compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
+    return compiled_{{ operator_name }}({{ arg_names }}, out=out)
     {% else %}
     # Standard variant
-    compiled_{{ template_data.base_op_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
-    return compiled_{{ template_data.base_op_name }}({{ arg_names }})
+    compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
+    return compiled_{{ operator_name }}({{ arg_names }})
     {% endif %}

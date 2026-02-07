@@ -169,6 +169,7 @@ def convert_cpp_type_to_python(cpp_type):
         "Scalar": "Union[int, float, bool, complex]",
         "IntArrayRef": "list[int]",
         "c10::string_view": "str",
+        "DimnameList": "list[str]",
         "Dimname": "str",
     }
 
@@ -204,40 +205,6 @@ def get_argument_names(arguments, schema_string):
         else:
             names.append(arg["name"])
     return ", ".join(names)
-
-
-def extract_base_op_name(op_name):
-    """
-    Extract base operation name without suffixes.
-
-    Example:
-        "mm_out" -> "mm"
-        "add_" -> "add"
-        "relu" -> "relu"
-    """
-    # Remove common suffixes
-    base_name = op_name
-
-    strip_list = [
-        "_Scalar",
-        "_names",
-        "_out",
-        "_Tensor",
-        "_default",
-        "_mode",
-        "_dims",
-        "_dimname",
-        "_dim",
-        "_Dimname",
-        "_int",
-    ]
-    for st in strip_list:
-        if st in base_name:
-            base_name = base_name.replace(st, "")
-    if base_name.endswith("_"):
-        base_name = base_name[:-1]
-
-    return base_name
 
 
 def append_scalar_suffix(arg_names: str, scalar_arg_names: List[str]) -> str:
@@ -287,11 +254,6 @@ def enhance_replacement_data(rep_data):
     rep_data["arg_names"] = append_scalar_suffix(
         rep_data["arg_names"], rep_data["scalar_arg_names"]
     )
-
-    # Extract base operation name
-    if "template_data" in rep_data:
-        op_name = rep_data["template_data"].get("op_name", "")
-        rep_data["template_data"]["base_op_name"] = extract_base_op_name(op_name)
 
     return rep_data
 
@@ -474,11 +436,7 @@ def generate_replacements(
                             declaration["returns"][i]["stride"] = output_shape_stride[
                                 "stride"
                             ]
-        # print("Before ")
-        # print(declaration)
         declaration = enhance_replacement_data(declaration)
-        # print("After ")
-        # print(declaration)
         replacements.append(declaration)
 
     print(f"{num_supported_decs} of {num_total_decs} declarations are supported.")

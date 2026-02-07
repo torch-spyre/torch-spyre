@@ -85,7 +85,7 @@
   template_name: base
 - operator_name: sigmoid
   template_name: base
-  torch_prefix: torch.nn.functional
+  torch_prefix: torch.ops.aten
 - operator_name: silu
   template_name: base
   torch_prefix: torch.nn.functional
@@ -99,6 +99,8 @@
 - operator_name: stack
   template_name: base
 - operator_name: sub
+  template_name: base
+- operator_name: sum
   template_name: base
 - operator_name: t
   template_name: view

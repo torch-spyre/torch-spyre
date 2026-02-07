@@ -242,7 +242,6 @@ class TestOps(TestCase):
             y, torch.reciprocal(x), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.expectedFailure
     def test_sigmoid(self):
         x = torch.tensor([-2, 1, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
@@ -419,7 +418,6 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Debug accuracy error")
     def test_matmul_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -435,7 +433,6 @@ class TestOps(TestCase):
             z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("TODO: Debug accuracy error")
     def test_matmul_cb_ba(self):
         B = 1
         x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
@@ -471,7 +468,6 @@ class TestOps(TestCase):
             atol=self.atol,
         )
 
-    @unittest.skip("TODO: Implement aten::sum.IntList_out in eager codegen")
     def test_sum(self):
         x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
         x_spyre = x.to("spyre")
@@ -480,7 +476,6 @@ class TestOps(TestCase):
             y0, torch.sum(x, dim=[0]), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("TODO: Debug softmax codegen for eager")
     def test_softmax(self):
         x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
         x_spyre = x.to("spyre")
