@@ -179,8 +179,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_0": (0, cached_randn((3, 7, 9))),
                 "3d_1": (1, cached_randn((3, 7, 9))),
                 "3d_2": (2, cached_randn((3, 7, 9))),
-#                "3d_01": ((0, 1), cached_randn((3, 7, 9))),
-#                "3d_12": ((1, 2), cached_randn((3, 7, 9))),
+                "3d_01": ((0, 1), cached_randn((3, 7, 9))),
+                "3d_12": ((1, 2), cached_randn((3, 7, 9))),
                 # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
                 # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
             },

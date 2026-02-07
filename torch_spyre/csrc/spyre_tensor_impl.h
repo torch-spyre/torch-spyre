@@ -28,6 +28,8 @@
 namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
+std::vector<int32_t> get_generic_stick_layout(
+    std::vector<int32_t> host_dim_order);
 
 class SpyreTensorLayout {
  public:
@@ -98,6 +100,11 @@ class SpyreTensorLayout {
 
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);
+  }
+
+  std::vector<int32_t> get_generic_stick_layout(
+      std::vector<int32_t> host_dim_order) {
+    return spyre::get_generic_stick_layout(host_dim_order);
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
