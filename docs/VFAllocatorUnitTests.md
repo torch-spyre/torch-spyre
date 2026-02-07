@@ -298,6 +298,9 @@ FLEX_DEVICE=VF ./build/test_vf_allocator
 ```
 Running VF Allocator C++ Unit Tests
 ====================================
+Mode: Standalone (no external dependencies)
+  To use gtest: compile with -DUSE_GTEST and link gtest
+  To use module.h structs: compile with -DUSE_MODULE_H
 
 Running FreeIntervalOrdering... PASSED
 Running BlockInfoCreation... PASSED
@@ -306,6 +309,42 @@ Running AlignmentCalculation... PASSED
 Running FreeIntervalMerging... PASSED
 
 Results: 5 passed, 0 failed
+```
+
+### Option 2: With Google Test (Recommended for CI)
+
+Use the standard gtest framework for integration with CI systems:
+
+**Compilation:**
+
+```bash
+g++ -std=c++17 -DTEST_VF_ALLOCATOR -DUSE_GTEST \
+    torch_spyre/csrc/test_vf_allocator.cpp \
+    -lgtest -lgtest_main -pthread \
+    -o build/test_vf_allocator_gtest
+```
+
+### Option 3: With Module.h Structs
+
+Use actual struct definitions from `module.h` for validation:
+
+```bash
+g++ -std=c++17 -DTEST_VF_ALLOCATOR -DUSE_MODULE_H \
+    -I/path/to/torch-spyre/torch_spyre/csrc \
+    -I/path/to/flex/include \
+    torch_spyre/csrc/test_vf_allocator.cpp \
+    -o build/test_vf_allocator_integrated
+```
+
+### Option 4: SpyreAllocator Integration Tests
+
+For tests that require the full SpyreAllocator, enable integration mode:
+
+```bash
+# Requires full build system with Flex runtime linked
+cmake -DBUILD_TESTING=ON -DTEST_SPYRE_ALLOCATOR_INTEGRATION=ON ..
+make test_vf_allocator
+./test_vf_allocator
 ```
 
 ## Key Testing Patterns

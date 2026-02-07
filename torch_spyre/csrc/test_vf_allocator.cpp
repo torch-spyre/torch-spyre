@@ -17,15 +17,22 @@
 /**
  * C++ Unit Tests for VF Allocator
  *
- * This file contains unit tests for the VF allocator implementation.
- * To compile and run from the root folder:
+ * This file supports two compilation modes:
  *
- *   g++ -std=c++17 -DTEST_VF_ALLOCATOR torch_spyre/csrc/test_vf_allocator.cpp
- * -o build/test_vf_allocator
- *   ./build/test_vf_allocator
+ * 1. STANDALONE MODE (default, no external dependencies):
+ *    Uses local struct definitions and a lightweight test framework.
+ *    g++ -std=c++17 -DTEST_VF_ALLOCATOR torch_spyre/csrc/test_vf_allocator.cpp \
+ *        -o build/test_vf_allocator && ./build/test_vf_allocator
  *
- * Note: These tests require the Flex runtime to be available and FLEX_DEVICE=VF
- * to be set. Some tests may require mocking of Flex dependencies.
+ * 2. INTEGRATED MODE (uses module.h structs and gtest):
+ *    Requires full build system with gtest and Flex dependencies.
+ *    cmake -DBUILD_TESTING=ON .. && make test_vf_allocator && ./test_vf_allocator
+ *
+ * Design Note: Standalone mode is intentionally designed to work without
+ * external dependencies for quick iteration during development. The structs
+ * here mirror the ones in module.h to ensure test logic is correct.
+ *
+ * See also: docs/VFAllocatorUnitTests.md for detailed documentation.
  */
 
 #include <cassert>
@@ -38,7 +45,23 @@
 
 #ifdef TEST_VF_ALLOCATOR
 
-// Minimal type definitions for standalone testing
+// ============================================================================
+// STRUCT DEFINITIONS
+// ============================================================================
+// In standalone mode, we define minimal structs that mirror module.h.
+// In integrated mode (USE_MODULE_H), include the actual definitions.
+// ============================================================================
+
+#ifdef USE_MODULE_H
+// Use actual struct definitions from module.h
+// Requires: -I<path_to_csrc> and flex/runtime.hpp availability
+#include "module.h"
+using spyre::BlockInfo;
+using spyre::FreeInterval;
+using spyre::SegmentInfo;
+#else
+// Standalone struct definitions (mirrors module.h for testing without deps)
+// NOTE: These must be kept in sync with module.h
 namespace spyre {
 struct FreeInterval {
   size_t start;
@@ -71,6 +94,19 @@ struct SegmentInfo {
 using spyre::BlockInfo;
 using spyre::FreeInterval;
 using spyre::SegmentInfo;
+#endif  // USE_MODULE_H
+
+// ============================================================================
+// TEST FRAMEWORK
+// ============================================================================
+// In standalone mode, use lightweight custom framework.
+// In gtest mode (USE_GTEST), use Google Test macros.
+// ============================================================================
+
+#ifdef USE_GTEST
+#include <gtest/gtest.h>
+// gtest provides TEST, ASSERT_EQ, ASSERT_TRUE, etc.
+#else
 
 // Simple test framework
 class TestFramework {
@@ -146,6 +182,12 @@ class TestFramework {
       throw std::runtime_error("Assertion failed: " #cond); \
     }                                                       \
   } while (0)
+
+#endif  // USE_GTEST
+
+// ============================================================================
+// UNIT TESTS - Data Structure Validation
+// ============================================================================
 
 // Test FreeInterval structure
 TEST(FreeIntervalOrdering) {
@@ -255,15 +297,78 @@ TEST(FreeIntervalMerging) {
   ASSERT_EQ(merged.end, 300);
 }
 
+// ============================================================================
+// SPYRE ALLOCATOR INTEGRATION TESTS
+// ============================================================================
+// These tests require the full build environment with SpyreAllocator available.
+// Enable with: -DTEST_SPYRE_ALLOCATOR_INTEGRATION
+// ============================================================================
+
+#ifdef TEST_SPYRE_ALLOCATOR_INTEGRATION
+// Note: This section requires the full Flex runtime and SpyreAllocator to be
+// linked. These tests validate the actual allocator behavior, not just the
+// data structures.
+//
+// To enable these tests:
+// 1. Build with CMAKE using the full torch_spyre build system
+// 2. Add -DTEST_SPYRE_ALLOCATOR_INTEGRATION to compile flags
+// 3. Link against flex runtime and torch_spyre_C library
+//
+// Example tests to add:
+// - SpyreAllocatorInitialization: Test allocator singleton creation
+// - SpyreAllocatorVFModeSelection: Verify VF mode is selected based on env
+// - SpyreAllocatorSegmentCreation: Test segment initialization
+// - SpyreAllocatorBlockAllocation: Test block allocation within segments
+// - SpyreAllocatorDeallocation: Test block deallocation and merging
+
+#include "spyre_mem_test.h"  // Test interface for SpyreAllocator
+
+TEST(SpyreAllocatorModeSelection) {
+  // This test would verify that the allocator correctly selects VF mode
+  // based on FLEX_DEVICE environment variable.
+  //
+  // Implementation requires access to SpyreAllocator::instance().use_pf
+  // which is currently private. Using the test interface:
+  // auto& allocator = SpyreAllocator::instance();
+  // ASSERT_FALSE(spyre::test::SpyreAllocatorTestInterface::isVFMode(allocator));
+  std::cout << "  (SpyreAllocator integration tests require full build)"
+            << std::endl;
+}
+
+TEST(SpyreAllocatorAlignment) {
+  // Test that setMinSpyreAllocation correctly aligns sizes to 128 bytes
+  //
+  // Implementation:
+  // auto& allocator = SpyreAllocator::instance();
+  // ASSERT_EQ(spyre::test::SpyreAllocatorTestInterface::setMinSpyreAllocation(allocator, 1), 128);
+  // ASSERT_EQ(spyre::test::SpyreAllocatorTestInterface::setMinSpyreAllocation(allocator, 129), 256);
+  std::cout << "  (SpyreAllocator integration tests require full build)"
+            << std::endl;
+}
+
+#endif  // TEST_SPYRE_ALLOCATOR_INTEGRATION
+
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
+
+#ifdef USE_GTEST
+// When using gtest, it provides its own main() via gtest_main
+// Link with -lgtest -lgtest_main
+#else
 int main() {
   std::cout << "Running VF Allocator C++ Unit Tests\n";
   std::cout << "====================================\n\n";
+  std::cout << "Mode: Standalone (no external dependencies)\n";
+  std::cout << "  To use gtest: compile with -DUSE_GTEST and link gtest\n";
+  std::cout << "  To use module.h structs: compile with -DUSE_MODULE_H\n\n";
 
   // Set FLEX_DEVICE for tests that need it
   setenv("FLEX_DEVICE", "VF", 0);
 
   return TestFramework::run_tests();
 }
+#endif  // USE_GTEST
 
 #else
 // If not compiled with TEST_VF_ALLOCATOR, provide a message

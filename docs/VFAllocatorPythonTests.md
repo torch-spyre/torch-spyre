@@ -64,15 +64,15 @@ y = x.to("cpu")
 
 ## Test Categories
 
-The 16 tests are organized into three categories:
+The 18 tests are organized into four categories:
 
 ### 1. **Initialization & Device Management** (3 tests)
-- `test_vf_mode_detection` - Environment variable detection
+- `test_vf_mode_detection` - Environment variable and VF mode verification
 - `test_basic_allocation` - Simple tensor creation
 - `test_zero_size_allocation` - Empty tensor handling
 
 ### 2. **Memory Management** (8 tests)
-- `test_allocation_alignment` - 128-byte alignment verification
+- `test_allocation_alignment` - 128-byte alignment verification (parameterized by dtype)
 - `test_memory_reuse` - Deallocation and reallocation patterns
 - `test_sequential_allocation_deallocation` - Sequential patterns
 - `test_interleaved_allocations` - Sparse deallocation patterns
@@ -87,6 +87,10 @@ The 16 tests are organized into three categories:
 - `test_large_tensor_allocation` - Large memory allocations
 - `test_tensor_operations_with_vf_allocator` - Tensor arithmetic
 - `test_realistic_allocation_pattern` - Real-world scenario
+
+### 4. **Error Handling & Limits** (2 tests)
+- `test_oom_error_handling` - Out-of-memory error handling
+- `test_memory_limit_then_free` - Memory limit stress test with deallocation
 
 ## Building and Running
 
@@ -656,6 +660,64 @@ self.assertEqual(k.device.type, "spyre")
 ---------- verify all tensors are still valid -------------
 All tensors verified successfully!
 ```
+
+---
+
+### 18. **test_oom_error_handling**
+**Purpose:** Test error handling when requesting more memory than available.
+
+**Implementation:**
+
+```python
+def test_oom_error_handling(self):
+    segment_size_bytes = 12 * 1024 * 1024 * 1024  # 12GB
+    oversized_elements = (segment_size_bytes // 2) + 1
+
+    with self.assertRaises(RuntimeError) as context:
+        torch.empty(oversized_elements + (1024 * 1024 * 1024), device="spyre", dtype=torch.float16)
+
+    self.assertTrue("allocation" in str(context.exception).lower() or
+                    "memory" in str(context.exception).lower())
+```
+
+**What It Tests:**
+- Error handling for allocation requests larger than segment size
+- Proper exception raising with meaningful error messages
+- Graceful failure without crashes
+
+---
+
+### 19. **test_memory_limit_then_free**
+**Purpose:** Test allocation near memory limit, then freeing to verify no OOM.
+
+**Implementation:**
+
+```python
+def test_memory_limit_then_free(self):
+    one_gb_elements = 512 * 1024 * 1024  # 1GB for float16
+    large_tensors = []
+
+    # Allocate 4 x 1GB tensors
+    for i in range(4):
+        t = torch.empty(one_gb_elements, device="spyre", dtype=torch.float16)
+        large_tensors.append(t)
+
+    # Free all tensors
+    del large_tensors
+    gc.collect()
+
+    # Should be able to allocate again without OOM
+    for i in range(4):
+        t = torch.empty(one_gb_elements, device="spyre", dtype=torch.float16)
+        del t
+        gc.collect()
+```
+
+**What It Tests:**
+- Large allocation near memory limits
+- Memory is properly freed and reusable
+- No memory leaks from large allocations
+- Allocator stability under memory pressure
 
 ---
 

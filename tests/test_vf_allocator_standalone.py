@@ -52,18 +52,48 @@ if FLEX_DEVICE != "VF":
     sys.exit(0)
 
 import torch  # noqa: E402
+import torch_spyre  # noqa: E402
 
 
 class TestVFAllocatorStandalone(unittest.TestCase):
     """Standalone test suite for VF allocator - can be run without pytest."""
 
+    _original_flex_device = None
+
+    @classmethod
+    def setUpClass(cls):
+        """Save original FLEX_DEVICE value and ensure VF mode is set."""
+        cls._original_flex_device = os.environ.get("FLEX_DEVICE")
+        os.environ["FLEX_DEVICE"] = "VF"
+
+    @classmethod
+    def tearDownClass(cls):
+        """Restore original FLEX_DEVICE value."""
+        if cls._original_flex_device is not None:
+            os.environ["FLEX_DEVICE"] = cls._original_flex_device
+        elif "FLEX_DEVICE" in os.environ:
+            del os.environ["FLEX_DEVICE"]
+
     def test_vf_mode_detection(self):
-        """Test that VF mode is correctly detected from environment variable."""
+        """Test that VF mode is correctly detected from environment variable.
+
+        Note: Currently the allocator mode is determined by the FLEX_DEVICE environment
+        variable at allocator initialization time. The allocator's use_pf flag is set
+        based on this variable. A future enhancement would be to expose an API like
+        `torch_spyre.get_allocator_mode()` to verify the allocator mode at runtime.
+        See: https://github.com/torch-spyre/torch-spyre/pull/448 for discussion.
+        """
+        # Verify environment variable is set correctly
         self.assertEqual(os.environ.get("FLEX_DEVICE"), "VF")
 
-        # Create a tensor to verify allocator works
+        # Create a tensor to verify allocator works in VF mode
         x = torch.empty(10, device="spyre", dtype=torch.float16)
         self.assertEqual(x.device.type, "spyre")
+
+        # VF mode verification: allocations should be aligned to 128 bytes
+        # (this is a VF mode characteristic)
+        storage_size = x.untyped_storage().nbytes()
+        self.assertEqual(storage_size % 128, 0, "VF mode requires 128-byte alignment")
 
     def test_basic_allocation(self):
         """Test basic memory allocation in VF mode."""
@@ -76,17 +106,26 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         self.assertGreaterEqual(storage_size, 128)
 
     def test_allocation_alignment(self):
-        """Test that allocations are aligned to 128 bytes."""
+        """Test that allocations are aligned to 128 bytes across different dtypes."""
         test_sizes = [1, 50, 100, 127, 128, 129, 200, 255, 256]
+        test_dtypes = [
+            torch.float16,
+            torch.float32,
+            torch.int32,
+            torch.bool,
+        ]
 
-        for size in test_sizes:
-            x = torch.empty(size, device="spyre", dtype=torch.float16)
-            storage_size = x.untyped_storage().nbytes()
-            self.assertEqual(
-                storage_size % 128,
-                0,
-                f"Allocation size {storage_size} for tensor size {size} is not aligned to 128 bytes",
-            )
+        for dtype in test_dtypes:
+            for size in test_sizes:
+                with self.subTest(dtype=dtype, size=size):
+                    x = torch.empty(size, device="spyre", dtype=dtype)
+                    storage_size = x.untyped_storage().nbytes()
+                    self.assertEqual(
+                        storage_size % 128,
+                        0,
+                        f"Allocation size {storage_size} for tensor size {size} "
+                        f"(dtype={dtype}) is not aligned to 128 bytes",
+                    )
 
     def test_memory_reuse(self):
         """Test that deallocated memory can be reused for new allocations."""
@@ -174,7 +213,7 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         large = torch.empty(3000, device="spyre", dtype=torch.float16)
         self.assertEqual(large.numel(), 3000)
 
-    def test_tensor_operations_with_vf_allocator(self):
+    def test_zzz_tensor_operations_with_vf_allocator(self):
         """Test that tensor operations work correctly with VF allocator."""
         # Create tensors on CPU first, then move to spyre device
         x = torch.randn(100, dtype=torch.float16).to("spyre")
@@ -349,6 +388,56 @@ class TestVFAllocatorStandalone(unittest.TestCase):
         self.assertEqual(tensor_l.device.type, "spyre")
         self.assertEqual(f.device.type, "spyre")
         print("All tensors verified successfully!")
+
+    def test_oom_error_handling(self):
+        """Test error handling when requesting more memory than available.
+
+        This test verifies that the allocator properly raises an exception
+        when memory request exceeds available segment size.
+        """
+        # VF allocator has 12GB segments. Try to allocate more than segment size.
+        # Single segment max is 12GB, so request larger than that.
+        segment_size_bytes = 12 * 1024 * 1024 * 1024  # 12GB
+        oversized_elements = (segment_size_bytes // 2) + 1  # float16 = 2 bytes
+
+        with self.assertRaises(RuntimeError) as context:
+            # This should fail because single allocation > segment size
+            torch.empty(oversized_elements + (1024 * 1024 * 1024), device="spyre", dtype=torch.float16)
+
+        # Verify error message mentions allocation failure
+        self.assertTrue(
+            "allocation" in str(context.exception).lower()
+            or "memory" in str(context.exception).lower()
+            or "segment" in str(context.exception).lower(),
+            f"Expected OOM-related error message, got: {context.exception}",
+        )
+
+    def test_memory_limit_then_free(self):
+        """Test allocation near memory limit, then freeing to verify no OOM.
+
+        This test fills up a significant portion of memory, then deallocates
+        and reallocates to ensure freed memory can be reused.
+        """
+        # Allocate several large tensors (each 1GB)
+        one_gb_elements = 512 * 1024 * 1024  # 1GB for float16 (2 bytes each)
+        large_tensors = []
+
+        # Allocate 4 x 1GB tensors
+        for i in range(4):
+            t = torch.empty(one_gb_elements, device="spyre", dtype=torch.float16)
+            self.assertEqual(t.device.type, "spyre")
+            large_tensors.append(t)
+
+        # Free all tensors
+        del large_tensors
+        gc.collect()
+
+        # Should be able to allocate again without OOM
+        for i in range(4):
+            t = torch.empty(one_gb_elements, device="spyre", dtype=torch.float16)
+            self.assertEqual(t.device.type, "spyre")
+            del t
+            gc.collect()
 
 
 if __name__ == "__main__":
