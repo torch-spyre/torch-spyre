@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-// cpplint: disable=readability/braces
-
 #include "spyre_mem.h"
 
 #include <ATen/EmptyTensor.h>
@@ -30,6 +28,7 @@
 #include <util/sen_data_convert.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>  // check env vars
 #include <flex/flex_graph_builder.hpp>
@@ -40,7 +39,6 @@
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
-#include <stdexcept>  // throw exceptions
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -48,6 +46,7 @@
 
 #include "logging.h"
 #include "module.h"
+#include "spyre_allocator.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_storage_impl.h"
 #include "spyre_tensor_impl.h"
@@ -67,7 +66,6 @@ struct DMAParameters {
   const int64_t size_bytes;
   const off64_t src_offset;
   const off64_t dst_offset;
-  // NOLINTNEXTLINE(readability/braces)
 };
 /*
  * CPU stride for a dimension.
@@ -350,7 +348,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::Segment::INVALID,
       sendnn::Segment::INVALID,
       sendnn::Segment::PROGRAM(128),
-  };  // NOLINT
+  };
   // STAGE 2: SenSuperNodeV2 graph
   sendnn::Graph sn_graph;  // sn = supernode
   {                        // SenSuperNodeV2 graph
@@ -419,43 +417,27 @@ auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
 }
 
 // A custom allocator for our custom device, what returns is a handle to the
-// Forward declaration for test interface
-namespace spyre {
-namespace test {
-class SpyreAllocatorTestInterface;
-}  // namespace test
-}  // namespace spyre
-
 // allocated memory not the actual pointer
-struct SpyreAllocator final : public at::Allocator {
-  // Allow test interface to access private members
-  friend class spyre::test::SpyreAllocatorTestInterface;
 
- private:
+// Forward declarations for derived allocator classes
+struct PFSpyreAllocator;
+struct VFSpyreAllocator;
+
+// Base allocator class, no longer final to allow inheritance
+struct SpyreAllocator : public at::Allocator {
+ protected:
+  bool alloc_debug = false;  // control debug printouts
+
+  static constexpr size_t MAX_SEGMENTS = 12;      // NOTE: limit to be defined
+  static constexpr size_t MIN_ALLOC_BYTES = 128;  // Spyre requirement
+
   flex::DeviceMemoryAllocatorPtr getAllocator(unsigned int dev_id) {
     return GlobalRuntime::get()
         ->GetDeviceHandle(dev_id)
         ->GetDeviceMemoryAllocator();
   }
 
-  bool use_pf = false;       // PF or VF Mode
-  bool alloc_debug = false;  // control debug printouts
-
-  // Segments and Blocks storage/handling
-  std::vector<MemorySegment> segments;
-  size_t segment_size;
-  int n_segments;
-  std::unordered_map<SharedOwnerCtx*, MemorySegment*> block_to_segment;
-
-  // Mutex to protect shared state in VF mode
-  mutable std::mutex allocator_mutex;
-
-  // Segment size fixed to 12 GB for now (14 fails)
-  static constexpr size_t DEFAULT_SEGMENT_SIZE = 12ULL * 1024 * 1024 * 1024;
-  static constexpr size_t DEFAULT_N_SEGMENTS = 8;
-  static constexpr size_t MIN_ALLOC_BYTES = 128;  // Spyre requirement
-
-  bool is_pf_mode() {
+  static bool is_pf_mode() {
     const char* fmode_envvar = std::getenv("FLEX_DEVICE");
     TORCH_CHECK(fmode_envvar != nullptr, "FLEX_DEVICE env var is not set!")
 
@@ -469,7 +451,7 @@ struct SpyreAllocator final : public at::Allocator {
     }
   }
 
-  bool is_alloc_debug() {
+  static bool is_alloc_debug() {
     const char* alloc_envvar = std::getenv("TORCH_SPYRE_ALLOC_DEBUG");
     if (alloc_envvar == nullptr) return false;
 
@@ -477,28 +459,63 @@ struct SpyreAllocator final : public at::Allocator {
     return alloc_debug_str == "1";
   }
 
-  SpyreAllocator(size_t seg_sz = DEFAULT_SEGMENT_SIZE,
-                 int n_seg = DEFAULT_N_SEGMENTS)
-      : segment_size(seg_sz), n_segments(n_seg) {
-    /* This constructor determines if using VF of PF mode based on FLEX_DEVICE
-     * env var. Alternatively to the following method, we could check if
-     * allocator attribute vfw_ is nullptr. If so, PF is in use, otherwise VF.
-     * However, this requires allocator object of type
-     * flex::DeviceMemoryAllocatorPtr to exist, which doesn't yet in this
-     * constructor. Can be checked within allocate() method though. However,
-     * vfw_ is private and needs a getter created in Flex.
-     */
-
-    use_pf = is_pf_mode();
+  SpyreAllocator() {
     alloc_debug = is_alloc_debug();
   }
 
-  at::DataPtr pf_allocation(flex::DeviceMemoryAllocatorPtr allocator,
-                            size_t nbytes, c10::Device curr_device,
-                            unsigned int device_id) {
+ public:
+  virtual ~SpyreAllocator() = default;
+
+  // A PyTorch Allocator interface method that returns a function pointer
+  // for deallocating memory when only the data pointer is available (without
+  // context). Placeholder implementation. To implement this, we first need to
+  // create a runtime interface that can correctly free an allocation only
+  // based on the data ptr, without the allocation idx from the context
+  at::DeleterFnPtr raw_deleter() const override {
+    return nullptr;
+  }
+
+  // A PyTorch Allocator interface method for copying data between allocations
+  // managed by this allocator. Placeholder implementation.
+  void copy_data(void* dest, const void* src,
+                 std::size_t count) const override {
+    py::gil_scoped_acquire acquire;  // Python thread-safety mechanism
+    DEBUGINFO("entering allocator->copy_data method");
+    // do nothing -- look into when this is called
+    // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
+    // reinterpret_cast<spyre_ptr_t>(src));
+  }
+
+  // Factory method to create the appropriate allocator
+  static SpyreAllocator& instance();
+};
+
+// PF (Physical Function) Allocator - simple direct allocation
+struct PFSpyreAllocator final : public SpyreAllocator {
+ private:
+  static void ReportAndDelete(void* ctx_void) {
+    /* Called when DataPtr is being deallocated in PF mode. */
+    if (!ctx_void) return;
+    auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
+    delete ctx;
+  }
+
+ public:
+  PFSpyreAllocator() : SpyreAllocator() {}
+
+  at::DataPtr allocate(size_t nbytes) override {
     /* PF allocation implementation. Functionalities are preserved exactly from
      * earlier iteration of the code (PF-only).
      */
+
+    c10::Device curr_device =
+        c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+            ->getDevice();
+    auto device_id = curr_device.index();
+    DEBUGINFO("allocating", nbytes, "bytes on Spyre", curr_device, "(PF mode)");
+    if (nbytes <= 0) return {nullptr, nullptr, &ReportAndDelete, curr_device};
+
+    auto allocator = getAllocator(device_id);
 
     DEBUGINFO("PF allocation");
     flex::DeviceMemoryAllocationPtr data;      // a smart-pointer object
@@ -513,73 +530,118 @@ struct SpyreAllocator final : public at::Allocator {
 
     return at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
   }
+};
 
-  at::DataPtr vf_allocation(flex::DeviceMemoryAllocatorPtr allocator,
-                            size_t nbytes, c10::Device curr_device,
-                            unsigned int device_id) {
-    /* VF allocation implementation. A fixed number of Segments are
-     * pre-allocated upon first call. Blocks are inserted into Segments
-     * following a memory-balanced strategy that relies on:
-     * - selecting the Segment with most available free memory
-     * - assigning a Block to the first (= lowest offset) free memory block that
-     *   can fit the requested allocation
-     * No further sub-Segment balancing is implemented at this time.
-     */
+// VF (Virtual Function) Allocator - complex segment-based allocation
+struct VFSpyreAllocator final : public SpyreAllocator {
+ private:
+  // Segments and Blocks storage/handling
+  std::vector<MemorySegment> segments;
+  std::unordered_map<SharedOwnerCtx*, MemorySegment*> block_to_segment;
 
-    std::lock_guard<std::mutex> lock(allocator_mutex);
+  // Dynamic allocation control
+  bool segments_locked;
+  std::vector<size_t> fallback_sizes;
+  size_t max_segments;
 
-    if (segments.empty())
-      initializeSegments(allocator);  // on-chip memory allocation request
+  // Mutex to protect shared state in VF mode
+  mutable std::mutex allocator_mutex;
 
-    size_t aligned_nbytes = setMinSpyreAllocation(nbytes);
-    AllocationInfo alloc_info = findFreeBlock(aligned_nbytes);
+  // Static atomic pointer to this instance for ReportAndDelete
+  static std::atomic<VFSpyreAllocator*> instance_ptr;
 
-    TORCH_CHECK(alloc_info.found,
-                "Unable to find enough free memory for allocation. All ",
-                n_segments, " segments are full.");
+  struct AllocationInfo {
+    MemorySegment* segment;
+    MemoryBlock block;
+    bool found;
+  };
 
-    MemoryBlock* new_block =
-        allocateInSegment(alloc_info.segment, alloc_info.block, aligned_nbytes);
+  static void ReportAndDelete(void* ctx_void) {
+    /* Called when DataPtr is being deallocated in VF mode. */
 
-    flex::DeviceMemoryAllocationPtr data = alloc_info.segment->data;
-    TORCH_CHECK(data, "Failed to allocate ", aligned_nbytes,
-                " bytes on Spyre device.");
+    if (!ctx_void) return;
 
-    if (alloc_debug)
-      logSegmentState(*alloc_info.segment, "After block allocation");
+    auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
+    // Atomic read to initialize allocator
+    VFSpyreAllocator* allocator = instance_ptr.load(std::memory_order_acquire);
 
-    // Instantiate object to live beyond SpyreAllocator scope
-    auto* ctx =
-        new SharedOwnerCtx{std::move(data), new_block->start, device_id};
-    void* ctx_void = static_cast<void*>(ctx);
-    void* data_void = static_cast<void*>(ctx->owner.get());
+    // Guard against dangling pointer if allocator was destroyed
+    if (!allocator) {
+      delete ctx;
+      return;
+    }
 
-    alloc_info.segment->ctx_to_block[ctx] = const_cast<MemoryBlock*>(new_block);
-    block_to_segment[ctx] = alloc_info.segment;
+    std::lock_guard<std::mutex> lock(allocator->allocator_mutex);
 
-    return at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
+    if (allocator->alloc_debug)
+      allocator->logAllSegments("Pre deallocation", true);
+
+    // Using lookup map for blocks into segments (O(1))
+    auto seg_it = allocator->block_to_segment.find(ctx);
+    if (seg_it != allocator->block_to_segment.end()) {
+      allocator->deallocateBlock(*seg_it->second, ctx);
+      allocator->block_to_segment.erase(seg_it);
+    }
+
+    if (allocator->alloc_debug)
+      allocator->logAllSegments("Post deallocation", true);
+
+    delete ctx;
   }
 
-  void initializeSegments(flex::DeviceMemoryAllocatorPtr allocator) {
-    /* Request memory allocation on Spyre for `n_segments` of size
-     * `segment_size`. */
+  bool allocateNewSegment(flex::DeviceMemoryAllocatorPtr allocator) {
+    /* Try to allocate a single new segment, attempting fallback sizes.
+     * Returns true if successful, false if all attempts fail or max reached. */
 
-    if (!segments.empty()) return;  // Already initialized
+    if (segments_locked) return false;
 
-    DEBUGINFO("Initializing", n_segments, "segments");
-
-    for (int i = 0; i < n_segments; i++) {
-      flex::DeviceMemoryAllocationPtr data;
-      allocator->TryAllocate(&data, segment_size,
-                             0);  // on-chip allocation request
-      TORCH_CHECK(data, "Failed to allocate segment ", i);
-      segments.emplace_back(data->AllocIndex(), segment_size);
-      segments.back().data = data;
-
-      // Initialize with one large free block covering entire segment
-      segments.back().blocks.insert(MemoryBlock{0, segment_size, true});
-      segments.back().free_sizes.insert(segment_size);
+    // Check if we've reached maximum number of segments
+    if (segments.size() >= max_segments) {
+      DEBUGINFO("Reached maximum number of segments (", max_segments,
+                "). Locking segments.");
+      segments_locked = true;
+      return false;
     }
+
+    for (size_t attempt_size : fallback_sizes) {
+      flex::DeviceMemoryAllocationPtr data;
+
+      try {
+        allocator->TryAllocate(&data, attempt_size, 0);
+      }
+      catch (const std::runtime_error& e) {
+        // VF allocation failed - try next fallback size
+        DEBUGINFO("TryAllocate failed for size", attempt_size, ":", e.what());
+        continue;
+      }
+
+      if (data) {
+        DEBUGINFO("Allocated new segment", segments.size() + 1, "of size",
+                  attempt_size, "bytes");
+        segments.emplace_back(data->AllocIndex(), attempt_size);
+        segments.back().data = data;
+
+        // Initialize with one large free block covering entire segment
+        segments.back().blocks.insert(MemoryBlock{0, attempt_size, true});
+        segments.back().free_sizes.insert(attempt_size);
+
+        // Check if we've now reached the maximum
+        if (segments.size() >= max_segments) {
+          DEBUGINFO("Reached maximum number of segments (", max_segments,
+                    "). Locking segments.");
+          segments_locked = true;
+        }
+
+        return true;
+      }
+    }
+
+    // All allocation attempts failed - lock segments
+    DEBUGINFO(
+        "Failed to allocate new segment with all fallback sizes. Locking "
+        "segments.");
+    segments_locked = true;
+    return false;
   }
 
   size_t setMinSpyreAllocation(size_t nbytes) const {
@@ -591,19 +653,34 @@ struct SpyreAllocator final : public at::Allocator {
     return nbytes;
   }
 
-  struct AllocationInfo {
-    MemorySegment* segment;
-    MemoryBlock block;
-    bool found;
-  };  // NOLINT(readability/braces)
-
-  AllocationInfo findFreeBlock(size_t nbytes) {
+  AllocationInfo findFreeBlock(size_t nbytes,
+                               flex::DeviceMemoryAllocatorPtr allocator) {
     /* Locate first memory block that can accommodate a block of size nbytes.
-     */
+     * Until segments are locked, always attempt to allocate a new segment
+     * first. Once locked, use load-balancing across existing segments. */
 
-    TORCH_CHECK(nbytes <= segment_size, "Requested allocation (", nbytes,
-                " bytes) exceeds segment size (", segment_size, " bytes)");
+    // Check if requested size is reasonable for largest fallback size
+    if (!fallback_sizes.empty()) {
+      size_t max_segment_size = fallback_sizes[0];
+      TORCH_CHECK(nbytes <= max_segment_size, "Requested allocation (", nbytes,
+                  " bytes) exceeds maximum segment size (", max_segment_size,
+                  " bytes)");
+    }
 
+    // If segments not locked, always try to allocate a new segment first
+    if (!segments_locked) {
+      if (allocateNewSegment(allocator)) {
+        // Use the newly allocated segment (it's the last one)
+        MemorySegment* new_seg = &segments.back();
+        for (const MemoryBlock& r : new_seg->blocks) {
+          if (r.is_free && r.size() >= nbytes) return {new_seg, r, true};
+        }
+      }
+      // If allocation failed, segments are now locked, fall through to load
+      // balancing
+    }
+
+    // Load-balancing: find segment with most free memory
     MemorySegment* best_seg = nullptr;
     size_t max_free_size = 0;
 
@@ -622,6 +699,7 @@ struct SpyreAllocator final : public at::Allocator {
     if (best_seg == nullptr)
       return {nullptr, {}, false};  // not enough free memory
 
+    // Find first-fit block in best segment
     for (const MemoryBlock& r : best_seg->blocks) {
       if (r.is_free && r.size() >= nbytes)
         return {best_seg, r, true};  // free block found
@@ -724,33 +802,6 @@ struct SpyreAllocator final : public at::Allocator {
     seg.ctx_to_block.erase(ctx_it);
   }
 
-  static void ReportAndDelete(void* ctx_void) {
-    /* Called when DataPtr is being deallocated. */
-
-    if (!ctx_void) return;
-
-    auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-    if (!SpyreAllocator::instance().use_pf) {
-      auto& allocator = SpyreAllocator::instance();
-      std::lock_guard<std::mutex> lock(allocator.allocator_mutex);
-
-      if (allocator.alloc_debug)
-        allocator.logAllSegments("Pre deallocation", true);
-
-      // Using lookup map for blocks into segments (O(1))
-      auto seg_it = allocator.block_to_segment.find(ctx);
-      if (seg_it != allocator.block_to_segment.end()) {
-        allocator.deallocateBlock(*seg_it->second, ctx);
-        allocator.block_to_segment.erase(seg_it);
-      }
-
-      if (allocator.alloc_debug)
-        allocator.logAllSegments("Post deallocation", true);
-    }
-
-    delete ctx;
-  }
-
   void logSegmentState(const MemorySegment& seg, const char* context,
                        bool include_blocks = false) {
     /* Log free and used memory in the specified Segment. */
@@ -788,47 +839,93 @@ struct SpyreAllocator final : public at::Allocator {
   }
 
  public:
-  static SpyreAllocator& instance() {
-    static SpyreAllocator allocator;
-    return allocator;
+  VFSpyreAllocator(size_t max_seg = MAX_SEGMENTS)
+      : SpyreAllocator(), segments_locked(false), max_segments(max_seg) {
+    // Initialize fallback sizes: 12GB, 8GB, 4GB
+    // NOTE: size selection to be defined
+    fallback_sizes = {12ULL * 1024 * 1024 * 1024, 8ULL * 1024 * 1024 * 1024,
+                      4ULL * 1024 * 1024 * 1024};
+    instance_ptr.store(this, std::memory_order_release);  // atomic write
+  }
+
+  ~VFSpyreAllocator() override {
+    instance_ptr.store(nullptr, std::memory_order_release);  // atomic write
   }
 
   at::DataPtr allocate(size_t nbytes) override {
-    /* Allocation entry point. Implement branching to PF or VF allocation. */
+    /* VF allocation implementation with dynamic segment allocation.
+     * Segments are allocated on-demand as needed. When a new segment cannot
+     * be allocated, the vectors of segments is locked and the allocator
+     * assigns blocks using load-balancing logic across existing segments,
+     * selecting the one with most free memory, and first-fit logic within
+     * each segment, occupying the first (= lowest offset) free block that
+     * can fit the requested allocation.
+     */
 
     c10::Device curr_device =
         c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
             ->getDevice();
     auto device_id = curr_device.index();
-    DEBUGINFO("allocating", nbytes, "bytes on Spyre", curr_device);
+    DEBUGINFO("allocating", nbytes, "bytes on Spyre", curr_device, "(VF mode)");
     if (nbytes <= 0) return {nullptr, nullptr, &ReportAndDelete, curr_device};
 
     auto allocator = getAllocator(device_id);
 
-    if (use_pf) {
-      return pf_allocation(allocator, nbytes, curr_device, device_id);
-    } else {
-      return vf_allocation(allocator, nbytes, curr_device, device_id);
-    }
-  }
+    std::lock_guard<std::mutex> lock(allocator_mutex);
 
-  // The raw deleter only gets passed the data ptr, no context, so
-  // it would not work right now. To implement this, we first need to
-  // create a runtime interface that can correctly free an allocation
-  // only based on the data ptr, without the allocation idx from the
-  // context
-  at::DeleterFnPtr raw_deleter() const override {
-    return nullptr;
-  }
+    size_t aligned_nbytes = setMinSpyreAllocation(nbytes);
+    AllocationInfo alloc_info = findFreeBlock(aligned_nbytes, allocator);
 
-  void copy_data(void* dest, const void* src, std::size_t count) const final {
-    py::gil_scoped_acquire acquire;
-    DEBUGINFO("entering allocator->copy_data method");
-    // do nothing -- look into when this is called
-    // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
-    // reinterpret_cast<spyre_ptr_t>(src));
+    TORCH_CHECK(
+        alloc_info.found, "Unable to find enough free memory for allocation. ",
+        segments_locked
+            ? "All segments are full and no new segments could be allocated."
+            : "Failed to allocate memory.");
+
+    MemoryBlock* new_block =
+        allocateInSegment(alloc_info.segment, alloc_info.block, aligned_nbytes);
+
+    flex::DeviceMemoryAllocationPtr data = alloc_info.segment->data;
+    TORCH_CHECK(data, "Failed to allocate ", aligned_nbytes,
+                " bytes on Spyre device.");
+
+    if (alloc_debug)
+      logSegmentState(*alloc_info.segment, "After block allocation");
+
+    // Instantiating object to live beyond SpyreAllocator scope.
+    // Note: changed to share the data pointer, not move it. This is needed
+    // so that the segment retains its reference when a block is freed.
+    // With std::move(data), the segment would lose its reference to the
+    // Spyre allocation after the first block allocation
+    auto* ctx = new SharedOwnerCtx{data, new_block->start, device_id};
+    void* ctx_void = static_cast<void*>(ctx);
+    void* data_void = static_cast<void*>(ctx->owner.get());
+
+    alloc_info.segment->ctx_to_block[ctx] = const_cast<MemoryBlock*>(new_block);
+    block_to_segment[ctx] = alloc_info.segment;
+
+    return at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
   }
 };
+
+// Define static member
+std::atomic<VFSpyreAllocator*> VFSpyreAllocator::instance_ptr{nullptr};
+
+// Factory method implementation (defined after derived classes)
+SpyreAllocator& SpyreAllocator::instance() {
+  static std::unique_ptr<SpyreAllocator> allocator;
+  static std::once_flag init_flag;
+
+  std::call_once(init_flag, [&allocator]() {
+    if (is_pf_mode()) {
+      allocator.reset(new PFSpyreAllocator());
+    } else {
+      allocator.reset(new VFSpyreAllocator());
+    }
+  });
+
+  return *allocator;
+}
 
 // Register our custom allocator
 REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
@@ -1031,4 +1128,5 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
 }
+
 }  // namespace spyre
