@@ -52,7 +52,6 @@ if FLEX_DEVICE != "VF":
     sys.exit(0)
 
 import torch  # noqa: E402
-import torch_spyre  # noqa: E402
 
 
 class TestVFAllocatorStandalone(unittest.TestCase):
@@ -402,7 +401,11 @@ class TestVFAllocatorStandalone(unittest.TestCase):
 
         with self.assertRaises(RuntimeError) as context:
             # This should fail because single allocation > segment size
-            torch.empty(oversized_elements + (1024 * 1024 * 1024), device="spyre", dtype=torch.float16)
+            torch.empty(
+                oversized_elements + (1024 * 1024 * 1024),
+                device="spyre",
+                dtype=torch.float16,
+            )
 
         # Verify error message mentions allocation failure
         self.assertTrue(

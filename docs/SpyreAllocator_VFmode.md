@@ -13,23 +13,23 @@ The new implementation adds VF Mode support, allowing the allocator to operate i
 #### **PF (Physical Function) Mode**
 - This mode has been left mostly functionally-unaltered from previous implementations. The only I/O difference is a new `vf_offset` attribute in SharedOwnerCtx. `vf_offset` is set to 0 for PF Mode and should be ignored
 - **Functionalities**
-   - Each tensor allocation directly requests memory from Spyre hardware via `TryAllocate()`
-   - Allocation on demand, deallocation when tensor is destroyed
-   - Each allocation is independent
+  - Each tensor allocation directly requests memory from Spyre hardware via `TryAllocate()`
+  - Allocation on demand, deallocation when tensor is destroyed
+  - Each allocation is independent
 
 #### **VF (Virtual Function) Mode**
 Implemented in PR #355
 - **Functionalities**
-   - Creates a pre-allocated fixed pool of large memory segments (default: 8 segments × 12 GB each)
-   - Divides segments into blocks for individual tensor allocations
-   - Freed blocks return to the pool for future allocations
-   - Merges adjacent free blocks to reduce fragmentation
+  - Creates a pre-allocated fixed pool of large memory segments (default: 8 segments × 12 GB each)
+  - Divides segments into blocks for individual tensor allocations
+  - Freed blocks return to the pool for future allocations
+  - Merges adjacent free blocks to reduce fragmentation
 - **Additional details**
-   - Called via `vf_allocation` method, through `allocate` (a request for `nbytes` allocation)
-   - Returns `at::DataPtr` smart pointer comprising raw memory buffer, context/metadata
+  - Called via `vf_allocation` method, through `allocate` (a request for `nbytes` allocation)
+  - Returns `at::DataPtr` smart pointer comprising raw memory buffer, context/metadata
 pointer needed by the deleter, cleanup function, and device identifier
-   - Context is `SharedOwnerCtx` object, now augmented with `vf_offset` (block offset)
-   - All blocks within the same segment share the same `flex::DeviceMemoryAllocationPtr data` pointer
+  - Context is `SharedOwnerCtx` object, now augmented with `vf_offset` (block offset)
+  - All blocks within the same segment share the same `flex::DeviceMemoryAllocationPtr data` pointer
 
 ### 2. Memory Segment Architecture (VF Mode)
 
