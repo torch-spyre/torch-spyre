@@ -549,8 +549,9 @@ struct VFSpyreAllocator final : public SpyreAllocator {
 
   // Static atomic pointer to this instance for ReportAndDelete
   static std::atomic<VFSpyreAllocator*> instance_ptr;
-  
-  // Static flag to track if allocator is being destroyed (safe for dereferencing)
+
+  // Static flag to track if allocator is being destroyed (safe for
+  // dereferencing)
   static std::atomic<bool> vf_allocator_valid;
 
   struct AllocationInfo {
@@ -575,7 +576,8 @@ struct VFSpyreAllocator final : public SpyreAllocator {
     // Atomic read to initialize allocator
     VFSpyreAllocator* allocator = instance_ptr.load(std::memory_order_acquire);
 
-    // Guard against null pointer (should not happen given valid flag check above, but defensive)
+    // Guard against null pointer (should not happen given valid flag check
+    // above, but defensive)
     if (!allocator) {
       delete ctx;
       return;
@@ -855,20 +857,22 @@ struct VFSpyreAllocator final : public SpyreAllocator {
     // NOTE: size selection to be defined
     fallback_sizes = {12ULL * 1024 * 1024 * 1024, 8ULL * 1024 * 1024 * 1024,
                       4ULL * 1024 * 1024 * 1024};
-    instance_ptr.store(this, std::memory_order_release);  // atomic write
+    instance_ptr.store(this, std::memory_order_release);        // atomic write
     vf_allocator_valid.store(true, std::memory_order_release);  // Mark as valid
   }
 
   ~VFSpyreAllocator() override {
-    // Mark as invalid to prevent any pending callbacks from trying to access us.
-    // However, the allocator itself is NOT destroyed (never deleted) to prevent
-    // use-after-free during Python interpreter shutdown when pending deallocations
-    // may still occur. The OS will clean up all memory when the process exits.
+    // Mark as invalid to prevent any pending callbacks from trying to access
+    // us. However, the allocator itself is NOT destroyed (never deleted) to
+    // prevent use-after-free during Python interpreter shutdown when pending
+    // deallocations may still occur. The OS will clean up all memory when the
+    // process exits.
     vf_allocator_valid.store(false, std::memory_order_release);
-    
-    // Note: We intentionally do NOT clean up segments, block_to_segment, or other
-    // data structures here, since this destructor should not actually be called
-    // during normal operation. The allocator is kept alive until process exit.
+
+    // Note: We intentionally do NOT clean up segments, block_to_segment, or
+    // other data structures here, since this destructor should not actually be
+    // called during normal operation. The allocator is kept alive until process
+    // exit.
   }
 
   at::DataPtr allocate(size_t nbytes) override {
