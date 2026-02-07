@@ -19,6 +19,8 @@ from torch._dynamo.backends.common import AotAutograd
 from torch._inductor.virtualized import V
 from torch._inductor.graph import GraphLowering
 
+from .decompositions import spyre_decompositions
+
 
 @contextmanager
 def spyre_data_types():
@@ -43,6 +45,23 @@ class SpyreAotAutograd(AotAutograd):
             isinstance(t, torch.Tensor) and t.device.type == "spyre"
             for t in example_inputs
         ):
+            # Merge Spyre-specific decompositions with any existing decompositions
+            # Note: the decompositions need to be merged in this way
+            # as opposed to the lowerings.
+            # The reason is that PyTorch maintains a separate
+            # CURRENT_DECOMPOSITION_TABLE in torch.fx.experimental.proxy_tensor
+            # During FX tracing.
+            # AotAutograd reads decompositions from self.kwargs["decompositions"] and
+            # thus using the kwargs of the compile process will ensure that the
+            # spyre-specific decompositions are loaded correctly
+            existing_decomps = self.kwargs.get("decompositions", {})
+            if callable(existing_decomps):
+                existing_decomps = existing_decomps()
+
+            # Spyre decompositions take precedence over existing ones
+            merged_decomps = {**existing_decomps, **spyre_decompositions}
+            self.kwargs["decompositions"] = merged_decomps
+
             with (
                 spyre_data_types(),
                 V.set_real_inputs(example_inputs),

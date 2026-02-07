@@ -168,3 +168,53 @@ class TestBuildingBlocks(unittest.TestCase):
 
         # Compare with cpu implementation
         compare_with_cpu(rms_norm, *args)
+
+    @unittest.skip("somewhere during the operation a tensor on spyre and cpu is mixed")
+    def test_layer_norm(self):
+        F16_EPS = 1e-6
+        T = 128
+        D = 256
+
+        activation = torch.randn(D, T, dtype=torch.float16)
+        weight = torch.randn(T, dtype=torch.float16)
+        bias = torch.randn(T, dtype=torch.float16)
+
+        args = [
+            activation,  # [D, T]
+            weight.reshape(T, 1)
+            .expand(T, D)
+            .contiguous(),  # [D, T] # work around on device broadcast limitation
+            bias.reshape(T, 1)
+            .expand(T, D)
+            .contiguous(),  # [D, T] # work around on device broadcast limitation
+            torch.full([D], F16_EPS, dtype=torch.float16),
+        ]
+
+        # NOTE: To work around reduction dimension restriction,
+        #       this version performs rms_norm along dim 0
+        #       The inputs and the output should be transposed on the host
+        def layer_norm(x, w, b, eps):
+            x_mean = x.mean(dim=-1)
+            x_var = x.var(dim=-1)
+            x_norm = (x - x_mean[:, None]) * torch.rsqrt(x_var + eps)[:, None]
+            return x_norm * weight + bias  # [D, T]
+
+        # Compare with pytorch native implementation
+        def pytorch_fn(x, w, b):
+            return F.layer_norm(
+                # return torch.nn.functional.layer_norm(
+                x.mT,
+                normalized_shape=[T, D],
+                weight=w,
+                bias=b,
+                eps=F16_EPS,
+            ).mT
+
+        compare_with_pytorch(layer_norm, pytorch_fn, *args)
+
+        # Compare with cpu implementation
+        compare_with_cpu(layer_norm, *args)
+
+
+if __name__ == "__main__":
+    unittest.main()

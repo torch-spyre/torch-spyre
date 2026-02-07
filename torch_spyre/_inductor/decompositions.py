@@ -16,15 +16,29 @@ from typing import Optional, Sequence, Union
 
 import torch
 
-from torch._inductor.decomposition import register_decomposition
+
+import torch._decomp as decomp
+
+# Dictionary for Spyre-specific decompositions
+spyre_decompositions: dict = {}
 
 
-@register_decomposition([torch.ops.spyre.compact])
+def register_spyre_decomposition(
+    ops: Union[torch._ops.OperatorBase, list],
+):
+    """
+    Register decompositions specifically for Spyre device.
+    These will only be active when compiling for the Spyre device.
+    """
+    return decomp.register_decomposition(ops, spyre_decompositions)
+
+
+@register_spyre_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
 
-@register_decomposition([torch.ops.spyre.layer_norm])
+@register_spyre_decomposition([torch.ops.spyre.layer_norm])
 def layernorm_decomp(
     input: torch.Tensor,
     normalized_shape: list[int],
@@ -45,7 +59,7 @@ def layernorm_decomp(
 # To avoid constant folding, we introduce a custom op `spyre::full` that runs
 # torch.full on CPU and copies the result to Spyre. Remove this workaround once
 # Spyre supports one-element tensors.
-@register_decomposition([torch.ops.aten.full])
+@register_spyre_decomposition([torch.ops.aten.full])
 def full_decomp(
     size: list[Union[int, torch.SymInt]],
     fill_value: torch.types.Number,
@@ -135,7 +149,7 @@ def spyre_clamp(
 torch.clamp = spyre_clamp
 
 
-@register_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
+@register_spyre_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
 def gt_decomp(
     input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -145,7 +159,7 @@ def gt_decomp(
     return torch.mul(out_ge, out_ne, out=out).to(dtype=torch.bool)
 
 
-@register_decomposition([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Tensor_out])
+@register_spyre_decomposition([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Tensor_out])
 def lt_decomp(
     input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
