@@ -145,6 +145,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((67, 256), (256, 128)),
+                    # Fails for now, pending deeptools reduce fixes
+                    # ((67, 67,), (67, 67)),
+                    # ((67, 255), (255, 128)),
                 ]
             ),
         },
@@ -166,6 +169,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #         # "dim_1": (1, cached_randn((67, 256))),
         #     },
         # },
+        ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": {
+                "2d_0": (0, cached_randn((63, 129))),
+                "2d_1": (1, cached_randn((63, 129))),
+                "2d_01": ((0, 1), cached_randn((63, 129))),
+                "3d_0": (0, cached_randn((3, 7, 9))),
+                "3d_1": (1, cached_randn((3, 7, 9))),
+                "3d_2": (2, cached_randn((3, 7, 9))),
+                "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+            },
+        },
+        ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"amin": torch.amin},
+            "param_sets": {
+                "dim_0": (0, torch.ones((3, 7), dtype=torch.float16)),
+                #  Disabled because torch-sendnn fails
+                # "dim_1": (1, torch.ones((3, 7), dtype=torch.float16)),
+                # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
+            },
+        },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
                 "dim_0": (0, cached_randn((128, 256))),

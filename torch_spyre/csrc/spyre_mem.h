@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include <string>
+
 namespace spyre {
 
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
@@ -38,4 +40,15 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
 
 at::Tensor to_with_layout(const at::Tensor& self,
                           SpyreTensorLayout device_layout);
+
+at::Tensor empty_with_layout(
+    c10::IntArrayRef size, SpyreTensorLayout device_layout,
+    std::optional<c10::ScalarType> dtype_opt,
+    std::optional<c10::Layout> layout_opt,
+    std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
+    std::optional<c10::MemoryFormat> memory_format_opt);
+
+// Returns the current allocator mode: "VF" or "PF"
+std::string get_allocator_mode();
+
 }  // namespace spyre

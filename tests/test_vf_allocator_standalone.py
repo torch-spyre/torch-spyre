@@ -74,16 +74,21 @@ class TestVFAllocatorStandalone(unittest.TestCase):
             del os.environ["FLEX_DEVICE"]
 
     def test_vf_mode_detection(self):
-        """Test that VF mode is correctly detected from environment variable.
+        """Test that VF mode is correctly detected and the VF allocator is being used.
 
-        Note: Currently the allocator mode is determined by the FLEX_DEVICE environment
-        variable at allocator initialization time. The allocator's use_pf flag is set
-        based on this variable. A future enhancement would be to expose an API like
-        `torch_spyre.get_allocator_mode()` to verify the allocator mode at runtime.
-        See: https://github.com/torch-spyre/torch-spyre/pull/448 for discussion.
+        This verifies both the environment variable and the actual allocator mode
+        via the torch.spyre.get_allocator_mode() API.
         """
         # Verify environment variable is set correctly
         self.assertEqual(os.environ.get("FLEX_DEVICE"), "VF")
+
+        # Verify the allocator is actually in VF mode using the runtime API
+        allocator_mode = torch.spyre.get_allocator_mode()
+        self.assertEqual(
+            allocator_mode,
+            "VF",
+            f"Expected allocator mode 'VF', got '{allocator_mode}'",
+        )
 
         # Create a tensor to verify allocator works in VF mode
         x = torch.empty(10, device="spyre", dtype=torch.float16)

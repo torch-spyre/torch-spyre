@@ -103,6 +103,10 @@ class _SpyreImpl:
         if fn:
             fn(int(idx))
 
+    def get_allocator_mode(self) -> str:
+        """Return the current allocator mode: 'VF', 'PF', or 'UNKNOWN'."""
+        return getattr(self._C, "get_allocator_mode", lambda: "UNKNOWN")()
+
     def _mark_after_fork(self):
         self._initialized = True
         self._in_bad_fork = True
@@ -125,6 +129,7 @@ def make_spyre_module() -> types.ModuleType:
     mod.device_count = impl.device_count
     mod.current_device = impl.current_device
     mod.set_device = impl.set_device
+    mod.get_allocator_mode = impl.get_allocator_mode
     mod._is_compiled = lambda: True
 
     # Optional: forward unknown attrs to the impl or _C for convenience

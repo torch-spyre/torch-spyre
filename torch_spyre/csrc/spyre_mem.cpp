@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// cpplint: disable=readability/braces
+
 #include "spyre_mem.h"
 
 #include <ATen/EmptyTensor.h>
@@ -66,6 +68,7 @@ struct DMAParameters {
   const int64_t size_bytes;
   const off64_t src_offset;
   const off64_t dst_offset;
+  // NOLINTNEXTLINE(readability/braces)
 };
 /*
  * CPU stride for a dimension.
@@ -348,7 +351,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::Segment::INVALID,
       sendnn::Segment::INVALID,
       sendnn::Segment::PROGRAM(128),
-  };
+  };  // NOLINT
   // STAGE 2: SenSuperNodeV2 graph
   sendnn::Graph sn_graph;  // sn = supernode
   {                        // SenSuperNodeV2 graph
@@ -550,10 +553,6 @@ struct VFSpyreAllocator final : public SpyreAllocator {
   // Static atomic pointer to this instance for ReportAndDelete
   static std::atomic<VFSpyreAllocator*> instance_ptr;
 
-  // Static flag to track if allocator is being destroyed (safe for
-  // dereferencing)
-  static std::atomic<bool> vf_allocator_valid;
-
   struct AllocationInfo {
     MemorySegment* segment;
     MemoryBlock block;
@@ -565,19 +564,11 @@ struct VFSpyreAllocator final : public SpyreAllocator {
 
     if (!ctx_void) return;
 
-    // Check static flag BEFORE accessing allocator pointer
-    if (!vf_allocator_valid.load(std::memory_order_acquire)) {
-      auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-      delete ctx;
-      return;
-    }
-
     auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
     // Atomic read to initialize allocator
     VFSpyreAllocator* allocator = instance_ptr.load(std::memory_order_acquire);
 
-    // Guard against null pointer (should not happen given valid flag check
-    // above, but defensive)
+    // Guard against dangling pointer if allocator was destroyed
     if (!allocator) {
       delete ctx;
       return;
@@ -857,22 +848,11 @@ struct VFSpyreAllocator final : public SpyreAllocator {
     // NOTE: size selection to be defined
     fallback_sizes = {12ULL * 1024 * 1024 * 1024, 8ULL * 1024 * 1024 * 1024,
                       4ULL * 1024 * 1024 * 1024};
-    instance_ptr.store(this, std::memory_order_release);        // atomic write
-    vf_allocator_valid.store(true, std::memory_order_release);  // Mark as valid
+    instance_ptr.store(this, std::memory_order_release);  // atomic write
   }
 
   ~VFSpyreAllocator() override {
-    // Mark as invalid to prevent any pending callbacks from trying to access
-    // us. However, the allocator itself is NOT destroyed (never deleted) to
-    // prevent use-after-free during Python interpreter shutdown when pending
-    // deallocations may still occur. The OS will clean up all memory when the
-    // process exits.
-    vf_allocator_valid.store(false, std::memory_order_release);
-
-    // Note: We intentionally do NOT clean up segments, block_to_segment, or
-    // other data structures here, since this destructor should not actually be
-    // called during normal operation. The allocator is kept alive until process
-    // exit.
+    instance_ptr.store(nullptr, std::memory_order_release);  // atomic write
   }
 
   at::DataPtr allocate(size_t nbytes) override {
@@ -931,20 +911,19 @@ struct VFSpyreAllocator final : public SpyreAllocator {
   }
 };
 
-// Define static members
+// Define static member
 std::atomic<VFSpyreAllocator*> VFSpyreAllocator::instance_ptr{nullptr};
-std::atomic<bool> VFSpyreAllocator::vf_allocator_valid{false};
 
 // Factory method implementation (defined after derived classes)
 SpyreAllocator& SpyreAllocator::instance() {
-  static SpyreAllocator* allocator = nullptr;
+  static std::unique_ptr<SpyreAllocator> allocator;
   static std::once_flag init_flag;
 
   std::call_once(init_flag, [&allocator]() {
     if (is_pf_mode()) {
-      allocator = new PFSpyreAllocator();
+      allocator.reset(new PFSpyreAllocator());
     } else {
-      allocator = new VFSpyreAllocator();
+      allocator.reset(new VFSpyreAllocator());
     }
   });
 
@@ -953,6 +932,19 @@ SpyreAllocator& SpyreAllocator::instance() {
 
 // Register our custom allocator
 REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
+
+// Returns the current allocator mode based on FLEX_DEVICE environment variable
+std::string get_allocator_mode() {
+  const char* fmode_envvar = std::getenv("FLEX_DEVICE");
+  if (fmode_envvar == nullptr) {
+    return "UNKNOWN";
+  }
+  std::string fmode = fmode_envvar;
+  if (fmode == "VF" || fmode == "PF") {
+    return fmode;
+  }
+  return "UNKNOWN";
+}
 
 // Empty op needs C++ code and cannot be handled by python side fallback
 at::Tensor spyre_empty(c10::IntArrayRef size,
@@ -1143,6 +1135,39 @@ at::Tensor to_with_layout(const at::Tensor& self,
                                      c10::typeMetaToScalarType(self.dtype()),
                                      device_layout);
   return spyre_copy_from(self, dst, false);
+}
+
+at::Tensor empty_with_layout(
+    c10::IntArrayRef size, SpyreTensorLayout device_layout,
+    std::optional<c10::ScalarType> dtype_opt,
+    std::optional<c10::Layout> layout_opt,
+    std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
+    std::optional<c10::MemoryFormat> memory_format_opt) {
+  c10::Device device = device_opt.value_or(
+      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
+  DEBUGINFO("shape=", size, " on Spyre ", device);
+  const auto dtype = c10::dtype_or_default(dtype_opt);
+  TORCH_CHECK(device.is_privateuseone());
+  TORCH_CHECK(c10::layout_or_default(layout_opt) == c10::Layout::Strided,
+              "Non strided layout not supported");
+  TORCH_CHECK(!c10::pinned_memory_or_default(pin_memory_opt),
+              "Pin memory can only be on CPU");
+  const c10::DeviceGuard device_guard(device);
+
+  size_t size_bytes = get_device_size_in_bytes(device_layout);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
+          c10::StorageImpl::use_byte_size_t(), size_bytes,
+          &SpyreAllocator::instance(),
+          /*resizeable=*/true)),
+      pu1_dks, c10::scalarTypeToTypeMeta(dtype));
+
+  tensor.unsafeGetTensorImpl()->set_sizes_contiguous(size);
+  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+  DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
+  return tensor;
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

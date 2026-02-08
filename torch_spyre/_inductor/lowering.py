@@ -34,6 +34,8 @@ def register_spyre_lowering(
 ):
     name = name or op.__name__
 
+    ensure_default_handler(name)
+
     lowering.register_op_dtype_propagation_rules(
         name=name,
         type_promotion_kind=type_promotion_kind,
@@ -63,6 +65,28 @@ def unregister_lowering(op, lowering_dict=lowering.lowerings):
 
 for op in lowerings_to_exclude:
     unregister_lowering(op)
+
+
+def ensure_default_handler(op_name):
+    """
+    Install a default handler for a custom operator in DefaultHandler.
+
+    DefaultHandler defines handlers for built‑in operators but does not
+    automatically create one for custom ops, which leads to warnings like:
+
+      UserWarning: undefined OpHandler.<op_name>, please add missing op schema
+
+    This helper registers a fallback handler to suppress that warning.
+
+    Ref: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/ops_handler.py#L745
+
+    TODO: Remove once the handler registration issue is resolved.
+    """
+
+    cls = torch._inductor.ops_handler.DefaultHandler
+    if op_name not in cls.__dict__:
+        method = cls._call_default(op_name)
+        setattr(cls, op_name, method)
 
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
@@ -275,6 +299,10 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
+    if min is None:
+        min = torch.finfo(torch.float16).min
+    if max is None:
+        max = torch.finfo(torch.float16).max
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
