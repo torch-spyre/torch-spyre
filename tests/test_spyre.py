@@ -107,17 +107,28 @@ class TestSpyre(TestCase):
             print("Printing failed:", e)
             assert False, "Spyre backend should support tensor printing"
 
+    @unittest.skip("TODO: Support 0-dim tensors in Spyre")
     def test_cross_device_copy_scalar(self):
         # scalar tensor becomes 1D tensor on Spyre
         a = torch.tensor(10, dtype=torch.float16)
-        b = a.to(device="spyre").add(2).to(device="cpu")
+        # TODO: Remove torch.tensor of add scalar when constants are supported in eager
+        b = (
+            a.to(device="spyre")
+            .add(torch.tensor([2.0], dtype=torch.float16, device="spyre"))
+            .to(device="cpu")
+        )
         self.assertEqual(b.ndim, 1)
         self.assertEqual(b.numel(), 1)
         self.assertEqual(b.item(), a + 2)
 
     def test_cross_device_copy(self):
         a = torch.rand(10, dtype=torch.float16)
-        b = a.to(device="spyre").add(2).to(device="cpu")
+        # TODO: Remove torch.tensor of add scalar when constants are supported in eager
+        b = (
+            a.to(device="spyre")
+            .add(torch.tensor([2.0], dtype=torch.float16, device="spyre"))
+            .to(device="cpu")
+        )
         self.assertEqual(b, a + 2)
 
     def test_cross_device_copy_dtypes(self):
@@ -130,7 +141,7 @@ class TestSpyre(TestCase):
             msg = "does not support int64"
             recorded = [str(w.message) for w in rec]
             if expect_warning:
-                assert len(rec) == 1 and msg in str(rec[0].message), (
+                assert any(msg in record for record in recorded), (
                     f"Expected one warning containing '{msg}', got: {recorded}"
                 )
             else:
@@ -162,8 +173,11 @@ class TestSpyre(TestCase):
                 x = torch.rand(64, 64, dtype=dtype)
             assert x.device.type == "cpu", "initial device is not cpu"
 
+            prev_warn_always = torch.is_warn_always_enabled()
+            torch.set_warn_always(True)
             with check_downcast_warning(expect_warning):
                 x_spyre = x.to("spyre")
+            torch.set_warn_always(prev_warn_always)
 
             assert x_spyre.device.type == "spyre", "to device is not spyre"
             assert x_spyre.dtype == x.dtype

@@ -43,9 +43,10 @@ int64_t elems_per_stick(const DataFormats& df) {
  * Non-stick dimensions appear once, stick dimensions appear twice.
  * Must be kept in synch with host_dim_order below.
  */
-auto get_generic_stick_layout(int rank, std::vector<int32_t> host_dim_order)
+auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
     -> std::vector<int32_t> {
   std::vector<int32_t> dim_map;
+  auto rank = host_dim_order.size();
   switch (rank) {
     case 1:
       dim_map = {host_dim_order[0], host_dim_order[0]};
@@ -127,6 +128,9 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order,
                              StickFormat format) {
+  TORCH_CHECK(host_size.size() == dim_order.size(),
+              "Invalid arguments: host_size.size() != dim_order.size()");
+
   auto str_type = torchScalarToString[dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
       stringToDTDataFormatPair(str_type);
@@ -137,24 +141,30 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     this->device_size.resize(1);
     this->dim_map.resize(1);
     this->format = Dense;
-    this->num_stick_dims = 1;
     this->device_size[0] = this->elems_per_stick();
     this->dim_map[0] = 0;  // host_size has no entries!
 
     return;
   }
 
-  int host_dims = static_cast<int>(host_size.size());
-  int device_dims = host_dims + 1;
+  // PyTorch expects to be able to freely add/remove size 1 dimensions
+  // without changing the memory layout of a tensor.  We enable this by
+  // filtering dim_order to remove all non-stick dimensions of size 1's
+  // before we compute the device_size (ie, on-device tiled memory layout).
+  std::vector<int32_t> filtered_dim_order;
+  for (auto i = 0; i < (dim_order.size() - 1); i++) {
+    if (host_size[dim_order[i]] != 1) {
+      filtered_dim_order.push_back(dim_order[i]);
+    }
+  }
+  filtered_dim_order.push_back(dim_order[dim_order.size() - 1]);
+
+  int device_dims = static_cast<int>(filtered_dim_order.size()) + 1;
   auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
 
-  TORCH_CHECK(host_size.size() == dim_order.size(),
-              "Invalid arguments: host_size.size() != dim_order.size()");
-
   this->device_size.resize(device_dims);
-  this->dim_map = spyre::get_generic_stick_layout(host_size.size(), dim_order);
+  this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
   this->format = format;
-  this->num_stick_dims = 1;
 
   // Stick dim
   auto stick_dim = this->dim_map[this->dim_map.size() - 1];
@@ -197,6 +207,16 @@ std::vector<int64_t> SpyreTensorLayout::device_strides() {
   return strides;
 }
 
+int32_t SpyreTensorLayout::num_stick_dims() {
+  int32_t num_stick_dims = 0;
+  int64_t stick_elems = 1;
+  auto device_rank = this->device_size.size();
+  for (; stick_elems < this->elems_per_stick(); num_stick_dims++) {
+    stick_elems *= this->device_size[device_rank - 1 - num_stick_dims];
+  }
+  return num_stick_dims;
+}
+
 std::string SpyreTensorLayout::toString() const {
   std::stringstream ss;
   ss << "SpyreTensorLayout(";
@@ -214,12 +234,11 @@ std::string SpyreTensorLayout::toString() const {
       ss << ", ";
     }
   }
-  ss << "], num_stick_dims=";
-  ss << this->num_stick_dims;
+  ss << "], ";
   if (this->format == StickFormat::Dense) {
-    ss << ", format=StickFormat.Dense, ";
+    ss << "format=StickFormat.Dense, ";
   } else {
-    ss << ", format=StickFormat.Sparse, ";
+    ss << "format=StickFormat.Sparse, ";
   }
   ss << "device_dtype=DataFormats."
      << EnumsConversion::dataFormatsToString(this->device_dtype);
