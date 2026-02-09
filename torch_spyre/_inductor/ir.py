@@ -97,10 +97,6 @@ class FixedTiledLayout(FixedLayout):
             f"size={self.size}, stride={self.stride}, device_layout={self.device_layout})"
         )
 
-    def get_allocation_size(self) -> list[Expr]:
-        # TODO: Eventually this will include padding, etc.
-        return self.size
-
     def make_indexer(self) -> Callable[[Sequence[Expr]], Expr]:
         """
         A closure containing math to read a given element.
