@@ -584,8 +584,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         Return the scale implied by the given iteration space and indexing expression
         """
+        ordered_vars = FixedTiledLayout.ordered_indexer_vars(index)
         return [
-            1 if (di.var == self.wildcard) or (di.var in index.free_symbols) else -1
+            -2
+            if (di.var == self.wildcard)
+            else (ordered_vars.index(di.var) if di.var in ordered_vars else -1)
             for di in op_dimensions
         ]
 
@@ -593,14 +596,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         Return the iteration space implied by the index expression
         """
-        strides = self.get_strides(index)
-        ordered_strides: Sequence[tuple[sympy.Symbol, sympy.Expr]] = sorted(
-            strides.items(), key=lambda item: item[1], reverse=True
-        )
+        ordered_vars = FixedTiledLayout.ordered_indexer_vars(index)
         var_ranges = self.var_ranges()
         if var_ranges:
             result = []
-            for v, _ in ordered_strides:
+            for v in ordered_vars:
                 result.append(DimensionInfo(v, int(var_ranges[v])))
             return result
         else:
