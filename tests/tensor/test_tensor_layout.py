@@ -128,5 +128,6 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x_stl.device_size, [256, 512, 64])
         self.assertEqual(x_stl.dim_map, [1, 0, -1])
 
+
 if __name__ == "__main__":
     run_tests()
