@@ -586,7 +586,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         ordered_vars = FixedTiledLayout.ordered_indexer_vars(index)
         return [
-            -2
+            -3
             if (di.var == self.wildcard)
             else (ordered_vars.index(di.var) if di.var in ordered_vars else -1)
             for di in op_dimensions
