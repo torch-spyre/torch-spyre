@@ -13,10 +13,7 @@
 # limitations under the License.
 
 from typing import Optional, Sequence, Union
-
 import torch
-
-
 import torch._decomp as decomp
 
 # Dictionary for Spyre-specific decompositions
@@ -88,7 +85,9 @@ def spyre_layer_norm(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    if input.device.type == "spyre" and len(normalized_shape) == 1:
+    from .patches import _should_run_on_spyre
+
+    if _should_run_on_spyre([input]) and len(normalized_shape) == 1:
         return torch.ops.spyre.layer_norm(input, normalized_shape, weight, bias, eps)
     else:
         return orig_layer_norm(input, normalized_shape, weight, bias, eps)
@@ -103,7 +102,9 @@ def spyre_gelu(
     input: torch.Tensor,
     approximate: str = "none",
 ) -> torch.Tensor:
-    if input.device.type == "spyre":
+    from .patches import _should_run_on_spyre
+
+    if _should_run_on_spyre([input]):
         return torch.ops.spyre.gelu(input, approximate)
     else:
         return orig_gelu(input, approximate=approximate)
@@ -118,7 +119,9 @@ orig_softplus = torch.nn.functional.softplus
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
-    if input.device.type == "spyre":
+    from .patches import _should_run_on_spyre
+
+    if _should_run_on_spyre([input]):
         return torch.ops.spyre.softplus(input, beta, threshold)
     else:
         return orig_softplus(input, beta, threshold)
@@ -136,7 +139,9 @@ def spyre_clamp(
     *,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if input.device.type == "spyre":
+    from .patches import _should_run_on_spyre
+
+    if _should_run_on_spyre([input]):
         res = torch.ops.spyre.clamp(input, min, max)
         if out is not None:
             out.copy_(res)

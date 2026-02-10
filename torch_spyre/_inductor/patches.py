@@ -23,6 +23,18 @@ from .lowering import enable_spyre_lowerings
 from .decompositions import spyre_decompositions
 
 
+def _should_run_on_spyre(
+    example_inputs: torch.Tensor,
+):
+    if any(
+        isinstance(t, torch.Tensor) and t.device.type == "spyre" for t in example_inputs
+    ):
+        return True
+
+    # If the spyre device could not be detected until now, fallback to the CPU device
+    return False
+
+
 @contextmanager
 def spyre_data_types():
     saved = torch._prims_common._computation_dtype_map
@@ -42,10 +54,7 @@ class SpyreAotAutograd(AotAutograd):
         super().__init__(**kwargs)
 
     def __call__(self, gm: torch.fx.GraphModule, example_inputs, **kwargs):
-        if any(
-            isinstance(t, torch.Tensor) and t.device.type == "spyre"
-            for t in example_inputs
-        ):
+        if _should_run_on_spyre(example_inputs):
             # Merge Spyre-specific decompositions with any existing decompositions
             # Note: the decompositions need to be merged in this way
             # as opposed to the lowerings.
