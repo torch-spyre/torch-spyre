@@ -39,6 +39,7 @@ class KernelSpec:
     op: str
     is_reduction: bool
     dimensions: list[int]
+    dim_defining_arg: int
     args: Sequence[TensorArg | ConstantArg]
     scales: list[list[int]]
     op_info: dict[str, Any]

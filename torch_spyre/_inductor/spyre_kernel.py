@@ -305,6 +305,7 @@ def create_kernel_spec(
     op: str,
     is_reduction: bool,
     dims: list[DimensionInfo],
+    dim_defining_arg: TensorArg | ConstantArg,
     args: Sequence[TensorArg | ConstantArg],
     scales: list[list[int]],
     op_info: dict[str, Any],
@@ -319,7 +320,15 @@ def create_kernel_spec(
             torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
-    return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
+    return KernelSpec(
+        op,
+        is_reduction,
+        [d.numel for d in dims],
+        args.index(dim_defining_arg),
+        args,
+        scales,
+        op_info,
+    )
 
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
@@ -411,7 +420,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             scales.append(scale)
             op_info.update(value.op_info)
             self.kernel_specs.append(
-                create_kernel_spec(value.op, False, di, args, scales, op_info)
+                create_kernel_spec(value.op, False, di, args[-1], args, scales, op_info)
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
@@ -456,7 +465,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 # Unsupported data operation on ConstantArg
                 raise Unsupported(f"Data operation on {type(args[0])}")
 
-            ks = create_kernel_spec(op, False, in_di, args, scales, op_info)
+            ks = create_kernel_spec(op, False, in_di, args[-1], args, scales, op_info)
             if in_di != out_di:
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
@@ -521,7 +530,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ]
             scales = [[1, 1, -1], [-1, 1, 1], [1, -1, 1]]
             self.kernel_specs.append(
-                create_kernel_spec(value.op, True, di, args, scales, op_info)
+                create_kernel_spec(value.op, True, di, args[0], args, scales, op_info)
             )
         elif value.op == BATCH_MATMUL_OP:
             if (
@@ -546,7 +555,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(di, dst),
             ]
             self.kernel_specs.append(
-                create_kernel_spec(value.op, True, di, args, scales, op_info)
+                create_kernel_spec(value.op, True, di, args[0], args, scales, op_info)
             )
         else:
             # All other reductions have exactly one input which is a tensor
@@ -565,7 +574,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(di, dst),
             ]
             self.kernel_specs.append(
-                create_kernel_spec(value.op, True, di, args, scales, op_info)
+                create_kernel_spec(value.op, True, di, args[0], args, scales, op_info)
             )
 
     def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
@@ -622,6 +631,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 buf.writeline(f"op='{ks.op}',")
                 buf.writeline(f"is_reduction={ks.is_reduction},")
                 buf.writeline(f"dimensions={ks.dimensions!r},")
+                buf.writeline(f"dim_defining_arg={ks.dim_defining_arg},")
                 buf.writeline(f"scales={ks.scales!r},")
                 buf.writeline(f"op_info={ks.op_info!r},")
                 buf.writeline("args=[")
