@@ -36,7 +36,7 @@ from torch_spyre._C import SpyreTensorLayout
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps
+from .pass_utils import SchedNodeArg, get_mem_deps, map_dims_to_vars
 
 
 aten = torch.ops.aten
@@ -115,12 +115,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        output_dims = FixedTiledLayout.ordered_indexer_vars(
-            list(n.read_writes.writes)[0].index
-        )
-        input_dims = [
-            FixedTiledLayout.ordered_indexer_vars(arg.dep.index) for arg in args
-        ]
+        output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
+        input_dims = [map_dims_to_vars(arg.layout, arg.dep.index) for arg in args]
         input_dim_idx = [0] * len(args)
         for i in range(len(output_dims)):
             var = output_dims[i]
@@ -144,9 +140,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
-    output_dims = FixedTiledLayout.ordered_indexer_vars(
-        list(n.read_writes.writes)[0].index
-    )
+    output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
     if red.reduction_type == MATMUL_REDUCTION_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
@@ -185,9 +179,10 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         )
     else:
         input = args[0]
-        input_dims = FixedTiledLayout.ordered_indexer_vars(input.dep.index)
-        stick_var = input_dims[-1]
-        is_stick_reduction = stick_var not in output_dims
+        stick_dim = input.layout.device_layout.host_stick_dim()
+        input_dims = map_dims_to_vars(input.layout, input.dep.index)
+        stick_var = input_dims[stick_dim]
+        is_stick_reduction = stick_var not in output_dims.values()
         sparse_tensor = is_stick_reduction
         # TODO: FIXME forcing generic stick layout.  Should compute the lowlevel device_size and dim_map directly from input STL
         dim_map = list(range(len(output.size))) + ([-1] if sparse_tensor else [])
