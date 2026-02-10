@@ -39,14 +39,15 @@ int64_t elems_per_stick(const DataFormats& df) {
   return static_cast<int64_t>(fp_elems);
 }
 
-/* Returns default ordering of tensor dimensions on the device (generic stick).
+/* Returns default tiling of tensor dimensions on the device.
  * Non-stick dimensions appear once, stick dimensions appear twice.
- * Must be kept in synch with host_dim_order below.
+ * Sparse sticks are encoded using a trailing -1 in the host_dim_order.
  */
 auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
     -> std::vector<int32_t> {
   std::vector<int32_t> dim_map;
-  auto rank = host_dim_order.size();
+  bool sparse = host_dim_order.back() == -1;
+  auto rank = sparse ? host_dim_order.size() - 1 : host_dim_order.size();
   switch (rank) {
     case 1:
       dim_map = {host_dim_order[0], host_dim_order[0]};
@@ -76,42 +77,21 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
       ss << "Unsupported tensor rank: " << std::to_string(rank);
       throw std::runtime_error(ss.str());
   }
+  if (sparse) {
+    dim_map.back() = -1;
+  }
   return dim_map;
 }
 
-/* This is the inverse function of get_generic_stick_layout.  Keep in sync
- */
-std::vector<int32_t> SpyreTensorLayout::host_dim_order() {
-  auto rank = this->dim_map.size() - 1;
-  std::vector<int32_t> host_dim_order;
-  switch (rank) {
-    case 1:
-      host_dim_order = {this->dim_map[1]};
-      break;
-    case 2:
-      host_dim_order = {this->dim_map[1], this->dim_map[2]};
-      break;
-    case 3:
-      host_dim_order = {this->dim_map[2], this->dim_map[0], this->dim_map[3]};
-      break;
-    case 4:
-      host_dim_order = {this->dim_map[3], this->dim_map[0], this->dim_map[1],
-                        this->dim_map[4]};
-      break;
-    case 5:
-      host_dim_order = {this->dim_map[4], this->dim_map[0], this->dim_map[1],
-                        this->dim_map[2], this->dim_map[5]};
-      break;
-    case 6:
-      host_dim_order = {this->dim_map[5], this->dim_map[0], this->dim_map[1],
-                        this->dim_map[2], this->dim_map[3], this->dim_map[6]};
-      break;
-    default:
-      std::stringstream ss;
-      ss << "Unsupported tensor rank: " << std::to_string(rank);
-      throw std::runtime_error(ss.str());
+int32_t SpyreTensorLayout::host_stick_dim() {
+  // NOTE: dim_map[rank-1] is -1 for a sparse tensor.
+  //       Return the other entry for the stick so we get a real host dim.
+  auto rank = this->dim_map.size();
+  if (rank == 2) {
+    return this->dim_map[rank - 2];
+  } else {
+    return this->dim_map[rank - 3];
   }
-  return host_dim_order;
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -121,15 +101,16 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   for (int32_t i = 0; i < host_dims; i++) {
     dim_order.push_back(i);
   }
-  init(host_size, dtype, dim_order, Dense);
+  init(host_size, dtype, dim_order);
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
-                             std::vector<int32_t> dim_order,
-                             StickFormat format) {
-  TORCH_CHECK(host_size.size() == dim_order.size(),
-              "Invalid arguments: host_size.size() != dim_order.size()");
+                             std::vector<int32_t> dim_order) {
+  TORCH_CHECK((host_size.size() == dim_order.size()) ||
+                  (((host_size.size() + 1) == dim_order.size()) &&
+                   dim_order.back() == -1),
+              "Incompatible host_size and dim_order");
 
   auto str_type = torchScalarToString[dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
@@ -140,81 +121,44 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(1);
     this->dim_map.resize(1);
-    this->format = Dense;
     this->device_size[0] = this->elems_per_stick();
-    this->dim_map[0] = 0;  // host_size has no entries!
-
+    this->dim_map[0] = -1;  // host_size has no entries!
     return;
   }
 
   // PyTorch expects to be able to freely add/remove size 1 dimensions
-  // without changing the memory layout of a tensor.  We enable this by
-  // filtering dim_order to remove all non-stick dimensions of size 1's
-  // before we compute the device_size (ie, on-device tiled memory layout).
+  // without changing the memory layout of a tensor.
+  // To enable this to be true for Spyre tensors
+  // we filter dim_order to remove trivial dimensions before tiling.
+  bool sparse = dim_order.back() == -1;
   std::vector<int32_t> filtered_dim_order;
-  for (auto i = 0; i < (dim_order.size() - 1); i++) {
-    if (host_size[dim_order[i]] != 1) {
+  for (auto i = 0; i < dim_order.size(); i++) {
+    if ((dim_order[i] == -1) || (host_size[dim_order[i]] != 1)) {
       filtered_dim_order.push_back(dim_order[i]);
     }
   }
-  filtered_dim_order.push_back(dim_order[dim_order.size() - 1]);
 
-  int device_dims = static_cast<int>(filtered_dim_order.size()) + 1;
-  auto elems_in_stick = format == Dense ? this->elems_per_stick() : 1;
+  // Special case: a tensor all of whose dimensions are size 1 keeps dim 0
+  if ((filtered_dim_order.size() == 0) ||
+      ((filtered_dim_order.size() == 1) && (filtered_dim_order.back() == -1))) {
+    filtered_dim_order.insert(filtered_dim_order.begin(), 0);
+  }
 
-  this->device_size.resize(device_dims);
+  // Computing tiling
   this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
-  this->format = format;
-
-  // Stick dim
-  auto stick_dim = this->dim_map[this->dim_map.size() - 1];
+  this->device_size.resize(this->dim_map.size());
+  auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
+  auto stick_dim = this->host_stick_dim();
   this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();
-
-  // Pad stick dimension if necessary
-  auto requires_padding = host_size[stick_dim] % elems_in_stick != 0;
-  host_size[stick_dim] =
-      requires_padding
-          ? ((host_size[stick_dim] / elems_in_stick) + 1) * elems_in_stick
-          : host_size[stick_dim];
-
-  // Non-stick dims
   for (int i = 0; i < this->dim_map.size() - 1; i++) {
     auto dim = this->dim_map[i];
     if (dim == stick_dim) {
       this->device_size[i] =
-          format == Dense
-              ? (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick
-              : host_size[stick_dim];
+          (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
     } else {
       this->device_size[i] = host_size[dim];
     }
   }
-}
-
-std::vector<int64_t> SpyreTensorLayout::device_strides() {
-  int device_dims = static_cast<int>(this->device_size.size());
-  std::vector<int64_t> strides(device_dims);
-
-  // Stick dim
-  int64_t cur_stride = this->elems_per_stick();
-  strides[device_dims - 1] = 1;
-
-  // Non-stick dims
-  for (int i = device_dims - 2; i >= 0; i--) {
-    strides[i] = cur_stride;
-    cur_stride = cur_stride * this->device_size[i];
-  }
-  return strides;
-}
-
-int32_t SpyreTensorLayout::num_stick_dims() {
-  int32_t num_stick_dims = 0;
-  int64_t stick_elems = 1;
-  auto device_rank = this->device_size.size();
-  for (; stick_elems < this->elems_per_stick(); num_stick_dims++) {
-    stick_elems *= this->device_size[device_rank - 1 - num_stick_dims];
-  }
-  return num_stick_dims;
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -234,14 +178,8 @@ std::string SpyreTensorLayout::toString() const {
       ss << ", ";
     }
   }
-  ss << "], ";
-  if (this->format == StickFormat::Dense) {
-    ss << "format=StickFormat.Dense, ";
-  } else {
-    ss << "format=StickFormat.Sparse, ";
-  }
-  ss << "device_dtype=DataFormats."
-     << EnumsConversion::dataFormatsToString(this->device_dtype);
+  ss << "], device_dtype=DataFormats.";
+  ss << EnumsConversion::dataFormatsToString(this->device_dtype);
   ss << ")";
   return ss.str();
 }

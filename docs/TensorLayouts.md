@@ -89,8 +89,8 @@ the maximal number of element per stick for the tensor data type.
 
 The dim_map vector maps the dimensions in the Spyre tensor layout back to the
 dimensions in the PyTorch tensor layout. The elements of this vector are
-integers in the range `range(rank+1)` where elements in range `range(rank)`
-represent dimensions of the PyTorch tensor layout and `rank` if present
+integers in the range `range(-1, rank)` where elements in range `range(rank)`
+represent dimensions of the PyTorch tensor layout and `-1` if present
 represents a synthetic dimension that does not exist in the PyTorch tensor
 layout. dim_map elements in `range(rank)` must occur at least once. dim_map
 elements may be repeated.

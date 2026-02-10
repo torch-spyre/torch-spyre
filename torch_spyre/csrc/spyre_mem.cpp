@@ -123,7 +123,7 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   auto cpu_strides = strides.vec();
 
   // sparse tensors need no padding of the stick dimension
-  bool sparse = stl.dim_map.back() >= cpu_shape.size();
+  bool sparse = stl.dim_map.back() == -1;
   bool requires_padding =
       !sparse && cpu_shape[stl.dim_map.back()] % stick_size != 0;
   bool size_less_than_stick =
@@ -198,7 +198,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   int stick_size = stl.elems_per_stick();
 
   // sparse tensors need no padding of the stick dimension
-  bool sparse = stl.dim_map.back() >= cpu_shape.size();
+  bool sparse = stl.dim_map.back() == -1;
   bool requires_padding =
       !sparse && cpu_shape[stl.dim_map.back()] % stick_size != 0;
   bool size_less_than_stick =
@@ -246,11 +246,7 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
                   bool host2device) -> std::string {
   /*   host2device = true : then 'tensor' is CPU-tensor
    *   host2device = false: then 'tensor' is Spyre-tensor
-   * TODO: support strided tensors
    */
-  if (stl.format != SpyreTensorLayout::StickFormat::Dense) {
-    throw std::runtime_error("Unsupported: DCI for stick-sparse tensors");
-  }
   auto str_type = torchScalarToString[tensor->scalar_type()];
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;

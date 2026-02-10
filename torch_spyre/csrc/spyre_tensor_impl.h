@@ -31,11 +31,6 @@ int64_t elems_per_stick(const DataFormats& df);
 
 class SpyreTensorLayout {
  public:
-  enum StickFormat {
-    Dense = 0,
-    Sparse,
-  };
-
   /**
    * The on-device size array for the (Tiled) tensor.
    * The dimensions are in decreasing stride order with the stick dimension(s)
@@ -50,68 +45,56 @@ class SpyreTensorLayout {
    * appear once.
    */
   std::vector<int32_t> dim_map;
-  StickFormat format;
+
   DataFormats device_dtype;
 
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
 
   /**
-   * Construct a SpyreTensorLayout in generic stick format for the argument
-   * host_size. Generic stick format is row major with a single dense stick
-   * dimension.
+   * Construct a SpyreTensorLayout for the argument host_size with a row
+   * major order of dimensions using the default device memory layout.
+   * See docs/SpyreTensors.md for a precise definition of this layout.
    */
   SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype) {
     init(host_size, dtype);
   }
 
   /**
-   * Construct a SpyreTensorLayout for the argument host_size with the given
-   * order of dimensions in decreasing stride order and stick format.
+   * Construct a SpyreTensorLayout for the argument host_size
+   * with the given order of dimensions in decreasing stride order
+   * using the default device memory layout.
+   * See docs/SpyreTensors.md for a precise definition of this layout.
    */
   SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype,
-                    std::vector<int32_t> dim_order,
-                    StickFormat format = Dense) {
-    init(host_size, dtype, dim_order, format);
+                    std::vector<int32_t> dim_order) {
+    init(host_size, dtype, dim_order);
   }
 
+  /**
+   * Construct a SpyreTensorLayout with the specified device_size
+   * and dim_map. This constructor is intended for use only by the compiler
+   * or the expert programmer. It enables complete control over the
+   * device memory layout, but callers are responsible for ensuring
+   * that all device layout invariants are satisfied.
+   */
   SpyreTensorLayout(std::vector<int64_t> device_size,
-                    std::vector<int32_t> dim_map, StickFormat format,
-                    DataFormats device_dtype)
+                    std::vector<int32_t> dim_map, DataFormats device_dtype)
       : device_size(device_size),
         dim_map(dim_map),
-        format(format),
         device_dtype(device_dtype) {}
 
-  /**
-   * Initialize a SpyreTensorLayout in generic stick format for the argument
-   * host_size. Generic stick format is row major with a single dense stick
-   * dimension.
-   */
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
-  /**
-   * Initialize a SpyreTensorLayout for the argument host_size with the given
-   * order of dimensions in decreasing stride order and stick format.
-   */
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
-            std::vector<int32_t> dim_order, StickFormat format = Dense);
+            std::vector<int32_t> dim_order);
 
   std::string toString() const;
 
-  std::vector<int64_t> device_strides();
-
   /**
-   * Return the number of dimensions that are in a stick.
+   * Return the host_dim that is considered to be the stick dimension.
    */
-  int32_t num_stick_dims();
-
-  /**
-   * Return the host_dim_order that can be used as an argument to
-   * SpyreTensorLayout::init to create a new SpyreTensorLayout that
-   * will have the same dim_map as this SpyreTensorLayout.
-   */
-  std::vector<int32_t> host_dim_order();
+  int32_t host_stick_dim();
 
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);
@@ -119,7 +102,7 @@ class SpyreTensorLayout {
 
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
-           this->dim_map == other.dim_map && this->format == other.format &&
+           this->dim_map == other.dim_map &&
            this->device_dtype == other.device_dtype;
   }
 };

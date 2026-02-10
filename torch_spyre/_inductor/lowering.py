@@ -12,16 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+from contextlib import contextmanager
+
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise
 from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
+
+from typing import Any, Callable, Union
+
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
+
+# The specific spyre lowerings will be registered into this dictionary
+# and merged with the in-tree lowerings when needed
+spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
 
 
 def register_spyre_lowering(
@@ -31,7 +41,7 @@ def register_spyre_lowering(
     type_promotion_kind=lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     override_return_dtype=None,
     convert_input_to_bool=False,
-    lowering_dict=lowering.lowerings,
+    lowering_dict=spyre_lowerings,
 ):
     name = name or op.__name__
 
@@ -66,6 +76,32 @@ def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=Fals
 
 for op in fallback_ops:
     unregister_lowering(op, allow_missing=True)
+
+
+# Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
+@contextmanager
+def enable_spyre_lowerings():
+    saved_intree_lowerings = {}
+    try:
+        for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+            if spyre_lowering_op in lowering.lowerings:
+                saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[
+                    spyre_lowering_op
+                ]
+            lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
+        yield
+    except Exception as e:
+        # TODO: Better error handling here?
+        raise e
+    finally:
+        # Reset the saved in-tree lowerings if needed
+        for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+            if spyre_lowering_op in saved_intree_lowerings:
+                lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[
+                    spyre_lowering_op
+                ]
+            else:
+                lowering.lowerings.pop(spyre_lowering_op, None)
 
 
 def ensure_default_handler(op_name):

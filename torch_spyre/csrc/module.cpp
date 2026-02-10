@@ -282,33 +282,23 @@ PYBIND11_MODULE(_C, m) {
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
-  py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
-      .value("Dense", spyre::SpyreTensorLayout::StickFormat::Dense)
-      .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse);
-
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
-      .def_readonly("format", &spyre::SpyreTensorLayout::format)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("__repr__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
-      .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
-      .def("host_dim_order", &spyre::SpyreTensorLayout::host_dim_order)
-      .def("num_stick_dims", &spyre::SpyreTensorLayout::num_stick_dims)
+      .def("host_stick_dim", &spyre::SpyreTensorLayout::host_stick_dim)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
-      .def(py::init<std::vector<int64_t>, c10::ScalarType, std::vector<int32_t>,
-                    spyre::SpyreTensorLayout::StickFormat>(),
-           py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
-           py::arg("format") = spyre::SpyreTensorLayout::StickFormat::Dense)
-      .def(py::init<std::vector<int64_t>, std::vector<int32_t>,
-                    spyre::SpyreTensorLayout::StickFormat, DataFormats>(),
-           py::arg("device_size"), py::arg("dim_map"), py::arg("format"),
-           py::arg("device_dtype"));
+      .def(py::init<std::vector<int64_t>, c10::ScalarType,
+                    std::vector<int32_t>>(),
+           py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"))
+      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, DataFormats>(),
+           py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
