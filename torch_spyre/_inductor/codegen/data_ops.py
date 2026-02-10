@@ -939,7 +939,7 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                 else elems_per_stick
             )
         )
-    else:
+    elif ndims == 3:
         layout = ["mb", "out", "x"]
         dim_map = {"mb": dimensions[0], "out": dimensions[-1], "x": dimensions[1]}
         offsets = {
@@ -979,6 +979,58 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                 else elems_per_stick
             )
         )
+    else:  # 4d
+        layout = ["mb", "out", "x", "y"]
+        dim_map = {
+            "mb": dimensions[0],
+            "out": dimensions[-1],
+            "x": dimensions[1],
+            "y": dimensions[2],
+        }
+        offsets = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": dimensions[0],
+            "x": dimensions[-1] * dimensions[0] // elems_per_stick,
+            "y": dimensions[-1] * dimensions[0] * dimensions[1] // elems_per_stick,
+        }
+        loop_counts = {
+            "mb": dimensions[0] // elems_per_stick
+            if dimensions[0] % elems_per_stick == 0
+            else dimensions[0],
+            "out": dimensions[-1] // elems_per_stick,
+            "x": dimensions[1],
+            "y": dimensions[2],
+        }
+        piece_sizes = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": elems_per_stick,
+            "x": 1,
+            "y": 1,
+        }
+        piece_valid_gaps = {
+            "mb": [[piece_sizes["mb"], 0]],
+            "out": [[piece_sizes["out"], 0]],
+            "x": [[piece_sizes["x"], 0]],
+            "y": [[piece_sizes["y"], 0]],
+        }
+        valid_gaps = {
+            "mb": [[dimensions[0], 0]],
+            "out": [[dimensions[-1], 0]],
+            "x": [[dimensions[1], 0]],
+            "y": [[dimensions[2], 0]],
+        }
+        piece_count = (
+            dimensions[0]
+            * dimensions[1]
+            * dimensions[-1]
+            * dimensions[2]
+            // (
+                elems_per_stick * elems_per_stick
+                if dimensions[0] % elems_per_stick == 0
+                else elems_per_stick
+            )
+        )
+
     return {
         "clone": {
             "numCoresUsed_": 1,
