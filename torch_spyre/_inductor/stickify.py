@@ -44,7 +44,7 @@ spyreop = torch.ops.spyre
 
 
 def is_sparse(stl: SpyreTensorLayout) -> bool:
-    return stl.device_size[-1] == -1
+    return stl.dim_map[-1] == -1
 
 
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
