@@ -101,7 +101,7 @@ tensor of size `[128, 256, 512]`, a dim_map `[1, 2, 0, 2]` and device_size
 with dimension 0, whereas dimension 1 of the PyTorch tensor becomes the
 outermost dimension of the Spyre tensor layout. In this example, the element
 with coordinates `(a, b, c, d)` in the Spyre tensor corresponds to the PyTorch
-element `(c, a, b*64 + d)`. The coordinates of a tiled dimension are always
+element `(c, a, b * d)`. The coordinates of a tiled dimension are always
 combined into a PyTorch coordinate with strides increasing right-to-left akin to
 the implicit strides of the whole Spyre tensor layout.
 
