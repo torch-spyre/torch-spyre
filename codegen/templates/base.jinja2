@@ -15,12 +15,19 @@
 #}
 @torch.library.register_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", ["spyre"])
 def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length > 0 %} -> {{ signature_out }}{% endif %}:
+    {% if scalar_arg_names|length > 0 %}
+    # Convert scalar arguments to tensors on Spyre device
+    {% for scalar_name in scalar_arg_names %}
+    {{ scalar_name }}_scaTensor = None
+    {{ scalar_name }}_scaTensor = torch.tensor([{{ scalar_name }}], device="spyre")
+    {% endfor %}
+    {% endif %}
     {% if "out" in overload_name %}
-    # Out variant - extract 'out' parameter
-    compiled_{{ template_data.base_op_name }} = torch.compile(torch.{{ template_data.base_op_name }}, dynamic=False)
-    return compiled_{{ template_data.base_op_name }}({{ arg_names }}, out={{ out_arg_name }})
+    # Out variant
+    compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
+    return compiled_{{ operator_name }}({{ arg_names }}, out=out)
     {% else %}
     # Standard variant
-    compiled_{{ template_data.base_op_name }} = torch.compile(torch.{{ template_data.base_op_name }}, dynamic=False)
-    return compiled_{{ template_data.base_op_name }}({{ arg_names }})
+    compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
+    return compiled_{{ operator_name }}({{ arg_names }})
     {% endif %}

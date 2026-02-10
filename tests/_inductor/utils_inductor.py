@@ -186,22 +186,45 @@ def compare_with_eager(fn, *args, atol=0, rtol=0, needs_device=False):
 
 
 # compare with cpu
-def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1, needs_device=False):
-    torch._dynamo.reset_code_caches()  # kernel caching workaround
-    device_args = [arg.to(DEVICE) for arg in args]
-    device_kwargs = {"device": DEVICE} if needs_device else {}
-    result = torch.compile(fn)(*device_args, **device_kwargs)
-    if not isinstance(result, int):
-        result = result.cpu()
+def compare_with_cpu(
+    fn, *args, atol=0.1, rtol=0.1, needs_device=False, cpu_compile=True
+):
+    def _run_compiled_device(device):
+        torch._dynamo.reset_code_caches()  # kernel caching workaround
+        device_args = [arg.to(device) for arg in args]
+        device_kwargs = {"device": device} if needs_device else {}
+        result = torch.compile(fn)(*device_args, **device_kwargs)
+        if not isinstance(result, int):
+            assert result.device.type == device.type, (
+                f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
+            )
+            result = result.cpu()
+        return result
+
     cpu_result = fn(*args)
+    spyre_compiled_result = _run_compiled_device(DEVICE)
+
     torch.testing.assert_close(
-        result,
+        spyre_compiled_result,
         cpu_result,
         equal_nan=True,
         atol=atol,
         rtol=rtol,
-        msg=lambda msg: f"cpu mismatch\n\n{msg}\n",
+        msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
     )
+
+    if cpu_compile:
+        # Test against compiled cpu function
+        cpu_compiled_result = _run_compiled_device(torch.device("cpu"))
+
+        torch.testing.assert_close(
+            spyre_compiled_result,
+            cpu_compiled_result,
+            equal_nan=True,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"compiled spyre <-> compiled cpu mismatch\n\n{msg}\n",
+        )
 
 
 # compare with cpu

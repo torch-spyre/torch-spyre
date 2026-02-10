@@ -12,15 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+from contextlib import contextmanager
+
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise
 from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
+
+from typing import Any, Callable, Union
+
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from torch_spyre._C import get_elem_in_stick
+from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
+
+# The specific spyre lowerings will be registered into this dictionary
+# and merged with the in-tree lowerings when needed
+spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
 
 
 def register_spyre_lowering(
@@ -30,9 +41,11 @@ def register_spyre_lowering(
     type_promotion_kind=lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     override_return_dtype=None,
     convert_input_to_bool=False,
-    lowering_dict=lowering.lowerings,
+    lowering_dict=spyre_lowerings,
 ):
     name = name or op.__name__
+
+    ensure_default_handler(name)
 
     lowering.register_op_dtype_propagation_rules(
         name=name,
@@ -52,17 +65,65 @@ def register_spyre_lowering(
 # Implicit fallback to an eager op does not become effective when lowering of
 # the op is registered by default. Here, we unregister ops that are falling back
 # to eager ops
-lowerings_to_exclude = [torch.ops.aten.cos.default, torch.ops.aten.sin.default]
+# Note: If an op has a decomposition defined, a lowering is not registered
+def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=False):
+    for overload in lowering.get_overloads(op):
+        if overload in lowering_dict:
+            del lowering_dict[overload]
+        elif not allow_missing:
+            raise RuntimeError(f"lowering of {overload} is not registered")
 
 
-def unregister_lowering(op, lowering_dict=lowering.lowerings):
-    if op not in lowering_dict:
-        raise RuntimeError(f"lowering of {op} is not registered")
-    del lowering_dict[op]
+for op in fallback_ops:
+    unregister_lowering(op, allow_missing=True)
 
 
-for op in lowerings_to_exclude:
-    unregister_lowering(op)
+# Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
+@contextmanager
+def enable_spyre_lowerings():
+    saved_intree_lowerings = {}
+    try:
+        for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+            if spyre_lowering_op in lowering.lowerings:
+                saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[
+                    spyre_lowering_op
+                ]
+            lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
+        yield
+    except Exception as e:
+        # TODO: Better error handling here?
+        raise e
+    finally:
+        # Reset the saved in-tree lowerings if needed
+        for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+            if spyre_lowering_op in saved_intree_lowerings:
+                lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[
+                    spyre_lowering_op
+                ]
+            else:
+                lowering.lowerings.pop(spyre_lowering_op, None)
+
+
+def ensure_default_handler(op_name):
+    """
+    Install a default handler for a custom operator in DefaultHandler.
+
+    DefaultHandler defines handlers for built‑in operators but does not
+    automatically create one for custom ops, which leads to warnings like:
+
+      UserWarning: undefined OpHandler.<op_name>, please add missing op schema
+
+    This helper registers a fallback handler to suppress that warning.
+
+    Ref: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/ops_handler.py#L745
+
+    TODO: Remove once the handler registration issue is resolved.
+    """
+
+    cls = torch._inductor.ops_handler.DefaultHandler
+    if op_name not in cls.__dict__:
+        method = cls._call_default(op_name)
+        setattr(cls, op_name, method)
 
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
@@ -275,6 +336,10 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
+    if min is None:
+        min = torch.finfo(torch.float16).min
+    if max is None:
+        max = torch.finfo(torch.float16).max
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),

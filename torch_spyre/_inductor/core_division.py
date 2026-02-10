@@ -27,6 +27,7 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     ExternKernelSchedulerNode,
     SchedulerNode,
+    NopKernelSchedulerNode,
 )
 
 from . import Unsupported
@@ -135,6 +136,8 @@ def core_division_planning(
                 pass
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
+        elif isinstance(n, NopKernelSchedulerNode):
+            pass
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 

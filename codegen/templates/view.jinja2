@@ -13,6 +13,13 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 #}
-@torch_spyre.fallbacks.register_fallback(["aten::{{ template_data.reg_name | replace('"', '')}}"])
-def spyre__{{ template_data.op_name }}(*args, **kwargs):
-    return torch.{{ template_data.base_op_name }}(*args, **kwargs)
+@torch.library.register_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", ["spyre"])
+def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length > 0 %} -> {{ signature_out }}{% endif %}:
+    {% if "out" in overload_name %}
+    kernel = torch.library.get_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", "CPU")
+    out = kernel.call_boxed(torch._C._dispatch_keys(self), {{ arg_names }})
+    return out
+    {% else %}
+    kernel = torch.library.get_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", "CPU")
+    return kernel.call_boxed(torch._C._dispatch_keys(self), {{ arg_names }})
+    {% endif %}

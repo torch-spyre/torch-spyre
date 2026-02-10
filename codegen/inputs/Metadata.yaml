@@ -13,29 +13,22 @@
 # limitations under the License.
 
 - operator_name: abs
-  sendnn_func_name: Abs
   template_name: base
 - operator_name: add
-  sendnn_func_name: Add
   template_name: base
-- operator_name: as_strided
-  sendnn_func_name: As_strided
-  template_name: view
 - operator_name: bitwise_not
-  sendnn_func_name: LogicalNot
   template_name: base
 - operator_name: cat
-  sendnn_func_name: Concat
   template_name: base
+- operator_name: cumsum
+  template_name: view
 - operator_name: div
-  sendnn_func_name: RealDiv
   template_name: base
 - operator_name: eq
-  sendnn_func_name: Equal
   template_name: base
 - operator_name: embedding
-  sendnn_func_name: Gather
   template_name: base
+  torch_prefix: torch.nn.functional
   extra_arguments:
   - name: padding_idx
     type: int64_t
@@ -44,109 +37,83 @@
   - name: arg_2
     type: int
     default: 0
+- operator_name: expand
+  template_name: view
 - operator_name: exp
-  sendnn_func_name: Exp
   template_name: base
 - operator_name: ge
-  sendnn_func_name: GreaterEqual
   template_name: base
 - operator_name: gelu
-  sendnn_func_name: Gelu
   template_name: base
+  torch_prefix: torch.nn.functional
   extra_arguments:
   - name: approximate
     type: bool
     default: False
     overwrite: True
 - operator_name: linalg_vector_norm
-  sendnn_func_name: ReduceEuclideanNorm
   template_name: base
+  torch_prefix: torch.linalg
+  torch_func_name: vector_norm
   out_shape_stride_expr: reduce
 - operator_name: log
-  sendnn_func_name: Log
   template_name: base
 - operator_name: logical_not
-  sendnn_func_name: LogicalNot
   template_name: base
 - operator_name: lt
-  sendnn_func_name: Less
   template_name: base
 - operator_name: maximum
-  sendnn_func_name: Maximum
   template_name: base
 - operator_name: mish
-  sendnn_func_name: Mish
   template_name: base
+  torch_prefix: torch.nn.functional
 - operator_name: mul
-  sendnn_func_name: Multiply
   template_name: base
 - operator_name: neg
-  sendnn_func_name: Negative
   template_name: base
 - operator_name: permute
-  sendnn_func_name: Transpose
   template_name: view
 - operator_name: pow
-  sendnn_func_name: Pow
   template_name: base
 - operator_name: reciprocal
-  sendnn_func_name: Reciprocal
   template_name: base
 - operator_name: relu
-  sendnn_func_name: Relu
   template_name: base
 - operator_name: repeat
-  sendnn_func_name: Tile
-  template_name: view
-- operator_name: reshape
-  sendnn_func_name: Tile
   template_name: view
 - operator_name: rsqrt
-  sendnn_func_name: Rsqrt
   template_name: base
 - operator_name: sigmoid
-  sendnn_func_name: Sigmoid
   template_name: base
+  torch_prefix: torch.ops.aten
 - operator_name: silu
-  sendnn_func_name: Silu
   template_name: base
+  torch_prefix: torch.nn.functional
 - operator_name: _softmax
-  sendnn_func_name: Softmax
   template_name: base
+  torch_prefix: torch.ops.aten
 - operator_name: sqrt
-  sendnn_func_name: Sqrt
   template_name: base
 - operator_name: squeeze
-  sendnn_func_name: Squeeze
   template_name: view
 - operator_name: stack
-  sendnn_func_name: Stack
   template_name: base
 - operator_name: sub
-  sendnn_func_name: Subtract
+  template_name: base
+- operator_name: sum
   template_name: base
 - operator_name: t
-  sendnn_func_name: Transpose
   template_name: view
 - operator_name: tanh
-  sendnn_func_name: Tanh
   template_name: base
 - operator_name: transpose
-  sendnn_func_name: Transpose
   template_name: view
   out_shape_stride_expr: transpose
 - operator_name: tril
-  sendnn_func_name: Trilu
   template_name: base
 - operator_name: _unsafe_view
-  sendnn_func_name: Reshape
   template_name: view
 - operator_name: unsqueeze
-  sendnn_func_name: ExpandDims
   template_name: view
 - operator_name: view
-  sendnn_func_name: Reshape
-  template_name: view
-- operator_name: _reshape_alias
-  sendnn_func_name: Reshape
   template_name: view
