@@ -16,12 +16,16 @@ import math
 from dataclasses import dataclass
 
 from torch_spyre._C import encode_constant, DataFormats
+<<<<<<< HEAD
 from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
 )
 from itertools import takewhile
+=======
+from torch_spyre._inductor.constants import LAYOUT_LABELS
+>>>>>>> b99f085 (Fix 4d reduction layouts)
 
 
 @dataclass
@@ -323,6 +327,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     if reduction and tensors[-1]["scale"][-1] >= 0:
         op += "nonstick"
+
 
     # Get operation dim map from input or output tensor
     op_dims_tensor = inputs[0] if reduction else outputs[0]
