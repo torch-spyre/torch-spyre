@@ -29,9 +29,6 @@ decomps_to_exclude = [
     # uses torch.full, which is not yet supported in Spyre eager mode.
     # See: https://github.com/torch-spyre/torch-spyre/issues/128#issuecomment-3576168221
     torch.ops.aten.new_ones,
-    # The default decomposition for torch.full (defined in pytorch/torch/refs/__init__.py)
-    # is duplicated with the decomposition in torch_spyre/_inductor/decompositions.py.
-    # torch.ops.aten.full,
 ]
 
 # Remove the selected decompositions from Inductor's registry for Spyre.

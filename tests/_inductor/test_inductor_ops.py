@@ -745,10 +745,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
-        def fn(device=None):
-            return torch.full(*args, dtype=torch.float16, device=device)
+        with pytest.raises(torch._dynamo.exc.BackendCompilerFailed, match="backend=\'inductor\' raised:\nNotImplementedError: could not find kernel for aten._local_scalar_dense.default at dispatch key DispatchKey.PrivateUse1.*"):
+            def fn(device=None):
+                return torch.full(*args, dtype=torch.float16, device=device)
 
-        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+            compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
 
 if __name__ == "__main__":
