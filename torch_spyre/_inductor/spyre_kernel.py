@@ -425,7 +425,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ]
             scales = [
                 self.analyze_tensor_access(in_di, value),
-                self.analyze_tensor_access(out_di, index),
+                self.analyze_tensor_access(out_di, dst),
             ]
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
                 # Determine data op based on tensor arg and scales
