@@ -337,12 +337,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
 
-    # Dimension layout for the operation is the generic device layout
-    # of an ndim-dimensional tensor
-    device_layout = tensors[0]["device_layout"].get_generic_stick_layout(
-        list(range(ndim))
-    )
-    dim_indices = device_layout[::-1][1:]  # reverse and remove stick tiling
+    # Get operation dim map from input or output tensor
+    tensor = inputs[0] if reduction else outputs[0]
+    dim_indices = tensor["device_layout"].dim_map[::-1][1:]
 
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim - 1) + [cores]
