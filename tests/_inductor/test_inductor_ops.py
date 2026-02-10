@@ -330,17 +330,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     cached_randn((256, 3, 17, 64), abs=True),
                 ),
-                # skipping these - not working yet
-                # "dim_1_3": (
-                #     1,
-                #     3,
-                #     cached_randn((3, 256, 17, 64), abs=True),
-                # ),
-                # "dim_2_3": (
-                #     2,
-                #     3,
-                #     cached_randn((3, 17, 256, 64), abs=True),
-                # ),
+                "dim_2_3": (
+                    2,
+                    3,
+                    cached_randn((3, 17, 128, 256), abs=True),
+                ),
+                "dim_1_3": (
+                    1,
+                    3,
+                    cached_randn((3, 256, 17, 64), abs=True),
+                ),
             }
         },
         ("test_cmp", "test_binary_op_cpu"): {
