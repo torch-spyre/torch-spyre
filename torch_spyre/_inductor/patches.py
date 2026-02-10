@@ -24,10 +24,11 @@ from .decompositions import spyre_decompositions
 
 
 def _should_run_on_spyre(
-    example_inputs: torch.Tensor,
+    graph_inputs: torch.Tensor,
 ):
+    # Check if example inputs exists and whether one of them is on a spyre device
     if any(
-        isinstance(t, torch.Tensor) and t.device.type == "spyre" for t in example_inputs
+        isinstance(t, torch.Tensor) and t.device.type == "spyre" for t in graph_inputs
     ):
         return True
 
@@ -83,7 +84,7 @@ class SpyreAotAutograd(AotAutograd):
 
 
 def spyre_compile_to_module(graph: GraphLowering, original_compile_to_module):
-    if "spyre" in graph.device_types:
+    if _should_run_on_spyre(graph.example_inputs):
         with spyre_data_types(), enable_spyre_lowerings():
             return original_compile_to_module(graph)
     else:
