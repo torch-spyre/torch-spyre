@@ -476,6 +476,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
                 "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "fp16_4d": (cached_randn((8, 2, 16, 256), dtype=torch.float16),),
                 "int64_1d": (torch.randint(1000, (128,)),),
                 "int64_2d": (torch.randint(1000, (256, 128)),),
                 "int_3d": (torch.randint(1000, (8, 16, 256)),),
