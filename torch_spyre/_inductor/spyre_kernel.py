@@ -291,7 +291,12 @@ def create_tensor_arg(
     is_input: bool, arg_index: int, layout: FixedTiledLayout
 ) -> TensorArg:
     return TensorArg(
-        is_input, arg_index, layout.dtype, layout.size, layout.device_layout
+        is_input,
+        arg_index,
+        layout.dtype,
+        layout.size,
+        layout.allocation,
+        layout.device_layout,
     )
 
 
@@ -310,6 +315,7 @@ def create_kernel_spec(
             torch.bool,
             torch.float16,
             torch.float32,
+            torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
@@ -317,6 +323,7 @@ def create_kernel_spec(
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
+    wildcard = sympy.Symbol("*")
 
     def __init__(
         self,
@@ -492,17 +499,26 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             y = value.arguments[1]
             di_x = self.analyze_index_expr(x.index)
             di_y = self.analyze_index_expr(y.index)
-            di = [di_x[0], di_x[1], di_y[1]]
+            if len(di_x) == 2 and len(di_y) == 2:
+                di = [di_x[0], di_x[1], di_y[1]]
+            elif len(di_x) == 1 and len(di_y) == 2:
+                di = [di_x[0], DimensionInfo(self.wildcard, 1), di_y[1]]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
+            elif len(di_x) == 2 and len(di_y) == 1:
+                di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1)]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
+            else:
+                raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
-            scales = [
-                self.analyze_tensor_access(di, x.index),
-                self.analyze_tensor_access(di, y.index),
-                self.analyze_tensor_access(di, dst.index),
-            ]
+            scales = [[1, 1, -1], [-1, 1, 1], [1, -1, 1]]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
@@ -568,7 +584,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         Return the scale implied by the given iteration space and indexing expression
         """
-        return [1 if di.var in index.free_symbols else -1 for di in op_dimensions]
+        return [
+            1 if (di.var == self.wildcard) or (di.var in index.free_symbols) else -1
+            for di in op_dimensions
+        ]
 
     def analyze_index_expr(self, index: sympy.Expr) -> list[DimensionInfo]:
         """
@@ -578,11 +597,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         ordered_strides: Sequence[tuple[sympy.Symbol, sympy.Expr]] = sorted(
             strides.items(), key=lambda item: item[1], reverse=True
         )
-        result = []
         var_ranges = self.var_ranges()
-        for v, _ in ordered_strides:
-            result.append(DimensionInfo(v, int(var_ranges[v])))
-        return result
+        if var_ranges:
+            result = []
+            for v, _ in ordered_strides:
+                result.append(DimensionInfo(v, int(var_ranges[v])))
+            return result
+        else:
+            return [DimensionInfo(self.wildcard, 1)]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its KernelSpec"""

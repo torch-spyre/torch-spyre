@@ -45,4 +45,7 @@ SPYRE_FP32_OPS = [
     "sigmoid",
     "exx2",
     "layernormnorm",
+    "clone",
 ]
+
+LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]

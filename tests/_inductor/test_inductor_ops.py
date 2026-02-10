@@ -145,6 +145,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((67, 256), (256, 128)),
+                    # Fails for now, pending deeptools reduce fixes
+                    # ((67, 67,), (67, 67)),
+                    # ((67, 255), (255, 128)),
                 ]
             ),
         },
@@ -166,6 +169,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #         # "dim_1": (1, cached_randn((67, 256))),
         #     },
         # },
+        ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": {
+                "2d_0": (0, cached_randn((63, 129))),
+                "2d_1": (1, cached_randn((63, 129))),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "2d_01": ((0, 1), cached_randn((63, 129))),
+                "3d_0": (0, cached_randn((3, 7, 9))),
+                "3d_1": (1, cached_randn((3, 7, 9))),
+                "3d_2": (2, cached_randn((3, 7, 9))),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+            },
+        },
+        ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"amin": torch.amin},
+            "param_sets": {
+                "dim_0": (0, torch.ones((3, 7), dtype=torch.float16)),
+                #  Disabled because torch-sendnn fails
+                # "dim_1": (1, torch.ones((3, 7), dtype=torch.float16)),
+                # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
+            },
+        },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
                 "dim_0": (0, cached_randn((128, 256))),
@@ -211,10 +237,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
-                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                "2d_dim_1": (1, cached_randn((67, 256))),  #  sparse tensor output
                 # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256))),
-                # "3d_dim_2": (2, cached_randn((67, 71, 256))), # sparse tensor output
+                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -235,12 +261,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
-                # "2d_dim_1": (1, cached_randn((67, 256))), # `cpu()` on sparse tensor doesn't work in eager mode yet
+                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
                 # "2d_dim_01": ([0, 1], cached_randn((67, 256))), # spyre scalar represented as 1d instead of 0d
                 # "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.01)),
-                # "3d_dim_2": (2, cached_randn((67, 71, 256), scale=0.01)), # sparse tensor output
-                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
+                "3d_dim_2": (
+                    2,
+                    cached_randn((67, 71, 256), scale=0.01),
+                ),  # sparse tensor output
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
                 # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)), # spyre scalar represented as 1d instead of 0d
             },
         },
@@ -251,15 +281,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
                 "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
-                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "2d_dim_01": ([0, 1], cached_randn((67, 256))),
                 "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.1)),
                 "3d_dim_2": (
                     2,
                     cached_randn((67, 71, 256), scale=0.1),
                 ),  # sparse tensor output
-                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
-                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
+                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
+                # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
+                # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
             },
         },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
@@ -427,6 +459,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {
                 "silu": torch.nn.functional.silu,
+                "sigmoid": torch.sigmoid,
             },
             "param_sets": {
                 "fp16": (
@@ -440,9 +473,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_clone",
         ): {
             "param_sets": {
-                "1d": (cached_randn((128,), dtype=torch.float16),),
-                "2d": (cached_randn((256, 128), dtype=torch.float16),),
-                "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "int64_1d": (torch.randint(1000, (128,)),),
+                "int64_2d": (torch.randint(1000, (256, 128)),),
+                "int_3d": (torch.randint(1000, (8, 16, 256)),),
+                "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
+                "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
+                "fp32_3d": (cached_randn((8, 16, 256), dtype=torch.float32),),
+                "bool_1d": (
+                    torch.rand(
+                        (128,),
+                    )
+                    > 0.5,
+                ),
+                "bool_2d": (
+                    torch.rand(
+                        (
+                            256,
+                            128,
+                        ),
+                    )
+                    > 0.5,
+                ),
+                "bool_3d": (
+                    torch.rand(
+                        (
+                            8,
+                            16,
+                            256,
+                        ),
+                    )
+                    > 0.5,
+                ),
             },
         },
         (
@@ -647,6 +711,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_activation_fn(self, op, input, err):
         compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
 
+    @pytest.mark.filterwarnings(
+        "ignore:Backend Spyre does not support int64:UserWarning"
+    )
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
 
@@ -681,7 +748,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
 
-        compare_with_cpu(fn, needs_device=True)
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
 
 if __name__ == "__main__":

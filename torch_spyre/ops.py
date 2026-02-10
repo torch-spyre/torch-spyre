@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union
 import torch
 import torch_spyre.fallbacks  # noqa: F401
+from typing import Union
 
 
 @torch.library.register_kernel("aten::mm", ["spyre"])
@@ -38,5 +38,6 @@ def spyre__fill_scalar(
     tmp = torch.ones(self.size(), dtype=self.dtype) * other
     self.copy_(tmp)
     return self
+
 
 # INSERT_CODEGEN_HERE

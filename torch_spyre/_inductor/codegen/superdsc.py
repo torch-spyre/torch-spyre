@@ -69,7 +69,10 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             **kwargs,
         )
     if op == "to_dtype":
-        if inputs[0]["ddtype"] == outputs[0]["ddtype"]:
+        if (
+            inputs[0]["device_layout"].device_dtype
+            == outputs[0]["device_layout"].device_dtype
+        ):
             return generate_clone(
                 pointers,
                 op=CLONE_OP,
@@ -80,7 +83,7 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             )
         else:
             raise Unsupported(
-                f"to_dtype from {inputs[0]['ddtype']} to {outputs[0]['ddtype']}"
+                f"to_dtype from {inputs[0]['device_layout'].device_dtype} to {outputs[0]['device_layout'].device_dtype}"
             )
 
     if op == TRANSPOSE_OP and len(dimensions) == 2:

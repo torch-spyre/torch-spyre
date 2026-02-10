@@ -156,13 +156,21 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+    from . import _hooks  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
-    #import torch_spyre.ops  # noqa: F401
     import torch_spyre.codegen_ops
     import torch_spyre._inductor.preload  # noqa: F401
+
+    # Set correct state for dynamo to support eager ops
+    import torch._dynamo.config
+
+    # Increasing the default number of graphs from 8 to 1024
+    # to have enough cache space for all eager ops
+    # You'll get recursion errors if this is exceeded
+    torch._dynamo.config.cache_size_limit = 1024
 
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging

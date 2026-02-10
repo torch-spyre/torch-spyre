@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from torch_spyre._inductor.codegen.compute_ops import num_bytes
+
 
 def generate_transpose(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     return {
@@ -656,35 +658,35 @@ def generate_transpose_4d_stick(
                                 "pdsName_": "pds0",
                                 "wordLength": 2,
                                 "dataformat": "SEN169_FP16",
-                                "layoutDimOrder_": ["mb", "x", "out", "y"],
+                                "layoutDimOrder_": ["mb", "out", "x", "y"],
                                 "stickDimOrder_": ["out"],
                                 "dimToLayoutSize_": {
-                                    "mb": dimensions[2],
+                                    "mb": dimensions[0],
                                     "out": dimensions[-1],
                                     "x": dimensions[1],
-                                    "y": dimensions[0],
+                                    "y": dimensions[2],
                                 },
                                 "dimToStickSize_": {"out": 64},
                                 "validGap_": {
-                                    "mb": [[dimensions[2], 0]],
+                                    "mb": [[dimensions[0], 0]],
                                     "out": [[dimensions[-1], 0]],
                                     "x": [[dimensions[1], 0]],
-                                    "y": [[dimensions[0], 0]],
+                                    "y": [[dimensions[2], 0]],
                                 },
                                 "PieceInfo": [
                                     {
                                         "key_": "p0",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -704,16 +706,16 @@ def generate_transpose_4d_stick(
                                     {
                                         "key_": "p1",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -735,35 +737,35 @@ def generate_transpose_4d_stick(
                                 "pdsName_": "pds0",
                                 "wordLength": 2,
                                 "dataformat": "SEN169_FP16",
-                                "layoutDimOrder_": ["mb", "x", "y", "out"],
-                                "stickDimOrder_": ["y"],
+                                "layoutDimOrder_": ["out", "mb", "x", "y"],
+                                "stickDimOrder_": ["mb"],
                                 "dimToLayoutSize_": {
-                                    "mb": dimensions[2],
+                                    "mb": dimensions[0],
                                     "out": dimensions[-1],
                                     "x": dimensions[1],
-                                    "y": dimensions[0],
+                                    "y": dimensions[2],
                                 },
-                                "dimToStickSize_": {"y": 64},
+                                "dimToStickSize_": {"mb": 64},
                                 "validGap_": {
-                                    "mb": [[dimensions[2], 0]],
+                                    "mb": [[dimensions[0], 0]],
                                     "out": [[dimensions[-1], 0]],
                                     "x": [[dimensions[1], 0]],
-                                    "y": [[dimensions[0], 0]],
+                                    "y": [[dimensions[2], 0]],
                                 },
                                 "PieceInfo": [
                                     {
                                         "key_": "p0",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -783,16 +785,16 @@ def generate_transpose_4d_stick(
                                     {
                                         "key_": "p1",
                                         "dimToSize_": {
-                                            "mb": 64 if transpose_2_3 else 1,
+                                            "mb": 64 if transpose_0_3 else 1,
                                             "out": 64,
                                             "x": 64 if transpose_1_3 else 1,
-                                            "y": 64 if transpose_0_3 else 1,
+                                            "y": 64 if transpose_2_3 else 1,
                                         },
                                         "validGap_": {
                                             "out": [[64, 0]],
-                                            "mb": [[64 if transpose_2_3 else 1, 0]],
+                                            "mb": [[64 if transpose_0_3 else 1, 0]],
                                             "x": [[64 if transpose_1_3 else 1, 0]],
-                                            "y": [[64 if transpose_0_3 else 1, 0]],
+                                            "y": [[64 if transpose_2_3 else 1, 0]],
                                         },
                                         "PlacementInfo": [
                                             {
@@ -816,42 +818,44 @@ def generate_transpose_4d_stick(
                             "coreIDtoANInfo": {
                                 "0": {
                                     "loopCount": {
-                                        "out": dimensions[-1] // 64,
-                                        "mb": dimensions[2],
+                                        "out": dimensions[0] // 64,
+                                        "mb": dimensions[-1] // 64,
                                         "x": dimensions[1],
-                                        "y": dimensions[0] // 64
-                                        if transpose_0_3
-                                        else dimensions[0],
+                                        "y": dimensions[2],
                                     },
                                     "loopCountL3SU": {
-                                        "out": dimensions[-1] // 64,
-                                        "mb": dimensions[2],
+                                        "out": dimensions[0] // 64,
+                                        "mb": dimensions[-1] // 64,
                                         "x": dimensions[1],
-                                        "y": dimensions[0] // 64
-                                        if transpose_0_3
-                                        else dimensions[0],
+                                        "y": dimensions[2],
                                     },
                                     "addr_info_": {
                                         "l3lu": {
                                             "type_": "stride",
                                             "offset_": {
-                                                "mb": 1,
-                                                "out": dimensions[2] * dimensions[1],
-                                                "y": dimensions[2]
+                                                "mb": dimensions[0],
+                                                "out": 64,
+                                                "y": dimensions[0]
                                                 * dimensions[1]
-                                                * dimensions[-1],
-                                                "x": dimensions[2],
+                                                * dimensions[-1]
+                                                // 64,
+                                                "x": dimensions[-1]
+                                                * dimensions[0]
+                                                // 64,
                                             },
                                         },
                                         "l3su": {
                                             "type_": "stride",
                                             "offset_": {
-                                                "mb": 1,
-                                                "out": dimensions[0]
+                                                "mb": 64,
+                                                "out": dimensions[-1],
+                                                "y": dimensions[0]
                                                 * dimensions[1]
-                                                * dimensions[2],
-                                                "y": dimensions[2] * dimensions[1],
-                                                "x": dimensions[2],
+                                                * dimensions[-1]
+                                                // 64,
+                                                "x": dimensions[-1]
+                                                * dimensions[0]
+                                                // 64,
                                             },
                                         },
                                     },
@@ -890,46 +894,71 @@ def generate_transpose_4d_stick(
 
 def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     ndims = len(dimensions)
+    # Get data type information from inputs
+    input_dtype = inputs[0]["device_layout"].device_dtype
+    word_length = num_bytes(input_dtype)
+    data_format = input_dtype.name
+    elems_per_stick = input_dtype.elems_per_stick()
     if ndims == 1:
         layout = ["out"]
         dim_map = {"out": dimensions[0]}
         offsets = {"out": 1}
-        loop_counts = {"out": dimensions[0] // 64}
-        piece_valid_gaps = {"out": [[64, 0]]}
-        piece_sizes = {"out": 64}
+        loop_counts = {"out": dimensions[0] // elems_per_stick}
+        piece_valid_gaps = {"out": [[elems_per_stick, 0]]}
+        piece_sizes = {"out": elems_per_stick}
         valid_gaps = {"out": [[dimensions[0], 0]]}
-        piece_count = dimensions[0] // 64
+        piece_count = dimensions[0] // elems_per_stick
     elif ndims == 2:
         layout = ["mb", "out"]
         dim_map = {"mb": dimensions[0], "out": dimensions[-1]}
-        offsets = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": dimensions[0]}
-        loop_counts = {
-            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
-            "out": dimensions[-1] // 64,
+        offsets = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": dimensions[0],
         }
-        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64}
+        loop_counts = {
+            "mb": dimensions[0] // elems_per_stick
+            if dimensions[0] % elems_per_stick == 0
+            else dimensions[0],
+            "out": dimensions[-1] // elems_per_stick,
+        }
+        piece_sizes = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": elems_per_stick,
+        }
         piece_valid_gaps = {
             "mb": [[piece_sizes["mb"], 0]],
             "out": [[piece_sizes["out"], 0]],
         }
         valid_gaps = {"mb": [[dimensions[0], 0]], "out": [[dimensions[-1], 0]]}
         piece_count = (
-            dimensions[0] * dimensions[-1] // (4096 if dimensions[0] % 64 == 0 else 64)
+            dimensions[0]
+            * dimensions[-1]
+            // (
+                elems_per_stick * elems_per_stick
+                if dimensions[0] % elems_per_stick == 0
+                else elems_per_stick
+            )
         )
     else:
         layout = ["mb", "out", "x"]
         dim_map = {"mb": dimensions[0], "out": dimensions[-1], "x": dimensions[1]}
         offsets = {
-            "mb": 64 if dimensions[0] % 64 == 0 else 1,
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
             "out": dimensions[0],
-            "x": dimensions[-1] * dimensions[0] // 64,
+            "x": dimensions[-1] * dimensions[0] // elems_per_stick,
         }
         loop_counts = {
-            "mb": dimensions[0] // 64 if dimensions[0] % 64 == 0 else dimensions[0],
-            "out": dimensions[-1] // 64,
+            "mb": dimensions[0] // elems_per_stick
+            if dimensions[0] % elems_per_stick == 0
+            else dimensions[0],
+            "out": dimensions[-1] // elems_per_stick,
             "x": dimensions[1],
         }
-        piece_sizes = {"mb": 64 if dimensions[0] % 64 == 0 else 1, "out": 64, "x": 1}
+        piece_sizes = {
+            "mb": elems_per_stick if dimensions[0] % elems_per_stick == 0 else 1,
+            "out": elems_per_stick,
+            "x": 1,
+        }
         piece_valid_gaps = {
             "mb": [[piece_sizes["mb"], 0]],
             "out": [[piece_sizes["out"], 0]],
@@ -944,7 +973,11 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
             dimensions[0]
             * dimensions[1]
             * dimensions[-1]
-            // (4096 if dimensions[0] % 64 == 0 else 64)
+            // (
+                elems_per_stick * elems_per_stick
+                if dimensions[0] % elems_per_stick == 0
+                else elems_per_stick
+            )
         )
     return {
         "clone": {
@@ -960,12 +993,12 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         "labeledDs_": [
                             {
                                 "pdsName_": "pds0",
-                                "wordLength": 2,
-                                "dataformat": "SEN169_FP16",
+                                "wordLength": word_length,
+                                "dataformat": data_format,
                                 "layoutDimOrder_": layout,
                                 "stickDimOrder_": ["out"],
                                 "dimToLayoutSize_": dim_map,
-                                "dimToStickSize_": {"out": 64},
+                                "dimToStickSize_": {"out": elems_per_stick},
                                 "validGap_": valid_gaps,
                                 "PieceInfo": [
                                     {
@@ -993,12 +1026,12 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             },
                             {
                                 "pdsName_": "pds0",
-                                "wordLength": 2,
-                                "dataformat": "SEN169_FP16",
+                                "wordLength": word_length,
+                                "dataformat": data_format,
                                 "layoutDimOrder_": layout,
                                 "stickDimOrder_": ["out"],
                                 "dimToLayoutSize_": dim_map,
-                                "dimToStickSize_": {"out": 64},
+                                "dimToStickSize_": {"out": elems_per_stick},
                                 "validGap_": valid_gaps,
                                 "PieceInfo": [
                                     {
