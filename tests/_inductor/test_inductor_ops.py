@@ -601,6 +601,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_softmax", "test_softmax_cpu"): {
+            "param_sets": {
+                "2d_dim0": (
+                    0,
+                    cached_randn((512, 1024), dtype=torch.float16),
+                ),
+                "2d_dim1": (
+                    1,
+                    cached_randn((512, 1024), dtype=torch.float16),
+                ),
+                "3d_dim0": (
+                    0,
+                    cached_randn((256, 64, 128), dtype=torch.float16),
+                ),
+                "3d_dim1": (
+                    1,
+                    cached_randn((256, 64, 128), dtype=torch.float16),
+                ),
+                "3d_dim2": (
+                    2,
+                    cached_randn((256, 64, 128), dtype=torch.float16),
+                ),
+            }
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -749,6 +773,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.full(*args, dtype=torch.float16, device=device)
 
         compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+
+    def test_softmax_cpu(self, dim, x):
+        compare_with_cpu(lambda x: torch.softmax(x, dim=dim), x)
 
 
 if __name__ == "__main__":
