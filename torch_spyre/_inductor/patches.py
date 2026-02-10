@@ -24,11 +24,20 @@ from .decompositions import spyre_decompositions
 
 
 def _should_run_on_spyre(
-    graph_inputs: torch.Tensor,
+    graph_inputs: torch.Tensor = [], graph: torch.fx.graph.Graph = None
 ):
-    # Check if example inputs exists and whether one of them is on a spyre device
+    # Check if example inputs exists and whether one of them is on the spyre device
     if any(
         isinstance(t, torch.Tensor) and t.device.type == "spyre" for t in graph_inputs
+    ):
+        return True
+
+    # Check the last "real" node of the graph whether it resides on the spyre device
+    if (
+        graph is not None
+        and graph.output_node().prev.meta.get("example_value", None) is not None
+        and graph.output_node().prev.meta.get("example_value", None).device.type
+        == "spyre"
     ):
         return True
 
@@ -55,7 +64,7 @@ class SpyreAotAutograd(AotAutograd):
         super().__init__(**kwargs)
 
     def __call__(self, gm: torch.fx.GraphModule, example_inputs, **kwargs):
-        if _should_run_on_spyre(example_inputs):
+        if _should_run_on_spyre(example_inputs, gm.graph):
             # Merge Spyre-specific decompositions with any existing decompositions
             # Note: the decompositions need to be merged in this way
             # as opposed to the lowerings.
@@ -84,7 +93,7 @@ class SpyreAotAutograd(AotAutograd):
 
 
 def spyre_compile_to_module(graph: GraphLowering, original_compile_to_module):
-    if _should_run_on_spyre(graph.example_inputs):
+    if _should_run_on_spyre(graph.example_inputs, graph.graph):
         with spyre_data_types(), enable_spyre_lowerings():
             return original_compile_to_module(graph)
     else:

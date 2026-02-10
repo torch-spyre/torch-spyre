@@ -769,15 +769,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
-        with pytest.raises(
-            torch._dynamo.exc.BackendCompilerFailed,
-            match="backend='inductor' raised:\nNotImplementedError: could not find kernel for aten._local_scalar_dense.default at dispatch key DispatchKey.PrivateUse1.*",
-        ):
+        def fn(device=None):
+            return torch.full(*args, dtype=torch.float16, device=device)
 
-            def fn(device=None):
-                return torch.full(*args, dtype=torch.float16, device=device)
-
-            compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
     def test_softmax_cpu(self, dim, x):
         compare_with_cpu(lambda x: torch.softmax(x, dim=dim), x)
