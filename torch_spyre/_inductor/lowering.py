@@ -158,11 +158,11 @@ def lower_bmm(x, y):
         (r0,) = reduction_index
         tmp1 = ops.load(
             x.get_name(),
-            x.get_size()[2] * x.get_size()[1] * i0 + x.get_size()[1] * i1 + r0,
+            x.get_size()[1] * x.get_size()[2] * i0 + x.get_size()[2] * i1 + r0,
         )
         tmp2 = ops.load(
             y.get_name(),
-            y.get_size()[2] * y.get_size()[1] * i0 + y.get_size()[1] * r0 + i2,
+            y.get_size()[1] * y.get_size()[2] * i0 + y.get_size()[2] * r0 + i2,
         )
         return (tmp1, tmp2)
 
