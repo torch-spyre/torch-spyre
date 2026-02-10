@@ -121,8 +121,7 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
         transposed_dims = [
             dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
         ]
-        # TODO: add support for other stick transpose variants (1-3 and 2-3)
-        is_supported = (0 in transposed_dims) and 3 in transposed_dims
+        is_supported = 3 in transposed_dims
         if is_supported:
             return generate_transpose_4d_stick(
                 pointers,
