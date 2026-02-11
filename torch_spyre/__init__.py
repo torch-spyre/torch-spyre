@@ -162,7 +162,6 @@ def _autoload():
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
     import torch_spyre.codegen_ops
-    import torch_spyre._inductor.preload  # noqa: F401
 
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config

@@ -19,6 +19,17 @@ import torch._decomp as decomp
 # Dictionary for Spyre-specific decompositions
 spyre_decompositions: dict = {}
 
+# Exclude specific Inductor default decompositions on Spyre.
+# Some Inductor decompositions do not work reliably on the Spyre backend yet.
+# We disable them here and rely on implicit fallbacks to eager ops instead. Once
+# the blocking issues are resolved, these exclusions can be removed.
+spyre_decompositions_to_exclude = [
+    # The default decomposition for torch.new_ones (defined in pytorch/torch/refs/__init__.py)
+    # uses torch.full, which is not yet supported in Spyre eager mode.
+    # See: https://github.com/torch-spyre/torch-spyre/issues/128#issuecomment-3576168221
+    torch.ops.aten.new_ones,
+]
+
 
 def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
