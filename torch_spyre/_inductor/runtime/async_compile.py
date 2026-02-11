@@ -57,11 +57,7 @@ class SpyreAsyncCompile:
                 inputs.append(
                     {
                         "name": _argument_names[index],
-                        # TODO: TEMP UNTIL SDSC CODEGEN IS UPDATED BY MATT
-                        "scale": [
-                            1 if scale_elem != -1 else -1
-                            for scale_elem in ks.scales[index]
-                        ],
+                        "scale": ks.scales[index],
                         "device_layout": ts.device_layout,
                         "host_size": ts.host_size,
                     }
@@ -71,11 +67,7 @@ class SpyreAsyncCompile:
                 outputs.append(
                     {
                         "name": _argument_names[index],
-                        # TODO: TEMP UNTIL SDSC CODEGEN IS UPDATED BY MATT
-                        "scale": [
-                            1 if scale_elem != -1 else -1
-                            for scale_elem in ks.scales[index]
-                        ],
+                        "scale": ks.scales[index],
                         "device_layout": ts.device_layout,
                         "host_size": ts.host_size,
                     }
