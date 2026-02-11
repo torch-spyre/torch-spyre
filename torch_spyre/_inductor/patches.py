@@ -23,6 +23,7 @@ from .lowering import enable_spyre_lowerings
 from .decompositions import spyre_decompositions, spyre_decompositions_to_exclude
 from torch_spyre.fallbacks import fallback_ops
 
+
 def _should_run_on_spyre(
     graph_inputs: torch.Tensor = [], graph: torch.fx.graph.Graph = None
 ):
@@ -77,10 +78,12 @@ class SpyreAotAutograd(AotAutograd):
             existing_decomps = self.kwargs.get("decompositions", {})
             if callable(existing_decomps):
                 existing_decomps = existing_decomps()
-            
+
             # Remove the selected decompositions from Inductor's registry for Spyre.
-            torch._decomp.remove_decompositions(existing_decomps, spyre_decompositions_to_exclude)
-            
+            torch._decomp.remove_decompositions(
+                existing_decomps, spyre_decompositions_to_exclude
+            )
+
             # Remove decompositions for fallback ops defined in fallbacks.py
             torch._decomp.remove_decompositions(existing_decomps, fallback_ops)
 
