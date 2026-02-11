@@ -16,16 +16,11 @@ import math
 from dataclasses import dataclass
 
 from torch_spyre._C import encode_constant, DataFormats
-<<<<<<< HEAD
 from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
 )
-from itertools import takewhile
-=======
-from torch_spyre._inductor.constants import LAYOUT_LABELS
->>>>>>> b99f085 (Fix 4d reduction layouts)
 
 
 @dataclass
@@ -328,7 +323,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if reduction and tensors[-1]["scale"][-1] >= 0:
         op += "nonstick"
 
-
     # Get operation dim map from input or output tensor
     op_dims_tensor = inputs[0] if reduction else outputs[0]
     dim_indices = op_dims_tensor["device_layout"].dim_map[::-1][1:]
@@ -375,34 +369,17 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         # Compute the number of leading missing dims (-1)
         dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
         missing_dims = list(set(dim_indices) - set(dev_dim_order))
-        if len(missing_dims) > 0 and ndim == 3:
-            # Add missing dimensions to end of device dimension order
-            # Compute the number of leading missing dims (-1)
-            tensor_dim_indices = dev_dim_order + list(
-                set(dim_indices) - set(dev_dim_order)
-            )
-        elif len(missing_dims) > 0 and ndim == 4:
-            if (
-                tensor["scale"][missing_dims[0]] != -1 and tensor["scale"][0] == -1
-            ):  # keepdim=False
-                tensor_dim_indices = [0, 3, 1, 2]
-            elif tensor["scale"][missing_dims[0]] != -1:  # keepdim=False
-                tensor_dim_indices = dim_indices
-            elif (
-                ndim == 4
-                and missing_dims[0] == 0
-                and tensor["scale"][missing_dims[0]] == -1
-            ):
-                tensor_dim_indices = [1, 3, 0, 2]
-            elif (
-                ndim == 4
-                and missing_dims[0] == 3
-                and tensor["scale"][missing_dims[0]] == -1
-            ):
-                tensor_dim_indices = [0, 2, 1, 3]
-            else:
-                # Indices and order unchanged
-                tensor_dim_indices = dim_indices
+        if len(missing_dims) > 0 and ndim >= 3 and tensor["scale"][0] == -1:
+            if missing_dims[0] == 0:
+                # Add missing dimensions to end of device dimension order
+                # Compute the number of leading missing dims (-1)
+                tensor_dim_indices = dev_dim_order + list(
+                    set(dim_indices) - set(dev_dim_order)
+                )
+            else:  # keepdim=0 case
+                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
+
+                print(tensor_dim_indices)
         else:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices
