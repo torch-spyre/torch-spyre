@@ -521,7 +521,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
-            scales = [[1, 1, -1], [-1, 1, 1], [1, -1, 1]]
+            scales = [
+                self.analyze_tensor_access(di, x),
+                self.analyze_tensor_access(di, y),
+                self.analyze_tensor_access(di, dst),
+            ]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
