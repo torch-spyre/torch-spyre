@@ -21,7 +21,6 @@ from torch_spyre._inductor.constants import (
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
 )
-from itertools import takewhile
 
 
 @dataclass
@@ -306,7 +305,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     d3 = len(dimensions) >= 3
 
     ndim = len(dimensions)
-    assert ndim <= 3
 
     # implement core division on stick dimension
     cores = 1
@@ -314,7 +312,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
         # enable work division for non-reduction only for now
         if not reduction:
-            split_idx = -3 if d3 else 0  # split along stick dim
+            split_idx = len(dimensions) * -1 if d3 else 0  # split along stick dim
             cores = kwargs["op_info"]["core_division"][-1][split_idx]
             # FIXME: cores should be the product of list of splits
 
@@ -369,14 +367,19 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         # Adjust for output tensors that have leading dimensions of size 1
         # These dimensions do not exist on the device, and the tiling is different
         # Compute the number of leading missing dims (-1)
-        missing_dims = sum(1 for _ in takewhile(lambda x: x == -1, tensor["scale"]))
-        if missing_dims > 0 and ndim >= 3:
-            # Add missing dimensions to end of device dimension order
-            # Compute the number of leading missing dims (-1)
-            dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-            tensor_dim_indices = dev_dim_order + list(
-                set(dim_indices) - set(dev_dim_order)
-            )
+        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+        missing_dims = list(set(dim_indices) - set(dev_dim_order))
+        if len(missing_dims) > 0 and ndim >= 3 and tensor["scale"][0] == -1:
+            if missing_dims[0] == 0:
+                # Add missing dimensions to end of device dimension order
+                # Compute the number of leading missing dims (-1)
+                tensor_dim_indices = dev_dim_order + list(
+                    set(dim_indices) - set(dev_dim_order)
+                )
+            else:  # keepdim=0 case
+                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
+
+                print(tensor_dim_indices)
         else:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices

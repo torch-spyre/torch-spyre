@@ -174,6 +174,14 @@ class SpyreOpFuncs:
         return PointwiseOp("rsqrt", [x])
 
     @staticmethod
+    def slice(x):
+        return PointwiseOp("slice", [x])
+
+    @staticmethod
+    def swap(x):
+        return PointwiseOp("swap", [x])
+
+    @staticmethod
     def sigmoid(x):
         return PointwiseOp("sigmoid", [x])
 
@@ -415,8 +423,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
-            input_stride = list(self.get_strides(value.index).values())[0]
-            output_stride = list(self.get_strides(dst.index).values())[0]
             in_di = self.derive_dim_info(value)
             out_di = self.derive_dim_info(dst)
             args = [
@@ -439,10 +445,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 elif Counter(in_di) == Counter(out_di) and in_di != out_di:
                     # Transpose: check that the input / output DimensionInfo are the same, but in different order.
                     op = TRANSPOSE_OP
-                elif input_stride == 64 and output_stride == 64:
-                    op = "swap"
-                elif input_stride == 64 and output_stride == 1:
-                    op = "slice"
                 elif (
                     args[1].device_layout.device_size
                     == args[0].device_layout.device_size
@@ -519,7 +521,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
-            scales = [[1, 1, -1], [-1, 1, 1], [1, -1, 1]]
+            scales = [
+                self.analyze_tensor_access(di, x),
+                self.analyze_tensor_access(di, y),
+                self.analyze_tensor_access(di, dst),
+            ]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
@@ -567,15 +573,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
-
-    def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
-        """
-        Compute the strides of the free variables in an index expression.
-        """
-        return {
-            s: sympy_subs(index, {s: 1}) - sympy_subs(index, {s: 0})
-            for s in index.free_symbols
-        }
 
     def analyze_tensor_access(
         self,

@@ -119,6 +119,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((256,),) * 2,
                     ((67, 256),) * 2,
                     ((67, 71, 256),) * 2,
+                    ((7, 12, 32, 64),) * 2,
                 ]
             ),
         },
@@ -183,6 +184,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_12": ((1, 2), cached_randn((3, 7, 9))),
                 # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
                 # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+                "4d_0": (0, cached_randn((3, 7, 9, 32))),
+                "4d_1": (1, cached_randn((3, 7, 9, 32))),
+                "4d_2": (2, cached_randn((3, 7, 9, 32))),
+                "4d_3": (3, cached_randn((3, 7, 9, 32))),
             },
         },
         ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -196,8 +201,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
-                "dim_0": (0, cached_randn((128, 256))),
-                "dim_1": (1, cached_randn((128, 256))),
+                "2d_dim_0": (0, cached_randn((128, 256))),
+                "2d_dim_1": (1, cached_randn((128, 256))),
+                "4d_dim_0": (0, cached_randn((12, 8, 25, 64))),
+                "4d_dim_1": (1, cached_randn((12, 8, 25, 64))),
+                "4d_dim_2": (2, cached_randn((12, 8, 25, 64))),
+                "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
             },
         },
         (
@@ -243,6 +252,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256))),
                 "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
+                "4d_dim_0": (0, cached_randn((6, 17, 7, 64))),
+                "4d_dim_1": (1, cached_randn((6, 17, 7, 64))),
+                "4d_dim_2": (2, cached_randn((6, 17, 7, 64))),
+                "4d_dim_3": (3, cached_randn((6, 17, 7, 64))),  # sparse tensor output
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -255,6 +268,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim_0": (0, cached_randn((67, 71, 256))),
                 "3d_dim_1": (1, cached_randn((67, 71, 256))),
                 "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
+                "4d_dim_0": (0, cached_randn((6, 7, 12, 256))),
+                "4d_dim_1": (1, cached_randn((6, 7, 12, 256))),
+                "4d_dim_2": (2, cached_randn((6, 7, 12, 256))),
+                "4d_dim_3": (3, cached_randn((6, 7, 12, 256))),
             },
         },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -294,6 +311,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
                 # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
                 # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
+                "4d_dim_0": (0, cached_randn((6, 7, 12, 256), scale=0.1)),
+                "4d_dim_1": (1, cached_randn((6, 7, 12, 256), scale=0.1)),
+                "4d_dim_2": (2, cached_randn((6, 7, 12, 256), scale=0.1)),
+                "4d_dim_3": (3, cached_randn((6, 7, 12, 256), scale=0.1)),
             },
         },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
@@ -624,6 +645,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim2": (
                     2,
                     cached_randn((256, 64, 128), dtype=torch.float16),
+                ),
+                "4d_dim0": (
+                    0,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim1": (
+                    1,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim2": (
+                    2,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
+                ),
+                "4d_dim3": (
+                    3,
+                    cached_randn((6, 17, 32, 64), dtype=torch.float16),
                 ),
             }
         },
