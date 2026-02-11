@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from itertools import zip_longest
 import math
 from dataclasses import dataclass
 
@@ -42,10 +41,9 @@ class DimInfo:
         self.padded_size = padded_size
         self.nsplits = nsplits
         self.scale = scale
-        self.split_size = self.padded_size // nsplits 
+        self.split_size = self.padded_size // nsplits
         self.padding = self.padded_size - self.unpadded_size
 
-        print ("Padding for dim", label, "is", self.padding, "because padded size is", self.padded_size, "and unpadded size is", self.unpadded_size)
         assert self.padding >= 0
 
 
@@ -79,23 +77,21 @@ class DimInfos:
         self.nsplits = nsplits
 
         # SDSC needs non-negative scale values to be 1
-        self.scales = [1 if s >= 0 else s for s in scales]  
+        self.scales = [1 if s >= 0 else s for s in scales]
 
         self.do_reordering()
 
-        for label, index, unpadded_size, padded_size, nsplits, scale in zip_longest(
-            self.labels,
-            self.dim_indices,
-            self.unpadded_sizes,
-            self.padded_sizes,
-            self.nsplits,
-            self.scales,
-        ):
+        for i in range(len(labels)):
             dim_info = DimInfo(
-                label, index, unpadded_size, padded_size, nsplits, scale
+                self.labels[i],
+                self.dim_indices[i],
+                self.unpadded_sizes[i],
+                self.padded_sizes[i],
+                self.nsplits[i],
+                self.scales[i] if self.scales else -1,
             )
             self.dim_infos_list.append(dim_info)
-            self.dim_infos_dict[label] = dim_info
+            self.dim_infos_dict[labels[i]] = dim_info
 
     def as_list(self) -> list:
         return self.dim_infos_list
@@ -343,7 +339,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         }
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
-    padded_op_dimensions = [1]*len(dimensions)
+    padded_op_dimensions = [1] * len(dimensions)
     dl = op_dims_tensor["device_layout"]
 
     # Un-tile and put in host order
@@ -354,7 +350,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         si = op_dims_tensor["scale"][dim]
         assert si >= 0, "Scale value should be non-negative for op_dims_tensor"
         size = sizes[dim_map.index(si)]
-        padded_op_dimensions[dim] = size * dl.elems_per_stick() if (dim == dl.host_stick_dim()) else size
+        padded_op_dimensions[dim] = (
+            size * dl.elems_per_stick() if (dim == dl.host_stick_dim()) else size
+        )
 
     op_dim_infos = DimInfos(
         dim_labels,
@@ -430,7 +428,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                         "N_": {
                             "name_": "n",
                             **{
-                                di.label + "_": di.padded_size for di in op_dim_infos.as_list()
+                                di.label + "_": di.padded_size
+                                for di in op_dim_infos.as_list()
                             },  # dim sizes before split
                         },
                         "coordinateMasking_": coordinateMasking,
@@ -574,9 +573,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         }
     }
 
+
 # TODO: temp manual padding for matmu / bmm
 def pad_up(size, stick_size):
     return ((size + stick_size - 1) // stick_size) * stick_size
+
 
 def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     # [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
@@ -585,7 +586,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     for tensor in inputs + outputs:
         tensor["scale"] = [1 if s >= 0 else s for s in tensor["scale"]]
 
-   # implement core division on stick dimension
+    # implement core division on stick dimension
     cores = 1
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
         cores = kwargs["op_info"]["core_division"][-1][0]
@@ -597,7 +598,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     # TODO: Temp manual padding
     elems_per_stick = inputs[0]["device_layout"].elems_per_stick()
     padded_dimensions = dimensions[:-1] + [pad_up(dimensions[-1], elems_per_stick)]
-    
+
     op_dim_infos = DimInfos(
         dim_labels,
         dim_indices,
@@ -855,7 +856,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_labels,
         dim_indices,
         dimensions,
-        padded_dimensions,  
+        padded_dimensions,
         dim_splits,
     )
     dim_info_dict = op_dim_infos.as_dict()
