@@ -378,6 +378,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         op_info = {}
         if hasattr(self.current_node, "spyre_core_division"):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
+        if hasattr(self.current_node, "n_cores_used"):
+            op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
 
         if isinstance(value, UnimplementedOp):
             self.kernel_specs.append(value)
@@ -489,6 +491,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
         if hasattr(self.current_node, "spyre_core_division"):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
+        if hasattr(self.current_node, "n_cores_used"):
+            op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
 
         actuals = self.args.python_argdefs()[1]
         if value.op == MATMUL_REDUCTION_OP:
