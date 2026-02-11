@@ -19,6 +19,8 @@ from torch._dynamo.backends.common import AotAutograd
 from torch._inductor.virtualized import V
 from torch._inductor.graph import GraphLowering
 
+from .lowering import enable_spyre_lowerings
+
 
 @contextmanager
 def spyre_data_types():
@@ -45,6 +47,7 @@ class SpyreAotAutograd(AotAutograd):
         ):
             with (
                 spyre_data_types(),
+                enable_spyre_lowerings(),
                 V.set_real_inputs(example_inputs),
             ):
                 return super().__call__(gm, example_inputs, **kwargs)
@@ -54,7 +57,7 @@ class SpyreAotAutograd(AotAutograd):
 
 def spyre_compile_to_module(graph: GraphLowering, original_compile_to_module):
     if "spyre" in graph.device_types:
-        with spyre_data_types():
+        with spyre_data_types(), enable_spyre_lowerings():
             return original_compile_to_module(graph)
     else:
         return original_compile_to_module(graph)

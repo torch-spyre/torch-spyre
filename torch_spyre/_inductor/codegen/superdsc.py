@@ -30,8 +30,6 @@ from .data_ops import (
 
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
-    if len(dimensions) > 3 and (op != BATCH_MATMUL_OP and op != TRANSPOSE_OP):
-        raise Unsupported(f"{op} on {len(dimensions)}-D tensor")
     if op == MATMUL_REDUCTION_OP:
         return generate_matmul(
             pointers,
@@ -69,7 +67,10 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             **kwargs,
         )
     if op == "to_dtype":
-        if inputs[0]["ddtype"] == outputs[0]["ddtype"]:
+        if (
+            inputs[0]["device_layout"].device_dtype
+            == outputs[0]["device_layout"].device_dtype
+        ):
             return generate_clone(
                 pointers,
                 op=CLONE_OP,
@@ -80,7 +81,7 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             )
         else:
             raise Unsupported(
-                f"to_dtype from {inputs[0]['ddtype']} to {outputs[0]['ddtype']}"
+                f"to_dtype from {inputs[0]['device_layout'].device_dtype} to {outputs[0]['device_layout'].device_dtype}"
             )
 
     if op == TRANSPOSE_OP and len(dimensions) == 2:
@@ -116,8 +117,7 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
         transposed_dims = [
             dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
         ]
-        # TODO: add support for other stick transpose variants (1-3 and 2-3)
-        is_supported = (0 in transposed_dims) and 3 in transposed_dims
+        is_supported = 3 in transposed_dims
         if is_supported:
             return generate_transpose_4d_stick(
                 pointers,

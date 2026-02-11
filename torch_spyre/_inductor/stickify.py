@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence
-
-import sympy
-
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -32,33 +28,23 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     SchedulerNode,
     ExternKernelSchedulerNode,
+    NopKernelSchedulerNode,
 )
-from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout, StickFormat
+from torch_spyre._C import SpyreTensorLayout
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps
+from .pass_utils import SchedNodeArg, get_mem_deps, map_dims_to_vars
 
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
 
-def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
-    """
-    Order the free variables in an index expression in decreasing stride order.
-    """
-    strides = {
-        s: sympy_subs(index, {s: 1}) - sympy_subs(index, {s: 0})
-        for s in index.free_symbols
-    }
-    ordered_strides: Sequence[tuple[sympy.Symbol, sympy.Expr]] = sorted(
-        strides.items(), key=lambda item: item[1], reverse=True
-    )
-    return [item[0] for item in ordered_strides]
+def is_sparse(stl: SpyreTensorLayout) -> bool:
+    return stl.dim_map[-1] == -1
 
 
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
@@ -67,6 +53,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     op = pw.get_origin_node().target
     if len(args) == 1:
         x = args[0]
+        x_stl = x.layout.device_layout
         match op:
             case spyreop.layernormscale.default:
                 if not x.layout.size == output.size:
@@ -74,16 +61,13 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                         f"size mismatch:  layernormscale({x.layout.size})=>{output.size}) "
                     )
                 stl = SpyreTensorLayout(
-                    output.size,
-                    output.dtype,
-                    x.layout.device_layout.host_dim_order(),
-                    x.layout.device_layout.format,
+                    x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
                 )
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case spyreop.slice.default:
-                if x.layout.device_layout.format != StickFormat.Sparse:
+                if not is_sparse(x_stl):
                     raise Unsupported("slice on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("slice on non 1-D tensor")
@@ -92,56 +76,47 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case spyreop.swap.default:
-                if x.layout.device_layout.format != StickFormat.Sparse:
+                if not is_sparse(x_stl):
                     raise Unsupported("swap on non-sparse tensor")
                 if len(x.layout.size) != 1:
                     raise Unsupported("swap on non 1-D tensor")
-                stl = SpyreTensorLayout(
-                    output.size, output.dtype, [0], StickFormat.Sparse
-                )
+                stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case aten.clone.default:
-                if not x.layout.device_layout.format == StickFormat.Dense:
+                if is_sparse(x_stl):
                     raise Unsupported("clone on sparse tensor")
+                # FIXME: Blindly using dense generic stick layout. Should derive from inputs
                 stl = SpyreTensorLayout(output.size, output.dtype)
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
             case _:
-                # Generic pointwise unary: output layout is same as input
+                # Generic pointwise unary: output dim order is same as input
                 if not x.layout.size == output.size:
                     raise Unsupported(
                         f"size mismatch:  {op}({x.layout.size})=>{output.size}) "
                     )
-                stl = SpyreTensorLayout(
-                    output.size,
-                    output.dtype,
-                    x.layout.device_layout.host_dim_order(),
-                    x.layout.device_layout.format,
-                )
+                # FIXME: Blindly using dense generic stick layout. Should derive from inputs
+                stl = SpyreTensorLayout(output.size, output.dtype)
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
     elif op == spyreop.layernormnorm.default:
         x = args[0]
+        x_stl = x.layout.device_layout
         if not x.layout.size == output.size:
             raise Unsupported(
                 f"size mismatch:  layernormnorm({x.layout.size})=>{output.size}) "
             )
-        stl = SpyreTensorLayout(
-            output.size,
-            output.dtype,
-            x.layout.device_layout.host_dim_order(),
-            x.layout.device_layout.format,
-        )
+        stl = SpyreTensorLayout(x_stl.device_size, x_stl.dim_map, x_stl.device_dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
-        input_dims = [stride_order_vars(arg.dep.index) for arg in args]
+        output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
+        input_dims = [map_dims_to_vars(arg.layout, arg.dep.index) for arg in args]
         input_dim_idx = [0] * len(args)
         for i in range(len(output_dims)):
             var = output_dims[i]
@@ -154,39 +129,26 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                             "pointwise op with non-aligned input dimensions"
                         )
                     input_dim_idx[j] += 1
-        output_format = None
-        stick_dim_var = output_dims[-1]
-        for i in range(len(args)):
-            if stick_dim_var in input_dims[i]:
-                if output_format is None:
-                    output_format = args[i].layout.device_layout.format
-                elif output_format != args[i].layout.device_layout.format:
-                    raise Unsupported(
-                        "pointwise op with incompatible input stick formats"
-                    )
-        stl = SpyreTensorLayout(
-            output.size, output.dtype, list(range(len(output.size))), output_format
-        )
+
+        # FIXME: Blindly using dense generic stick layout. Should derive from inputs
+        stl = SpyreTensorLayout(output.size, output.dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
 
 
 def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
-    def stick_dim(stl: SpyreTensorLayout) -> int:
-        return stl.dim_map[-1]
-
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
-    output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
+    output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
     if red.reduction_type == MATMUL_REDUCTION_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
-        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+        if is_sparse(x_stl) or is_sparse(y_stl):
             raise Unsupported(f"matmul on non-dense tensors {x_stl} {y_stl}")
-        if stick_dim(x_stl) == 0 and stick_dim(y_stl) == 0:
+        if x_stl.host_stick_dim() == 0 and y_stl.host_stick_dim() == 0:
             out_host_dim_order = [1, 0]
-        elif stick_dim(x_stl) != 0 and stick_dim(y_stl) != 0:
+        elif x_stl.host_stick_dim() != 0 and y_stl.host_stick_dim() != 0:
             out_host_dim_order = [0, 1]
         else:
             raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
@@ -197,52 +159,40 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     elif red.reduction_type == BATCH_MATMUL_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
-        output_host_dim_order = x_stl.host_dim_order()
-        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+        if is_sparse(x_stl) or is_sparse(y_stl):
             raise Unsupported(
                 f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
             )
-        if len(x_stl.device_size) != len(output.size) + 1:
-            output_host_dim_order = x_stl.host_dim_order()[:-1]
-        if x_stl.host_dim_order() != y_stl.host_dim_order():
-            raise Unsupported(
-                f"{red.reduction_type} stick dimensions mismatch {x_stl} {y_stl}"
-            )
-        stl = SpyreTensorLayout(output.size, output.dtype, output_host_dim_order)
+        if x_stl.dim_map != y_stl.dim_map:
+            raise Unsupported(f"{red.reduction_type} layout mismatch {x_stl} {y_stl}")
+        # TODO: FIXME forcing generic stick layout. Should compute the output device_size and dim_map directly from input STL
+        stl = SpyreTensorLayout(output.size, output.dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
     elif red.reduction_type == "exx2":
-        x_stl = args[0].layout.device_layout
-        stl = SpyreTensorLayout(
-            output.size,
-            output.dtype,
-            x_stl.host_dim_order(),
-            StickFormat.SparseMulti,
-        )
+        # TODO: FIXME forcing generic stick layout.  Should compute the output device_size and dim_map directly from input STL
+        dim_map = list(range(len(output.size))) + [-1]
+        stl = SpyreTensorLayout(output.size, output.dtype, dim_map)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
         input = args[0]
-        input_dims = stride_order_vars(input.dep.index)
-        stick_var = input_dims[-1]
-        is_stick_reduction = stick_var not in output_dims
-        keep_dim = len(input.layout.size) == len(output.size)
-        format = (
-            StickFormat.Sparse
-            if is_stick_reduction and not keep_dim
-            else StickFormat.Dense
-        )
-        stl = SpyreTensorLayout(
-            output.size, output.dtype, list(range(len(output.size))), format
-        )
+        stick_dim = input.layout.device_layout.host_stick_dim()
+        input_dims = map_dims_to_vars(input.layout, input.dep.index)
+        stick_var = input_dims[stick_dim]
+        is_stick_reduction = stick_var not in output_dims.values()
+        sparse_tensor = is_stick_reduction
+        # TODO: FIXME forcing generic stick layout.  Should compute the lowlevel device_size and dim_map directly from input STL
+        dim_map = list(range(len(output.size))) + ([-1] if sparse_tensor else [])
+        stl = SpyreTensorLayout(output.size, output.dtype, dim_map)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
 
 
-def fallback_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
+def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
     output: FixedLayout = n.node.get_layout()
     # Use the generic stick format
     stl = SpyreTensorLayout(output.size, output.dtype)
@@ -306,10 +256,13 @@ def propagate_spyre_tensor_layouts(
                 ):
                     raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
-                output_layout = fallback_layout(n)
+                output_layout = generic_layout(n)
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
+        elif isinstance(n, NopKernelSchedulerNode):
+            output_layout = generic_layout(n)
+            n.node.layout = output_layout
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 

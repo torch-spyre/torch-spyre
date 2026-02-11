@@ -45,4 +45,11 @@ SPYRE_FP32_OPS = [
     "sigmoid",
     "exx2",
     "layernormnorm",
+    "clone",
 ]
+
+LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
+
+# Populate more valid labels from deeptools here if needed
+INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j"]
+OUTPUT_DIM_LABELS = ["out"]

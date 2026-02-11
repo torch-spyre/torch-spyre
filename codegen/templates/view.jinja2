@@ -13,40 +13,13 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 #}
-{{signature_out}} spyre__{{ template_data.op_name }}({{signature_in}}) {
-  DEBUGINFO("Tensor is on: ", {{ arguments[0].name }}.device());
-  
-  {% if "out" in overload_name %}
-    {% set out_given = True %}
-    {% set output_variable_name = "out" %}
-    {% set arguments = arguments[:-1] %}
-  {% else %}
-    {% set out_given = False %}
-    {% if returns|length > 0 %}
-      {% set output_variable_name = returns[0].name %}
+@torch.library.register_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", ["spyre"])
+def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length > 0 %} -> {{ signature_out }}{% endif %}:
+    {% if "out" in overload_name %}
+    kernel = torch.library.get_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", "CPU")
+    out = kernel.call_boxed(torch._C._dispatch_keys(self), {{ arg_names }})
+    return out
     {% else %}
-      {% if inplace %}
-        {% set output_variable_name = arguments[0].name %}
-      {% else %}
-        {% set output_variable_name = "out" %}
-      {% endif %}
+    kernel = torch.library.get_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", "CPU")
+    return kernel.call_boxed(torch._C._dispatch_keys(self), {{ arg_names }})
     {% endif %}
-  {% endif %}
-
-  {% if not out_given and not inplace %}
-  {{signature_out}} {{ output_variable_name }};
-  {% endif %}
-
-  if ({{ arguments[0].name }}.is_contiguous()) {
-    {{ output_variable_name }} = at::native::{{ operator_name }}({{ arguments[0].name }}{{"" if arguments|length == 1 else "," }}{% for arg in arguments[1:] %}{{ C10_AS_INTARRAYREF_SLOW(arg.name) if "Sym" in arg.type else arg.name}}{{" " if loop.last else "," }}{% endfor %});
-  }
-  else {
-    DEBUGINFO("spyre_{{ template_data.op_name }} not contiguous");
-    {{ output_variable_name }} = at::native::{{ operator_name }}({{ arguments[0].name }}.to(c10::kCPU).contiguous(){{"" if arguments|length == 1 else "," }}{% for arg in arguments[1:] %}{{ C10_AS_INTARRAYREF_SLOW(arg.name) if "Sym" in arg.type else arg.name}}{{" " if loop.last else "," }}{% endfor %}).to(c10::kPrivateUse1);
-  }
-  return {{ output_variable_name }};
-}
-
-TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
-  m.impl({{ template_data.reg_name }}, TORCH_FN(spyre__{{ template_data.op_name }}));
-}

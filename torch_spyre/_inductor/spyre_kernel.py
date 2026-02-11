@@ -40,6 +40,7 @@ from .constants import (
 )
 from . import Unsupported
 from .ir import FixedTiledLayout
+from .pass_utils import map_dims_to_vars
 
 
 class RValue(ABC):
@@ -171,6 +172,14 @@ class SpyreOpFuncs:
     @staticmethod
     def rsqrt(x):
         return PointwiseOp("rsqrt", [x])
+
+    @staticmethod
+    def slice(x):
+        return PointwiseOp("slice", [x])
+
+    @staticmethod
+    def swap(x):
+        return PointwiseOp("swap", [x])
 
     @staticmethod
     def sigmoid(x):
@@ -315,6 +324,7 @@ def create_kernel_spec(
             torch.bool,
             torch.float16,
             torch.float32,
+            torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
@@ -322,6 +332,7 @@ def create_kernel_spec(
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
+    wildcard = sympy.Symbol("*")
 
     def __init__(
         self,
@@ -372,12 +383,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             self.kernel_specs.append(value)
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
-            di = self.analyze_index_expr(dst.index)
+            di = self.derive_dim_info(dst)
             args: list[TensorArg | ConstantArg] = []
             scales = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
-                    scale = self.analyze_tensor_access(di, input.index)
+                    scale = self.analyze_tensor_access(di, input)
                     if value.op == "layernormscale" or (
                         value.op == "layernormnorm"
                         and (len(args) == 1 or len(args) == 2)
@@ -397,7 +408,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     scales.append([-1] * len(di))
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
-            scale = self.analyze_tensor_access(di, dst.index)
+            scale = self.analyze_tensor_access(di, dst)
             args.append(
                 create_tensor_arg(
                     False,
@@ -412,17 +423,15 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
-            input_stride = list(self.get_strides(value.index).values())[0]
-            output_stride = list(self.get_strides(dst.index).values())[0]
-            in_di = self.analyze_index_expr(value.index)
-            out_di = self.analyze_index_expr(dst.index)
+            in_di = self.derive_dim_info(value)
+            out_di = self.derive_dim_info(dst)
             args = [
                 create_tensor_arg(True, actuals.index(value.name), value.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
             scales = [
-                self.analyze_tensor_access(in_di, value.index),
-                self.analyze_tensor_access(out_di, index),
+                self.analyze_tensor_access(in_di, value),
+                self.analyze_tensor_access(out_di, dst),
             ]
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
                 # Determine data op based on tensor arg and scales
@@ -436,10 +445,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 elif Counter(in_di) == Counter(out_di) and in_di != out_di:
                     # Transpose: check that the input / output DimensionInfo are the same, but in different order.
                     op = TRANSPOSE_OP
-                elif input_stride == 64 and output_stride == 64:
-                    op = "swap"
-                elif input_stride == 64 and output_stride == 1:
-                    op = "slice"
                 elif (
                     args[1].device_layout.device_size
                     == args[0].device_layout.device_size
@@ -495,18 +500,31 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 raise Unsupported(f"invalid matmul arguments {value.arguments}")
             x = value.arguments[0]
             y = value.arguments[1]
-            di_x = self.analyze_index_expr(x.index)
-            di_y = self.analyze_index_expr(y.index)
-            di = [di_x[0], di_x[1], di_y[1]]
+            di_x = self.derive_dim_info(x)
+            di_y = self.derive_dim_info(y)
+            if len(di_x) == 2 and len(di_y) == 2:
+                di = [di_x[0], di_x[1], di_y[1]]
+            elif len(di_x) == 1 and len(di_y) == 2:
+                di = [di_x[0], DimensionInfo(self.wildcard, 1), di_y[1]]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
+            elif len(di_x) == 2 and len(di_y) == 1:
+                di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1)]
+                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # will not compute the correct result.  Raise Unsupported to make this explicit.
+                raise Unsupported(f"matmul requires padding support: {value.arguments}")
+            else:
+                raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
             scales = [
-                self.analyze_tensor_access(di, x.index),
-                self.analyze_tensor_access(di, y.index),
-                self.analyze_tensor_access(di, dst.index),
+                self.analyze_tensor_access(di, x),
+                self.analyze_tensor_access(di, y),
+                self.analyze_tensor_access(di, dst),
             ]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
@@ -520,8 +538,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 raise Unsupported(f"invalid batchmatmul arguments {value.arguments}")
             x = value.arguments[0]
             y = value.arguments[1]
-            di_x = self.analyze_index_expr(x.index)  # type: ignore[union-attr]
-            di_y = self.analyze_index_expr(y.index)  # type: ignore[union-attr]
+            di_x = self.derive_dim_info(x)
+            di_y = self.derive_dim_info(y)
             di = [di_x[0], di_x[1], di_x[2], di_y[2]]
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
@@ -529,9 +547,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
             scales = [
-                self.analyze_tensor_access(di, x.index),
-                self.analyze_tensor_access(di, y.index),
-                self.analyze_tensor_access(di, dst.index),
+                self.analyze_tensor_access(di, x),
+                self.analyze_tensor_access(di, y),
+                self.analyze_tensor_access(di, dst),
             ]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
@@ -543,51 +561,49 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ):
                 raise Unsupported(f"reduction operands: {value.arguments}")
             x = value.arguments[0]
-            di = self.analyze_index_expr(x.index)
+            di = self.derive_dim_info(x)
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(False, actuals.index(dst.name), dst.layout),
             ]
             scales = [
-                self.analyze_tensor_access(di, x.index),
-                self.analyze_tensor_access(di, dst.index),
+                self.analyze_tensor_access(di, x),
+                self.analyze_tensor_access(di, dst),
             ]
             self.kernel_specs.append(
                 create_kernel_spec(value.op, True, di, args, scales, op_info)
             )
 
-    def get_strides(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
-        """
-        Compute the strides of the free variables in an index expression.
-        """
-        return {
-            s: sympy_subs(index, {s: 1}) - sympy_subs(index, {s: 0})
-            for s in index.free_symbols
-        }
-
     def analyze_tensor_access(
         self,
         op_dimensions: Sequence[DimensionInfo],
-        index: sympy.Expr,
+        access: TensorAccess,
     ) -> list[int]:
         """
         Return the scale implied by the given iteration space and indexing expression
         """
-        return [1 if di.var in index.free_symbols else -1 for di in op_dimensions]
+        dim_map = map_dims_to_vars(access.layout, access.index)
+        var_map = {v: k for k, v in dim_map.items()}
+        return [
+            -3
+            if (di.var == self.wildcard)
+            else (var_map[di.var] if di.var in var_map else -1)
+            for di in op_dimensions
+        ]
 
-    def analyze_index_expr(self, index: sympy.Expr) -> list[DimensionInfo]:
+    def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
         """
-        Return the iteration space implied by the index expression
+        Return the iteration space implied by the tensor access
         """
-        strides = self.get_strides(index)
-        ordered_strides: Sequence[tuple[sympy.Symbol, sympy.Expr]] = sorted(
-            strides.items(), key=lambda item: item[1], reverse=True
-        )
-        result = []
         var_ranges = self.var_ranges()
-        for v, _ in ordered_strides:
-            result.append(DimensionInfo(v, int(var_ranges[v])))
-        return result
+        if var_ranges:
+            dim_map = map_dims_to_vars(access.layout, access.index)
+            return [
+                DimensionInfo(dim_map[v], int(var_ranges[dim_map[v]]))
+                for v in sorted(dim_map)
+            ]
+        else:
+            return [DimensionInfo(self.wildcard, 1)]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its KernelSpec"""
