@@ -76,8 +76,6 @@ class FixedTiledLayout(FixedLayout):
     the device tensor layout and the information needed to map between them.
     """
 
-    device_layout: SpyreTensorLayout
-
     def __init__(
         self,
         device: torch.device,
@@ -87,7 +85,7 @@ class FixedTiledLayout(FixedLayout):
         device_layout: SpyreTensorLayout,
     ) -> None:
         super().__init__(device, dtype, size, stride)
-        self.device_layout = device_layout
+        self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
 
     def __str__(self) -> str:
@@ -96,36 +94,5 @@ class FixedTiledLayout(FixedLayout):
             f"{type(self).__name__}('{self.device.type}{device_index_str}', {self.dtype}, "
             f"size={self.size}, stride={self.stride}, device_layout={self.device_layout})"
         )
-
-    def make_indexer(self) -> Callable[[Sequence[Expr]], Expr]:
-        """
-        A closure containing math to read a given element.
-
-        NOTE:   For the purposes of representing an access in the LoopLevelIR,
-                we use a stride of 1 for the stick dimension.
-                This is not true, because the sticks are actually tiled in memory.
-                If we needed this indexer to compute the real offset in memory, the stick dimension
-                compuation would actually need to be something like:
-                    result = result + ((index[stick_dim] // 64) * stride[-2] + (index[stick_dim] % 64)
-                However, all SpyreKernel needs from this indexer to be able to build a KernelSpec
-                is for the indexer function to robustly capture the relationship between dim_map and
-                the free variables in the index expression.
-                By using a simpler expression it is easier to recover this relationship by stride-ordering the variables.
-        """
-        offset = self.offset
-        stl = self.device_layout
-        host_size = self.size
-
-        def indexer(index: Sequence[Expr]) -> Expr:
-            stick_dim = stl.host_stick_dim()
-            expr = index[stick_dim] + offset
-            stride = stl.elems_per_stick()
-            for hd in reversed(stl.dim_map[:-1]):
-                if hd != stick_dim:
-                    expr = (index[hd] * stride) + expr
-                    stride = stride * host_size[hd]
-            return expr
-
-        return indexer
 
     __repr__ = __str__

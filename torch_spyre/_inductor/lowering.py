@@ -18,7 +18,6 @@ from contextlib import contextmanager
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise
-from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
 
 
@@ -131,9 +130,10 @@ def lower_mm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1 = index
         (r0,) = reduction_index
-        tmp1 = ops.load(x.get_name(), x.get_size()[1] * i0 + r0)
-        tmp2 = ops.load(y.get_name(), i1 + y.get_size()[1] * r0)
-        return (tmp1, tmp2)
+        return (x_loader([i0, r0]), y_loader([r0, i1]))
+
+    x_loader = x.make_loader()
+    y_loader = y.make_loader()
 
     result = Reduction.create(
         reduction_type=MATMUL_REDUCTION_OP,
@@ -156,15 +156,12 @@ def lower_bmm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1, i2 = index
         (r0,) = reduction_index
-        tmp1 = ops.load(
-            x.get_name(),
-            x.get_size()[2] * x.get_size()[1] * i0 + x.get_size()[1] * i1 + r0,
-        )
-        tmp2 = ops.load(
-            y.get_name(),
-            y.get_size()[2] * y.get_size()[1] * i0 + y.get_size()[1] * r0 + i2,
-        )
+        tmp1 = x_loader([i0, i1, r0])
+        tmp2 = y_loader([i0, r0, i2])
         return (tmp1, tmp2)
+
+    x_loader = x.make_loader()
+    y_loader = y.make_loader()
 
     result = Reduction.create(
         reduction_type=BATCH_MATMUL_OP,

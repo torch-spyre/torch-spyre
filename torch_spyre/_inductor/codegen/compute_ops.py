@@ -12,10 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import zip_longest
 import math
 from dataclasses import dataclass
+
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import LAYOUT_LABELS
+from torch_spyre._inductor.constants import (
+    LAYOUT_LABELS,
+    INPUT_DIM_LABELS,
+    OUTPUT_DIM_LABELS,
+)
 from itertools import takewhile
 
 
@@ -29,11 +35,13 @@ class DimInfo:
         unpadded_size: int,
         elems_per_stick: int,
         stick_dims: list,
+        scale: int,
     ):
         self.label = label
         self.index = index
         self.unpadded_size = unpadded_size
         self.nsplits = nsplits
+        self.scale = scale
 
         self.is_stick_dim = label in stick_dims
 
@@ -52,8 +60,17 @@ class DimInfo:
         self.size = self.unpadded_size + self.padding
 
 
+def reorder_dims(cur_list, dim_map):
+    return [cur_list[i] for i in dim_map]
+
+
 @dataclass
 class DimInfos:
+    """
+    Class to help iterate over dimension information in various formats
+    Input lists are in host order, but are immediately reordered according to the dim_indices position map
+    """
+
     def __init__(
         self,
         dim_labels: list[str],
@@ -62,7 +79,7 @@ class DimInfos:
         dim_splits: list[int],
         elems_per_stick: int,
         stick_dims: list,
-        new_indices_order: list[int] = [],
+        scales: list[int] = [],
     ):
         self.dim_infos_list = []
         self.dim_infos_dict = {}
@@ -71,14 +88,20 @@ class DimInfos:
         self.dim_indices = dim_indices
         self.dim_sizes = dim_sizes
         self.dim_splits = dim_splits
+        self.scales = scales
 
-        if new_indices_order:
-            self.reorder_all_indices(new_indices_order)
+        self.do_reordering()
 
-        for label, index, size, nsplits in zip(
-            self.dim_labels, self.dim_indices, self.dim_sizes, self.dim_splits
+        for label, index, size, nsplits, scale in zip_longest(
+            self.dim_labels,
+            self.dim_indices,
+            self.dim_sizes,
+            self.dim_splits,
+            self.scales,
         ):
-            dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims)
+            dim_info = DimInfo(
+                label, index, nsplits, size, elems_per_stick, stick_dims, scale
+            )
             self.dim_infos_list.append(dim_info)
             self.dim_infos_dict[label] = dim_info
 
@@ -88,16 +111,13 @@ class DimInfos:
     def as_dict(self) -> dict[str, DimInfo]:
         return self.dim_infos_dict
 
-    # Convenience function for construction for per-tensor dim infos.
-    # Todo: this is a bit awkward.  Make this simpler as we refine dims abstraction
-    def reorder_all_indices(self, new_indices_order):
-        self.dim_labels = self.reorder_indices(self.dim_labels, new_indices_order)
-        self.dim_sizes = self.reorder_indices(self.dim_sizes, new_indices_order)
-        self.dim_splits = self.reorder_indices(self.dim_splits, new_indices_order)
-        self.dim_indices = new_indices_order
-
-    def reorder_indices(self, cur_list, new_indices):
-        return [cur_list[self.dim_indices.index(i)] for i in new_indices]
+    # Reorder lists to align with dim_indices position map.
+    def do_reordering(self):
+        self.dim_labels = reorder_dims(self.dim_labels, self.dim_indices)
+        self.dim_sizes = reorder_dims(self.dim_sizes, self.dim_indices)
+        self.dim_splits = reorder_dims(self.dim_splits, self.dim_indices)
+        if self.scales:
+            self.scales = reorder_dims(self.scales, self.dim_indices)
 
 
 def num_bytes(df: DataFormats) -> int:
@@ -317,36 +337,23 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
 
-    # FIXME: use core_division instead of cores to fill the list of splits
-    if ndim == 1:
-        dim_labels = ["out"]
-        dim_indices = [0]
-        dim_splits = [cores]
-        core_id_to_wk_slice = {str(i): {"out": i} for i in range(cores)}
-    elif ndim == 2:
-        dim_labels = ["mb", "out"]
-        dim_indices = [0, 1]
-        dim_splits = [1, cores]
-        core_id_to_wk_slice = {str(i): {"mb": 0, "out": i} for i in range(cores)}
-    else:  # ndim == 3
-        # NOTE: Pytorch host tensor shape is [mb, x, out] from the most to the
-        #       least significant dimension. Here when filling in the
-        #       layoutDimOrder, we use 3d generic stick layout on device
-        #       [mb, out, x] from the least to the most significant
-        #       dimension.
-        dim_labels = ["mb", "out", "x"]
-        dim_indices = [0, 2, 1]
-        dim_splits = [1, cores, 1]
-        core_id_to_wk_slice = {
-            str(i): {"mb": 0, "x": 0, "out": i} for i in range(cores)
+    # Get operation dim map from input or output tensor
+    tensor = inputs[0] if reduction else outputs[0]
+    dim_indices = tensor["device_layout"].dim_map[::-1][1:]
+
+    dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+    dim_splits = [1] * (ndim - 1) + [cores]
+
+    core_id_to_wk_slice = {}
+    for i in range(cores):
+        core_id_to_wk_slice[str(i)] = {
+            str(s): i if s == "out" else 0 for s in dim_labels
         }
 
-    # reorder sizes according to layoutDimOrder
-    dim_sizes = [dimensions[i] for i in dim_indices]
     op_dim_infos = DimInfos(
         dim_labels,
         dim_indices,
-        dim_sizes,
+        dimensions,
         dim_splits,
         elems_per_stick,
         stick_dims=["out"],
@@ -374,13 +381,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         # Create dim infos specific to this tensor, reordered if necessary
         tensor["dim_infos"] = DimInfos(
             dim_labels,
-            dim_indices,
-            dim_sizes,
+            tensor_dim_indices,
+            dimensions,
             dim_splits,
             elems_per_stick,
             stick_dims=["out"],
-            new_indices_order=tensor_dim_indices,
+            scales=tensor["scale"],
         )
+
+        # primaryDsInfo_ requires each unique layout order to have a name.
+        # Reuse the same label for tensors with the same layout, for compactness
         tensor["ds_type"] = None
         for label, dim_order in layouts.items():
             if tensor["dim_infos"].dim_labels == dim_order:
@@ -473,7 +483,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             + c
                                             # calculate the prod of dim sizes
                                             # less significant than chosen split dim i.e. the stick
-                                            * math.prod(dim_sizes[:2])
+                                            * math.prod(op_dim_infos.dim_sizes[:2])
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
                                             )
@@ -486,7 +496,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "coordInfo": {
                                         di.label: gen_coord_info_value(
                                             size=di.split_size
-                                            if (tensor["scale"][di.index] == 1)
+                                            if (di.scale == 1)
                                             else 1,
                                             nsplits=di.nsplits,
                                             elems_per_stick=tensor[
@@ -494,8 +504,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             ].device_dtype.elems_per_stick(),
                                             is_stick_dim=(di.label == "out"),
                                             is_stick_reduction=(
-                                                di.label == "out"
-                                                and tensor["scale"][di.index] == -1
+                                                di.label == "out" and di.scale == -1
                                             ),
                                         )
                                         for di in tensor["dim_infos"].as_list()
@@ -512,13 +521,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "dsType_": tensor["ds_type"],
                                 "scale_": [
                                     (
-                                        tensor["scale"][di.index]
+                                        di.scale
                                         # TODO: revisit whether this special case can be removed
                                         #       pending change in deeptools
-                                        if not (
-                                            di.label == "out"
-                                            and tensor["scale"][di.index] == -1
-                                        )
+                                        if not (di.label == "out" and di.scale == -1)
                                         else -2
                                     )
                                     for di in tensor["dim_infos"].as_list()

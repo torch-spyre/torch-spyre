@@ -179,6 +179,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_0": (0, cached_randn((3, 7, 9))),
                 "3d_1": (1, cached_randn((3, 7, 9))),
                 "3d_2": (2, cached_randn((3, 7, 9))),
+                "3d_01": ((0, 1), cached_randn((3, 7, 9))),
+                "3d_12": ((1, 2), cached_randn((3, 7, 9))),
                 # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
                 # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
             },
@@ -328,17 +330,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     cached_randn((256, 3, 17, 64), abs=True),
                 ),
-                # skipping these - not working yet
-                # "dim_1_3": (
-                #     1,
-                #     3,
-                #     cached_randn((3, 256, 17, 64), abs=True),
-                # ),
-                # "dim_2_3": (
-                #     2,
-                #     3,
-                #     cached_randn((3, 17, 256, 64), abs=True),
-                # ),
+                "dim_2_3": (
+                    2,
+                    3,
+                    cached_randn((3, 17, 128, 256), abs=True),
+                ),
+                "dim_1_3": (
+                    1,
+                    3,
+                    cached_randn((3, 256, 17, 64), abs=True),
+                ),
             }
         },
         ("test_cmp", "test_binary_op_cpu"): {
@@ -476,6 +477,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
                 "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "fp16_4d": (cached_randn((8, 2, 16, 256), dtype=torch.float16),),
                 "int64_1d": (torch.randint(1000, (128,)),),
                 "int64_2d": (torch.randint(1000, (256, 128)),),
                 "int_3d": (torch.randint(1000, (8, 16, 256)),),
