@@ -163,6 +163,10 @@ def _autoload():
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
     import torch_spyre.codegen_ops  # noqa: F401
 
+    from torch_spyre._inductor import _autoload as ts_autoload
+
+    ts_autoload()
+
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config
 

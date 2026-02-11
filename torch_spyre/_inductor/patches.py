@@ -33,12 +33,20 @@ def _should_run_on_spyre(
     ):
         return True
 
-    # Check the last "real" node of the graph whether it resides on the spyre device
+    # Check the example_values of the last "real" node of the graph whether it resides on the spyre device
     if (
         graph is not None
         and graph.output_node().prev.meta.get("example_value", None) is not None
         and graph.output_node().prev.meta.get("example_value", None).device.type
         == "spyre"
+    ):
+        return True
+
+    # Check the kwargs of the last "real" node of the graph whether it resides on the spyre device
+    if (
+        graph is not None
+        and "device" in graph.output_node().prev.kwargs
+        and graph.output_node().prev.kwargs["device"].type == "spyre"
     ):
         return True
 
