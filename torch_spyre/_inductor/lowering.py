@@ -19,7 +19,6 @@ import torch
 
 from torch._inductor.ir import Reduction, Pointwise
 import torch._inductor.lowering as lowering
-from torch._inductor.select_algorithm import realize_inputs
 
 from typing import Any, Callable, Union
 
@@ -133,9 +132,8 @@ def lower_mm(x, y):
         (r0,) = reduction_index
         return (x_loader([i0, r0]), y_loader([r0, i1]))
 
-    # x, y = realize_inputs(x, y)
-    # x = V.graph.get_buffer(x.realize())
-    # y = V.graph.get_buffer(y.realize())
+    x = V.graph.get_buffer(x.realize())
+    y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
@@ -155,17 +153,8 @@ def lower_mm(x, y):
     return result
 
 
-@register_spyre_lowering(torch.ops.aten.matmul.default)
-def lower_matmul(x, y):
-    if len(x.get_size()) == 2:
-        return lower_mm(x, y)
-    else:
-        return lower_bmm(x, y)
-
-
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
-    x, y = realize_inputs(x, y)
     x = V.graph.get_buffer(x.realize())
     y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()

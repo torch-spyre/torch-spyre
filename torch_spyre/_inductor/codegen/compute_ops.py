@@ -1008,11 +1008,9 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                 cores = kwargs["op_info"]["n_cores_used"]
 
             if "core_division" in kwargs["op_info"]:
-                print(kwargs["op_info"]["core_division"])
                 core_div = kwargs["op_info"]["core_division"][
                     -1
                 ]  # output core division
-                print(core_div)
                 dim_splits = [
                     core_div[0],  # x split (from device layout index 0)
                     core_div[1],  # y split (from device layout index 1)

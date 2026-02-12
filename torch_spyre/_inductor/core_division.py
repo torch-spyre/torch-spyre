@@ -236,7 +236,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         sizes = [device_size[dim] for dim in parallelizable_dims]
 
         # Prioritize: y > x > out > mb
-        priorities = [1, 2, 3, 4]  # mb=1 (lowest), out=2, x=3, y=3(highest)
+        priorities = [1, 2, 3, 4]  # mb=1 (lowest), out=2, x=3, y=4 (highest)
         splits = multi_dim_core_split(sizes, max_cores, priorities)
         n.n_cores_used = math.prod(splits)
 
