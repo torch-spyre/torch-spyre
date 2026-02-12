@@ -140,7 +140,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_mm", "test_binary_op"): {
             "ops_dict": {
                 "mm": torch.mm,
-                "matmul": torch.matmul,
                 # "einsum": lambda a, b: torch.einsum('mk, kn -> mn', a, b),  # bmm not supported yet
             },
             "param_sets": make_param_dict(
@@ -153,12 +152,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         ("test_bmm", "test_binary_op"): {
-            "ops_dict": {
-                "bmm": torch.bmm,
-            },
+            "ops_dict": {"bmm": torch.bmm},
             "param_sets": make_param_dict(
                 [
                     ((3, 17, 256), (3, 256, 128)),
+                ]
+            ),
+        },
+        ("test_matmul", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "matmul": torch.matmul,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((512, 256), (256, 128)),
+                    ((3, 17, 256), (3, 256, 128)),
+                    ((4, 3, 128, 256), (4, 3, 256, 128)),
                 ]
             ),
         },
