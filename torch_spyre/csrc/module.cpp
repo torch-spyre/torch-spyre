@@ -23,7 +23,6 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
-#include <common/traced_setting.hpp>
 #include <cstdlib>  // std::getenv
 #include <dee_internal/dee_graph_converter.hpp>
 #include <flex/flex_factory.hpp>
