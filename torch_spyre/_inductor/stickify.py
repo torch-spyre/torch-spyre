@@ -32,7 +32,7 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
@@ -52,19 +52,11 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     output: FixedLayout = n.node.get_layout()
     origin_node = next(iter(pw.origins))
     op = origin_node.target
+    output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
     if len(args) == 1:
         x = args[0]
         x_stl = x.layout.device_layout
         match op:
-            case spyreop.layernormscale.default:
-                if not x.layout.size == output.size:
-                    raise Unsupported(
-                        f"size mismatch:  layernormscale({x.layout.size})=>{output.size}) "
-                    )
-                stl = SpyreTensorLayout(
-                    x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
-                )
-
             case spyreop.slice.default:
                 if not is_sparse(x_stl):
                     raise Unsupported("slice on non-sparse tensor")
@@ -80,9 +72,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
 
             case aten.clone.default:
-                if is_sparse(x_stl):
-                    raise Unsupported("clone on sparse tensor")
-                # FIXME: Blindly using dense generic stick layout. Should derive from inputs
+                # Clone puts its output into the default device layoout.
                 stl = SpyreTensorLayout(output.size, output.dtype)
 
             case _:
@@ -92,7 +82,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 if in_size == out_size:
                     # Generic pointwise unary: output dim order is same as input
                     stl = SpyreTensorLayout(
-                        x_stl.device_size, x_stl.dim_map, x_stl.device_dtype
+                        x_stl.device_size, x_stl.dim_map, get_device_dtype(output.dtype)
                     )
                 elif [s for s in in_size if s != 1] == [s for s in out_size if s != 1]:
                     # squeeze or unsqueeze
@@ -121,7 +111,6 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
         input_dims = [map_dims_to_vars(arg.layout, arg.dep.index) for arg in args]
         input_dim_idx = [0] * len(args)
         for i in range(len(output_dims)):
@@ -151,7 +140,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
         if is_sparse(x_stl) or is_sparse(y_stl):
-            raise Unsupported(f"matmul on non-dense tensors {x_stl} {y_stl}")
+            raise Unsupported(f"matmul on sparse tensors {x_stl} {y_stl}")
         if x_stl.host_stick_dim() == 0 and y_stl.host_stick_dim() == 0:
             out_host_dim_order = [1, 0]
         elif x_stl.host_stick_dim() != 0 and y_stl.host_stick_dim() != 0:
@@ -166,9 +155,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
         if is_sparse(x_stl) or is_sparse(y_stl):
-            raise Unsupported(
-                f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
-            )
+            raise Unsupported(f"bmm on sparse tensors {x_stl} {y_stl}")
         if x_stl.dim_map != y_stl.dim_map:
             raise Unsupported(f"{red.reduction_type} layout mismatch {x_stl} {y_stl}")
         # TODO: FIXME forcing generic stick layout. Should compute the output device_size and dim_map directly from input STL
