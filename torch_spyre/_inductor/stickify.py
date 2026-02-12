@@ -32,7 +32,7 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 from . import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
@@ -45,6 +45,38 @@ spyreop = torch.ops.spyre
 
 def is_sparse(stl: SpyreTensorLayout) -> bool:
     return stl.dim_map[-1] == -1
+
+
+def device_layout_like(
+    layout: FixedTiledLayout, dtype: torch.dtype
+) -> SpyreTensorLayout:
+    """
+    Return a SpyreTensorLayout with the same tiling pattern as layout adjusted for the device_size of dtype.
+    """
+    if get_elem_in_stick(layout.dtype) == get_elem_in_stick(dtype):
+        return SpyreTensorLayout(
+            layout.device_layout.device_size,
+            layout.device_layout.dim_map,
+            get_device_dtype(dtype),
+        )
+    else:
+        adjusted_device_size = list(layout.device_layout.device_size)
+        stick_dim_idx = -3 if len(adjusted_device_size) > 2 else -2
+        old = get_elem_in_stick(layout.dtype)
+        new = get_elem_in_stick(dtype)
+        if old > new:
+            scaling_factor = old / new
+            adjusted_device_size[-1] *= scaling_factor
+            adjusted_device_size[stick_dim_idx] = (
+                adjusted_device_size[stick_dim_idx] + scaling_factor - 1
+            ) / scaling_factor
+        else:
+            scaling_factor = new / old
+            adjusted_device_size[-1] /= scaling_factor
+            adjusted_device_size[stick_dim_idx] *= scaling_factor
+        return SpyreTensorLayout(
+            adjusted_device_size, layout.device_layout.dim_map, get_device_dtype(dtype)
+        )
 
 
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
@@ -81,9 +113,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 
                 if in_size == out_size:
                     # Generic pointwise unary: output dim order is same as input
-                    stl = SpyreTensorLayout(
-                        x_stl.device_size, x_stl.dim_map, get_device_dtype(output.dtype)
-                    )
+                    stl = stl = device_layout_like(x.layout, output.dtype)
                 elif [s for s in in_size if s != 1] == [s for s in out_size if s != 1]:
                     # squeeze or unsqueeze
 
@@ -100,6 +130,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     elif op == spyreop.layernormnorm.default:
+        # Output layout is determined by layout of first argument only
         x = args[0]
         x_stl = x.layout.device_layout
         if not x.layout.size == output.size:
@@ -111,21 +142,18 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        input_dims = [map_dims_to_vars(arg.layout, arg.dep.index) for arg in args]
-        input_dim_idx = [0] * len(args)
-        for i in range(len(output_dims)):
-            var = output_dims[i]
-            for j in range(len(args)):
-                if var in input_dims[j]:
-                    if input_dims[j][input_dim_idx[j]] != var:
-                        # TODO: This is overly conservative.
-                        #        SDSCs can support pointwise ops where non-stick dimensions differ in stride order
-                        raise Unsupported(
-                            "pointwise op with non-aligned input dimensions"
-                        )
-                    input_dim_idx[j] += 1
+        # Case 1: There exists a non-broadcasting input. Propagate its device_layout to the output.
+        for arg in args:
+            if arg.layout.size == output.size:
+                stl = device_layout_like(arg.layout, output.dtype)
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
 
-        # FIXME: Blindly using dense generic stick layout. Should derive from inputs
+        # Case 2: All inputs are broadcasting at least one dimension.
+        #         For now, just use the default layout for the output shape.
+        #         TODO: Are there cases where we should instead use a non-default
+        #               dimension order by looking at the dimension order of the inputs?
         stl = SpyreTensorLayout(output.size, output.dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
