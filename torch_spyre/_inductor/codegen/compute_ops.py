@@ -382,7 +382,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # Get operation dim map from input or output tensor
     op_dims_tensor = inputs[0] if reduction else outputs[0]
-    dim_indices = op_dims_tensor["device_layout"].dim_map[::-1][1:]
+    dl = op_dims_tensor["device_layout"]
+    dim_map = dl.dim_map[::-1][1:]
+    reindex_map = {v: k for k, v in enumerate(sorted(dim_map))}
+    dim_indices = [reindex_map[x] for x in dim_map]
 
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim - 1) + [cores]
@@ -395,18 +398,17 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [1] * len(dimensions)
-    dl = op_dims_tensor["device_layout"]
 
     # Un-tile and put in host order
-    dim_map = dl.dim_map[::-1][1:]
     sizes = dl.device_size[::-1][1:]
 
+    stick_dim = reindex_map[dl.host_stick_dim()]
     for dim in range(ndim):
         si = op_dims_tensor["scale"][dim]
         assert si >= 0, "Scale value should be non-negative for op_dims_tensor"
         size = sizes[dim_map.index(si)]
         padded_op_dimensions[dim] = (
-            size * dl.elems_per_stick() if (dim == dl.host_stick_dim()) else size
+            size * dl.elems_per_stick() if (dim == stick_dim) else size
         )
 
     op_dim_infos = DimInfos(
@@ -435,8 +437,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                 )
             else:  # keepdim=0 case
                 tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
-
-                print(tensor_dim_indices)
         else:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices

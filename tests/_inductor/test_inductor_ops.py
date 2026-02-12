@@ -664,6 +664,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        (
+            "test_size_one",
+            "test_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "exp": torch.exp,
+            },
+            "param_sets": {
+                "2d0": {cached_randn((1, 3), dtype=torch.float16)},
+                "2d1": {cached_randn((2, 1), dtype=torch.float16)},
+                "3d0": {cached_randn((1, 3, 4), dtype=torch.float16)},
+                "3d1": {cached_randn((2, 1, 4), dtype=torch.float16)},
+                "3d2": {cached_randn((2, 3, 1), dtype=torch.float16)},
+                "3d01": {cached_randn((1, 1, 4), dtype=torch.float16)},
+                "3d02": {cached_randn((2, 3, 1), dtype=torch.float16)},
+                "3d12": {cached_randn((1, 1, 4), dtype=torch.float16)},
+                "4d0": {cached_randn((1, 3, 4, 5), dtype=torch.float16)},
+                "4d1": {cached_randn((2, 1, 4, 5), dtype=torch.float16)},
+                "4d2": {cached_randn((2, 3, 1, 5), dtype=torch.float16)},
+                "4d3": {cached_randn((2, 3, 4, 1), dtype=torch.float16)},
+                "4d01": {cached_randn((1, 1, 4, 5), dtype=torch.float16)},
+                "4d02": {cached_randn((1, 3, 1, 5), dtype=torch.float16)},
+                "4d03": {cached_randn((1, 3, 4, 1), dtype=torch.float16)},
+                "4d12": {cached_randn((2, 1, 1, 1), dtype=torch.float16)},
+                "4d13": {cached_randn((2, 1, 4, 1), dtype=torch.float16)},
+                "4d23": {cached_randn((2, 3, 1, 1), dtype=torch.float16)},
+                "4d012": {cached_randn((1, 1, 1, 5), dtype=torch.float16)},
+                "4d013": {cached_randn((1, 1, 4, 1), dtype=torch.float16)},
+                "4d023": {cached_randn((1, 3, 1, 1), dtype=torch.float16)},
+                "4d123": {cached_randn((2, 1, 1, 1), dtype=torch.float16)},
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
