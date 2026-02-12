@@ -196,13 +196,37 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         n.spyre_core_division[2][1] = splits[1]  # assign M split
 
     if red.reduction_type == BATCH_MATMUL_OP:
-        # [mb, out//64, x, 64]
-        # try split along mb first
-        mb_nsplit = core_split(device_size[0], max_cores)
-        if mb_nsplit > 1:
-            n.n_cores_used = mb_nsplit
-            for cd in n.spyre_core_division:
-                cd[0] = mb_nsplit
+        assert len(args) == 2, "bmm has exactly 2 input args"
+
+        # Logical: [x, mb, in] @ [x, in, out] --> [x, mb, out]
+        # where x=batch, mb=M, in=K, out=N
+
+        # Device layout (3D rule: [x, mb, out] -> [mb, out//64, x, 64]):
+        # Input 0:  [mb, in//64, x, 64]
+        # Input 1:  [in, out//64, x, 64]
+        # Output:   [mb, out//64, x, 64]
+
+        # Choose dimensions to parallelize (exclude stick dimension -1)
+        parallelizable_dims = [0, 1, 2]  # mb, out//64, x
+
+        # Compute the splits
+        sizes = [device_size[dim] for dim in parallelizable_dims]
+        # Prioritize: x > out > mb
+        priorities = [1, 2, 3]  # mb=1 (lowest), out=2, x=3 (highest)
+        splits = multi_dim_core_split(sizes, max_cores, priorities)
+        n.n_cores_used = math.prod(splits)
+
+        # Assign split values accordingly
+        # arg 0 device layout: [mb, in//64, x, 64]
+        n.spyre_core_division[0][0] = splits[0]  # assign mb split
+        n.spyre_core_division[0][2] = splits[2]  # assign x split
+        # arg 1 device layout: [in, out//64, x, 64]
+        n.spyre_core_division[1][1] = splits[1]  # assign out split
+        n.spyre_core_division[1][2] = splits[2]  # assign x split
+        # output device layout: [mb, out//64, x, 64]
+        n.spyre_core_division[2][0] = splits[0]  # assign mb split
+        n.spyre_core_division[2][1] = splits[1]  # assign out split
+        n.spyre_core_division[2][2] = splits[2]  # assign x split
 
 
 def core_division_planning(

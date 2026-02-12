@@ -65,19 +65,6 @@ def calculate_core_to_slice_mapping(
 
     Returns:
         Dictionary mapping core ID (as string) to dimension slice indices
-
-    Example:
-        >>> calculate_core_to_slice_mapping(["mb", "out"], [2, 4])
-        {
-            "0": {"mb": 0, "out": 0},
-            "1": {"mb": 0, "out": 1},
-            "2": {"mb": 0, "out": 2},
-            "3": {"mb": 0, "out": 3},
-            "4": {"mb": 1, "out": 0},
-            "5": {"mb": 1, "out": 1},
-            "6": {"mb": 1, "out": 2},
-            "7": {"mb": 1, "out": 3}
-        }
     """
     total_cores = 1
     for splits in dim_splits:
@@ -163,9 +150,6 @@ def core_idx_to_slice_offset(
     wk_slice: dict[str, int],
     device_size: list[int],
 ) -> int:
-    # FIXME: strides calculation relies on device_size
-    #        there are too much metadata passed around
-
     # compute tensor specific strides from its device layout
     strides = {}
     for i, di in enumerate(dim_info_list):
@@ -670,15 +654,13 @@ def _generate_matmul_common(
     kernel_layoutDimOrder,
     output_layoutDimOrder,
     cores,
-    use_bmm_address_calc=False,
-    **kwargs
 ):
     """
     Common implementation for matmul and bmm operations.
-    
+
     This function contains the shared logic between generate_matmul and generate_bmm,
-    which differ primarily in their dimension configurations and address calculations.
-    
+    which differ primarily in their dimension configurations.
+
     Args:
         pointers: Memory pointers for tensors
         op: Operation name
@@ -693,9 +675,7 @@ def _generate_matmul_common(
         kernel_layoutDimOrder: Layout order for kernel tensor
         output_layoutDimOrder: Layout order for output tensor
         cores: Number of cores used
-        use_bmm_address_calc: Use BMM-specific address calculation (default: False)
-        **kwargs: Additional arguments
-    
+
     Returns:
         Dictionary containing the SDSC structure for the operation
     """
@@ -815,36 +795,16 @@ def _generate_matmul_common(
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
-                                            + (
-                                                # BMM-specific address calculation
-                                                c
-                                                * math.prod(
-                                                    [
-                                                        dim_info_dict[label].split_size
-                                                        for label in layout_dim_order
-                                                    ]
-                                                )
-                                                * num_bytes(
-                                                    tensor["device_layout"].device_dtype
-                                                )
-                                                if use_bmm_address_calc and idx != 1  # duplicated tensor
-                                                else 0
+                                            + core_idx_to_slice_offset(
+                                                [
+                                                    dim_info_dict[label]
+                                                    for label in layout_dim_order
+                                                ],
+                                                coreid_to_wk_slice[str(c)],
+                                                tensor["device_layout"].device_size,
                                             )
-                                            + (
-                                                # Standard matmul address calculation
-                                                core_idx_to_slice_offset(
-                                                    [
-                                                        dim_info_dict[label]
-                                                        for label in layout_dim_order
-                                                    ],
-                                                    coreid_to_wk_slice[str(c)],
-                                                    tensor["device_layout"].device_size,
-                                                )
-                                                * num_bytes(
-                                                    tensor["device_layout"].device_dtype
-                                                )
-                                                if not use_bmm_address_calc
-                                                else 0
+                                            * num_bytes(
+                                                tensor["device_layout"].device_dtype
                                             )
                                         )
                                         for c in range(cores)
@@ -876,9 +836,9 @@ def _generate_matmul_common(
                             ) in enumerate(
                                 zip(
                                     [
-                                        "allocate_bmm-Input0_hbm",
-                                        "allocate_bmm-Input1_hbm",
-                                        "allocate_bmm_out_hbm",
+                                        "allocate_Input0_hbm",
+                                        "allocate_Input1_hbm",
+                                        "allocate_out_hbm",
                                     ],
                                     inputs + outputs,
                                     [
@@ -952,9 +912,9 @@ def _generate_matmul_common(
 def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     """
     Generate SDSC structure for matrix multiplication operation.
-    
+
     Matmul operation: [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
-    
+
     This is a thin wrapper around _generate_matmul_common that provides
     matmul-specific configuration (3D dimensions, specific layouts).
     """
@@ -969,17 +929,14 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
             cores = kwargs["op_info"]["n_cores_used"]
 
         if "core_division" in kwargs["op_info"]:
+            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
             dim_splits = [
-                kwargs["op_info"]["core_division"][0][1],  # mb_split
-                kwargs["op_info"]["core_division"][0][0],  # in_split
-                kwargs["op_info"]["core_division"][2][0],  # out_split
+                core_div[1],  # mb_split
+                1,  # in_split
+                core_div[0],  # out_split
             ]
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
-
-    input_layoutDimOrder = ["mb", "in"]
-    kernel_layoutDimOrder = ["in", "out"]
-    output_layoutDimOrder = ["mb", "out"]
 
     return _generate_matmul_common(
         pointers,
@@ -991,41 +948,42 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_indices=dim_indices,
         dim_splits=dim_splits,
         coreid_to_wk_slice=coreid_to_wk_slice,
-        input_layoutDimOrder=input_layoutDimOrder,
-        kernel_layoutDimOrder=kernel_layoutDimOrder,
-        output_layoutDimOrder=output_layoutDimOrder,
+        input_layoutDimOrder=["mb", "in"],
+        kernel_layoutDimOrder=["in", "out"],
+        output_layoutDimOrder=["mb", "out"],
         cores=cores,
-        use_bmm_address_calc=False,
-        **kwargs,
     )
 
 
 def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     """
     Generate SDSC structure for batched matrix multiplication operation.
-    
+
     BMM operation: [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
-    
+
     This is a thin wrapper around _generate_matmul_common that provides
     bmm-specific configuration (4D dimensions with batch, specific layouts).
     """
-    # implement core division on stick dimension
-    cores = 1
-    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
-        cores = kwargs["op_info"]["core_division"][-1][0]  # mb_nsplit of the output
-
     dim_labels = ["x", "mb", "in", "out"]
     dim_indices = [0, 1, 2, 3]
-    dim_splits = [1, cores, 1, 1]
 
-    # BMM uses a simpler hardcoded core-to-slice mapping
-    coreid_to_wk_slice = {
-        str(i): {"x": 0, "mb": i, "in": 0, "out": 0} for i in range(cores)
-    }
+    # work division logic
+    cores = 1
+    dim_splits = [1, 1, 1, 1]
+    if "op_info" in kwargs:
+        if "n_cores_used" in kwargs["op_info"]:
+            cores = kwargs["op_info"]["n_cores_used"]
 
-    input_layoutDimOrder = ["x", "in", "mb"]
-    kernel_layoutDimOrder = ["x", "out", "in"]
-    output_layoutDimOrder = ["x", "out", "mb"]
+        if "core_division" in kwargs["op_info"]:
+            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
+            dim_splits = [
+                core_div[2],  # x split (from device layout index 2)
+                core_div[0],  # mb split (from device layout index 0)
+                1,  # in dimension (not split)
+                core_div[1],  # out split (from device layout index 1)
+            ]
+
+    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
     return _generate_matmul_common(
         pointers,
@@ -1037,10 +995,8 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_indices=dim_indices,
         dim_splits=dim_splits,
         coreid_to_wk_slice=coreid_to_wk_slice,
-        input_layoutDimOrder=input_layoutDimOrder,
-        kernel_layoutDimOrder=kernel_layoutDimOrder,
-        output_layoutDimOrder=output_layoutDimOrder,
+        input_layoutDimOrder=["x", "in", "mb"],
+        kernel_layoutDimOrder=["x", "out", "in"],
+        output_layoutDimOrder=["x", "out", "mb"],
         cores=cores,
-        use_bmm_address_calc=True,
-        **kwargs,
     )
