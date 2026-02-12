@@ -195,7 +195,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         n.spyre_core_division[2][0] = splits[0]  # assign N split
         n.spyre_core_division[2][1] = splits[1]  # assign M split
 
-    if red.reduction_type == BATCH_MATMUL_OP:
+    if red.reduction_type == BATCH_MATMUL_OP and len(device_size) == 4:  # 3d bmm
         assert len(args) == 2, "bmm has exactly 2 input args"
 
         # Logical: [x, mb, in] @ [x, in, out] --> [x, mb, out]
@@ -227,6 +227,31 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         n.spyre_core_division[2][0] = splits[0]  # assign mb split
         n.spyre_core_division[2][1] = splits[1]  # assign out split
         n.spyre_core_division[2][2] = splits[2]  # assign x split
+
+    if red.reduction_type == BATCH_MATMUL_OP and len(device_size) == 5:  # 4d bmm
+        assert len(args) == 2, "bmm has exactly 2 input args"
+        parallelizable_dims = [1, 2, 3, 0]  # mb, out//64, x, y
+
+        # Compute the splits
+        sizes = [device_size[dim] for dim in parallelizable_dims]
+
+        # Prioritize: y > x > out > mb
+        priorities = [1, 2, 3, 4]  # mb=1 (lowest), out=2, x=3, y=3(highest)
+        splits = multi_dim_core_split(sizes, max_cores, priorities)
+        n.n_cores_used = math.prod(splits)
+
+        n.spyre_core_division[0][0] = splits[2]  # assign x split
+        n.spyre_core_division[0][1] = splits[3]  # assign y split
+        n.spyre_core_division[0][2] = splits[0]  # assign mb split
+
+        n.spyre_core_division[1][2] = splits[1]  # assign out split
+        n.spyre_core_division[1][0] = splits[2]  # assign x split
+        n.spyre_core_division[1][1] = splits[3]  # assign y split
+
+        n.spyre_core_division[2][2] = splits[0]  # assign mb split
+        n.spyre_core_division[2][3] = splits[1]  # assign out split
+        n.spyre_core_division[2][0] = splits[2]  # assign x split
+        n.spyre_core_division[2][1] = splits[3]  # assign y split
 
 
 def core_division_planning(
