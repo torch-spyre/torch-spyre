@@ -655,31 +655,53 @@ def pad_up(size, stick_size):
     return ((size + stick_size - 1) // stick_size) * stick_size
 
 
-def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
-    # [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
-
+def _generate_matmul_common(
+    pointers,
+    *,
+    op,
+    dimensions,
+    inputs,
+    outputs,
+    dim_labels,
+    dim_indices,
+    dim_splits,
+    coreid_to_wk_slice,
+    input_layoutDimOrder,
+    kernel_layoutDimOrder,
+    output_layoutDimOrder,
+    cores,
+    use_bmm_address_calc=False,
+    **kwargs
+):
+    """
+    Common implementation for matmul and bmm operations.
+    
+    This function contains the shared logic between generate_matmul and generate_bmm,
+    which differ primarily in their dimension configurations and address calculations.
+    
+    Args:
+        pointers: Memory pointers for tensors
+        op: Operation name
+        dimensions: Tensor dimensions
+        inputs: Input tensor specifications
+        outputs: Output tensor specifications
+        dim_labels: Dimension labels (e.g., ["mb", "in", "out"] for matmul)
+        dim_indices: Dimension indices
+        dim_splits: Number of splits per dimension
+        coreid_to_wk_slice: Mapping from core ID to work slice
+        input_layoutDimOrder: Layout order for input tensor
+        kernel_layoutDimOrder: Layout order for kernel tensor
+        output_layoutDimOrder: Layout order for output tensor
+        cores: Number of cores used
+        use_bmm_address_calc: Use BMM-specific address calculation (default: False)
+        **kwargs: Additional arguments
+    
+    Returns:
+        Dictionary containing the SDSC structure for the operation
+    """
     # TODO: This is temporary; will move scales to dims_info
     for tensor in inputs + outputs:
         tensor["scale"] = [1 if s >= 0 else s for s in tensor["scale"]]
-
-    dim_labels = ["mb", "in", "out"]
-    dim_indices = [0, 1, 2]
-
-    # work division logic
-    cores = 1
-    dim_splits = [1, 1, 1]
-    if "op_info" in kwargs:
-        if "n_cores_used" in kwargs["op_info"]:
-            cores = kwargs["op_info"]["n_cores_used"]
-
-        if "core_division" in kwargs["op_info"]:
-            dim_splits = [
-                kwargs["op_info"]["core_division"][0][1],  # mb_split
-                kwargs["op_info"]["core_division"][0][0],  # in_split
-                kwargs["op_info"]["core_division"][2][0],  # out_split
-            ]
-
-    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
     # TODO: Temp manual padding
     elems_per_stick = inputs[0]["device_layout"].elems_per_stick()
@@ -694,10 +716,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_splits,
     )
     dim_info_dict = op_dim_infos.as_dict()
-
-    input_layoutDimOrder = ["mb", "in"]
-    kernel_layoutDimOrder = ["in", "out"]
-    output_layoutDimOrder = ["mb", "out"]
 
     return {
         op: {
@@ -797,16 +815,36 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
-                                            + core_idx_to_slice_offset(
-                                                [
-                                                    dim_info_dict[label]
-                                                    for label in layout_dim_order
-                                                ],
-                                                coreid_to_wk_slice[str(c)],
-                                                tensor["device_layout"].device_size,
+                                            + (
+                                                # BMM-specific address calculation
+                                                c
+                                                * math.prod(
+                                                    [
+                                                        dim_info_dict[label].split_size
+                                                        for label in layout_dim_order
+                                                    ]
+                                                )
+                                                * num_bytes(
+                                                    tensor["device_layout"].device_dtype
+                                                )
+                                                if use_bmm_address_calc and idx != 1  # duplicated tensor
+                                                else 0
                                             )
-                                            * num_bytes(
-                                                tensor["device_layout"].device_dtype
+                                            + (
+                                                # Standard matmul address calculation
+                                                core_idx_to_slice_offset(
+                                                    [
+                                                        dim_info_dict[label]
+                                                        for label in layout_dim_order
+                                                    ],
+                                                    coreid_to_wk_slice[str(c)],
+                                                    tensor["device_layout"].device_size,
+                                                )
+                                                * num_bytes(
+                                                    tensor["device_layout"].device_dtype
+                                                )
+                                                if not use_bmm_address_calc
+                                                else 0
                                             )
                                         )
                                         for c in range(cores)
@@ -911,16 +949,66 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     }
 
 
+def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    """
+    Generate SDSC structure for matrix multiplication operation.
+    
+    Matmul operation: [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
+    
+    This is a thin wrapper around _generate_matmul_common that provides
+    matmul-specific configuration (3D dimensions, specific layouts).
+    """
+    dim_labels = ["mb", "in", "out"]
+    dim_indices = [0, 1, 2]
+
+    # work division logic
+    cores = 1
+    dim_splits = [1, 1, 1]
+    if "op_info" in kwargs:
+        if "n_cores_used" in kwargs["op_info"]:
+            cores = kwargs["op_info"]["n_cores_used"]
+
+        if "core_division" in kwargs["op_info"]:
+            dim_splits = [
+                kwargs["op_info"]["core_division"][0][1],  # mb_split
+                kwargs["op_info"]["core_division"][0][0],  # in_split
+                kwargs["op_info"]["core_division"][2][0],  # out_split
+            ]
+
+    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
+
+    input_layoutDimOrder = ["mb", "in"]
+    kernel_layoutDimOrder = ["in", "out"]
+    output_layoutDimOrder = ["mb", "out"]
+
+    return _generate_matmul_common(
+        pointers,
+        op=op,
+        dimensions=dimensions,
+        inputs=inputs,
+        outputs=outputs,
+        dim_labels=dim_labels,
+        dim_indices=dim_indices,
+        dim_splits=dim_splits,
+        coreid_to_wk_slice=coreid_to_wk_slice,
+        input_layoutDimOrder=input_layoutDimOrder,
+        kernel_layoutDimOrder=kernel_layoutDimOrder,
+        output_layoutDimOrder=output_layoutDimOrder,
+        cores=cores,
+        use_bmm_address_calc=False,
+        **kwargs,
+    )
+
+
 def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
-    # [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
-
-    # TODO: This is temporary; will move scales to dims_info
-    for tensor in inputs + outputs:
-        tensor["scale"] = [1 if s >= 0 else s for s in tensor["scale"]]
-
-    data_format = inputs[0]["device_layout"].device_dtype
-    elems_per_stick = data_format.elems_per_stick()
-
+    """
+    Generate SDSC structure for batched matrix multiplication operation.
+    
+    BMM operation: [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
+    
+    This is a thin wrapper around _generate_matmul_common that provides
+    bmm-specific configuration (4D dimensions with batch, specific layouts).
+    """
     # implement core division on stick dimension
     cores = 1
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
@@ -930,231 +1018,29 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     dim_indices = [0, 1, 2, 3]
     dim_splits = [1, cores, 1, 1]
 
-    # TODO: Temp manual padding
-    elems_per_stick = inputs[0]["device_layout"].elems_per_stick()
-    padded_dimensions = dimensions[:-1] + [pad_up(dimensions[-1], elems_per_stick)]
-
-    op_dim_infos = DimInfos(
-        dim_labels,
-        dim_indices,
-        dimensions,
-        padded_dimensions,
-        dim_splits,
-    )
-    dim_info_dict = op_dim_infos.as_dict()
+    # BMM uses a simpler hardcoded core-to-slice mapping
+    coreid_to_wk_slice = {
+        str(i): {"x": 0, "mb": i, "in": 0, "out": 0} for i in range(cores)
+    }
 
     input_layoutDimOrder = ["x", "in", "mb"]
     kernel_layoutDimOrder = ["x", "out", "in"]
     output_layoutDimOrder = ["x", "out", "mb"]
 
-    return {
-        op: {
-            "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
-            "sdscFolds_": {
-                "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
-                "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
-                "data_": {"[0]": "0"},
-            },
-            "coreFoldProp_": {"factor_": cores, "label_": "core"},
-            "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-            "numCoresUsed_": cores,
-            "coreIdToDsc_": {str(i): 0 for i in range(cores)},
-            "numWkSlicesPerDim_": {"in": 1, "out": 1, "mb": cores, "x": 1},
-            "coreIdToWkSlice_": {
-                str(i): {"x": 0, "mb": i, "in": 0, "out": 0} for i in range(cores)
-            },
-            "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
-            "dscs_": [
-                {
-                    op: {
-                        "numCoresUsed_": cores,
-                        "numCoreletsUsed_": 1,
-                        "coreIdsUsed_": list(range(cores)),
-                        "N_": {
-                            "name_": "n",
-                            **{
-                                label + "_": di.padded_size
-                                for label, di in dim_info_dict.items()
-                            },
-                        },
-                        "dataStageParam_": {
-                            "0": {
-                                "ss_": {
-                                    "name_": "core",
-                                    **{
-                                        label + "_": di.split_size
-                                        for label, di in dim_info_dict.items()
-                                    },
-                                },
-                                "el_": {
-                                    "name_": "core",
-                                    **{
-                                        label + "_": di.split_size
-                                        for label, di in dim_info_dict.items()
-                                    },
-                                },
-                            }
-                        },
-                        "primaryDsInfo_": {
-                            "INPUT": {
-                                "layoutDimOrder_": input_layoutDimOrder,
-                                "stickDimOrder_": ["in"],
-                                "stickSize_": [
-                                    inputs[0][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                            "OUTPUT": {
-                                "layoutDimOrder_": output_layoutDimOrder,
-                                "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    outputs[0][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                            "KERNEL": {
-                                "layoutDimOrder_": kernel_layoutDimOrder,
-                                "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    inputs[1][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                        },
-                        "scheduleTree_": [
-                            {
-                                "nodeType_": "allocate",
-                                "name_": node_name,
-                                "prev_": "",
-                                "ldsIdx_": idx,
-                                "component_": "hbm",
-                                "layoutDimOrder_": layout_dim_order,
-                                "maxDimSizes_": [-1] * len(layout_dim_order),
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
-                                    ],
-                                    "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
-                                    ],
-                                    "data_": {
-                                        # TODO: generalize this to avoid special case handling
-                                        f"[{c}, 0, 0]": str(
-                                            pointers[tensor["name"]]
-                                            + c
-                                            * math.prod(
-                                                [
-                                                    dim_info_dict[label].split_size
-                                                    for label in layout_dim_order
-                                                ]
-                                            )
-                                            * num_bytes(
-                                                tensor["device_layout"].device_dtype
-                                            )
-                                        )
-                                        if idx != 1  # duplicated tensor
-                                        else str(pointers[tensor["name"]])
-                                        for c in range(cores)
-                                    },
-                                },
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        label: gen_coord_info_value(
-                                            size=di.split_size
-                                            if (tensor["scale"][di.index] == 1)
-                                            else 1,
-                                            nsplits=di.nsplits,
-                                            elems_per_stick=tensor[
-                                                "device_layout"
-                                            ].device_dtype.elems_per_stick(),
-                                            is_stick_dim=(di.label == stick_label),
-                                        )
-                                        for label in layout_dim_order
-                                        if (di := dim_info_dict[label])
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            }
-                            for idx, (
-                                node_name,
-                                tensor,
-                                layout_dim_order,
-                                stick_label,
-                            ) in enumerate(
-                                zip(
-                                    [
-                                        "allocate_bmm-Input0_hbm",
-                                        "allocate_bmm-Input1_hbm",
-                                        "allocate_bmm_out_hbm",
-                                    ],
-                                    inputs + outputs,
-                                    [
-                                        input_layoutDimOrder,
-                                        kernel_layoutDimOrder,
-                                        output_layoutDimOrder,
-                                    ],
-                                    ["in", "out", "out"],
-                                )
-                            )
-                        ],
-                        "labeledDs_": [
-                            {
-                                "ldsIdx_": idx,
-                                "dsName_": f"Tensor{idx}",
-                                "dsType_": ds_type,
-                                # permute scale values according to layoutDimOrder
-                                "scale_": [
-                                    tensor["scale"][di.index]
-                                    for label in layout_dim_order
-                                    if (di := dim_info_dict[label])
-                                ],
-                                "wordLength": num_bytes(
-                                    tensor["device_layout"].device_dtype
-                                ),
-                                "dataFormat_": tensor[
-                                    "device_layout"
-                                ].device_dtype.name,
-                                "memOrg_": {
-                                    "hbm": {"isPresent": 1},
-                                    "lx": {"isPresent": 1},
-                                },
-                            }
-                            for idx, (ds_type, tensor, layout_dim_order) in enumerate(
-                                zip(
-                                    ["INPUT", "KERNEL", "OUTPUT"],
-                                    inputs + outputs,
-                                    [
-                                        input_layoutDimOrder,
-                                        kernel_layoutDimOrder,
-                                        output_layoutDimOrder,
-                                    ],
-                                )
-                            )
-                        ],
-                        "computeOp_": [
-                            {
-                                "exUnit": "pt",
-                                "opFuncName": op,
-                                "attributes_": {
-                                    "dataFormat_": inputs[0][
-                                        "device_layout"
-                                    ].device_dtype.name,
-                                    "fidelity_": "regular",
-                                },
-                                "location": "Inner",
-                                "inputLabeledDs": ["Tensor0-idx0", "Tensor1-idx1"],
-                                "outputLabeledDs": ["Tensor2-idx2"],
-                            }
-                        ],
-                    }
-                }
-            ],
-        }
-    }
+    return _generate_matmul_common(
+        pointers,
+        op=op,
+        dimensions=dimensions,
+        inputs=inputs,
+        outputs=outputs,
+        dim_labels=dim_labels,
+        dim_indices=dim_indices,
+        dim_splits=dim_splits,
+        coreid_to_wk_slice=coreid_to_wk_slice,
+        input_layoutDimOrder=input_layoutDimOrder,
+        kernel_layoutDimOrder=kernel_layoutDimOrder,
+        output_layoutDimOrder=output_layoutDimOrder,
+        cores=cores,
+        use_bmm_address_calc=True,
+        **kwargs,
+    )
