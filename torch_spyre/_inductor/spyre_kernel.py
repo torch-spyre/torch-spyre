@@ -551,7 +551,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             y = value.arguments[1]
             di_x = self.derive_dim_info(x)
             di_y = self.derive_dim_info(y)
-            di = [di_x[0], di_x[1], di_x[2], di_y[2]]
+            di = di_x[0:3] + di_y[2:]
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),

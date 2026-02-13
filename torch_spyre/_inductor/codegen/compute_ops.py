@@ -686,9 +686,8 @@ def _generate_matmul_common(
         Dictionary containing the SDSC structure for the operation
     """
     # TODO: This is temporary; will move scales to dims_info
-    d4 = len(inputs[0]["device_layout"].device_size) == 5
     for tensor in inputs + outputs:
-        tensor["scale"] = [1 if s >= 0 or d4 else s for s in tensor["scale"]]
+        tensor["scale"] = [1 if s >= 0 else s for s in tensor["scale"]]
 
     # TODO: Temp manual padding
     elems_per_stick = inputs[0]["device_layout"].elems_per_stick()
@@ -1000,7 +999,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 
     else:
         dim_labels = ["x", "y", "mb", "in", "out"]
-        dim_indices = [0, 1, 2, 3, 2]
+        dim_indices = [0, 1, 2, 3, 4]
 
         input_layoutDimOrder = ["x", "in", "mb", "y"]
         kernel_layoutDimOrder = ["x", "out", "in", "y"]
