@@ -163,12 +163,9 @@ class DimInfos:
         return [di for di in tensor_op_infos if di.scale >= 0]
 
     def get_tensor_stick_dim_labels(self, tensor):
-        # Get the label associated with the stick dim
-        tensor_labels = self.get_tensor_layout_order(tensor)
         dl = tensor["device_layout"]
-        dev_i = tensor["scale"].index(dl.get_stick_dim_index())
-        result = tensor_labels[dev_i]
-        return result
+        idx = tensor["scale"].index(dl.host_stick_dim())
+        return [self.rows["label"][idx]]
 
 
 def calculate_core_to_slice_mapping(
@@ -430,8 +427,8 @@ def create_tensor_specific_layouts(tensors, dim_infos, is_matmul=False):
             if is_matmul
             else dim_infos.get_tensor_op_layout_order(tensor)
         )
-        for label, dim_order in layouts.items():
-            if layout_order == dim_order:
+        for label, layout_infos in layouts.items():
+            if layout_order == layout_infos["layout_order"]:
                 tensor["ds_type"] = label
                 break
         if tensor["ds_type"] is None:
@@ -442,7 +439,10 @@ def create_tensor_specific_layouts(tensors, dim_infos, is_matmul=False):
                     len(layouts.keys()) - len(LAYOUT_INPUT_LABELS)
                 ]
             )
-            layouts[LAYOUT_INPUT_LABELS[len(layouts.keys())]] = layout_order
+            layouts[LAYOUT_INPUT_LABELS[len(layouts.keys())]] = {
+                "layout_order": layout_order,
+                "stick_dim_order": dim_infos.get_tensor_stick_dim_labels(tensor),
+            }
 
     # Now adjust the label of the final tensor (and all that share the same layout) to be "OUTPUT".
     # This is not strictly required, but conformes the standard naming pattern
@@ -495,18 +495,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim - 1) + [cores]
 
-    core_id_to_wk_slice = {}
-    for i in range(cores):
-        core_id_to_wk_slice[str(i)] = {
-            str(s): i if s == "out" else 0 for s in dim_labels
-        }
-
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [1] * len(dimensions)
-
     # Un-tile and put in host order
     sizes = dl.device_size[::-1][1:]
-
     for dim in range(ndim):
         sv = op_dims_tensor["scale"][dim]
         assert sv >= 0, "Scale value should be non-negative for op_dims_tensor"
@@ -526,6 +518,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
     layouts = create_tensor_specific_layouts(tensors, dim_infos)
+
+    op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
+
+    core_id_to_wk_slice = {}
+    for i in range(cores):
+        core_id_to_wk_slice[str(i)] = {
+            str(s): i if s in op_stick_labels else 0 for s in dim_labels
+        }
 
     return {
         op: {
@@ -579,11 +579,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                         },
                         "primaryDsInfo_": {
                             name: {
-                                "layoutDimOrder_": dim_order,
-                                "stickDimOrder_": ["out"],
+                                "layoutDimOrder_": layout_info["layout_order"],
+                                "stickDimOrder_": layout_info["stick_dim_order"],
                                 "stickSize_": [data_format.elems_per_stick()],
                             }
-                            for name, dim_order in layouts.items()
+                            for name, layout_info in layouts.items()
                         },
                         "scheduleTree_": [
                             {
@@ -639,9 +639,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             elems_per_stick=tensor[
                                                 "device_layout"
                                             ].device_dtype.elems_per_stick(),
-                                            is_stick_dim=(di.label == "out"),
+                                            is_stick_dim=(di.label in op_stick_labels),
                                             is_stick_reduction=(
-                                                di.label == "out" and di.scale == -1
+                                                di.label in op_stick_labels and di.scale == -1
                                             ),
                                         )
                                         for di in dim_infos.get_tensor_op_infos(tensor)
@@ -661,7 +661,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         di.scale
                                         # TODO: revisit whether this special case can be removed
                                         #       pending change in deeptools
-                                        if not (di.label == "out" and di.scale == -1)
+                                        if not (di.label in op_stick_labels and di.scale == -1)
                                         else -2
                                     )
                                     for di in dim_infos.get_tensor_op_infos(tensor)
