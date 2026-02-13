@@ -215,10 +215,11 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        input = args[0]
-        stick_dim = input.layout.device_layout.host_stick_dim()
-        input_dims = map_dims_to_vars(input.layout, input.dep.index)
-        stick_var = input_dims[stick_dim]
+        x = args[0]
+        x_stl = x.layout.device_layout
+        stick_dim = x_stl.host_stick_dim()
+        in_dims = map_dims_to_vars(x.layout, x.dep.index)
+        stick_var = in_dims[stick_dim]
         is_stick_reduction = stick_var not in output_dims.values()
         sparse_tensor = is_stick_reduction
         # TODO: FIXME forcing generic stick layout.  Should compute the lowlevel device_size and dim_map directly from input STL
