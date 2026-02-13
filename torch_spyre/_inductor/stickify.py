@@ -111,8 +111,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 out_size = output.size
 
                 if in_size == out_size:
-                    # Generic pointwise unary: output dim order is same as input
-                    stl = stl = device_layout_like(x.layout, output.dtype)
+                    # Sizes match; propagate the input SpyreTensorLayout
+                    stl = device_layout_like(x.layout, output.dtype)
                 elif [s for s in in_size if s != 1] == [s for s in out_size if s != 1]:
                     # squeeze or unsqueeze
 
