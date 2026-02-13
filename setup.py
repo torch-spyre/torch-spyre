@@ -86,7 +86,7 @@ INCLUDE_DIRS = [
 LIBRARY_DIRS = []
 
 
-INCLUDE_DIRS += [maybe_download_nlohmann_json(), os.environ["SEN_COMMON_HEADERS"]]
+INCLUDE_DIRS += [maybe_download_nlohmann_json()]
 
 cmake_include_path = os.environ.get("CMAKE_INCLUDE_PATH", "")
 extra_include_dirs = cmake_include_path.split(":") if cmake_include_path else []
@@ -114,6 +114,8 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
         DEEPTOOLS_DIR / "include",
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+
+INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
 LIBRARIES = ["sendnn", "sendnn_interface", "flex", "dee_internal"]
 
