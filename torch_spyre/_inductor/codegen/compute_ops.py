@@ -170,10 +170,6 @@ class DimInfos:
         result = tensor_labels[dev_i]
         return result
 
-    # Temp functions for compatability, to remove
-    def as_list(self):
-        return self.get_op_infos()
-
 
 def calculate_core_to_slice_mapping(
     dim_labels: list[str], dim_splits: list[int]
@@ -412,7 +408,7 @@ def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     coordinateMasking = {}
     maskingConstId = -1
 
-    for di in dim_infos.as_list():
+    for di in dim_infos.get_op_infos():
         if di.padding > 0:
             coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
     if coordinateMasking:
@@ -490,8 +486,12 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     op_dims_tensor = inputs[0] if reduction else outputs[0]
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
+
+    # Downstream code expects dim_indices to be consecutive, so make them so
+    # If this is a problem, we can update DimInfos to handle non-consecutive instead
     reindex_map = {v: k for k, v in enumerate(sorted(dim_map))}
     dim_indices = [reindex_map[x] for x in dim_map]
+
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim - 1) + [cores]
 
@@ -500,9 +500,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         core_id_to_wk_slice[str(i)] = {
             str(s): i if s == "out" else 0 for s in dim_labels
         }
-
-
-
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [1] * len(dimensions)
