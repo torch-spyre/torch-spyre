@@ -373,8 +373,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
-
         actuals = self.args.python_argdefs()[1]
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
         op_info = {}
         if hasattr(self.current_node, "spyre_core_division"):
             op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
@@ -414,7 +417,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             args.append(
                 create_tensor_arg(
                     False,
-                    actuals.index(dst.name),
+                    actuals.index(real_dst_name),
                     dst.layout,
                 )
             )
@@ -429,7 +432,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             out_di = self.derive_dim_info(dst)
             args = [
                 create_tensor_arg(True, actuals.index(value.name), value.layout),
-                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
             ]
             scales = [
                 self.analyze_tensor_access(in_di, value),
@@ -481,6 +484,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
 
         if isinstance(value, UnimplementedOp):
             self.kernel_specs.append(value)
@@ -523,7 +530,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
-                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
             ]
             scales = [
                 self.analyze_tensor_access(di, x),
@@ -548,7 +555,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
-                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
             ]
             scales = [
                 self.analyze_tensor_access(di, x),
@@ -568,7 +575,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             di = self.derive_dim_info(x)
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
-                create_tensor_arg(False, actuals.index(dst.name), dst.layout),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
             ]
             scales = [
                 self.analyze_tensor_access(di, x),
