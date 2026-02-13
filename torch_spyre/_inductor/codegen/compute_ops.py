@@ -163,7 +163,7 @@ class DimInfos:
         return [di for di in tensor_op_infos if di.scale >= 0]
 
     def get_tensor_stick_dim_labels(self, tensor):
-        # Get the label associated with the stick dim 
+        # Get the label associated with the stick dim
         tensor_labels = self.get_tensor_layout_order(tensor)
         dl = tensor["device_layout"]
         dev_i = tensor["scale"].index(dl.get_stick_dim_index())
@@ -514,7 +514,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         size = sizes[device_index]
         padded_op_dimensions[dim] = (
             size * dl.elems_per_stick() if (sv == dl.host_stick_dim()) else size
-
         )
 
     dim_infos = DimInfos(
@@ -598,7 +597,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
                                     tensor
                                 ),
-                                "maxDimSizes_": [-1] * len(dim_infos.get_tensor_op_layout_order(tensor)),
+                                "maxDimSizes_": [-1]
+                                * len(dim_infos.get_tensor_op_layout_order(tensor)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
