@@ -103,7 +103,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
 
             case aten.clone.default:
-                # Clone puts its output into the default device layoout.
+                # Clone puts its output into the default device layout.
                 stl = SpyreTensorLayout(output.size, output.dtype)
 
             case _:
