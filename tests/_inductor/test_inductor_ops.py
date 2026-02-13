@@ -785,6 +785,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
             },
         },
+        ("test_attention", "test_attention_cpu"): {
+            "param_sets": {
+                "3d": (
+                    cached_randn((4, 256, 128), dtype=torch.float16),  # q
+                    cached_randn((4, 256, 128), dtype=torch.float16),  # k
+                    cached_randn((4, 256, 128), dtype=torch.float16),  # v
+                    torch.tensor(1 / (128**0.5), dtype=torch.float16).repeat(
+                        4, 256, 256
+                    ),  # sm_scale
+                ),
+                "3d_batch_size_1": (
+                    cached_randn((1, 4, 256, 128), dtype=torch.float16),  # q
+                    cached_randn((1, 4, 256, 128), dtype=torch.float16),  # k
+                    cached_randn((1, 4, 256, 128), dtype=torch.float16),  # v
+                    torch.tensor(1 / (128**0.5), dtype=torch.float16).repeat(
+                        4, 256, 256
+                    ),  # sm_scale
+                ),
+                "4d": (
+                    cached_randn((8, 4, 128, 64), dtype=torch.float16),  # q
+                    cached_randn((8, 4, 128, 64), dtype=torch.float16),  # k
+                    cached_randn((8, 4, 128, 64), dtype=torch.float16),  # v
+                    torch.tensor(1 / (128**0.5), dtype=torch.float16).repeat(
+                        8, 4, 128, 128
+                    ),  # sm_scale
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -946,6 +974,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
             return op(dim, *args)
+
+        compare_with_cpu(fn, *args)
+
+    def test_attention_cpu(self, *args):
+        def fn(q, k, v, sm_scale):
+            qk = q @ k.transpose(-1, -2).contiguous()
+            p = qk.softmax(dim=-1) * sm_scale
+            return p @ v
 
         compare_with_cpu(fn, *args)
 
