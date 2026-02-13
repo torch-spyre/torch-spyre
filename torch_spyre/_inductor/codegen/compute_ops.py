@@ -163,14 +163,11 @@ class DimInfos:
         return [di for di in tensor_op_infos if di.scale >= 0]
 
     def get_tensor_stick_dim_labels(self, tensor):
-        # MRA TODO: Simplify this after rebasing to get Dave's change
-        dl = tensor["device_layout"]
-        tensor_dim_map = dl.dim_map[::-1][1:]
-        tensor_index = tensor_dim_map.index(dl.host_stick_dim())
+        # Get the label associated with the stick dim 
         tensor_labels = self.get_tensor_layout_order(tensor)
-        result = (
-            [tensor_labels[tensor_index]] if tensor_index < len(tensor_labels) else []
-        )
+        dl = tensor["device_layout"]
+        dev_i = tensor["scale"].index(dl.get_stick_dim_index())
+        result = tensor_labels[dev_i]
         return result
 
     # Temp functions for compatability, to remove
@@ -489,13 +486,12 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if reduction and tensors[-1]["scale"][-1] >= 0:
         op += "nonstick"
 
-    # Get operation dim map from input or output tensor
+    # Get operation dim map from the tensor that represents the operation space
     op_dims_tensor = inputs[0] if reduction else outputs[0]
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     reindex_map = {v: k for k, v in enumerate(sorted(dim_map))}
     dim_indices = [reindex_map[x] for x in dim_map]
-
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim - 1) + [cores]
 
@@ -505,19 +501,23 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             str(s): i if s == "out" else 0 for s in dim_labels
         }
 
+
+
+
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [1] * len(dimensions)
 
     # Un-tile and put in host order
     sizes = dl.device_size[::-1][1:]
 
-    stick_dim = reindex_map[dl.host_stick_dim()]
     for dim in range(ndim):
-        si = op_dims_tensor["scale"][dim]
-        assert si >= 0, "Scale value should be non-negative for op_dims_tensor"
-        size = sizes[dim_map.index(si)]
+        sv = op_dims_tensor["scale"][dim]
+        assert sv >= 0, "Scale value should be non-negative for op_dims_tensor"
+        device_index = dim_map.index(sv)
+        size = sizes[device_index]
         padded_op_dimensions[dim] = (
-            size * dl.elems_per_stick() if (dim == stick_dim) else size
+            size * dl.elems_per_stick() if (sv == dl.host_stick_dim()) else size
+
         )
 
     dim_infos = DimInfos(
