@@ -17,37 +17,165 @@ from dataclasses import dataclass
 
 from torch_spyre._C import encode_constant, DataFormats
 from torch_spyre._inductor.constants import (
-    LAYOUT_LABELS,
+    LAYOUT_INPUT_LABELS,
+    LAYOUT_OUTPUT_LABELS,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
 )
 
 
-@dataclass
 class DimInfo:
+    def __init__(self, index: int, fields: dict = {}):
+        self.index = index
+        for name, value in fields.items():
+            self.add_data(name, value)
+
+    def add_data(self, name, value):
+        setattr(self, name, value)
+
+
+@dataclass
+class DimInfos:
+    """
+    Class to provide various views of dimension information during sdsc generation.
+
+    All lists for the rows are provided in and stored in host order.
+    Access functions reorder when queried.
+
+    There are 3 main categories of orderings requested during sdsc generation
+      1. Op dimensions, ordered by op dim_indices (rank == op dimensions)
+      2. Op dimensions, reorderd by a specific tensor.  (rank == op dimensions)
+         This one is non-obvious, because a tensor may have fewer dimensions than the op,
+         but all op dimension are returned.  See detailed comment on get_tensor_op_index_order()
+      3. Tensor dimensions (rank <= operation dimensions)
+    """
+
     def __init__(
         self,
-        label: str,
-        index: int,
-        unpadded_size: int,
-        padded_size: int,
-        nsplits: int,
-        scale: int,
+        dim_indices: list[int],
+        labels: list[str],
+        unpadded_sizes: list[int],
+        padded_sizes: list[int],
+        nsplits: list[int],
     ):
-        self.label = label
-        self.index = index
-        self.unpadded_size = unpadded_size
-        self.padded_size = padded_size
-        self.nsplits = nsplits
-        self.scale = scale
-        self.split_size = self.padded_size // nsplits
-        self.padding = self.padded_size - self.unpadded_size
+        self.dim_indices = dim_indices
+        self.rows: dict[str, list] = {}
+        self.add_row("label", labels)
+        self.add_row("unpadded_size", unpadded_sizes)
+        self.add_row("padded_size", padded_sizes)
+        self.add_row("nsplits", nsplits)
+        self.add_row(
+            "split_size",
+            [size // nsplits for size, nsplits in zip(padded_sizes, nsplits)],
+        )
+        self.add_row(
+            "padding",
+            [
+                padded_size - unpadded_size
+                for padded_size, unpadded_size in zip(padded_sizes, unpadded_sizes)
+            ],
+        )
+        assert all(p >= 0 for p in self.rows["padding"]), (
+            "Negative padding found, check padded and unpadded sizes"
+        )
 
-        assert self.padding >= 0
+    # Internal implementation functions.
+    def add_row(self, name, info_list, in_former_order=True):
+        self.rows[name] = info_list
 
+    def make_dim_infos(self, fields=[], index_order=None, additional_rows={}):
+        rows = self.rows | additional_rows
+        if not index_order:
+            index_order = self.dim_indices
+        if not fields:
+            fields = rows.keys()
+        return [self.make_dim_info(i, rows, fields) for i in index_order]
 
-def reorder_dims(cur_list, dim_map):
-    return [cur_list[i] for i in dim_map]
+    def make_dim_info(self, i, rows, fields):
+        di_dict = {field: rows[field][i] for field in fields}
+        return DimInfo(i, di_dict)
+
+    def ordered_row(self, field_name, index_order=None):
+        if not index_order:
+            index_order = self.dim_indices
+        return [self.rows[field_name][i] for i in index_order]
+
+    # Dimensions of length 1 do not exist on the device layout
+    # Therefore some sdsc sections require all op dimensions, but
+    # with the order of a subset of the indices adjusted to match
+    # the tile layout of the tensor on the device.  This
+    # function computest that reordering
+    def get_tensor_op_index_order(self, tensor):
+        dim_indices = self.dim_indices  # op dimension order
+        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+        missing_dims = list(set(dim_indices) - set(dev_dim_order))
+        if len(missing_dims) > 0 and len(dim_indices) >= 3 and tensor["scale"][0] == -1:
+            if missing_dims[0] == 0:
+                # Add missing dimensions to end of device dimension order
+                # Compute the number of leading missing dims (-1)
+                tensor_dim_indices = dev_dim_order + list(
+                    set(dim_indices) - set(dev_dim_order)
+                )
+            else:  # keepdim=0 case
+                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
+        else:
+            # Indices and order unchanged
+            tensor_dim_indices = dim_indices
+        return tensor_dim_indices
+
+    def get_tensor_scales(self, tensor):
+        # SDSC needs non-negative scale values to be 1
+        return [1 if s >= 0 else s for s in tensor["scale"]]
+
+    def get_labels_host_order(self):
+        return self.rows["label"]
+
+    # Accessor functions used by SDSC generation
+    def get_op_infos(self) -> list:
+        return self.make_dim_infos()
+
+    def get_op_layout_order(self, index_order=None):
+        return self.ordered_row("label", index_order)
+
+    def get_padded_sizes(self):
+        return self.ordered_row("padded_size")
+
+    # Get infos for the operation dimensions, order influenced by tensor layout
+    # Rank of returned list == op dimensions
+    # See get_tensor_op_index_order
+    def get_tensor_op_layout_order(self, tensor):
+        return [di.label for di in self.get_tensor_op_infos(tensor)]
+
+    def get_tensor_op_infos(self, tensor):
+        result = self.make_dim_infos(
+            additional_rows={"scale": self.get_tensor_scales(tensor)},
+            index_order=self.get_tensor_op_index_order(tensor),
+        )
+        return result
+
+    # Get infos corresponding to tensor layout
+    # Rank of returned list == num tensor dimensions
+    def get_tensor_layout_order(self, tensor):
+        return [di.label for di in self.get_tensor_infos(tensor)]
+
+    def get_tensor_infos(self, tensor):
+        tensor_op_infos = self.get_tensor_op_infos(tensor)
+        return [di for di in tensor_op_infos if di.scale >= 0]
+
+    def get_tensor_stick_dim_labels(self, tensor):
+        # MRA TODO: Simplify this after rebasing to get Dave's change
+        dl = tensor["device_layout"]
+        tensor_dim_map = dl.dim_map[::-1][1:]
+        tensor_index = tensor_dim_map.index(dl.host_stick_dim())
+        tensor_labels = self.get_tensor_layout_order(tensor)
+        result = (
+            [tensor_labels[tensor_index]] if tensor_index < len(tensor_labels) else []
+        )
+        return result
+
+    # Temp functions for compatability, to remove
+    def as_list(self):
+        return self.get_op_infos()
 
 
 def calculate_core_to_slice_mapping(
@@ -85,64 +213,6 @@ def calculate_core_to_slice_mapping(
         core_to_slice[str(core_id)] = indices
 
     return core_to_slice
-
-
-@dataclass
-class DimInfos:
-    """
-    Class to help iterate over dimension information in various formats
-    Input lists are in host order, but are immediately reordered according to the dim_indices position map
-    """
-
-    def __init__(
-        self,
-        labels: list[str],
-        dim_indices: list[int],
-        unpadded_sizes: list[int],
-        padded_sizes: list[int],
-        nsplits: list[int],
-        scales: list[int] = [],
-    ):
-        self.dim_infos_list = []
-        self.dim_infos_dict = {}
-
-        self.labels = labels
-        self.dim_indices = dim_indices
-        self.unpadded_sizes = unpadded_sizes
-        self.padded_sizes = padded_sizes
-        self.nsplits = nsplits
-
-        # SDSC needs non-negative scale values to be 1
-        self.scales = [1 if s >= 0 else s for s in scales]
-
-        self.do_reordering()
-
-        for i in range(len(labels)):
-            dim_info = DimInfo(
-                self.labels[i],
-                self.dim_indices[i],
-                self.unpadded_sizes[i],
-                self.padded_sizes[i],
-                self.nsplits[i],
-                self.scales[i] if self.scales else -1,
-            )
-            self.dim_infos_list.append(dim_info)
-            self.dim_infos_dict[labels[i]] = dim_info
-
-    def as_list(self) -> list:
-        return self.dim_infos_list
-
-    def as_dict(self) -> dict[str, DimInfo]:
-        return self.dim_infos_dict
-
-    # Reorder lists to align with dim_indices position map.
-    def do_reordering(self):
-        self.labels = reorder_dims(self.labels, self.dim_indices)
-        self.unpadded_sizes = reorder_dims(self.unpadded_sizes, self.dim_indices)
-        self.padded_sizes = reorder_dims(self.padded_sizes, self.dim_indices)
-        self.nsplits = reorder_dims(self.nsplits, self.dim_indices)
-        if self.scales:
-            self.scales = reorder_dims(self.scales, self.dim_indices)
 
 
 def core_idx_to_slice_offset(
@@ -354,6 +424,45 @@ def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     return coordinateMasking, maskingConstId
 
 
+def create_tensor_specific_layouts(tensors, dim_infos, is_matmul=False):
+    layouts = {}
+    # Compute tensor-specific dimension info
+    for i, tensor in enumerate(tensors):
+        # primaryDsInfo_ requires each unique layout order to have a name.
+        # Reuse the same label for tensors with the same layout, for compactness
+        tensor["ds_type"] = None
+
+        layout_order = (
+            dim_infos.get_tensor_layout_order(tensor)
+            if is_matmul
+            else dim_infos.get_tensor_op_layout_order(tensor)
+        )
+        for label, dim_order in layouts.items():
+            if layout_order == dim_order:
+                tensor["ds_type"] = label
+                break
+        if tensor["ds_type"] is None:
+            tensor["ds_type"] = (
+                LAYOUT_INPUT_LABELS[len(layouts.keys())]
+                if len(layouts.keys()) < len(LAYOUT_INPUT_LABELS)
+                else LAYOUT_OUTPUT_LABELS[
+                    len(layouts.keys()) - len(LAYOUT_INPUT_LABELS)
+                ]
+            )
+            layouts[LAYOUT_INPUT_LABELS[len(layouts.keys())]] = layout_order
+
+    # Now adjust the label of the final tensor (and all that share the same layout) to be "OUTPUT".
+    # This is not strictly required, but conformes the standard naming pattern
+    final_label = tensors[-1]["ds_type"]
+    output_label = LAYOUT_OUTPUT_LABELS[0]
+    for tensor in tensors:
+        if tensor["ds_type"] == final_label:
+            tensor["ds_type"] = output_label
+    layouts[output_label] = layouts.pop(final_label)
+
+    return layouts
+
+
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
 
@@ -411,56 +520,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             size * dl.elems_per_stick() if (dim == stick_dim) else size
         )
 
-    op_dim_infos = DimInfos(
-        dim_labels,
+    dim_infos = DimInfos(
         dim_indices,
+        dim_labels,
         dimensions,
         padded_op_dimensions,
         dim_splits,
     )
 
-    coordinateMasking, maskingConstId = create_padding_mask_info(op_dim_infos, kwargs)
-    layouts = {}
-    # Compute tensor-specific dimension info
-    for i, tensor in enumerate(tensors):
-        # Adjust for output tensors that have leading dimensions of size 1
-        # These dimensions do not exist on the device, and the tiling is different
-        # Compute the number of leading missing dims (-1)
-        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-        missing_dims = list(set(dim_indices) - set(dev_dim_order))
-        if len(missing_dims) > 0 and ndim >= 3 and tensor["scale"][0] == -1:
-            if missing_dims[0] == 0:
-                # Add missing dimensions to end of device dimension order
-                # Compute the number of leading missing dims (-1)
-                tensor_dim_indices = dev_dim_order + list(
-                    set(dim_indices) - set(dev_dim_order)
-                )
-            else:  # keepdim=0 case
-                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
-        else:
-            # Indices and order unchanged
-            tensor_dim_indices = dim_indices
-
-        # Create dim infos specific to this tensor, reordered if necessary
-        tensor["dim_infos"] = DimInfos(
-            dim_labels,
-            tensor_dim_indices,
-            dimensions,
-            padded_op_dimensions,
-            dim_splits,
-            scales=tensor["scale"],
-        )
-
-        # primaryDsInfo_ requires each unique layout order to have a name.
-        # Reuse the same label for tensors with the same layout, for compactness
-        tensor["ds_type"] = None
-        for label, dim_order in layouts.items():
-            if tensor["dim_infos"].labels == dim_order:
-                tensor["ds_type"] = label
-                break
-        if tensor["ds_type"] is None:
-            tensor["ds_type"] = LAYOUT_LABELS[len(layouts.keys())]
-            layouts[LAYOUT_LABELS[len(layouts.keys())]] = tensor["dim_infos"].labels
+    coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
+    layouts = create_tensor_specific_layouts(tensors, dim_infos)
 
     return {
         op: {
@@ -475,7 +544,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             "numCoresUsed_": cores,
             "coreIdToDsc_": {str(c): 0 for c in range(cores)},
             "numWkSlicesPerDim_": {
-                di.label: di.nsplits for di in op_dim_infos.as_list()
+                di.label: di.nsplits for di in dim_infos.get_op_infos()
             },
             "coreIdToWkSlice_": core_id_to_wk_slice,
             "coreIdToDscSchedule": {str(c): [[-1, 0, 0, 0]] for c in range(cores)},
@@ -489,7 +558,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                             "name_": "n",
                             **{
                                 di.label + "_": di.padded_size
-                                for di in op_dim_infos.as_list()
+                                for di in dim_infos.get_op_infos()
                             },  # dim sizes before split
                         },
                         "coordinateMasking_": coordinateMasking,
@@ -500,14 +569,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "name_": "core",
                                     **{
                                         di.label + "_": di.split_size
-                                        for di in op_dim_infos.as_list()
+                                        for di in dim_infos.get_op_infos()
                                     },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
                                         di.label + "_": di.split_size
-                                        for di in op_dim_infos.as_list()
+                                        for di in dim_infos.get_op_infos()
                                     },
                                 },
                             }
@@ -529,8 +598,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "component_": "hbm"
                                 if tensor["lx_addr"] is None
                                 else "lx",
-                                "layoutDimOrder_": tensor["dim_infos"].labels,
-                                "maxDimSizes_": [-1] * len(tensor["dim_infos"].labels),
+                                "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
+                                    tensor
+                                ),
+                                "maxDimSizes_": [-1] * len(dim_infos.get_tensor_op_layout_order(tensor)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -548,7 +619,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             + c
                                             # calculate the prod of dim sizes
                                             # less significant than chosen split dim i.e. the stick
-                                            * math.prod(op_dim_infos.padded_sizes[:2])
+                                            * math.prod(
+                                                dim_infos.get_padded_sizes()[:2]
+                                            )
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
                                             )
@@ -574,7 +647,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 di.label == "out" and di.scale == -1
                                             ),
                                         )
-                                        for di in tensor["dim_infos"].as_list()
+                                        for di in dim_infos.get_tensor_op_infos(tensor)
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -594,7 +667,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         if not (di.label == "out" and di.scale == -1)
                                         else -2
                                     )
-                                    for di in tensor["dim_infos"].as_list()
+                                    for di in dim_infos.get_tensor_op_infos(tensor)
                                 ],
                                 "wordLength": num_bytes(
                                     tensor["device_layout"].device_dtype
@@ -694,14 +767,15 @@ def _generate_matmul_common(
     # FIXME: assumes ordering
     padded_dimensions = dimensions[:-1] + [pad_up(dimensions[-1], elems_per_stick)]
 
-    op_dim_infos = DimInfos(
-        dim_labels,
+    dim_infos = DimInfos(
         dim_indices,
+        dim_labels,
         dimensions,
         padded_dimensions,
         dim_splits,
     )
-    dim_info_dict = op_dim_infos.as_dict()
+    # Will be deleted after bmm cleanup
+    dim_info_dict = {di.label: di for di in dim_infos.get_op_infos()}
 
     return {
         op: {
