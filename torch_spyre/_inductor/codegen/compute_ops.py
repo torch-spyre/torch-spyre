@@ -519,7 +519,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
     layouts = create_tensor_specific_layouts(tensors, dim_infos)
 
+    # Compute the stick label from the op tensor.
+    # For now we expect stick dim to always be "out", so check.
+    # Remove the assertion when this invariant changes
     op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
+    assert op_stick_labels == ["out"]
 
     core_id_to_wk_slice = {}
     for i in range(cores):
