@@ -258,7 +258,7 @@ def core_division_planning(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
     # Nodes are in topological order (guarenteed by caller).
-    max_cores = int(os.getenv("SENCORES", "1"))
+    max_cores = int(os.getenv("SENCORES", "32"))
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
 
