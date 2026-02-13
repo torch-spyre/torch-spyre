@@ -58,7 +58,13 @@ class DimInfos:
         padded_sizes: list[int],
         nsplits: list[int],
     ):
-        self.dim_indices = dim_indices
+
+        # Non-consecutive dim_indices can occur because dims of size 1 are deleted on device.
+        # Current code expects dim_indices to be consecutive, so reindex them.
+        # If this creates problems in the future, update Diminfos to support non-consecutive indices
+        reindex_map = {v: k for k, v in enumerate(sorted(dim_indices))}
+        self.dim_indices = [reindex_map[x] for x in dim_indices]
+
         self.rows: dict[str, list] = {}
         self.add_row("label", labels)
         self.add_row("unpadded_size", unpadded_sizes)
@@ -486,12 +492,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     op_dims_tensor = inputs[0] if reduction else outputs[0]
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
-
-    # Downstream code expects dim_indices to be consecutive, so make them so
-    # If this is a problem, we can update DimInfos to handle non-consecutive instead
-    reindex_map = {v: k for k, v in enumerate(sorted(dim_map))}
-    dim_indices = [reindex_map[x] for x in dim_map]
-
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
     dim_splits = [1] * (ndim - 1) + [cores]
 
@@ -509,7 +509,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         )
 
     dim_infos = DimInfos(
-        dim_indices,
+        dim_map,
         dim_labels,
         dimensions,
         padded_op_dimensions,
