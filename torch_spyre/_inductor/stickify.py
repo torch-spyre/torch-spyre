@@ -170,24 +170,37 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         if is_sparse(x_stl) or is_sparse(y_stl):
             raise Unsupported(f"matmul on sparse tensors {x_stl} {y_stl}")
         if x_stl.host_stick_dim() == 0 and y_stl.host_stick_dim() == 0:
-            out_host_dim_order = [1, 0]
+            out_dim_order = [1, 0]
         elif x_stl.host_stick_dim() != 0 and y_stl.host_stick_dim() != 0:
-            out_host_dim_order = [0, 1]
+            out_dim_order = [0, 1]
         else:
             raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
-        stl = SpyreTensorLayout(output.size, output.dtype, out_host_dim_order)
+        stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
     elif red.reduction_type == BATCH_MATMUL_OP:
-        x_stl = args[0].layout.device_layout
-        y_stl = args[1].layout.device_layout
+        x_layout = args[0].layout
+        y_layout = args[1].layout
+        x_stl = x_layout.device_layout
+        y_stl = y_layout.device_layout
+        x_dims = len(x_layout.size)
+        y_dims = len(y_layout.size)
+        out_dims = len(output.size)
         if is_sparse(x_stl) or is_sparse(y_stl):
             raise Unsupported(f"bmm on sparse tensors {x_stl} {y_stl}")
-        if x_stl.dim_map != y_stl.dim_map:
-            raise Unsupported(f"{red.reduction_type} layout mismatch {x_stl} {y_stl}")
-        # TODO: FIXME forcing generic stick layout. Should compute the output device_size and dim_map directly from input STL
-        stl = SpyreTensorLayout(output.size, output.dtype)
+        out_dim_order = list(range(out_dims - 2))
+        if (x_stl.host_stick_dim() == (x_dims - 1)) and (
+            y_stl.host_stick_dim() == (y_dims - 1)
+        ):
+            out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
+        elif (x_stl.host_stick_dim() == (x_dims - 1)) and (
+            y_stl.host_stick_dim() == (y_dims - 1)
+        ):
+            out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
+        else:
+            raise Unsupported(f"bmm stick dimensions mismatch {x_stl} {y_stl}")
+        stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
