@@ -48,7 +48,8 @@ SPYRE_FP32_OPS = [
     "clone",
 ]
 
-LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
+LAYOUT_INPUT_LABELS = ["INPUT", "KERNEL", "KERNEL_IDX"]
+LAYOUT_OUTPUT_LABELS = ["OUTPUT"]
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j"]
