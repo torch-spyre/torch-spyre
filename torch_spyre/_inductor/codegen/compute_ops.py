@@ -743,12 +743,6 @@ def get_padded_dimensions_mm(ndim, inputs):
         padded_dimensions[host_dim] = get_device_size(host_dim, inputs[tensor_idx])
     return padded_dimensions
 
-
-# To be removed after pulling scales from dim infos
-def tmp_adjust_scale(scale_value):
-    return 1 if scale_value >= 0 else scale_value
-
-
 def _generate_matmul_common(
     pointers,
     *,
@@ -785,6 +779,7 @@ def _generate_matmul_common(
     Returns:
         Dictionary containing the SDSC structure for the operation
     """
+    tensors = inputs + outputs
     data_format = inputs[0]["device_layout"].device_dtype
 
     dim_infos = DimInfos(
@@ -796,7 +791,7 @@ def _generate_matmul_common(
     )
     dim_info_dict = {di.label: di for di in dim_infos.get_op_infos()}
 
-    layouts = create_tensor_specific_layouts(inputs + outputs, dim_infos, is_matmul=True)
+    layouts = create_tensor_specific_layouts(tensors, dim_infos, is_matmul=True)
 
     return {
         op: {
@@ -855,7 +850,8 @@ def _generate_matmul_common(
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": node_name,
+                                # "name_": node_name,
+                                "name_": f"allocate_Input{idx}_hbm" if idx < len(tensors)-1 else "allocate_out_hbm",
                                 "prev_": "",
                                 "ldsIdx_": idx,
                                 "component_": "hbm",
@@ -892,48 +888,31 @@ def _generate_matmul_common(
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        label: gen_coord_info_value(
+                                        di.label: gen_coord_info_value(
                                             size=di.split_size
-                                            if (tmp_adjust_scale(tensor["scale"][di.index]) == 1)
+                                            if (di.scale == 1)
                                             else 1,
                                             nsplits=di.nsplits,
                                             elems_per_stick=tensor[
                                                 "device_layout"
                                             ].device_dtype.elems_per_stick(),
-                                            is_stick_dim=(di.label == stick_label),
+                                            is_stick_dim=(di.label in dim_infos.get_tensor_stick_dim_labels(tensor)), 
                                         )
-                                        for label in dim_infos.get_tensor_layout_order(tensor)
-                                        if (di := dim_info_dict[label])
+                                        for di in dim_infos.get_tensor_infos(tensor)
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
                             }
-                            for idx, (
-                                node_name,
-                                tensor,
-                                stick_label,
-                            ) in enumerate(
-                                zip(
-                                    [
-                                        "allocate_Input0_hbm",
-                                        "allocate_Input1_hbm",
-                                        "allocate_out_hbm",
-                                    ],
-                                    inputs + outputs,
-                                    ["in", "out", "out"],
-                                )
-                            )
+                            for idx, tensor in enumerate(tensors)
                         ],
                         "labeledDs_": [
                             {
                                 "ldsIdx_": idx,
                                 "dsName_": f"Tensor{idx}",
-                                "dsType_": ds_type,
-                                # permute scale values according to layoutDimOrder
+                                "dsType_": tensor["ds_type"],
                                 "scale_": [
-                                    tmp_adjust_scale(tensor["scale"][di.index]) 
-                                    for label in dim_infos.get_tensor_layout_order(tensor)
-                                    if (di := dim_info_dict[label])
+                                    di.scale
+                                    for di in dim_infos.get_tensor_infos(tensor)
                                 ],
                                 "wordLength": num_bytes(
                                     tensor["device_layout"].device_dtype
@@ -946,12 +925,7 @@ def _generate_matmul_common(
                                     "lx": {"isPresent": 1},
                                 },
                             }
-                            for idx, (ds_type, tensor) in enumerate(                            
-                                zip(
-                                    ["INPUT", "KERNEL", "OUTPUT"],
-                                    inputs + outputs,
-                                )
-                            )
+                            for idx, tensor in enumerate(tensors)
                         ],
                         "computeOp_": [
                             {
