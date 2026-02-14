@@ -161,7 +161,7 @@ class DimInfos:
         )
         return result
 
-    # Get infos corresponding to tensor layout
+    # Get labels corresponding to tensor layout
     # Rank of returned list == num tensor dimensions
     def get_tensor_layout_order(self, tensor):
         dl = tensor["device_layout"]
@@ -178,6 +178,19 @@ class DimInfos:
         dl = tensor["device_layout"]
         idx = tensor["scale"].index(dl.host_stick_dim())
         return [self.rows["label"][idx]]
+
+
+
+# Extract the device size for a give host dim
+# Assumption is that the passed tensor operate in host dimension space
+def get_device_size(host_dim, tensor):
+    dl = tensor["device_layout"]
+    device_dim = tensor["scale"][host_dim]
+    assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
+    size = dl.device_size[dl.dim_map.index(device_dim)]
+    if device_dim == dl.host_stick_dim():
+        size *= dl.elems_per_stick()
+    return size
 
 
 def calculate_core_to_slice_mapping(
@@ -502,17 +515,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     dim_splits = [1] * (ndim - 1) + [cores]
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
-    padded_op_dimensions = [1] * len(dimensions)
-    # Un-tile and put in host order
-    sizes = dl.device_size[::-1][1:]
-    for dim in range(ndim):
-        sv = op_dims_tensor["scale"][dim]
-        assert sv >= 0, "Scale value should be non-negative for op_dims_tensor"
-        device_index = dim_map.index(sv)
-        size = sizes[device_index]
-        padded_op_dimensions[dim] = (
-            size * dl.elems_per_stick() if (sv == dl.host_stick_dim()) else size
-        )
+    padded_op_dimensions = [get_device_size(host_dim, op_dims_tensor) for host_dim in range(ndim)]
 
     dim_infos = DimInfos(
         dim_map,
@@ -720,23 +723,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     }
 
 
-# Extract the device size for a give host dim
-# Assumption is that the passed tensor operate in host dimension space
-def get_device_size(host_dim, tensor):
-    dl = tensor["device_layout"]
-    device_dim = tensor["scale"][host_dim]
-    assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
-    size = dl.device_size[dl.dim_map.index(device_dim)]
-    if device_dim == dl.host_stick_dim():
-        size *= dl.elems_per_stick()
-    return size
-
-
 # Extract the padded sizes from the tensors for mm and bmm.
-# The pattern of how dimensions map to tensors seems to be:
+# The pattern of how op dimensions map to tensors seems to be:
 #  - The first N-2 dims come from tensor 0
 #  - Last 2 dims come from tensor 1
-def get_padded_dimensions_mm(ndim, inputs):
+def get_padded_dimensions_matmul(ndim, inputs):
     padded_dimensions = [0]*ndim
     for host_dim in range(ndim):
         tensor_idx = 0 if host_dim < ndim - 2 else 1
@@ -748,7 +739,6 @@ def _generate_matmul_common(
     *,
     op,
     dimensions,
-    padded_dimensions,
     inputs,
     outputs,
     dim_labels,
@@ -767,7 +757,6 @@ def _generate_matmul_common(
         pointers: Memory pointers for tensors
         op: Operation name
         dimensions: Tensor host dimensions
-        padded_dimensions: Tensor device dimensions (may be padded)
         inputs: Input tensor specifications
         outputs: Output tensor specifications
         dim_labels: Dimension labels (e.g., ["mb", "in", "out"] for matmul)
@@ -781,6 +770,8 @@ def _generate_matmul_common(
     """
     tensors = inputs + outputs
     data_format = inputs[0]["device_layout"].device_dtype
+
+    padded_dimensions = get_padded_dimensions_matmul(len(dim_indices), inputs)
 
     dim_infos = DimInfos(
         dim_indices,
@@ -965,8 +956,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     dim_labels = ["mb", "in", "out"]
     dim_indices = [0, 1, 2]
 
-    padded_dimensions = get_padded_dimensions_mm(len(dim_indices), inputs)
-
     # work division logic
     cores = 1
     dim_splits = [1, 1, 1]
@@ -988,7 +977,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         pointers,
         op=op,
         dimensions=dimensions,
-        padded_dimensions=padded_dimensions,
         inputs=inputs,
         outputs=outputs,
         dim_labels=dim_labels,
@@ -1054,7 +1042,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                     core_div[3],  # out split (from device layout index -1)
                 ]
 
-    padded_dimensions = get_padded_dimensions_mm(len(dim_indices), inputs)
+    
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
@@ -1062,7 +1050,6 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         pointers,
         op=op,
         dimensions=dimensions,
-        padded_dimensions=padded_dimensions,
         inputs=inputs,
         outputs=outputs,
         dim_labels=dim_labels,
