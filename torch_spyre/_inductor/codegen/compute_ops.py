@@ -714,9 +714,28 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     }
 
 
-# TODO: temp manual padding for matmu / bmm
-def pad_up(size, stick_size):
-    return ((size + stick_size - 1) // stick_size) * stick_size
+# Extract the device size for a give host dim
+# Assumption is that the passed tensor operate in host dimension space
+def get_device_size(host_dim, tensor):
+    dl = tensor["device_layout"]
+    device_dim = tensor["scale"][host_dim]
+    assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
+    size = dl.device_size[dl.dim_map.index(device_dim)]
+    if device_dim == dl.host_stick_dim():
+        size *= dl.elems_per_stick()
+    return size
+
+
+# Extract the padded sizes from the tensors for mm and bmm.
+# The pattern of how dimensions map to tensors seems to be:
+#  - The first N-2 dims come from tensor 0
+#  - Last 2 dims come from tensor 1
+def get_padded_dimensions_mm(ndim, inputs):
+    padded_dimensions = [0]*ndim
+    for host_dim in range(ndim):
+        tensor_idx = 0 if host_dim < ndim - 2 else 1
+        padded_dimensions[host_dim] = get_device_size(host_dim, inputs[tensor_idx])
+    return padded_dimensions
 
 
 def _generate_matmul_common(
@@ -724,6 +743,7 @@ def _generate_matmul_common(
     *,
     op,
     dimensions,
+    padded_dimensions,
     inputs,
     outputs,
     dim_labels,
@@ -744,7 +764,8 @@ def _generate_matmul_common(
     Args:
         pointers: Memory pointers for tensors
         op: Operation name
-        dimensions: Tensor dimensions
+        dimensions: Tensor host dimensions
+        padded_dimensions: Tensor device dimensions (may be padded)
         inputs: Input tensor specifications
         outputs: Output tensor specifications
         dim_labels: Dimension labels (e.g., ["mb", "in", "out"] for matmul)
@@ -763,10 +784,10 @@ def _generate_matmul_common(
     for tensor in inputs + outputs:
         tensor["scale"] = [1 if s >= 0 else s for s in tensor["scale"]]
 
-    # TODO: Temp manual padding
-    elems_per_stick = inputs[0]["device_layout"].elems_per_stick()
-    # FIXME: assumes ordering
-    padded_dimensions = dimensions[:-1] + [pad_up(dimensions[-1], elems_per_stick)]
+    # # TODO: Temp manual padding
+    # elems_per_stick = inputs[0]["device_layout"].elems_per_stick()
+    # # FIXME: assumes ordering
+    # padded_dimensions = dimensions[:-1] + [pad_up(dimensions[-1], elems_per_stick)]
 
     dim_infos = DimInfos(
         dim_indices,
@@ -990,6 +1011,7 @@ def _generate_matmul_common(
     }
 
 
+
 def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     """
     Generate SDSC structure for matrix multiplication operation.
@@ -1001,6 +1023,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     """
     dim_labels = ["mb", "in", "out"]
     dim_indices = [0, 1, 2]
+
+    padded_dimensions = get_padded_dimensions_mm(len(dim_indices), inputs)
 
     # work division logic
     cores = 1
@@ -1023,6 +1047,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         pointers,
         op=op,
         dimensions=dimensions,
+        padded_dimensions=padded_dimensions,
         inputs=inputs,
         outputs=outputs,
         dim_labels=dim_labels,
@@ -1099,12 +1124,15 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                     core_div[3],  # out split (from device layout index -1)
                 ]
 
+    padded_dimensions = get_padded_dimensions_mm(len(dim_indices), inputs)
+
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
     return _generate_matmul_common(
         pointers,
         op=op,
         dimensions=dimensions,
+        padded_dimensions=padded_dimensions,
         inputs=inputs,
         outputs=outputs,
         dim_labels=dim_labels,
