@@ -146,7 +146,7 @@ class DimInfos:
     def get_padded_sizes(self):
         return self.ordered_row("padded_size")
 
-    # Get infos for the operation dimensions, with order influenced 
+    # Get infos for the operation dimensions, with order influenced
     # by tensor layout. Rank of returned list == op dimensions
     # See get_tensor_op_index_order
     def get_tensor_op_layout_order(self, tensor):
@@ -162,8 +162,8 @@ class DimInfos:
     # Get labels corresponding to tensor layout
     # Rank of returned list == num tensor dimensions
     def get_tensor_layout_order(self, tensor):
-        # TODO: Understsand why matmul needed this layout order to be different 
-        # than the order obtained by get_tensor_infos().  Is it possible 
+        # TODO: Understsand why matmul needed this layout order to be different
+        # than the order obtained by get_tensor_infos().  Is it possible
         # get_tensor_infos() should be using this same order as well?
         dl = tensor["device_layout"]
         scale = tensor["scale"]
