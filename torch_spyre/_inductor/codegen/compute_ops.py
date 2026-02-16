@@ -35,6 +35,11 @@ class DimInfo:
         setattr(self, name, value)
 
 
+def get_scales_sdsc_format(tensor):
+    # SDSC needs non-negative scale values to be 1
+    return [1 if s >= 0 else s for s in tensor["scale"]]
+
+
 @dataclass
 class DimInfos:
     """
@@ -86,7 +91,7 @@ class DimInfos:
         )
 
     # Internal implementation functions.
-    def add_row(self, name, info_list, in_former_order=True):
+    def add_row(self, name, info_list):
         self.rows[name] = info_list
 
     def make_dim_infos(self, fields=[], index_order=None, additional_rows={}):
@@ -110,7 +115,7 @@ class DimInfos:
     # Therefore some sdsc sections require all op dimensions, but
     # with the order of a subset of the indices adjusted to match
     # the tile layout of the tensor on the device.  This
-    # function computest that reordering
+    # function computes that reordering
     def get_tensor_op_index_order(self, tensor):
         dim_indices = self.dim_indices  # op dimension order
         dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
@@ -128,10 +133,6 @@ class DimInfos:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices
         return tensor_dim_indices
-
-    def get_tensor_scales(self, tensor):
-        # SDSC needs non-negative scale values to be 1
-        return [1 if s >= 0 else s for s in tensor["scale"]]
 
     def get_labels_host_order(self):
         return self.rows["label"]
@@ -154,7 +155,7 @@ class DimInfos:
 
     def get_tensor_op_infos(self, tensor):
         result = self.make_dim_infos(
-            additional_rows={"scale": self.get_tensor_scales(tensor)},
+            additional_rows={"scale": get_scales_sdsc_format(tensor)},
             index_order=self.get_tensor_op_index_order(tensor),
         )
         return result
