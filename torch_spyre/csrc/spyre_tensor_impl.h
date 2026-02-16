@@ -96,6 +96,14 @@ class SpyreTensorLayout {
    */
   int32_t host_stick_dim();
 
+  /**
+   * Return a dim_order of the desired rank that is as similar as
+   * possible to the dim_order encoded in this->dim_map.
+   * Because of the elision of size 1 dimensions, there will not always
+   * be a unique "most similar" dim_order, so heuristics may be applied.
+   */
+  std::vector<int32_t> similar_dim_order(int32_t desired_rank);
+
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);
   }

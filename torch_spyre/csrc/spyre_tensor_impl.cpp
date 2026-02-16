@@ -94,6 +94,58 @@ int32_t SpyreTensorLayout::host_stick_dim() {
   }
 }
 
+std::vector<int32_t> SpyreTensorLayout::similar_dim_order(
+    int32_t desired_rank) {
+  auto rank = this->dim_map.size();
+  std::vector<int32_t> dim_order;
+
+  // Invert get_generic_stick_layout
+  dim_order.push_back(this->dim_map[rank - 2]);
+  for (auto i = 0; i < rank - 2; i++) {
+    dim_order.push_back(this->dim_map[i]);
+  }
+
+  // How similar is the layout to a vanilla row major or column major?
+  auto row_major_count = 0;
+  auto col_major_count = 0;
+  for (auto i = 1; i < rank; i++) {
+    if (this->dim_map[i - 1] < this->dim_map[i]) {
+      row_major_count++;
+    } else {
+      col_major_count++;
+    }
+  }
+
+  std::vector<int32_t> result;
+  if (row_major_count == (rank - 1)) {
+    // It is exactly row major
+    for (int32_t i = 0; i < desired_rank; i++) {
+      result.push_back(i);
+    }
+  } else if (col_major_count == (rank - 1)) {
+    // It is exactly column major
+    for (int32_t i = desired_rank - 1; i >= 0; i--) {
+      result.push_back(i);
+    }
+  } else if (col_major_count > row_major_count) {
+    // It is closer to column major
+    // TODO(dgrove-oss): We could try harder here if neccessary
+    DEBUGINFO("similar_dim_order: closest to column major")
+    for (int32_t i = desired_rank - 1; i >= 0; i--) {
+      result.push_back(i);
+    }
+  } else {
+    // It is closer to row major
+    // TODO(dgrove-oss): We could try harder here if neccessary
+    DEBUGINFO("similar_dim_order: closest to row major")
+    for (int32_t i = 0; i < desired_rank; i++) {
+      result.push_back(i);
+    }
+  }
+
+  return result;
+}
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
