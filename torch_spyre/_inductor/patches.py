@@ -51,7 +51,16 @@ def _should_run_on_spyre(
     if (
         graph is not None
         and "device" in graph.output_node().prev.kwargs
-        and graph.output_node().prev.kwargs["device"].type == "spyre"
+        and (
+            (
+                isinstance(graph.output_node().prev.kwargs["device"], str)
+                and graph.output_node().prev.kwargs["device"] == "spyre"
+            )
+            or (
+                isinstance(graph.output_node().prev.kwargs["device"], torch.device)
+                and graph.output_node().prev.kwargs["device"].type == "spyre"
+            )
+        )
     ):
         return True
 
