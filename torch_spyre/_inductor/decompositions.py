@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+from contextlib import contextmanager
+
 from typing import Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
+from torch._inductor.decomposition import decompositions
 
 # Dictionary for Spyre-specific decompositions
 spyre_decompositions: dict = {}
@@ -29,6 +33,38 @@ spyre_decompositions_to_exclude = [
     # See: https://github.com/torch-spyre/torch-spyre/issues/128#issuecomment-3576168221
     torch.ops.aten.new_ones,
 ]
+
+
+# Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
+@contextmanager
+def enable_spyre_decompositions():
+    saved_intree_decompositions = {}
+    try:
+        for (
+            spyre_decompositions_op,
+            spyre_decompositions_impl,
+        ) in spyre_decompositions.items():
+            if spyre_decompositions_op in decompositions:
+                saved_intree_decompositions[spyre_decompositions_op] = decompositions[
+                    spyre_decompositions_op
+                ]
+            decompositions[spyre_decompositions_op] = spyre_decompositions_impl
+        yield
+    except Exception as e:
+        # TODO: Better error handling here?
+        raise e
+    finally:
+        # Reset the saved in-tree decompositions if needed
+        for (
+            spyre_decompositions_op,
+            spyre_decompositions_impl,
+        ) in spyre_decompositions.items():
+            if spyre_decompositions_op in saved_intree_decompositions:
+                decompositions[spyre_decompositions_op] = saved_intree_decompositions[
+                    spyre_decompositions_op
+                ]
+            else:
+                decompositions.pop(spyre_decompositions_op, None)
 
 
 def register_spyre_decomposition(

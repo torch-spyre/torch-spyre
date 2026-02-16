@@ -20,8 +20,13 @@ from torch._inductor.virtualized import V
 from torch._inductor.graph import GraphLowering
 
 from .lowering import enable_spyre_lowerings
-from .decompositions import spyre_decompositions, spyre_decompositions_to_exclude
+from .decompositions import (
+    spyre_decompositions,
+    spyre_decompositions_to_exclude,
+    enable_spyre_decompositions,
+)
 from torch_spyre.fallbacks import fallback_ops
+from torch._inductor.decomposition import decompositions
 
 
 def _should_run_on_spyre(
@@ -75,8 +80,8 @@ class SpyreAotAutograd(AotAutograd):
     def __call__(self, gm: torch.fx.GraphModule, example_inputs, **kwargs):
         if _should_run_on_spyre(example_inputs, gm.graph):
             # Merge Spyre-specific decompositions with any existing decompositions
-            # Note: the decompositions need to be merged in this way
-            # as opposed to the lowerings.
+            # Note: the decompositions additionally need to be merged in this way,
+            # which is not required for the lowerings.
             # The reason is that PyTorch maintains a separate
             # CURRENT_DECOMPOSITION_TABLE in torch.fx.experimental.proxy_tensor
             # During FX tracing.
@@ -91,9 +96,13 @@ class SpyreAotAutograd(AotAutograd):
             torch._decomp.remove_decompositions(
                 existing_decomps, spyre_decompositions_to_exclude
             )
+            torch._decomp.remove_decompositions(
+                decompositions, spyre_decompositions_to_exclude
+            )
 
             # Remove decompositions for fallback ops defined in fallbacks.py
             torch._decomp.remove_decompositions(existing_decomps, fallback_ops)
+            torch._decomp.remove_decompositions(decompositions, fallback_ops)
 
             # Spyre decompositions take precedence over existing ones
             merged_decomps = {**existing_decomps, **spyre_decompositions}
@@ -102,6 +111,7 @@ class SpyreAotAutograd(AotAutograd):
             with (
                 spyre_data_types(),
                 enable_spyre_lowerings(),
+                enable_spyre_decompositions(),
                 V.set_real_inputs(example_inputs),
             ):
                 return super().__call__(gm, example_inputs, **kwargs)
@@ -111,7 +121,12 @@ class SpyreAotAutograd(AotAutograd):
 
 def spyre_compile_to_module(graph: GraphLowering, original_compile_to_module):
     if _should_run_on_spyre(graph.example_inputs, graph.graph):
-        with spyre_data_types(), enable_spyre_lowerings():
+        # with spyre_data_types(), enable_spyre_lowerings():
+        with (
+            spyre_data_types(),
+            enable_spyre_lowerings(),
+            enable_spyre_decompositions(),
+        ):
             return original_compile_to_module(graph)
     else:
         return original_compile_to_module(graph)
