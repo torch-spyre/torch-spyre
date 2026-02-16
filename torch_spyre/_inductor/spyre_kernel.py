@@ -551,7 +551,33 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             y = value.arguments[1]
             di_x = self.derive_dim_info(x)
             di_y = self.derive_dim_info(y)
-            di = di_x[0:3] + di_y[2:]
+            if len(di_x) == 4 and len(di_y) == 4:
+                di = di_x[0:3] + di_y[2:]
+            elif len(di_x) == 3 and len(di_y) == 3:
+                di = di_x[0:3] + di_y[2:]
+            elif len(di_x) == 2 and len(di_y) == 3:
+                if di_x == di_y[0:2]:
+                    di = [di_x[0], DimensionInfo(self.wildcard, 1), di_x[1], di_y[2]]
+                elif di_x[0] == di_y[0]:
+                    di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1), di_y[2]]
+                else:
+                    di = [DimensionInfo(self.wildcard, 1), di_x[0], di_x[1], di_y[2]]
+            elif len(di_x) == 3 and len(di_y) == 2:
+                di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
+            elif len(di_x) == 2 and len(di_y) == 2:
+                if di_x == di_y:
+                    di = [
+                        di_x[0],
+                        DimensionInfo(self.wildcard, 1),
+                        di_x[1],
+                        DimensionInfo(self.wildcard, 1),
+                    ]
+                elif di_x[0] == di_y[0]:
+                    di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1), di_y[1]]
+                else:
+                    di = [DimensionInfo(self.wildcard, 1), di_x[0], di_x[1], di_y[1]]
+            else:
+                raise Unsupported(f"malformed bmm {di_x} {di_y}")
             args = [
                 create_tensor_arg(True, actuals.index(x.name), x.layout),
                 create_tensor_arg(True, actuals.index(y.name), y.layout),
