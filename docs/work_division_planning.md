@@ -4,7 +4,7 @@ This document describes the multi-dimensional parallelization planning in Torch-
 
 ## Motivation
 
-Spyreprovide multiple processing cores that can execute operations in parallel. To maximize performance, the compiler must decide how to divide tensor operations across these cores. The challenges are to:
+Spyre provide multiple processing cores that can execute operations in parallel. To maximize performance, the compiler must decide how to divide tensor operations across these cores. The challenges are to:
 
 1. Maximize parallelism by using as many cores as possible
 2. Ensure balanced workloads across all cores
