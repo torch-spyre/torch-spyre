@@ -130,7 +130,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def gelu(x):
-        return PointwiseOp("gelu", [x])
+        return PointwiseOp("gelufwd", [x])
 
     @staticmethod
     def layernormnorm(*args):
