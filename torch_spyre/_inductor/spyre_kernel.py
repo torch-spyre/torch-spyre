@@ -595,6 +595,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         dim_map = map_dims_to_vars(access.layout, access.index)
         var_map = {v: k for k, v in dim_map.items()}
+
+        # Special case: single dimension of size 1 is not elided by inductor
+        if len(op_dimensions) == 1 and op_dimensions[0].numel == 1:
+            return [access.layout.device_layout.dim_map[0]]
+
         return [
             -3
             if (di.var == self.wildcard)

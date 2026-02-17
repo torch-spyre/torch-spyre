@@ -616,6 +616,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "exp": torch.exp,
             },
             "param_sets": {
+                "1d0": {cached_randn((1,), dtype=torch.float16)},
                 "2d0": {cached_randn((1, 3), dtype=torch.float16)},
                 "2d1": {cached_randn((2, 1), dtype=torch.float16)},
                 "3d0": {cached_randn((1, 3, 4), dtype=torch.float16)},
