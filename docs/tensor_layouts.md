@@ -1,7 +1,9 @@
 # Tensor Layouts
 
 In this document we discuss the rationale for Spyre tensor layouts, the
-specifics, and their relationship with PyTorch tensor layouts.
+specifics, and their relationship with PyTorch tensor layouts. This document
+complements the [Tiled Tensor RFC](../RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md)
+by describing the specific device memory layouts and related APIs used for Tensors in Torch-Spyre.
 
 ## PyTorch Tensor Layouts
 
@@ -70,8 +72,7 @@ The device_rank is always greater than or equal to the rank of the
 (canonicalized) PyTorch tensor layout.
 
 In combination with a PyTorch tensor layout, a Spyre tensor layout makes it
-possible to represent tiled tensors, sparse tensors, and padded tensors
-altogether.
+possible to represent tiled tensors, sparse tensors, and padded tensors.
 
 In contrast with a PyTorch tensor layout, a Spyre tensor has no explicit stride
 vector. A Spyre tensor layout is always in row-major format, i.e., the strides
@@ -81,7 +82,7 @@ in the implicit stride vector are always decreasing obtained by formula:
 stride[i] = math.prod(size[i+1:device_rank])
 ```
 
-For now a Spyre tensor layout has a unique _stick dimension_, which is always
+For now, a Spyre tensor layout has a unique _stick dimension_, which is always
 dimension device_rank-1. Elements in an 128-byte-aligned 128-byte _stick_ of
 tensor data (in a 128-byte-aligned tensor) share the same coordinates for
 dimensions 0 to device_rank-2. The device_size of the stick dimension is always
@@ -119,9 +120,95 @@ tensor layout represent padding.
 
 - Dividing tensor access across cores
 
-## Default Layouts and Layout Compatibility
+## Default Layouts and Controlling Layouts
 
-- Default layouts for input tensors
+Spyre tensors are created using two fundamental PyTorch APIs.  
+- The `to()` method is used to transfer all elements of an existing
+   (host) tensor to a newly allocated device tensor; the result of `to`
+   is the device tensor object.
+- The `new_empty()`, `new_empty_strided()`, etc. methods are used
+   to create an uninitialized device tensor; the result of the method
+   is the device tensor object.
+Both of these APIs can be invoked either with or without providing an
+explicit `SpyreTensorLayout`.  When a `SpyreTensorLayout` is provided, it
+specifies precisely how the device tensor will be laid out. When the APIs are
+invoked without providing a `SpyreTensorLayout` the device tensor
+is created using a default layout. Conceptually the default layout
+(a) designates the last dimension as the stick dimension, (b) tiles
+along the first dimension, and (c) pads the size of the stick dimension
+to make it evenly divisible into sticks.
+
+### Default Layout Example
+The layout metadata is encoded by the runtime C++ class `SpyreTensorLayout` (see [spyre_tensor_impl.h](../torch_spyre/csrc/spyre_tensor_impl.h)).
+An instance of this class is embedded as a field in the `SpyreTensorImpl` class.
+It can be accessed in Python via an added Tensor method `device_tensor_layout()`.
+The key elements of metadata are:
+- `device_size`: analagous to PyTorch's `size` but with padded values and extra dimensions for tiling.
+- `dim_map`: a vector of the same length as `device_size` giving the index in the PyTorch `size` array for each element of `device_size`.
+- `device_dtype`: the datatype of the Tensor.
+
+As a concrete example, run the following program:
+
+```
+import torch
+x = torch.rand(5, 100, 150, dtype=torch.float16)
+y = x.to("spyre")
+stl = y.device_tensor_layout()
+print(stl)
+```
+
+You should see something like:
+
+```
+SpyreTensorLayout(device_size=[100, 3, 5, 64], dim_map =[1, 2, 0, 2], device_dtype=DataFormats.SEN169_FP16)
+```
+
+The 3-D tensor has a 4-D `device_size`.  
+A float16 is two bytes, therefore each stick contains 64 data values.
+The stick dimension of `150` has been padded to `192` and broken into two device dimensions of (`3` and `64`).
+
+### Specifiying Alternate Layouts
+
+The minimal constructor for a `SpyreTensorLayout` takes a `size` and `dtype` and
+builds a instance that encodes the default layout.  This constructor
+is what is used behind the scenes when the user does not specify a layout.
+
+As an example, we can explictly request the default layout in a `to` by doing:
+
+```
+import torch
+from torch_spyre._C import SpyreTensorLayout
+x = torch.rand(5, 100, 150, dtype=torch.float16)
+stl = SpyreTensorLayout((5, 100, 150), torch.float16)
+y = x.to("spyre",device_layout=stl)
+print(y.device_tensor_layout())
+```
+
+You should see exactly the same output as before:
+
+```
+SpyreTensorLayout(device_size=[100, 3, 5, 64], dim_map =[1, 2, 0, 2], device_dtype=DataFormats.SEN169_FP16)
+```
+
+A second constructor of `SpyreTensorLayout` enables finer-grained control.
+It takes an additional `dim_order` allowing the programmer
+to fine-tune the layout based on their knowledge of how the Tensor will be used
+in computation.
+
+For example, changing the constructor in the above program to
+
+```
+stl = SpyreTensorLayout((5, 100, 150), torch.float16, [1,0,2])
+```
+
+yields a tensor with the tiling inverted:
+
+```
+SpyreTensorLayout(device_size=[5, 3, 100, 64], dim_map =[0, 2, 1, 2], device_dtype=DataFormats.SEN169_FP16)
+```
+
+## Layout Compatibility
+
 - Operation validation and layouts for computed tensors
 
 ## Generating DCIs and SuperDSCs
