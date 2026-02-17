@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Any, Callable, List
 
 import torch
@@ -89,5 +90,6 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     nodes = propagate_spyre_tensor_layouts(nodes)
     nodes = core_division_planning(nodes)
-    nodes = scratchpad_planning(nodes)
+    if os.environ.get("LX_PLANNING", "0") == "1":
+        nodes = scratchpad_planning(nodes)
     return nodes

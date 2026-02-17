@@ -16,7 +16,7 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import SpyreTensorLayout, DataFormats, to_with_layout
+from torch_spyre._C import SpyreTensorLayout, to_with_layout, get_device_dtype
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -53,7 +53,9 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
-        stl_y = SpyreTensorLayout([4, 512, 64], [1, 0, 1], DataFormats.SEN169_FP16)
+        stl_y = SpyreTensorLayout(
+            [4, 512, 64], [1, 0, 1], get_device_dtype(torch.float16)
+        )
         self.assertEqual(stl_x.dim_map, stl_y.dim_map)
         self.assertEqual(stl_x.device_size, stl_y.device_size)
 
@@ -90,7 +92,9 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x, x_dev.cpu())
 
         y = torch.rand([512, 512], dtype=torch.float16)
-        y_stl = SpyreTensorLayout([8, 512, 64], [1, 0, 1], DataFormats.SEN169_FP16)
+        y_stl = SpyreTensorLayout(
+            [8, 512, 64], [1, 0, 1], get_device_dtype(torch.float16)
+        )
         y_dev = to_with_layout(y, y_stl)
         self.assertEqual(y, y_dev.cpu())
 

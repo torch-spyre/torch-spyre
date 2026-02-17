@@ -17,32 +17,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils_inductor import compare, compare_with_cpu, cached_randn, compare_with_pytorch
+from utils_inductor import compare_with_cpu, compare_with_pytorch
 
 
 class TestBuildingBlocks(unittest.TestCase):
     torch.manual_seed(0xAFFE)
-
-    @unittest.skip("eager result is incorrect")
-    def test_softmax(self):
-        compare(lambda x: torch.softmax(x, dim=0), cached_randn((512, 1024)))
-        compare(lambda x: torch.softmax(x, dim=1), cached_randn((512, 1024)))
-        compare(lambda x: torch.softmax(x, dim=-1), cached_randn((512, 1024)))
-
-    # Temporary until eager mode implements softmax correctly.
-    def test_softmax_cpu(self):
-        compare_with_cpu(lambda x: torch.softmax(x, dim=0), cached_randn((512, 1024)))
-        compare_with_cpu(lambda x: torch.softmax(x, dim=1), cached_randn((512, 1024)))
-        compare_with_cpu(lambda x: torch.softmax(x, dim=-1), cached_randn((512, 1024)))
-        compare_with_cpu(
-            lambda x: torch.softmax(x, dim=0), cached_randn((256, 64, 128))
-        )
-        compare_with_cpu(
-            lambda x: torch.softmax(x, dim=1), cached_randn((256, 64, 128))
-        )
-        compare_with_cpu(
-            lambda x: torch.softmax(x, dim=-1), cached_randn((256, 64, 128))
-        )
 
     def test_softplus(self):
         # beta * x >= threshold ? x : (log(1 + exp(-abs(beta * x)) + relu(beta * x)

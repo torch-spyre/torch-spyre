@@ -54,4 +54,4 @@ high-level description of a single operation to be performed on the device.
 
 ## Additional Topics
 
-+[AddingOperations.md](./AddingOperations.md) describes the steps to add a new supported operation to the front-end compiler.
++[adding_operations.md](./adding_operations.md) describes the steps to add a new supported operation to the front-end compiler.

@@ -119,6 +119,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((256,),) * 2,
                     ((67, 256),) * 2,
                     ((67, 71, 256),) * 2,
+                    ((7, 12, 32, 64),) * 2,
                 ]
             ),
         },
@@ -139,7 +140,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_mm", "test_binary_op"): {
             "ops_dict": {
                 "mm": torch.mm,
-                "matmul": torch.matmul,
                 # "einsum": lambda a, b: torch.einsum('mk, kn -> mn', a, b),  # bmm not supported yet
             },
             "param_sets": make_param_dict(
@@ -152,12 +152,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         ("test_bmm", "test_binary_op"): {
-            "ops_dict": {
-                "bmm": torch.bmm,
-            },
+            "ops_dict": {"bmm": torch.bmm},
             "param_sets": make_param_dict(
                 [
                     ((3, 17, 256), (3, 256, 128)),
+                ]
+            ),
+        },
+        ("test_matmul", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "matmul": torch.matmul,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((512, 256), (256, 128)),
+                    ((3, 17, 256), (3, 256, 128)),
+                    ((3, 17, 128, 256), (3, 17, 256, 128)),
                 ]
             ),
         },
@@ -179,8 +189,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_0": (0, cached_randn((3, 7, 9))),
                 "3d_1": (1, cached_randn((3, 7, 9))),
                 "3d_2": (2, cached_randn((3, 7, 9))),
+                "3d_01": ((0, 1), cached_randn((3, 7, 9))),
+                "3d_12": ((1, 2), cached_randn((3, 7, 9))),
                 # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
                 # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+                "4d_0": (0, cached_randn((3, 7, 9, 32))),
+                "4d_1": (1, cached_randn((3, 7, 9, 32))),
+                "4d_2": (2, cached_randn((3, 7, 9, 32))),
+                "4d_3": (3, cached_randn((3, 7, 9, 32))),
             },
         },
         ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -194,8 +210,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
             "param_sets": {
-                "dim_0": (0, cached_randn((128, 256))),
-                "dim_1": (1, cached_randn((128, 256))),
+                "2d_dim_0": (0, cached_randn((128, 256))),
+                "2d_dim_1": (1, cached_randn((128, 256))),
+                "4d_dim_0": (0, cached_randn((12, 8, 25, 64))),
+                "4d_dim_1": (1, cached_randn((12, 8, 25, 64))),
+                "4d_dim_2": (2, cached_randn((12, 8, 25, 64))),
+                "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
             },
         },
         (
@@ -241,6 +261,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
                 "3d_dim_1": (1, cached_randn((67, 71, 256))),
                 "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
+                "4d_dim_0": (0, cached_randn((6, 17, 7, 64))),
+                "4d_dim_1": (1, cached_randn((6, 17, 7, 64))),
+                "4d_dim_2": (2, cached_randn((6, 17, 7, 64))),
+                "4d_dim_3": (3, cached_randn((6, 17, 7, 64))),  # sparse tensor output
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -253,6 +277,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim_0": (0, cached_randn((67, 71, 256))),
                 "3d_dim_1": (1, cached_randn((67, 71, 256))),
                 "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
+                "4d_dim_0": (0, cached_randn((6, 7, 12, 256))),
+                "4d_dim_1": (1, cached_randn((6, 7, 12, 256))),
+                "4d_dim_2": (2, cached_randn((6, 7, 12, 256))),
+                "4d_dim_3": (3, cached_randn((6, 7, 12, 256))),
             },
         },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -292,6 +320,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
                 # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
                 # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
+                "4d_dim_0": (0, cached_randn((6, 7, 12, 256), scale=0.1)),
+                "4d_dim_1": (1, cached_randn((6, 7, 12, 256), scale=0.1)),
+                "4d_dim_2": (2, cached_randn((6, 7, 12, 256), scale=0.1)),
+                "4d_dim_3": (3, cached_randn((6, 7, 12, 256), scale=0.1)),
             },
         },
         ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
@@ -328,17 +360,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     cached_randn((256, 3, 17, 64), abs=True),
                 ),
-                # skipping these - not working yet
-                # "dim_1_3": (
-                #     1,
-                #     3,
-                #     cached_randn((3, 256, 17, 64), abs=True),
-                # ),
-                # "dim_2_3": (
-                #     2,
-                #     3,
-                #     cached_randn((3, 17, 256, 64), abs=True),
-                # ),
+                "dim_2_3": (
+                    2,
+                    3,
+                    cached_randn((3, 17, 128, 256), abs=True),
+                ),
+                "dim_1_3": (
+                    1,
+                    3,
+                    cached_randn((3, 256, 17, 64), abs=True),
+                ),
             }
         },
         ("test_cmp", "test_binary_op_cpu"): {
@@ -476,37 +507,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
                 "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
+                "fp16_4d": (cached_randn((8, 2, 16, 256), dtype=torch.float16),),
                 "int64_1d": (torch.randint(1000, (128,)),),
                 "int64_2d": (torch.randint(1000, (256, 128)),),
                 "int_3d": (torch.randint(1000, (8, 16, 256)),),
                 "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
                 "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
                 "fp32_3d": (cached_randn((8, 16, 256), dtype=torch.float32),),
-                "bool_1d": (
-                    torch.rand(
-                        (128,),
-                    )
-                    > 0.5,
-                ),
-                "bool_2d": (
-                    torch.rand(
-                        (
-                            256,
-                            128,
-                        ),
-                    )
-                    > 0.5,
-                ),
-                "bool_3d": (
-                    torch.rand(
-                        (
-                            8,
-                            16,
-                            256,
-                        ),
-                    )
-                    > 0.5,
-                ),
+                "bool_1d": (torch.rand((128,)) > 0.5,),
+                "bool_2d": (torch.rand((256, 128)) > 0.5,),
+                "bool_3d": (torch.rand((8, 16, 256)) > 0.5,),
             },
         },
         (
@@ -545,14 +555,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_numel_cpu",
         ): {
             "param_sets": {
-                "size_1": {
-                    cached_randn(
-                        (
-                            64,
-                            128,
-                        )
-                    ),
-                },
+                "size_1": (cached_randn((64, 128)),),
             },
         },
         (
@@ -560,22 +563,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_full_cpu",
         ): {
             "param_sets": {
-                "value_1": (
-                    ([64, 128]),
-                    -65472.0,
-                ),
-                "value_2": (
-                    ([64, 128]),
-                    -65504.0,
-                ),
-                "tuple": (
-                    ((64, 64)),
-                    1024.0,
-                ),
-                "size": (
-                    torch.Size([64, 128]),
-                    1024.0,
-                ),
+                "value_1": (([64, 128]), -65472.0),
+                "value_2": (([64, 128]), -65504.0),
+                "tuple": (((64, 64)), 1024.0),
+                "size": (torch.Size([64, 128]), 1024.0),
             },
         },
         (
@@ -598,6 +589,228 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         "training": False,
                         "inplace": False,
                     },
+                ),
+            },
+        },
+        ("test_softmax", "test_dim_op_cpu"): {
+            "ops_dict": {
+                "softmax": lambda dim, x: torch.softmax(x, dim=dim),
+            },
+            "param_sets": {
+                "2d_dim0": (0, cached_randn((512, 1024), dtype=torch.float16)),
+                "2d_dim1": (1, cached_randn((512, 1024), dtype=torch.float16)),
+                "3d_dim0": (0, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim1": (1, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim2": (2, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "4d_dim0": (0, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim1": (1, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim2": (2, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim3": (3, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+            },
+        },
+        (
+            "test_size_one",
+            "test_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "exp": torch.exp,
+            },
+            "param_sets": {
+                "1d0": {cached_randn((1,), dtype=torch.float16)},
+                "2d0": {cached_randn((1, 3), dtype=torch.float16)},
+                "2d1": {cached_randn((2, 1), dtype=torch.float16)},
+                "3d0": {cached_randn((1, 3, 4), dtype=torch.float16)},
+                "3d1": {cached_randn((2, 1, 4), dtype=torch.float16)},
+                "3d2": {cached_randn((2, 3, 1), dtype=torch.float16)},
+                "3d01": {cached_randn((1, 1, 4), dtype=torch.float16)},
+                "3d02": {cached_randn((2, 3, 1), dtype=torch.float16)},
+                "3d12": {cached_randn((1, 1, 4), dtype=torch.float16)},
+                "4d0": {cached_randn((1, 3, 4, 5), dtype=torch.float16)},
+                "4d1": {cached_randn((2, 1, 4, 5), dtype=torch.float16)},
+                "4d2": {cached_randn((2, 3, 1, 5), dtype=torch.float16)},
+                "4d3": {cached_randn((2, 3, 4, 1), dtype=torch.float16)},
+                "4d01": {cached_randn((1, 1, 4, 5), dtype=torch.float16)},
+                "4d02": {cached_randn((1, 3, 1, 5), dtype=torch.float16)},
+                "4d03": {cached_randn((1, 3, 4, 1), dtype=torch.float16)},
+                "4d12": {cached_randn((2, 1, 1, 1), dtype=torch.float16)},
+                "4d13": {cached_randn((2, 1, 4, 1), dtype=torch.float16)},
+                "4d23": {cached_randn((2, 3, 1, 1), dtype=torch.float16)},
+                "4d012": {cached_randn((1, 1, 1, 5), dtype=torch.float16)},
+                "4d013": {cached_randn((1, 1, 4, 1), dtype=torch.float16)},
+                "4d023": {cached_randn((1, 3, 1, 1), dtype=torch.float16)},
+                "4d123": {cached_randn((2, 1, 1, 1), dtype=torch.float16)},
+            },
+        },
+        (
+            "test_inplace_op",
+            "test_inplace_op_cpu",
+        ): {
+            "ops_dict": {
+                "add": torch.Tensor.add_,
+                "mul": torch.Tensor.mul_,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.zeros(128, dtype=torch.float16),
+                    cached_randn((128,)),
+                ),
+                "2d": (
+                    torch.zeros(4, 128, dtype=torch.float16),
+                    cached_randn((4, 128)),
+                ),
+                "3d": (
+                    torch.zeros(3, 4, 128, dtype=torch.float16),
+                    cached_randn((3, 4, 128)),
+                ),
+            },
+        },
+        (
+            "test_inplace_copy",
+            "test_inplace_op_cpu",
+        ): {
+            "ops_dict": {
+                "copy": torch.Tensor.copy_,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.zeros(128, dtype=torch.float16),
+                    cached_randn((128,)),
+                ),
+                "2d": (
+                    torch.zeros(4, 128, dtype=torch.float16),
+                    cached_randn((4, 128)),
+                ),
+                "3d": (
+                    torch.zeros(3, 4, 128, dtype=torch.float16),
+                    cached_randn((3, 4, 128)),
+                ),
+                "bool": (
+                    torch.zeros(128, dtype=torch.bool),  # bool tensor
+                    (cached_randn((128,)) > 0),  # bool tensor
+                ),
+                # TODO: Copying bool tensors to host is not working yet. See issue #488.
+                # "float2bool": (
+                #     torch.zeros(128, dtype=torch.bool),  # bool tensor
+                #     (cached_randn((128,)) > 0).to(dtype=torch.float16),  # float tensor
+                # ),
+                "bool2float": (
+                    torch.zeros(128, dtype=torch.float16),  # float tensor
+                    cached_randn((128,)) > 0,  # bool tensor
+                ),
+            },
+        },
+        (
+            "test_squeeze",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "single": lambda dim, x: torch.squeeze(x, dim),
+                "combined": lambda dim, x: torch.exp(torch.squeeze(x, dim)),
+            },
+            "param_sets": {
+                "2d0": (0, cached_randn((1, 128))),
+                "2d1": (1, cached_randn((4, 1))),
+                "3d0": (0, cached_randn((1, 4, 128))),
+                "3d1": (1, cached_randn((3, 1, 128))),
+                "3d2": (2, cached_randn((3, 4, 1))),
+                "4d0": (0, cached_randn((1, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 1, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 1, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 1))),
+            },
+        },
+        (
+            "test_squeeze_reduction",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "sum": lambda dim, x: torch.squeeze(
+                    torch.sum(x, dim, keepdim=True), dim
+                ),
+            },
+            "param_sets": {
+                "2d0": (0, cached_randn((4, 128))),
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "4d0": (0, cached_randn((2, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 3, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 4, 128))),
+                # TODO: Support sparse tensors
+                # "3d2": (2, cached_randn((3, 4, 128))),
+                # "2d1": (1, cached_randn((4, 128))),
+                # "4d3": (3, cached_randn((2, 3, 4, 128))),
+            },
+        },
+        (
+            "test_unsqueeze",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "single": lambda dim, x: torch.unsqueeze(x, dim),
+                "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((128,))),
+                "1d1": (1, cached_randn((128,))),
+                "2d0": (0, cached_randn((4, 128))),
+                "2d1": (1, cached_randn((4, 128))),
+                "2d2": (2, cached_randn((4, 128))),
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "3d2": (2, cached_randn((3, 4, 128))),
+                "3d3": (3, cached_randn((3, 4, 128))),
+                "4d0": (0, cached_randn((2, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 3, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 4, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 128))),
+                "4d4": (4, cached_randn((2, 3, 4, 128))),
+            },
+        },
+        (
+            "test_unsqueeze_broadcast",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                "add": lambda dim, x, y: torch.add(x, torch.unsqueeze(y, dim)),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((4, 128)), cached_randn((128,))),
+                "2d0": (0, cached_randn((3, 4, 128)), cached_randn((4, 128))),
+                "2d1": (1, cached_randn((3, 4, 128)), cached_randn((3, 128))),
+                "3d0": (0, cached_randn((2, 3, 4, 128)), cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((2, 3, 4, 128)), cached_randn((2, 4, 128))),
+                "3d2": (2, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 128))),
+                # TODO: Support dim=-1 for broadcasting. See: #598
+                # "1d1": (1, cached_randn((4, 128)), cached_randn((4,))),
+                # "2d2": (2, cached_randn((3, 4, 128)), cached_randn((3, 4))),
+                # "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
+            },
+        },
+        ("test_attention", "test_attention_cpu"): {
+            "param_sets": {
+                "3d": (
+                    cached_randn((4, 256, 128), dtype=torch.float16),  # q
+                    cached_randn((4, 256, 128), dtype=torch.float16),  # k
+                    cached_randn((4, 256, 128), dtype=torch.float16),  # v
+                    torch.tensor(1 / (128**0.5), dtype=torch.float16).repeat(
+                        4, 256, 256
+                    ),  # sm_scale
+                ),
+                "3d_batch_size_1": (
+                    cached_randn((1, 4, 256, 128), dtype=torch.float16),  # q
+                    cached_randn((1, 4, 256, 128), dtype=torch.float16),  # k
+                    cached_randn((1, 4, 256, 128), dtype=torch.float16),  # v
+                    torch.tensor(1 / (128**0.5), dtype=torch.float16).repeat(
+                        4, 256, 256
+                    ),  # sm_scale
+                ),
+                "4d": (
+                    cached_randn((8, 4, 128, 64), dtype=torch.float16),  # q
+                    cached_randn((8, 4, 128, 64), dtype=torch.float16),  # k
+                    cached_randn((8, 4, 128, 64), dtype=torch.float16),  # v
+                    torch.tensor(1 / (128**0.5), dtype=torch.float16).repeat(
+                        8, 4, 128, 128
+                    ),  # sm_scale
                 ),
             },
         },
@@ -720,6 +933,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_dropout_functional(self, input, kwargs):
         compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
 
+    def test_inplace_op_cpu(self, op, dst, src):
+        def fn(dst, src):
+            dst = dst.clone()
+            result = op(dst, src)
+            assert id(result) == id(dst)
+            return result
+
+        compare_with_cpu(fn, dst, src)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
         def fn(t):
@@ -749,6 +971,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.full(*args, dtype=torch.float16, device=device)
 
         compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+
+    def test_dim_op_cpu(self, op, dim, *args):
+        def fn(*args):
+            return op(dim, *args)
+
+        compare_with_cpu(fn, *args)
+
+    def test_attention_cpu(self, *args):
+        def fn(q, k, v, sm_scale):
+            qk = q @ k.transpose(-1, -2).contiguous()
+            p = qk.softmax(dim=-1) * sm_scale
+            return p @ v
+
+        compare_with_cpu(fn, *args)
 
 
 if __name__ == "__main__":

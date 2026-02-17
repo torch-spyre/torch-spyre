@@ -18,9 +18,7 @@ from contextlib import contextmanager
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise
-from torch._inductor.virtualized import ops
 import torch._inductor.lowering as lowering
-
 
 from typing import Any, Callable, Union
 
@@ -28,6 +26,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
+from torch._inductor.virtualized import V
 
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
@@ -131,9 +130,12 @@ def lower_mm(x, y):
     def inner_fn(index, reduction_index):
         i0, i1 = index
         (r0,) = reduction_index
-        tmp1 = ops.load(x.get_name(), x.get_size()[1] * i0 + r0)
-        tmp2 = ops.load(y.get_name(), i1 + y.get_size()[1] * r0)
-        return (tmp1, tmp2)
+        return (x_loader([i0, r0]), y_loader([r0, i1]))
+
+    x = V.graph.get_buffer(x.realize())
+    y = V.graph.get_buffer(y.realize())
+    x_loader = x.make_loader()
+    y_loader = y.make_loader()
 
     result = Reduction.create(
         reduction_type=MATMUL_REDUCTION_OP,
@@ -153,41 +155,70 @@ def lower_mm(x, y):
 
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
-    def inner_fn(index, reduction_index):
-        i0, i1, i2 = index
-        (r0,) = reduction_index
-        tmp1 = ops.load(
-            x.get_name(),
-            x.get_size()[2] * x.get_size()[1] * i0 + x.get_size()[1] * i1 + r0,
-        )
-        tmp2 = ops.load(
-            y.get_name(),
-            y.get_size()[2] * y.get_size()[1] * i0 + y.get_size()[1] * r0 + i2,
-        )
-        return (tmp1, tmp2)
+    x = V.graph.get_buffer(x.realize())
+    y = V.graph.get_buffer(y.realize())
+    x_loader = x.make_loader()
+    y_loader = y.make_loader()
+    d3 = len(x.get_size()) == 3
+    if d3:
 
-    result = Reduction.create(
-        reduction_type=BATCH_MATMUL_OP,
-        input_node=[x, y],
-        device=x.get_device(),
-        dst_dtype=x.get_dtype(),
-        src_dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[2]],  # B, M, N
-        reduction_ranges=[x.get_size()[2]],  # K
-    )
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            tmp1 = x_loader([i0, i1, r0])
+            tmp2 = y_loader([i0, r0, i2])
+            return (tmp1, tmp2)
+
+        result = Reduction.create(
+            reduction_type=BATCH_MATMUL_OP,
+            input_node=[x, y],
+            device=x.get_device(),
+            dst_dtype=x.get_dtype(),
+            src_dtype=x.get_dtype(),
+            inner_fn=inner_fn,
+            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[2]],  # B, M, N
+            reduction_ranges=[x.get_size()[2]],  # K
+        )
+    else:  # 4d
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2, i3 = index
+            (r0,) = reduction_index
+            tmp1 = x_loader([i0, i1, i2, r0])
+            tmp2 = y_loader([i0, i1, r0, i3])
+            return (tmp1, tmp2)
+
+        result = Reduction.create(
+            reduction_type=BATCH_MATMUL_OP,
+            input_node=[x, y],
+            device=x.get_device(),
+            dst_dtype=x.get_dtype(),
+            src_dtype=x.get_dtype(),
+            inner_fn=inner_fn,
+            ranges=[
+                x.get_size()[0],
+                x.get_size()[1],
+                x.get_size()[2],
+                y.get_size()[-1],
+            ],
+            reduction_ranges=[x.get_size()[-1]],
+        )
 
     result.realize()
-
     return result
 
 
 @register_spyre_lowering(torch.ops.spyre.swap)
 def lower_swap(x):
+    fn = lowering.ops_wrapper(torch.ops.spyre.swap.__name__)
+
+    def inner_fn(index):
+        return fn(x.make_loader()(index))
+
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
-        inner_fn=x.make_loader(),
+        inner_fn=inner_fn,
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
@@ -198,10 +229,15 @@ def lower_swap(x):
 
 @register_spyre_lowering(torch.ops.spyre.slice)
 def lower_slice(x):
+    fn = lowering.ops_wrapper(torch.ops.spyre.slice.__name__)
+
+    def inner_fn(index):
+        return fn(x.make_loader()(index))
+
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
-        inner_fn=x.make_loader(),
+        inner_fn=inner_fn,
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
