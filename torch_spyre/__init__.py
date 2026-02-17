@@ -41,7 +41,7 @@ class _SpyreImpl:
 
     def __getattr__(self, name):
         if name == "_C":
-            return self.__dict__.get("_C", None)
+            return self.__dict__.get(name, None)
         self._lazy_init()
         return super().__getattribute__(name)
 

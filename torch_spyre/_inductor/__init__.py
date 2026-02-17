@@ -27,6 +27,8 @@ class Unsupported(RuntimeError):
 
 def enable_spyre_compile_fx_wrapper():
     import torch._inductor.compile_fx as cfx
+    import torch.fx as fx
+    import torch
 
     if getattr(cfx, "_spyre_wrapped", False):
         return
@@ -35,9 +37,28 @@ def enable_spyre_compile_fx_wrapper():
             return
         _orig = cfx.compile_fx
 
-        def _uses_spyre(gm, example_inputs, device_name=DEVICE_NAME):
-            import torch
+        # Iterate over producer nodes (supports nested containers of nodes)
+        def iter_nodes(x):
+            if isinstance(x, fx.Node):
+                yield x
+            elif isinstance(x, (tuple, list)):
+                for e in x:
+                    yield from iter_nodes(e)
+            elif isinstance(x, dict):
+                for e in x.values():
+                    yield from iter_nodes(e)
 
+        def iter_tensors(v):
+            if isinstance(v, torch.Tensor):
+                yield v  # FakeTensor is a Tensor subclass, so this works
+            elif isinstance(v, (tuple, list)):
+                for e in v:
+                    yield from iter_tensors(e)
+            elif isinstance(v, dict):
+                for e in v.values():
+                    yield from iter_tensors(e)
+
+        def _uses_spyre(gm, example_inputs, device_name=DEVICE_NAME) -> bool:
             # Inputs
             if any(
                 isinstance(x, torch.Tensor)
@@ -45,6 +66,19 @@ def enable_spyre_compile_fx_wrapper():
                 for x in (example_inputs or ())
             ):
                 return True
+            # Output
+            out_node = gm.graph.output_node()
+            out_puts = out_node.args[0] if out_node.args else []
+            for n in iter_nodes(out_puts):
+                meta = getattr(n, "meta", {}) or {}
+                mv = meta.get("val", None) or meta.get("example_value", None)
+                if mv is None:
+                    continue
+
+                for t in iter_tensors(mv):
+                    if getattr(getattr(t, "device", None), "type", None) == device_name:
+                        return True
+
             # Graph nodes (covers tensorless factories)
             for n in gm.graph.nodes:
                 dev = n.kwargs.get("device")
