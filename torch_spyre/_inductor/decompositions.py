@@ -153,3 +153,13 @@ def lt_decomp(
     out_le = torch.le(input, other).to(dtype=torch.float16)
     out_ne = torch.ne(input, other).to(dtype=torch.float16)
     return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
+
+
+@register_decomposition([torch.ops.aten.pow.Tensor_Tensor])
+def pow_decomp(input: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
+    # Handle broadcasting: if exponent is a scalar tensor (size 1), expand it to match input shape
+    if exponent.numel() == 1 and input.numel() > 1:
+        exponent = exponent.expand_as(input)
+    # Decompose pow(x, y) as exp(y * log(x))
+    # This works for positive x values
+    return torch.exp(torch.mul(exponent, torch.log(input)))

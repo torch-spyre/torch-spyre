@@ -19,7 +19,7 @@ def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length >
     # Convert scalar arguments to tensors on Spyre device
     {% for scalar_name in scalar_arg_names %}
     {{ scalar_name }}_scaTensor = None
-    {{ scalar_name }}_scaTensor = torch.tensor([{{ scalar_name }}], device="spyre")
+    {{ scalar_name }}_scaTensor = torch.tensor([{{ scalar_name }}], dtype=self.dtype, device="spyre")
     {% endfor %}
     {% endif %}
     {% if "out" in overload_name %}

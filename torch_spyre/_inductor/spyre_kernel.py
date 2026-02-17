@@ -161,6 +161,10 @@ class SpyreOpFuncs:
         return PointwiseOp("neg", [a])
 
     @staticmethod
+    def pow(a, b):
+        return PointwiseOp("pow", [a, b])
+
+    @staticmethod
     def reciprocal(x):
         return PointwiseOp("reciprocal", [x])
 
