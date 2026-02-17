@@ -15,6 +15,7 @@
 from .constants import DEVICE_NAME
 
 import threading
+from functools import wraps
 
 _autoload_lock = threading.Lock()
 
@@ -38,12 +39,12 @@ def enable_spyre_compile_fx_wrapper():
             import torch
 
             # Inputs
-            for x in example_inputs or ():
-                if (
-                    isinstance(x, torch.Tensor)
-                    and getattr(x.device, "type", None) == device_name
-                ):
-                    return True
+            if any(
+                isinstance(x, torch.Tensor)
+                and getattr(x.device, "type", None) == device_name
+                for x in (example_inputs or ())
+            ):
+                return True
             # Graph nodes (covers tensorless factories)
             for n in gm.graph.nodes:
                 dev = n.kwargs.get("device")
@@ -55,9 +56,12 @@ def enable_spyre_compile_fx_wrapper():
                     return True
             return False
 
+        @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
             if _uses_spyre(gm, example_inputs):
-                _autoload()
+                import torch
+
+                torch.spyre._impl._lazy_init()
             return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _wrapper
