@@ -177,7 +177,10 @@ class DimInfos:
 
     def get_tensor_stick_dim_labels(self, tensor):
         dl = tensor["device_layout"]
-        idx = tensor["scale"].index(dl.host_stick_dim())
+        if dl.host_stick_dim() not in tensor["scale"]:
+            idx = tensor["scale"][dl.host_stick_dim()]
+        else:
+            idx = tensor["scale"].index(dl.host_stick_dim())
         return [self.rows["label"][idx]]
 
 

@@ -398,7 +398,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                         value.op == "layernormnorm"
                         and (len(args) == 1 or len(args) == 2)
                     ):
-                        scale[-1] = -1
+                        scale[input.layout.device_layout.host_stick_dim()] = -1
 
                     args.append(
                         create_tensor_arg(
