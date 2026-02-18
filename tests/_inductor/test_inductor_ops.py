@@ -1005,6 +1005,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, input, weight, bias)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_implicit_loading(self):
+        def test(end, device=None):
+            return torch.arange(end, device=device, dtype=torch.float16)
+
+        compiled = torch.compile(test, backend="inductor")
+        output = compiled(64.0, device="spyre")
+
+        _ = output.cpu()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -133,7 +133,7 @@ def make_spyre_module() -> types.ModuleType:
 
     # Optional: forward unknown attrs to the impl or _C for convenience
     def __getattr__(name):
-        if name in ["__file__", "_lazy_init", "_C"]:
+        if name in ["__file__", "_C"]:
             # Important: raising AttributeError ensures hasattr() returns False
             # without triggering our lazy loader.
             raise AttributeError(name)
