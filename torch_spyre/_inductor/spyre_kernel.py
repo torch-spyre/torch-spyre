@@ -432,6 +432,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(in_di, value),
                 self.analyze_tensor_access(out_di, dst),
             ]
+            generic_relayout = False
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
                 # Determine data op based on tensor arg and scales
                 if (
@@ -444,6 +445,23 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 elif Counter(in_di) == Counter(out_di) and in_di != out_di:
                     # Transpose: check that the input / output DimensionInfo are the same, but in different order.
                     op = TRANSPOSE_OP
+                elif (
+                    Counter(args[0].host_size) == Counter(args[1].host_size)
+                    and args[0].host_size == args[1].host_size
+                    and args[0].device_layout.device_size
+                    != args[1].device_layout.device_size
+                ):
+                    # This is the generic relayout case in Spyre, where the host sizes match
+                    # but the device sizes are different
+
+                    # When implementing torch.nn.Linear + relayout_linear_weights pass, we hit this case
+
+                    # When this happens, for now we do the op as a Transpose as we know that's the only
+                    # option we support
+
+                    # TODO(aviros): Make this a fully fledged STCDP op
+                    op = TRANSPOSE_OP
+                    generic_relayout = True
                 elif (
                     args[1].device_layout.device_size
                     == args[0].device_layout.device_size
@@ -462,6 +480,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
+
+            # TODO(aviros): Remove this piece of code when real relayout is implemented
+            if generic_relayout:
+                ks.dimensions.reverse()
+                ks.op_info["transposed_dims"] = [0, 1]
 
             self.kernel_specs.append(ks)
         else:

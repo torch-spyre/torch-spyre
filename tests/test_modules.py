@@ -40,16 +40,16 @@ class TestOps(TestCase):
         self.atol = 1e-3
         self.dtype = torch.float16
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_linear(self):
-        m = nn.Linear(3, 5, dtype=self.dtype)
-        m_spyre = copy.deepcopy(m)
-        m_spyre.to("spyre")
-
-        x = torch.arange(6, dtype=self.dtype).view(2, 3)
-        x_spyre = x.to("spyre")
-
         with torch.no_grad():
+            m = nn.Linear(64, 128, bias=False, dtype=self.dtype)
+            m.weight.normal_(0, 0.01)
+            m_spyre = copy.deepcopy(m)
+            m_spyre.to("spyre")
+
+            x = torch.randn((2, 64), dtype=self.dtype)
+            x_spyre = x.to("spyre")
+
             y = m_spyre(x_spyre).to("cpu")
 
         torch.testing.assert_close(y, m(x), rtol=self.rtol, atol=self.atol)
