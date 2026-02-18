@@ -35,9 +35,14 @@ class DimInfo:
         setattr(self, name, value)
 
 
-def get_scales_sdsc_format(tensor):
+def get_scales_sdsc_format(tensor, op):
     # SDSC needs non-negative scale values to be 1
-    return [1 if s >= 0 else s for s in tensor["scale"]]
+    if op == "layernormscale" and tensor["name"] == "arg0":
+        return [1] * (len(tensor["scale"]) - 1) + [-1]
+    elif op == "layernormnorm" and tensor["name"] == "arg1":
+        return [1] * (len(tensor["scale"]) - 1) + [-1]
+    else:
+        return [1 if s >= 0 else s for s in tensor["scale"]]
 
 
 @dataclass
@@ -150,12 +155,12 @@ class DimInfos:
     # Get infos for the operation dimensions, with order influenced
     # by tensor layout. Rank of returned list == op dimensions
     # See get_tensor_op_index_order
-    def get_tensor_op_layout_order(self, tensor):
-        return [di.label for di in self.get_tensor_op_infos(tensor)]
+    def get_tensor_op_layout_order(self, tensor, op):
+        return [di.label for di in self.get_tensor_op_infos(tensor, op)]
 
-    def get_tensor_op_infos(self, tensor):
+    def get_tensor_op_infos(self, tensor, op):
         result = self.make_dim_infos(
-            additional_rows={"scale": get_scales_sdsc_format(tensor)},
+            additional_rows={"scale": get_scales_sdsc_format(tensor, op)},
             index_order=self.get_tensor_op_index_order(tensor),
         )
         return result
@@ -171,16 +176,13 @@ class DimInfos:
         dev_dim_order = dl.dim_map[::-1][1:]
         return [self.rows["label"][scale.index(dmv)] for dmv in dev_dim_order]
 
-    def get_tensor_infos(self, tensor):
-        tensor_op_infos = self.get_tensor_op_infos(tensor)
+    def get_tensor_infos(self, tensor, op):
+        tensor_op_infos = self.get_tensor_op_infos(tensor, op)
         return [di for di in tensor_op_infos if di.scale >= 0]
 
     def get_tensor_stick_dim_labels(self, tensor):
         dl = tensor["device_layout"]
-        if dl.host_stick_dim() not in tensor["scale"]:
-            idx = tensor["scale"][dl.host_stick_dim()]
-        else:
-            idx = tensor["scale"].index(dl.host_stick_dim())
+        idx = tensor["scale"].index(dl.host_stick_dim())
         return [self.rows["label"][idx]]
 
 
@@ -444,7 +446,7 @@ def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     return coordinateMasking, maskingConstId
 
 
-def create_tensor_specific_layouts(tensors, dim_infos, is_matmul=False):
+def create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=False):
     layouts = {}
     # Compute tensor-specific dimension info
     for i, tensor in enumerate(tensors):
@@ -457,7 +459,7 @@ def create_tensor_specific_layouts(tensors, dim_infos, is_matmul=False):
         layout_order = (
             dim_infos.get_tensor_layout_order(tensor)
             if is_matmul
-            else dim_infos.get_tensor_op_layout_order(tensor)
+            else dim_infos.get_tensor_op_layout_order(tensor, op)
         )
         for label, layout_infos in layouts.items():
             if layout_order == layout_infos["layout_order"]:
@@ -535,7 +537,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     )
 
     coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
-    layouts = create_tensor_specific_layouts(tensors, dim_infos)
+    layouts = create_tensor_specific_layouts(tensors, dim_infos, op)
 
     # Compute the stick label from the op tensor.
     # For now we expect stick dim to always be "out", so check.
@@ -617,10 +619,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 if tensor["lx_addr"] is None
                                 else "lx",
                                 "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
-                                    tensor
+                                    tensor, op
                                 ),
                                 "maxDimSizes_": [-1]
-                                * len(dim_infos.get_tensor_op_layout_order(tensor)),
+                                * len(dim_infos.get_tensor_op_layout_order(tensor, op)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -667,7 +669,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 and di.scale == -1
                                             ),
                                         )
-                                        for di in dim_infos.get_tensor_op_infos(tensor)
+                                        for di in dim_infos.get_tensor_op_infos(
+                                            tensor, op
+                                        )
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -690,7 +694,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         )
                                         else -2
                                     )
-                                    for di in dim_infos.get_tensor_op_infos(tensor)
+                                    for di in dim_infos.get_tensor_op_infos(tensor, op)
                                 ],
                                 "wordLength": num_bytes(
                                     tensor["device_layout"].device_dtype
@@ -796,7 +800,7 @@ def _generate_matmul_common(
     )
     dim_info_dict = {di.label: di for di in dim_infos.get_op_infos()}
 
-    layouts = create_tensor_specific_layouts(tensors, dim_infos, is_matmul=True)
+    layouts = create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=True)
 
     return {
         op: {
@@ -915,7 +919,7 @@ def _generate_matmul_common(
                                                 )
                                             ),
                                         )
-                                        for di in dim_infos.get_tensor_infos(tensor)
+                                        for di in dim_infos.get_tensor_infos(tensor, op)
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -929,7 +933,7 @@ def _generate_matmul_common(
                                 "dsType_": tensor["ds_type"],
                                 "scale_": [
                                     di.scale
-                                    for di in dim_infos.get_tensor_infos(tensor)
+                                    for di in dim_infos.get_tensor_infos(tensor, op)
                                 ],
                                 "wordLength": num_bytes(
                                     tensor["device_layout"].device_dtype
