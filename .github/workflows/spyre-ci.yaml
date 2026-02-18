@@ -1,7 +1,7 @@
-name: spyre-ci-status
+name: spyre-ci
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened]
   issue_comment:
@@ -22,7 +22,7 @@ jobs:
       - name: Set awaiting trigger status
         uses: actions/github-script@v7
         with:
-          script: |
+          script: |-
             try {
               await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner,
