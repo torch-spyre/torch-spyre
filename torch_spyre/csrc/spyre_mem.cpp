@@ -622,7 +622,7 @@ at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             std::optional<int64_t> storage_offset_) {
   // TODO(aviros): This as is will lead to many errors for views, fail for now
   TORCH_CHECK_NOT_IMPLEMENTED(
-      self.is_privateuseone(),
+      !self.is_privateuseone(),
       "as_strided not implemented for Spyre tensors, implement the caller "
       "using as_strided_with_layout with the proper semantics");
   return at::cpu::as_strided(self, size, stride, storage_offset_);

@@ -146,21 +146,18 @@ class TestOps(TestCase):
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Swapping stick dimension is unsupported in new DCI")
     def test_t_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Implement permute/transpose properly on eager")
     def test_transpose_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Implement permute/transpose properly on eager")
     def test_transpose_3d(self):
         x = torch.tensor(
             [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
@@ -170,7 +167,7 @@ class TestOps(TestCase):
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Implement permute/transpose properly on eager")
+    @unittest.skip("TODO: Implement permute properly on eager")
     def test_permute_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
