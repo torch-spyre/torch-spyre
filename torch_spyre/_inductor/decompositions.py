@@ -45,6 +45,7 @@ def rmsnorm_decomp(
     eps: float = 1e-5,
 ) -> torch.Tensor:
     # TODO: limitation with mean on dim=-1, transpose for now to avoid
+    # https://github.com/torch-spyre/torch-spyre/issues/632
     input = input.transpose(-1, 0).contiguous()
     eps = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
     rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=0, keepdim=True)) + eps
