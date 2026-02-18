@@ -180,8 +180,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         elif x_stl.host_stick_dim() != 0 and y_stl.host_stick_dim() != 0:
             out_dim_order = [0, 1]
         else:
-            out_dim_order = [0, 1]
-            # raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
+            raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl

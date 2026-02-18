@@ -342,9 +342,9 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
     impl->spyre_layout = stl;
   } else {
-    DEBUGINFO(
-        "Error: Attempting to set a STL for a device tensor that does not have "
-        "SpyreTensorImpl");
+    TORCH_CHECK(false,
+                "Error: Attempting to set a STL for a device tensor that does "
+                "not have SpyreTensorImpl");
   }
 }
 
