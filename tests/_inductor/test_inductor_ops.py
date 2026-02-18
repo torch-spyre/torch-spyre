@@ -1011,6 +1011,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
         compare_with_cpu(fn, input, weight, bias)
+        
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_rmsnorm_cpu(self, x):
         def fn(input):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
