@@ -106,7 +106,3 @@
   template_name: base
 - operator_name: tril
   template_name: base
-- operator_name: _unsafe_view
-  template_name: view
-- operator_name: view
-  template_name: view

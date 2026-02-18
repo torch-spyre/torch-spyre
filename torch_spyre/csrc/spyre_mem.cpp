@@ -17,6 +17,7 @@
 #include "spyre_mem.h"
 
 #include <ATen/EmptyTensor.h>
+#include <ATen/InferSize.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/Resize.h>
 #include <ATen/ops/as_strided_cpu_dispatch.h>
@@ -684,6 +685,75 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     return at::_copy_from(self, dst, non_blocking);
   }
 }
+
+//
+// templated for ArrayRef<int64_t> and SmallVector<int64_t> use cases
+//
+template <typename Vec>
+static at::Tensor spyre_alias_with_sizes_and_strides(
+    const at::Tensor& self, const Vec& sizes, const Vec& strides,
+    SpyreTensorLayout device_layout) {
+  // caller should make sure that sizes and strides are valid for self
+  //(storage is sufficient, strides are non-negative, strides and sizes array
+  // size is the same)
+  at::Tensor self_;
+  self_ = at::detail::make_tensor<SpyreTensorImpl>(
+      c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
+      self.dtype());
+  auto* self_tmp_ = self_.unsafeGetTensorImpl();
+  self_tmp_->set_storage_offset(self.storage_offset());
+  self_tmp_->set_sizes_and_strides(sizes, strides);
+  static_cast<SpyreTensorImpl*>(self_tmp_)->spyre_layout = device_layout;
+  return self_;
+}
+
+// specialization for symbolic shapes and strides.
+// SymIntArrayRef/ArrayRef<c10::SymInt> and
+// SmallVector<c10::SymInt>/SymDimVector
+template <template <typename...> typename Container>
+static at::Tensor spyre_alias_with_sizes_and_strides(
+    const at::Tensor& self, const Container<c10::SymInt>& sizes,
+    const Container<c10::SymInt>& strides, SpyreTensorLayout device_layout) {
+  // caller should make sure that sizes and strides are valid for self
+  //(storage is sufficient, strides are non-negative, strides and sizes array
+  // size is the same)
+  at::Tensor self_;
+  self_ = at::detail::make_tensor<SpyreTensorImpl>(
+      c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
+      self.dtype());
+  self_.unsafeGetTensorImpl()->set_sizes_and_strides(sizes, strides,
+                                                     self.sym_storage_offset());
+  static_cast<SpyreTensorImpl*>(self_.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+  return self_;
+}
+
+static inline at::Tensor spyre_view_impl(const at::Tensor& self,
+                                         c10::IntArrayRef size) {
+  c10::DimVector inferred_size = at::infer_size_dv(size, self.numel());
+  auto stride =
+      at::detail::computeStride(self.sizes(), self.strides(), inferred_size);
+  TORCH_CHECK(
+      stride.has_value(),
+      "view size is "
+      "not compatible with input tensor's size and stride (at least one "
+      "dimension"
+      " spans across two contiguous subspaces). Use .reshape(...) instead.");
+  // Compute the new SpyreTensorLayout based on changes to size and stride
+  SpyreTensorLayout old_stl =
+      static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+  return spyre_alias_with_sizes_and_strides(self, inferred_size, *stride,
+                                            old_stl);
+}
+
+at::Tensor spyre_view(const at::Tensor& self, c10::IntArrayRef size) {
+  return spyre_view_impl(self, size);
+}
+
+at::Tensor spyre__unsafe_view(const at::Tensor& self, c10::IntArrayRef size) {
+  return spyre_view_impl(self, size);
+}
+
 at::Tensor to_with_layout(const at::Tensor& self,
                           SpyreTensorLayout device_layout) {
   DEBUGINFO(
@@ -754,6 +824,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("as_strided", TORCH_FN(spyre_as_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
+  m.impl("view", TORCH_FN(spyre_view));
+  m.impl("_unsafe_view", TORCH_FN(spyre__unsafe_view));
 }
 
 }  // namespace spyre
