@@ -155,6 +155,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"bmm": torch.bmm},
             "param_sets": make_param_dict(
                 [
+                    ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                 ]
             ),
@@ -166,6 +167,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((512, 256), (256, 128)),
+                    ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((3, 17, 128, 256), (3, 17, 256, 128)),
                 ]

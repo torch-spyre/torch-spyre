@@ -186,6 +186,8 @@ class DimInfos:
 def get_device_size(host_dim, tensor):
     dl = tensor["device_layout"]
     device_dim = tensor["scale"][host_dim]
+    if device_dim == -3:  # special case to skip elided dim
+        return 1
     assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
     size = dl.device_size[dl.dim_map.index(device_dim)]
     if device_dim == dl.host_stick_dim():
@@ -985,11 +987,14 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 
         if "core_division" in kwargs["op_info"]:
             core_div = kwargs["op_info"]["core_division"][-1]  # output core division
-            dim_splits = [
-                core_div[1],  # mb_split
-                1,  # in_split
-                core_div[0],  # out_split
-            ]
+            for dev_dim_idx, nsplit in enumerate(
+                core_div[:-1]
+            ):  # exclude the last device dim
+                if nsplit > 1:
+                    # dev_dim_idx -> host_dim_idx
+                    host_dim_idx = outputs[0]["device_layout"].dim_map[dev_dim_idx]
+                    # host_dim_idx -> op_dim_idx for nsplit assignment
+                    dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
@@ -1016,51 +1021,29 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     This is a thin wrapper around _generate_matmul_common that provides
     bmm-specific configuration (4D dimensions with batch, specific layouts).
     """
-    d3 = len(inputs[0]["device_layout"].device_size) == 4
-    if d3:
+    if len(dimensions) == 4:  # 3d bmm
         dim_labels = ["x", "mb", "in", "out"]
-        dim_indices = [0, 1, 2, 3]
-
-        # work division logic
-        cores = 1
-        dim_splits = [1, 1, 1, 1]
-        if "op_info" in kwargs:
-            if "n_cores_used" in kwargs["op_info"]:
-                cores = kwargs["op_info"]["n_cores_used"]
-
-            if "core_division" in kwargs["op_info"]:
-                core_div = kwargs["op_info"]["core_division"][
-                    -1
-                ]  # output core division
-                dim_splits = [
-                    core_div[2],  # x split (from device layout index 2)
-                    core_div[0],  # mb split (from device layout index 0)
-                    1,  # in dimension (not split)
-                    core_div[1],  # out split (from device layout index 1)
-                ]
-
-    else:
+    else:  # 4d bmm
         dim_labels = ["x", "y", "mb", "in", "out"]
-        dim_indices = [0, 1, 2, 3, 4]
 
-        # work division logic
-        cores = 1
-        dim_splits = [1, 1, 1, 1, 1]
-        if "op_info" in kwargs:
-            if "n_cores_used" in kwargs["op_info"]:
-                cores = kwargs["op_info"]["n_cores_used"]
+    dim_indices = list(range(len(dim_labels)))
 
-            if "core_division" in kwargs["op_info"]:
-                core_div = kwargs["op_info"]["core_division"][
-                    -1
-                ]  # output core division
-                dim_splits = [
-                    core_div[0],  # x split (from device layout index 0)
-                    core_div[1],  # y split (from device layout index 1)
-                    core_div[2],  # mb split (from device layout index 2)
-                    1,  # in dimension (not split)
-                    core_div[3],  # out split (from device layout index -1)
-                ]
+    cores = 1
+    dim_splits = [1] * len(dim_labels)
+    if "op_info" in kwargs:
+        if "n_cores_used" in kwargs["op_info"]:
+            cores = kwargs["op_info"]["n_cores_used"]
+
+        if "core_division" in kwargs["op_info"]:
+            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
+            for dev_dim_idx, nsplit in enumerate(
+                core_div[:-1]
+            ):  # exclude the last device dim
+                if nsplit > 1:
+                    # dev_dim_idx -> host_dim_idx
+                    host_dim_idx = outputs[0]["device_layout"].dim_map[dev_dim_idx]
+                    # host_dim_idx -> op_dim_idx for nsplit assignment
+                    dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
