@@ -205,8 +205,8 @@ def lower_mm(x, y):
         (r0,) = reduction_index
         return (x_loader([i0, r0]), y_loader([r0, i1]))
 
-    # x = V.graph.get_buffer(x.realize())
-    # y = V.graph.get_buffer(y.realize())
+    x = V.graph.get_buffer(x.realize())
+    y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
