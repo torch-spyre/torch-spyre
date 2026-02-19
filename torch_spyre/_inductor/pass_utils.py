@@ -14,8 +14,12 @@
 
 from typing import NamedTuple
 
+from sympy import Expr, Symbol
+
+from torch._inductor.ir import FixedLayout
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
 from .ir import FixedTiledLayout
@@ -36,3 +40,20 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
                 raise RuntimeError(f"{buf} does not have FixedTiledLayout")
             res.append(SchedNodeArg(arg, layout))
     return res
+
+
+def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
+    """
+    Construct a mapping from the dimensions of layout
+    to the free variables of index that correspond to them.
+
+    This works by reversing the algorithm used by torch._inductor.ir. _fixed_indexer to build index.
+    """
+    result = {}
+    for sym in index.free_symbols:
+        stride_val = sympy_subs(index, {sym: 1}) - sympy_subs(index, {sym: 0})
+        if stride_val in layout.stride:
+            idx = layout.stride.index(stride_val)
+            result[idx] = sym
+
+    return result

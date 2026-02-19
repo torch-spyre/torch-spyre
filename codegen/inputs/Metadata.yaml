@@ -94,8 +94,6 @@
   torch_prefix: torch.ops.aten
 - operator_name: sqrt
   template_name: base
-- operator_name: squeeze
-  template_name: view
 - operator_name: stack
   template_name: base
 - operator_name: sub
@@ -106,14 +104,5 @@
   template_name: view
 - operator_name: tanh
   template_name: base
-- operator_name: transpose
-  template_name: view
-  out_shape_stride_expr: transpose
 - operator_name: tril
   template_name: base
-- operator_name: _unsafe_view
-  template_name: view
-- operator_name: unsqueeze
-  template_name: view
-- operator_name: view
-  template_name: view

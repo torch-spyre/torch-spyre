@@ -14,90 +14,247 @@
 
 import math
 from dataclasses import dataclass
+
+
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import LAYOUT_LABELS
-from itertools import takewhile
+from torch_spyre._inductor.constants import (
+    LAYOUT_INPUT_LABELS,
+    LAYOUT_OUTPUT_LABELS,
+    INPUT_DIM_LABELS,
+    OUTPUT_DIM_LABELS,
+)
 
 
-@dataclass
 class DimInfo:
-    def __init__(
-        self,
-        label: str,
-        index: int,
-        nsplits: int,
-        unpadded_size: int,
-        elems_per_stick: int,
-        stick_dims: list,
-    ):
-        self.label = label
+    def __init__(self, index: int, fields: dict = {}):
         self.index = index
-        self.unpadded_size = unpadded_size
-        self.nsplits = nsplits
+        for name, value in fields.items():
+            self.add_data(name, value)
 
-        self.is_stick_dim = label in stick_dims
+    def add_data(self, name, value):
+        setattr(self, name, value)
 
-        self.compute_padding(elems_per_stick)
-        self.split_size = self.size // nsplits  # Must come after padding
 
-    def compute_padding(self, elems_per_stick: int):
-        if self.is_stick_dim:
-            self.padding = (-self.unpadded_size) & (
-                elems_per_stick - 1
-            )  # pad to multiple of elems_per_stick
-            self.size = self.unpadded_size + self.padding
-        else:
-            self.padding = 0
-
-        self.size = self.unpadded_size + self.padding
+def get_scales_sdsc_format(tensor, op):
+    # SDSC needs non-negative scale values to be 1
+    if op == "layernormscale" and tensor["name"] == "arg0":
+        return [1] * (len(tensor["scale"]) - 1) + [-1]
+    elif op == "layernormnorm" and tensor["name"] == "arg1":
+        return [1] * (len(tensor["scale"]) - 1) + [-1]
+    else:
+        return [1 if s >= 0 else s for s in tensor["scale"]]
 
 
 @dataclass
 class DimInfos:
+    """
+    Class to provide various views of dimension information during sdsc generation.
+
+    All lists for the rows are provided in and stored in host order.
+    Access functions reorder when queried.
+
+    There are 3 main categories of orderings requested during sdsc generation
+      1. Op dimensions, ordered by op dim_indices (rank == op dimensions)
+      2. Op dimensions, reorderd by a specific tensor.  (rank == op dimensions)
+         This one is non-obvious, because a tensor may have fewer dimensions than the op,
+         but all op dimension are returned.  See detailed comment on get_tensor_op_index_order()
+      3. Tensor dimensions (rank <= operation dimensions)
+    """
+
     def __init__(
         self,
-        dim_labels: list[str],
         dim_indices: list[int],
-        dim_sizes: list[int],
-        dim_splits: list[int],
-        elems_per_stick: int,
-        stick_dims: list,
-        new_indices_order: list[int] = [],
+        labels: list[str],
+        unpadded_sizes: list[int],
+        padded_sizes: list[int],
+        nsplits: list[int],
     ):
-        self.dim_infos_list = []
-        self.dim_infos_dict = {}
+        # Non-consecutive dim_indices can occur because dims of size 1 are deleted on device.
+        # Current code expects dim_indices to be consecutive, so reindex them.
+        # If this creates problems in the future, update Diminfos to support non-consecutive indices
+        reindex_map = {v: k for k, v in enumerate(sorted(dim_indices))}
+        self.dim_indices = [reindex_map[x] for x in dim_indices]
+        self.ndim = len(dim_indices)
+        self.rows: dict[str, list] = {}
+        self.add_row("label", labels)
+        self.add_row("unpadded_size", unpadded_sizes)
+        self.add_row("padded_size", padded_sizes)
+        self.add_row("nsplits", nsplits)
+        self.add_row(
+            "split_size",
+            [size // nsplits for size, nsplits in zip(padded_sizes, nsplits)],
+        )
+        self.add_row(
+            "padding",
+            [
+                padded_size - unpadded_size
+                for padded_size, unpadded_size in zip(padded_sizes, unpadded_sizes)
+            ],
+        )
+        assert all(p >= 0 for p in self.rows["padding"]), (
+            "Negative padding found, check padded and unpadded sizes"
+        )
 
-        self.dim_labels = dim_labels
-        self.dim_indices = dim_indices
-        self.dim_sizes = dim_sizes
-        self.dim_splits = dim_splits
+    # Internal implementation functions.
+    def add_row(self, name, info_list):
+        self.rows[name] = info_list
 
-        if new_indices_order:
-            self.reorder_all_indices(new_indices_order)
+    def make_dim_infos(self, fields=[], index_order=None, additional_rows={}):
+        rows = self.rows | additional_rows
+        if not index_order:
+            index_order = self.dim_indices
+        if not fields:
+            fields = rows.keys()
+        return [self.make_dim_info(i, rows, fields) for i in index_order]
 
-        for label, index, size, nsplits in zip(
-            self.dim_labels, self.dim_indices, self.dim_sizes, self.dim_splits
-        ):
-            dim_info = DimInfo(label, index, nsplits, size, elems_per_stick, stick_dims)
-            self.dim_infos_list.append(dim_info)
-            self.dim_infos_dict[label] = dim_info
+    def make_dim_info(self, i, rows, fields):
+        di_dict = {field: rows[field][i] for field in fields}
+        return DimInfo(i, di_dict)
 
-    def as_list(self) -> list:
-        return self.dim_infos_list
+    def ordered_row(self, field_name, index_order=None):
+        if not index_order:
+            index_order = self.dim_indices
+        return [self.rows[field_name][i] for i in index_order]
 
-    def as_dict(self) -> dict[str, DimInfo]:
-        return self.dim_infos_dict
+    # Dimensions of length 1 do not exist on the device layout
+    # Therefore some sdsc sections require all op dimensions, but
+    # with the order of a subset of the indices adjusted to match
+    # the tile layout of the tensor on the device.  This
+    # function computes that reordering
+    def get_tensor_op_index_order(self, tensor):
+        dim_indices = self.dim_indices  # op dimension order
+        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+        missing_dims = list(set(dim_indices) - set(dev_dim_order))
+        if len(missing_dims) > 0 and len(dim_indices) >= 3 and tensor["scale"][0] == -1:
+            if missing_dims[0] == 0:
+                # Add missing dimensions to end of device dimension order
+                # Compute the number of leading missing dims (-1)
+                tensor_dim_indices = dev_dim_order + list(
+                    set(dim_indices) - set(dev_dim_order)
+                )
+            else:  # keepdim=0 case
+                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
+        else:
+            # Indices and order unchanged
+            tensor_dim_indices = dim_indices
+        return tensor_dim_indices
 
-    # Convenience function for construction for per-tensor dim infos.
-    # Todo: this is a bit awkward.  Make this simpler as we refine dims abstraction
-    def reorder_all_indices(self, new_indices_order):
-        self.dim_labels = self.reorder_indices(self.dim_labels, new_indices_order)
-        self.dim_sizes = self.reorder_indices(self.dim_sizes, new_indices_order)
-        self.dim_splits = self.reorder_indices(self.dim_splits, new_indices_order)
-        self.dim_indices = new_indices_order
+    def get_labels_host_order(self):
+        return self.rows["label"]
 
-    def reorder_indices(self, cur_list, new_indices):
-        return [cur_list[self.dim_indices.index(i)] for i in new_indices]
+    # Accessor functions used by SDSC generation
+    def get_op_infos(self) -> list:
+        return self.make_dim_infos()
+
+    def get_op_layout_order(self, index_order=None):
+        return self.ordered_row("label", index_order)
+
+    def get_padded_sizes(self):
+        return self.ordered_row("padded_size")
+
+    # Get infos for the operation dimensions, with order influenced
+    # by tensor layout. Rank of returned list == op dimensions
+    # See get_tensor_op_index_order
+    def get_tensor_op_layout_order(self, tensor, op):
+        return [di.label for di in self.get_tensor_op_infos(tensor, op)]
+
+    def get_tensor_op_infos(self, tensor, op):
+        result = self.make_dim_infos(
+            additional_rows={"scale": get_scales_sdsc_format(tensor, op)},
+            index_order=self.get_tensor_op_index_order(tensor),
+        )
+        return result
+
+    # Get labels corresponding to tensor layout
+    # Rank of returned list == num tensor dimensions
+    def get_tensor_layout_order(self, tensor):
+        # TODO: Understsand why matmul needed this layout order to be different
+        # than the order obtained by get_tensor_infos().  Is it possible
+        # get_tensor_infos() should be using this same order as well?
+        dl = tensor["device_layout"]
+        scale = tensor["scale"]
+        dev_dim_order = dl.dim_map[::-1][1:]
+        return [self.rows["label"][scale.index(dmv)] for dmv in dev_dim_order]
+
+    def get_tensor_infos(self, tensor, op):
+        tensor_op_infos = self.get_tensor_op_infos(tensor, op)
+        return [di for di in tensor_op_infos if di.scale >= 0]
+
+    def get_tensor_stick_dim_labels(self, tensor):
+        dl = tensor["device_layout"]
+        idx = tensor["scale"].index(dl.host_stick_dim())
+        return [self.rows["label"][idx]]
+
+
+# Extract the device size for a give host dim
+# Assumption is that the passed tensor operate in host dimension space
+def get_device_size(host_dim, tensor):
+    dl = tensor["device_layout"]
+    device_dim = tensor["scale"][host_dim]
+    if device_dim == -3:  # special case to skip elided dim
+        return 1
+    assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
+    size = dl.device_size[dl.dim_map.index(device_dim)]
+    if device_dim == dl.host_stick_dim():
+        size *= dl.elems_per_stick()
+    return size
+
+
+def calculate_core_to_slice_mapping(
+    dim_labels: list[str], dim_splits: list[int]
+) -> dict[str, dict[str, int]]:
+    """
+    Calculate mapping from core ID to slice indices for each dimension.
+
+    Iterates dimensions right-to-left (innermost varies fastest), similar to
+    row-major ordering in multi-dimensional arrays.
+
+    Args:
+        dim_labels: List of dimension labels (e.g., ["mb", "out", "x"])
+        dim_splits: Number of splits per dimension (e.g., [2, 4, 1])
+
+    Returns:
+        Dictionary mapping core ID (as string) to dimension slice indices
+    """
+    total_cores = 1
+    for splits in dim_splits:
+        total_cores *= splits
+
+    core_to_slice = {}
+
+    for core_id in range(total_cores):
+        # Calculate multi-dimensional index from flat core_id
+        # Iterate right-to-left (innermost dimension varies fastest)
+        indices = {}
+        remaining = core_id
+
+        for i in range(len(dim_labels) - 1, -1, -1):
+            indices[dim_labels[i]] = remaining % dim_splits[i]
+            remaining //= dim_splits[i]
+
+        core_to_slice[str(core_id)] = indices
+
+    return core_to_slice
+
+
+def core_idx_to_slice_offset(
+    dim_info_list: list[DimInfo],
+    wk_slice: dict[str, int],
+    device_size: list[int],
+) -> int:
+    # compute tensor specific strides from its device layout
+    strides = {}
+    for i, di in enumerate(dim_info_list):
+        strides[di.label] = math.prod(device_size[-i - 2 :])
+
+    # Calculate offset by accumulating contribution from each dimension
+    offset = 0
+    for di in dim_info_list:
+        label = di.label
+        slice_idx = wk_slice[label]
+        offset += slice_idx * strides[label] // di.nsplits
+
+    return offset
 
 
 def num_bytes(df: DataFormats) -> int:
@@ -153,7 +310,7 @@ def gen_coord_info_value(
     nsplits: int,
     elems_per_stick: int,
     is_stick_dim: bool,
-    is_stick_reduction: bool,
+    is_stick_reduction: bool = False,
 ):
     return (
         {
@@ -280,7 +437,7 @@ def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     coordinateMasking = {}
     maskingConstId = -1
 
-    for di in dim_infos.as_list():
+    for di in dim_infos.get_op_infos():
         if di.padding > 0:
             coordinateMasking[di.label] = [[di.unpadded_size, di.padding]]
     if coordinateMasking:
@@ -289,16 +446,58 @@ def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     return coordinateMasking, maskingConstId
 
 
+def create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=False):
+    layouts = {}
+    # Compute tensor-specific dimension info
+    for i, tensor in enumerate(tensors):
+        # primaryDsInfo_ requires each unique layout order to have a name.
+        # Reuse the same label for tensors with the same layout, for compactness
+        tensor["ds_type"] = None
+
+        # For sfp, the sdsc layout expected is determined by the operation layout
+        # For matmul, the layout order is determined by the tensor's layout
+        layout_order = (
+            dim_infos.get_tensor_layout_order(tensor)
+            if is_matmul
+            else dim_infos.get_tensor_op_layout_order(tensor, op)
+        )
+        for label, layout_infos in layouts.items():
+            if layout_order == layout_infos["layout_order"]:
+                tensor["ds_type"] = label
+                break
+        if tensor["ds_type"] is None:
+            tensor["ds_type"] = (
+                LAYOUT_INPUT_LABELS[len(layouts.keys())]
+                if len(layouts.keys()) < len(LAYOUT_INPUT_LABELS)
+                else LAYOUT_OUTPUT_LABELS[
+                    len(layouts.keys()) - len(LAYOUT_INPUT_LABELS)
+                ]
+            )
+            layouts[LAYOUT_INPUT_LABELS[len(layouts.keys())]] = {
+                "layout_order": layout_order,
+                "stick_dim_order": dim_infos.get_tensor_stick_dim_labels(tensor),
+            }
+
+    # Now adjust the label of the final tensor (and all that share the same layout) to be "OUTPUT".
+    # This is not strictly required, but conformes the standard naming pattern
+    final_label = tensors[-1]["ds_type"]
+    output_label = LAYOUT_OUTPUT_LABELS[0]
+    for tensor in tensors:
+        if tensor["ds_type"] == final_label:
+            tensor["ds_type"] = output_label
+    layouts[output_label] = layouts.pop(final_label)
+
+    return layouts
+
+
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
 
     data_format = inputs[0]["device_layout"].device_dtype
-    elems_per_stick = data_format.elems_per_stick()
 
     d3 = len(dimensions) >= 3
 
     ndim = len(dimensions)
-    assert ndim <= 3
 
     # implement core division on stick dimension
     cores = 1
@@ -306,7 +505,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
         # enable work division for non-reduction only for now
         if not reduction:
-            split_idx = -3 if d3 else 0  # split along stick dim
+            split_idx = len(dimensions) * -1 if d3 else 0  # split along stick dim
             cores = kwargs["op_info"]["core_division"][-1][split_idx]
             # FIXME: cores should be the product of list of splits
 
@@ -314,81 +513,43 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     if "op_info" in kwargs and "constants" in kwargs["op_info"]:
         cores = 1
 
-    if reduction and tensors[-1]["scale"][-1] == 1:
+    if reduction and tensors[-1]["scale"][-1] >= 0:
         op += "nonstick"
 
-    # FIXME: use core_division instead of cores to fill the list of splits
-    if ndim == 1:
-        dim_labels = ["out"]
-        dim_indices = [0]
-        dim_splits = [cores]
-        core_id_to_wk_slice = {str(i): {"out": i} for i in range(cores)}
-    elif ndim == 2:
-        dim_labels = ["mb", "out"]
-        dim_indices = [0, 1]
-        dim_splits = [1, cores]
-        core_id_to_wk_slice = {str(i): {"mb": 0, "out": i} for i in range(cores)}
-    else:  # ndim == 3
-        # NOTE: Pytorch host tensor shape is [mb, x, out] from the most to the
-        #       least significant dimension. Here when filling in the
-        #       layoutDimOrder, we use 3d generic stick layout on device
-        #       [mb, out, x] from the least to the most significant
-        #       dimension.
-        dim_labels = ["mb", "out", "x"]
-        dim_indices = [0, 2, 1]
-        dim_splits = [1, cores, 1]
-        core_id_to_wk_slice = {
-            str(i): {"mb": 0, "x": 0, "out": i} for i in range(cores)
-        }
+    # Get operation dim map from the tensor that represents the operation space
+    op_dims_tensor = inputs[0] if reduction else outputs[0]
+    dl = op_dims_tensor["device_layout"]
+    dim_map = dl.dim_map[::-1][1:]
+    dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+    dim_splits = [1] * (ndim - 1) + [cores]
 
-    # reorder sizes according to layoutDimOrder
-    dim_sizes = [dimensions[i] for i in dim_indices]
-    op_dim_infos = DimInfos(
+    # Obtain (padded) dimensions of the op from a spyre tensor layout
+    padded_op_dimensions = [
+        get_device_size(host_dim, op_dims_tensor) for host_dim in range(ndim)
+    ]
+
+    dim_infos = DimInfos(
+        dim_map,
         dim_labels,
-        dim_indices,
-        dim_sizes,
+        dimensions,
+        padded_op_dimensions,
         dim_splits,
-        elems_per_stick,
-        stick_dims=["out"],
     )
 
-    coordinateMasking, maskingConstId = create_padding_mask_info(op_dim_infos, kwargs)
-    layouts = {}
-    # Compute tensor-specific dimension info
-    for i, tensor in enumerate(tensors):
-        # Adjust for output tensors that have leading dimensions of size 1
-        # These dimensions do not exist on the device, and the tiling is different
-        # Compute the number of leading missing dims (-1)
-        missing_dims = sum(1 for _ in takewhile(lambda x: x == -1, tensor["scale"]))
-        if missing_dims > 0 and ndim >= 3:
-            # Add missing dimensions to end of device dimension order
-            # Compute the number of leading missing dims (-1)
-            dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-            tensor_dim_indices = dev_dim_order + list(
-                set(dim_indices) - set(dev_dim_order)
-            )
-        else:
-            # Indices and order unchanged
-            tensor_dim_indices = dim_indices
+    coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
+    layouts = create_tensor_specific_layouts(tensors, dim_infos, op)
 
-        # Create dim infos specific to this tensor, reordered if necessary
-        tensor["dim_infos"] = DimInfos(
-            dim_labels,
-            dim_indices,
-            dim_sizes,
-            dim_splits,
-            elems_per_stick,
-            stick_dims=["out"],
-            new_indices_order=tensor_dim_indices,
-        )
-        tensor["ds_type"] = None
-        for label, dim_order in layouts.items():
-            if tensor["dim_infos"].dim_labels == dim_order:
-                tensor["ds_type"] = label
-                break
-        if tensor["ds_type"] is None:
-            tensor["ds_type"] = LAYOUT_LABELS[len(layouts.keys())]
-            layouts[LAYOUT_LABELS[len(layouts.keys())]] = tensor["dim_infos"].dim_labels
+    # Compute the stick label from the op tensor.
+    # For now we expect stick dim to always be "out", so check.
+    # Remove the assertion when this invariant changes
+    op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
+    assert op_stick_labels == ["out"]
+
+    core_id_to_wk_slice = {}
+    for i in range(cores):
+        core_id_to_wk_slice[str(i)] = {
+            str(s): i if s in op_stick_labels else 0 for s in dim_labels
+        }
 
     return {
         op: {
@@ -403,7 +564,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             "numCoresUsed_": cores,
             "coreIdToDsc_": {str(c): 0 for c in range(cores)},
             "numWkSlicesPerDim_": {
-                di.label: di.nsplits for di in op_dim_infos.as_list()
+                di.label: di.nsplits for di in dim_infos.get_op_infos()
             },
             "coreIdToWkSlice_": core_id_to_wk_slice,
             "coreIdToDscSchedule": {str(c): [[-1, 0, 0, 0]] for c in range(cores)},
@@ -416,7 +577,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                         "N_": {
                             "name_": "n",
                             **{
-                                di.label + "_": di.size for di in op_dim_infos.as_list()
+                                di.label + "_": di.padded_size
+                                for di in dim_infos.get_op_infos()
                             },  # dim sizes before split
                         },
                         "coordinateMasking_": coordinateMasking,
@@ -427,35 +589,40 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "name_": "core",
                                     **{
                                         di.label + "_": di.split_size
-                                        for di in op_dim_infos.as_list()
+                                        for di in dim_infos.get_op_infos()
                                     },
                                 },
                                 "el_": {
                                     "name_": "core",
                                     **{
                                         di.label + "_": di.split_size
-                                        for di in op_dim_infos.as_list()
+                                        for di in dim_infos.get_op_infos()
                                     },
                                 },
                             }
                         },
                         "primaryDsInfo_": {
                             name: {
-                                "layoutDimOrder_": dim_order,
-                                "stickDimOrder_": ["out"],
+                                "layoutDimOrder_": layout_info["layout_order"],
+                                "stickDimOrder_": layout_info["stick_dim_order"],
                                 "stickSize_": [data_format.elems_per_stick()],
                             }
-                            for name, dim_order in layouts.items()
+                            for name, layout_info in layouts.items()
                         },
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_hbm",
+                                "name_": f"allocate-Tensor{i}_{'hbm' if tensor['lx_addr'] is None else 'lx'}",
                                 "prev_": "",
                                 "ldsIdx_": i,
-                                "component_": "hbm",
-                                "layoutDimOrder_": tensor["dim_infos"].dim_labels,
-                                "maxDimSizes_": [-1] * len(dim_labels),
+                                "component_": "hbm"
+                                if tensor["lx_addr"] is None
+                                else "lx",
+                                "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
+                                    tensor, op
+                                ),
+                                "maxDimSizes_": [-1]
+                                * len(dim_infos.get_tensor_op_layout_order(tensor, op)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -473,12 +640,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             + c
                                             # calculate the prod of dim sizes
                                             # less significant than chosen split dim i.e. the stick
-                                            * math.prod(dim_sizes[:2])
+                                            * math.prod(
+                                                dim_infos.get_padded_sizes()[:2]
+                                            )
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
                                             )
                                             // cores
                                         )
+                                        if tensor["lx_addr"] is None
+                                        else tensor["lx_addr"]
                                         for c in range(cores)
                                     },
                                 },
@@ -486,19 +657,21 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "coordInfo": {
                                         di.label: gen_coord_info_value(
                                             size=di.split_size
-                                            if (tensor["scale"][di.index] == 1)
+                                            if (di.scale == 1)
                                             else 1,
                                             nsplits=di.nsplits,
                                             elems_per_stick=tensor[
                                                 "device_layout"
                                             ].device_dtype.elems_per_stick(),
-                                            is_stick_dim=(di.label == "out"),
+                                            is_stick_dim=(di.label in op_stick_labels),
                                             is_stick_reduction=(
-                                                di.label == "out"
-                                                and tensor["scale"][di.index] == -1
+                                                di.label in op_stick_labels
+                                                and di.scale == -1
                                             ),
                                         )
-                                        for di in tensor["dim_infos"].as_list()
+                                        for di in dim_infos.get_tensor_op_infos(
+                                            tensor, op
+                                        )
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
@@ -512,16 +685,16 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "dsType_": tensor["ds_type"],
                                 "scale_": [
                                     (
-                                        tensor["scale"][di.index]
+                                        di.scale
                                         # TODO: revisit whether this special case can be removed
                                         #       pending change in deeptools
                                         if not (
-                                            di.label == "out"
-                                            and tensor["scale"][di.index] == -1
+                                            di.label in op_stick_labels
+                                            and di.scale == -1
                                         )
                                         else -2
                                     )
-                                    for di in tensor["dim_infos"].as_list()
+                                    for di in dim_infos.get_tensor_op_infos(tensor, op)
                                 ],
                                 "wordLength": num_bytes(
                                     tensor["device_layout"].device_dtype
@@ -532,7 +705,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                 "memOrg_": {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
-                                },
+                                }
+                                if tensor["lx_addr"] is None
+                                else {"lx": {"isPresent": 1}},
                             }
                             for i, tensor in enumerate(tensors)
                         ],
@@ -565,35 +740,67 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     }
 
 
-def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
-    # [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
+# Extract the padded sizes from the tensors for mm and bmm.
+# The pattern of how op dimensions map to tensors seems to be:
+#  - The first N-2 dims come from tensor 0
+#  - Last 2 dims come from tensor 1
+def get_padded_dimensions_matmul(ndim, inputs):
+    padded_dimensions = [0] * ndim
+    for host_dim in range(ndim):
+        tensor_idx = 0 if host_dim < ndim - 2 else 1
+        padded_dimensions[host_dim] = get_device_size(host_dim, inputs[tensor_idx])
+    return padded_dimensions
 
+
+def _generate_matmul_common(
+    pointers,
+    *,
+    op,
+    dimensions,
+    inputs,
+    outputs,
+    dim_labels,
+    dim_indices,
+    dim_splits,
+    coreid_to_wk_slice,
+    cores,
+):
+    """
+    Common implementation for matmul and bmm operations.
+
+    This function contains the shared logic between generate_matmul and generate_bmm,
+    which differ primarily in their dimension configurations.
+
+    Args:
+        pointers: Memory pointers for tensors
+        op: Operation name
+        dimensions: Tensor host dimensions
+        inputs: Input tensor specifications
+        outputs: Output tensor specifications
+        dim_labels: Dimension labels (e.g., ["mb", "in", "out"] for matmul)
+        dim_indices: Dimension indices
+        dim_splits: Number of splits per dimension
+        coreid_to_wk_slice: Mapping from core ID to work slice
+        cores: Number of cores used
+
+    Returns:
+        Dictionary containing the SDSC structure for the operation
+    """
+    tensors = inputs + outputs
     data_format = inputs[0]["device_layout"].device_dtype
-    elems_per_stick = data_format.elems_per_stick()
 
-    # implement core division on stick dimension
-    cores = 1
-    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
-        cores = kwargs["op_info"]["core_division"][-1][0]
+    padded_dimensions = get_padded_dimensions_matmul(len(dim_indices), inputs)
 
-    dim_labels = ["mb", "in", "out"]
-    dim_indices = [0, 1, 2]
-    dim_sizes = dimensions
-    dim_splits = [1, 1, cores]
-
-    op_dim_infos = DimInfos(
-        dim_labels,
+    dim_infos = DimInfos(
         dim_indices,
-        dim_sizes,
+        dim_labels,
+        dimensions,
+        padded_dimensions,
         dim_splits,
-        elems_per_stick,
-        stick_dims=["in", "out"],
     )
-    dim_info_dict = op_dim_infos.as_dict()
+    dim_info_dict = {di.label: di for di in dim_infos.get_op_infos()}
 
-    input_layoutDimOrder = ["mb", "in"]
-    kernel_layoutDimOrder = ["in", "out"]
-    output_layoutDimOrder = ["mb", "out"]
+    layouts = create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=True)
 
     return {
         op: {
@@ -607,10 +814,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
             "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
             "numCoresUsed_": cores,
             "coreIdToDsc_": {str(i): 0 for i in range(cores)},
-            "numWkSlicesPerDim_": {"mb": 1, "in": 1, "out": cores},
-            "coreIdToWkSlice_": {
-                str(i): {"in": 0, "out": i, "mb": 0} for i in range(cores)
-            },
+            "numWkSlicesPerDim_": {k: v for k, v in zip(dim_labels, dim_splits)},
+            "coreIdToWkSlice_": coreid_to_wk_slice,
             "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
             "dscs_": [
                 {
@@ -621,7 +826,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                         "N_": {
                             "name_": "n",
                             **{
-                                label + "_": di.size
+                                label + "_": di.padded_size
                                 for label, di in dim_info_dict.items()
                             },
                         },
@@ -644,43 +849,28 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                             }
                         },
                         "primaryDsInfo_": {
-                            "INPUT": {
-                                "layoutDimOrder_": input_layoutDimOrder,
-                                "stickDimOrder_": ["in"],
-                                "stickSize_": [
-                                    inputs[0][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                            "OUTPUT": {
-                                "layoutDimOrder_": output_layoutDimOrder,
-                                "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    outputs[0][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                            "KERNEL": {
-                                "layoutDimOrder_": kernel_layoutDimOrder,
-                                "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    inputs[1][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
+                            name: {
+                                "layoutDimOrder_": layout_info["layout_order"],
+                                "stickDimOrder_": layout_info["stick_dim_order"],
+                                "stickSize_": [data_format.elems_per_stick()],
+                            }
+                            for name, layout_info in layouts.items()
                         },
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": node_name,
+                                # "name_": node_name,
+                                "name_": f"allocate_Input{idx}_hbm"
+                                if idx < len(tensors) - 1
+                                else "allocate_out_hbm",
                                 "prev_": "",
                                 "ldsIdx_": idx,
                                 "component_": "hbm",
-                                "layoutDimOrder_": layout_dim_order,
-                                "maxDimSizes_": [-1] * len(layout_dim_order),
+                                "layoutDimOrder_": dim_infos.get_tensor_layout_order(
+                                    tensor
+                                ),
+                                "maxDimSizes_": [-1]
+                                * len(dim_infos.get_tensor_layout_order(tensor)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -693,76 +883,57 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                         {"factor_": 1, "label_": "time"},
                                     ],
                                     "data_": {
-                                        # TODO: generalize this to avoid special case handling
                                         f"[{c}, 0, 0]": str(
                                             pointers[tensor["name"]]
-                                            + c
-                                            * math.prod(
+                                            + core_idx_to_slice_offset(
                                                 [
-                                                    dim_info_dict[label].split_size
-                                                    for label in layout_dim_order
-                                                ]
+                                                    dim_info_dict[label]
+                                                    for label in dim_infos.get_tensor_layout_order(
+                                                        tensor
+                                                    )
+                                                ],
+                                                coreid_to_wk_slice[str(c)],
+                                                tensor["device_layout"].device_size,
                                             )
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
                                             )
                                         )
-                                        if idx != 0  # duplicated tensor
-                                        else str(pointers[tensor["name"]])
                                         for c in range(cores)
                                     },
                                 },
                                 "coordinates_": {
                                     "coordInfo": {
-                                        label: gen_coord_info_value(
+                                        di.label: gen_coord_info_value(
                                             size=di.split_size
-                                            if (tensor["scale"][di.index] == 1)
+                                            if (di.scale == 1)
                                             else 1,
                                             nsplits=di.nsplits,
                                             elems_per_stick=tensor[
                                                 "device_layout"
                                             ].device_dtype.elems_per_stick(),
-                                            is_stick_dim=(di.label == stick_label),
-                                            is_stick_reduction=False,
+                                            is_stick_dim=(
+                                                di.label
+                                                in dim_infos.get_tensor_stick_dim_labels(
+                                                    tensor
+                                                )
+                                            ),
                                         )
-                                        for label in layout_dim_order
-                                        if (di := dim_info_dict[label])
+                                        for di in dim_infos.get_tensor_infos(tensor, op)
                                     },
                                     "coreIdToWkSlice_": {},
                                 },
                             }
-                            for idx, (
-                                node_name,
-                                tensor,
-                                layout_dim_order,
-                                stick_label,
-                            ) in enumerate(
-                                zip(
-                                    [
-                                        "allocate_bmm-Input0_hbm",
-                                        "allocate_bmm-Input1_hbm",
-                                        "allocate_bmm_out_hbm",
-                                    ],
-                                    inputs + outputs,
-                                    [
-                                        input_layoutDimOrder,
-                                        kernel_layoutDimOrder,
-                                        output_layoutDimOrder,
-                                    ],
-                                    ["in", "out", "out"],
-                                )
-                            )
+                            for idx, tensor in enumerate(tensors)
                         ],
                         "labeledDs_": [
                             {
                                 "ldsIdx_": idx,
                                 "dsName_": f"Tensor{idx}",
-                                "dsType_": ds_type,
-                                # permute scale values according to layoutDimOrder
+                                "dsType_": tensor["ds_type"],
                                 "scale_": [
-                                    tensor["scale"][di.index]
-                                    for label in layout_dim_order
-                                    if (di := dim_info_dict[label])
+                                    di.scale
+                                    for di in dim_infos.get_tensor_infos(tensor, op)
                                 ],
                                 "wordLength": num_bytes(
                                     tensor["device_layout"].device_dtype
@@ -775,17 +946,7 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                     "lx": {"isPresent": 1},
                                 },
                             }
-                            for idx, (ds_type, tensor, layout_dim_order) in enumerate(
-                                zip(
-                                    ["INPUT", "KERNEL", "OUTPUT"],
-                                    inputs + outputs,
-                                    [
-                                        input_layoutDimOrder,
-                                        kernel_layoutDimOrder,
-                                        output_layoutDimOrder,
-                                    ],
-                                )
-                            )
+                            for idx, tensor in enumerate(tensors)
                         ],
                         "computeOp_": [
                             {
@@ -812,245 +973,96 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     }
 
 
-def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
-    # [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
+def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    """
+    Generate SDSC structure for matrix multiplication operation.
 
-    data_format = inputs[0]["device_layout"].device_dtype
-    elems_per_stick = data_format.elems_per_stick()
+    Matmul operation: [mb=dim0, in=dim1] @ [in=dim1, out=dim2]
 
-    # implement core division on stick dimension
+    This is a thin wrapper around _generate_matmul_common that provides
+    matmul-specific configuration (3D dimensions, specific layouts).
+    """
+    dim_labels = ["mb", "in", "out"]
+    dim_indices = [0, 1, 2]
+
+    # work division logic
     cores = 1
-    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
-        cores = kwargs["op_info"]["core_division"][-1][0]  # mb_nsplit of the output
+    dim_splits = [1, 1, 1]
+    if "op_info" in kwargs:
+        if "n_cores_used" in kwargs["op_info"]:
+            cores = kwargs["op_info"]["n_cores_used"]
 
-    dim_labels = ["x", "mb", "in", "out"]
-    dim_indices = [0, 1, 2, 3]
-    dim_sizes = dimensions
-    dim_splits = [1, cores, 1, 1]
+        if "core_division" in kwargs["op_info"]:
+            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
+            for dev_dim_idx, nsplit in enumerate(
+                core_div[:-1]
+            ):  # exclude the last device dim
+                if nsplit > 1:
+                    # dev_dim_idx -> host_dim_idx
+                    host_dim_idx = outputs[0]["device_layout"].dim_map[dev_dim_idx]
+                    # host_dim_idx -> op_dim_idx for nsplit assignment
+                    dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
 
-    op_dim_infos = DimInfos(
-        dim_labels,
-        dim_indices,
-        dim_sizes,
-        dim_splits,
-        elems_per_stick,
-        stick_dims=["in", "out"],
+    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
+
+    return _generate_matmul_common(
+        pointers,
+        op=op,
+        dimensions=dimensions,
+        inputs=inputs,
+        outputs=outputs,
+        dim_labels=dim_labels,
+        dim_indices=dim_indices,
+        dim_splits=dim_splits,
+        coreid_to_wk_slice=coreid_to_wk_slice,
+        cores=cores,
     )
-    dim_info_dict = op_dim_infos.as_dict()
 
-    input_layoutDimOrder = ["x", "in", "mb"]
-    kernel_layoutDimOrder = ["x", "out", "in"]
-    output_layoutDimOrder = ["x", "out", "mb"]
 
-    return {
-        op: {
-            "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
-            "sdscFolds_": {
-                "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
-                "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
-                "data_": {"[0]": "0"},
-            },
-            "coreFoldProp_": {"factor_": cores, "label_": "core"},
-            "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-            "numCoresUsed_": cores,
-            "coreIdToDsc_": {str(i): 0 for i in range(cores)},
-            "numWkSlicesPerDim_": {"in": 1, "out": 1, "mb": cores, "x": 1},
-            "coreIdToWkSlice_": {
-                str(i): {"x": 0, "mb": i, "in": 0, "out": 0} for i in range(cores)
-            },
-            "coreIdToDscSchedule": {str(i): [[-1, 0, 0, 0]] for i in range(cores)},
-            "dscs_": [
-                {
-                    op: {
-                        "numCoresUsed_": cores,
-                        "numCoreletsUsed_": 1,
-                        "coreIdsUsed_": list(range(cores)),
-                        "N_": {
-                            "name_": "n",
-                            **{
-                                label + "_": di.size
-                                for label, di in dim_info_dict.items()
-                            },
-                        },
-                        "dataStageParam_": {
-                            "0": {
-                                "ss_": {
-                                    "name_": "core",
-                                    **{
-                                        label + "_": di.split_size
-                                        for label, di in dim_info_dict.items()
-                                    },
-                                },
-                                "el_": {
-                                    "name_": "core",
-                                    **{
-                                        label + "_": di.split_size
-                                        for label, di in dim_info_dict.items()
-                                    },
-                                },
-                            }
-                        },
-                        "primaryDsInfo_": {
-                            "INPUT": {
-                                "layoutDimOrder_": input_layoutDimOrder,
-                                "stickDimOrder_": ["in"],
-                                "stickSize_": [
-                                    inputs[0][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                            "OUTPUT": {
-                                "layoutDimOrder_": output_layoutDimOrder,
-                                "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    outputs[0][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                            "KERNEL": {
-                                "layoutDimOrder_": kernel_layoutDimOrder,
-                                "stickDimOrder_": ["out"],
-                                "stickSize_": [
-                                    inputs[1][
-                                        "device_layout"
-                                    ].device_dtype.elems_per_stick()
-                                ],
-                            },
-                        },
-                        "scheduleTree_": [
-                            {
-                                "nodeType_": "allocate",
-                                "name_": node_name,
-                                "prev_": "",
-                                "ldsIdx_": idx,
-                                "component_": "hbm",
-                                "layoutDimOrder_": layout_dim_order,
-                                "maxDimSizes_": [-1] * len(layout_dim_order),
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
-                                    ],
-                                    "dim_prop_attr": [
-                                        {"factor_": cores, "label_": "core"},
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
-                                    ],
-                                    "data_": {
-                                        # TODO: generalize this to avoid special case handling
-                                        f"[{c}, 0, 0]": str(
-                                            pointers[tensor["name"]]
-                                            + c
-                                            * math.prod(
-                                                [
-                                                    dim_info_dict[label].split_size
-                                                    for label in layout_dim_order
-                                                ]
-                                            )
-                                            * num_bytes(
-                                                tensor["device_layout"].device_dtype
-                                            )
-                                        )
-                                        if idx != 1  # duplicated tensor
-                                        else str(pointers[tensor["name"]])
-                                        for c in range(cores)
-                                    },
-                                },
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        label: gen_coord_info_value(
-                                            size=di.split_size
-                                            if (tensor["scale"][di.index] == 1)
-                                            else 1,
-                                            nsplits=di.nsplits,
-                                            elems_per_stick=tensor[
-                                                "device_layout"
-                                            ].device_dtype.elems_per_stick(),
-                                            is_stick_dim=(di.label == stick_label),
-                                            is_stick_reduction=False,
-                                        )
-                                        for label in layout_dim_order
-                                        if (di := dim_info_dict[label])
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            }
-                            for idx, (
-                                node_name,
-                                tensor,
-                                layout_dim_order,
-                                stick_label,
-                            ) in enumerate(
-                                zip(
-                                    [
-                                        "allocate_bmm-Input0_hbm",
-                                        "allocate_bmm-Input1_hbm",
-                                        "allocate_bmm_out_hbm",
-                                    ],
-                                    inputs + outputs,
-                                    [
-                                        input_layoutDimOrder,
-                                        kernel_layoutDimOrder,
-                                        output_layoutDimOrder,
-                                    ],
-                                    ["in", "out", "out"],
-                                )
-                            )
-                        ],
-                        "labeledDs_": [
-                            {
-                                "ldsIdx_": idx,
-                                "dsName_": f"Tensor{idx}",
-                                "dsType_": ds_type,
-                                # permute scale values according to layoutDimOrder
-                                "scale_": [
-                                    tensor["scale"][di.index]
-                                    for label in layout_dim_order
-                                    if (di := dim_info_dict[label])
-                                ],
-                                "wordLength": num_bytes(
-                                    tensor["device_layout"].device_dtype
-                                ),
-                                "dataFormat_": tensor[
-                                    "device_layout"
-                                ].device_dtype.name,
-                                "memOrg_": {
-                                    "hbm": {"isPresent": 1},
-                                    "lx": {"isPresent": 1},
-                                },
-                            }
-                            for idx, (ds_type, tensor, layout_dim_order) in enumerate(
-                                zip(
-                                    ["INPUT", "KERNEL", "OUTPUT"],
-                                    inputs + outputs,
-                                    [
-                                        input_layoutDimOrder,
-                                        kernel_layoutDimOrder,
-                                        output_layoutDimOrder,
-                                    ],
-                                )
-                            )
-                        ],
-                        "computeOp_": [
-                            {
-                                "exUnit": "pt",
-                                "opFuncName": op,
-                                "attributes_": {
-                                    "dataFormat_": inputs[0][
-                                        "device_layout"
-                                    ].device_dtype.name,
-                                    "fidelity_": "regular",
-                                },
-                                "location": "Inner",
-                                "inputLabeledDs": ["Tensor0-idx0", "Tensor1-idx1"],
-                                "outputLabeledDs": ["Tensor2-idx2"],
-                            }
-                        ],
-                    }
-                }
-            ],
-        }
-    }
+def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    """
+    Generate SDSC structure for batched matrix multiplication operation.
+
+    BMM operation: [x=dim0, mb=dim1, in=dim2] @ [x=dim0, in=dim2, out=dim3]
+
+    This is a thin wrapper around _generate_matmul_common that provides
+    bmm-specific configuration (4D dimensions with batch, specific layouts).
+    """
+    if len(dimensions) == 4:  # 3d bmm
+        dim_labels = ["x", "mb", "in", "out"]
+    else:  # 4d bmm
+        dim_labels = ["x", "y", "mb", "in", "out"]
+
+    dim_indices = list(range(len(dim_labels)))
+
+    cores = 1
+    dim_splits = [1] * len(dim_labels)
+    if "op_info" in kwargs:
+        if "n_cores_used" in kwargs["op_info"]:
+            cores = kwargs["op_info"]["n_cores_used"]
+
+        if "core_division" in kwargs["op_info"]:
+            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
+            for dev_dim_idx, nsplit in enumerate(
+                core_div[:-1]
+            ):  # exclude the last device dim
+                if nsplit > 1:
+                    # dev_dim_idx -> host_dim_idx
+                    host_dim_idx = outputs[0]["device_layout"].dim_map[dev_dim_idx]
+                    # host_dim_idx -> op_dim_idx for nsplit assignment
+                    dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
+
+    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
+
+    return _generate_matmul_common(
+        pointers,
+        op=op,
+        dimensions=dimensions,
+        inputs=inputs,
+        outputs=outputs,
+        dim_labels=dim_labels,
+        dim_indices=dim_indices,
+        dim_splits=dim_splits,
+        coreid_to_wk_slice=coreid_to_wk_slice,
+        cores=cores,
+    )
