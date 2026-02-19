@@ -919,6 +919,10 @@ static SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
       // innermost contributes ceil(new_sizes[innermost] / eps) tiling entries.
       // The rest contribute their full size.
       int32_t innermost_new = grp.new_dims.back();
+      TORCH_CHECK(new_sizes[innermost_new] >= eps,
+                  "view: splitting stick dimension requires innermost new "
+                  "dimension size (",
+                  new_sizes[innermost_new], ") >= elems_per_stick (", eps, ")");
       int64_t innermost_tiling = (new_sizes[innermost_new] + eps - 1) / eps;
 
       // Check the split is clean
@@ -932,15 +936,14 @@ static SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
                   dev_size, " but expected ", outer_product, " * ",
                   innermost_tiling);
 
-      // Emit innermost tiling first, then outer dims.
-      // This matches the convention where the tiling count for the stick
-      // dim appears at a lower device index than other non-stick dims.
-      new_device_size.push_back(innermost_tiling);
-      new_dim_map.push_back(innermost_new);
+      // Emit outer dims first, then innermost tiling adjacent to stick dim.
+      // The innermost split dimension is the stick iterator (tiling count).
       for (size_t k = 0; k < grp.new_dims.size() - 1; k++) {
         new_device_size.push_back(new_sizes[grp.new_dims[k]]);
         new_dim_map.push_back(grp.new_dims[k]);
       }
+      new_device_size.push_back(innermost_tiling);
+      new_dim_map.push_back(innermost_new);
       continue;
     }
 
