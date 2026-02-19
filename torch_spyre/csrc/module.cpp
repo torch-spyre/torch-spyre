@@ -245,6 +245,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::empty_with_layout);
+  m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
@@ -291,6 +292,7 @@ PYBIND11_MODULE(_C, m) {
            py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
+  m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
