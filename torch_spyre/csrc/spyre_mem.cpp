@@ -740,6 +740,10 @@ static inline at::Tensor spyre_view_impl(const at::Tensor& self,
       "dimension"
       " spans across two contiguous subspaces). Use .reshape(...) instead.");
   // Compute the new SpyreTensorLayout based on changes to size and stride
+  std::vector<std::int64_t> involved_dims;
+  for (std::size_t i = 0; i < self.sizes().size(); ++i) {
+    
+  }
   SpyreTensorLayout old_stl =
       static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
   return spyre_alias_with_sizes_and_strides(self, inferred_size, *stride,
