@@ -16,7 +16,12 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import SpyreTensorLayout, to_with_layout, get_device_dtype
+from torch_spyre._C import (
+    SpyreTensorLayout,
+    to_with_layout,
+    get_device_dtype,
+    compute_view_layout,
+)
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -131,6 +136,15 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x, x_dev.cpu())
         self.assertEqual(x_stl.device_size, [256, 512, 64])
         self.assertEqual(x_stl.dim_map, [1, 0, -1])
+
+    def test_compute_view_layout(self):
+        stl = SpyreTensorLayout((3, 5, 128), torch.float16)
+        unsqueeze_stl = compute_view_layout((3, 5, 128), (3, 5, 1, 128), stl)
+        self.assertEqual(unsqueeze_stl.device_size, stl.device_size)
+        self.assertEqual(unsqueeze_stl.dim_map, [1, 3, 0, 3])
+        fused_stl = compute_view_layout((3, 5, 128), (15, 1, 128), stl)
+        self.assertEqual(fused_stl.device_size, stl.device_size)
+        self.assertEqual(fused_stl.dim_map, [0, 2, 0, 2])
 
 
 if __name__ == "__main__":
