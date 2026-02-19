@@ -627,10 +627,10 @@ class TestOps(TestCase):
     # --- View layout: rejection cases ---
 
     def test_view_reject_nm_complex(self):
-        """[6, 10] -> [2, 3, 5, 2]: N:M group (N>1, M>1) should fail."""
-        x = torch.rand(6, 10, dtype=self.dtype).to("spyre")
+        """[4, 6] -> [3, 8]: N:M group (2 old, 2 new) should fail."""
+        x = torch.rand(4, 6, dtype=self.dtype).to("spyre")
         with self.assertRaisesRegex(RuntimeError, "N:M dimension groups"):
-            x.view(2, 3, 5, 2)
+            x.view(3, 8)
 
     def test_view_reject_stick_split_too_small(self):
         """[512] -> [16, 32]: innermost new dim (32) < elems_per_stick (64)."""
