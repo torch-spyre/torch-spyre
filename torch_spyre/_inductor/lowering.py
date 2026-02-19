@@ -23,6 +23,7 @@ import torch._inductor.lowering as lowering
 from typing import Any, Callable, Union, Iterable
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from . import customops  # noqa: F401
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction

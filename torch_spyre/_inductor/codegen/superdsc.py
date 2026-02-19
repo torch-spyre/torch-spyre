@@ -18,7 +18,7 @@ from torch_spyre._inductor.constants import (
     TRANSPOSE_OP,
     CLONE_OP,
 )
-from torch_spyre._inductor import Unsupported
+from torch_spyre._inductor.errors import Unsupported
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (
     generate_slice,

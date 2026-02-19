@@ -38,7 +38,7 @@ from .constants import (
     TRANSPOSE_OP,
     CLONE_OP,
 )
-from . import Unsupported
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import map_dims_to_vars
 

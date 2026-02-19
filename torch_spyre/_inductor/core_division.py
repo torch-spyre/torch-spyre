@@ -31,7 +31,7 @@ from torch._inductor.scheduler import (
     NopKernelSchedulerNode,
 )
 
-from . import Unsupported
+from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps
