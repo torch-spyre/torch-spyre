@@ -71,15 +71,18 @@ def enable_spyre_compile_fx_wrapper():
                 if mv is None:
                     continue
 
-                for t in iter_tensors(mv):
-                    if getattr(getattr(t, "device", None), "type", None) == device_name:
-                        return True
+                if any(
+                    getattr(getattr(t, "device", None), "type", None) == device_name
+                    for t in iter_tensors(mv)
+                ):
+                    return True
 
             # Graph nodes (covers tensorless factories)
             for n in gm.graph.nodes:
                 dev = n.kwargs.get("device")
                 if dev is None:
                     continue
+
                 if isinstance(dev, torch.device) and dev.type == device_name:
                     return True
                 if isinstance(dev, str) and dev.split(":")[0] == device_name:
