@@ -54,10 +54,8 @@ def full_decomp(
     device: Optional[torch.device] = None,
     pin_memory: Optional[bool] = None,
 ) -> torch.Tensor:
-    assert layout == torch.strided or layout is None, f"dosn't support layout={layout}"
-    assert not pin_memory or pin_memory is None, (
-        f"dosn't support pin_memory={pin_memory}"
-    )
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
 
 
@@ -111,28 +109,6 @@ def spyre_softplus(
 
 
 torch.nn.functional.softplus = spyre_softplus
-
-orig_clamp = torch.clamp
-
-
-def spyre_clamp(
-    input: torch.Tensor,
-    min: Optional[torch.types.Number] = None,
-    max: Optional[torch.types.Number] = None,
-    *,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if input.device.type == "spyre":
-        res = torch.ops.spyre.clamp(input, min, max)
-        if out is not None:
-            out.copy_(res)
-            return out
-        return res
-    else:
-        return orig_clamp(input, min, max, out=out)
-
-
-torch.clamp = spyre_clamp
 
 
 @register_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])

@@ -20,7 +20,7 @@ import torch
 from torch._inductor.ir import Reduction, Pointwise
 import torch._inductor.lowering as lowering
 
-from typing import Any, Callable, Union
+from typing import Any, Callable, Union, Iterable
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from torch_spyre._C import get_elem_in_stick
@@ -388,3 +388,38 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
+
+
+# ------------------------------
+# Helpers to register across overloads
+# ------------------------------
+def _register_overloads(packet, names: Iterable[str], impl_fn: Callable):
+    for name in names:
+        ov = getattr(packet, name, None)
+        if ov is not None:
+            register_spyre_lowering(ov)(impl_fn)
+
+
+# Overload names for aten.clamp
+_CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
+
+
+def _impl_lower_aten_clamp(x, min=None, max=None):
+    # Redirect aten.clamp → spyre.clamp
+    return lower_clamp(x, min=min, max=max)
+
+
+# Register all aten.clamp overloads to use spyre.clamp lowering
+_register_overloads(torch.ops.aten.clamp, _CLAMP_FUNC_OVS, _impl_lower_aten_clamp)
+
+
+def _impl_lower_aten_clamp_min(x, min):
+    return _impl_lower_aten_clamp(x, min=min, max=None)
+
+
+def _impl_lower_aten_clamp_max(x, max):
+    return _impl_lower_aten_clamp(x, min=None, max=max)
+
+
+_register_overloads(torch.ops.aten.clamp_min, ["default"], _impl_lower_aten_clamp_min)
+_register_overloads(torch.ops.aten.clamp_max, ["default"], _impl_lower_aten_clamp_max)
