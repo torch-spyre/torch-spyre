@@ -178,27 +178,10 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     return;
   }
 
-  // PyTorch expects to be able to freely add/remove size 1 dimensions
-  // without changing the memory layout of a tensor.
-  // To enable this to be true for Spyre tensors
-  // we filter dim_order to remove trivial dimensions before tiling.
-  bool sparse = dim_order.back() == -1;
-  std::vector<int32_t> filtered_dim_order;
-  for (auto i = 0; i < dim_order.size(); i++) {
-    if ((dim_order[i] == -1) || (host_size[dim_order[i]] != 1)) {
-      filtered_dim_order.push_back(dim_order[i]);
-    }
-  }
-
-  // Special case: a tensor all of whose dimensions are size 1 keeps dim 0
-  if ((filtered_dim_order.size() == 0) ||
-      ((filtered_dim_order.size() == 1) && (filtered_dim_order.back() == -1))) {
-    filtered_dim_order.insert(filtered_dim_order.begin(), 0);
-  }
-
   // Computing tiling
-  this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
+  this->dim_map = spyre::get_generic_stick_layout(dim_order);
   this->device_size.resize(this->dim_map.size());
+  bool sparse = dim_order.back() == -1;
   auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
   auto stick_dim = this->host_stick_dim();
   this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();

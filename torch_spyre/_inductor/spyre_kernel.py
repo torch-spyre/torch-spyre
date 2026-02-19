@@ -40,7 +40,7 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import map_dims_to_vars
+from .pass_utils import map_dims_to_vars, wildcard_symbol
 
 
 class RValue(ABC):
@@ -332,7 +332,6 @@ def create_kernel_spec(
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
-    wildcard = sympy.Symbol("*")
 
     def __init__(
         self,
@@ -533,12 +532,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             if len(di_x) == 2 and len(di_y) == 2:
                 di = [di_x[0], di_x[1], di_y[1]]
             elif len(di_x) == 1 and len(di_y) == 2:
-                di = [di_x[0], DimensionInfo(self.wildcard, 1), di_y[1]]
+                di = [di_x[0], DimensionInfo(wildcard_symbol(1), 1), di_y[1]]
                 # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
                 # will not compute the correct result.  Raise Unsupported to make this explicit.
                 raise Unsupported(f"matmul requires padding support: {value.arguments}")
             elif len(di_x) == 2 and len(di_y) == 1:
-                di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1)]
+                di = [di_x[0], di_x[1], DimensionInfo(wildcard_symbol(1), 1)]
                 # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
                 # will not compute the correct result.  Raise Unsupported to make this explicit.
                 raise Unsupported(f"matmul requires padding support: {value.arguments}")
@@ -574,25 +573,50 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 di = di_x[0:3] + di_y[2:]
             elif len(di_x) == 2 and len(di_y) == 3:
                 if di_x == di_y[0:2]:
-                    di = [di_x[0], DimensionInfo(self.wildcard, 1), di_x[1], di_y[2]]
+                    di = [
+                        di_x[0],
+                        DimensionInfo(wildcard_symbol(1), 1),
+                        di_x[1],
+                        di_y[2],
+                    ]
                 elif di_x[0] == di_y[0]:
-                    di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1), di_y[2]]
+                    di = [
+                        di_x[0],
+                        di_x[1],
+                        DimensionInfo(wildcard_symbol(1), 1),
+                        di_y[2],
+                    ]
                 else:
-                    di = [DimensionInfo(self.wildcard, 1), di_x[0], di_x[1], di_y[2]]
+                    di = [
+                        DimensionInfo(wildcard_symbol(1), 1),
+                        di_x[0],
+                        di_x[1],
+                        di_y[2],
+                    ]
             elif len(di_x) == 3 and len(di_y) == 2:
-                di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
+                di = [di_x[0], di_x[1], di_x[2], DimensionInfo(wildcard_symbol(1), 1)]
             elif len(di_x) == 2 and len(di_y) == 2:
                 if di_x == di_y:
                     di = [
                         di_x[0],
-                        DimensionInfo(self.wildcard, 1),
+                        DimensionInfo(wildcard_symbol(1), 1),
                         di_x[1],
-                        DimensionInfo(self.wildcard, 1),
+                        DimensionInfo(wildcard_symbol(2), 1),
                     ]
                 elif di_x[0] == di_y[0]:
-                    di = [di_x[0], di_x[1], DimensionInfo(self.wildcard, 1), di_y[1]]
+                    di = [
+                        di_x[0],
+                        di_x[1],
+                        DimensionInfo(wildcard_symbol(1), 1),
+                        di_y[1],
+                    ]
                 else:
-                    di = [DimensionInfo(self.wildcard, 1), di_x[0], di_x[1], di_y[1]]
+                    di = [
+                        DimensionInfo(wildcard_symbol(1), 1),
+                        di_x[0],
+                        di_x[1],
+                        di_y[1],
+                    ]
             else:
                 raise Unsupported(f"malformed bmm {di_x} {di_y}")
             args = [
@@ -643,12 +667,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if len(op_dimensions) == 1 and op_dimensions[0].numel == 1:
             return [access.layout.device_layout.dim_map[0]]
 
-        return [
-            -3
-            if (di.var == self.wildcard)
-            else (var_map[di.var] if di.var in var_map else -1)
-            for di in op_dimensions
-        ]
+        return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
 
     def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
         """
@@ -658,11 +677,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if var_ranges:
             dim_map = map_dims_to_vars(access.layout, access.index)
             return [
-                DimensionInfo(dim_map[v], int(var_ranges[dim_map[v]]))
+                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
                 for v in sorted(dim_map)
             ]
         else:
-            return [DimensionInfo(self.wildcard, 1)]
+            return [DimensionInfo(wildcard_symbol(0), 1)]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its KernelSpec"""

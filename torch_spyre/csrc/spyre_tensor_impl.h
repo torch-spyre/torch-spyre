@@ -99,8 +99,6 @@ class SpyreTensorLayout {
   /**
    * Return a dim_order of the desired rank that is as similar as
    * possible to the dim_order encoded in this->dim_map.
-   * Because of the elision of size 1 dimensions, there will not always
-   * be a unique "most similar" dim_order, so heuristics may be applied.
    */
   std::vector<int32_t> similar_dim_order(int32_t desired_rank);
 

@@ -191,8 +191,6 @@ class DimInfos:
 def get_device_size(host_dim, tensor):
     dl = tensor["device_layout"]
     device_dim = tensor["scale"][host_dim]
-    if device_dim == -3:  # special case to skip elided dim
-        return 1
     assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
     size = dl.device_size[dl.dim_map.index(device_dim)]
     if device_dim == dl.host_stick_dim():

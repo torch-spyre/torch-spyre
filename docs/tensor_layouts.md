@@ -38,18 +38,7 @@ include padded sizes in a Spyre tensor layout. While we could work with strides
 instead, we find it easier to reason about padded sizes and order of dimensions
 separately rather than combining them into strides.
 
-PyTorch eliminates tensor dimensions with per-dimension size 1 whenever
-possible, for instance replacing layout `(size=[512, 1, 256], stride=[256, 256,
-1])` with layout `(size=[512, 256], stride=[256, 1])`. After careful
-consideration we concluded that dimensions of size 1 must not contribute to the
-Spyre layout of a tensor. For this reason, we say a PyTorch tensor layout is in
-_canonical form_ if it has no dimension of size 1 and canonicalize PyTorch
-tensor layouts before reasoning about them. To be clear, this does not preclude
-selecting a different layout on Spyre for a tensor of size `[512, 1]` vs. a
-tensor of size `[512]` but this will require explicitly specifying the desired
-Spyre layout as the default is the same for both.
-
-A number of operations on Spyre produce _sparse_ tensors, i.e., tensors with a
+A number of compute operations on Spyre produce _sparse_ tensors, i.e., tensors with a
 single element per 128-byte _stick_ of tensor data. In order to describe sparse
 tensor layouts we permit Spyre tensor layouts to optionally include a single
 synthetic dimension that does not correspond to any dimension of the PyTorch
@@ -61,9 +50,6 @@ stick.
 ## Spyre Tensor Layouts
 
 A Spyre tensor has a Spyre tensor layout in addition to a PyTorch tensor layout.
-While the PyTorch layout of a tensor may or may not be described in canonical
-form, in the sequel we always assume it is, implicitly canonicalizing the
-PyTorch layout if necessary.
 
 A Spyre tensor layout consists of a _device\_size_ vector, a _dim\_map_ vector
 with the same number of elements called _device\_rank_.
