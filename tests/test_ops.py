@@ -587,16 +587,16 @@ class TestOps(TestCase):
         x = torch.rand(512, dtype=self.dtype).to("spyre")
         y = x.view(4, 128)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 2, 64])
-        self.assertEqual(stl.dim_map, [0, 1, 1])
+        self.assertEqual(stl.device_size, [2, 4, 64])
+        self.assertEqual(stl.dim_map, [1, 0, 1])
 
     def test_view_split_stick_dim_exact(self):
         """[256] -> [4, 64]: split where innermost == elems_per_stick."""
         x = torch.rand(256, dtype=self.dtype).to("spyre")
         y = x.view(4, 64)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 1, 64])
-        self.assertEqual(stl.dim_map, [0, 1, 1])
+        self.assertEqual(stl.device_size, [1, 4, 64])
+        self.assertEqual(stl.dim_map, [1, 0, 1])
 
     def test_view_split_stick_dim_2d(self):
         """[3, 512] -> [3, 4, 128]: split stick dim from 2d tensor."""

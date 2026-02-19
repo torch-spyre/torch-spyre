@@ -936,14 +936,25 @@ static SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
                   dev_size, " but expected ", outer_product, " * ",
                   innermost_tiling);
 
-      // Emit outer dims first, then innermost tiling adjacent to stick dim.
-      // The innermost split dimension is the stick iterator (tiling count).
-      for (size_t k = 0; k < grp.new_dims.size() - 1; k++) {
-        new_device_size.push_back(new_sizes[grp.new_dims[k]]);
-        new_dim_map.push_back(grp.new_dims[k]);
+      // For 1D splits (old_rank == 1), the outermost device dim is the
+      // stick iterator (tiling count), matching the standard rank-2 layout
+      // produced by init(). For higher-rank tensors, outer dims come first
+      // and the tiling count is emitted last, adjacent to the stick dim.
+      if (old_rank == 1) {
+        new_device_size.push_back(innermost_tiling);
+        new_dim_map.push_back(innermost_new);
+        for (size_t k = 0; k < grp.new_dims.size() - 1; k++) {
+          new_device_size.push_back(new_sizes[grp.new_dims[k]]);
+          new_dim_map.push_back(grp.new_dims[k]);
+        }
+      } else {
+        for (size_t k = 0; k < grp.new_dims.size() - 1; k++) {
+          new_device_size.push_back(new_sizes[grp.new_dims[k]]);
+          new_dim_map.push_back(grp.new_dims[k]);
+        }
+        new_device_size.push_back(innermost_tiling);
+        new_dim_map.push_back(innermost_new);
       }
-      new_device_size.push_back(innermost_tiling);
-      new_dim_map.push_back(innermost_new);
       continue;
     }
 
