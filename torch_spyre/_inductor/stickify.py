@@ -32,7 +32,12 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+from torch_spyre._C import (
+    SpyreTensorLayout,
+    get_device_dtype,
+    get_elem_in_stick,
+    compute_view_layout,
+)
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
@@ -122,11 +127,15 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     # Sizes match exactly; propagate the input's SpyreTensorLayout
                     stl = device_layout_like(x.layout, output.dtype)
                 elif [s for s in in_size if s != 1] == [s for s in out_size if s != 1]:
-                    # Squeezed sizes match; derive output dim_order from the input
-                    dim_order = x_stl.similar_dim_order(len(out_size))
-                    if is_sparse(x_stl):
-                        dim_order += [-1]
-                    stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+                    # Squeezed sizes match; see if we can reshape
+                    try:
+                        stl = compute_view_layout(
+                            torch.Size(in_size), torch.Size(out_size), x_stl
+                        )
+                    except RuntimeError:
+                        raise Unsupported(
+                            f"incompatible sizes: {op}({in_size})=>{out_size}) "
+                        )
                 else:
                     raise Unsupported(f"size mismatch: {op}({in_size})=>{out_size}) ")
 
