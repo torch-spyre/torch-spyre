@@ -829,7 +829,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
-                "4d": (cached_randn((64, 17, 28, 128), dtype=torch.float16),),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
     }

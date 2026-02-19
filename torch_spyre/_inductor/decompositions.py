@@ -17,6 +17,7 @@ from typing import Optional, Sequence, Union
 import torch
 
 from torch._inductor.decomposition import register_decomposition
+from . import Unsupported
 
 
 @register_decomposition([torch.ops.spyre.compact])
@@ -46,10 +47,10 @@ def rmsnorm_decomp(
 ) -> torch.Tensor:
     # TODO: limitation with mean on dim=-1, transpose for now to avoid
     # https://github.com/torch-spyre/torch-spyre/issues/632
-    input = input.transpose(-1, 0).contiguous()
+    input = input.transpose(-1, -2).contiguous()
     eps = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
-    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=0, keepdim=True)) + eps
-    output = (input * rsqrt_inp).transpose(-1, 0).contiguous()
+    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps
+    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
     if weight is not None:
         output = output * weight
     return output
@@ -109,6 +110,8 @@ def spyre_rms_norm(
 ) -> torch.Tensor:
     if input.device.type == "spyre" and len(normalized_shape) == 1:
         return torch.ops.spyre.rms_norm(input, normalized_shape, weight, eps)
+    elif input.device.type == "spyre" and len(normalized_shape) != 1:
+        raise Unsupported("RMSNorm reducing more than 1 dimension")
     else:
         return orig_rms_norm(input, normalized_shape, weight, eps)
 
