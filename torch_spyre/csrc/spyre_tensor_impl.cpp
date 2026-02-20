@@ -243,6 +243,14 @@ SpyreTensorImpl::SpyreTensorImpl(c10::Storage&& storage,
   set_custom_sizes_strides(c10::TensorImpl::SizesStridesPolicy::Default);
 }
 
+SpyreTensorImpl::SpyreTensorImpl(at::TensorImpl::ImplType unused,
+                                 c10::Storage&& storage,
+                                 c10::DispatchKeySet key_set,
+                                 const caffe2::TypeMeta data_type)
+    : TensorImpl(unused, std::move(storage), key_set, data_type) {
+  set_custom_sizes_strides(c10::TensorImpl::SizesStridesPolicy::Default);
+}
+
 SpyreTensorImpl::SpyreTensorImpl(c10::Storage storage,
                                  c10::DispatchKeySet key_set,
                                  const caffe2::TypeMeta& dtype,
@@ -325,6 +333,19 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
                             c10::typeMetaToScalarType(tensor.dtype()));
   }
   return stl;
+}
+
+void set_spyre_tensor_layout(const at::Tensor& tensor,
+                             const SpyreTensorLayout& stl) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  SpyreTensorImpl* impl;
+  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
+    impl->spyre_layout = stl;
+  } else {
+    TORCH_CHECK(false,
+                "Error: Attempting to set a STL for a device tensor that does "
+                "not have SpyreTensorImpl");
+  }
 }
 
 };  // namespace spyre

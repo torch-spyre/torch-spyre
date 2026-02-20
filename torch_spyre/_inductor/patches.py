@@ -15,57 +15,7 @@
 from contextlib import contextmanager
 
 import torch
-from torch._dynamo.backends.common import AotAutograd
 from torch._inductor.virtualized import V
-from torch._inductor.graph import GraphLowering
-
-from .lowering import enable_spyre_lowerings
-from .decompositions import (
-    spyre_decompositions,
-    spyre_decompositions_to_exclude,
-    enable_spyre_decompositions,
-)
-from torch_spyre.fallbacks import fallback_ops
-from torch._inductor.decomposition import decompositions
-
-
-def _should_run_on_spyre(
-    graph_inputs: torch.Tensor = [], graph: torch.fx.graph.Graph = None
-):
-    # Check if example inputs exists and whether one of them is on the spyre device
-    if any(
-        isinstance(t, torch.Tensor) and t.device.type == "spyre" for t in graph_inputs
-    ):
-        return True
-
-    # Check the example_values of the last "real" node of the graph whether it resides on the spyre device
-    if (
-        graph is not None
-        and graph.output_node().prev.meta.get("example_value", None) is not None
-        and graph.output_node().prev.meta.get("example_value", None).device.type
-        == "spyre"
-    ):
-        return True
-
-    # Check the kwargs of the last "real" node of the graph whether it resides on the spyre device
-    if (
-        graph is not None
-        and "device" in graph.output_node().prev.kwargs
-        and (
-            (
-                isinstance(graph.output_node().prev.kwargs["device"], str)
-                and graph.output_node().prev.kwargs["device"] == "spyre"
-            )
-            or (
-                isinstance(graph.output_node().prev.kwargs["device"], torch.device)
-                and graph.output_node().prev.kwargs["device"].type == "spyre"
-            )
-        )
-    ):
-        return True
-
-    # If the spyre device could not be detected until now, fallback to the CPU device
-    return False
 
 
 @contextmanager
@@ -82,60 +32,109 @@ def spyre_data_types():
         torch._prims_common._computation_dtype_map = saved
 
 
-class SpyreAotAutograd(AotAutograd):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+@contextmanager
+def enable_spyre_context(example_inputs, kwargs):
+    from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
-    def __call__(self, gm: torch.fx.GraphModule, example_inputs, **kwargs):
-        if _should_run_on_spyre(example_inputs, gm.graph):
-            # Merge Spyre-specific decompositions with any existing decompositions
-            # Note: the decompositions additionally need to be merged in this way,
-            # which is not required for the lowerings.
-            # The reason is that PyTorch maintains a separate
-            # CURRENT_DECOMPOSITION_TABLE in torch.fx.experimental.proxy_tensor
-            # During FX tracing.
-            # AotAutograd reads decompositions from self.kwargs["decompositions"] and
-            # thus using the kwargs of the compile process will ensure that the
-            # spyre-specific decompositions are loaded correctly
-            existing_decomps = self.kwargs.get("decompositions", {})
-            if callable(existing_decomps):
-                existing_decomps = existing_decomps()
+    # Ensure decorators run (custom ops/decomp/lowerings modules)
+    import torch_spyre._inductor.customops  # noqa: F401
+    # import torch_spyre._inductor.decompositions  # noqa: F401
+    from torch_spyre._inductor.decompositions import (
+        spyre_decompositions,
+        spyre_decompositions_to_exclude,
+        enable_spyre_decompositions,
+    )
+    from torch_spyre.fallbacks import fallback_ops
+    from torch._inductor.decomposition import decompositions
+    
+    
+    import torch_spyre._inductor.lowering  # noqa: F401
+    from torch_spyre._inductor.choices import SpyreHeuristics
+    from torch_spyre._inductor.passes import (
+        CustomPrePasses,
+        CustomPostPasses,
+        scheduler_passes,
+        _maybe_run_scheduler_pass,
+    )
 
-            # Remove the selected decompositions from Inductor's registry for Spyre.
-            torch._decomp.remove_decompositions(
-                existing_decomps, spyre_decompositions_to_exclude
-            )
-            torch._decomp.remove_decompositions(
-                decompositions, spyre_decompositions_to_exclude
-            )
+    # *) Inductor config tweaks (saved/restored)
+    import torch._inductor.config as inductor_config
 
-            # Remove decompositions for fallback ops defined in fallbacks.py
-            torch._decomp.remove_decompositions(existing_decomps, fallback_ops)
-            torch._decomp.remove_decompositions(decompositions, fallback_ops)
+    saved_config = {
+        "split_reductions": inductor_config.split_reductions,
+        "benchmark_harness": inductor_config.benchmark_harness,
+        "post_grad_custom_pre_pass": inductor_config.post_grad_custom_pre_pass,
+        "post_grad_custom_post_pass": inductor_config.post_grad_custom_post_pass,
+        "_pre_fusion_custom_pass": inductor_config._pre_fusion_custom_pass,
+        "unroll_reductions_threshold": inductor_config.unroll_reductions_threshold,
+        "permute_fusion": inductor_config.permute_fusion,
+    }
+    inductor_config.split_reductions = False
+    inductor_config.benchmark_harness = False
+    inductor_config.post_grad_custom_pre_pass = CustomPrePasses()
+    inductor_config.post_grad_custom_post_pass = CustomPostPasses()
+    inductor_config._pre_fusion_custom_pass = lambda nodes: _maybe_run_scheduler_pass(
+        scheduler_passes, nodes
+    )
+    # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
+    # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
+    inductor_config.unroll_reductions_threshold = 1
+    # Disable fusing of mm + permute/transpose for now.
+    inductor_config.permute_fusion = False
 
-            # Spyre decompositions take precedence over existing ones
-            merged_decomps = {**existing_decomps, **spyre_decompositions}
-            self.kwargs["decompositions"] = merged_decomps
+    from torch._inductor.ir import Loops
 
-            with (
-                spyre_data_types(),
-                enable_spyre_lowerings(),
-                enable_spyre_decompositions(),
-                V.set_real_inputs(example_inputs),
-            ):
-                return super().__call__(gm, example_inputs, **kwargs)
-        else:
-            return super().__call__(gm, example_inputs, **kwargs)
+    # Force all operations to be realized when LoopLevel IR is initially constructed
+    old_loop = Loops.has_large_inner_fn
+    Loops.has_large_inner_fn = lambda self, threshold=None: True
 
+    from torch._inductor.fx_passes import joint_graph
 
-def spyre_compile_to_module(graph: GraphLowering, original_compile_to_module):
-    if _should_run_on_spyre(graph.example_inputs, graph.graph):
-        # with spyre_data_types(), enable_spyre_lowerings():
-        with (
-            spyre_data_types(),
-            enable_spyre_lowerings(),
-            enable_spyre_decompositions(),
-        ):
-            return original_compile_to_module(graph)
-    else:
-        return original_compile_to_module(graph)
+    origin_pass = list(joint_graph.pass_patterns)
+    # disable mul_softmax_pattern and div_softmax_pattern for now
+    joint_graph.pass_patterns.pop()
+    
+    # Merge Spyre-specific decompositions with any existing decompositions
+    # Note: the decompositions additionally need to be merged in this way,
+    # which is not required for the lowerings.
+    # The reason is that PyTorch maintains a separate
+    # CURRENT_DECOMPOSITION_TABLE in torch.fx.experimental.proxy_tensor
+    # During FX tracing.
+    # AotAutograd reads decompositions from self.kwargs["decompositions"] and
+    # thus using the kwargs of the compile process will ensure that the
+    # spyre-specific decompositions are loaded correctly
+    existing_decomps = self.kwargs.get("decompositions", {})
+    if callable(existing_decomps):
+        existing_decomps = existing_decomps()
+
+    # Remove the selected decompositions from Inductor's registry for Spyre.
+    torch._decomp.remove_decompositions(
+        existing_decomps, spyre_decompositions_to_exclude
+    )
+    torch._decomp.remove_decompositions(
+        decompositions, spyre_decompositions_to_exclude
+    )
+
+    # Remove decompositions for fallback ops defined in fallbacks.py
+    torch._decomp.remove_decompositions(existing_decomps, fallback_ops)
+    torch._decomp.remove_decompositions(decompositions, fallback_ops)
+
+    # Spyre decompositions take precedence over existing ones
+    merged_decomps = {**existing_decomps, **spyre_decompositions}
+    self.kwargs["decompositions"] = merged_decomps
+
+    with (
+        spyre_data_types(),
+        enable_spyre_lowerings(),
+        enable_spyre_decompositions(),
+        V.set_real_inputs(example_inputs),
+        V.set_choices_handler(SpyreHeuristics()),
+    ):
+        try:
+            yield
+        finally:
+            joint_graph.pass_patterns[:] = origin_pass
+            Loops.has_large_inner_fn = old_loop
+            # restore configs
+            for k, v in saved_config.items():
+                setattr(inductor_config, k, v)

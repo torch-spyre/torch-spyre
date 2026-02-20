@@ -18,6 +18,7 @@
 
 #include <ATen/EmptyTensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
+#include <ATen/native/Resize.h>
 #include <ATen/ops/as_strided_cpu_dispatch.h>
 #include <ATen/ops/set_cpu_dispatch.h>
 #include <c10/core/Allocator.h>
@@ -619,7 +620,11 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
-  // Metadata-only change so we re-use the cpu impl
+  // TODO(aviros): This as is will lead to many errors for views, fail for now
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      !self.is_privateuseone(),
+      "as_strided not implemented for Spyre tensors, implement the caller "
+      "using as_strided_with_layout with the proper semantics");
   return at::cpu::as_strided(self, size, stride, storage_offset_);
 }
 
@@ -679,6 +684,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     return at::_copy_from(self, dst, non_blocking);
   }
 }
+
 at::Tensor to_with_layout(const at::Tensor& self,
                           SpyreTensorLayout device_layout) {
   DEBUGINFO(
@@ -725,6 +731,24 @@ at::Tensor empty_with_layout(
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
+
+at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
+                                  c10::IntArrayRef stride,
+                                  std::optional<int64_t> storage_offset_,
+                                  SpyreTensorLayout device_layout) {
+  // NOTE: This function does not check whether
+  // the as_strided info and stl are compatible.
+  // This is for the caller of this function to check
+  auto storage_offset = storage_offset_.value_or(self.storage_offset());
+  auto result = at::detail::make_tensor<SpyreTensorImpl>(
+      c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
+      self.dtype());
+  at::native::setStrided(result, size, stride, storage_offset);
+  static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl())->spyre_layout =
+      device_layout;
+  return result;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
