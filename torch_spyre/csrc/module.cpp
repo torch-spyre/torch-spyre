@@ -243,9 +243,31 @@ PYBIND11_MODULE(_C, m) {
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("convert_artifacts", &dee::convertArtifacts);
+
+  py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
+
+  dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
+      .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
+      .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
+      .def("__str__",
+           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("__repr__",
+           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
+      .def("host_stick_dim", &spyre::SpyreTensorLayout::host_stick_dim)
+      .def("similar_dim_order", &spyre::SpyreTensorLayout::similar_dim_order)
+      .def(py::self == py::self)
+      .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
+           py::arg("host_size"), py::arg("dtype"))
+      .def(py::init<std::vector<int64_t>, c10::ScalarType,
+                    std::vector<int32_t>>(),
+           py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"))
+      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, DataFormats>(),
+           py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
+
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
-  m.def("empty_with_layout", &spyre::empty_with_layout);
+  m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
@@ -270,27 +292,6 @@ PYBIND11_MODULE(_C, m) {
       .value("SEN18F_FP24", DataFormats::SEN18F_FP24)
       .def("elems_per_stick",
            [](const DataFormats &df) { return spyre::elems_per_stick(df); });
-
-  py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
-
-  dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
-      .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
-      .def("__str__",
-           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
-      .def("__repr__",
-           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
-      .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
-      .def("host_stick_dim", &spyre::SpyreTensorLayout::host_stick_dim)
-      .def("similar_dim_order", &spyre::SpyreTensorLayout::similar_dim_order)
-      .def(py::self == py::self)
-      .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
-           py::arg("host_size"), py::arg("dtype"))
-      .def(py::init<std::vector<int64_t>, c10::ScalarType,
-                    std::vector<int32_t>>(),
-           py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"))
-      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, DataFormats>(),
-           py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
