@@ -66,14 +66,17 @@ def device_layout_like(
         new = get_elem_in_stick(dtype)
         if old > new:
             scaling_factor = old / new
-            adjusted_device_size[-1] *= scaling_factor
-            adjusted_device_size[stick_dim_idx] = (
-                adjusted_device_size[stick_dim_idx] + scaling_factor - 1
-            ) / scaling_factor
+            adjusted_device_size[-1] = int(adjusted_device_size[-1] * scaling_factor)
+            adjusted_device_size[stick_dim_idx] = int(
+                (adjusted_device_size[stick_dim_idx] + scaling_factor - 1)
+                / scaling_factor
+            )
         else:
             scaling_factor = new / old
-            adjusted_device_size[-1] /= scaling_factor
-            adjusted_device_size[stick_dim_idx] *= scaling_factor
+            adjusted_device_size[-1] = int(adjusted_device_size[-1] / scaling_factor)
+            adjusted_device_size[stick_dim_idx] = int(
+                adjusted_device_size[stick_dim_idx] * scaling_factor
+            )
         return SpyreTensorLayout(
             adjusted_device_size, layout.device_layout.dim_map, get_device_dtype(dtype)
         )

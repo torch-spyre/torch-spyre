@@ -732,6 +732,16 @@ at::Tensor empty_with_layout(
   return tensor;
 }
 
+at::Tensor py_empty_with_layout(
+    c10::IntArrayRef size, SpyreTensorLayout device_layout,
+    std::optional<c10::ScalarType> dtype_opt,
+    std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
+    std::optional<c10::MemoryFormat> memory_format_opt) {
+  return empty_with_layout(size, device_layout, dtype_opt,
+                           /*layout_opt=*/std::nullopt, device_opt,
+                           pin_memory_opt, memory_format_opt);
+}
+
 at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   c10::IntArrayRef stride,
                                   std::optional<int64_t> storage_offset_,
