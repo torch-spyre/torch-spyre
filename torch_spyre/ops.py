@@ -45,15 +45,17 @@ def spyre__fill_scalar(
     self.copy_(tmp)
     return self
 
+
 @torch.library.register_kernel("aten::zero_", ["spyre"])
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     """Zero out the tensor in-place."""
     # Create zeros on CPU
-    tmp = torch.zeros(self.size(), dtype=self.dtype, device='cpu')
+    tmp = torch.zeros(self.size(), dtype=self.dtype, device="cpu")
     # Copy to device
     self.copy_(tmp)
     # TODO: Can we zero out tensors in-place without copy
     return self
+
 
 @torch.library.register_kernel("aten::transpose.int", ["spyre"])
 def spyre__transpose_int(self: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
