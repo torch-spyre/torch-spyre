@@ -70,6 +70,8 @@ def enable_spyre_decompositions():
             from torch_spyre.fallbacks import fallback_ops
             from torch._inductor.decomposition import decompositions
             
+            enable_spyre_decompositions._orig = [op._name for op in decompositions]
+            
             saved_intree_decompositions = {}
             for (
                 spyre_decompositions_op,
@@ -79,17 +81,40 @@ def enable_spyre_decompositions():
                     saved_intree_decompositions[spyre_decompositions_op] = decompositions[
                         spyre_decompositions_op
                     ]
+                decompositions[spyre_decompositions_op] = spyre_decompositions_impl
 
             # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._saved_decompositions = saved_intree_decompositions
             
             # Remove the selected decompositions from Inductor's registry for Spyre.
-            torch._decomp.remove_decompositions(
-                decompositions, spyre_decompositions_to_exclude
-            )
+            # torch._decomp.remove_decompositions(
+            #     decompositions, spyre_decompositions_to_exclude
+            # )
+            from torch._ops import OpOverload, OpOverloadPacket
+            def _fetch_and_remove_op(ops):
+                _removed = {}
+                for (
+                    op
+                ) in ops:
+                    if isinstance(op, OpOverloadPacket):
+                        for overload_name in op.overloads():
+                            opo = getattr(op, overload_name)
+                            op_ret = decompositions.pop(opo, None)
+                            if op_ret is not None:
+                                _removed[opo] = op_ret
+                    elif isinstance(op, OpOverload):
+                        op_ret = decompositions.pop(op, None)
+                        if op_ret is not None:
+                            _removed[op] = op_ret
+                return _removed
+            
+            _removed_decompositions_to_exclude = _fetch_and_remove_op(spyre_decompositions_to_exclude)
+            enable_spyre_decompositions._removed_decompositions_to_exclude = _removed_decompositions_to_exclude
 
             # Remove decompositions for fallback ops defined in fallbacks.py
-            torch._decomp.remove_decompositions(decompositions, fallback_ops)
+            # torch._decomp.remove_decompositions(decompositions, fallback_ops)
+            _removed_decompositions_fallback_ops = _fetch_and_remove_op(fallback_ops)
+            enable_spyre_decompositions._removed_decompositions_fallback_ops = _removed_decompositions_fallback_ops
 
         try:
             yield
@@ -111,8 +136,28 @@ def enable_spyre_decompositions():
                         ]
                     else:
                         decompositions.pop(spyre_decompositions_op, None)
+                        
+                removed_decompositions_to_exclude = getattr(
+                    enable_spyre_decompositions, "_removed_decompositions_to_exclude", {}
+                )
+                # Remove the selected decompositions from Inductor's registry for Spyre.
+                [torch._decomp._add_op_to_registry(
+                    decompositions, op, fn
+                ) for op, fn in removed_decompositions_to_exclude.items()]
+                # decompositions.extend(removed_decompositions_to_exclude)
+
+                removed_decompositions_fallback_ops = getattr(
+                    enable_spyre_decompositions, "_removed_decompositions_fallback_ops", {}
+                )
+                [torch._decomp._add_op_to_registry(
+                    decompositions, op, fn
+                ) for op, fn in removed_decompositions_fallback_ops.items()]
+                # decompositions.extend(removed_decompositions_fallback_ops)
+                        
                 # Clean up
                 enable_spyre_decompositions._saved_lowerings = {}
+                enable_spyre_decompositions._removed_decompositions_to_exclude = {}
+                enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
 @register_spyre_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
@@ -167,9 +212,7 @@ def spyre_layer_norm(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    from .patches import _should_run_on_spyre
-
-    if _should_run_on_spyre([input]) and len(normalized_shape) == 1:
+    if input.device.type == "spyre" and len(normalized_shape) == 1:
         return torch.ops.spyre.layer_norm(input, normalized_shape, weight, bias, eps)
     else:
         return orig_layer_norm(input, normalized_shape, weight, bias, eps)
@@ -184,9 +227,7 @@ def spyre_gelu(
     input: torch.Tensor,
     approximate: str = "none",
 ) -> torch.Tensor:
-    from .patches import _should_run_on_spyre
-
-    if _should_run_on_spyre([input]):
+    if input.device.type == "spyre":
         return torch.ops.spyre.gelu(input, approximate)
     else:
         return orig_gelu(input, approximate=approximate)
@@ -201,9 +242,7 @@ orig_softplus = torch.nn.functional.softplus
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
-    from .patches import _should_run_on_spyre
-
-    if _should_run_on_spyre([input]):
+    if input.device.type == "spyre":
         return torch.ops.spyre.softplus(input, beta, threshold)
     else:
         return orig_softplus(input, beta, threshold)
