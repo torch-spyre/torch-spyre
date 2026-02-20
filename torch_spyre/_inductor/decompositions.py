@@ -17,7 +17,7 @@ from typing import Optional, Sequence, Union
 import torch
 
 from torch._inductor.decomposition import register_decomposition
-from . import Unsupported
+from .errors import Unsupported
 
 
 @register_decomposition([torch.ops.spyre.compact])
