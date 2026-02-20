@@ -44,7 +44,7 @@ def enable_spyre_context(example_inputs):
     #     spyre_decompositions_to_exclude,
     #     enable_spyre_decompositions,
     # )
-    
+
     # from torch_spyre.fallbacks import fallback_ops
     # from torch._inductor.decomposition import decompositions
     from torch_spyre._inductor.decompositions import (
@@ -52,8 +52,7 @@ def enable_spyre_context(example_inputs):
         # spyre_decompositions_to_exclude,
         enable_spyre_decompositions,
     )
-    
-    
+
     import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.choices import SpyreHeuristics
     from torch_spyre._inductor.passes import (
@@ -99,7 +98,7 @@ def enable_spyre_context(example_inputs):
     origin_pass = list(joint_graph.pass_patterns)
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
-    
+
     # # Merge Spyre-specific decompositions with any existing decompositions
     # # Note: the decompositions additionally need to be merged in this way,
     # # which is not required for the lowerings.
