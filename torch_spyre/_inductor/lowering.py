@@ -20,13 +20,20 @@ import torch
 from torch._inductor.ir import Reduction, Pointwise
 import torch._inductor.lowering as lowering
 
-from typing import Any, Callable, Union, Iterable
+from typing import Any, Callable, Union
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
+
+import threading
+
+# A module-level lock + nesting counter to make the CM reentrant/thread-safe
+_lowerings_lock = threading.RLock()
+_lowerings_nesting = 0
 
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
@@ -76,31 +83,97 @@ def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=Fals
 for op in fallback_ops:
     unregister_lowering(op, allow_missing=True)
 
+# Overload names for aten.clamp
+_CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
+
 
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
 @contextmanager
 def enable_spyre_lowerings():
-    saved_intree_lowerings = {}
-    try:
-        for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
-            if spyre_lowering_op in lowering.lowerings:
-                saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[
-                    spyre_lowering_op
-                ]
-            lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
-        yield
-    except Exception as e:
-        # TODO: Better error handling here?
-        raise e
-    finally:
-        # Reset the saved in-tree lowerings if needed
-        for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
-            if spyre_lowering_op in saved_intree_lowerings:
-                lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[
-                    spyre_lowering_op
-                ]
-            else:
-                lowering.lowerings.pop(spyre_lowering_op, None)
+    """
+    Existing CM that enables Spyre lowerings:
+      - Temporarily redirect relevant aten ops → Spyre lowering
+      - Restore original aten lowerings on exit
+
+    This CM is reentrant and safe under nested usage.
+    """
+    global _lowerings_nesting
+    with _lowerings_lock:
+        first_enter = (_lowerings_nesting == 0)  # fmt: skip
+        _lowerings_nesting += 1
+
+        if first_enter:
+            saved_intree_lowerings = {}
+            for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+                if spyre_lowering_op in lowering.lowerings:
+                    saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[
+                        spyre_lowering_op
+                    ]
+                lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
+
+            # Build adapters that call your Spyre lowering
+            def _impl_lower_aten_clamp(x, min=None, max=None):
+                return lower_clamp(x, min=min, max=max)
+
+            def _impl_lower_aten_clamp_min(x, min):
+                return lower_clamp(x, min=min, max=None)
+
+            def _impl_lower_aten_clamp_max(x, max):
+                return lower_clamp(x, min=None, max=max)
+
+            # Collect overload handles
+            clamp_ovs = [
+                getattr(torch.ops.aten.clamp, name, None) for name in _CLAMP_FUNC_OVS
+            ]
+            clamp_min_ov = getattr(torch.ops.aten.clamp_min, "default", None)
+            clamp_max_ov = getattr(torch.ops.aten.clamp_max, "default", None)
+
+            # Save originals and patch — keep references in function attribute
+            saved = {}
+
+            def _save_set(ov, fn):
+                if ov is None:
+                    return
+                saved[ov] = lowering.lowerings.get(ov)
+                lowering.lowerings[ov] = fn
+
+            for ov in clamp_ovs:
+                _save_set(ov, _impl_lower_aten_clamp)
+            _save_set(clamp_min_ov, _impl_lower_aten_clamp_min)
+            _save_set(clamp_max_ov, _impl_lower_aten_clamp_max)
+
+            # Attach to the function so we can restore on last exit
+            enable_spyre_lowerings._saved_aten_lowerings = saved
+            enable_spyre_lowerings._saved_lowerings = saved_intree_lowerings
+
+        try:
+            yield
+        finally:
+            _lowerings_nesting -= 1
+            last_exit = (_lowerings_nesting == 0)  # fmt: skip
+            if last_exit:
+                # Restore on final exit
+                saved = getattr(enable_spyre_lowerings, "_saved_aten_lowerings", {})
+                for ov, prev in saved.items():
+                    if prev is None:
+                        lowering.lowerings.pop(ov, None)
+                    else:
+                        lowering.lowerings[ov] = prev
+                # Clean up
+                enable_spyre_lowerings._saved_aten_lowerings = {}
+                # Reset the saved in-tree lowerings if needed
+                saved_intree_lowerings = getattr(
+                    enable_spyre_lowerings, "_saved_lowerings", {}
+                )
+                for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+                    if spyre_lowering_op in saved_intree_lowerings:
+                        lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[
+                            spyre_lowering_op
+                        ]
+                    else:
+                        lowering.lowerings.pop(spyre_lowering_op, None)
+                # Clean up
+                enable_spyre_lowerings._saved_lowerings = {}
 
 
 def ensure_default_handler(op_name):
@@ -388,38 +461,3 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
-
-
-# ------------------------------
-# Helpers to register across overloads
-# ------------------------------
-def _register_overloads(packet, names: Iterable[str], impl_fn: Callable):
-    for name in names:
-        ov = getattr(packet, name, None)
-        if ov is not None:
-            register_spyre_lowering(ov)(impl_fn)
-
-
-# Overload names for aten.clamp
-_CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
-
-
-def _impl_lower_aten_clamp(x, min=None, max=None):
-    # Redirect aten.clamp → spyre.clamp
-    return lower_clamp(x, min=min, max=max)
-
-
-# Register all aten.clamp overloads to use spyre.clamp lowering
-_register_overloads(torch.ops.aten.clamp, _CLAMP_FUNC_OVS, _impl_lower_aten_clamp)
-
-
-def _impl_lower_aten_clamp_min(x, min):
-    return _impl_lower_aten_clamp(x, min=min, max=None)
-
-
-def _impl_lower_aten_clamp_max(x, max):
-    return _impl_lower_aten_clamp(x, min=None, max=max)
-
-
-_register_overloads(torch.ops.aten.clamp_min, ["default"], _impl_lower_aten_clamp_min)
-_register_overloads(torch.ops.aten.clamp_max, ["default"], _impl_lower_aten_clamp_max)

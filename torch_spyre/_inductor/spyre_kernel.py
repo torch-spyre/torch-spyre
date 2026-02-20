@@ -38,7 +38,7 @@ from .constants import (
     TRANSPOSE_OP,
     CLONE_OP,
 )
-from . import Unsupported
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import map_dims_to_vars
 
@@ -130,7 +130,7 @@ class SpyreOpFuncs:
 
     @staticmethod
     def gelu(x):
-        return PointwiseOp("gelu", [x])
+        return PointwiseOp("gelufwd", [x])
 
     @staticmethod
     def layernormnorm(*args):

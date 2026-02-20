@@ -13,16 +13,12 @@
 # limitations under the License.
 
 from .constants import DEVICE_NAME
+from .patches import enable_spyre_context
 
 import threading
 from functools import wraps
 
 _autoload_lock = threading.Lock()
-
-
-class Unsupported(RuntimeError):
-    def __init__(self, thing) -> None:
-        super().__init__(f"Spyre backend does not support: {thing}")
 
 
 def enable_spyre_compile_fx_wrapper():
@@ -75,15 +71,18 @@ def enable_spyre_compile_fx_wrapper():
                 if mv is None:
                     continue
 
-                for t in iter_tensors(mv):
-                    if getattr(getattr(t, "device", None), "type", None) == device_name:
-                        return True
+                if any(
+                    getattr(getattr(t, "device", None), "type", None) == device_name
+                    for t in iter_tensors(mv)
+                ):
+                    return True
 
             # Graph nodes (covers tensorless factories)
             for n in gm.graph.nodes:
                 dev = n.kwargs.get("device")
                 if dev is None:
                     continue
+
                 if isinstance(dev, torch.device) and dev.type == device_name:
                     return True
                 if isinstance(dev, str) and dev.split(":")[0] == device_name:
@@ -96,6 +95,8 @@ def enable_spyre_compile_fx_wrapper():
                 import torch
 
                 torch.spyre._impl._lazy_init()
+                with enable_spyre_context(example_inputs):
+                    return _orig(gm, example_inputs, *args, **kwargs)
             return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _wrapper
@@ -141,66 +142,4 @@ def _autoload():
             DEVICE_NAME, SuperDSCScheduling, SpyrePythonWrapperCodegen
         )
 
-        # Set all the appropriate state on PyTorch
-        import torch
-
-        # Define Spyre-specific custom ops, decompositions, and lowerings
-        import torch_spyre._inductor.customops  # noqa: F401  # usort: skip
-        import torch_spyre._inductor.decompositions  # noqa: F401  # usort: skip
-        import torch_spyre._inductor.lowering  # noqa: F401  # usort: skip
-        from .patches import SpyreAotAutograd, spyre_compile_to_module
-
-        # Monkey patching these methods let us install Spyre-specific overrides
-        # and contexts that are not supported by existing extension points.
-        # We need to hook both, because a user may directly compile a module for spyre without going through AotAutograd.
-        torch._dynamo.backends.common.aot_autograd = lambda **kwargs: SpyreAotAutograd(
-            **kwargs
-        )
-        orig_compile_to_module = torch._inductor.graph.GraphLowering.compile_to_module
-        torch._inductor.graph.GraphLowering.compile_to_module = (
-            lambda graph: spyre_compile_to_module(graph, orig_compile_to_module)
-        )
-        import torch._inductor.compile_fx  # noqa: F401  # usort: skip
-
-        # This overwrites the copy of `aot_autograd` imported by compile_fx.py to use our monkey patch.
-        torch._inductor.compile_fx.aot_autograd = (
-            torch._dynamo.backends.common.aot_autograd
-        )
-
-        # Customize inductor heuristics
-        from .choices import SpyreHeuristics
-
-        torch._inductor.virtualized.V.set_choices_handler(SpyreHeuristics())
-
-        # Customize inductor configuration
-        from .passes import (
-            CustomPrePasses,
-            CustomPostPasses,
-            scheduler_passes,
-            _maybe_run_scheduler_pass,
-        )
-
-        torch._inductor.config.split_reductions = False
-        torch._inductor.config.benchmark_harness = False
-        torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
-        torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
-        torch._inductor.config._pre_fusion_custom_pass = (
-            lambda nodes: _maybe_run_scheduler_pass(scheduler_passes, nodes)
-        )
-        # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
-        # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
-        torch._inductor.config.unroll_reductions_threshold = 1
-
-        from torch._inductor.ir import Loops
-
-        # Force all operations to be realized when LoopLevel IR is initially constructed
-        Loops.has_large_inner_fn = lambda self, threshold=None: True
-
-        from torch._inductor.fx_passes import joint_graph
-
-        # disable mul_softmax_pattern and div_softmax_pattern for now
-        joint_graph.pass_patterns.pop()
-
-        # Disable fusing of mm + permute/transpose for now.
-        torch._inductor.config.permute_fusion = False
         _autoload._ran = True
