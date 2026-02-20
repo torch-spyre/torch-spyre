@@ -38,18 +38,7 @@ def enable_spyre_context(example_inputs):
 
     # Ensure decorators run (custom ops/decomp/lowerings modules)
     import torch_spyre._inductor.customops  # noqa: F401
-    # import torch_spyre._inductor.decompositions  # noqa: F401
-    # from torch_spyre._inductor.decompositions import (
-    #     spyre_decompositions,
-    #     spyre_decompositions_to_exclude,
-    #     enable_spyre_decompositions,
-    # )
-
-    # from torch_spyre.fallbacks import fallback_ops
-    # from torch._inductor.decomposition import decompositions
     from torch_spyre._inductor.decompositions import (
-        # spyre_decompositions,
-        # spyre_decompositions_to_exclude,
         enable_spyre_decompositions,
     )
 
@@ -98,35 +87,6 @@ def enable_spyre_context(example_inputs):
     origin_pass = list(joint_graph.pass_patterns)
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
-
-    # # Merge Spyre-specific decompositions with any existing decompositions
-    # # Note: the decompositions additionally need to be merged in this way,
-    # # which is not required for the lowerings.
-    # # The reason is that PyTorch maintains a separate
-    # # CURRENT_DECOMPOSITION_TABLE in torch.fx.experimental.proxy_tensor
-    # # During FX tracing.
-    # # AotAutograd reads decompositions from self.kwargs["decompositions"] and
-    # # thus using the kwargs of the compile process will ensure that the
-    # # spyre-specific decompositions are loaded correctly
-    # existing_decomps = kwargs.get("decompositions", {})
-    # if callable(existing_decomps):
-    #     existing_decomps = existing_decomps()
-
-    # # Remove the selected decompositions from Inductor's registry for Spyre.
-    # torch._decomp.remove_decompositions(
-    #     existing_decomps, spyre_decompositions_to_exclude
-    # )
-    # torch._decomp.remove_decompositions(
-    #     decompositions, spyre_decompositions_to_exclude
-    # )
-
-    # Remove decompositions for fallback ops defined in fallbacks.py
-    # torch._decomp.remove_decompositions(existing_decomps, fallback_ops)
-    # torch._decomp.remove_decompositions(decompositions, fallback_ops)
-
-    # # Spyre decompositions take precedence over existing ones
-    # merged_decomps = {**existing_decomps, **spyre_decompositions}
-    # kwargs["decompositions"] = merged_decomps
 
     with (
         spyre_data_types(),
