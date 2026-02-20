@@ -161,7 +161,7 @@ def enable_spyre_decompositions():
                 ]
 
                 # Clean up
-                enable_spyre_decompositions._saved_lowerings = {}
+                enable_spyre_decompositions._saved_decompositions = {}
                 enable_spyre_decompositions._removed_decompositions_to_exclude = {}
                 enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
