@@ -98,6 +98,7 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
                                       const SpyreTensorLayout& old_stl) {
   size_t old_rank = old_sizes.size();
   size_t new_rank = new_sizes.size();
+  int sparse_to_dense_stick_dim = -1;
 
   // Phase 1: Identify old->new host dimension groups
   std::vector<DimGroup> groups;
@@ -108,6 +109,9 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
       TORCH_CHECK(new_sizes[new_j] == 1,
                   "view: unsqueezed dimension must be size 1");
       groups.push_back({{}, {new_j}});
+      if (old_stl.dim_map[old_stl.device_size.size() - 1] == -1) {
+        sparse_to_dense_stick_dim = new_j;
+      }
       new_j++;
       continue;
     }
@@ -174,8 +178,15 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
 
     // Device dims not mapped to any host dim (e.g., -1 for scalars/sparse)
     if (mapped_dim == -1) {
-      new_device_size.push_back(old_stl.device_size[d]);
-      new_dim_map.push_back(-1);
+      if (sparse_to_dense_stick_dim == -1) {
+        // Remains sparse
+        new_device_size.push_back(old_stl.device_size[d]);
+        new_dim_map.push_back(-1);
+      } else {
+        // Converting sparse to dense.
+        new_device_size.push_back((d == dev_rank - 1) ? eps : 1);
+        new_dim_map.push_back(sparse_to_dense_stick_dim);
+      }
       continue;
     }
 
@@ -193,11 +204,12 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
 
     // 1:0 group (size-1 removal): old dim was size-1
     if (grp.old_dims.size() == 1 && grp.new_dims.empty()) {
-      // Size-1 dims are typically filtered before tiling in init(), so they
-      // shouldn't appear in dim_map. But handle the all-size-1 special case.
-      // Map to -1 since the host dim is gone.
-      new_device_size.push_back(old_stl.device_size[d]);
-      new_dim_map.push_back(-1);
+      // Can be removed entirely, unless it is the stick dim.
+      // Squeezing a stick dimension of size 1 creates a sparse tensor.
+      if (mapped_dim == old_stl.dim_map[old_stl.dim_map.size() - 1]) {
+        new_device_size.push_back((d == dev_rank - 1) ? eps : 1);
+        new_dim_map.push_back(-1);
+      }
       continue;
     }
 

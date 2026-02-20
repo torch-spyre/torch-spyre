@@ -142,9 +142,20 @@ class TestSpyreTensorLayout(TestCase):
         unsqueeze_stl = compute_view_layout((3, 5, 128), (3, 5, 1, 128), stl)
         self.assertEqual(unsqueeze_stl.device_size, stl.device_size)
         self.assertEqual(unsqueeze_stl.dim_map, [1, 3, 0, 3])
+
         fused_stl = compute_view_layout((3, 5, 128), (15, 1, 128), stl)
         self.assertEqual(fused_stl.device_size, stl.device_size)
         self.assertEqual(fused_stl.dim_map, [0, 2, 0, 2])
+
+        # A k-dim tensor with a size 1 stick dimension is interchangably with a sparse tensor of dim k-1
+        stl = SpyreTensorLayout((5, 128, 1), torch.float16)
+        self.assertEqual(stl.device_size, [128, 1, 5, 64])
+        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
+        sparse_stl = compute_view_layout((5, 128, 1), (5, 128), stl)
+        self.assertEqual(sparse_stl.device_size, [128, 1, 5, 64])
+        self.assertEqual(sparse_stl.dim_map, [1, -1, 0, -1])
+        dense_stl = compute_view_layout((5, 128), (5, 128, 1), sparse_stl)
+        self.assertEqual(stl, dense_stl)
 
 
 if __name__ == "__main__":
