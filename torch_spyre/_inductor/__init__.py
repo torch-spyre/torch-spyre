@@ -95,7 +95,7 @@ def enable_spyre_compile_fx_wrapper():
                 import torch
 
                 torch.spyre._impl._lazy_init()
-                with enable_spyre_context(example_inputs, **kwargs):
+                with enable_spyre_context(example_inputs):
                     return _orig(gm, example_inputs, *args, **kwargs)
             return _orig(gm, example_inputs, *args, **kwargs)
 
