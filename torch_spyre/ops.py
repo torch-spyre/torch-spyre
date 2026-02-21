@@ -143,6 +143,8 @@ def infer_squeeze_geometry(
     current_stl: SpyreTensorLayout = tensor.device_tensor_layout()  # type:ignore
     assert isinstance(current_stl, SpyreTensorLayout)
     stick_dim = current_stl.host_stick_dim()
+    if stick_dim is None:
+        raise ValueError("Squeezing of sparse tensors not implemented")
     dim_map = current_stl.dim_map
 
     for idx in range(tensor.dim()):
@@ -223,6 +225,9 @@ def infer_unsqueeze_geometry(
     current_stl = tensor.device_tensor_layout()  # type:ignore
     assert isinstance(current_stl, SpyreTensorLayout)
     dim_map = current_stl.dim_map
+    stick_dim = current_stl.host_stick_dim()
+    if stick_dim is None:
+        raise ValueError("Unsqueezing of sparse tensors not implemented")
 
     for dim_idx in range(len(dim_map)):
         if dim_map[dim_idx] >= dim:

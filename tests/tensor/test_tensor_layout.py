@@ -66,9 +66,9 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_sparse_dim_order(self):
         stl = SpyreTensorLayout([512, 256], torch.float16, [0, 1, -1])
-        self.assertEqual(stl.device_size, [256, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 0, -1])
-        self.assertEqual(stl.host_stick_dim(), 1)
+        self.assertEqual(stl.device_size, [256, 1, 512, 64])
+        self.assertEqual(stl.dim_map, [1, -1, 0, -1])
+        self.assertEqual(stl.host_stick_dim(), None)
 
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
@@ -134,18 +134,19 @@ class TestSpyreTensorLayout(TestCase):
         x_stl = SpyreTensorLayout([512, 256], torch.float16, [0, 1, -1])
         x_dev = x.to("spyre", device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
-        self.assertEqual(x_stl.device_size, [256, 512, 64])
-        self.assertEqual(x_stl.dim_map, [1, 0, -1])
+        self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
+        self.assertEqual(x_stl.dim_map, [1, -1, 0, -1])
 
     def test_compute_view_layout(self):
         stl = SpyreTensorLayout((3, 5, 128), torch.float16)
+        self.assertEqual(stl.device_size, [5, 2, 3, 64])
+        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
         unsqueeze_stl = compute_view_layout((3, 5, 128), (3, 5, 1, 128), stl)
-        self.assertEqual(unsqueeze_stl.device_size, stl.device_size)
-        self.assertEqual(unsqueeze_stl.dim_map, [1, 3, 0, 3])
-
+        self.assertEqual(unsqueeze_stl.device_size, [5, 1, 2, 3, 64])
+        self.assertEqual(unsqueeze_stl.dim_map, [1, 2, 3, 0, 3])
         fused_stl = compute_view_layout((3, 5, 128), (15, 1, 128), stl)
-        self.assertEqual(fused_stl.device_size, stl.device_size)
-        self.assertEqual(fused_stl.dim_map, [0, 2, 0, 2])
+        self.assertEqual(fused_stl.device_size, [5, 1, 2, 3, 64])
+        self.assertEqual(fused_stl.dim_map, [0, 1, 2, 0, 2])
 
         # A k-dim tensor with a size 1 stick dimension is interchangably with a sparse tensor of dim k-1
         stl = SpyreTensorLayout((5, 128, 1), torch.float16)
