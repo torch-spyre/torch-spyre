@@ -532,6 +532,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_decompositions_change",
+            "test_decompositions_change",
+        ): {
+            "param_sets": {
+                "1d": (cached_randn((128,), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_decompositions_graph",
+            "test_decompositions_graph",
+        ): {
+            "param_sets": {
+                "1d": (),
+            },
+        },
+        (
             "test_arange",
             "test_arange_cpu",
         ): {
@@ -961,7 +977,156 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             t = torch.exp(t)  # compiled op
             return t
 
-        compare_with_cpu(fn, x)
+        with pytest.warns(UserWarning) as record:
+            compare_with_cpu(fn, x, cpu_compile=True)
+
+        print(f"Warn {len(record)}")
+
+    def test_decompositions_change(self, x):
+        import torch_spyre
+        import types
+        import copy
+        from functools import partial
+
+        def fn(t):
+            t = torch.sin(t)  # fallback op
+            return t
+
+        from torch._inductor.decomposition import decompositions
+
+        orig_decomps = copy.deepcopy(decompositions)
+
+        with pytest.warns(torch_spyre.fallbacks.FallbackWarning) as record:
+            compare_with_cpu(fn, x, cpu_compile=True)
+
+        assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
+
+        from torch._inductor.decomposition import decompositions
+
+        after_decomps = copy.deepcopy(decompositions)
+
+        assert len(orig_decomps.items()) == len(after_decomps.items()), (
+            f"Amount of decompositions before ({len(orig_decomps.items())}) and after ({len(after_decomps.items())}) not identical!"
+        )
+
+        for op, fn in orig_decomps.items():
+            if op._name not in [o._name for o in after_decomps.keys()]:
+                raise Exception(f"Decomposition {op} not present anymore!")
+            else:
+                opa = None
+                for opa in after_decomps.keys():
+                    if opa._name == op._name:
+                        break
+                if isinstance(fn, types.FunctionType):
+                    # fn is a regular function -> compare the hashes directly
+                    if hash(fn) != hash(after_decomps[opa]):
+                        raise Exception(
+                            f"Decomposition for {op} changed!\nUsed to be {fn} and is now {after_decomps[opa]}"
+                        )
+                elif isinstance(fn, partial):
+                    # fn is a functools.partial -> compare the hashes of the functions
+                    if hash(fn.func) != hash(after_decomps[opa].func):
+                        raise Exception(
+                            f"Decomposition for {op} changed!\nUsed to be {fn} and is now {after_decomps[opa]}"
+                        )
+                else:
+                    raise Exception(
+                        f"Unexpected object in decomposition op: {op}, fn: {fn}"
+                    )
+
+    @unittest.skip("Interference between cpu and spyre compile")
+    def test_decompositions_graph(self):
+        from torch._dynamo.testing import (
+            InductorAndRecordGraphs,
+            normalize_gm,
+        )
+        import torch._inductor.config as config
+
+        # Disable all Inductor caches
+        config.force_disable_caches = True
+
+        def _check_out(out, tar):
+            torch.testing.assert_close(
+                out,
+                tar,
+                equal_nan=True,
+                atol=0.1,
+                rtol=0.1,
+                msg=lambda msg: f"compiled spyre <-> compiled cpu mismatch\n\n{msg}\n",
+            )
+
+        def fn(device):
+            t = torch.arange(65, device=device)
+            return t
+
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        cmp = torch.compile(fn, fullgraph=True, backend=backend)
+        out = cmp("cpu")
+        _check_out(out, torch.arange(65))
+        expected_graph_str = """\
+class <lambda>(torch.nn.Module):
+    def forward(self):
+        iota: "i64[65]" = torch.ops.prims.iota.default(65, start = 0, step = 1, dtype = torch.int64, device = device(type='cpu'), requires_grad = False)
+        return (iota,)
+"""
+        inductor_graph_str = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        cmp = torch.compile(fn, backend=backend)
+        out = cmp("spyre")
+        _check_out(out.cpu(), torch.arange(65))
+        expected_graph_str = """\
+class <lambda>(torch.nn.Module):
+    def forward(self):
+        arange: "i64[65]" = torch.ops.aten.arange.default(65, device = device(type='cpu'), pin_memory = False)
+        return (arange,)
+"""
+        inductor_graph_str = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        cmp = torch.compile(fn, fullgraph=True, backend=backend)
+        out = cmp("cpu")
+        _check_out(out, torch.arange(65))
+        expected_graph_str = """\
+class <lambda>(torch.nn.Module):
+    def forward(self):
+        iota: "i64[65]" = torch.ops.prims.iota.default(65, start = 0, step = 1, dtype = torch.int64, device = device(type='cpu'), requires_grad = False)
+        return (iota,)
+"""
+        inductor_graph_str = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
+
+        def fn(device):
+            t1 = torch.arange(65, device=device).to("cpu")
+            t2 = torch.arange(65, device="cpu")
+            return t2
+
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        cmp = torch.compile(fn, backend=backend)
+        out = cmp("spyre")
+        _check_out(out, torch.arange(65))
+        expected_graph_str = """\
+class <lambda>(torch.nn.Module):
+    def forward(self):
+        arange_1: "i64[65]" = torch.ops.aten.arange.default(65, device = device(type='cpu'), pin_memory = False)
+        return (arange_1,)
+"""
+        inductor_graph_str = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
