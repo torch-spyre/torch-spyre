@@ -145,7 +145,6 @@ def infer_squeeze_geometry(
     stick_dim = current_stl.host_stick_dim()
     if stick_dim is None:
         raise ValueError("Squeezing of sparse tensors not implemented")
-    dim_map = current_stl.dim_map
 
     for idx in range(tensor.dim()):
         dim_check = False
@@ -163,16 +162,8 @@ def infer_squeeze_geometry(
         elif idx == stick_dim:
             # We cannot squeeze the stick dimension!
             raise ValueError("The stick dimension cannot be squeezed")
-        else:
-            # For the squeezed dimensions, correct the dim_map by
-            # lowering the dimensions after the squeezed one
-            for dim_idx in range(len(dim_map)):
-                if dim_map[dim_idx] >= idx:
-                    dim_map[dim_idx] -= 1
 
-    new_stl = SpyreTensorLayout(
-        current_stl.device_size, dim_map, current_stl.device_dtype
-    )
+    new_stl = torch_spyre._C.compute_view_layout(tensor.size(), sizes, current_stl)
 
     return tuple(sizes), tuple(strides), new_stl
 
@@ -222,20 +213,12 @@ def infer_unsqueeze_geometry(
     sizes.insert(dim, 1)
     strides.insert(dim, new_stride)
 
-    current_stl = tensor.device_tensor_layout()  # type:ignore
-    assert isinstance(current_stl, SpyreTensorLayout)
-    dim_map = current_stl.dim_map
+    current_stl = tensor.device_tensor_layout()
     stick_dim = current_stl.host_stick_dim()
     if stick_dim is None:
         raise ValueError("Unsqueezing of sparse tensors not implemented")
 
-    for dim_idx in range(len(dim_map)):
-        if dim_map[dim_idx] >= dim:
-            dim_map[dim_idx] += 1
-
-    new_stl = SpyreTensorLayout(
-        current_stl.device_size, dim_map, current_stl.device_dtype
-    )
+    new_stl = torch_spyre._C.compute_view_layout(tensor.size(), sizes, current_stl)
 
     return tuple(sizes), tuple(strides), new_stl
 
