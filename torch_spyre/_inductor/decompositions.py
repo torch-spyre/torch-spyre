@@ -69,8 +69,6 @@ def enable_spyre_decompositions():
             from torch_spyre.fallbacks import fallback_ops
             from torch._inductor.decomposition import decompositions
 
-            enable_spyre_decompositions._orig = [op._name for op in decompositions]
-
             saved_intree_decompositions = {}
             for (
                 spyre_decompositions_op,
