@@ -481,6 +481,17 @@ class TestOps(TestCase):
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
+    def test_zeros(self):
+        x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
+        x = torch.zeros(3, 64, dtype=self.dtype)
+        torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
+
+    def test_zeros_padded_last_dim(self):
+        # Test zeros with last dimension requiring padding (not 64)
+        x_spyre = torch.zeros(3, 50, device="spyre", dtype=self.dtype)
+        x = torch.zeros(3, 50, dtype=self.dtype)
+        torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
+
     # --- View layout: identity ---
 
     def test_view_identity_2d(self):
