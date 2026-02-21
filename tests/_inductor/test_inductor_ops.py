@@ -982,6 +982,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         print(f"Warn {len(record)}")
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_decompositions_change(self, x):
         import torch_spyre
         import types
@@ -1034,7 +1035,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         f"Unexpected object in decomposition op: {op}, fn: {fn}"
                     )
 
-    @unittest.skip("Interference between cpu and spyre compile")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings(
+        "ignore::UserWarning"
+    )  # because of forced cache disabling
     def test_decompositions_graph(self):
         from torch._dynamo.testing import (
             InductorAndRecordGraphs,
@@ -1059,9 +1063,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             t = torch.arange(65, device=device)
             return t
 
+        # For the `cpu`, there is a decomposition for arange which should be captured
         torch.compiler.reset()
         backend = InductorAndRecordGraphs()
-        cmp = torch.compile(fn, fullgraph=True, backend=backend)
+        cmp = torch.compile(fn, backend=backend)
         out = cmp("cpu")
         _check_out(out, torch.arange(65))
         expected_graph_str = """\
@@ -1075,6 +1080,7 @@ class <lambda>(torch.nn.Module):
         )
         assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
+        # For `spyre`, there is NO decomposition for arange
         torch.compiler.reset()
         backend = InductorAndRecordGraphs()
         cmp = torch.compile(fn, backend=backend)
@@ -1083,7 +1089,7 @@ class <lambda>(torch.nn.Module):
         expected_graph_str = """\
 class <lambda>(torch.nn.Module):
     def forward(self):
-        arange: "i64[65]" = torch.ops.aten.arange.default(65, device = device(type='cpu'), pin_memory = False)
+        arange: "i64[65]" = torch.ops.aten.arange.default(65, device = device(type='spyre'), pin_memory = False)
         return (arange,)
 """
         inductor_graph_str = normalize_gm(
@@ -1091,6 +1097,7 @@ class <lambda>(torch.nn.Module):
         )
         assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
+        # Check that `cpu` still has the decomposition registered
         torch.compiler.reset()
         backend = InductorAndRecordGraphs()
         cmp = torch.compile(fn, fullgraph=True, backend=backend)
@@ -1108,10 +1115,16 @@ class <lambda>(torch.nn.Module):
         assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
         def fn(device):
-            t1 = torch.arange(65, device=device).to("cpu")
+            t1 = torch.arange(65, device=device).to("cpu")  # noqa: F841
             t2 = torch.arange(65, device="cpu")
             return t2
 
+        # In case the graph contains `spyre` and `cpu` tensors,
+        # the decompositons of `spyre` are used and thus the
+        # `cpu` arange is not used anymore.
+        # Note: This is a known limitation at the moment as the
+        # spyre-specific lowerings and decompositions are
+        # merged PER GRAPH not per instruction
         torch.compiler.reset()
         backend = InductorAndRecordGraphs()
         cmp = torch.compile(fn, backend=backend)

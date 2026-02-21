@@ -136,7 +136,6 @@ def enable_spyre_decompositions():
                         decompositions[spyre_decompositions_op] = (
                             saved_intree_decompositions[spyre_decompositions_op]
                         )
-                        pass
                     else:
                         decompositions.pop(spyre_decompositions_op, None)
 
