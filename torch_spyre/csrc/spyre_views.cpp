@@ -112,6 +112,11 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
       groups.push_back({{}, {new_j}});
       if (old_stl.dim_map[old_stl.device_size.size() - 1] == -1) {
         sparse_to_dense_stick_dim = new_j;
+      } else {
+        if (!size_1_insertions.count(old_i - 1)) {
+          size_1_insertions[old_i - 1] = {};
+        }
+        size_1_insertions[old_i - 1].push_back(new_j);
       }
       new_j++;
       continue;

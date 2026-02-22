@@ -615,16 +615,16 @@ class TestOps(TestCase):
         x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
         y = x.view(512, 256, 1)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
+        self.assertEqual(stl.device_size, [1, 4, 512, 64])
+        self.assertEqual(stl.dim_map, [2, 1, 0, 1])
 
     def test_view_insert_multiple_size1(self):
         """[512, 256] -> [1, 512, 1, 256, 1]: multiple size-1 insertions."""
         x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
         y = x.view(1, 512, 1, 256, 1)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 1, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 3, 0, 1, 3])
+        self.assertEqual(stl.device_size, [1, 1, 4, 1, 512, 64])
+        self.assertEqual(stl.dim_map, [2, 4, 3, 0, 1, 3])
 
     # --- View layout: size-1 removal (squeeze equivalent) ---
 
