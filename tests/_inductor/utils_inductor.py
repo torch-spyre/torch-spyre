@@ -170,13 +170,23 @@ class ParameterizedTestMeta(type):
 
 # compare with cpu
 def compare_with_cpu(
-    fn, *args, atol=0.1, rtol=0.1, needs_device=False, cpu_compile=True
+    fn,
+    *args,
+    atol=0.1,
+    rtol=0.1,
+    needs_device=False,
+    cpu_compile=True,
+    compile_only=True,
 ):
-    def _run_compiled_device(device):
+    def _run_device(device, compile=True):
         torch._dynamo.reset_code_caches()  # kernel caching workaround
         device_args = [arg.to(device) for arg in args]
         device_kwargs = {"device": device} if needs_device else {}
-        result = torch.compile(fn)(*device_args, **device_kwargs)
+        if compile:
+            cmp = torch.compile(fn)
+        else:
+            cmp = fn
+        result = cmp(*device_args, **device_kwargs)
         if not isinstance(result, int):
             assert result.device.type == device.type, (
                 f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
@@ -185,7 +195,22 @@ def compare_with_cpu(
         return result
 
     cpu_result = fn(*args)
-    spyre_compiled_result = _run_compiled_device(DEVICE)
+
+    if not compile_only:
+        # Eager-mode check.
+        # Run this mode first, because otherwise side effects might wrongly trick the test into passing.
+        spyre_eager_result = _run_device(DEVICE, False)
+        torch.testing.assert_close(
+            spyre_eager_result,
+            cpu_result,
+            equal_nan=True,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"eager spyre <-> eager cpu mismatch\n\n{msg}\n",
+        )
+
+    # torch.compile-mode check
+    spyre_compiled_result = _run_device(DEVICE, True)
 
     torch.testing.assert_close(
         spyre_compiled_result,
@@ -193,12 +218,22 @@ def compare_with_cpu(
         equal_nan=True,
         atol=atol,
         rtol=rtol,
-        msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        msg=lambda msg: f"compiled spyre <-> eager cpu mismatch\n\n{msg}\n",
     )
 
     if cpu_compile:
         # Test against compiled cpu function
-        cpu_compiled_result = _run_compiled_device(torch.device("cpu"))
+        cpu_compiled_result = _run_device(torch.device("cpu"), True)
+
+        if not compile_only:
+            torch.testing.assert_close(
+                spyre_eager_result,
+                cpu_compiled_result,
+                equal_nan=True,
+                atol=atol,
+                rtol=rtol,
+                msg=lambda msg: f"eager spyre <-> compiled cpu mismatch\n\n{msg}\n",
+            )
 
         torch.testing.assert_close(
             spyre_compiled_result,

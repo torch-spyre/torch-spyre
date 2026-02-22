@@ -869,15 +869,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         if a.dtype == torch.float32:
-            compare_with_cpu(op, a, b)
+            compare_with_cpu(op, a, b, compile_only=False)
         elif op == torch.bmm:
             # TODO: Eager mode mismatch causing cryptic error, sidestep for now.
-            compare_with_cpu(op, a, b)
+            compare_with_cpu(op, a, b, compile_only=False)
         else:
             compare(op, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
-        compare_with_cpu(op, x, y)
+        compare_with_cpu(op, x, y, compile_only=False)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -930,10 +930,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
 
     def test_activation_cls(self, op, input, kwargs, err):
-        compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
+        compare_with_cpu(
+            lambda x: op(**kwargs)(x), input, atol=err, rtol=err, compile_only=False
+        )
 
     def test_activation_fn(self, op, input, err):
-        compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
+        compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err, compile_only=False)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
@@ -981,7 +983,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
 
-        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False, compile_only=False)
 
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
@@ -1003,7 +1005,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 input, input.shape[1:], weight=weight, bias=bias
             )
 
-        compare_with_cpu(fn, input, weight, bias)
+        compare_with_cpu(fn, input, weight, bias, compile_only=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

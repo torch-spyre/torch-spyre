@@ -50,6 +50,7 @@ class TestBuildingBlocks(unittest.TestCase):
             torch.full([D, T], threshold, dtype=torch.float16),
             torch.full([D, T], 1.0, dtype=torch.float16),
             torch.full([D, T], -1.0, dtype=torch.float16),
+            compile_only=False,
         )
 
     def test__simple_attn(self):
