@@ -159,9 +159,6 @@ def infer_squeeze_geometry(
         if dim_check or tensor.size(idx) != 1:
             sizes.append(tensor.size(idx))
             strides.append(tensor.stride(idx))
-        elif idx == stick_dim:
-            # We cannot squeeze the stick dimension!
-            raise ValueError("The stick dimension cannot be squeezed")
 
     new_stl = torch_spyre._C.compute_view_layout(tensor.size(), sizes, current_stl)
 
