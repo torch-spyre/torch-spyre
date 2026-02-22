@@ -47,6 +47,10 @@ def wildcard_symbol(dim) -> Symbol:
     return sympy.Symbol(f"*_{dim}")
 
 
+def is_wildcard(s: Symbol) -> bool:
+    return s.name.startswith("*_")
+
+
 def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
     """
     Construct a mapping from the dimensions of layout
