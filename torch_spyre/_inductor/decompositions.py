@@ -68,7 +68,25 @@ def enable_spyre_decompositions():
         if first_enter:
             from torch_spyre.fallbacks import fallback_ops
             from torch._inductor.decomposition import decompositions
+            from torch._ops import OpOverload, OpOverloadPacket
 
+            # Helper function to remove ops from decompositions
+            def _fetch_and_remove_op(ops):
+                _removed = {}
+                for op in ops:
+                    if isinstance(op, OpOverloadPacket):
+                        for overload_name in op.overloads():
+                            opo = getattr(op, overload_name)
+                            op_ret = decompositions.pop(opo, None)
+                            if op_ret is not None:
+                                _removed[opo] = op_ret
+                    elif isinstance(op, OpOverload):
+                        op_ret = decompositions.pop(op, None)
+                        if op_ret is not None:
+                            _removed[op] = op_ret
+                return _removed
+
+            # 1. Add/override spyre-specific decompositions
             saved_intree_decompositions = {}
             for (
                 spyre_decompositions_op,
@@ -85,35 +103,20 @@ def enable_spyre_decompositions():
                 saved_intree_decompositions
             )
 
-            from torch._ops import OpOverload, OpOverloadPacket
-
-            def _fetch_and_remove_op(ops):
-                _removed = {}
-                for op in ops:
-                    if isinstance(op, OpOverloadPacket):
-                        for overload_name in op.overloads():
-                            opo = getattr(op, overload_name)
-                            op_ret = decompositions.pop(opo, None)
-                            if op_ret is not None:
-                                _removed[opo] = op_ret
-                    elif isinstance(op, OpOverload):
-                        op_ret = decompositions.pop(op, None)
-                        if op_ret is not None:
-                            _removed[op] = op_ret
-                return _removed
-
-            # Remove the selected decompositions from Inductor's registry for Spyre
-            # but attach to the function so we restore on last exit
+            # 2. Remove selected decompositions from Inductor's registry for spyre
             _removed_decompositions_to_exclude = _fetch_and_remove_op(
                 spyre_decompositions_to_exclude
             )
+
+            # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._removed_decompositions_to_exclude = (
                 _removed_decompositions_to_exclude
             )
 
-            # Remove decompositions for fallback ops defined in fallbacks.py
-            # but attach to the function so we restore on last exit
+            # 3. Remove selected decompositions for fallback ops defined in fallbacks.py
             _removed_decompositions_fallback_ops = _fetch_and_remove_op(fallback_ops)
+
+            # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._removed_decompositions_fallback_ops = (
                 _removed_decompositions_fallback_ops
             )
@@ -124,7 +127,31 @@ def enable_spyre_decompositions():
             _decompositions_nesting -= 1
             last_exit = (_decompositions_nesting == 0)  # fmt: skip
             if last_exit:
-                # Reset the saved in-tree lowerings if needed
+                # Inverse order compared to when entering the context manager
+
+                # 1. Revert selected decompositions that have been marked for fallback ops
+                removed_decompositions_fallback_ops = getattr(
+                    enable_spyre_decompositions,
+                    "_removed_decompositions_fallback_ops",
+                    {},
+                )
+                [
+                    torch._decomp._add_op_to_registry(decompositions, op, fn)
+                    for op, fn in removed_decompositions_fallback_ops.items()
+                ]
+
+                # 2. Revert selected decompositions that have been removed from Inductor's registry for spyre
+                removed_decompositions_to_exclude = getattr(
+                    enable_spyre_decompositions,
+                    "_removed_decompositions_to_exclude",
+                    {},
+                )
+                [
+                    torch._decomp._add_op_to_registry(decompositions, op, fn)
+                    for op, fn in removed_decompositions_to_exclude.items()
+                ]
+
+                # 3. Reset the saved in-tree lowerings if needed
                 saved_intree_decompositions = getattr(
                     enable_spyre_decompositions, "_saved_decompositions", {}
                 )
@@ -138,28 +165,6 @@ def enable_spyre_decompositions():
                         )
                     else:
                         decompositions.pop(spyre_decompositions_op, None)
-
-                # Re-add the selected decompositions that were excluded before
-                removed_decompositions_to_exclude = getattr(
-                    enable_spyre_decompositions,
-                    "_removed_decompositions_to_exclude",
-                    {},
-                )
-                [
-                    torch._decomp._add_op_to_registry(decompositions, op, fn)
-                    for op, fn in removed_decompositions_to_exclude.items()
-                ]
-
-                # Re-add the fallback decompositions that were excluded before
-                removed_decompositions_fallback_ops = getattr(
-                    enable_spyre_decompositions,
-                    "_removed_decompositions_fallback_ops",
-                    {},
-                )
-                [
-                    torch._decomp._add_op_to_registry(decompositions, op, fn)
-                    for op, fn in removed_decompositions_fallback_ops.items()
-                ]
 
                 # Clean up
                 enable_spyre_decompositions._saved_decompositions = {}
