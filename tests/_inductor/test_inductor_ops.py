@@ -825,6 +825,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_rmsnorm", "test_rmsnorm_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1004,6 +1011,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
         compare_with_cpu(fn, input, weight, bias)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_rmsnorm_cpu(self, x):
+        def fn(input):
+            return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
+
+        compare_with_cpu(fn, x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

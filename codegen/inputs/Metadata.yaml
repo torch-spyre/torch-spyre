@@ -18,6 +18,8 @@
   template_name: base
 - operator_name: bitwise_not
   template_name: base
+- operator_name: bmm
+  template_name: base
 - operator_name: cat
   template_name: base
 - operator_name: cumsum
@@ -71,8 +73,6 @@
   template_name: base
 - operator_name: neg
   template_name: base
-- operator_name: permute
-  template_name: view
 - operator_name: pow
   template_name: base
 - operator_name: reciprocal
