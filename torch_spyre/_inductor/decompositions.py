@@ -38,19 +38,16 @@ def register_spyre_decomposition_via_dispatchkey(
     """
 
     def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
-        orig_fn = fn
-        
         class OPWrapper:
-            
             def __init__(self, op, spyre_fn):
                 self.op = op
                 self.spyre_fn = spyre_fn
                 self._spyre_enabled = True
-            
+
             @property
             def spyre_enabled(self):
                 return self._spyre_enabled
-            
+
             @spyre_enabled.setter
             def spyre_enabled(self, value):
                 self._spyre_enabled = bool(value)
