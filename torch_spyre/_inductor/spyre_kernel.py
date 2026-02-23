@@ -30,6 +30,8 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
+from torch_spyre._C import compute_view_layout
+
 from .runtime import ConstantArg, KernelSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
@@ -41,6 +43,7 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import map_dims_to_vars, wildcard_symbol
+from .stickify import is_sparse
 
 
 class RValue(ABC):
@@ -54,6 +57,16 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+
+    def __post_init__(self):
+        size = torch.Size(self.layout.size)
+        stl = self.layout.device_layout
+        # TODO: Cannonicallize to simplify SDSC codegen; should this be pushed down to inside SDSC codegen instead?
+        if is_sparse(stl):
+            new_size = size + (1,)
+            self.layout.device_layout = compute_view_layout(size, new_size, stl)
+            self.layout.size = new_size
+            self.layout.stride = self.layout.stride + [1]
 
 
 @dataclass
