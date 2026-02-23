@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from typing import Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
+from torch._inductor.decomposition import register_decomposition
+from .errors import Unsupported
 
 import threading
 
@@ -38,9 +40,6 @@ spyre_decompositions_to_exclude = [
     # See: https://github.com/torch-spyre/torch-spyre/issues/128#issuecomment-3576168221
     torch.ops.aten.new_ones,
 ]
-
-from torch._inductor.decomposition import register_decomposition
-from .errors import Unsupported
 
 
 def register_spyre_decomposition(
