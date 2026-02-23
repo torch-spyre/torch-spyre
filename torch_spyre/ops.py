@@ -96,9 +96,7 @@ def spyre__transpose_int(self: torch.Tensor, dim0: int, dim1: int) -> torch.Tens
             dim_map[idx] = dim1
         elif dim == dim1:
             dim_map[idx] = dim0
-    new_stl = SpyreTensorLayout(
-        prev_stl.device_size, dim_map, prev_stl.device_dtype
-    )
+    new_stl = SpyreTensorLayout(prev_stl.device_size, dim_map, prev_stl.device_dtype)
 
     result = as_strided_with_layout(
         self, tuple(sizes), tuple(strides), self.storage_offset(), new_stl
@@ -180,7 +178,9 @@ def spyre__squeeze_dims(self: torch.Tensor, dim: list[int]) -> torch.Tensor:
 
 # derived from https://github.com/pytorch/pytorch/blob/f91f262275e12bd6249a2bcd2c3c06e0c78e20ee/aten/src/ATen/native/TensorShape.cpp#L3943
 # with changes specific to Spyre
-def infer_unsqueeze_geometry(tensor: torch.Tensor, dim: int) -> tuple[tuple[int, ...], tuple[int, ...], SpyreTensorLayout]:
+def infer_unsqueeze_geometry(
+    tensor: torch.Tensor, dim: int
+) -> tuple[tuple[int, ...], tuple[int, ...], SpyreTensorLayout]:
     sizes = list(tensor.size())
     strides = list(tensor.stride())
 
@@ -225,7 +225,6 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     self.copy_(tmp)
     # TODO: Can we zero out tensors in-place without copy
     return self
-
 
 
 # INSERT_CODEGEN_HERE
