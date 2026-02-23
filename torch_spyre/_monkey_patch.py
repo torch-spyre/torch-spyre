@@ -89,8 +89,11 @@ def _patch_tensor_for_spyre():
                 memory_format=memory_format,
             )
         else:
+            # layout_opt is omitted; c10::Layout has no pybind11 type caster,
+            # so py_empty_with_layout drops that parameter and always uses
+            # the default (Strided).
             return empty_with_layout(
-                *args, device_layout, dtype, None, device, pin_memory, memory_format
+                *args, device_layout, dtype, device, pin_memory, memory_format
             )
 
     torch.Tensor.__repr__ = spyre_aware_repr

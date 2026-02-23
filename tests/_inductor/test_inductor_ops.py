@@ -155,6 +155,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {"bmm": torch.bmm},
             "param_sets": make_param_dict(
                 [
+                    ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                 ]
             ),
@@ -166,6 +167,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((512, 256), (256, 128)),
+                    ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((3, 17, 128, 256), (3, 17, 256, 128)),
                 ]
@@ -814,6 +816,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_layernorm", "test_layernorm_cpu"): {
+            "param_sets": {
+                "2d": (
+                    cached_randn((256, 128), dtype=torch.float16),  # input
+                    cached_randn((128), dtype=torch.float16),  # weight
+                    torch.zeros([128], dtype=torch.float16),  # bias
+                ),
+            },
+        },
+        ("test_rmsnorm", "test_rmsnorm_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -985,6 +1003,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return p @ v
 
         compare_with_cpu(fn, *args)
+
+    def test_layernorm_cpu(self, input, weight, bias):
+        def fn(input, weight, bias):
+            return torch.nn.functional.layer_norm(
+                input, input.shape[1:], weight=weight, bias=bias
+            )
+
+        compare_with_cpu(fn, input, weight, bias)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_rmsnorm_cpu(self, x):
+        def fn(input):
+            return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
+
+        compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_implicit_loading(self):
+        def test(end, device=None):
+            return torch.arange(end, device=device, dtype=torch.float16)
+
+        compiled = torch.compile(test, backend="inductor")
+        output = compiled(64.0, device="spyre")
+
+        _ = output.cpu()
 
 
 if __name__ == "__main__":

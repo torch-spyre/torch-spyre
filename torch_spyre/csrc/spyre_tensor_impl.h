@@ -129,6 +129,10 @@ class SpyreTensorImpl : public at::TensorImpl {
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
 
+  SpyreTensorImpl(at::TensorImpl::ImplType unused, c10::Storage&& storage,
+                  c10::DispatchKeySet key_set,
+                  const caffe2::TypeMeta data_type);
+
   SpyreTensorImpl(c10::Storage storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype, SpyreTensorLayout stl);
   const at::Storage& storage() const override;
@@ -152,5 +156,7 @@ class SpyreTensorImpl : public at::TensorImpl {
 
 uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
+void set_spyre_tensor_layout(const at::Tensor& tensor,
+                             const SpyreTensorLayout& stl);
 
 }  // namespace spyre

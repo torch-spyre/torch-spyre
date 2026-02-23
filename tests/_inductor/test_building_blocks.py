@@ -76,14 +76,13 @@ class TestBuildingBlocks(unittest.TestCase):
             sm_scale.repeat(k.shape[0]),
         )
 
-    @unittest.skip("result divergent from CPU -- need to investigate")
     def test_mlp(self):
         seq_len = 256
         emb_dim = 1024
-        x = torch.randn(seq_len, emb_dim)
-        gate_proj_weight = torch.empty(emb_dim, 4 * emb_dim)
-        up_proj_weight = torch.empty(emb_dim, 4 * emb_dim)
-        down_proj_weight = torch.empty(4 * emb_dim, emb_dim)
+        x = torch.randn(seq_len, emb_dim, dtype=torch.float16)
+        gate_proj_weight = torch.empty(emb_dim, 4 * emb_dim, dtype=torch.float16)
+        up_proj_weight = torch.empty(emb_dim, 4 * emb_dim, dtype=torch.float16)
+        down_proj_weight = torch.empty(4 * emb_dim, emb_dim, dtype=torch.float16)
         nn.init.kaiming_uniform_(gate_proj_weight)
         nn.init.kaiming_uniform_(up_proj_weight)
         nn.init.kaiming_uniform_(down_proj_weight)
