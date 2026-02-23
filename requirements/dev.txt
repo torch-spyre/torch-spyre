@@ -61,7 +61,7 @@ ninja==1.13.0
     # via torch-spyre
 nodeenv==1.10.0
     # via pre-commit
-numpy==2.3.5
+numpy==2.4.2
     # via
     #   torch-spyre
     #   transformers
@@ -92,7 +92,7 @@ pyyaml==6.0.3
     #   pre-commit
     #   torch-spyre
     #   transformers
-regex==2025.11.3
+regex==2026.2.19
     # via
     #   torch-spyre
     #   transformers

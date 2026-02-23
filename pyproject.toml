@@ -23,8 +23,8 @@ authors = [
 ]
 description = "Torch-Spyre out of tree registration"
 dependencies = [
-    "numpy~=2.3.4",
-    "regex~=2025.11.3",
+    "numpy",
+    "regex",
     "torch~=2.10.0",
     "psutil~=7.2.1"
 ]

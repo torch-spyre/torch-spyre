@@ -40,7 +40,7 @@ ninja==1.13.0
     # via torch-spyre
 nodeenv==1.10.0
     # via pre-commit
-numpy==2.3.5
+numpy==2.4.2
     # via torch-spyre
 packaging==26.0
     # via
@@ -58,7 +58,7 @@ pyyaml==6.0.3
     # via
     #   pre-commit
     #   torch-spyre
-regex==2025.11.3
+regex==2026.2.19
     # via torch-spyre
 setuptools==75.8.2
     # via

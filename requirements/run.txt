@@ -12,11 +12,11 @@ mpmath==1.3.0
     # via sympy
 networkx==3.6.1
     # via torch
-numpy==2.3.5
+numpy==2.4.2
     # via torch-spyre
 psutil==7.2.2
     # via torch-spyre
-regex==2025.11.3
+regex==2026.2.19
     # via torch-spyre
 setuptools==75.8.2
     # via torch
