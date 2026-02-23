@@ -216,5 +216,6 @@ class <lambda>(torch.nn.Module):
         )
         assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
+
 if __name__ == "__main__":
     unittest.main()
