@@ -56,19 +56,20 @@ def spyre__permute(self: torch.Tensor, dims: list[int]) -> torch.Tensor:
     new_sizes = [sizes[d] for d in dims]
     new_strides = [strides[d] for d in dims]
 
-    prev_stl = self.device_tensor_layout()
+    prev_stl: SpyreTensorLayout = self.device_tensor_layout()
+    assert isinstance(prev_stl, SpyreTensorLayout)
     inv_perm = [0] * ndims
     for new_pos, old_pos in enumerate(dims):
         inv_perm[old_pos] = new_pos
 
     new_dim_map = [inv_perm[dim] for dim in prev_stl.dim_map]
 
-    new_stl = torch_spyre._C.SpyreTensorLayout(
+    new_stl = SpyreTensorLayout(
         prev_stl.device_size, new_dim_map, prev_stl.device_dtype
     )
 
-    result = torch_spyre._C.as_strided_with_layout(
-        self, new_sizes, new_strides, self.storage_offset(), new_stl
+    result = as_strided_with_layout(
+        self, tuple(new_sizes), tuple(new_strides), self.storage_offset(), new_stl
     )
     return result
 
