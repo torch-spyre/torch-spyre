@@ -1000,10 +1000,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(fn, *args)
 
     def test_layernorm_cpu(self, input, weight, bias):
+        import torch_spyre._inductor.decompositions  # noqa: F401
+        from torch_spyre._inductor.decompositions import enable_spyre_decomposition_via_dispatchkey
+        
         def fn(input, weight, bias):
-            return torch.nn.functional.layer_norm(
-                input, input.shape[1:], weight=weight, bias=bias
-            )
+            with enable_spyre_decomposition_via_dispatchkey():
+                out = torch.nn.functional.layer_norm(
+                    input, input.shape[1:], weight=weight, bias=bias
+                )
+            return out
 
         compare_with_cpu(fn, input, weight, bias, compile_only=False)
 
