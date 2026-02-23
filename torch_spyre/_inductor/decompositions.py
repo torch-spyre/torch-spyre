@@ -39,6 +39,9 @@ spyre_decompositions_to_exclude = [
     torch.ops.aten.new_ones,
 ]
 
+from torch._inductor.decomposition import register_decomposition
+from .errors import Unsupported
+
 
 def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
@@ -190,6 +193,24 @@ def layernorm_decomp(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
+@register_decomposition([torch.ops.spyre.rms_norm])
+def rmsnorm_decomp(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    # TODO: limitation with mean on dim=-1, transpose for now to avoid
+    # https://github.com/torch-spyre/torch-spyre/issues/632
+    input = input.transpose(-1, -2).contiguous()
+    eps = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
+    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps
+    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
+    if weight is not None:
+        output = output * weight
+    return output
+
+
 # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
 # a one-element Spyre tensor. This currently fails because Spyre does not handle
 # single-element tensors well.
@@ -232,6 +253,25 @@ def spyre_layer_norm(
 
 
 torch.nn.functional.layer_norm = spyre_layer_norm
+
+orig_rms_norm = torch.nn.functional.rms_norm
+
+
+def spyre_rms_norm(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: Optional[float] = None,
+) -> torch.Tensor:
+    if input.device.type == "spyre" and len(normalized_shape) == 1:
+        return torch.ops.spyre.rms_norm(input, normalized_shape, weight, eps)
+    elif input.device.type == "spyre" and len(normalized_shape) != 1:
+        raise Unsupported("RMSNorm reducing more than 1 dimension")
+    else:
+        return orig_rms_norm(input, normalized_shape, weight, eps)
+
+
+torch.nn.functional.rms_norm = spyre_rms_norm
 
 orig_gelu = torch.nn.functional.gelu
 
