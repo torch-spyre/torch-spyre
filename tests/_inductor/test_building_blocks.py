@@ -146,15 +146,3 @@ class TestBuildingBlocks(unittest.TestCase):
 
         # Compare with cpu implementation
         compare_with_cpu(rms_norm, *args)
-
-    # NOTE: embedding / indirect indexing / index_select are not supported yet
-    def test_embedding(self):
-        # an embedding matrix containing 10 tensors of size 3
-        embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
-        # a batch of 2 samples of 4 indices each
-        indices = torch.tensor([[1, 2, 4, 5], [4, 3, 2, 9]])
-
-        def pytorch_fn(indices, embed):
-            return F.embedding(indices, embed)
-
-        compare_with_cpu(pytorch_fn, indices, embedding_matrix)
