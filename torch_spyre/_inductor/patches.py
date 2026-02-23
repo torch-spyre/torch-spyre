@@ -39,7 +39,9 @@ def enable_spyre_context(example_inputs):
     # Ensure decorators run (custom ops/decomp/lowerings modules)
     import torch_spyre._inductor.customops  # noqa: F401
     import torch_spyre._inductor.decompositions  # noqa: F401
-    from torch_spyre._inductor.decompositions import enable_spyre_decomposition_via_dispatchkey
+    from torch_spyre._inductor.decompositions import (
+        enable_spyre_decomposition_via_dispatchkey,
+    )
     import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.choices import SpyreHeuristics
     from torch_spyre._inductor.passes import (

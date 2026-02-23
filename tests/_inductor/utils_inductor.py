@@ -194,7 +194,7 @@ def compare_with_cpu(
             result = result.cpu()
         return result
 
-    # cpu_result = fn(*args)
+    cpu_result = fn(*args)
 
     if not compile_only:
         # Eager-mode check.

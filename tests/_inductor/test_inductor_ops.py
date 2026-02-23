@@ -869,15 +869,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         if a.dtype == torch.float32:
-            compare_with_cpu(op, a, b, compile_only=False)
+            compare_with_cpu(op, a, b)
         elif op == torch.bmm:
             # TODO: Eager mode mismatch causing cryptic error, sidestep for now.
-            compare_with_cpu(op, a, b, compile_only=False)
+            compare_with_cpu(op, a, b)
         else:
             compare(op, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
-        compare_with_cpu(op, x, y, compile_only=False)
+        compare_with_cpu(op, x, y)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -930,9 +930,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
 
     def test_activation_cls(self, op, input, kwargs, err):
-        compare_with_cpu(
-            lambda x: op(**kwargs)(x), input, atol=err, rtol=err, compile_only=False
-        )
+        compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
 
     def test_activation_fn(self, op, input, err):
         compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err, compile_only=False)
@@ -983,7 +981,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
 
-        compare_with_cpu(fn, needs_device=True, cpu_compile=False, compile_only=False)
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
@@ -1000,10 +998,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(fn, *args)
 
     def test_layernorm_cpu(self, input, weight, bias):
-        import torch_spyre._inductor.decompositions  # noqa: F401
-        from torch_spyre._inductor.decompositions import enable_spyre_decomposition_via_dispatchkey
+        # Note, this is only done for demonstration purposes so that the 
+        # decomposition.py file and its content is loaded.
+        t = torch.randn(4, dtype=torch.float16).to("spyre")
+        def dummy_fn(x):
+            return x * x
+        res = torch.compile(dummy_fn)(t)
+        print(res)
         
-        t = torch.randn(3).to("spyre")
+        from torch_spyre._inductor.decompositions import (
+            enable_spyre_decomposition_via_dispatchkey,
+        )
         
         def fn(input, weight, bias):
             with enable_spyre_decomposition_via_dispatchkey():
