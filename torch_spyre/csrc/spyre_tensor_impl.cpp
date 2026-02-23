@@ -259,9 +259,7 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
     stl = impl->spyre_layout;
   } else {
-    DEBUGINFO("Warning: Device tensor does not have SpyreTensorImpl");
-    stl = SpyreTensorLayout(tensor.sizes().vec(),
-                            c10::typeMetaToScalarType(tensor.dtype()));
+    TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorLayout");
   }
   return stl;
 }
