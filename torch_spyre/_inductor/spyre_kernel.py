@@ -20,6 +20,8 @@ from collections import Counter
 import torch
 import sympy
 
+from torch_spyre._C import compute_view_layout
+
 from torch._inductor.codegen.common import (
     CSEVariable,
     IndentedBuffer,
@@ -41,6 +43,7 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import map_dims_to_vars, wildcard_symbol
+from .stickify import is_sparse
 
 
 class RValue(ABC):
@@ -54,6 +57,25 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+
+    def unsqueeze_if_sparse(self) -> Self:
+        """
+        If layout is sparse, construct a new layout that unsqueezes to a dense tensor
+        """
+
+        if is_sparse(self.layout.device_layout):
+            new_size = self.layout.size + [1]
+            new_stride = self.layout.stride + [1]
+            new_stl = compute_view_layout(
+                torch.Size(self.layout.size),
+                torch.Size(new_size),
+                self.layout.device_layout,
+            )
+            self.layout = FixedTiledLayout(
+                self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
+            )
+
+        return self
 
 
 @dataclass
@@ -356,7 +378,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        return TensorAccess(name, index, layout)
+        return TensorAccess(name, index, layout).unsqueeze_if_sparse()
 
     def store(
         self,
@@ -371,7 +393,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
+        dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
         actuals = self.args.python_argdefs()[1]
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
