@@ -62,51 +62,66 @@ def enable_spyre_decomposition_via_dispatchkey():
         ...     # Custom spyre implementation is used here
         >>> # Custom implementation is cleaned up here
     """
-    # Store the original kernels so we can restore them
-    original_kernels = {}
-    newly_registered = []
+    from torch.library import Library, fallthrough_kernel
+    
+    # lib = Library("aten", "IMPL", "PrivateUse1")
+    # lib = Library("aten", "IMPL", "spyre")
+    
+    autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
+    lib = Library("aten", "IMPL", "PrivateUse1")
+    
+    saved_intree_kernels = []
+    
+    def _store_prev_kernel(op):
+        def _old_kernel(*args, **kwargs):
+            # Temporarily remove PrivateUse1 from keyset
+            with torch._C._ExcludeDispatchKeyGuard(torch._C.DispatchKey.PrivateUse1),\
+                    torch._C._ExcludeDispatchKeyGuard(torch._C.DispatchKey.AutogradPrivateUse1):
+                return op(*args, **kwargs)
+        saved_intree_kernels.append((op, "PrivateUse1", _old_kernel))
+    
+    for op, fn in spyre_decomposition_via_dispatchkey.items():
+        # print(torch._C._dispatch_dump_table("aten::layer_norm"))
+        # print(torch._C._dispatch_dump_table(op._name))
+        
+        _store_prev_kernel(op)
+        
+        # autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
+        autograd_lib.impl(op._name, fallthrough_kernel)
+        
+        # lib = Library("aten", "IMPL", "PrivateUse1")
+        lib.impl(op._name, fn)
+        
+        # print(torch._C._dispatch_dump_table(op._name))
+        
+        
+        # # Check if already registered for PrivateUse1
+        # if torch._C.DispatchKey.PrivateUse1 in op.py_kernels:
+        #     # Already registered, store it so we can restore later
+        #     original_kernels[op] = op.py_kernels[torch._C.DispatchKey.PrivateUse1]
+        #     # Skip re-registration to avoid "Trying to override" error
+        #     continue
+        
+        # # Register the custom implementation for PrivateUse1 (spyre)
+        # op.py_impl(torch._C.DispatchKey.PrivateUse1)(fn)
+        # newly_registered.append(op)
+        
+        # # Clear dispatch cache to ensure new implementation is used
+        # if hasattr(op, '_dispatch_cache'):
+        #     op._dispatch_cache.clear()
+        
+    # Attach to the function so we can restore on last exit
+    enable_spyre_decomposition_via_dispatchkey._saved_intree_kernels = (
+        saved_intree_kernels
+    )
     
     try:
-        for op, fn in spyre_decomposition_via_dispatchkey.items():
-            # Check if already registered for PrivateUse1
-            if torch._C.DispatchKey.PrivateUse1 in op.py_kernels:
-                # Already registered, store it so we can restore later
-                original_kernels[op] = op.py_kernels[torch._C.DispatchKey.PrivateUse1]
-                # Skip re-registration to avoid "Trying to override" error
-                continue
-            
-            # Register the custom implementation for PrivateUse1 (spyre)
-            op.py_impl(torch._C.DispatchKey.PrivateUse1)(fn)
-            newly_registered.append(op)
-            
-            # Clear dispatch cache to ensure new implementation is used
-            if hasattr(op, '_dispatch_cache'):
-                op._dispatch_cache.clear()
-        
         yield
         
     finally:
         # Clean up: restore or remove the registered implementations
-        for op in newly_registered:
-            try:
-                # Remove our custom kernel (only for newly registered ones)
-                if torch._C.DispatchKey.PrivateUse1 in op.py_kernels:
-                    del op.py_kernels[torch._C.DispatchKey.PrivateUse1]
-                
-                # Clear dispatch cache again
-                if hasattr(op, '_dispatch_cache'):
-                    op._dispatch_cache.clear()
-            except:
-                pass
-        
-        # Restore original kernels
-        for op, original_kernel in original_kernels.items():
-            try:
-                op.py_kernels[torch._C.DispatchKey.PrivateUse1] = original_kernel
-                if hasattr(op, '_dispatch_cache'):
-                    op._dispatch_cache.clear()
-            except:
-                pass
+        for op, dispatchkey, fn in saved_intree_kernels:
+            lib.impl(op._name, fn)
 
 # @register_decomposition([torch.ops.spyre.compact])
 # def compact_decomp(x: torch.Tensor) -> torch.Tensor:
@@ -152,10 +167,10 @@ def enable_spyre_decomposition_via_dispatchkey():
 Hook torch.nn.functional.layer_norm to select spyre optimized version where applicable
 """
 # Store original layer_norm function for fallback
-orig_layer_norm = torch.nn.functional.layer_norm
+# orig_layer_norm = torch.nn.functional.layer_norm
 
 # Register the native_layer_norm operator for spyre device
-@register_spyre_decomposition_via_dispatchkey([torch.ops.aten.native_layer_norm.default])
+@register_spyre_decomposition_via_dispatchkey([torch.ops.aten.native_layer_norm.default, torch.ops.aten.native_batch_norm.default])
 def spyre_native_layer_norm(
     input: torch.Tensor,
     normalized_shape: Sequence[int],
@@ -178,83 +193,86 @@ def spyre_native_layer_norm(
         rstd = torch.rsqrt(var + eps)
         return output, mean.to(input.device), rstd.to(input.device)
     else:
+        # with torch._C._ExcludeDispatchKeyGuard(
+        #     torch._C.DispatchKey.PrivateUse1
+        # ):
         # Fallback to default implementation
         return torch.ops.aten.native_layer_norm.default(input, normalized_shape, weight, bias, eps)
 
-# CRITICAL WORKAROUND: torch.layer_norm incorrectly dispatches to native_batch_norm for PrivateUse1
-# This appears to be a bug in PyTorch's dispatch system for custom backends.
-# Register native_batch_norm to redirect to layer_norm as a workaround.
-@register_spyre_decomposition_via_dispatchkey([torch.ops.aten.native_batch_norm.default])
-def spyre_native_batch_norm_redirect(
-    input: torch.Tensor,
-    weight: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
-    running_mean: Optional[torch.Tensor],
-    running_var: Optional[torch.Tensor],
-    training: bool,
-    momentum: float,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    WORKAROUND: torch.layer_norm incorrectly calls native_batch_norm for PrivateUse1.
-    Redirect to layer_norm implementation.
-    """
-    # Infer normalized_shape from weight if available, otherwise use last dimension
-    if weight is not None:
-        normalized_shape = list(weight.shape)
-    else:
-        normalized_shape = [input.shape[-1]]
+# # CRITICAL WORKAROUND: torch.layer_norm incorrectly dispatches to native_batch_norm for PrivateUse1
+# # This appears to be a bug in PyTorch's dispatch system for custom backends.
+# # Register native_batch_norm to redirect to layer_norm as a workaround.
+# @register_spyre_decomposition_via_dispatchkey([torch.ops.aten.native_batch_norm.default])
+# def spyre_native_batch_norm_redirect(
+#     input: torch.Tensor,
+#     weight: Optional[torch.Tensor],
+#     bias: Optional[torch.Tensor],
+#     running_mean: Optional[torch.Tensor],
+#     running_var: Optional[torch.Tensor],
+#     training: bool,
+#     momentum: float,
+#     eps: float,
+# ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#     """
+#     WORKAROUND: torch.layer_norm incorrectly calls native_batch_norm for PrivateUse1.
+#     Redirect to layer_norm implementation.
+#     """
+#     # Infer normalized_shape from weight if available, otherwise use last dimension
+#     if weight is not None:
+#         normalized_shape = list(weight.shape)
+#     else:
+#         normalized_shape = [input.shape[-1]]
     
-    # Call our layer_norm implementation
-    return spyre_native_layer_norm(input, normalized_shape, weight, bias, eps)
+#     # Call our layer_norm implementation
+#     return spyre_native_layer_norm(input, normalized_shape, weight, bias, eps)
 
 
 # torch.nn.functional.layer_norm = spyre_layer_norm
 
-# Register GELU for spyre device
-# torch.nn.functional.gelu calls torch.ops.aten.gelu.default
-@register_spyre_decomposition_via_dispatchkey([torch.ops.aten.gelu.default])
-def spyre_gelu(
-    input: torch.Tensor,
-    approximate: str = "none",
-) -> torch.Tensor:
-    """
-    Custom implementation of GELU for spyre device.
-    """
-    if input.device.type == "spyre":
-        return torch.ops.spyre.gelu(input, approximate)
-    else:
-        # Fallback to default implementation
-        return torch.ops.aten.gelu.default(input, approximate=approximate)
+# # Register GELU for spyre device
+# # torch.nn.functional.gelu calls torch.ops.aten.gelu.default
+# @register_spyre_decomposition_via_dispatchkey([torch.ops.aten.gelu.default])
+# def spyre_gelu(
+#     input: torch.Tensor,
+#     approximate: str = "none",
+# ) -> torch.Tensor:
+#     """
+#     Custom implementation of GELU for spyre device.
+#     """
+#     if input.device.type == "spyre":
+#         return torch.ops.spyre.gelu(input, approximate)
+#     else:
+#         # Fallback to default implementation
+#         return torch.ops.aten.gelu.default(input, approximate=approximate)
 
 
-# Register softplus for spyre device
-# torch.nn.functional.softplus calls torch.ops.aten.softplus
-@register_spyre_decomposition_via_dispatchkey([
-    torch.ops.aten.softplus.default,
-    torch.ops.aten.softplus.out
-])
-def spyre_softplus(
-    input: torch.Tensor,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-    out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """
-    Custom implementation of softplus for spyre device.
-    Handles both default and out variants.
-    """
-    if input.device.type == "spyre":
-        result = torch.ops.spyre.softplus(input, beta, threshold)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
-    else:
-        # Fallback to default implementation
-        if out is not None:
-            return torch.ops.aten.softplus.out(input, beta, threshold, out=out)
-        return torch.ops.aten.softplus.default(input, beta, threshold)
+# # Register softplus for spyre device
+# # torch.nn.functional.softplus calls torch.ops.aten.softplus
+# @register_spyre_decomposition_via_dispatchkey([
+#     torch.ops.aten.softplus.default,
+#     torch.ops.aten.softplus.out
+# ])
+# def spyre_softplus(
+#     input: torch.Tensor,
+#     beta: float = 1.0,
+#     threshold: float = 20.0,
+#     out: Optional[torch.Tensor] = None
+# ) -> torch.Tensor:
+#     """
+#     Custom implementation of softplus for spyre device.
+#     Handles both default and out variants.
+#     """
+#     if input.device.type == "spyre":
+#         result = torch.ops.spyre.softplus(input, beta, threshold)
+#         if out is not None:
+#             out.copy_(result)
+#             return out
+#         return result
+#     else:
+#         # Fallback to default implementation
+#         if out is not None:
+#             return torch.ops.aten.softplus.out(input, beta, threshold, out=out)
+#         return torch.ops.aten.softplus.default(input, beta, threshold)
 
 
 # @register_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])

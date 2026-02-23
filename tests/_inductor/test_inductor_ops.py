@@ -1003,6 +1003,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         import torch_spyre._inductor.decompositions  # noqa: F401
         from torch_spyre._inductor.decompositions import enable_spyre_decomposition_via_dispatchkey
         
+        t = torch.randn(3).to("spyre")
+        
         def fn(input, weight, bias):
             with enable_spyre_decomposition_via_dispatchkey():
                 out = torch.nn.functional.layer_norm(
