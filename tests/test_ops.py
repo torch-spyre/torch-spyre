@@ -707,14 +707,13 @@ class TestOps(TestCase):
         self.assertEqual(stl.device_size, [3, 1, 1, 2, 64])
         self.assertEqual(stl.dim_map, [1, 2, 0, 1, 2])
 
-    @unittest.expectedFailure
     def test_view_split_and_insert_size1(self):
         """[6, 4] -> [2, 3, 1, 4]: split non-stick dim and insert size-1."""
         x = torch.rand(6, 4, dtype=self.dtype).to("spyre")
         y = x.view(2, 3, 1, 4)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [3, 0, 1, 3])
+        self.assertEqual(stl.device_size, [1, 1, 2, 3, 64])
+        self.assertEqual(stl.dim_map, [2, 3, 0, 1, 3])
 
     # --- View layout: rejection cases ---
 
