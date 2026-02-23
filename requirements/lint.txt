@@ -50,5 +50,5 @@ typing-extensions==4.15.0
     #   torch
 uv==0.9.30
     # via torch-spyre
-virtualenv==20.38.0
+virtualenv==20.39.0
     # via pre-commit
