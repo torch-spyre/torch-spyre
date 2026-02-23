@@ -229,6 +229,14 @@ class TestOps(TestCase):
             y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
         )
 
+    def test_mish(self):
+        x = torch.tensor([1, -2, 3], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.mish(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.mish(x), rtol=self.rtol, atol=self.atol
+        )
+
     def test_exp(self):
         x = torch.tensor([-10, -1, 0, 1, 10], dtype=self.dtype)
         x_spyre = x.to("spyre")
