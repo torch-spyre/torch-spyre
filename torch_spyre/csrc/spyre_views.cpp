@@ -400,9 +400,22 @@ at::Tensor spyre__unsafe_view(const at::Tensor& self, c10::IntArrayRef size) {
   return spyre_view_impl(self, size);
 }
 
+at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
+                                    c10::IntArrayRef size,
+                                    c10::IntArrayRef stride,
+                                    int64_t offset_increment) {
+  TORCH_CHECK(offset_increment == 0,
+              "reinterpert_tensor with offset_increment not implemented");
+  SpyreTensorLayout old_stl =
+      static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+  SpyreTensorLayout new_stl = compute_view_layout(self.sizes(), size, old_stl);
+  return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(spyre_view));
   m.impl("_unsafe_view", TORCH_FN(spyre__unsafe_view));
+  m.impl("reinterpret_tensor", TORCH_FN(spyre_reinterpret_tensor));
 }
 
 }  // namespace spyre
