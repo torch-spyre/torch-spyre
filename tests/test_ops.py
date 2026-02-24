@@ -428,7 +428,6 @@ class TestOps(TestCase):
             z, torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.expectedFailure
     def test_addmm_ab_bc_scaled(self):
         mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_a, self.mm_c
