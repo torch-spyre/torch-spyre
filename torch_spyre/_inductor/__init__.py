@@ -93,6 +93,9 @@ def enable_spyre_compile_fx_wrapper():
         def _wrapper(gm, example_inputs, *args, **kwargs):
             from torch._inductor.decomposition import decompositions
 
+            if "decompositions" in kwargs:
+                kwargs.pop("decompositions")
+
             if _uses_spyre(gm, example_inputs):
                 import torch
 
