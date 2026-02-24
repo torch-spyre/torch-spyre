@@ -78,7 +78,7 @@ typing-extensions==4.15.0
     # via
     #   mypy
     #   torch
-uv==0.9.30
+uv==0.10.5
     # via torch-spyre
 virtualenv==20.39.0
     # via pre-commit
