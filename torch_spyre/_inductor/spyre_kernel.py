@@ -274,7 +274,6 @@ class SpyreKernelOpsHandler(DefaultHandler):
         if reduction_type in [
             "welford_reduce",
             "welford_combine",
-            "any",
             "prod",
             "xor_sum",
         ]:

@@ -832,6 +832,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        ("test_any", "test_any_cpu"): {
+            "param_sets": {
+                "2d_dim0": (
+                    0,
+                    False,
+                    torch.randint(0, 2, (512, 1024), dtype=torch.float16),
+                ),
+                "2d_dim0_keepdim": (
+                    0,
+                    True,
+                    torch.randint(0, 2, (256, 128), dtype=torch.float16),
+                ),
+                "2d_all_true": (
+                    0,
+                    False,
+                    torch.ones(256, 128, dtype=torch.float16),
+                ),
+            }
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1021,6 +1040,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
 
         compare_with_cpu(fn, x)
+
+    def test_any_cpu(self, dim, keepdim, x):
+        compare_with_cpu(lambda x: torch.any(x, dim=dim, keepdim=keepdim), x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

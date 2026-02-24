@@ -470,6 +470,37 @@ class TestOps(TestCase):
             y0, torch.sum(x, dim=[0]), rtol=self.rtol, atol=self.atol
         )
 
+    def test_any_basic(self):
+        x = torch.randint(0, 2, (512, 1024), dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y0 = torch.any(x_spyre, dim=0).to("cpu")
+        torch.testing.assert_close(y0, torch.any(x, dim=0))
+
+    def test_any_keepdim(self):
+        x = torch.randint(0, 2, (256, 128), dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y0 = torch.any(x_spyre, dim=0, keepdim=True).to("cpu")
+        torch.testing.assert_close(y0, torch.any(x, dim=0, keepdim=True))
+
+    def test_any_dim1(self):
+        x = torch.randint(0, 2, (512, 1024), dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y1 = torch.any(x_spyre, dim=1).to("cpu")
+        torch.testing.assert_close(y1, torch.any(x, dim=1))
+
+    def test_any_all_true(self):
+        x = torch.ones(256, 128, dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y0 = torch.any(x_spyre, dim=0).to("cpu")
+        torch.testing.assert_close(y0, torch.any(x, dim=0))
+
+    def test_any_all_false(self):
+        # Test with all zero values
+        x = torch.zeros(256, 128, dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y0 = torch.any(x_spyre, dim=0).to("cpu")
+        torch.testing.assert_close(y0, torch.any(x, dim=0))
+
     def test_softmax(self):
         x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
         x_spyre = x.to("spyre")

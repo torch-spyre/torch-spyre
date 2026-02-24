@@ -333,7 +333,13 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   sendnn::SubGraph exec_graph;
   {  // add above subgraph as part of SenFusedDeviceCompute node
     flex::FlexGraphBuilder gb;
-    auto dci = generate_dci(dev_tensor, stl, host2device);
+    // For bool tensors, cpu_tensor, fp16 staging buffer is used to avoid broken
+    // DL16→bool conversion
+    const at::Tensor* dci_tensor =
+        (cpu_tensor->scalar_type() != (host2device ? self : dst).scalar_type())
+            ? cpu_tensor
+            : dev_tensor;
+    auto dci = generate_dci(dci_tensor, stl, host2device);
     if (host2device) {
       auto inp_node = gb.PrimaryInput("Input", cpu_ti);
       auto dci_node = gb.SenHostCompute("Host2Sen-HostPrep", {dci_ti},
@@ -420,16 +426,28 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
   SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
 }
 auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
-  std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, false);
-  // execute
+  at::Tensor dma_dst =
+      (dst.scalar_type() == at::kBool)
+          ? at::empty(self.sizes(),
+                      at::TensorOptions().dtype(at::kHalf).device(at::kCPU))
+          : dst;
+
+  std::shared_ptr<sendnn::GraphLoader> gl =
+      create_dma_graph(self, dma_dst, false);
+
   constexpr int sn_idx = 0;
   constexpr int tensor_idx = 0;
-  auto out_tensor = createOutputTensor(*gl, dst.storage().data_ptr().get(),
+  auto out_tensor = createOutputTensor(*gl, dma_dst.storage().data_ptr().get(),
                                        tensor_idx, sn_idx);
   auto* ctx =
       static_cast<SharedOwnerCtx*>(self.storage().data_ptr().get_context());
   out_tensor.SetSpyreData(ctx->owner);
   SEN_THROW_NOK(gl->Copy({out_tensor}, sendnn::Inputs(), sn_idx));
+
+  // Post-copy cast only needed for bool
+  if (dst.scalar_type() == at::kBool) {
+    dst.copy_(dma_dst.to(at::kBool));
+  }
 }
 
 // A custom allocator for our custom device, what returns is a handle to the

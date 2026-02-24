@@ -223,4 +223,10 @@ def spyre__unsqueeze(self: torch.Tensor, dim: int) -> torch.Tensor:
     return result
 
 
+@torch.library.register_kernel("aten::any.dim", ["spyre"])
+def spyre__any_dim(self: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
+    compiled_any = torch.compile(torch.any, dynamic=False)
+    return compiled_any(self, dim=dim, keepdim=keepdim)
+
+
 # INSERT_CODEGEN_HERE

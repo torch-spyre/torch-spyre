@@ -14,6 +14,7 @@
 
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import torch
 
@@ -405,6 +406,43 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
         reduction_type="mean", input_node=x, op_info=op_info, **kwargs
     )
     result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.aten.any.default)
+@register_spyre_lowering(torch.ops.aten.any.dim)
+@register_spyre_lowering(torch.ops.aten.any.out)
+def reduce_any(x, dim=None, keepdim=False, *, out=None):
+    origin = x.get_origin_node()
+    if origin is None:
+        origin = SimpleNamespace(
+            target=torch.ops.aten.abs.default,
+            name="any_abs_fallback",
+            args=(),
+            kwargs={},
+        )
+    x_abs = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops.abs(x.make_loader()(index)),
+        ranges=x.get_size(),
+        origin_node=origin,
+        traceback=x.get_traceback(),
+    )
+    x_abs.realize()
+
+    kwargs = lowering._make_reduction_inner(
+        x_abs,
+        axis=dim,
+        keepdims=keepdim,
+        dtype=x.get_dtype(),
+        override_return_dtype=torch.bool,
+    )
+    result = SpyreReduction.create(
+        reduction_type="max", input_node=x_abs, op_info={}, **kwargs
+    )
+    result.realize()
+
     return result
 
 
