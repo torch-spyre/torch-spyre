@@ -93,29 +93,15 @@ def enable_spyre_compile_fx_wrapper():
         def _wrapper(gm, example_inputs, *args, **kwargs):
             if _uses_spyre(gm, example_inputs):
                 import torch
+                from torch._inductor.decomposition import select_decomp_table
 
                 torch.spyre._impl._lazy_init()
-                with enable_spyre_context(example_inputs):
-                    from torch._inductor.decomposition import decompositions
 
-                    # Check if there is a decomposition in kwargs
-                    if "decompositions" in kwargs:
-                        from torch_spyre.fallbacks import fallback_ops
-                        from torch_spyre._inductor.decompositions import (
-                            _merge_spyre_decompositions,
-                        )
-
-                        kwargs_decompositions = kwargs["decompositions"]
-
-                        # Merge the decompositions with priority of the spyre-specific decompositions
-                        _merge_spyre_decompositions(kwargs_decompositions, fallback_ops)
-
-                        for op, fn in decompositions.items():
-                            kwargs_decompositions[op] = fn
-
-                    else:
-                        # If not present in kwargs, then use the prepared decompositions
-                        kwargs["decompositions"] = decompositions
+                cloned_decompositions = select_decomp_table().copy()
+                with enable_spyre_context(example_inputs, cloned_decompositions):
+                    # The `cloned_decompositions` is the updated in the context manager
+                    # with the appropriate spyre decompositions
+                    kwargs["decompositions"] = cloned_decompositions
 
                     return _orig(
                         gm,

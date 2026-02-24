@@ -51,55 +51,9 @@ def register_spyre_decomposition(
     return decomp.register_decomposition(ops, spyre_decompositions)
 
 
-def _merge_spyre_decompositions(decomposition_dict, fallback_ops):
-    from torch._ops import OpOverload, OpOverloadPacket
-
-    # Helper function to remove ops from decompositions
-    def _fetch_and_remove_op(ops):
-        _removed = {}
-        for op in ops:
-            if isinstance(op, OpOverloadPacket):
-                for overload_name in op.overloads():
-                    opo = getattr(op, overload_name)
-                    op_ret = decomposition_dict.pop(opo, None)
-                    if op_ret is not None:
-                        _removed[opo] = op_ret
-            elif isinstance(op, OpOverload):
-                op_ret = decomposition_dict.pop(op, None)
-                if op_ret is not None:
-                    _removed[op] = op_ret
-        return _removed
-
-    # 1. Add/override spyre-specific decompositions
-    saved_intree_decompositions = {}
-    for (
-        spyre_decompositions_op,
-        spyre_decompositions_impl,
-    ) in spyre_decompositions.items():
-        if spyre_decompositions_op in decomposition_dict:
-            saved_intree_decompositions[spyre_decompositions_op] = decomposition_dict[
-                spyre_decompositions_op
-            ]
-        decomposition_dict[spyre_decompositions_op] = spyre_decompositions_impl
-
-    # 2. Remove selected decompositions from Inductor's registry for spyre
-    _removed_decompositions_to_exclude = _fetch_and_remove_op(
-        spyre_decompositions_to_exclude
-    )
-
-    # 3. Remove selected decompositions for fallback ops defined in fallbacks.py
-    _removed_decompositions_fallback_ops = _fetch_and_remove_op(fallback_ops)
-
-    return (
-        saved_intree_decompositions,
-        _removed_decompositions_to_exclude,
-        _removed_decompositions_fallback_ops,
-    )
-
-
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
 @contextmanager
-def enable_spyre_decompositions():
+def enable_spyre_decompositions(cloned_decompositions):
     """
     CM that enables Spyre decompositions:
       - Temporarily adds relevant Spyre decompositions to global decompositions dictionary
@@ -114,23 +68,55 @@ def enable_spyre_decompositions():
 
         if first_enter:
             from torch_spyre.fallbacks import fallback_ops
-            from torch._inductor.decomposition import decompositions
+            from torch._ops import OpOverload, OpOverloadPacket
 
-            (
-                saved_intree_decompositions,
-                _removed_decompositions_to_exclude,
-                _removed_decompositions_fallback_ops,
-            ) = _merge_spyre_decompositions(decompositions, fallback_ops)
+            # Helper function to remove ops from decompositions
+            def _fetch_and_remove_op(ops):
+                _removed = {}
+                for op in ops:
+                    if isinstance(op, OpOverloadPacket):
+                        for overload_name in op.overloads():
+                            opo = getattr(op, overload_name)
+                            op_ret = cloned_decompositions.pop(opo, None)
+                            if op_ret is not None:
+                                _removed[opo] = op_ret
+                    elif isinstance(op, OpOverload):
+                        op_ret = cloned_decompositions.pop(op, None)
+                        if op_ret is not None:
+                            _removed[op] = op_ret
+                return _removed
+
+            # 1. Add/override spyre-specific decompositions
+            saved_intree_decompositions = {}
+            for (
+                spyre_decompositions_op,
+                spyre_decompositions_impl,
+            ) in spyre_decompositions.items():
+                if spyre_decompositions_op in cloned_decompositions:
+                    saved_intree_decompositions[spyre_decompositions_op] = (
+                        cloned_decompositions[spyre_decompositions_op]
+                    )
+                cloned_decompositions[spyre_decompositions_op] = (
+                    spyre_decompositions_impl
+                )
 
             # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._saved_decompositions = (
                 saved_intree_decompositions
             )
 
+            # 2. Remove selected decompositions from Inductor's registry for spyre
+            _removed_decompositions_to_exclude = _fetch_and_remove_op(
+                spyre_decompositions_to_exclude
+            )
+
             # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._removed_decompositions_to_exclude = (
                 _removed_decompositions_to_exclude
             )
+
+            # 3. Remove selected decompositions for fallback ops defined in fallbacks.py
+            _removed_decompositions_fallback_ops = _fetch_and_remove_op(fallback_ops)
 
             # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._removed_decompositions_fallback_ops = (
@@ -152,7 +138,7 @@ def enable_spyre_decompositions():
                     {},
                 )
                 [
-                    torch._decomp._add_op_to_registry(decompositions, op, fn)
+                    torch._decomp._add_op_to_registry(cloned_decompositions, op, fn)
                     for op, fn in removed_decompositions_fallback_ops.items()
                 ]
 
@@ -163,7 +149,7 @@ def enable_spyre_decompositions():
                     {},
                 )
                 [
-                    torch._decomp._add_op_to_registry(decompositions, op, fn)
+                    torch._decomp._add_op_to_registry(cloned_decompositions, op, fn)
                     for op, fn in removed_decompositions_to_exclude.items()
                 ]
 
@@ -176,11 +162,11 @@ def enable_spyre_decompositions():
                     spyre_decompositions_impl,
                 ) in spyre_decompositions.items():
                     if spyre_decompositions_op in saved_intree_decompositions:
-                        decompositions[spyre_decompositions_op] = (
+                        cloned_decompositions[spyre_decompositions_op] = (
                             saved_intree_decompositions[spyre_decompositions_op]
                         )
                     else:
-                        decompositions.pop(spyre_decompositions_op, None)
+                        cloned_decompositions.pop(spyre_decompositions_op, None)
 
                 # Clean up
                 enable_spyre_decompositions._saved_decompositions = {}

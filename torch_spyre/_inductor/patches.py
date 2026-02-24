@@ -33,7 +33,7 @@ def spyre_data_types():
 
 
 @contextmanager
-def enable_spyre_context(example_inputs):
+def enable_spyre_context(example_inputs, cloned_decompositions):
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
     # Ensure decorators run (custom ops/decomp/lowerings modules)
@@ -91,7 +91,7 @@ def enable_spyre_context(example_inputs):
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
-        enable_spyre_decompositions(),
+        enable_spyre_decompositions(cloned_decompositions),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
     ):
