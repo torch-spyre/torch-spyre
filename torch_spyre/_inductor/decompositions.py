@@ -43,102 +43,19 @@ spyre_decompositions_to_exclude = [
     torch.ops.aten.new_ones,
 ]
 
+# A module-level lock + nesting counter to make the CM reentrant/thread-safe
+_decompositions_via_dispatchkey_lock = threading.RLock()
+_decompositions_via_dispatchkey_nesting = 0
 
 # Dict for Spyre-specific decompositions to be registered via DispatchKey
 spyre_decomposition_via_dispatchkey: dict = {}
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
-
-
-def register_spyre_decomposition_via_dispatchkey(
-    ops: Union[torch._ops.OperatorBase, list],
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
-    """
-    Register decompositions specifically for Spyre device via the PyTorch dispatcher
-    This replaces the need for global patching of operations in order to enable them for 
-    eager mode.
-    """
-    
-    def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
-        class OPWrapper:
-            def __init__(self, op, spyre_fn):
-                self.op = op
-                self.spyre_fn = spyre_fn
-                self._spyre_enabled = True
-
-            @property
-            def spyre_enabled(self):
-                return self._spyre_enabled
-
-            @spyre_enabled.setter
-            def spyre_enabled(self, value):
-                self._spyre_enabled = bool(value)
-
-            def __call__(self, *args, **kwargs):
-                if not self.spyre_enabled:
-                    # This codepath should with high probability never be hit!
-                    # If it is, it means that the Wrapper for the spyre decomposition
-                    # is dispatched for in a non-spyre scenario.
-                    # If this case is intended, try to dispatch the next higher key except PrivateUse1
-                    # Note: We should probably either raise an Exception or at least a warning?
-                    with torch._C._ExcludeDispatchKeyGuard(
-                        torch._C.DispatchKeySet(torch._C.DispatchKey.PrivateUse1)
-                    ):
-                        return self.op(*args, **kwargs)
-
-                return self.spyre_fn(*args, **kwargs)
-
-        def register(op):
-            spyre_decomposition_via_dispatchkey[op] = OPWrapper(op, fn)
-
-        # To handle allowing multiple aten_ops at once
-        pytree.tree_map_(register, ops)
-        return fn
-
-    return decomposition_decorator
-    
-@contextmanager
-def enable_spyre_decomposition_via_dispatchkey():
-    """
-    Context manager to temporarily register custom spyre implementations.
-
-    This allows you to register device-specific implementations that are only
-    active within the context, and automatically cleaned up when exiting.
-
-    Example:
-        >>> with enable_spyre_decomposition_via_dispatchkey():
-        ...     output = torch.nn.functional.layer_norm(input, [512])
-        ...     # Custom spyre implementation is used here
-        >>> # Custom implementation is cleaned up here
-    """
-    from torch.library import Library, fallthrough_kernel
-
-    autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
-    lib = Library("aten", "IMPL", "PrivateUse1")
-
-    for op, wrapper_cls in spyre_decomposition_via_dispatchkey.items():
-        # Ensure that the spyre_fn is enabled in the wrapper
-        wrapper_cls.spyre_enabled = True
-
-        # Register a fallthrough kernel for the Autograd
-        autograd_lib.impl(op._name, fallthrough_kernel)
-
-        # Register the custom spyre kernel for the DispatchKey PrivateUse1
-        lib.impl(op._name, wrapper_cls)
-
-    try:
-        yield
-    finally:
-        # Clean up: restore or remove the registered implementations
-        for op, wrapper_cls in spyre_decomposition_via_dispatchkey.items():
-            # Ensure that the spyre_fn is enabled in the wrapper
-            wrapper_cls.spyre_enabled = False
-        pass
     
 def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
-):
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
     Register decompositions specifically for Spyre device.
     These will only be active when compiling for the Spyre device.
@@ -267,6 +184,103 @@ def enable_spyre_decompositions():
                 enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
 
+def register_spyre_decomposition_via_dispatchkey(
+    ops: Union[torch._ops.OperatorBase, list],
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """
+    Register decompositions specifically for Spyre device via the PyTorch dispatcher
+    This replaces the need for global patching of operations in order to enable them for 
+    eager mode.
+    """
+    
+    def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        class OPWrapper:
+            def __init__(self, op, spyre_fn):
+                self.op = op
+                self.spyre_fn = spyre_fn
+                self._spyre_enabled = True
+
+            @property
+            def spyre_enabled(self):
+                return self._spyre_enabled
+
+            @spyre_enabled.setter
+            def spyre_enabled(self, value):
+                self._spyre_enabled = bool(value)
+
+            def __call__(self, *args, **kwargs):
+                if not self.spyre_enabled:
+                    # This codepath should with high probability never be hit!
+                    # If it is, it means that the Wrapper for the spyre decomposition
+                    # is dispatched for in a non-spyre scenario.
+                    # If this case is intended, try to dispatch the next higher key except PrivateUse1
+                    # Note: We should probably either raise an Exception or at least a warning?
+                    with torch._C._ExcludeDispatchKeyGuard(
+                        torch._C.DispatchKeySet(torch._C.DispatchKey.PrivateUse1)
+                    ):
+                        return self.op(*args, **kwargs)
+
+                return self.spyre_fn(*args, **kwargs)
+
+        def register(op):
+            spyre_decomposition_via_dispatchkey[op] = OPWrapper(op, fn)
+
+        # To handle allowing multiple aten_ops at once
+        pytree.tree_map_(register, ops)
+        return fn
+
+    return decomposition_decorator
+    
+@contextmanager
+def enable_spyre_decomposition_via_dispatchkey():
+    """
+    Context manager to temporarily register custom spyre implementations.
+
+    This allows you to register device-specific implementations that are only
+    active within the context, and automatically cleaned up when exiting.
+
+    Example:
+        >>> with enable_spyre_decomposition_via_dispatchkey():
+        ...     output = torch.nn.functional.layer_norm(input, [512])
+        ...     # Custom spyre implementation is used here
+        >>> # Custom implementation is cleaned up here
+    """
+    from torch.library import Library, fallthrough_kernel
+    
+    global _decompositions_via_dispatchkey_nesting
+    with _decompositions_via_dispatchkey_lock:
+        first_enter = (_decompositions_nesting == 0)  # fmt: skip
+        _decompositions_nesting += 1
+
+        autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
+        lib = Library("aten", "IMPL", "PrivateUse1")
+
+        for op, wrapper_cls in spyre_decomposition_via_dispatchkey.items():
+            # Ensure that the spyre_fn is enabled in the wrapper
+            wrapper_cls.spyre_enabled = True
+
+            # Add the new kernels just once
+            if first_enter:
+                # Register a fallthrough kernel for the Autograd
+                autograd_lib.impl(op._name, fallthrough_kernel)
+
+                # Register the custom spyre kernel for the DispatchKey PrivateUse1
+                lib.impl(op._name, wrapper_cls)
+
+    try:
+        yield
+    finally:
+        _decompositions_nesting -= 1
+        last_exit = (_decompositions_nesting == 0)  # fmt: skip
+        
+        # Keep the spyre implementations enabled until the last context manager exits
+        if last_exit:
+            # Clean up: restore or remove the registered implementations
+            for op, wrapper_cls in spyre_decomposition_via_dispatchkey.items():
+                # Ensure that the spyre_fn is enabled in the wrapper
+                wrapper_cls.spyre_enabled = False
+
+
 @register_spyre_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
@@ -331,9 +345,10 @@ Hook torch.nn.functional.layer_norm to select spyre optimized version where appl
 
 
 # Register the spyre_layer_norm as Dispatcher backend for the spyre device
-@register_spyre_decomposition_via_dispatchkey(
-    [torch.ops.aten.native_layer_norm.default, torch.ops.aten.native_batch_norm.default]
-)
+# @register_spyre_decomposition_via_dispatchkey(
+#     [torch.ops.aten.native_layer_norm.default, torch.ops.aten.native_batch_norm.default]
+# )
+@register_spyre_decomposition([torch.ops.spyre.rms_norm])
 def spyre_layer_norm(
     input: torch.Tensor,
     normalized_shape: Sequence[int],
