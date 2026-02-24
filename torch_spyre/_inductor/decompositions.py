@@ -20,6 +20,7 @@ from typing_extensions import ParamSpec
 import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
+# from torch._inductor.decomposition import register_decomposition
 from .errors import Unsupported
 
 import threading
@@ -47,7 +48,7 @@ _decompositions_via_dispatchkey_lock = threading.RLock()
 _decompositions_via_dispatchkey_nesting = 0
 
 # Dict for Spyre-specific decompositions to be registered via DispatchKey
-spyre_decomposition_via_dispatchkey: dict = {}
+spyre_decompositions_via_dispatchkey: dict = {}
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -183,7 +184,7 @@ def enable_spyre_decompositions():
                 enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
 
-def register_spyre_decomposition_via_dispatchkey(
+def register_spyre_decompositions_via_dispatchkey(
     ops: Union[torch._ops.OperatorBase, list],
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
@@ -222,7 +223,7 @@ def register_spyre_decomposition_via_dispatchkey(
                 return self.spyre_fn(*args, **kwargs)
 
         def register(op):
-            spyre_decomposition_via_dispatchkey[op] = OPWrapper(op, fn)
+            spyre_decompositions_via_dispatchkey[op] = OPWrapper(op, fn)
 
         # To handle allowing multiple aten_ops at once
         pytree.tree_map_(register, ops)
@@ -231,7 +232,7 @@ def register_spyre_decomposition_via_dispatchkey(
     return decomposition_decorator
     
 @contextmanager
-def enable_spyre_decomposition_via_dispatchkey():
+def enable_spyre_decompositions_via_dispatchkey():
     """
     Context manager to temporarily register custom spyre implementations.
 
@@ -239,7 +240,7 @@ def enable_spyre_decomposition_via_dispatchkey():
     active within the context, and automatically cleaned up when exiting.
 
     Example:
-        >>> with enable_spyre_decomposition_via_dispatchkey():
+        >>> with enable_spyre_decompositions_via_dispatchkey():
         ...     output = torch.nn.functional.layer_norm(input, [512])
         ...     # Custom spyre implementation is used here
         >>> # Custom implementation is cleaned up here
@@ -248,13 +249,13 @@ def enable_spyre_decomposition_via_dispatchkey():
     
     global _decompositions_via_dispatchkey_nesting
     with _decompositions_via_dispatchkey_lock:
-        first_enter = (_decompositions_nesting == 0)  # fmt: skip
-        _decompositions_nesting += 1
+        first_enter = (_decompositions_via_dispatchkey_nesting == 0)  # fmt: skip
+        _decompositions_via_dispatchkey_nesting += 1
 
         autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
         lib = Library("aten", "IMPL", "PrivateUse1")
 
-        for op, wrapper_cls in spyre_decomposition_via_dispatchkey.items():
+        for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
             # Ensure that the spyre_fn is enabled in the wrapper
             wrapper_cls.spyre_enabled = True
 
@@ -269,13 +270,13 @@ def enable_spyre_decomposition_via_dispatchkey():
     try:
         yield
     finally:
-        _decompositions_nesting -= 1
-        last_exit = (_decompositions_nesting == 0)  # fmt: skip
+        _decompositions_via_dispatchkey_nesting -= 1
+        last_exit = (_decompositions_via_dispatchkey_nesting == 0)  # fmt: skip
         
         # Keep the spyre implementations enabled until the last context manager exits
         if last_exit:
             # Clean up: restore or remove the registered implementations
-            for op, wrapper_cls in spyre_decomposition_via_dispatchkey.items():
+            for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
                 # Ensure that the spyre_fn is enabled in the wrapper
                 wrapper_cls.spyre_enabled = False
 
@@ -344,10 +345,9 @@ Hook torch.nn.functional.layer_norm to select spyre optimized version where appl
 
 
 # Register the spyre_layer_norm as Dispatcher backend for the spyre device
-# @register_spyre_decomposition_via_dispatchkey(
-#     [torch.ops.aten.native_layer_norm.default, torch.ops.aten.native_batch_norm.default]
-# )
-@register_spyre_decomposition([torch.ops.spyre.rms_norm])
+@register_spyre_decompositions_via_dispatchkey(
+    [torch.ops.aten.native_layer_norm.default, torch.ops.aten.native_batch_norm.default]
+)
 def spyre_layer_norm(
     input: torch.Tensor,
     normalized_shape: Sequence[int],
