@@ -230,7 +230,7 @@ class TestOps(TestCase):
         )
 
     def test_mish(self):
-        x = torch.tensor([1, -2, 3], dtype=self.dtype)
+        x = torch.rand([2, 32, 256], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.nn.functional.mish(x_spyre).to("cpu")
         torch.testing.assert_close(
