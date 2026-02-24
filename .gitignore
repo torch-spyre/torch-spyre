@@ -393,3 +393,4 @@ test/*.txt
 test/*.json
 
 .*env*
+stubs

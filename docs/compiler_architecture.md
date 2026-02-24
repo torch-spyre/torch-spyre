@@ -50,7 +50,7 @@ Some key entry points to the front-end compiler are:
 extension points of Inductor. It supports adding passes to both the FX Graph and LoopLevelIR stages of compilation.
 + [spyre_kernel.py](../torch_spyre/_inductor/spyre_kernel.py) defines our compilation from LoopLevelIR into `KernelSpec`, our
 high-level description of a single operation to be performed on the device.
-+ [codegen](../torch_spyre/_inductor/codegen/) defines the compilation from a `KernelSpec` into a lower-level SuperDSC json file with is the input to the backend compiler.
++ [codegen](../torch_spyre/_inductor/codegen/) defines the compilation from a `KernelSpec` into a lower-level SuperDSC json file which is the input to the backend compiler.
 
 ## Additional Topics
 

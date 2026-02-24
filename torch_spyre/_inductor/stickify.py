@@ -33,7 +33,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
-from . import Unsupported
+from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps, map_dims_to_vars
@@ -66,14 +66,17 @@ def device_layout_like(
         new = get_elem_in_stick(dtype)
         if old > new:
             scaling_factor = old / new
-            adjusted_device_size[-1] *= scaling_factor
-            adjusted_device_size[stick_dim_idx] = (
-                adjusted_device_size[stick_dim_idx] + scaling_factor - 1
-            ) / scaling_factor
+            adjusted_device_size[-1] = int(adjusted_device_size[-1] * scaling_factor)
+            adjusted_device_size[stick_dim_idx] = int(
+                (adjusted_device_size[stick_dim_idx] + scaling_factor - 1)
+                / scaling_factor
+            )
         else:
             scaling_factor = new / old
-            adjusted_device_size[-1] /= scaling_factor
-            adjusted_device_size[stick_dim_idx] *= scaling_factor
+            adjusted_device_size[-1] = int(adjusted_device_size[-1] / scaling_factor)
+            adjusted_device_size[stick_dim_idx] = int(
+                adjusted_device_size[stick_dim_idx] * scaling_factor
+            )
         return SpyreTensorLayout(
             adjusted_device_size, layout.device_layout.dim_map, get_device_dtype(dtype)
         )

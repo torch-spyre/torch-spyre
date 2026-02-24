@@ -9,12 +9,3 @@
 #
 
 *  @ani300 @dgrove-oss @JRosenkranz @tardieu @avery-blanchard
-
-
-# Rules to focus PR review requests
-
-/codegen @ani300 @JRosenkranz
-
-/torch_spyre/_inductor @dgrove-oss @avery-blanchard @tardieu
-
-/torch_spyre/csrc @ani300 @dgrove-oss @JRosenkranz @avery-blanchard
