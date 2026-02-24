@@ -386,6 +386,63 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
+    def test_addmm_ab_bc(self):
+        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
+            self.mm_a, self.mm_c
+        )
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
+            self.mm_a, self.mm_b
+        )
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
+            self.mm_b, self.mm_c
+        )
+        mat_spyre = mat.to("spyre")
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        z = torch.addmm(mat_spyre, x_spyre, y_spyre).to("cpu")
+        torch.testing.assert_close(
+            z, torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
+        )
+
+    @unittest.expectedFailure
+    def test_addmm_ab_bc_scaled(self):
+        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
+            self.mm_a, self.mm_c
+        )
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
+            self.mm_a, self.mm_b
+        )
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
+            self.mm_b, self.mm_c
+        )
+        alpha = 0.5
+        mat_spyre = mat.to("spyre")
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        z = torch.addmm(mat_spyre, x_spyre, y_spyre, alpha=alpha).to("cpu")
+        torch.testing.assert_close(
+            z, torch.addmm(mat, x, y, alpha=alpha), rtol=self.rtol, atol=self.atol
+        )
+
+    def test_addmm_ab_bc_out(self):
+        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
+            self.mm_a, self.mm_c
+        )
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
+            self.mm_a, self.mm_b
+        )
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
+            self.mm_b, self.mm_c
+        )
+        mat_spyre = mat.to("spyre")
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        out_spyre = torch.empty(self.mm_a, self.mm_c, dtype=self.dtype, device="spyre")
+        torch.addmm(mat_spyre, x_spyre, y_spyre, out=out_spyre)
+        torch.testing.assert_close(
+            out_spyre.to("cpu"), torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
+        )
+
     def test_bmm_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
