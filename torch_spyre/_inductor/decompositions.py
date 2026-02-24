@@ -157,9 +157,25 @@ def lt_decomp(
 
 @register_decomposition([torch.ops.aten.pow.Tensor_Tensor])
 def pow_decomp(input: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
-    # Handle broadcasting: if exponent is a scalar tensor (size 1), expand it to match input shape
-    if exponent.numel() == 1 and input.numel() > 1:
-        exponent = exponent.expand_as(input)
-    # Decompose pow(x, y) as exp(y * log(x))
-    # This works for positive x values
-    return torch.exp(torch.mul(exponent, torch.log(input)))
+    """
+    Decompose pow operation for Spyre backend.
+    Currently only supports pow(x, 2) which is optimized to mul(x, x).
+    Raises error for other exponents.
+    """
+    # Check if exponent is a scalar tensor with value 2
+    if exponent.numel() == 1:
+        exponent_value = exponent.item()
+        if int(exponent_value) == 2:
+            # Optimize pow(x, 2) as mul(x, x) - same as PyTorch's optimization
+            return torch.mul(input, input)
+        else:
+            raise NotImplementedError(
+                f"Spyre backend currently only supports pow(x, 2). "
+                f"Got exponent={exponent_value}. "
+                f"For general pow support, use decomposition: pow(x, y) = exp(y * log(x))"
+            )
+    else:
+        raise NotImplementedError(
+            f"Spyre backend currently only supports scalar exponent with value 2. "
+            f"Got exponent tensor with shape {exponent.shape}."
+        )
