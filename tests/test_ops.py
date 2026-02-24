@@ -213,8 +213,16 @@ class TestOps(TestCase):
         torch.testing.assert_close(y, torch.relu(x), rtol=self.rtol, atol=self.atol)
 
     def test_silu(self):
-        # FIXME: change the tensor size to test padding and larger tensor shape
         x = torch.rand([2, 32, 256], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.silu(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
+        )
+
+    @unittest.expectedFailure
+    def test_silu_larger_input(self):
+        x = torch.rand([2, 100, 12800], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.nn.functional.silu(x_spyre).to("cpu")
         torch.testing.assert_close(
