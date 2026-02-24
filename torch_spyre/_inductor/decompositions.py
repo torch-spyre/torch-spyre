@@ -18,7 +18,6 @@ from contextlib import contextmanager
 from typing import Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
-from torch._inductor.decomposition import register_decomposition
 from .errors import Unsupported
 
 import threading
@@ -192,7 +191,7 @@ def layernorm_decomp(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
-@register_decomposition([torch.ops.spyre.rms_norm])
+@register_spyre_decomposition([torch.ops.spyre.rms_norm])
 def rmsnorm_decomp(
     input: torch.Tensor,
     normalized_shape: list[int],
