@@ -20,7 +20,6 @@ from typing_extensions import ParamSpec
 import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
-from torch._inductor.decomposition import register_decomposition
 from .errors import Unsupported
 
 import threading

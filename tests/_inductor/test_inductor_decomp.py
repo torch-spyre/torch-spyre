@@ -63,52 +63,73 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         import types
         import copy
         from functools import partial
+        from torch._inductor.decomposition import decompositions
+        from torch._decomp import global_decomposition_table
+
+        def _check_decomps(before, after):
+            assert len(before.items()) == len(after.items()), (
+                f"Amount of decompositions before ({len(before.items())}) and after ({len(after.items())}) not identical!"
+            )
+
+            for op, fn in before.items():
+                if op._name not in [o._name for o in after.keys()]:
+                    raise Exception(f"Decomposition {op} not present anymore!")
+                else:
+                    opa = None
+                    for opa in after.keys():
+                        if opa._name == op._name:
+                            break
+                    if isinstance(fn, types.FunctionType):
+                        # fn is a regular function -> compare the hashes directly
+                        if hash(fn) != hash(after[opa]):
+                            raise Exception(
+                                f"Decomposition for {op} changed!\nUsed to be {fn} and is now {after[opa]}"
+                            )
+                    elif isinstance(fn, partial):
+                        # fn is a functools.partial -> compare the hashes of the functions
+                        if hash(fn.func) != hash(after[opa].func):
+                            raise Exception(
+                                f"Decomposition for {op} changed!\nUsed to be {fn} and is now {after[opa]}"
+                            )
+                    else:
+                        raise Exception(
+                            f"Unexpected object in decomposition op: {op}, fn: {fn}"
+                        )
 
         def fn(t):
             t = torch.sin(t)  # fallback op
             return t
 
-        from torch._inductor.decomposition import decompositions
-
-        orig_decomps = copy.deepcopy(decompositions)
+        before_decomps = copy.deepcopy(decompositions)
+        before_post_autograd_decomposition_table = copy.deepcopy(
+            global_decomposition_table["post_autograd"]
+        )
+        before_pre_autograd_decomposition_table = copy.deepcopy(
+            global_decomposition_table["pre_autograd"]
+        )
 
         with pytest.warns(torch_spyre.fallbacks.FallbackWarning) as record:
             compare_with_cpu(fn, x, cpu_compile=True)
 
         assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
 
-        from torch._inductor.decomposition import decompositions
-
         after_decomps = copy.deepcopy(decompositions)
-
-        assert len(orig_decomps.items()) == len(after_decomps.items()), (
-            f"Amount of decompositions before ({len(orig_decomps.items())}) and after ({len(after_decomps.items())}) not identical!"
+        after_post_autograd_decomposition_table = copy.deepcopy(
+            global_decomposition_table["post_autograd"]
+        )
+        after_pre_autograd_decomposition_table = copy.deepcopy(
+            global_decomposition_table["pre_autograd"]
         )
 
-        for op, fn in orig_decomps.items():
-            if op._name not in [o._name for o in after_decomps.keys()]:
-                raise Exception(f"Decomposition {op} not present anymore!")
-            else:
-                opa = None
-                for opa in after_decomps.keys():
-                    if opa._name == op._name:
-                        break
-                if isinstance(fn, types.FunctionType):
-                    # fn is a regular function -> compare the hashes directly
-                    if hash(fn) != hash(after_decomps[opa]):
-                        raise Exception(
-                            f"Decomposition for {op} changed!\nUsed to be {fn} and is now {after_decomps[opa]}"
-                        )
-                elif isinstance(fn, partial):
-                    # fn is a functools.partial -> compare the hashes of the functions
-                    if hash(fn.func) != hash(after_decomps[opa].func):
-                        raise Exception(
-                            f"Decomposition for {op} changed!\nUsed to be {fn} and is now {after_decomps[opa]}"
-                        )
-                else:
-                    raise Exception(
-                        f"Unexpected object in decomposition op: {op}, fn: {fn}"
-                    )
+        _check_decomps(before_decomps, after_decomps)
+        _check_decomps(
+            before_post_autograd_decomposition_table,
+            after_post_autograd_decomposition_table,
+        )
+        _check_decomps(
+            before_pre_autograd_decomposition_table,
+            after_pre_autograd_decomposition_table,
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings(
