@@ -85,7 +85,7 @@ def enable_spyre_context(example_inputs):
 
     origin_pass = list(joint_graph.pass_patterns)
     # disable mul_softmax_pattern and div_softmax_pattern for now
-    joint_graph.pass_patterns.pop(None)
+    joint_graph.pass_patterns.pop()
 
     with (
         spyre_data_types(),
