@@ -166,7 +166,7 @@ def convert_cpp_type_to_python(cpp_type):
         "int64_t": "int",
         "double": "float",
         "bool": "bool",
-        "Scalar": "Union[int, float, bool, complex]",
+        "Scalar": "int | float | bool | complex",
         "IntArrayRef": "list[int]",
         "c10::string_view": "str",
         "DimnameList": "list[str]",

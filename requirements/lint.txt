@@ -26,7 +26,7 @@ networkx==3.6.1
     # via torch
 nodeenv==1.10.0
     # via pre-commit
-numpy==2.3.5
+numpy==2.4.2
     # via torch-spyre
 platformdirs==4.9.2
     # via virtualenv
@@ -36,7 +36,7 @@ psutil==7.2.2
     # via torch-spyre
 pyyaml==6.0.3
     # via pre-commit
-regex==2025.11.3
+regex==2026.2.19
     # via torch-spyre
 setuptools==75.8.2
     # via torch
@@ -50,5 +50,5 @@ typing-extensions==4.15.0
     #   torch
 uv==0.9.30
     # via torch-spyre
-virtualenv==20.38.0
+virtualenv==20.39.0
     # via pre-commit
