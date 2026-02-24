@@ -89,7 +89,7 @@ In summary, `ktdp` is a compositional IR that integrates established MLIR dialec
 
 This example demonstrates how `ktdp` operations express a data-parallel tensor addition kernel executing across multiple compute tiles over an accelerator.
 
-```
+```mlir
 
 // An example of two tensors of sizes 96x64 allocated on HBM.
 // Each compute tile works at a granularity of 3x64 with total number of compute tiles being 32
@@ -187,7 +187,7 @@ _Gets the id of the current compute tile_
 
 Syntax:
 
-```
+```mlir
 operation ::= `ktdp.get_compute_tile_id` attr-dict `:` type(results)
 ```
 
@@ -200,7 +200,7 @@ The returned value uniquely identifies the tile within the device’s
 execution grid or topology and can be used to specialize computation,
 index into distributed data structures, or select tile-specific memory
 regions. for, e.g.,
-  ```
+  ```mlir
   %tile_id = ktdp.get_compute_tile_id : index
   ```
 
@@ -217,7 +217,7 @@ _Operation to construct memory view._
 
 Syntax:
 
-```
+```mlir
 operation ::= `ktdp.construct_memory_view` $offset `` `,`  `sizes` `` `:`
               custom<DynamicIndexList>($sizes, $static_sizes)
               `` `,` `strides` `` `:`
@@ -260,7 +260,7 @@ a tensor, but does not impose any constraints on how that memory was
 created or managed.
 
 for, e.g.,
-```
+```mlir
   #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 64 >= 0)>
   %A_view = ktdp.construct_memory_view %A_start_address, sizes: [32, 64], strides: [64, 1] {
       coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>
@@ -339,7 +339,7 @@ spaces, enabling explicit modeling of distributed scratchpads and other
 non-uniform memory organizations in the IR.
 
 for, e.g.,
-```
+```mlir
 %A_dview = ktdp.construct_distributed_memory_view (%A0_view, %A1_view : memref<32x64xf16>, memref<32x64xf16>) : memref<64x64xf16>
 ```
 
@@ -382,7 +382,7 @@ stores, gathers, or scatters) that interpret it as an explicit access
 specification.
 
 for, e.g.,
-```
+```mlir
   %A_access_tile = ktdp.construct_access_tile %A_view[%c0, %c0] {
       access_tile_set = #set
   } : memref<32x64xf16> -> !ktdp.tile<32x64xindex>
@@ -433,12 +433,12 @@ The `$memory_view_subscripts` attribute is an array of affine expressions,
 one per base dimension, that computes the per-dimension index. These
 expressions may reference the `$common_variables` operands (typically SSA
 values representing induction variables, symbols, or constants) and may also
-reference *temporary variables* defined in the operation’s (hidden) region.
+reference *intermediate variables* defined in the operation’s (hidden) region.
 The same common variables may be shared across multiple dimension subscripts,
 enabling coupled indexing patterns (e.g., both `IDX1[m,k]` and `IDX2[m,k]`
 using the same `(m,k)` iterators).
 
-The `$variables_space_set` integer set constrains the domain of all temporary
+The `$variables_space_set` integer set constrains the domain of all intermediate
 variables used by the subscripts (introduced by the hidden region).
 It defines the set of legal values these intermediate
 variables may take while forming the access tile. Conceptually, the operation
@@ -459,17 +459,62 @@ collection describing where accesses should occur.
 Lowering is expected to resolve this into explicit address computation and
 the required loads from index views.
 
-Example: for `Y[m,k] = X[ IDX1[m,k], IDX2[m,k] ]`, the access tile is formed by
-iterating over `(m,k)` in the specified domain, loading `IDX1[m,k]` and
-`IDX2[m,k]`, and using the loaded values as the two-dimensional coordinates
-into `X`.
+#### Example1: Indirect Access Tile Construction
 
- ```
+Consider the indirect indexing pattern:
 
- %Y = ktir.construct_indirect_access_tile %X[%IDX1[m, k], %IDX2[m, k]] {
-                access_tile_set = {(m, k) | 0 <= m < 2, 0 <= k < 64},
-              } : memref<64x64xfp16>, memref<64x64xfp16>, memref<64x64xfp16>, !ktdp.tile<64x64xindex>
- ```
+`Y[m, k] = X[ IDX1[m, k], IDX2[m, k] ]`
+
+```mlir
+%Y = ktir.construct_indirect_access_tile intermediate_variables (%m, %k) %X[%IDX1[%m, %k], %IDX2[%m, %k]] {
+          variables_space_set = {(d0, d1) | 0 <= d0 < 2, 0 <= d1 < 64}
+        } : memref<64x64xfp16>, memref<64x64xfp16>, memref<64x64xfp16>, !ktdp.tile<64x64xindex>
+```
+
+In this case, the access tile for `X` is constructed by iterating over the
+iteration space defined by the intermediate variables `(m, k)` within the
+domain specified by `variables_space_set`. For each point `(m, k)` in this
+domain, the operation:
+
+1. Loads `IDX1[m, k]`,
+2. Loads `IDX2[m, k]`, and
+3. Uses the loaded values as the two-dimensional coordinate tuple into `X`.
+
+The resulting access tile represents the set of coordinate tuples obtained by
+evaluating the indirect index expressions over the specified iteration domain.
+Importantly, the operation does not perform a memory access to `X`. Instead,
+it materializes a tile of index tuples that can subsequently be consumed by
+`ktdp.load` or `ktdp.store`.
+
+
+
+[//]: # (Here, the `variables_space_set` defines the iteration domain for the)
+[//]: # (intermediate variables `%m` and `%k`. The operation does not directly access)
+[//]: # (`X`; instead, it materializes a tile of coordinates that can later be consumed)
+[//]: # (by `ktdp.load` or `ktdp.store`.)
+
+
+#### Example2: Paged tensor access in attention kernels
+
+As a more complex example, consider constructing an indirect access tile for a four-dimensional tensor `X` using the indexing expression: `X[Idx[b][tkv/64], hkv, tkv % 64, dkv ]`.
+
+
+```mlir
+        %X_access_tile = ktdp.construct_indirect_access_tile 
+                            intermediate_variables(%b, %h, %tkv, %dkv) 
+                            %X_mem_view[Idx_mem_view[%b, %tkv / 64] , %hkv, %tkv % 64, %dkv] {
+            variables_space_set = #XY_var_space_set
+        } : memref<10000x8x64x128xf16> -> !ktdp.tile<4x8x2048x128xindex>
+```
+
+
+In this scenario, the base tensor X is four-dimensional, and the operation maintains one memory view variable per dimension through the $memory_view_names operand. For dimensions that involve indirect indexing—such as expressions of the form Idx[b][tkv / Ptkv]—a corresponding memory view is provided to represent the auxiliary index tensor supplying the indirection. For dimensions that do not require indirection, no memory view variable is associated with that dimension (represented internally as nullptr), and the indexing expression is interpreted as a direct subscript into X.
+
+Each dimension of X is described by an affine or quasi-affine subscript expression. When a memory view variable exists for a given dimension, the corresponding subscript defines an index into that auxiliary memory view, thereby modeling indirect access. For example, an expression such as (%b, %tkv / 64) may compute the index into an auxiliary tensor (e.g., Idx) and thus act as an indirect coordinate supplier for that dimension of X. Conversely, if no memory view variable is present, the subscript expression directly computes the coordinate for X. An expression such as (%tkv % 64) therefore represents direct indexing without auxiliary indirection. This design is enabled by MLIR’s support for quasi-affine expressions within affine maps, allowing division and modulo operations to appear in subscript expressions while maintaining analyzability and compatibility with transformation passes.
+
+The intermediate variables `(e.g., %b, %h, %tkv, %dkv)` are not defined outside the operation but are required to formally describe the iteration domain over which the access tile is constructed. These variables are introduced through a hidden region attached to the operation and are modeled as region arguments. The region itself carries no execution semantics; it serves solely as a structural mechanism to scope and materialize the intermediate variables necessary to define the iteration space.
+
+The `common_variables` operand is distinct from the `intermediate_variables`. The common_variables correspond to SSA values defined outside the operation and may appear within subscript expressions alongside the intermediate variables. In contrast, the intermediate variables are local to the operation and define the iteration domain specified by variables_space_set for constructing the access tile.
 
 Traits: `AttrSizedOperandSegments`
 
@@ -521,7 +566,7 @@ source element type.
 Note: This op is intended to consume the result of an access-tile
 construction op.
 for, e.g.,
-```
+```mlir
   %A_data_tile = ktdp.load %A_access_tile : !ktdp.tile<32x64xindex> -> tensor<32x64xf16>
 ```
 
@@ -571,7 +616,7 @@ The `store` op does not define an ordering among writes beyond the
 dialect’s semantics for the access tile.
 
 for, e.g.,
-```
+```mlir
 ktdp.store %A_data_tile, %A_access_tile : tensor<32x64xf16>, !ktdp.tile<32x64xindex>
 ```
 
@@ -748,7 +793,6 @@ the chosen memory type (e.g., core is meaningful only for core-local spaces).
 | :-------: | :-------: | ----------- |
 | memory_type | `::mlir::ktdp::KTDP_Spyre_MemoryType` |  |
 | core | `int32_t` |  |
-
 
 ## **Metrics **
 Expressivity to capture data-parallel mappings for a wide range of operations
