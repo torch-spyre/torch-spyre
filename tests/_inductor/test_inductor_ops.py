@@ -825,6 +825,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_rmsnorm", "test_rmsnorm_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -961,7 +968,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             t = torch.exp(t)  # compiled op
             return t
 
-        compare_with_cpu(fn, x)
+        with pytest.warns(UserWarning) as record:
+            compare_with_cpu(fn, x, cpu_compile=True)
+
+        print(f"Warn {len(record)}")
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
@@ -1020,6 +1030,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return out
 
         compare_with_cpu(fn, input, weight, bias, compile_only=False)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_rmsnorm_cpu(self, x):
+        def fn(input):
+            return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
+
+        compare_with_cpu(fn, x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

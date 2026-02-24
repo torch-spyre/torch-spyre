@@ -91,13 +91,23 @@ def enable_spyre_compile_fx_wrapper():
 
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
+            from torch._inductor.decomposition import decompositions
+
             if _uses_spyre(gm, example_inputs):
                 import torch
 
                 torch.spyre._impl._lazy_init()
                 with enable_spyre_context(example_inputs):
-                    return _orig(gm, example_inputs, *args, **kwargs)
-            return _orig(gm, example_inputs, *args, **kwargs)
+                    return _orig(
+                        gm,
+                        example_inputs,
+                        decompositions=decompositions,
+                        *args,
+                        **kwargs,
+                    )
+            return _orig(
+                gm, example_inputs, decompositions=decompositions, *args, **kwargs
+            )
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True

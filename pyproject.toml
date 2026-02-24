@@ -86,10 +86,21 @@ disable_error_code = ["attr-defined"]
 
 [tool.uv]
 required-version = ">=0.9.0"
-index-url = "https://download.pytorch.org/whl/cpu"
-extra-index-url = ["https://pypi.org/simple"]
 index-strategy = "unsafe-best-match"
 override-dependencies = ['setuptools<=75.8.2']
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu" },
+]
+torchvision = [
+  { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv.pip]
 universal = true

@@ -46,6 +46,33 @@ def spyre__fill_scalar(
     return self
 
 
+@torch.library.register_kernel("aten::permute", ["spyre"])
+def spyre__permute(self: torch.Tensor, dims: list[int]) -> torch.Tensor:
+    ndims = self.dim()
+    dims = [maybe_wrap_dim(d, ndims) for d in dims]
+
+    sizes = list(self.shape)
+    strides = list(self.stride())
+    new_sizes = [sizes[d] for d in dims]
+    new_strides = [strides[d] for d in dims]
+
+    prev_stl = self.device_tensor_layout()
+    inv_perm = [0] * ndims
+    for new_pos, old_pos in enumerate(dims):
+        inv_perm[old_pos] = new_pos
+
+    new_dim_map = [inv_perm[dim] for dim in prev_stl.dim_map]
+
+    new_stl = torch_spyre._C.SpyreTensorLayout(
+        prev_stl.device_size, new_dim_map, prev_stl.device_dtype
+    )
+
+    result = torch_spyre._C.as_strided_with_layout(
+        self, new_sizes, new_strides, self.storage_offset(), new_stl
+    )
+    return result
+
+
 @torch.library.register_kernel("aten::zero_", ["spyre"])
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     """Zero out the tensor in-place."""
