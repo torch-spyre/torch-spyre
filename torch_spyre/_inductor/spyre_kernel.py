@@ -77,6 +77,31 @@ class TensorAccess(RValue):
 
         return self
 
+    def exx2_output_squeeze_to_sparse(self) -> Self:
+        """
+        Special case handling for exx2 output
+
+        This is temporary until a general fix for stick is completed within sdsc codegen layer
+        """
+        stick_dim = self.layout.device_layout.host_stick_dim()
+        new_size = []
+        new_stride = []
+        for i in range(len(self.layout.size)):
+            if i != stick_dim:
+                new_size.append(self.layout.size[i])
+                new_stride.append(self.layout.stride[i])
+
+        new_stl = compute_view_layout(
+            torch.Size(self.layout.size),
+            torch.Size(new_size),
+            self.layout.device_layout,
+        )
+
+        self.layout = FixedTiledLayout(
+            self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
+        )
+        return self
+
 
 @dataclass
 class Constant(RValue):
@@ -409,6 +434,15 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             self.kernel_specs.append(value)
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
+            if value.op == "layernormscale":
+                # TODO: eliminate this special case by pushing down to SDSC codegen layer
+                dst = dst.exx2_output_squeeze_to_sparse()
+                value.arguments[0] = value.arguments[0].exx2_output_squeeze_to_sparse()
+            if value.op == "layernormnorm":
+                # TODO: eliminate this special case by pushing down to SDSC codegen layer
+                value.arguments[1] = value.arguments[1].exx2_output_squeeze_to_sparse()
+                value.arguments[2] = value.arguments[2].exx2_output_squeeze_to_sparse()
+
             di = self.derive_dim_info(dst)
             args: list[TensorArg | ConstantArg] = []
             scales = []
