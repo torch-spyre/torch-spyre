@@ -86,9 +86,6 @@
 - operator_name: sigmoid
   template_name: base
   torch_prefix: torch.ops.aten
-- operator_name: silu
-  template_name: base
-  torch_prefix: torch.nn.functional
 - operator_name: _softmax
   template_name: base
   torch_prefix: torch.ops.aten

@@ -256,4 +256,11 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
+@torch.library.register_kernel("aten::silu.out", ["spyre"])
+def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    # Out variant
+    compiled_silu = torch.compile(torch.ops.aten.silu.out, dynamic=False)
+    return compiled_silu(self, out=out)
+
+
 # INSERT_CODEGEN_HERE

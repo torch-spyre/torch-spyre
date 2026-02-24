@@ -212,6 +212,23 @@ class TestOps(TestCase):
         y = torch.relu(x_spyre).to("cpu")
         torch.testing.assert_close(y, torch.relu(x), rtol=self.rtol, atol=self.atol)
 
+    def test_silu(self):
+        x = torch.rand([2, 32, 256], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.silu(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
+        )
+
+    @unittest.expectedFailure
+    def test_silu_larger_input(self):
+        x = torch.rand([2, 100, 12800], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.silu(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
+        )
+
     def test_exp(self):
         x = torch.tensor([-10, -1, 0, 1, 10], dtype=self.dtype)
         x_spyre = x.to("spyre")
