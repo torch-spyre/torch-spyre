@@ -91,7 +91,7 @@ _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
 @contextmanager
 def enable_spyre_lowerings():
     """
-    Existing CM that enables Spyre lowerings:
+    CM that enables Spyre lowerings:
       - Temporarily redirect relevant aten ops → Spyre lowering
       - Restore original aten lowerings on exit
 

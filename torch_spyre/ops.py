@@ -37,6 +37,35 @@ def spyre__mm_out(
     return compiled_mm(self, mat2, out=out)
 
 
+@torch.library.register_kernel("aten::addmm", ["spyre"])  # type:ignore
+def spyre__addmm_default(
+    self: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    beta: int | float | bool | complex = 1,
+    alpha: int | float | bool | complex = 1,
+) -> torch.Tensor:
+    # TODO: Add support for beta when constants work
+    # TODO: Use inductor decomp when available
+    mm_result = torch.ops.aten.mm(mat1, mat2)
+    return torch.ops.aten.add.Tensor(mm_result, self, alpha=alpha)
+
+
+@torch.library.register_kernel("aten::addmm.out", ["spyre"])  # type:ignore
+def spyre__addmm_out(
+    self: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    beta: int | float | bool | complex = 1,
+    alpha: int | float | bool | complex = 1,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # TODO: Add support for beta when constants work
+    # TODO: Use inductor decomp when available
+    mm_result = torch.ops.aten.mm(mat1, mat2)
+    return torch.ops.aten.add.out(mm_result, self, alpha=alpha, out=out)
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
@@ -111,7 +140,7 @@ def infer_squeeze_geometry(
 ) -> tuple[tuple[int, ...], tuple[int, ...], SpyreTensorLayout]:
     sizes: list[int] = []
     strides: list[int] = []
-    current_stl: SpyreTensorLayout = tensor.device_tensor_layout()
+    current_stl: SpyreTensorLayout = tensor.device_tensor_layout()  # type:ignore
     assert isinstance(current_stl, SpyreTensorLayout)
     stick_dim = current_stl.host_stick_dim()
     dim_map = current_stl.dim_map
@@ -191,7 +220,7 @@ def infer_unsqueeze_geometry(
     sizes.insert(dim, 1)
     strides.insert(dim, new_stride)
 
-    current_stl = tensor.device_tensor_layout()
+    current_stl = tensor.device_tensor_layout()  # type:ignore
     assert isinstance(current_stl, SpyreTensorLayout)
     dim_map = current_stl.dim_map
 
