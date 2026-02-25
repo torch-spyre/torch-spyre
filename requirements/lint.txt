@@ -38,7 +38,7 @@ pyyaml==6.0.3
     # via pre-commit
 regex==2026.2.19
     # via torch-spyre
-setuptools==75.8.2
+setuptools==79.0.1
     # via torch
 sympy==1.14.0
     # via torch
@@ -48,7 +48,7 @@ typing-extensions==4.15.0
     # via
     #   mypy
     #   torch
-uv==0.9.30
+uv==0.10.5
     # via torch-spyre
 virtualenv==20.39.0
     # via pre-commit
