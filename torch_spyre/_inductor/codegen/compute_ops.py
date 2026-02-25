@@ -181,8 +181,17 @@ class DimInfos:
         return [di for di in tensor_op_infos if di.scale >= 0]
 
     def get_tensor_stick_dim_labels(self, tensor):
+        # Get the label associated with the stick dim
         dl = tensor["device_layout"]
-        idx = tensor["scale"].index(dl.host_stick_dim())
+        host_stick = dl.host_stick_dim()
+        scale = tensor["scale"]
+
+        # Handle scalar/broadcast tensors where host_stick_dim may not be in scale
+        if host_stick not in scale:
+            # For scalar tensors, return the last dimension label (typically "out")
+            return [self.rows["label"][-1]]
+
+        idx = scale.index(host_stick)
         return [self.rows["label"][idx]]
 
 
