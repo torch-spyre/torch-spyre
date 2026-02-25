@@ -412,10 +412,18 @@ at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
   return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
 }
 
+at::Tensor spyre_alias(const at::Tensor& self) {
+  SpyreTensorLayout old_stl =
+      static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+  return spyre_alias_with_sizes_and_strides(self, self.sym_sizes(),
+                                            self.sym_strides(), old_stl);
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(spyre_view));
   m.impl("_unsafe_view", TORCH_FN(spyre__unsafe_view));
   m.impl("reinterpret_tensor", TORCH_FN(spyre_reinterpret_tensor));
+  m.impl("alias", TORCH_FN(spyre_alias));
 }
 
 }  // namespace spyre
