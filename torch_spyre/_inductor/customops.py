@@ -16,7 +16,7 @@ from typing import Optional, Sequence
 import torch
 from torch_spyre.fallbacks import warn_fallback
 
-from . import Unsupported
+from .errors import Unsupported
 
 
 @torch.library.custom_op("spyre::compact", mutates_args=())
@@ -138,6 +138,30 @@ def _(
     norm_mean: torch.Tensor,
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return x.new_empty(x.size())
+
+
+@torch.library.custom_op("spyre::rms_norm", mutates_args=())
+def rms_norm(
+    x: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
+        )
+    return torch.rms_norm(x, normalized_shape, weight, eps)
+
+
+@rms_norm.register_fake
+def _(
+    x: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
 ) -> torch.Tensor:
     return x.new_empty(x.size())
 

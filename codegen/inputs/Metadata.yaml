@@ -18,6 +18,8 @@
   template_name: base
 - operator_name: bitwise_not
   template_name: base
+- operator_name: bmm
+  template_name: base
 - operator_name: cat
   template_name: base
 - operator_name: cumsum
@@ -64,15 +66,10 @@
   template_name: base
 - operator_name: maximum
   template_name: base
-- operator_name: mish
-  template_name: base
-  torch_prefix: torch.nn.functional
 - operator_name: mul
   template_name: base
 - operator_name: neg
   template_name: base
-- operator_name: permute
-  template_name: view
 - operator_name: pow
   template_name: base
 - operator_name: reciprocal
@@ -86,16 +83,11 @@
 - operator_name: sigmoid
   template_name: base
   torch_prefix: torch.ops.aten
-- operator_name: silu
-  template_name: base
-  torch_prefix: torch.nn.functional
 - operator_name: _softmax
   template_name: base
   torch_prefix: torch.ops.aten
 - operator_name: sqrt
   template_name: base
-- operator_name: squeeze
-  template_name: view
 - operator_name: stack
   template_name: base
 - operator_name: sub
@@ -106,14 +98,5 @@
   template_name: view
 - operator_name: tanh
   template_name: base
-- operator_name: transpose
-  template_name: view
-  out_shape_stride_expr: transpose
 - operator_name: tril
   template_name: base
-- operator_name: _unsafe_view
-  template_name: view
-- operator_name: unsqueeze
-  template_name: view
-- operator_name: view
-  template_name: view

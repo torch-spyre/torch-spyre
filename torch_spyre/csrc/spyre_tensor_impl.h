@@ -96,6 +96,14 @@ class SpyreTensorLayout {
    */
   int32_t host_stick_dim();
 
+  /**
+   * Return a dim_order of the desired rank that is as similar as
+   * possible to the dim_order encoded in this->dim_map.
+   * Because of the elision of size 1 dimensions, there will not always
+   * be a unique "most similar" dim_order, so heuristics may be applied.
+   */
+  std::vector<int32_t> similar_dim_order(int32_t desired_rank);
+
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);
   }
@@ -121,6 +129,10 @@ class SpyreTensorImpl : public at::TensorImpl {
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
 
+  SpyreTensorImpl(at::TensorImpl::ImplType unused, c10::Storage&& storage,
+                  c10::DispatchKeySet key_set,
+                  const caffe2::TypeMeta data_type);
+
   SpyreTensorImpl(c10::Storage storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype, SpyreTensorLayout stl);
   const at::Storage& storage() const override;
@@ -144,5 +156,7 @@ class SpyreTensorImpl : public at::TensorImpl {
 
 uint64_t get_device_size_in_bytes(SpyreTensorLayout stl);
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor);
+void set_spyre_tensor_layout(const at::Tensor& tensor,
+                             const SpyreTensorLayout& stl);
 
 }  // namespace spyre

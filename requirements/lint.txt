@@ -4,13 +4,13 @@ cfgv==3.5.0
     # via pre-commit
 distlib==0.4.0
     # via virtualenv
-filelock==3.20.0
+filelock==3.24.3
     # via
     #   torch
     #   virtualenv
-fsspec==2025.10.0
+fsspec==2026.2.0
     # via torch
-identify==2.6.15
+identify==2.6.16
     # via pre-commit
 jinja2==3.1.6
     # via torch
@@ -22,23 +22,23 @@ mypy==1.13.0
     # via torch-spyre
 mypy-extensions==1.1.0
     # via mypy
-networkx==3.5
+networkx==3.6.1
     # via torch
-nodeenv==1.9.1
+nodeenv==1.10.0
     # via pre-commit
-numpy==2.3.5
+numpy==2.4.2
     # via torch-spyre
-platformdirs==4.5.0
+platformdirs==4.9.2
     # via virtualenv
-pre-commit==4.5.0
+pre-commit==4.5.1
     # via torch-spyre
-psutil==7.2.1
+psutil==7.2.2
     # via torch-spyre
 pyyaml==6.0.3
     # via pre-commit
-regex==2025.11.3
+regex==2026.2.19
     # via torch-spyre
-setuptools==75.8.2
+setuptools==79.0.1
     # via torch
 sympy==1.14.0
     # via torch
@@ -48,7 +48,7 @@ typing-extensions==4.15.0
     # via
     #   mypy
     #   torch
-uv==0.9.11
+uv==0.10.5
     # via torch-spyre
-virtualenv==20.35.4
+virtualenv==20.39.0
     # via pre-commit
