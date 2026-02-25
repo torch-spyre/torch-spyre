@@ -15,6 +15,7 @@
 # Owner(s): ["module: cpp"]
 
 import pathlib
+import pytest
 import yaml
 import unittest
 
@@ -227,6 +228,14 @@ class TestOps(TestCase):
         y = torch.nn.functional.silu(x_spyre).to("cpu")
         torch.testing.assert_close(
             y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
+        )
+
+    def test_mish(self):
+        x = torch.rand([2, 32, 256], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.mish(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.mish(x), rtol=self.rtol, atol=self.atol
         )
 
     def test_exp(self):
@@ -725,6 +734,21 @@ class TestOps(TestCase):
         x = torch.rand(512, dtype=self.dtype).to("spyre")
         with self.assertRaisesRegex(RuntimeError, "elems_per_stick"):
             x.view(16, 32)
+
+    # NOTE: embedding / indirect indexing / index_select are not supported yet
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_embedding(self):
+        # an embedding matrix containing 10 tensors of size 3
+        embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
+        # a batch of 2 samples of 4 indices each
+        indices = torch.tensor([[1, 2, 4, 5], [4, 3, 2, 9]], dtype=torch.int64)
+        cpu_y = torch.nn.functional.embedding(indices, embedding_matrix)
+
+        embed_spyre = embedding_matrix.to("spyre")
+        indices_spyre = indices.to("spyre")
+        spyre_y = torch.nn.functional.embedding(indices_spyre, embed_spyre).to("cpu")
+
+        torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):

@@ -11,7 +11,6 @@ requires = [
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=70.1.0,<80.0",
-    "torch~=2.10.0",  # Needed to use BuildExtension
     "wheel"
 ]
 build-backend = "setuptools.build_meta"
@@ -26,6 +25,7 @@ dependencies = [
     "numpy",
     "regex",
     "torch~=2.10.0",
+#    "torch>=2.10.0",
     "psutil~=7.2.1"
 ]
 requires-python = ">=3.11"
@@ -44,7 +44,6 @@ build = [ # no-isolation build
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=70.1.0,<80.0",
-    "torch~=2.10.0",  # Needed to use BuildExtension
     "wheel"
 ]
 test = [
@@ -56,7 +55,7 @@ lint = [
     "mypy~=1.13.0",
     "pre-commit~=4.5.0",
     "types-PyYAML~=6.0.12.20250915",
-    "uv~=0.9.10",
+    "uv~=0.10.0",
 ]
 
 [project.entry-points."torch.backends"]
@@ -84,13 +83,22 @@ exclude=["tests/_inductor"]
 module = ["torch_spyre._inductor.*"]
 disable_error_code = ["attr-defined"]
 
+[tool.pytest.ini_options]
+filterwarnings = [
+    # PyTorch 2.10.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
+    # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
+    # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/jit/_script.py#L363
+    "ignore::DeprecationWarning:torch.jit._script",
+]
+
 [tool.uv]
 required-version = ">=0.9.0"
 index-strategy = "unsafe-best-match"
-override-dependencies = ['setuptools<=75.8.2']
+override-dependencies = ['setuptools>=70.1.0,<80.0']
 
 [tool.uv.sources]
 torch = [
+#  { path = "../pytorch", editable = true },
   { index = "pytorch-cpu" },
 ]
 torchvision = [

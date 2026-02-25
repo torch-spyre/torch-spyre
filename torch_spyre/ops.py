@@ -263,4 +263,11 @@ def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tenso
     return compiled_silu(self, out=out)
 
 
+@torch.library.register_kernel("aten::mish.out", ["spyre"])
+def spyre__mish_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    # Out variant
+    compiled_mish = torch.compile(torch.ops.aten.mish.out, dynamic=False)
+    return compiled_mish(self, out=out)
+
+
 # INSERT_CODEGEN_HERE

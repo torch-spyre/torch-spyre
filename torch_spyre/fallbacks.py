@@ -134,7 +134,8 @@ def register_fallback(ops, device="cpu"):
             key = id(t)
             moved = memo.get(key)
             if moved is None:
-                moved = t.to(fallback_device)
+                # Preserve dtype when moving to fallback device
+                moved = t.to(device=fallback_device, dtype=t.dtype)
                 memo[key] = moved
             return moved
 
@@ -218,3 +219,15 @@ def spyre__sin(input, **kwargs):
 @register_fallback([aten.cos.default, aten.cos.out])
 def spyre__cos(input, **kwargs):
     return torch.cos(input, **kwargs)
+
+
+@register_fallback([aten.embedding.default])
+def spyre__embedding(weight, indices, **kwargs):
+    """
+    Fallback for torch.nn.functional.embedding.
+
+    Embedding requires indirect indexing (weight[indices]), which is not
+    supported by Spyre's current pointwise operation framework.
+    """
+    # TODO: Remove this fallback once we enable gather/scatter ops on spyre
+    return aten.embedding(weight, indices, **kwargs)
