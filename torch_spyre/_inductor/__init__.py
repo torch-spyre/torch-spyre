@@ -105,9 +105,7 @@ def enable_spyre_compile_fx_wrapper():
                         *args,
                         **kwargs,
                     )
-            return _orig(
-                gm, example_inputs, *args, **kwargs
-            )
+            return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True
