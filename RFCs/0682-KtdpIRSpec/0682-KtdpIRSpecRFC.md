@@ -1,13 +1,22 @@
 # Kernel Tile Data Parallel (`ktdp`) Intermediate Representation
 
 **Authors:**
-
-Prasanth Chatarasi, Bardia Mahjour, Alberto Mannari, Swagath Venkataramani, David Grove, Olivier Tardieu, Mori Ohara, Takuya Nakaike, Kazuaki Ishizaki, Eri Ogawa, Michihiro Horie, Mudhakar Srivatsa, Viji Srinivasan
-
-Point of contact: Prasanth Chatarasi
+* @pchath 
+* @bmahjour
+* @dgrove-oss 
+* @kiszk
+* @lupalby
+* @tnakaike
+* @erio
+* @moriohara
+* @michihirohorie
+* @Viji-Srinivasan
+* @mudhakar
+* @tardieu
+* @vswagath1989
 
 ## **Summary**
-This RFC defines a new interface between compiler frontend (TorchInductor, custom kernels via. Triton, and others) and compiler backend (Deeptools)
+This RFC defines `ktdp` IR, a new interface between compiler frontends (TorchInductor, custom kernels via. Triton, and others) and Spyre compiler backend (Deeptools)
 
 ## **Motivation**
 Transtion from SuperDSC-bundle into tile-based interface built over open-source MLIR compiler infrastructure. It enables sufficient expressivity to capture data-parallel mappings from: 1) Torch inductor compiler frontend 2) Custom Spyre kernels written in Triton/Helion
