@@ -160,7 +160,9 @@ def infer_squeeze_geometry(
             sizes.append(tensor.size(idx))
             strides.append(tensor.stride(idx))
 
-    new_stl = torch_spyre._C.compute_view_layout(tensor.size(), sizes, current_stl)
+    new_stl = torch_spyre._C.compute_view_layout(
+        tensor.size(), torch.Size(sizes), current_stl
+    )
 
     return tuple(sizes), tuple(strides), new_stl
 
@@ -215,7 +217,9 @@ def infer_unsqueeze_geometry(
     if stick_dim is None:
         raise ValueError("Unsqueezing of sparse tensors not implemented")
 
-    new_stl = torch_spyre._C.compute_view_layout(tensor.size(), sizes, current_stl)
+    new_stl = torch_spyre._C.compute_view_layout(
+        tensor.size(), torch.Size(sizes), current_stl
+    )
 
     return tuple(sizes), tuple(strides), new_stl
 

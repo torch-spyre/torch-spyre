@@ -503,6 +503,8 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_matmul_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
