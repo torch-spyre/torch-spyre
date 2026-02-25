@@ -577,7 +577,7 @@ class TestOps(TestCase):
         torch.testing.assert_close(
             out_spyre.cpu(), out_cpu, rtol=self.rtol, atol=self.atol
         )
-        
+
     def test_zeros(self):
         x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
         x = torch.zeros(3, 64, dtype=self.dtype)
