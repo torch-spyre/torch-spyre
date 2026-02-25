@@ -1,18 +1,17 @@
 [build-system]
 requires = [
     # any change here should be reflected in the build dependencies below
-    "build~=1.3.0",  # only required to build torch_sendnn
-    "cmake>=3.26.1,<4.0.0",
-    "expecttest~=0.3.0",
-    "hypothesis~=6.148.1",
-    "jinja2~=3.1.6",
-    "ninja~=1.13.0",
-    "numpy~=2.3.4",
-    "pyyaml~=6.0.0", # needed for codegen
-    "regex~=2025.11.3",
-    "setuptools<=75.8.2",
-    "torch~=2.9.1",  # Needed to use BuildExtension
-    "wheel~=0.45.1"
+    "build",  # only required to build torch_sendnn
+    "cmake>=3.27,<4.0.0",
+    "expecttest>=0.3.0",
+    "hypothesis",
+    "jinja2",
+    "ninja",
+    "numpy",
+    "pyyaml", # needed for codegen
+    "regex",
+    "setuptools>=70.1.0,<80.0",
+    "wheel"
 ]
 build-backend = "setuptools.build_meta"
 
@@ -23,9 +22,10 @@ authors = [
 ]
 description = "Torch-Spyre out of tree registration"
 dependencies = [
-    "numpy~=2.3.4",
-    "regex~=2025.11.3",
-    "torch~=2.9.1",
+    "numpy",
+    "regex",
+    "torch~=2.10.0",
+#    "torch>=2.10.0",
     "psutil~=7.2.1"
 ]
 requires-python = ">=3.11"
@@ -34,18 +34,17 @@ dynamic = ["version"]
 [project.optional-dependencies]
 build = [ # no-isolation build 
     # any change here should be reflected in the build system above
-    "build~=1.3.0",  # only required to build torch_sendnn
-    "cmake>=3.26.1,<4.0.0",
-    "expecttest~=0.3.0",
-    "hypothesis~=6.148.1",
-    "jinja2~=3.1.6",
-    "ninja~=1.13.0",
-    "numpy~=2.3.4",
-    "pyyaml~=6.0.0", # needed for codegen
-    "regex~=2025.11.3",
-    "setuptools<=75.8.2",
-    "torch~=2.9.1",  # Needed to use BuildExtension
-    "wheel~=0.45.1"
+    "build",  # only required to build torch_sendnn
+    "cmake>=3.27,<4.0.0",
+    "expecttest>=0.3.0",
+    "hypothesis",
+    "jinja2",
+    "ninja",
+    "numpy",
+    "pyyaml", # needed for codegen
+    "regex",
+    "setuptools>=70.1.0,<80.0",
+    "wheel"
 ]
 test = [
     "pytest~=9.0.0",
@@ -56,7 +55,7 @@ lint = [
     "mypy~=1.13.0",
     "pre-commit~=4.5.0",
     "types-PyYAML~=6.0.12.20250915",
-    "uv~=0.9.10",
+    "uv~=0.10.0",
 ]
 
 [project.entry-points."torch.backends"]
@@ -84,12 +83,32 @@ exclude=["tests/_inductor"]
 module = ["torch_spyre._inductor.*"]
 disable_error_code = ["attr-defined"]
 
+[tool.pytest.ini_options]
+filterwarnings = [
+    # PyTorch 2.10.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
+    # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
+    # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/jit/_script.py#L363
+    "ignore::DeprecationWarning:torch.jit._script",
+]
+
 [tool.uv]
 required-version = ">=0.9.0"
-index-url = "https://download.pytorch.org/whl/cpu"
-extra-index-url = ["https://pypi.org/simple"]
 index-strategy = "unsafe-best-match"
-override-dependencies = ['setuptools<=75.8.2']
+override-dependencies = ['setuptools>=70.1.0,<80.0']
+
+[tool.uv.sources]
+torch = [
+#  { path = "../pytorch", editable = true },
+  { index = "pytorch-cpu" },
+]
+torchvision = [
+  { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv.pip]
 universal = true

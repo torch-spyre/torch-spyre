@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
-
-_C: Any
-
 def _is_in_bad_fork() -> bool: ...
 def manual_seed_all(seed: int) -> None: ...
 def is_available() -> bool: ...

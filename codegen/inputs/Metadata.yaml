@@ -68,9 +68,6 @@
   template_name: base
 - operator_name: maximum
   template_name: base
-- operator_name: mish
-  template_name: base
-  torch_prefix: torch.nn.functional
 - operator_name: mul
   template_name: base
 - operator_name: neg
@@ -88,9 +85,6 @@
 - operator_name: sigmoid
   template_name: base
   torch_prefix: torch.ops.aten
-- operator_name: silu
-  template_name: base
-  torch_prefix: torch.nn.functional
 - operator_name: _softmax
   template_name: base
   torch_prefix: torch.ops.aten
