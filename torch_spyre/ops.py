@@ -269,5 +269,18 @@ def spyre__mish_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tenso
     compiled_mish = torch.compile(torch.ops.aten.mish.out, dynamic=False)
     return compiled_mish(self, out=out)
 
+@torch.library.register_kernel("aten::uniform_", "spyre")
+def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
+    # Create a new tensor on cpu
+    cpu_tmp = torch.empty_like(self, device="cpu", 
+                               memory_format=torch.preserve_format)
+    
+    # Fill the CPU tensor with uniform random values
+    cpu_tmp.uniform_(from_, to, generator=generator)
+    
+    # Copy the CPU tensor back to the spyre device
+    self.copy_(cpu_tmp)
+    
+    return self
 
 # INSERT_CODEGEN_HERE
