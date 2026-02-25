@@ -15,6 +15,7 @@
 # Owner(s): ["module: cpp"]
 
 import pathlib
+import pytest
 import yaml
 import unittest
 
