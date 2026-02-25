@@ -28,7 +28,9 @@ from .kernel_runner import (
     SpyreUnimplementedRunner,
 )
 
-_argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
+#_argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
+N=7
+_argument_names = [f'arg{i}' for i in range(N)]
 
 
 def get_output_dir(kernel_name: str):
@@ -92,8 +94,10 @@ class SpyreAsyncCompile:
         }
         if ks.op_info is not None:
             kernel_descriptor["op_info"] = ks.op_info
-        pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
-        dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
+        # pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
+        symaddress = _argument_names
+        # dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
+        dt_sdsc = generate_sdsc(symaddress, **kernel_descriptor)
         kernel_output_dir = get_output_dir(kernel_name)
         subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
         os.makedirs(subdir, exist_ok=True)

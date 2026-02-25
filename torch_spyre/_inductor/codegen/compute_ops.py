@@ -14,6 +14,7 @@
 
 import math
 from dataclasses import dataclass
+from sympy import Symbol
 
 
 from torch_spyre._C import encode_constant, DataFormats
@@ -634,9 +635,27 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         {"factor_": 1, "label_": "corelet"},
                                         {"factor_": 1, "label_": "time"},
                                     ],
-                                    "data_": {
+                                    # "data_": {
+                                    #     f"[{c}, 0, 0]": str(
+                                    #         pointers[tensor["name"]]
+                                    #         + c
+                                    #         # calculate the prod of dim sizes
+                                    #         # less significant than chosen split dim i.e. the stick
+                                    #         * math.prod(
+                                    #             dim_infos.get_padded_sizes()[:2]
+                                    #         )
+                                    #         * num_bytes(
+                                    #             tensor["device_layout"].device_dtype
+                                    #         )
+                                    #         // cores
+                                    #     )
+                                    #     if tensor["lx_addr"] is None
+                                    #     else tensor["lx_addr"]
+                                    #     for c in range(cores)
+                                    # },
+                                        "data_": {
                                         f"[{c}, 0, 0]": str(
-                                            pointers[tensor["name"]]
+                                            Symbol(tensor["name"])
                                             + c
                                             # calculate the prod of dim sizes
                                             # less significant than chosen split dim i.e. the stick
