@@ -406,14 +406,9 @@ at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
                                     int64_t offset_increment) {
   TORCH_CHECK(offset_increment == 0,
               "reinterpert_tensor with offset_increment not implemented");
-  // TODO(dgrove-oss): Blindly using the generic stick layout for new_stl
-  //                   because that is what we did in stickify.py in inductor
-  //                   when we created this device tensor as the output buffer
-  //                   from clone. We should be able to better connect these two
-  //                   operations, and not have to do this blindly, but this is
-  //                   acceptable for now.
-  SpyreTensorLayout new_stl =
-      SpyreTensorLayout(size.vec(), c10::typeMetaToScalarType(self.dtype()));
+  SpyreTensorLayout old_stl =
+      static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+  SpyreTensorLayout new_stl = compute_view_layout(self.sizes(), size, old_stl);
   return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
 }
 
