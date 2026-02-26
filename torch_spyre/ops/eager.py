@@ -96,5 +96,8 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
 
     return self
 
+@torch.library.impl("aten::_local_scalar_dense", "spyre")  # type:ignore
+def _local_scalar_dense_spyre(self):
+    return self.cpu().item()
 
 # INSERT_CODEGEN_HERE

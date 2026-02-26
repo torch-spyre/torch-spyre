@@ -1329,6 +1329,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        ("test_item", "test_item_cpu"): {
+            "param_sets": {
+                "float16": (torch.tensor([3.14], dtype=torch.float16),),
+                "float32": (torch.tensor([2.71828], dtype=torch.float32),),
+                "scalar_float": (torch.tensor(3.14, dtype=torch.float32),),
+                "int64": (torch.tensor([5], dtype=torch.int64),),
+                "from_computation": (
+                    torch.tensor([2.0], dtype=torch.float16),
+                    torch.tensor([3.0], dtype=torch.float16),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1835,6 +1847,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         output = compiled(64.0, device="spyre")
 
         _ = output.cpu()
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_item_cpu(self, *args):
+        """Test .item() operation on Spyre tensors"""
+        if len(args) == 1:
+            x = args[0]
+
+            def fn(t):
+                return t.item()
+
+            compare_with_cpu(fn, x, cpu_compile=False)
+
+        elif len(args) == 2:
+            x, y = args
+
+            def fn(a, b):
+                result = a * b
+                return result.item()
+
+            compare_with_cpu(fn, x, y, cpu_compile=False)
 
 
 if __name__ == "__main__":
