@@ -25,12 +25,30 @@ def enable_spyre_compile_fx_wrapper():
     import torch._inductor.compile_fx as cfx
     import torch.fx as fx
     import torch
+    from torch._inductor.decomposition import select_decomp_table
+    
+    from torch_spyre._inductor.decomposition_context import (
+        get_spyre_decomposition_table,
+        set_spyre_decomposition_table,
+    )
 
     if getattr(cfx, "_spyre_wrapped", False):
         return
     with _autoload_lock:
         if getattr(cfx, "_spyre_wrapped", False):
             return
+        
+        # # Patch select_decomp_table to use the spyre-specific decomposition table first
+        # _orig_select_decomp_table = select_decomp_table
+        
+        # def _patched_select_decomp_table():
+        #     custom_table = get_spyre_decomposition_table()
+        #     if custom_table is not None:
+        #         return custom_table
+        #     return _orig_select_decomp_table()
+        
+        # select_decomp_table = _patched_select_decomp_table
+        
         _orig = cfx.compile_fx
 
         # Iterate over producer nodes (supports nested containers of nodes)
@@ -92,23 +110,21 @@ def enable_spyre_compile_fx_wrapper():
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
             if _uses_spyre(gm, example_inputs):
-                import torch
-                from torch._inductor.decomposition import select_decomp_table
-
                 torch.spyre._impl._lazy_init()
 
                 cloned_decompositions = select_decomp_table().copy()
                 with enable_spyre_context(example_inputs, cloned_decompositions):
                     # The `cloned_decompositions` is the updated in the context manager
                     # with the appropriate spyre decompositions
-                    kwargs["decompositions"] = cloned_decompositions
+                    with set_spyre_decomposition_table(cloned_decompositions):
+                        kwargs["decompositions"] = cloned_decompositions
 
-                    return _orig(
-                        gm,
-                        example_inputs,
-                        *args,
-                        **kwargs,
-                    )
+                        return _orig(
+                            gm,
+                            example_inputs,
+                            *args,
+                            **kwargs,
+                        )
             return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _wrapper
