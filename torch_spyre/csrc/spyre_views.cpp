@@ -98,11 +98,13 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
                                       const SpyreTensorLayout& old_stl) {
   size_t old_rank = old_sizes.size();
   size_t new_rank = new_sizes.size();
+
+  // Built during Phase 1; used in Phase 2
   int sparse_to_dense_stick_dim = -1;
+  std::unordered_map<size_t, std::vector<size_t>> size_1_insertions;
 
   // Phase 1: Identify old->new host dimension groups
   std::vector<DimGroup> groups;
-  std::unordered_map<size_t, std::vector<size_t>> size_1_insertions;
   size_t old_i = 0, new_j = 0;
   while (old_i < old_rank || new_j < new_rank) {
     // Handle trailing size-1 dims
@@ -406,9 +408,9 @@ at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
                                     int64_t offset_increment) {
   TORCH_CHECK(
       offset_increment == 0,
-      "reinterpert_tensor with non-zero offset_increment not implemented");
+      "reinterpret_tensor with non-zero offset_increment not implemented");
 
-  // TODO(dgrove-oos):  Inductor uses reinterpret_tensor in two patterns
+  // TODO(dgrove-oss):  Inductor uses reinterpret_tensor in two patterns
   // we have encountered so far.
   //   1. To realize a view on a graph output.
   //   2. To implement .contiguous() on the cloned buffer.

@@ -68,7 +68,7 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
 
     for d in range(len(layout.size)):
         if d not in result:
-            assert layout.size[d] == 1, "non-trivial dim missing from index exper"
+            assert layout.size[d] == 1, "non-trivial dim missing from index expression"
             result[d] = wildcard_symbol(d)
 
     return result

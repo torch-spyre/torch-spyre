@@ -148,7 +148,7 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(fused_stl.device_size, [5, 1, 2, 3, 64])
         self.assertEqual(fused_stl.dim_map, [0, 1, 2, 0, 2])
 
-        # A k-dim tensor with a size 1 stick dimension is interchangably with a sparse tensor of dim k-1
+        # A k-dim tensor with a size 1 stick dimension is interchangeable with a sparse tensor of dim k-1
         stl = SpyreTensorLayout((5, 128, 1), torch.float16)
         self.assertEqual(stl.device_size, [128, 1, 5, 64])
         self.assertEqual(stl.dim_map, [1, 2, 0, 2])

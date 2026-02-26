@@ -58,7 +58,7 @@ class TensorAccess(RValue):
     index: sympy.Expr
     layout: FixedTiledLayout
 
-    def unsqueeze_if_sparse(self) -> Self:
+    def unsqueeze_if_sparse(self):
         """
         If layout is sparse, construct a new layout that unsqueezes to a dense tensor
         """
@@ -71,9 +71,10 @@ class TensorAccess(RValue):
                 torch.Size(new_size),
                 self.layout.device_layout,
             )
-            self.layout = FixedTiledLayout(
+            new_layout = FixedTiledLayout(
                 self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
             )
+            return TensorAccess(self.name, self.index, new_layout)
 
         return self
 
