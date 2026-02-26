@@ -1,7 +1,8 @@
 import contextvars
 from contextlib import contextmanager
+import torch._inductor.decomposition as decomp
 
-_spyre_decomposition_table = contextvars.ContextVar('spyre_decomposition_table', default=None)
+_spyre_decomposition_table = contextvars.ContextVar('spyre_decomposition_table', default=decomp.decompositions)
 
 def get_spyre_decomposition_table():
     """Get the current custom decomposition table from context."""

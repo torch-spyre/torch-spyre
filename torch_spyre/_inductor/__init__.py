@@ -25,7 +25,8 @@ def enable_spyre_compile_fx_wrapper():
     import torch._inductor.compile_fx as cfx
     import torch.fx as fx
     import torch
-    from torch._inductor.decomposition import select_decomp_table
+    # from torch._inductor.decomposition import select_decomp_table
+    import torch._inductor.decomposition as decomp
     
     from torch_spyre._inductor.decomposition_context import (
         get_spyre_decomposition_table,
@@ -48,6 +49,61 @@ def enable_spyre_compile_fx_wrapper():
         #     return _orig_select_decomp_table()
         
         # select_decomp_table = _patched_select_decomp_table
+        
+        # Create a property-like accessor for the decompositions variable
+        # This intercepts direct access to decomp_module.decompositions
+        class DecompositionsProxy:
+            def __getattribute__(self, name):
+                if name == '__class__':
+                    return dict
+                custom_table = get_spyre_decomposition_table()
+                return getattr(custom_table, name)
+            
+            def __getitem__(self, key):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table[key]
+            
+            def __contains__(self, key):
+                custom_table = get_spyre_decomposition_table()
+                return key in custom_table
+            
+            def __iter__(self):
+                custom_table = get_spyre_decomposition_table()
+                return iter(custom_table)
+            
+            def get(self, key, default=None):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table.get(key, default)
+            
+            def keys(self):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table.keys()
+            
+            def values(self):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table.values()
+            
+            def items(self):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table.items()
+            
+            def copy(self):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table.copy()
+            
+            def pop(self, key, *args):
+                custom_table = get_spyre_decomposition_table()
+                return custom_table.pop(key, *args)
+        
+        # Replace the global decompositions with our proxy
+        decomp.decompositions = DecompositionsProxy()
+        
+        # IMPORTANT: Also patch lowering module if it's already imported
+        import sys
+        if 'torch._inductor.lowering' in sys.modules:
+            import torch._inductor.lowering as lowering_module
+            # Replace lowering's local decompositions reference with our proxy
+            lowering_module.decompositions = DecompositionsProxy()
         
         _orig = cfx.compile_fx
 
@@ -112,7 +168,7 @@ def enable_spyre_compile_fx_wrapper():
             if _uses_spyre(gm, example_inputs):
                 torch.spyre._impl._lazy_init()
 
-                cloned_decompositions = select_decomp_table().copy()
+                cloned_decompositions = decomp.select_decomp_table().copy()
                 with enable_spyre_context(example_inputs, cloned_decompositions):
                     # The `cloned_decompositions` is the updated in the context manager
                     # with the appropriate spyre decompositions
