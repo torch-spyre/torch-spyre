@@ -404,12 +404,30 @@ at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
                                     c10::IntArrayRef size,
                                     c10::IntArrayRef stride,
                                     int64_t offset_increment) {
-  TORCH_CHECK(offset_increment == 0,
-              "reinterpert_tensor with offset_increment not implemented");
-  SpyreTensorLayout old_stl =
-      static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
-  SpyreTensorLayout new_stl = compute_view_layout(self.sizes(), size, old_stl);
-  return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
+  TORCH_CHECK(
+      offset_increment == 0,
+      "reinterpert_tensor with non-zero offset_increment not implemented");
+
+  // TODO(dgrove-oos):  Inductor uses reinterpret_tensor in two patterns
+  // we have encountered so far.
+  //   1. To realize a view on a graph output.
+  //   2. To implement .contiguous() on the cloned buffer.
+  // We need figure out how to change the codegen in inductor so that
+  // we aren't hueristically guessing which applies here.
+  if (self.sizes().size() != size.size()) {
+    // view case:
+    SpyreTensorLayout old_stl =
+        static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+    SpyreTensorLayout new_stl =
+        compute_view_layout(self.sizes(), size, old_stl);
+    return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
+  } else {
+    // clone case: we forced generic stick layout in stickify.py clone, so do
+    // same here.
+    SpyreTensorLayout new_stl =
+        SpyreTensorLayout(size.vec(), c10::typeMetaToScalarType(self.dtype()));
+    return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
+  }
 }
 
 at::Tensor spyre_alias(const at::Tensor& self) {
