@@ -11,6 +11,8 @@ requires = [
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=70.1.0,<80.0",
+    "torch~=2.10.0",
+#    "torch>=2.10.0",
     "wheel"
 ]
 build-backend = "setuptools.build_meta"
@@ -44,6 +46,8 @@ build = [ # no-isolation build
     "pyyaml", # needed for codegen
     "regex",
     "setuptools>=70.1.0,<80.0",
+    "torch~=2.10.0",
+#    "torch>=2.10.0",
     "wheel"
 ]
 test = [
