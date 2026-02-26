@@ -731,7 +731,7 @@ class TestOps(TestCase):
 
     def test_uniform_(self):
         x_spyre = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype, device="spyre")
-        x_spyre.uniform_(0.0, 1.0)
+        x_spyre.uniform_()
         x_cpu = x_spyre.to("cpu")
         self.assertTrue(
             torch.all(x_cpu >= 0.0) and torch.all(x_cpu < 1.0),
