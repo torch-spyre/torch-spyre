@@ -191,8 +191,6 @@ class DimInfos:
 def get_device_size(host_dim, tensor):
     dl = tensor["device_layout"]
     device_dim = tensor["scale"][host_dim]
-    if device_dim == -3:  # special case to skip elided dim
-        return 1
     assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
     size = dl.device_size[dl.dim_map.index(device_dim)]
     if device_dim == dl.host_stick_dim():
@@ -540,10 +538,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     layouts = create_tensor_specific_layouts(tensors, dim_infos, op)
 
     # Compute the stick label from the op tensor.
-    # For now we expect stick dim to always be "out", so check.
-    # Remove the assertion when this invariant changes
     op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
-    assert op_stick_labels == ["out"]
 
     core_id_to_wk_slice = {}
     for i in range(cores):

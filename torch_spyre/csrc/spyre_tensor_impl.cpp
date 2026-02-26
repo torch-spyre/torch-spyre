@@ -46,8 +46,7 @@ int64_t elems_per_stick(const DataFormats& df) {
 auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
     -> std::vector<int32_t> {
   std::vector<int32_t> dim_map;
-  bool sparse = host_dim_order.back() == -1;
-  auto rank = sparse ? host_dim_order.size() - 1 : host_dim_order.size();
+  auto rank = host_dim_order.size();
   switch (rank) {
     case 1:
       dim_map = {host_dim_order[0], host_dim_order[0]};
@@ -77,73 +76,16 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
       ss << "Unsupported tensor rank: " << std::to_string(rank);
       throw std::runtime_error(ss.str());
   }
-  if (sparse) {
-    dim_map.back() = -1;
-  }
   return dim_map;
 }
 
-int32_t SpyreTensorLayout::host_stick_dim() {
-  // NOTE: dim_map[rank-1] is -1 for a sparse tensor.
-  //       Return the other entry for the stick so we get a real host dim.
-  auto rank = this->dim_map.size();
-  if (rank == 2) {
-    return this->dim_map[rank - 2];
+std::optional<int32_t> SpyreTensorLayout::host_stick_dim() {
+  int32_t stick_dim = this->dim_map.back();
+  if (stick_dim == -1) {
+    return std::nullopt;
   } else {
-    return this->dim_map[rank - 3];
+    return stick_dim;
   }
-}
-
-std::vector<int32_t> SpyreTensorLayout::similar_dim_order(
-    int32_t desired_rank) {
-  auto rank = this->dim_map.size();
-  std::vector<int32_t> dim_order;
-
-  // Invert get_generic_stick_layout
-  dim_order.push_back(this->dim_map[rank - 2]);
-  for (auto i = 0; i < rank - 2; i++) {
-    dim_order.push_back(this->dim_map[i]);
-  }
-
-  // How similar is the layout to a vanilla row major or column major?
-  auto row_major_count = 0;
-  auto col_major_count = 0;
-  for (auto i = 1; i < rank; i++) {
-    if (this->dim_map[i - 1] < this->dim_map[i]) {
-      row_major_count++;
-    } else {
-      col_major_count++;
-    }
-  }
-
-  std::vector<int32_t> result;
-  if (row_major_count == (rank - 1)) {
-    // It is exactly row major
-    for (int32_t i = 0; i < desired_rank; i++) {
-      result.push_back(i);
-    }
-  } else if (col_major_count == (rank - 1)) {
-    // It is exactly column major
-    for (int32_t i = desired_rank - 1; i >= 0; i--) {
-      result.push_back(i);
-    }
-  } else if (col_major_count > row_major_count) {
-    // It is closer to column major
-    // TODO(dgrove-oss): We could try harder here if neccessary
-    DEBUGINFO("similar_dim_order: closest to column major")
-    for (int32_t i = desired_rank - 1; i >= 0; i--) {
-      result.push_back(i);
-    }
-  } else {
-    // It is closer to row major
-    // TODO(dgrove-oss): We could try harder here if neccessary
-    DEBUGINFO("similar_dim_order: closest to row major")
-    for (int32_t i = 0; i < desired_rank; i++) {
-      result.push_back(i);
-    }
-  }
-
-  return result;
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
@@ -171,42 +113,31 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
 
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
-    this->device_size.resize(1);
-    this->dim_map.resize(1);
+    this->device_size.resize(2);
+    this->dim_map.resize(2);
     this->device_size[0] = this->elems_per_stick();
-    this->dim_map[0] = -1;  // host_size has no entries!
+    this->device_size[1] = this->elems_per_stick();
+    this->dim_map[0] = -1;
+    this->dim_map[1] = -1;
     return;
   }
 
-  // PyTorch expects to be able to freely add/remove size 1 dimensions
-  // without changing the memory layout of a tensor.
-  // To enable this to be true for Spyre tensors
-  // we filter dim_order to remove trivial dimensions before tiling.
-  bool sparse = dim_order.back() == -1;
-  std::vector<int32_t> filtered_dim_order;
-  for (auto i = 0; i < dim_order.size(); i++) {
-    if ((dim_order[i] == -1) || (host_size[dim_order[i]] != 1)) {
-      filtered_dim_order.push_back(dim_order[i]);
-    }
-  }
-
-  // Special case: a tensor all of whose dimensions are size 1 keeps dim 0
-  if ((filtered_dim_order.size() == 0) ||
-      ((filtered_dim_order.size() == 1) && (filtered_dim_order.back() == -1))) {
-    filtered_dim_order.insert(filtered_dim_order.begin(), 0);
-  }
-
   // Computing tiling
-  this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
+  this->dim_map = spyre::get_generic_stick_layout(dim_order);
   this->device_size.resize(this->dim_map.size());
+  bool sparse = dim_order.back() == -1;
   auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
-  auto stick_dim = this->host_stick_dim();
+  auto stick_dim = this->dim_map.back();
   this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();
   for (int i = 0; i < this->dim_map.size() - 1; i++) {
     auto dim = this->dim_map[i];
     if (dim == stick_dim) {
-      this->device_size[i] =
-          (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
+      if (sparse) {
+        this->device_size[i] = 1;
+      } else {
+        this->device_size[i] =
+            (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
+      }
     } else {
       this->device_size[i] = host_size[dim];
     }
@@ -328,9 +259,7 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
     stl = impl->spyre_layout;
   } else {
-    DEBUGINFO("Warning: Device tensor does not have SpyreTensorImpl");
-    stl = SpyreTensorLayout(tensor.sizes().vec(),
-                            c10::typeMetaToScalarType(tensor.dtype()));
+    TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorLayout");
   }
   return stl;
 }

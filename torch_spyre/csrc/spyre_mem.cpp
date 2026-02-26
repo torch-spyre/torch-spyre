@@ -110,6 +110,7 @@ auto get_dim_device_stride(int dim, int stick_size,
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
+ * @param stl: SpyreTensorLayout of dev tensor
  * @param stick_size: stick length for the dtype
  * @param device_sizes: dimesion sizes of dev tensor
  * @param host2device: direction of data conversion

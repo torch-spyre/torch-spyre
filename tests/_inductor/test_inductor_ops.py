@@ -574,7 +574,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     },
                 ),
                 "value_4d": (
-                    cached_randn((1, 64, 11, 2048)),
+                    cached_randn((1, 64, 11, 512)),
                     {
                         "p": 0.0,
                         "training": False,
