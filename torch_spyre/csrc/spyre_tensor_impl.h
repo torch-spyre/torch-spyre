@@ -20,6 +20,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include <util/sendefs.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -92,17 +93,10 @@ class SpyreTensorLayout {
   std::string toString() const;
 
   /**
-   * Return the host_dim that is considered to be the stick dimension.
+   * Return the host_dim that is the stick dimension; sparse tensors return
+   * nullopt.
    */
-  int32_t host_stick_dim();
-
-  /**
-   * Return a dim_order of the desired rank that is as similar as
-   * possible to the dim_order encoded in this->dim_map.
-   * Because of the elision of size 1 dimensions, there will not always
-   * be a unique "most similar" dim_order, so heuristics may be applied.
-   */
-  std::vector<int32_t> similar_dim_order(int32_t desired_rank);
+  std::optional<int32_t> host_stick_dim();
 
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);

@@ -222,7 +222,9 @@ def spyre__cos(input, **kwargs):
 
 
 @register_fallback([aten.embedding.default])
-def spyre__embedding(weight, indices, **kwargs):
+def spyre__embedding(
+    weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
+):
     """
     Fallback for torch.nn.functional.embedding.
 
@@ -230,4 +232,4 @@ def spyre__embedding(weight, indices, **kwargs):
     supported by Spyre's current pointwise operation framework.
     """
     # TODO: Remove this fallback once we enable gather/scatter ops on spyre
-    return aten.embedding(weight, indices, **kwargs)
+    return aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse)
