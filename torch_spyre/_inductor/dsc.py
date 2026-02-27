@@ -29,16 +29,6 @@ class SuperDSCScheduling(SIMDScheduling):
     kernel_type: type[Any] = SpyreKernel
     dsc_type: str = "sdsc"
 
-    def get_argument_metadata(self, wrapper, kernel) -> str:
-        actuals = kernel.args.python_argdefs()[1]
-        buf = IndentedBuffer()
-        buf.writeline(f"{wrapper.comment} Argument Layouts:")
-        for index, name in enumerate(actuals):
-            arg = V.graph.try_get_buffer(name)
-            if arg:
-                buf.writeline(f"{wrapper.comment}   {index}: {arg.get_layout()}")
-        return buf.getvalue().rstrip()
-
     def define_kernel(self, src_code, node_schedule, kernel):
         """Codegen kernel definition to go in output wrapper code"""
         wrapper = V.graph.wrapper_code
@@ -56,8 +46,7 @@ class SuperDSCScheduling(SIMDScheduling):
                 buf.splice(f"{src_code}")
             buf.writeline(")")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
-            arginfo = self.get_argument_metadata(wrapper, kernel)
-            metadata_comment = f"{origins}\n{detailed_origins}\n{arginfo}"
+            metadata_comment = f"{origins}\n{detailed_origins}"
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
 
         return kernel_name

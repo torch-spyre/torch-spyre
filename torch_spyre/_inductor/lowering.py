@@ -24,7 +24,6 @@ from typing import Any, Callable, Union
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
-from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
@@ -337,7 +336,7 @@ def lower_exx2(x, exx2Scale, useZeroMean):
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
         inner_fn=kwargs["inner_fn"],
-        ranges=x.get_size()[:-1] + [get_elem_in_stick(x.get_dtype())],
+        ranges=x.get_size()[:-1] + [1],
         reduction_ranges=kwargs["reduction_ranges"],
         op_info=op_info,
     )

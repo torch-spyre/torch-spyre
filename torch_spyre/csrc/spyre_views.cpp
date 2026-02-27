@@ -99,6 +99,10 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
   size_t old_rank = old_sizes.size();
   size_t new_rank = new_sizes.size();
 
+  // Built during Phase 1; used in Phase 2
+  int sparse_to_dense_stick_dim = -1;
+  std::unordered_map<size_t, std::vector<size_t>> size_1_insertions;
+
   // Phase 1: Identify old->new host dimension groups
   std::vector<DimGroup> groups;
   size_t old_i = 0, new_j = 0;
@@ -108,6 +112,14 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
       TORCH_CHECK(new_sizes[new_j] == 1,
                   "view: unsqueezed dimension must be size 1");
       groups.push_back({{}, {new_j}});
+      if (old_stl.dim_map[old_stl.device_size.size() - 1] == -1) {
+        sparse_to_dense_stick_dim = new_j;
+      } else {
+        if (!size_1_insertions.count(old_i - 1)) {
+          size_1_insertions[old_i - 1] = {};
+        }
+        size_1_insertions[old_i - 1].push_back(new_j);
+      }
       new_j++;
       continue;
     }
@@ -119,15 +131,20 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
       continue;
     }
 
-    // Handle size-1 insertions/removals
+    // Handle size-1 removals
     if (old_sizes[old_i] == 1 && new_sizes[new_j] != 1) {
       groups.push_back({{old_i}, {}});
       old_i++;
       continue;
     }
+    // Handle size-1 insertions
     if (new_sizes[new_j] == 1 && old_sizes[old_i] != 1) {
-      groups.push_back({{}, {new_j}});
-      new_j++;
+      std::vector<size_t> to_inject;
+      while (new_sizes[new_j] == 1 && new_j < new_rank) {
+        to_inject.push_back(new_j);
+        new_j++;
+      }
+      size_1_insertions[old_i] = to_inject;
       continue;
     }
 
@@ -171,12 +188,32 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
   size_t dev_rank = old_stl.device_size.size();
   for (size_t d = 0; d < dev_rank; d++) {
     int32_t mapped_dim = old_stl.dim_map[d];
+    bool is_stick_dim = (d == dev_rank - 1);
 
     // Device dims not mapped to any host dim (e.g., -1 for scalars/sparse)
     if (mapped_dim == -1) {
-      new_device_size.push_back(old_stl.device_size[d]);
-      new_dim_map.push_back(-1);
+      if (sparse_to_dense_stick_dim == -1) {
+        // Remains sparse
+        new_device_size.push_back(old_stl.device_size[d]);
+        new_dim_map.push_back(-1);
+      } else {
+        // Converting sparse to dense.
+        new_device_size.push_back(is_stick_dim ? eps : 1);
+        new_dim_map.push_back(sparse_to_dense_stick_dim);
+      }
       continue;
+    }
+
+    // Insert any new size 1 dimensions that go before mapped_dim
+    // The mapped_dim for the stick dim appears twice; only do this once
+    if (!is_stick_dim) {
+      if (size_1_insertions.count(mapped_dim)) {
+        auto to_inject = size_1_insertions[mapped_dim];
+        for (auto i = 0; i < to_inject.size(); i++) {
+          new_device_size.push_back(1);
+          new_dim_map.push_back(to_inject[i]);
+        }
+      }
     }
 
     auto git = old_dim_to_group.find(mapped_dim);
@@ -193,11 +230,12 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
 
     // 1:0 group (size-1 removal): old dim was size-1
     if (grp.old_dims.size() == 1 && grp.new_dims.empty()) {
-      // Size-1 dims are typically filtered before tiling in init(), so they
-      // shouldn't appear in dim_map. But handle the all-size-1 special case.
-      // Map to -1 since the host dim is gone.
-      new_device_size.push_back(old_stl.device_size[d]);
-      new_dim_map.push_back(-1);
+      // Can be removed entirely, unless it is the stick dim.
+      // Squeezing a stick dimension of size 1 creates a sparse tensor.
+      if (mapped_dim == old_stl.dim_map[old_stl.dim_map.size() - 1]) {
+        new_device_size.push_back((d == dev_rank - 1) ? eps : 1);
+        new_dim_map.push_back(-1);
+      }
       continue;
     }
 
@@ -235,8 +273,6 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
     int64_t dev_size = old_stl.device_size[d];
 
     // Check if this is the stick dimension (last device dim)
-    bool is_stick_dim = (d == dev_rank - 1) && (dev_size == eps);
-
     if (is_stick_dim) {
       // Stick dim split: the innermost new dim must be >= elems_per_stick
       int32_t innermost_new = grp.new_dims.back();
@@ -332,7 +368,11 @@ SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
                 "view: device_size split has leftover factor: ", remaining);
   }
 
-  return SpyreTensorLayout(new_device_size, new_dim_map, old_stl.device_dtype);
+  auto res =
+      SpyreTensorLayout(new_device_size, new_dim_map, old_stl.device_dtype);
+  DEBUGINFO("old_size=", old_sizes, " new_size=", new_sizes,
+            " old_stl=", old_stl.toString(), " new_stl=", res.toString())
+  return res;
 }
 
 static inline at::Tensor spyre_view_impl(const at::Tensor& self,
@@ -362,9 +402,48 @@ at::Tensor spyre__unsafe_view(const at::Tensor& self, c10::IntArrayRef size) {
   return spyre_view_impl(self, size);
 }
 
+at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
+                                    c10::IntArrayRef size,
+                                    c10::IntArrayRef stride,
+                                    int64_t offset_increment) {
+  TORCH_CHECK(
+      offset_increment == 0,
+      "reinterpret_tensor with non-zero offset_increment not implemented");
+
+  // TODO(dgrove-oss):  Inductor uses reinterpret_tensor in two patterns
+  // we have encountered so far.
+  //   1. To realize a view on a graph output.
+  //   2. To implement .contiguous() on the cloned buffer.
+  // We need figure out how to change the codegen in inductor so that
+  // we aren't hueristically guessing which applies here.
+  if (self.sizes().size() != size.size()) {
+    // view case:
+    SpyreTensorLayout old_stl =
+        static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+    SpyreTensorLayout new_stl =
+        compute_view_layout(self.sizes(), size, old_stl);
+    return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
+  } else {
+    // clone case: we forced generic stick layout in stickify.py clone, so do
+    // same here.
+    SpyreTensorLayout new_stl =
+        SpyreTensorLayout(size.vec(), c10::typeMetaToScalarType(self.dtype()));
+    return spyre_alias_with_sizes_and_strides(self, size, stride, new_stl);
+  }
+}
+
+at::Tensor spyre_alias(const at::Tensor& self) {
+  SpyreTensorLayout old_stl =
+      static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+  return spyre_alias_with_sizes_and_strides(self, self.sym_sizes(),
+                                            self.sym_strides(), old_stl);
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(spyre_view));
   m.impl("_unsafe_view", TORCH_FN(spyre__unsafe_view));
+  m.impl("reinterpret_tensor", TORCH_FN(spyre_reinterpret_tensor));
+  m.impl("alias", TORCH_FN(spyre_alias));
 }
 
 }  // namespace spyre
