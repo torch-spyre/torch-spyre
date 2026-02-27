@@ -1,0 +1,2346 @@
+model: granite-vision-3.3-2b
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 0.005
+  rtol: 0.005
+cases:
+  - name: torch.nn.functional.embedding.1
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [49156, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: 0
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:492 in forward, code: inputs_embeds = self.get_input_embeddings()(input_ids)'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.getitem.1
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [2]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:95 in image_size_to_num_patches, code: image_size = image_size.tolist()'
+    marks: constant
+  - name: torch.to.1
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [10, 3, 384, 384]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:278 in forward, code: patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  #
+      shape = [*, width, grid, grid]'
+    marks:
+      - fp32operation
+      - largedimtensor
+    kwmap:
+      dtype: torch.float16
+  - name: torch.conv2d.1
+    op: torch.conv2d
+    inputs:
+      - tensor:
+          shape: [10, 3, 384, 384]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152, 3, 14, 14]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+      - value: (14, 14)
+      - value: valid
+      - value: (1, 1)
+      - value: 1
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:278 in forward, code: patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  #
+      shape = [*, width, grid, grid]'
+    marks: constant
+  - name: torch.flatten.1
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [10, 1152, 27, 27]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:279 in forward, code: embeddings = patch_embeds.flatten(2).transpose(1, 2)'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.transpose.1
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [10, 1152, 729]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:279 in forward, code: embeddings = patch_embeds.flatten(2).transpose(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.embedding.2
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 729]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [729, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: null
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:284 in forward, code: embeddings = embeddings + self.position_embedding(self.position_ids)'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.add.1
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 729, 1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:284 in forward, code: embeddings = embeddings + self.position_embedding(self.position_ids)'
+  - name: torch.nn.functional.layer_norm.1
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: (1152,)
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+      - value: 1.0e-06
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:448 in forward, code: hidden_states = self.layer_norm1(hidden_states)'
+    marks: constant
+  - name: torch.nn.functional.linear.1
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:385 in forward, code: queries = self.q_proj(hidden_states)'
+  - name: torch.Tensor.view.1
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: 10
+      - value: 729
+      - value: 16
+      - value: 72
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:389 in forward, code: queries = queries.view(batch_size, seq_length, self.num_heads,
+      self.head_dim).transpose(1, 2)'
+    marks: constant
+  - name: torch.transpose.2
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [10, 729, 16, 72]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:389 in forward, code: queries = queries.view(batch_size, seq_length, self.num_heads,
+      self.head_dim).transpose(1, 2)'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.nn.functional.scaled_dot_product_attention.1
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [10, 16, 729, 72]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [10, 16, 729, 72]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [10, 16, 729, 72]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.11785113019775792
+      is_causal: false
+  - name: torch.transpose.3
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [10, 16, 729, 72]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:106 in sdpa_attention_forward, code: attn_output = attn_output.transpose(1,
+      2).contiguous()'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.Tensor.contiguous.1
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [10, 729, 16, 72]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:106 in sdpa_attention_forward, code: attn_output = attn_output.transpose(1,
+      2).contiguous()'
+    marks: largedimtensor
+  - name: torch.reshape.1
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [10, 729, 16, 72]
+          dtype: torch.float16
+          init: rand
+      - value: (10, 729, 1152)
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:408 in forward, code: attn_output = attn_output.reshape(batch_size, seq_length,
+      embed_dim).contiguous()'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.Tensor.contiguous.2
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:408 in forward, code: attn_output = attn_output.reshape(batch_size, seq_length,
+      embed_dim).contiguous()'
+  - name: torch.add.2
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:454 in forward, code: hidden_states = residual + hidden_states'
+  - name: torch.nn.functional.linear.2
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4304, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4304]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:424 in forward, code: hidden_states = self.fc1(hidden_states)'
+  - name: torch.nn.functional.gelu.1
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [10, 729, 4304]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/activations.py:51 in forward, code: return self.act(input)'
+    kwmap:
+      approximate: tanh
+  - name: torch.nn.functional.linear.3
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 729, 4304]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152, 4304]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:426 in forward, code: hidden_states = self.fc2(hidden_states)'
+  - name: torch.repeat.1
+    op: torch.repeat
+    inputs:
+      - tensor:
+          shape: [1, 1, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: 10
+      - value: 1
+      - value: 1
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:729 in forward, code: probe = self.probe.repeat(batch_size, 1, 1)'
+    marks: constant
+  - name: torch.transpose.4
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [10, 1, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 0
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:731 in forward, code: hidden_state = self.attention(probe, hidden_state, hidden_state)[0]'
+    marks: constant
+  - name: torch.transpose.5
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [10, 729, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 0
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:731 in forward, code: hidden_state = self.attention(probe, hidden_state, hidden_state)[0]'
+    marks: constant
+  - name: torch.nn.functional.multi_head_attention_forward.1
+    op: torch.nn.functional.multi_head_attention_forward
+    inputs:
+      - tensor:
+          shape: [1, 10, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [729, 10, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [729, 10, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: 1152
+      - value: 16
+      - tensor:
+          shape: [3456, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [3456]
+          dtype: torch.float16
+          init: rand
+      - value: null
+      - value: null
+      - value: false
+      - value: 0.0
+      - tensor:
+          shape: [1152, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:731 in forward, code: hidden_state = self.attention(probe, hidden_state, hidden_state)[0]'
+    marks: constant
+    kwmap:
+      training: false
+      key_padding_mask: None
+      need_weights: true
+      average_attn_weights: true
+      is_causal: false
+  - name: torch.getitem.2
+    op: torch.getitem
+    inputs:
+      - tensor_list:
+          - shape: [1, 10, 1152]
+            dtype: torch.float16
+            init: rand
+          - shape: [10, 1, 729]
+            dtype: torch.float16
+            init: rand
+      - value: 0
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:731 in forward, code: hidden_state = self.attention(probe, hidden_state, hidden_state)[0]'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.transpose.6
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 10, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 0
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:731 in forward, code: hidden_state = self.attention(probe, hidden_state, hidden_state)[0]'
+    marks: constant
+  - name: torch.nn.functional.layer_norm.2
+    op: torch.nn.functional.layer_norm
+    inputs:
+      - tensor:
+          shape: [10, 1, 1152]
+          dtype: torch.float16
+          init: rand
+      - value: (1152,)
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+      - value: 1.0e-06
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:734 in forward, code: hidden_state = self.layernorm(hidden_state)'
+    marks: constant
+  - name: torch.nn.functional.linear.4
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 1, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4304, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4304]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:424 in forward, code: hidden_states = self.fc1(hidden_states)'
+  - name: torch.nn.functional.gelu.2
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [10, 1, 4304]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/activations.py:51 in forward, code: return self.act(input)'
+    kwmap:
+      approximate: tanh
+  - name: torch.nn.functional.linear.5
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 1, 4304]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152, 4304]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:426 in forward, code: hidden_states = self.fc2(hidden_states)'
+  - name: torch.add.3
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [10, 1, 1152]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [10, 1, 1152]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:735 in forward, code: hidden_state = residual + self.mlp(hidden_state)'
+  - name: torch.getitem.3
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [10, 1, 1152]
+          dtype: torch.float16
+          init: rand
+      - py: (0,)
+    description: 'site-packages/transformers/models/siglip/modeling_siglip.py:737 in forward, code: return hidden_state[:, 0]'
+    marks: constant
+  - name: torch.nn.functional.linear.6
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 729, 4608]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [2048, 4608]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:216 in forward, code: hidden_states = self.linear_1(image_features)'
+  - name: torch.nn.functional.gelu.3
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [10, 729, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/activations.py:85 in forward, code: return self.act(input)'
+  - name: torch.nn.functional.linear.7
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [10, 729, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [2048, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:218 in forward, code: hidden_states = self.linear_2(hidden_states)'
+  - name: torch.cat.1
+    op: torch.cat
+    inputs:
+      - tensor:
+          shape: [6237, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:501 in torch_dynamo_resume_in_forward_at_495, code: image_features
+      = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)'
+    marks: paddedtensor
+    kwmap:
+      dim: 0
+  - name: torch.__eq__.1
+    op: torch.__eq__
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 49155
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:438 in get_placeholder_mask, code: special_image_mask = input_ids
+      == self.config.image_token_id'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.sum.1
+    op: torch.sum
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.bool
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:440 in get_placeholder_mask, code: n_image_tokens = special_image_mask.sum()'
+    marks: paddedtensor
+  - name: torch.unsqueeze.1
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.bool
+      - value: -1
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:441 in get_placeholder_mask, code: special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.expand_as.1
+    op: torch.expand_as
+    inputs:
+      - tensor:
+          shape: [1, 6301, 1]
+          dtype: torch.bool
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:441 in get_placeholder_mask, code: special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)'
+  - name: torch.to.3
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.bool
+      - value: cuda:0
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:441 in get_placeholder_mask, code: special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)'
+    marks: constant
+  - name: torch.masked_scatter.1
+    op: torch.masked_scatter
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.bool
+      - tensor:
+          shape: [6237, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:505 in torch_dynamo_resume_in_forward_at_502, code: inputs_embeds
+      = inputs_embeds.masked_scatter(special_image_mask, image_features)'
+    marks: paddedtensor
+  - name: torch.mul.1
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: 12.0
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:411 in forward, code: inputs_embeds = inputs_embeds * self.embedding_multiplier  #
+      main diff with Llama'
+    marks: constant
+  - name: torch.to.4
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+    description: 'site-packages/transformers/masking_utils.py:723 in _preprocess_mask_arguments, code: attention_mask = attention_mask.to(device=cache_position.device,
+      dtype=torch.bool)'
+    marks: paddedtensor
+    kwmap:
+      device: cuda:0
+      dtype: torch.bool
+  - name: torch.arange.1
+    op: torch.arange
+    inputs:
+      - value: 6301
+    description: 'site-packages/transformers/masking_utils.py:379 in sdpa_mask_recent_torch, code: kv_arange = torch.arange(kv_length, device=cache_position.device)'
+    marks: constant
+    kwmap:
+      device: cuda:0
+  - name: torch.Tensor.add.1
+    op: torch.Tensor.add
+    inputs:
+      - tensor:
+          shape: [6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+    description: 'site-packages/transformers/masking_utils.py:380 in sdpa_mask_recent_torch, code: kv_arange += kv_offset'
+    marks: constant
+  - name: torch._C._functorch._vmap_increment_nesting.1
+    op: torch._C._functorch._vmap_increment_nesting
+    inputs:
+      - value: 1
+      - value: error
+    description: ''
+    marks: constant
+  - name: torch._C._functorch._add_batch_dim.1
+    op: torch._C._functorch._add_batch_dim
+    inputs:
+      - tensor:
+          shape: [1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+      - value: 1
+    description: 'site-packages/torch/_functorch/vmap.py:159 in _create_batched_inputs, code: arg if in_dim is None else _add_batch_dim(arg, in_dim, vmap_level)'
+    marks: constant
+  - name: torch._C._functorch._add_batch_dim.2
+    op: torch._C._functorch._add_batch_dim
+    inputs:
+      - tensor:
+          shape: [6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 0
+      - value: 3
+    description: 'site-packages/torch/_functorch/vmap.py:159 in _create_batched_inputs, code: arg if in_dim is None else _add_batch_dim(arg, in_dim, vmap_level)'
+    marks: constant
+  - name: torch.new_ones.1
+    op: torch.new_ones
+    inputs:
+      - tensor:
+          shape: []
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: ()
+    description: 'site-packages/torch/_dynamo/_trace_wrapped_higher_order_op.py:142 in __torch_function__, code: return func(*args, **(kwargs or {}))'
+    marks: constant
+    kwmap:
+      dtype: torch.bool
+  - name: torch.le.1
+    op: torch.le
+    inputs:
+      - tensor:
+          shape: []
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: []
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+    description: 'site-packages/torch/_dynamo/_trace_wrapped_higher_order_op.py:142 in __torch_function__, code: return func(*args, **(kwargs or {}))'
+  - name: torch.to.5
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: []
+          dtype: torch.bool
+      - value: cuda:0
+    description: 'site-packages/torch/_dynamo/_trace_wrapped_higher_order_op.py:142 in __torch_function__, code: return func(*args, **(kwargs or {}))'
+    marks: constant
+  - name: torch.__and__.1
+    op: torch.__and__
+    inputs:
+      - tensor:
+          shape: []
+          dtype: torch.bool
+      - tensor:
+          shape: []
+          dtype: torch.bool
+    description: 'site-packages/torch/_dynamo/_trace_wrapped_higher_order_op.py:142 in __torch_function__, code: return func(*args, **(kwargs or {}))'
+  - name: torch.ops.aten.index.1
+    op: torch.ops.aten.index
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.bool
+      - tensor_list:
+          - shape: []
+            dtype: torch.int64
+            init: randint
+            init_args:
+              high: 1000
+          - shape: []
+            dtype: torch.int64
+            init: randint
+            init_args:
+              high: 1000
+    description: 'site-packages/torch/_dynamo/_trace_wrapped_higher_order_op.py:100 in forward, code: return torch.ops.aten.index(x, indices)'
+  - name: torch._C._functorch._remove_batch_dim.1
+    op: torch._C._functorch._remove_batch_dim
+    inputs:
+      - tensor:
+          shape: []
+          dtype: torch.bool
+      - value: 4
+      - value: 6301
+      - value: 0
+    description: 'site-packages/torch/_functorch/vmap.py:184 in _maybe_remove_batch_dim, code: return _remove_batch_dim(batched_output, vmap_level, batch_size,
+      out_dim)'
+    marks: constant
+  - name: torch._C._functorch._remove_batch_dim.2
+    op: torch._C._functorch._remove_batch_dim
+    inputs:
+      - tensor:
+          shape: [6301]
+          dtype: torch.bool
+      - value: 3
+      - value: 6301
+      - value: 0
+    description: 'site-packages/torch/_functorch/vmap.py:184 in _maybe_remove_batch_dim, code: return _remove_batch_dim(batched_output, vmap_level, batch_size,
+      out_dim)'
+    marks: constant
+  - name: torch._C._functorch._remove_batch_dim.3
+    op: torch._C._functorch._remove_batch_dim
+    inputs:
+      - tensor:
+          shape: [6301, 6301]
+          dtype: torch.bool
+      - value: 2
+      - value: 1
+      - value: 0
+    description: 'site-packages/torch/_functorch/vmap.py:184 in _maybe_remove_batch_dim, code: return _remove_batch_dim(batched_output, vmap_level, batch_size,
+      out_dim)'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch._C._functorch._remove_batch_dim.4
+    op: torch._C._functorch._remove_batch_dim
+    inputs:
+      - tensor:
+          shape: [1, 6301, 6301]
+          dtype: torch.bool
+      - value: 1
+      - value: 1
+      - value: 0
+    description: 'site-packages/torch/_functorch/vmap.py:184 in _maybe_remove_batch_dim, code: return _remove_batch_dim(batched_output, vmap_level, batch_size,
+      out_dim)'
+    marks: constant
+  - name: torch.getitem.4
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [32]
+          dtype: torch.float32
+          init: rand
+      - py: (None, slice(None, None, None), None)
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:346 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
+      -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.float.1
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 32, 1]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:346 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
+      -1, 1).to(x.device)'
+    marks: fp32operation
+  - name: torch.Tensor.expand.1
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 32, 1]
+          dtype: torch.float32
+          init: rand
+      - value: 1
+      - value: -1
+      - value: 1
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:346 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
+      -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.to.6
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 32, 1]
+          dtype: torch.float32
+          init: rand
+      - value: cuda:0
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:346 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
+      -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.getitem.5
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None, slice(None, None, None))
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:347 in forward, code: position_ids_expanded = position_ids[:, None, :].float()'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.float.2
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 6301]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:347 in forward, code: position_ids_expanded = position_ids[:, None, :].float()'
+  - name: torch.amp.autocast_mode._enter_autocast.1
+    op: torch.amp.autocast_mode._enter_autocast
+    inputs:
+      - value: cuda
+      - value: null
+      - value: false
+      - value: null
+    description: ''
+    marks: constant
+  - name: torch.float.3
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 6301]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:351 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
+      2)'
+    marks: fp32operation
+  - name: torch.matmul.1
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [1, 32, 1]
+          dtype: torch.float32
+          init: rand
+      - tensor:
+          shape: [1, 1, 6301]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:351 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
+      2)'
+    marks: fp32operation
+  - name: torch.transpose.7
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301]
+          dtype: torch.float32
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:351 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
+      2)'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.cat.2
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 6301, 32]
+            dtype: torch.float32
+            init: rand
+          - shape: [1, 6301, 32]
+            dtype: torch.float32
+            init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:352 in forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
+    marks:
+      - fp32operation
+      - constant
+    kwmap:
+      dim: -1
+  - name: torch.cos.1
+    op: torch.cos
+    inputs:
+      - tensor:
+          shape: [1, 6301, 64]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:353 in forward, code: cos = emb.cos() * self.attention_scaling'
+    marks: fp32operation
+  - name: torch.mul.2
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 6301, 64]
+          dtype: torch.float32
+          init: rand
+      - value: 1.0
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:353 in forward, code: cos = emb.cos() * self.attention_scaling'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.sin.1
+    op: torch.sin
+    inputs:
+      - tensor:
+          shape: [1, 6301, 64]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:354 in forward, code: sin = emb.sin() * self.attention_scaling'
+    marks: fp32operation
+  - name: torch.to.7
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 6301, 64]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:356 in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+    marks: fp32operation
+    kwmap:
+      dtype: torch.float16
+  - name: torch.pow.1
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float32
+          init: rand
+      - value: 2
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.mean.1
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float32
+          init: rand
+      - value: -1
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+    marks:
+      - fp32operation
+      - constant
+    kwmap:
+      keepdim: true
+  - name: torch.add.4
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 6301, 1]
+          dtype: torch.float32
+          init: rand
+      - value: 1.0e-05
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:203 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+      + self.variance_epsilon)'
+    marks:
+      - fp32operation
+      - constant
+  - name: torch.rsqrt.1
+    op: torch.rsqrt
+    inputs:
+      - tensor:
+          shape: [1, 6301, 1]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:203 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+      + self.variance_epsilon)'
+    marks: fp32operation
+  - name: torch.mul.3
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float32
+          init: rand
+      - tensor:
+          shape: [1, 6301, 1]
+          dtype: torch.float32
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:203 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+      + self.variance_epsilon)'
+    marks: fp32operation
+  - name: torch.mul.4
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:204 in forward, code: return self.weight * hidden_states.to(input_dtype)'
+  - name: torch.nn.functional.linear.8
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [2048, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.Tensor.view.2
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: (1, 6301, -1, 64)
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks: constant
+  - name: torch.transpose.8
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 6301, 32, 64]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.nn.functional.linear.9
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [512, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:158 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.Tensor.view.3
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 6301, 512]
+          dtype: torch.float16
+          init: rand
+      - value: (1, 6301, -1, 64)
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:158 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks: constant
+  - name: torch.transpose.9
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 6301, 8, 64]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:158 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+      2)'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.unsqueeze.2
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:73 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
+    marks: constant
+  - name: torch.mul.5
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:75 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
+    marks: largedimtensor
+  - name: torch.getitem.6
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - py: (Ellipsis, slice(None, 32, None))
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:48 in rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.neg.1
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 32]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:50 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+    marks: largedimtensor
+  - name: torch.cat.3
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 32, 6301, 32]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 32, 6301, 32]
+            dtype: torch.float16
+            init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:50 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - largedimtensor
+      - constant
+    kwmap:
+      dim: -1
+  - name: torch.add.5
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:75 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
+    marks: largedimtensor
+  - name: torch.mul.6
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:76 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
+      * sin)'
+    marks: largedimtensor
+  - name: torch.getitem.7
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - py: (Ellipsis, slice(None, 32, None))
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:48 in rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.neg.2
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [1, 8, 6301, 32]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:50 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+    marks: largedimtensor
+  - name: torch.cat.4
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 6301, 32]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 6301, 32]
+            dtype: torch.float16
+            init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:50 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - largedimtensor
+      - constant
+    kwmap:
+      dim: -1
+  - name: torch.add.6
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 8, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 8, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:76 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
+      * sin)'
+    marks: largedimtensor
+  - name: torch.tensor.1
+    op: torch.tensor
+    inputs:
+      - value: []
+    description: 'site-packages/transformers/cache_utils.py:94 in lazy_initialization, code: self.keys = torch.tensor([], dtype=self.dtype, device=self.device)'
+    kwmap:
+      dtype: torch.float16
+      device: cuda:0
+  - name: torch.cat.5
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [0]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 6301, 64]
+            dtype: torch.float16
+            init: rand
+    description: 'site-packages/transformers/cache_utils.py:119 in update, code: self.keys = torch.cat([self.keys, key_states], dim=-2)'
+    marks: largedimtensor
+    kwmap:
+      dim: -2
+  - name: torch.Tensor.expand.2
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 8
+      - value: 4
+      - value: 6301
+      - value: 64
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:26 in repeat_kv, code: hidden_states = hidden_states[:, :, None, :, :].expand(batch,
+      num_key_value_heads, n_rep, slen, head_dim)'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.reshape.2
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - value: (1, 32, 6301, 64)
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:27 in repeat_kv, code: return hidden_states.reshape(batch, num_key_value_heads
+      * n_rep, slen, head_dim)'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.getitem.8
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1, 6301, 6301]
+          dtype: torch.bool
+      - py: (slice(None, None, None), slice(None, None, None), slice(None, None, None), slice(None, 6301, None))
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:73 in sdpa_attention_forward, code: attention_mask = attention_mask[:, :, :,
+      : key.shape[-2]]'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.nn.functional.scaled_dot_product_attention.2
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.transpose.10
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:106 in sdpa_attention_forward, code: attn_output = attn_output.transpose(1,
+      2).contiguous()'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.Tensor.contiguous.3
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 6301, 32, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:106 in sdpa_attention_forward, code: attn_output = attn_output.transpose(1,
+      2).contiguous()'
+    marks: largedimtensor
+  - name: torch.reshape.3
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 6301, 32, 64]
+          dtype: torch.float16
+          init: rand
+      - value: (1, 6301, -1)
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:184 in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - largedimtensor
+      - constant
+  - name: torch.Tensor.contiguous.4
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:184 in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+  - name: torch.add.7
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:288 in forward, code: hidden_states = residual + hidden_states * self.residual_multiplier'
+  - name: torch.nn.functional.linear.10
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [8192, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:222 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
+      * self.up_proj(x))'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.nn.functional.silu.1
+    op: torch.nn.functional.silu
+    inputs:
+      - tensor:
+          shape: [1, 6301, 8192]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/activations.py:99 in forward, code: return nn.functional.silu(input)'
+  - name: torch.mul.7
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 6301, 8192]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 6301, 8192]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:222 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
+      * self.up_proj(x))'
+  - name: torch.nn.functional.linear.11
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 6301, 8192]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [2048, 8192]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'site-packages/transformers/models/granite/modeling_granite.py:222 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
+      * self.up_proj(x))'
+    marks:
+      - paddedtensor
+      - constant
+  - name: torch.nn.functional.scaled_dot_product_attention.3
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.4
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.5
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.6
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.7
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.8
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.9
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.10
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.11
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.12
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.13
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.14
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.15
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.16
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.17
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.18
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.19
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.20
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.21
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.22
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.23
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.24
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.25
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.26
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.27
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.28
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.29
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.30
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.31
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.32
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.33
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.34
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.35
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.36
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.37
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.38
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.39
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.40
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.41
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 6301, 64]
+          dtype: torch.float16
+          init: rand
+    description: 'site-packages/transformers/integrations/sdpa_attention.py:96 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks: largedimtensor
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.015625
+      is_causal: false
+  - name: torch.getitem.9
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 6301, 2048]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:687 in torch_dynamo_resume_in_forward_at_666, code: logits = self.lm_head(hidden_states[:,
+      slice_indices, :])'
+    marks: constant
+  - name: torch.nn.functional.linear.12
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 2048]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [49156, 2048]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'site-packages/transformers/models/llava_next/modeling_llava_next.py:687 in torch_dynamo_resume_in_forward_at_666, code: logits = self.lm_head(hidden_states[:,
+      slice_indices, :])'
+    marks:
+      - paddedtensor
+      - constant

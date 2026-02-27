@@ -1,0 +1,29 @@
+model: gpt-oss
+
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 1.0e-2
+  rtol: 1.0e-2
+
+cases:
+  - name: mul_ok
+    op: torch.mul
+    inputs:
+    - tensor:
+        shape: [1, 64]
+    - tensor:
+        shape: [1, 64]
+
+  - name: mul_ng_fp32
+    op: torch.mul
+    marks:
+    - paddedtensor
+    - fpoperation
+    inputs:
+    - tensor:
+        shape: [1, 64]
+    - tensor:
+        shape: [1, 1]
+        dtype: torch.float32
+        init: rand
