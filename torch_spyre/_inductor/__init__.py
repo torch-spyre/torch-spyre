@@ -31,6 +31,7 @@ def enable_spyre_compile_fx_wrapper():
     with _autoload_lock:
         if getattr(cfx, "_spyre_wrapped", False):
             return
+
         _orig = cfx.compile_fx
 
         # Iterate over producer nodes (supports nested containers of nodes)
@@ -91,20 +92,26 @@ def enable_spyre_compile_fx_wrapper():
 
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
-            from torch._inductor.decomposition import decompositions
+            if "decompositions" in kwargs:
+                decomps = kwargs["decompositions"]
+            else:
+                decomps = torch._inductor.decomposition.decompositions
+                kwargs["decompositions"] = decomps
 
             if _uses_spyre(gm, example_inputs):
-                import torch
-
                 torch.spyre._impl._lazy_init()
-                with enable_spyre_context(example_inputs):
+
+                with enable_spyre_context(example_inputs, decomps):
+                    # The `decomps` is the updated in the context manager
+                    # with the appropriate spyre decompositions
+
                     return _orig(
                         gm,
                         example_inputs,
-                        decompositions=decompositions,
                         *args,
                         **kwargs,
                     )
+
             return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _wrapper

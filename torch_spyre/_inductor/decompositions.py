@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from contextlib import contextmanager
 
 from typing import Optional, Sequence, Union
@@ -53,7 +52,7 @@ def register_spyre_decomposition(
 
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
 @contextmanager
-def enable_spyre_decompositions():
+def enable_spyre_decompositions(decomps):
     """
     CM that enables Spyre decompositions:
       - Temporarily adds relevant Spyre decompositions to global decompositions dictionary
@@ -68,7 +67,6 @@ def enable_spyre_decompositions():
 
         if first_enter:
             from torch_spyre.fallbacks import fallback_ops
-            from torch._inductor.decomposition import decompositions
             from torch._ops import OpOverload, OpOverloadPacket
 
             # Helper function to remove ops from decompositions
@@ -78,11 +76,11 @@ def enable_spyre_decompositions():
                     if isinstance(op, OpOverloadPacket):
                         for overload_name in op.overloads():
                             opo = getattr(op, overload_name)
-                            op_ret = decompositions.pop(opo, None)
+                            op_ret = decomps.pop(opo, None)
                             if op_ret is not None:
                                 _removed[opo] = op_ret
                     elif isinstance(op, OpOverload):
-                        op_ret = decompositions.pop(op, None)
+                        op_ret = decomps.pop(op, None)
                         if op_ret is not None:
                             _removed[op] = op_ret
                 return _removed
@@ -93,11 +91,11 @@ def enable_spyre_decompositions():
                 spyre_decompositions_op,
                 spyre_decompositions_impl,
             ) in spyre_decompositions.items():
-                if spyre_decompositions_op in decompositions:
-                    saved_intree_decompositions[spyre_decompositions_op] = (
-                        decompositions[spyre_decompositions_op]
-                    )
-                decompositions[spyre_decompositions_op] = spyre_decompositions_impl
+                if spyre_decompositions_op in decomps:
+                    saved_intree_decompositions[spyre_decompositions_op] = decomps[
+                        spyre_decompositions_op
+                    ]
+                decomps[spyre_decompositions_op] = spyre_decompositions_impl
 
             # Attach to the function so we can restore on last exit
             enable_spyre_decompositions._saved_decompositions = (
@@ -137,7 +135,7 @@ def enable_spyre_decompositions():
                     {},
                 )
                 [
-                    torch._decomp._add_op_to_registry(decompositions, op, fn)
+                    torch._decomp._add_op_to_registry(decomps, op, fn)
                     for op, fn in removed_decompositions_fallback_ops.items()
                 ]
 
@@ -148,7 +146,7 @@ def enable_spyre_decompositions():
                     {},
                 )
                 [
-                    torch._decomp._add_op_to_registry(decompositions, op, fn)
+                    torch._decomp._add_op_to_registry(decomps, op, fn)
                     for op, fn in removed_decompositions_to_exclude.items()
                 ]
 
@@ -161,11 +159,11 @@ def enable_spyre_decompositions():
                     spyre_decompositions_impl,
                 ) in spyre_decompositions.items():
                     if spyre_decompositions_op in saved_intree_decompositions:
-                        decompositions[spyre_decompositions_op] = (
-                            saved_intree_decompositions[spyre_decompositions_op]
-                        )
+                        decomps[spyre_decompositions_op] = saved_intree_decompositions[
+                            spyre_decompositions_op
+                        ]
                     else:
-                        decompositions.pop(spyre_decompositions_op, None)
+                        decomps.pop(spyre_decompositions_op, None)
 
                 # Clean up
                 enable_spyre_decompositions._saved_decompositions = {}
