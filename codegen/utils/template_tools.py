@@ -72,7 +72,7 @@ def get_args_with_default_vals(schema_string):
 
     """
     # Extract everything inside parentheses
-    inside = re.search(r"\((.*)\)", schema_string).group(1)
+    inside = re.search(r"\((.*?)\)\s*->", schema_string).group(1)
     # Split by comma and clean spacing
     parts = [p.strip() for p in inside.split(",")]
     # Find the index of "*"
@@ -166,7 +166,7 @@ def convert_cpp_type_to_python(cpp_type):
         "int64_t": "int",
         "double": "float",
         "bool": "bool",
-        "Scalar": "Union[int, float, bool, complex]",
+        "Scalar": "int | float | bool | complex",
         "IntArrayRef": "list[int]",
         "c10::string_view": "str",
         "DimnameList": "list[str]",

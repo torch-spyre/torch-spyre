@@ -169,10 +169,13 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
         The size of the operation dimension or number of sticks if it's
         the stick dimension
     """
+    if host_dim_idx < 0:
+        host_dim_idx = len(layout.size) + host_dim_idx
+
     # layout.size is host size before canonicalization
     assert host_dim_idx < len(layout.size)
 
-    if host_dim_idx != -1 and host_dim_idx != len(layout.size) - 1:
+    if host_dim_idx != len(layout.size) - 1:
         return int(layout.size[host_dim_idx])
     else:  # stick dim
         return (
@@ -195,6 +198,10 @@ def map_host_dim_to_device_dim(layout: FixedTiledLayout, host_dim_idx: int) -> i
     # Assumptions:
     #   1. device layout is generic stick, so the last element is not considered
     #   2. dim_map elements have unique values
+
+    if host_dim_idx < 0:
+        host_dim_idx = len(layout.size) + host_dim_idx
+
     dim_map = layout.device_layout.dim_map[:-1]
     return dim_map.index(host_dim_idx)
 
@@ -253,14 +260,15 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
         if num_dims == 3:
             # 3D BMM: [B, M, K] @ [B, K, N] --> [B, M, N]
+            #     or  [B, M, K] @ [K, N] --> [B, M, N]
             # arg0 host layout: [B, M, K]
-            # arg1 host layout: [B, K, N]
+            # arg1 host layout: [B, K, N] or [K, N]
             # output host layout: [B, M, N]
 
             # Get operation dimension sizes from host layouts
             B = get_host_dim_size(args[0].layout, 0)
             M = get_host_dim_size(args[0].layout, 1)
-            N = get_host_dim_size(args[1].layout, 2)
+            N = get_host_dim_size(args[1].layout, -1)
 
             # Parallelizable operation dimensions: B, M, N (not K, the reduction dim)
             sizes = [B, M, N]
@@ -286,13 +294,13 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                 ] = op_dim_splits["M"]
 
             # arg1: [B, K, N] - B is host dim 0, K is host dim 1, N is host dim 2
-            if op_dim_splits["B"] > 1:
+            if op_dim_splits["B"] > 1 and args[1].layout.size == 3:
                 n.spyre_core_division[1][
                     map_host_dim_to_device_dim(args[1].layout, 0)
                 ] = op_dim_splits["B"]
             if op_dim_splits["N"] > 1:
                 n.spyre_core_division[1][
-                    map_host_dim_to_device_dim(args[1].layout, 2)
+                    map_host_dim_to_device_dim(args[1].layout, -1)
                 ] = op_dim_splits["N"]
 
             # output: [B, M, N] - B is host dim 0, M is host dim 1, N is host dim 2
@@ -305,7 +313,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                     op_dim_splits["M"]
                 )
             if op_dim_splits["N"] > 1:
-                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, -1)] = (
                     op_dim_splits["N"]
                 )
 
