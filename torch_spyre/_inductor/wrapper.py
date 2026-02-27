@@ -59,6 +59,9 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             """,
             strip=True,
         )
+        self.header.writeline(
+            "from torch_spyre._C import spyre_reinterpret_tensor as reinterpret_tensor"
+        )
         self.header.writeline("del async_compile")
         self.header.writeline("async_compile = SpyreAsyncCompile()")
 

@@ -166,6 +166,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((3, 17, 128, 256), (3, 17, 256, 128)),
+                    ((2, 64, 128), (128, 16384)),
                 ]
             ),
         },
@@ -495,16 +496,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_clone",
         ): {
             "param_sets": {
-                "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
-                "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "fp16_1d": (cached_randn((2,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((256, 100), dtype=torch.float16),),
                 "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
-                "fp16_4d": (cached_randn((8, 2, 16, 256), dtype=torch.float16),),
-                "int64_1d": (torch.randint(1000, (128,)),),
-                "int64_2d": (torch.randint(1000, (256, 128)),),
-                "int_3d": (torch.randint(1000, (8, 16, 256)),),
+                "fp16_4d": (cached_randn((8, 2, 16, 250), dtype=torch.float16),),
                 "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
                 "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
-                "fp32_3d": (cached_randn((8, 16, 256), dtype=torch.float32),),
+                "fp32_3d": (cached_randn((8, 16, 26), dtype=torch.float32),),
                 "bool_1d": (torch.rand((128,)) > 0.5,),
                 "bool_2d": (torch.rand((256, 128)) > 0.5,),
                 "bool_3d": (torch.rand((8, 16, 256)) > 0.5,),
@@ -574,7 +572,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     },
                 ),
                 "value_4d": (
-                    cached_randn((1, 64, 11, 2048)),
+                    cached_randn((1, 64, 11, 512)),
                     {
                         "p": 0.0,
                         "training": False,

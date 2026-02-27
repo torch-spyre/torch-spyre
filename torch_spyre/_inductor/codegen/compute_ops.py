@@ -116,28 +116,23 @@ class DimInfos:
             index_order = self.dim_indices
         return [self.rows[field_name][i] for i in index_order]
 
-    # Dimensions of length 1 do not exist on the device layout
-    # Therefore some sdsc sections require all op dimensions, but
-    # with the order of a subset of the indices adjusted to match
-    # the tile layout of the tensor on the device.  This
-    # function computes that reordering
+    # Get the order of operation dimensions for this tensor
+    # This method is counterintuitive because the order is influenced by a tensor
+    # that may have fewer dimensions than the operation. This is needed for sfp_op sdsc
+    # generation (allocation and primaryDs) because layoutDimOrder requires all operation
+    # dimensions, but ordered by the tensor device layout
+    #
+    # The list returned is
+    #   - length == # operation dimensions (not # tensor dimensions)
+    #   - Values are host dimensions in the tensor that represents the operation (op_dims_tensor)
+    #   - Order is the order of the dimensions as they appear in the device tensor,  followed
+    #     by any remaining dimensions not in the tensor
     def get_tensor_op_index_order(self, tensor):
-        dim_indices = self.dim_indices  # op dimension order
         dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-        missing_dims = list(set(dim_indices) - set(dev_dim_order))
-        if len(missing_dims) > 0 and len(dim_indices) >= 3 and tensor["scale"][0] == -1:
-            if missing_dims[0] == 0:
-                # Add missing dimensions to end of device dimension order
-                # Compute the number of leading missing dims (-1)
-                tensor_dim_indices = dev_dim_order + list(
-                    set(dim_indices) - set(dev_dim_order)
-                )
-            else:  # keepdim=0 case
-                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
-        else:
-            # Indices and order unchanged
-            tensor_dim_indices = dim_indices
-        return tensor_dim_indices
+        scale = tensor["scale"]
+        tensor_op_dims = [scale.index(i) for i in dev_dim_order if i in scale]
+        remaining_op_dims = [i for i in self.dim_indices if i not in tensor_op_dims]
+        return tensor_op_dims + remaining_op_dims
 
     def get_labels_host_order(self):
         return self.rows["label"]
@@ -168,9 +163,6 @@ class DimInfos:
     # Get labels corresponding to tensor layout
     # Rank of returned list == num tensor dimensions
     def get_tensor_layout_order(self, tensor):
-        # TODO: Understsand why matmul needed this layout order to be different
-        # than the order obtained by get_tensor_infos().  Is it possible
-        # get_tensor_infos() should be using this same order as well?
         dl = tensor["device_layout"]
         scale = tensor["scale"]
         dev_dim_order = dl.dim_map[::-1][1:]
@@ -188,14 +180,12 @@ class DimInfos:
 
 # Extract the device size for a give host dim
 # Assumption is that the passed tensor operate in host dimension space
-def get_device_size(host_dim, tensor):
+def get_device_size(op_dim, tensor):
     dl = tensor["device_layout"]
-    device_dim = tensor["scale"][host_dim]
-    if device_dim == -3:  # special case to skip elided dim
-        return 1
-    assert device_dim >= 0, "Scale value should be non-negative for tensor provided"
-    size = dl.device_size[dl.dim_map.index(device_dim)]
-    if device_dim == dl.host_stick_dim():
+    scale = tensor["scale"][op_dim]
+    assert scale >= 0, "Scale value should be non-negative for tensor provided"
+    size = dl.device_size[dl.dim_map.index(scale)]
+    if scale == dl.host_stick_dim():
         size *= dl.elems_per_stick()
     return size
 
@@ -446,7 +436,9 @@ def create_padding_mask_info(dim_infos: DimInfos, kwargs) -> tuple[dict, int]:
     return coordinateMasking, maskingConstId
 
 
-def create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=False):
+def create_tensor_specific_layouts(
+    tensors, dim_infos, op, is_matmul=False, op_dims_tensor=None
+):
     layouts = {}
     # Compute tensor-specific dimension info
     for i, tensor in enumerate(tensors):
@@ -461,6 +453,7 @@ def create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=False):
             if is_matmul
             else dim_infos.get_tensor_op_layout_order(tensor, op)
         )
+
         for label, layout_infos in layouts.items():
             if layout_order == layout_infos["layout_order"]:
                 tensor["ds_type"] = label
@@ -475,7 +468,9 @@ def create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=False):
             )
             layouts[LAYOUT_INPUT_LABELS[len(layouts.keys())]] = {
                 "layout_order": layout_order,
-                "stick_dim_order": dim_infos.get_tensor_stick_dim_labels(tensor),
+                "stick_dim_order": dim_infos.get_tensor_stick_dim_labels(tensor)
+                if is_matmul
+                else dim_infos.get_tensor_stick_dim_labels(op_dims_tensor),
             }
 
     # Now adjust the label of the final tensor (and all that share the same layout) to be "OUTPUT".
@@ -525,7 +520,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [
-        get_device_size(host_dim, op_dims_tensor) for host_dim in range(ndim)
+        get_device_size(op_dim, op_dims_tensor) for op_dim in range(ndim)
     ]
 
     dim_infos = DimInfos(
@@ -537,13 +532,12 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     )
 
     coordinateMasking, maskingConstId = create_padding_mask_info(dim_infos, kwargs)
-    layouts = create_tensor_specific_layouts(tensors, dim_infos, op)
+    layouts = create_tensor_specific_layouts(
+        tensors, dim_infos, op, op_dims_tensor=op_dims_tensor
+    )
 
     # Compute the stick label from the op tensor.
-    # For now we expect stick dim to always be "out", so check.
-    # Remove the assertion when this invariant changes
     op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
-    assert op_stick_labels == ["out"]
 
     core_id_to_wk_slice = {}
     for i in range(cores):
@@ -746,9 +740,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 #  - Last 2 dims come from tensor 1
 def get_padded_dimensions_matmul(ndim, inputs):
     padded_dimensions = [0] * ndim
-    for host_dim in range(ndim):
-        tensor_idx = 0 if host_dim < ndim - 2 else 1
-        padded_dimensions[host_dim] = get_device_size(host_dim, inputs[tensor_idx])
+    for op_dim in range(ndim):
+        tensor_idx = 0 if op_dim < ndim - 2 else 1
+        padded_dimensions[op_dim] = get_device_size(op_dim, inputs[tensor_idx])
     return padded_dimensions
 
 
