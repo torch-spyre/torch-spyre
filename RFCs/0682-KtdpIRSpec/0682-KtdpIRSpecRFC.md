@@ -25,49 +25,49 @@ Transtion from SuperDSC-bundle into tile-based interface built over open-source 
 
 ## Introduction
 
-KTIR is a tile-based, block-structured intermediate representation (IR) designed to express programs targeting multi-core accelerator architectures. It embodies a data-parallel abstraction of the accelerator shown in Figure 1. The accelerator contains multiple cores, with each core comprising a compute engine and an on-chip scratchpad memory associated with the compute unit. The cores are attached together through an on-chip interconnect fabric, which also interfaces with one or more off-chip memory banks. 
+KTIR is a tile-based, block-structured intermediate representation (IR) designed to express programs targeting multi-core accelerator architectures. It embodies a data-parallel abstraction of the accelerator shown in Figure 1. The accelerator contains multiple cores, with each core comprising a compute engine and an on-chip scratchpad memory associated with the compute unit. The cores are attached together through an on-chip interconnect fabric, which also interfaces with one or more off-chip memory banks.
 
 <p align="center">
   <img src="ktdp_hw_abstraction.png" alt="ktdp_hw_abstraction" width="450"/>
 </p>
 <p align="center">
-  Figure 1. Hardware abstraction of multi-core accelerator embodied in KTIR 
+  Figure 1. Hardware abstraction of multi-core accelerator embodied in KTIR
 </p>  
 
 KTIR programs allow tensors to be placed in a distributed fashion across multiple memory elements (on-chip and/or off-chip memory). In the same vein, compute operations can be split into compute tiles and assigned to the compute engine within each core. KTIR allows each compute tile to have global view of all on-chip and off-chip memory elements via the on-chip interconnect fabric.
 
 KTIR is built to represent complex computation kernels (e.g., attention in LLMs) mapped onto multi-core accelerators, going beyond a single operation (e.g., tensor Add). Kernels span multiple operations that are composed sequentially, interleaved with structured control-flow such as loops, conditionals, and multi-stage pipelines. KTIR includes constructs to capture kernel execution semantics including dependencies, synchronization points, and tensor liveliness. Intermediate tensors within the kernel could be placed on on-chip memory elements and reused across producer-consumer operations. With each compute tile having global access to all memory elements, individual compute operations can be flexibly tiled along different dimensions.
 
-#### Who Produces KTIR? 
+### Who Produces KTIR?
 KTIR is mid-level IR in the compilation pipeline. Starting from a graph-level description or expert-written versions of the kernel, higher-level compiler frameworks (e.g., TorchInductor, Triton) are expected to optimize data-parallel work partitioning and memory management and generate KTIR. It can express the already established parallel decomposition from the front-end compiler and facilitates further optimizations within that decomposition.
 
-#### Who Consumes KTIR? 
+#### Who Consumes KTIR?
 Kernel scheduler operates on KTIR programs and performs data-flow scheduling. The scheduler is responsible for efficient data-flow mapping of the kernel onto the hardware preserving correctness.
 
 # Table of Contents
 
-- [A) Operations in KTIR](#a-operations-in-ktir)
-    - [1. Layouts, Access Tiles, Loads, and Stores](#1-layouts-access-tiles-loads-and-stores)
-    - [2. Compute Operations](#2-compute-operations)
-    - [3. Control-Flow Operations](#3-control-flow-operations)
-    - [Overall Design Perspective](#overall-design-perspective)
+* [A) Operations in KTIR](#a-operations-in-ktir)
+  * [1. Layouts, Access Tiles, Loads, and Stores](#1-layouts-access-tiles-loads-and-stores)
+  * [2. Compute Operations](#2-compute-operations)
+  * [3. Control-Flow Operations](#3-control-flow-operations)
+  * [Overall Design Perspective](#overall-design-perspective)
 
-- [B) Example: Tile-Parallel Matrix Add in KTIR](#b-example-tile-parallel-matrix-add-in-ktdp)
+* [B) Example: Tile-Parallel Matrix Add in KTIR](#b-example-tile-parallel-matrix-add-in-ktdp)
 
-- [C) Operations within `ktdp` dialect](#c-operations-within-ktdp-dialect)
-    - [1. `ktdp.get_compute_tile_id`](#1-ktdpget_compute_tile_id-ktdpgetcomputetileid)
-    - [2. `ktdp.construct_memory_view`](#2-ktdpconstruct_memory_view-ktdpconstructmemoryviewop)
-    - [3. `ktdp.construct_distributed_memory_view`](#3-ktdpconstruct_distributed_memory_view-ktdpconstructdistributedmemoryviewop)
-    - [4. `ktdp.construct_access_tile`](#4-ktdpconstruct_access_tile-ktdpconstructaccesstilesop)
-    - [5. `ktdp.construct_indirect_access_tile`](#5-ktdpconstruct_indirect_access_tile-ktdpconstructindirectaccesstilesop)
-    - [6. `ktdp.load`](#6-ktdpload-ktdploadop)
-    - [7. `ktdp.store`](#7-ktdpstore-ktdpstoreop)
+* [C) Operations within `ktdp` dialect](#c-operations-within-ktdp-dialect)
+  * [1. `ktdp.get_compute_tile_id`](#1-ktdpget_compute_tile_id-ktdpgetcomputetileid)
+  * [2. `ktdp.construct_memory_view`](#2-ktdpconstruct_memory_view-ktdpconstructmemoryviewop)
+  * [3. `ktdp.construct_distributed_memory_view`](#3-ktdpconstruct_distributed_memory_view-ktdpconstructdistributedmemoryviewop)
+  * [4. `ktdp.construct_access_tile`](#4-ktdpconstruct_access_tile-ktdpconstructaccesstilesop)
+  * [5. `ktdp.construct_indirect_access_tile`](#5-ktdpconstruct_indirect_access_tile-ktdpconstructindirectaccesstilesop)
+  * [6. `ktdp.load`](#6-ktdpload-ktdploadop)
+  * [7. `ktdp.store`](#7-ktdpstore-ktdpstoreop)
 
-- [D) Types within `ktdp` dialect](#d-types-within-ktdp-dialect)
-    - [1. AccessTileType](#1-accesstiletype)
+* [D) Types within `ktdp` dialect](#d-types-within-ktdp-dialect)
+  * [1. AccessTileType](#1-accesstiletype)
 
-- [E) Attributes within `ktdp` dialect](#e-attributes-within-ktdp-dialect)
-    - [1. SpyreMemorySpaceAttr](#1-spyrememoryspaceattr)
+* [E) Attributes within `ktdp` dialect](#e-attributes-within-ktdp-dialect)
+  * [1. SpyreMemorySpaceAttr](#1-spyrememoryspaceattr)
   
 ## A) Operations in KTIR
 The operations within KTIR can be organized into several functional categories, reflecting the different roles they play in expressing kernel semantics and execution structure.
@@ -82,13 +82,12 @@ Arith dialect - https://mlir.llvm.org/docs/Dialects/ArithOps/
 
 Math dialect - https://mlir.llvm.org/docs/Dialects/MathOps/
 
-LinAlg dialect - https://mlir.llvm.org/docs/Dialects/Linalg/ 
-
+LinAlg dialect - https://mlir.llvm.org/docs/Dialects/Linalg/
 
 ### 3. Control-Flow Operations
 Structured control flow in KTIR is represented using operations borrowed from MLIR’s SCF dialect, which supports constructs such as conditionals, loops having region-based iterations with explicit loop-carried variables. This allows KTIR programs to describe complex kernel, including multi-stage pipelines, conditional execution paths, and iterative computations, while retaining analyzable structure for optimization and scheduling.
 
-SCF dialect - https://mlir.llvm.org/docs/Dialects/SCFDialect/ 
+SCF dialect - https://mlir.llvm.org/docs/Dialects/SCFDialect/
 
 At present, we consider the following operations from the SCF dialect: `scf.for, scf.if, scf.yield, scf.reduce, scf.reduce.return, scf.parallel, and scf.forall`.
 
@@ -205,7 +204,6 @@ The following sections describe the operations and types specific to the `ktdp` 
 
 _Gets the multidimensional id of the current compute tile_
 
-
 Syntax:
 
 ```mlir
@@ -221,10 +219,13 @@ The returned value uniquely identifies the tile within the device’s
 execution grid or topology and can be used to specialize computation,
 index into distributed data structures, or select tile-specific memory
 regions. for, e.g., for a 1D grid,
+
   ```mlir
   %tile_id = ktdp.get_compute_tile_id : index 
   ```
+
  for 2D grid,
+
  ```mlir
  %tile_id:2 = ktdp.get_compute_tile_id : index, index
  ```
@@ -238,7 +239,6 @@ regions. for, e.g., for a 1D grid,
 ### 2. `ktdp.construct_memory_view` (ktdp::ConstructMemoryViewOp)
 
 _Operation to construct memory view._
-
 
 Syntax:
 
@@ -285,6 +285,7 @@ a tensor, but does not impose any constraints on how that memory was
 created or managed.
 
 for, e.g.,
+
 ```mlir
   #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 64 >= 0)>
   %A_view = ktdp.construct_memory_view %A_start_address, sizes: [32, 64], strides: [64, 1] {
@@ -321,7 +322,6 @@ Traits: `AttrSizedOperandSegments`, `MemRefsNormalizable`
 ### 3. `ktdp.construct_distributed_memory_view` (ktdp::ConstructDistributedMemoryViewOp)
 
 _Operation to construct distributed memory view over multiple memref objects_
-
 
 Syntax:
 
@@ -364,6 +364,7 @@ spaces, enabling explicit modeling of distributed scratchpads and other
 non-uniform memory organizations in the IR.
 
 for, e.g.,
+
 ```mlir
 %A_dview = ktdp.construct_distributed_memory_view (%A0_view, %A1_view : memref<32x64xf16>, memref<32x64xf16>) : memref<64x64xf16>
 ```
@@ -394,7 +395,6 @@ In addition, the ordering of coordinates within the region is specified by an Af
 Please note that this ordering applies to the enumeration of points in the intermediate variable space, and not to the ordering of components within an individual coordinate tuple.
 By combining an IntegerSet to describe the coordinate domain with an AffineMap to define traversal order, the tile abstraction can represent general polyhedral regions, not only rectangular blocks, but also skewed, strided, triangular, or otherwise constrained coordinate sets, while preserving analyzability and structured iteration semantics.
 
-
 Conceptually, this operation separates *address computation* from *data
 access*: it materializes a symbolic set of coordinates without performing
 any memory read or write. The resulting value is a tile whose elements
@@ -404,6 +404,7 @@ stores, gathers, or scatters) that interpret it as an explicit access
 specification.
 
 for, e.g.,
+
 ```mlir
   %A_access_tile = ktdp.construct_access_tile %A_view[%c0, %c0] {
       access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
@@ -514,11 +515,9 @@ Importantly, the operation does not perform a memory access to `X`. Instead,
 it materializes a tile of index tuples that can subsequently be consumed by
 `ktdp.load` or `ktdp.store`.
 
-
 #### Example2: Paged tensor access in attention kernels
 
 As a more complex example, consider constructing an indirect access tile for a four-dimensional tensor `X` using the indexing expression: `X[Idx[b][tkv/64], hkv, tkv % 64, dkv ]`.
-
 
 ```mlir
         // (3) Construct indirect access tile X [Idx[b][tkv/Ptkv]] [h] [tkv%Ptkv] [dkv]
@@ -537,7 +536,6 @@ As a more complex example, consider constructing an indirect access tile for a f
         } : memref<10000x8x64x128xf16>,memref<4x32xi32> -> !ktdp.access_tile<4x8x2048x128xindex>
 ```
 
-
 In this scenario, the base tensor X is four-dimensional, and the operation maintains one memory view variable per dimension through the $memory_view_names operand. For dimensions that involve indirect indexing—such as expressions of the form Idx[b][tkv / Ptkv]—a corresponding memory view is provided to represent the auxiliary index tensor supplying the indirection. For dimensions that do not require indirection, no memory view variable is associated with that dimension (represented internally as nullptr), and the indexing expression is interpreted as a direct subscript into X.
 
 Each dimension of X is described by an affine or quasi-affine subscript expression. When a memory view variable exists for a given dimension, the corresponding subscript defines an index into that auxiliary memory view, thereby modeling indirect access. For example, an expression such as (%b, %tkv / 64) may compute the index into an auxiliary tensor (e.g., Idx) and thus act as an indirect coordinate supplier for that dimension of X. Conversely, if no memory view variable is present, the subscript expression directly computes the coordinate for X. An expression such as (%tkv % 64) therefore represents direct indexing without auxiliary indirection. This design is enabled by MLIR’s support for quasi-affine expressions within affine maps, allowing division and modulo operations to appear in subscript expressions while maintaining analyzability and compatibility with transformation passes.
@@ -546,7 +544,7 @@ The intermediate variables `(e.g., %b, %h, %tkv, %dkv)` are not defined outside 
 
 The `common_variables` operand is distinct from the `intermediate_variables`. The common_variables correspond to SSA values defined outside the operation and may appear within subscript expressions alongside the intermediate variables. In contrast, the intermediate variables are local to the operation and define the iteration domain specified by variables_space_set for constructing the access tile.
 
-#### Notes: 
+#### Notes:
 The construct_access_tile and construct_indirect_access_tile operations are designed to strike a deliberate balance between analyzability, expressiveness, and implementability, while avoiding explicit pointer-offset arithmetic. By representing subscripts as affine (or quasi-affine) expressions over logical variables, these operations preserve a high-level, structured view of tensor indexing that remains amenable to compiler analysis and transformation.
 
 When indirect indexing is involved in a particular tensor dimension, the operation imposes a restriction: the indirect subscript must appear as a standalone index value and may not be combined multiplicatively with other variables. In other words, an indirectly loaded index cannot participate in further affine scaling or linearizing with other dimensions. As a consequence, the operation does not support dimension fusion when one of the fused dimensions is accessed indirectly. This constraint simplifies semantic reasoning, preserves analyzability, and ensures that indirect accesses remain well-defined and structurally explicit.
@@ -582,7 +580,6 @@ Traits: `AttrSizedOperandSegments`
 
 _Operation to load data based on the coordinates from access_tile._
 
-
 Syntax:
 
 ```
@@ -604,6 +601,7 @@ source element type.
 Note: This op is intended to consume the result of an access-tile
 construction op.
 for, e.g.,
+
 ```mlir
   %A_data_tile = ktdp.load %A_access_tile : !ktdp.access_tile<32x64xindex> -> tensor<32x64xf16>
 ```
@@ -623,7 +621,6 @@ for, e.g.,
 ### 7. `ktdp.store` (ktdp::StoreOp)
 
 _Operation to load data based on the coordinates from access_tile._
-
 
 Syntax:
 
@@ -654,6 +651,7 @@ The `store` op does not define an ordering among writes beyond the
 dialect’s semantics for the access tile.
 
 for, e.g.,
+
 ```mlir
 ktdp.store %A_data_tile, %A_access_tile : tensor<32x64xf16>, !ktdp.access_tile<32x64xindex>
 ```
@@ -708,7 +706,6 @@ access_tile<1 x 64 x index>
 | shape | `::llvm::ArrayRef<int64_t>` |  |
 | elementType | `Type` |  |
 
-
 ## E) Attributes within `ktdp` dialect
 
 ### MemorySpaceAttr
@@ -716,7 +713,6 @@ access_tile<1 x 64 x index>
 The MemorySpaceAttr serves as a generic abstraction for device-specific memory space attributes within the `ktdp` dialect. It provides a uniform mechanism to associate IR values, such as memory views, with a target-specific memory hierarchy, while remaining extensible across different accelerator backends.
 
 For example, it may encapsulate attributes such as SpyreMemorySpaceAttr, which describe concrete memory kinds (e.g., on-chip scratchpad or HBM) and optional core affinity. By abstracting over device-specific memory descriptors, `KTDPMemoryTypeAttr` enables `ktdp` to remain portable and modular, allowing different hardware targets to define their own memory space semantics without altering the core IR design.
-
 
 ```mlir
   #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 64 >= 0)>
