@@ -11,10 +11,16 @@
                                               d1 >= 0, -d1 + 2047 >=0, 
                                               d2 >= 0, -d2 + 7 >= 0, 
                                               d3 >= 0, -d3 + 127>= 0)>
-#XY_var_space_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 3 >= 0, 
+#X_var_space_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 3 >= 0,
                                                   d1 >= 0, -d1 + 7 >= 0, 
                                                   d2 >= 0, -d2 + 2047>= 0, 
                                                   d3 >= 0, -d3 + 127 >= 0)>
+#Y_var_space_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 3 >= 0,
+                                                  d1 >= 0, -d1 + 2047>= 0,
+                                                  d2 >= 0, -d2 + 7 >= 0,
+                                                  d3 >= 0, -d3 + 127 >= 0)>
+#X_var_space_order = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+#Y_var_space_order = affine_map<(d0, d1, d2, d3) -> (d0, d2, d1, d3)>
 
 module {
   func.func @paged_tensor_copy_1core() {
@@ -31,14 +37,15 @@ module {
         // Copy is performed across Nb * Ntkv/Ptkv pages. Page ids to copy are provided by the index tensor
 
         // For this example, we will use Ndkv=128, Nhkv=8, Ntkv=2048 with Ptkv=64, Nb=4, Npages=10000
-        // X input = 4D tensor => shape {Ndkv=128, Nhkv=8, Ptkv=64, Npages=10000}  
+        // X input = 4D tensor => shape {Ndkv=128, Nhkv=8, Ptkv=64, Npages=10000}, dim order {Npages, Nh, Ptkv, Ndkv}
         // Idx input = 2D tensor => shape {Nb=4, Ntkv/Ptkv=32}
-        // Y output = 4D tensor => shape {Ndkv=128, Nhkv=8, Nb=4, Ntkv=2048}
-        // for dkv in 0..Ndkv
-        //    for h in 0..Nhkv
+        // Y output = 4D tensor => shape {Ndkv=128, Nhkv=8, Nb=4, Ntkv=2048}, dim order {Nb, Ntkv, Nh, Ndkv}
+        //
         //        for b in 0..Nb
+        //          for h in 0..Nh
         //            for tkv in 0..Ntkv
-        //                Y[dkv][h][b][tkv] = X[dkv][h][tkv%Ptkv][Idx[b][tkv/Ptkv]]
+        //              for dkv in 0..Ndkv
+        //                Y[b] [tkv] [h] [dkv] = X [Idx[b][tkv/Ptkv]] [h] [tkv%Ptkv] [dkv]
         
 
         %Nb = arith.constant 4 : index
@@ -76,7 +83,8 @@ module {
                         memory_space = #ktdp.spyre_memory_space<HBM>
         } : memref<4x32xi32>
 
-        // (1) Construct memory view for input X 
+        // (1) Construct memory view for input X
+        // dim order (outermost to innermost) {Npages, Nh, Ptkv, Ndkv}
         // Note: affine_set (e.g., #X_coord_set) can be declared outside the module 
         %X_mem_view = ktdp.construct_memory_view %X_start_address, 
                         sizes: [%Npages, %Nhkv, %Ptkv, %Ndkv], strides: [65536, 8192, %Ndkv, 1] {
@@ -84,7 +92,8 @@ module {
                         memory_space = #ktdp.spyre_memory_space<HBM>
         } : memref<10000x8x64x128xf16>
 
-        // (1) Construct memory view for output Y
+        // (2) Construct memory view for output Y
+        // dim order (outermost to innermost) {Nb, Ntkv, Nh, Ndkv}
         // Note: strides can be constructed with arit operations
         %Y_str_Ntkv = arith.muli  %Ndkv, %Nh : index
         %Y_str_Nb = arith.muli %Y_str_Ntkv, %Ntkv : index
@@ -94,27 +103,31 @@ module {
                         memory_space = #ktdp.spyre_memory_space<HBM>
         } : memref<4x2048x8x128xf16>
 
-        // (2) Construct indirect access tile X[dkv, h, tkv%Ptkv, Idx[b][tkv/Ptkv]]
+        // (3) Construct indirect access tile X [Idx[b][tkv/Ptkv]] [h] [tkv%Ptkv] [dkv]
         // Note: Number of entries in intermediate_variables and access_tile_set must be equal
-        // Note: Number of entries in subscript of mem_view, shape of memref, shape of ktdp.tile must be equal
+        // Note: Number of entries in subscript of mem_view, shape of memref, shape of ktdp.access_tile must be equal
         %X_access_tile = ktdp.construct_indirect_access_tile 
                             intermediate_variables(%b, %h, %tkv, %dkv) 
-                            %X_mem_view[Idx_mem_view[%b, %tkv / 64] , %hkv, %tkv % 64, %dkv] {
-            variables_space_set = #XY_var_space_set
-        } : memref<10000x8x64x128xf16> -> !ktdp.tile<4x8x2048x128xindex>
+                            %X_mem_view[Idx_mem_view[%b, %tkv / 64] , %h, %tkv % 64, %dkv] {
+            variables_space_set = #X_var_space_set,
+            variables_space_order = #X_var_space_order
+        } : memref<10000x8x64x128xf16>,memref<4x32xi32> -> !ktdp.access_tile<4x8x2048x128xindex>
 
-        // (2) Construct access tile for Y[dkv, h, b, tkv]
+        // (4) Construct access tile for Y[b] [tkv] [h] [dkv]
         // Note: No need for intermediate_variables in direct accessed tiles
-        // Note: Number of entries in subscript of mem_view, access_tile_set, shape of memref, shape of ktdp.tile must be equal
+        // Note: Number of entries in subscript of mem_view, access_tile_set, shape of memref, shape of ktdp.access_tile must be equal
+        // Note: Variable space order helps in setting the correct order among the region of coordinates making sure that
+        // it aligns with data that is going to be stored in it.
         %Y_access_tile = ktdp.construct_access_tile %Y_mem_view[0, 0, 0, 0] {
-            access_tile_set = #XY_var_space_set
-        } : memref<4x2048x8x128xf16> -> !ktdp.tile<4x8x2048x128xindex>
+            access_tile_set = #Y_var_space_set,
+            variables_space_order = #Y_var_space_order
+        } : memref<4x2048x8x128xf16> -> !ktdp.access_tile<4x8x2048x128xindex>
 
-        // (3) Create data_tile for X from its access tile
-        %X_data_tile = ktdp.load %X_access_tile : !ktdp.tile<4x8x2048x128xindex> -> tensor<4x8x2048x128xf16>
+        // (5) Create data_tile for X from its access tile
+        %X_data_tile = ktdp.load %X_access_tile : !ktdp.access_tile<4x8x2048x128xindex> -> tensor<4x8x2048x128xf16>
 
-        // (3) Store Y[...] = X_data_tile
-        ktdp.store %X_data_tile, %Y_access_tile : tensor<4x8x2048x128xf16>, !ktdp.tile<4x8x2048x128xindex>
+        // (6) Store Y[...] = X_data_tile
+        ktdp.store %X_data_tile, %Y_access_tile : tensor<4x8x2048x128xf16>, !ktdp.access_tile<4x8x2048x128xindex>
 
         return
   }
