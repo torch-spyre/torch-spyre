@@ -28,7 +28,7 @@ Transtion from SuperDSC-bundle into tile-based interface built over open-source 
 KTIR is a tile-based, block-structured intermediate representation (IR) designed to express programs targeting multi-core accelerator architectures. It embodies a data-parallel abstraction of the accelerator shown in Figure 1. The accelerator contains multiple cores, with each core comprising a compute engine and an on-chip scratchpad memory associated with the compute unit. The cores are attached together through an on-chip interconnect fabric, which also interfaces with one or more off-chip memory banks.
 
 <p align="center">
-  <img src="ktdp_hw_abstraction.png" alt="ktdp_hw_abstraction" width="450"/>
+  <img src="ktir_hw_abstraction.png" alt="ktir_hw_abstraction" width="450"/>
 </p>
 <p align="center">
   Figure 1. Hardware abstraction of multi-core accelerator embodied in KTIR
