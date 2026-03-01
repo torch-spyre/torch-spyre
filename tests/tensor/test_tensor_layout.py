@@ -31,8 +31,12 @@ class TestSpyreTensorLayout(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    # Test generic stick shorthands
-    def test_generic_stick(self):
+    def test_default_layout(self):
+        stl = SpyreTensorLayout([], torch.float16)
+        self.assertEqual(stl.device_size, [1, 64])
+        self.assertEqual(stl.dim_map, [-1, -1])
+        self.assertEqual(stl.host_stick_dim(), None)
+
         stl = SpyreTensorLayout([128], torch.float16)
         self.assertEqual(stl.device_size, [2, 64])
         self.assertEqual(stl.dim_map, [0, 0])
