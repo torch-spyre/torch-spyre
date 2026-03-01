@@ -181,6 +181,28 @@ class TestSpyreTensorLayout(TestCase):
             cpu_result, compiled_result, rtol=0.001, atol=0.00001
         )
 
+    def test_add_with_incompatible_mixed_layout_dim_orders(self):
+        """
+        Compiled add where x and y have incompatible device layouts.
+
+        When we implement https://github.com/torch-spyre/torch-spyre/issues/738,
+        this test will be updated to expect cpu_result and compiled_result to be equal.
+        """
+        x = torch.rand(3, 2, 2048, dtype=torch.float16)
+        y = torch.rand(3, 2, 2048, dtype=torch.float16)
+        x_stl = SpyreTensorLayout(x.size(), torch.float16, [1, 0, 2])
+        y_stl = SpyreTensorLayout(x.size(), torch.float16, [2, 1, 0])
+        _ = x.to("spyre")  # required for lazy device initialization
+        x_dev = to_with_layout(x, x_stl)
+        y_dev = to_with_layout(y, y_stl)
+        compiled = torch.compile(torch.add)
+        with self.assertRaises(RuntimeError) as context:
+            _ = compiled(x_dev, y_dev).cpu()
+        self.assertIn(
+            "pointwise op with multiple non-broadcasted stick dims",
+            str(context.exception),
+        )
+
 
 if __name__ == "__main__":
     run_tests()
