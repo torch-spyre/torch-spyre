@@ -292,7 +292,13 @@ def register_spyre_decompositions_via_dispatchkey(
                     ):
                         return self.op(*args, **kwargs)
 
-                return self.spyre_fn(*args, **kwargs)
+                # Check if we're already inside a torch.compile context
+                if torch.compiler.is_compiling():
+                    # Already compiling, call the function directly
+                    return self.spyre_fn(*args, **kwargs)
+                else:
+                    # Not compiling, wrap with torch.compile
+                    return torch.compile(self.spyre_fn)(*args, **kwargs)
 
         def register(op):
             spyre_decompositions_via_dispatchkey[op] = OPWrapper(op, fn)
@@ -360,72 +366,14 @@ def enable_spyre_decompositions_via_dispatchkey():
 #     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
-@register_spyre_decomposition([torch.ops.spyre.rms_norm])
-def rmsnorm_decomp(
-    input: torch.Tensor,
-    normalized_shape: list[int],
-    weight: Optional[torch.Tensor] = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    # TODO: limitation with mean on dim=-1, transpose for now to avoid
-    # https://github.com/torch-spyre/torch-spyre/issues/632
-    input = input.transpose(-1, -2).contiguous()
-    eps = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
-    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps
-    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
-    if weight is not None:
-        output = output * weight
-    return output
-
-
-# # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
-# # a one-element Spyre tensor. This currently fails because Spyre does not handle
-# # single-element tensors well.
-# # Ref: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/fx_passes/joint_graph.py#L324-L335
-# #
-# # To avoid constant folding, we introduce a custom op `spyre::full` that runs
-# # torch.full on CPU and copies the result to Spyre. Remove this workaround once
-# # Spyre supports one-element tensors.
-# @register_spyre_decomposition([torch.ops.aten.full])
-# def full_decomp(
-#     size: list[Union[int, torch.SymInt]],
-#     fill_value: torch.types.Number,
-#     dtype: Optional[torch.dtype] = None,
-#     layout: Optional[torch.layout] = None,
-#     device: Optional[torch.device] = None,
-#     pin_memory: Optional[bool] = None,
-# ) -> torch.Tensor:
-#     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
-#     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
-#     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
-
-
-# """
-# Hook torch.nn.functional.layer_norm to select spyre optimized version where applicable
-# """
-
-
-# # Register the spyre_layer_norm as Dispatcher backend for the spyre device
-# @register_spyre_decompositions_via_dispatchkey(
-#     [torch.ops.aten.native_layer_norm.default, torch.ops.aten.native_batch_norm.default]
-# )
-# def spyre_layer_norm(
-#     input: torch.Tensor,
-#     normalized_shape: Sequence[int],
-#     weight: Optional[torch.Tensor] = None,
-#     bias: Optional[torch.Tensor] = None,
-#     eps: float = 1e-5,
-# ) -> torch.Tensor:
-#     if input.device.type == "spyre" and len(normalized_shape) == 1:
-#         return torch.ops.spyre.layer_norm(input, normalized_shape, weight, bias, eps)
-#     else:
-#         # This should not happen, as this kernel should only dispatch for the spyre device
-#         raise Exception("This should not happen!")
-#         # return orig_layer_norm(input, normalized_shape, weight, bias, eps)
-
-# orig_rms_norm = torch.nn.functional.rms_norm
-
-
+# Register PrivateUse1 kernel for aten.rms_norm that decomposes directly into
+# lower-level Spyre ops. This works for both eager mode and torch.compile.
+# The decomposition uses a transpose workaround for Spyre issue #632 (mean on dim=-1
+# is broken) and converts eps to a tensor via spyre.full to avoid constant folding.
+#
+# Note: Both decorators are needed:
+# - @register_spyre_decomposition: Registers in decomposition table for make_fx (torch.compile)
+# - @register_spyre_decompositions_via_dispatchkey: Registers PrivateUse1 kernel for eager mode
 @register_spyre_decompositions_via_dispatchkey(
     [torch.ops.aten.rms_norm.default]
 )
@@ -436,11 +384,21 @@ def spyre_rms_norm(
     weight: Optional[torch.Tensor] = None,
     eps: Optional[float] = None,
 ) -> torch.Tensor:
-    if input.device.type == "spyre" and len(normalized_shape) == 1:
-        return torch.ops.spyre.rms_norm(input, normalized_shape, weight, eps)
-    else:
-        # This should not happen, as this kernel should only dispatch for the spyre device
-        raise Exception("This should not happen!")
+    if input.device.type != "spyre" or len(normalized_shape) != 1:
+        raise Unsupported(
+            f"spyre_rms_norm: only supports spyre device with normalized_shape of length 1, "
+            f"got device={input.device.type}, normalized_shape={normalized_shape}"
+        )
+    
+    # TODO: limitation with mean on dim=-1, transpose for now to avoid
+    # https://github.com/torch-spyre/torch-spyre/issues/632
+    input = input.transpose(-1, -2).contiguous()
+    eps_tensor = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
+    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
+    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
+    if weight is not None:
+        output = output * weight
+    return output
 
 
 # torch.nn.functional.rms_norm = spyre_rms_norm
