@@ -1014,7 +1014,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(input):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
 
-        compare_with_cpu(fn, x)
+        compare_with_cpu(fn, x, compile=True)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

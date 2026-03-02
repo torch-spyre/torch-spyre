@@ -95,6 +95,15 @@ def enable_spyre_decompositions():
                         op_ret = decompositions.pop(op, None)
                         if op_ret is not None:
                             _removed[op] = op_ret
+                    elif isinstance(op, str):
+                        to_remove = []
+                        for op_decomp, op_decomp_fn in decompositions.items():
+                            if op == op_decomp._name:
+                                to_remove.append(op_decomp)
+                                _removed[op_decomp] = op_decomp_fn
+                                
+                        for op_decomp in to_remove:
+                            decompositions.pop(op_decomp, None)
                 return _removed
 
             # 1. Add/override spyre-specific decompositions
@@ -116,6 +125,9 @@ def enable_spyre_decompositions():
 
             # 2. Remove selected decompositions from Inductor's registry for spyre
             _removed_decompositions_to_exclude = _fetch_and_remove_op(
+                # spyre_decompositions_to_exclude + ['aten::_fused_rms_norm', 'aten::_fused_rms_norm_backward', 'aten::rms_norm', 'spyre::rms_norm']
+                # spyre_decompositions_to_exclude + ['spyre::rms_norm']
+                # spyre_decompositions_to_exclude + ['aten::_fused_rms_norm', 'aten::_fused_rms_norm_backward', 'aten::rms_norm']
                 spyre_decompositions_to_exclude
             )
 
@@ -361,9 +373,13 @@ def spyre_layer_norm(
         raise Exception("This should not happen!")
         # return orig_layer_norm(input, normalized_shape, weight, bias, eps)
 
-orig_rms_norm = torch.nn.functional.rms_norm
+# orig_rms_norm = torch.nn.functional.rms_norm
 
 
+@register_spyre_decompositions_via_dispatchkey(
+    [torch.ops.aten.rms_norm.default]
+)
+@register_spyre_decomposition([torch.ops.aten.rms_norm.default])
 def spyre_rms_norm(
     input: torch.Tensor,
     normalized_shape: list[int],
@@ -372,13 +388,12 @@ def spyre_rms_norm(
 ) -> torch.Tensor:
     if input.device.type == "spyre" and len(normalized_shape) == 1:
         return torch.ops.spyre.rms_norm(input, normalized_shape, weight, eps)
-    elif input.device.type == "spyre" and len(normalized_shape) != 1:
-        raise Unsupported("RMSNorm reducing more than 1 dimension")
     else:
-        return orig_rms_norm(input, normalized_shape, weight, eps)
+        # This should not happen, as this kernel should only dispatch for the spyre device
+        raise Exception("This should not happen!")
 
 
-torch.nn.functional.rms_norm = spyre_rms_norm
+# torch.nn.functional.rms_norm = spyre_rms_norm
 
 
 orig_gelu = torch.nn.functional.gelu

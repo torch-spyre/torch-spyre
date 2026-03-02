@@ -142,7 +142,7 @@ def _(
     return x.new_empty(x.size())
 
 
-@torch.library.custom_op("spyre::rms_norm", mutates_args=())
+@torch.library.custom_op("spyre::rms_norm", mutates_args=(), device_types="spyre")
 def rms_norm(
     x: torch.Tensor,
     normalized_shape: list[int],
