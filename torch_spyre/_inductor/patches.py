@@ -13,11 +13,11 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from typing import Callable
 
 import torch
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
+from typing import Callable, Optional
 
 
 @contextmanager
@@ -37,7 +37,7 @@ def spyre_data_types():
 @contextmanager
 def enable_spyre_context(
     example_inputs: list[InputType],
-    decomps: dict[torch._ops.OperatorBase, Callable],
+    decomps: Optional[dict[torch._ops.OperatorBase, Callable]] = None,
 ):
     """
     Context manager that sets up the complete Spyre compilation environment.
@@ -57,6 +57,10 @@ def enable_spyre_context(
             decompositions. Maps operator overloads to their decomposition implementations.
             This is typically a clone of PyTorch Inductor's global decomposition registry.
     """
+
+    if decomps is None:
+        decomps = torch._inductor.decomposition.decompositions
+
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
     # Ensure decorators run (custom ops/decomp/lowerings modules)
