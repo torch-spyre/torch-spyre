@@ -21,6 +21,7 @@ import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 from .errors import Unsupported
+from . import customops  # noqa: F401
 
 import threading
 

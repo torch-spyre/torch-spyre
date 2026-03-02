@@ -114,6 +114,8 @@ def enable_spyre_compile_fx_wrapper():
 
 
 def _light_autoload():
+    from . import decompositions  # noqa: F401
+
     enable_spyre_compile_fx_wrapper()
 
 
