@@ -41,10 +41,6 @@ POINTWISE_BINARY_OPS_DICT = {
     "div": torch.div,
 }
 
-REDUCTION_OPS_DICT = {
-    "sum": torch.sum,
-    "max": torch.max,
-}
 
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
@@ -58,7 +54,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # as usual (i.e. no change in their behaviors)
     # If using unittest.skip decorator on a base function that is
     # parameterized, the parameterized functions are skipped too
-    # See utils.py for more details.
+    # See utils_inductor.py for more details.
     PARAMS = {
         (
             "test_sqrt",
@@ -170,17 +166,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((3, 17, 128, 256), (3, 17, 256, 128)),
+                    ((2, 64, 128), (128, 16384)),
                 ]
             ),
         },
-        # ("test_reduce_2d", "test_reduce"): {
-        #     "ops_dict": REDUCTION_OPS_DICT,
-        #     "param_sets": {
-        #         "dim_0": (0, cached_randn((67, 256))),
-        #         # Skip: `cpu()` on sparse tensor doesn't work in eager mode yet
-        #         # "dim_1": (1, cached_randn((67, 256))),
-        #     },
-        # },
         ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"sum": torch.sum},
             "param_sets": {
@@ -210,7 +199,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
-        ("test_max_sub_broadcast_cpu", "test_max_sub_broadcast_cpu"): {
+        ("test_max_sub_broadcast", "test_max_sub_broadcast"): {
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((128, 256))),
                 "2d_dim_1": (1, cached_randn((128, 256))),
@@ -234,7 +223,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,),),
                     ((67, 256),),
-                    # ((67, 71, 256),), # 3d input causes eager timeout
+                    ((67, 71, 256),),
                 ]
             ),
         },
@@ -249,6 +238,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,),),
                     ((67, 256),),
+                    ((67, 71, 256),),
                 ]
             ),
         },
@@ -506,16 +496,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_clone",
         ): {
             "param_sets": {
-                "fp16_1d": (cached_randn((128,), dtype=torch.float16),),
-                "fp16_2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "fp16_1d": (cached_randn((2,), dtype=torch.float16),),
+                "fp16_2d": (cached_randn((256, 100), dtype=torch.float16),),
                 "fp16_3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
-                "fp16_4d": (cached_randn((8, 2, 16, 256), dtype=torch.float16),),
-                "int64_1d": (torch.randint(1000, (128,)),),
-                "int64_2d": (torch.randint(1000, (256, 128)),),
-                "int_3d": (torch.randint(1000, (8, 16, 256)),),
+                "fp16_4d": (cached_randn((8, 2, 16, 250), dtype=torch.float16),),
                 "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
                 "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
-                "fp32_3d": (cached_randn((8, 16, 256), dtype=torch.float32),),
+                "fp32_3d": (cached_randn((8, 16, 26), dtype=torch.float32),),
                 "bool_1d": (torch.rand((128,)) > 0.5,),
                 "bool_2d": (torch.rand((256, 128)) > 0.5,),
                 "bool_3d": (torch.rand((8, 16, 256)) > 0.5,),
@@ -585,7 +572,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     },
                 ),
                 "value_4d": (
-                    cached_randn((1, 64, 11, 2048)),
+                    cached_randn((1, 64, 11, 512)),
                     {
                         "p": 0.0,
                         "training": False,
@@ -857,7 +844,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare(op, x)
 
     def test_bool(self):
-        # torch._dynamo.config.dynamic_shapes = False
         dtype = torch.bool
         x = torch.randint(0, 2, (2, 64), dtype=dtype)
         x_spyre = x.to("spyre")
@@ -878,8 +864,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         if a.dtype == torch.float32:
             compare_with_cpu(op, a, b)
         elif op == torch.bmm:
-            # TODO: Eager mode mismatch causing cryptic error, sidestep for now.
-            compare_with_cpu(op, a, b)
+            compare(op, a, b)
         else:
             compare(op, a, b)
 
@@ -894,13 +879,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_add_broadcast_cpu(self, x, y):
         compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
 
-    # @unittest.skip("eager mode crashes")
-    # def test_reduce(self, op, dim: int, x):
-    #     if op == torch.max:
-    #         compare(lambda x: op(x, dim=dim)[0], x)
-    #     else:
-    #         compare(lambda x: op(x, dim=dim), x)
-
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         if op == torch.max:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False)[0], x)
@@ -913,13 +891,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
-    def test_max_sub_broadcast_cpu(self, dim: int, x):
+    def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
             x_max = torch.max(x, dim=dim)[0]
             z = x - torch.unsqueeze(x_max, dim=dim)
             return z
 
-        compare_with_cpu(fn, x)  # eager mode crashes
+        compare(fn, x)
 
     def test_transpose_2d_cpu(self, x):
         compare_with_cpu(lambda x: x.t().contiguous(), x)

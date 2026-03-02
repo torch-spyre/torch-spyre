@@ -153,7 +153,7 @@ def rms_norm(
         raise Unsupported(
             f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
         )
-    return torch.rms_norm(x, normalized_shape, weight, eps)
+    return torch.compile(torch.ops.spyre.rms_norm)(x, normalized_shape, weight, eps)
 
 
 @rms_norm.register_fake

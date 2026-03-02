@@ -28,17 +28,19 @@
   template_name: base
 - operator_name: eq
   template_name: base
-- operator_name: embedding
-  template_name: base
-  torch_prefix: torch.nn.functional
-  extra_arguments:
-  - name: padding_idx
-    type: int64_t
-    default: 0
-    overwrite: True
-  - name: arg_2
-    type: int
-    default: 0
+# Commenting out in favor of fallback that supports indirect indexing
+# available in torch_spyre/fallbacks.py
+# - operator_name: embedding
+#   template_name: base
+#   torch_prefix: torch.nn.functional
+#   extra_arguments:
+#   - name: padding_idx
+#     type: int64_t
+#     default: 0
+#     overwrite: True
+#   - name: arg_2
+#     type: int
+#     default: 0
 - operator_name: expand
   template_name: view
 - operator_name: exp
@@ -66,9 +68,6 @@
   template_name: base
 - operator_name: maximum
   template_name: base
-- operator_name: mish
-  template_name: base
-  torch_prefix: torch.nn.functional
 - operator_name: mul
   template_name: base
 - operator_name: neg

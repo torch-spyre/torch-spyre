@@ -72,7 +72,7 @@ def get_args_with_default_vals(schema_string):
 
     """
     # Extract everything inside parentheses
-    inside = re.search(r"\((.*)\)", schema_string).group(1)
+    inside = re.search(r"\((.*?)\)\s*->", schema_string).group(1)
     # Split by comma and clean spacing
     parts = [p.strip() for p in inside.split(",")]
     # Find the index of "*"
