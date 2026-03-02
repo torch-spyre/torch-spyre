@@ -14,7 +14,7 @@
 
 from contextlib import contextmanager
 
-from typing import Optional, Sequence, Union, Callable, TypeVar
+from typing import Optional, Union, Callable, TypeVar
 from typing_extensions import ParamSpec
 
 import torch
@@ -51,7 +51,7 @@ _decompositions_via_dispatchkey_nesting = 0
 spyre_decompositions_via_dispatchkey: dict = {}
 
 # Module-level Library objects kept alive permanently so that the registered
-# PrivateUse1 / AutogradPrivateUse1 kernels are never unregistered by GC.
+# PrivateUse1 / AutogradPrivateUse1 kernels are never unregistered by garbage collector.
 # (torch.library.Library uses weakref.finalize → m.reset() on GC, which would
 # silently remove the kernels from the C++ dispatcher.)
 _spyre_autograd_lib = None
@@ -59,13 +59,15 @@ _spyre_lib = None
 _dispatchkey_kernels_registered = False
 
 # When True, the Spyre kernels are active for eager-mode dispatch even outside
-# of a torch.compile context.  Set by
-# _register_spyre_dispatchkey_kernels_permanently() and never cleared.
+# of a torch.compile context. Set by
+# _register_spyre_dispatchkey_kernels_permanently() and set to
+# False when context manager enable_spyre_decompositions_via_dispatchkey is left.
 _spyre_eager_mode_enabled = False
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
-    
+
+
 def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
@@ -74,6 +76,7 @@ def register_spyre_decomposition(
     These will only be active when compiling for the Spyre device.
     """
     return decomp.register_decomposition(ops, spyre_decompositions)
+
 
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
 @contextmanager
@@ -109,15 +112,6 @@ def enable_spyre_decompositions():
                         op_ret = decompositions.pop(op, None)
                         if op_ret is not None:
                             _removed[op] = op_ret
-                    elif isinstance(op, str):
-                        to_remove = []
-                        for op_decomp, op_decomp_fn in decompositions.items():
-                            if op == op_decomp._name:
-                                to_remove.append(op_decomp)
-                                _removed[op_decomp] = op_decomp_fn
-                                
-                        for op_decomp in to_remove:
-                            decompositions.pop(op_decomp, None)
                 return _removed
 
             # 1. Add/override spyre-specific decompositions
@@ -139,9 +133,6 @@ def enable_spyre_decompositions():
 
             # 2. Remove selected decompositions from Inductor's registry for spyre
             _removed_decompositions_to_exclude = _fetch_and_remove_op(
-                # spyre_decompositions_to_exclude + ['aten::_fused_rms_norm', 'aten::_fused_rms_norm_backward', 'aten::rms_norm', 'spyre::rms_norm']
-                # spyre_decompositions_to_exclude + ['spyre::rms_norm']
-                # spyre_decompositions_to_exclude + ['aten::_fused_rms_norm', 'aten::_fused_rms_norm_backward', 'aten::rms_norm']
                 spyre_decompositions_to_exclude
             )
 
@@ -244,7 +235,7 @@ def _register_spyre_dispatchkey_kernels_permanently():
         # PrivateUse1 key: the OPWrapper dispatches to spyre_fn when enabled.
         _spyre_lib.impl(op._name, wrapper_cls)
 
-    # Mark eager mode as active.  OPWrapper.__call__ checks this flag so that
+    # Mark eager mode as active. OPWrapper.__call__ checks this flag so that
     # Spyre kernels are used for all eager-mode dispatch, independently of the
     # compile-time spyre_enabled toggle.
     _spyre_eager_mode_enabled = True
@@ -257,10 +248,10 @@ def register_spyre_decompositions_via_dispatchkey(
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
     Register decompositions specifically for Spyre device via the PyTorch dispatcher
-    This replaces the need for global patching of operations in order to enable them for 
+    This replaces the need for global patching of operations in order to enable them for
     eager mode.
     """
-    
+
     def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
         class OPWrapper:
             def __init__(self, op, spyre_fn):
@@ -308,7 +299,8 @@ def register_spyre_decompositions_via_dispatchkey(
         return fn
 
     return decomposition_decorator
-    
+
+
 @contextmanager
 def enable_spyre_decompositions_via_dispatchkey():
     """
@@ -348,22 +340,22 @@ def enable_spyre_decompositions_via_dispatchkey():
                     wrapper_cls.spyre_enabled = False
 
 
-# @register_spyre_decomposition([torch.ops.spyre.compact])
-# def compact_decomp(x: torch.Tensor) -> torch.Tensor:
-#     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
+@register_spyre_decomposition([torch.ops.spyre.compact])
+def compact_decomp(x: torch.Tensor) -> torch.Tensor:
+    return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
 
-# @register_spyre_decomposition([torch.ops.spyre.layer_norm])
-# def layernorm_decomp(
-#     input: torch.Tensor,
-#     normalized_shape: list[int],
-#     weight: Optional[torch.Tensor] = None,
-#     bias: Optional[torch.Tensor] = None,
-#     eps: float = 1e-5,
-# ) -> torch.Tensor:
-#     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
-#     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
-#     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+@register_spyre_decomposition([torch.ops.spyre.layer_norm])
+def layernorm_decomp(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
+    norm_mean = torch.ops.spyre.layernormscale(mean, eps)
+    return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
 # Register PrivateUse1 kernel for aten.rms_norm that decomposes directly into
@@ -374,9 +366,7 @@ def enable_spyre_decompositions_via_dispatchkey():
 # Note: Both decorators are needed:
 # - @register_spyre_decomposition: Registers in decomposition table for make_fx (torch.compile)
 # - @register_spyre_decompositions_via_dispatchkey: Registers PrivateUse1 kernel for eager mode
-@register_spyre_decompositions_via_dispatchkey(
-    [torch.ops.aten.rms_norm.default]
-)
+@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.rms_norm.default])
 @register_spyre_decomposition([torch.ops.aten.rms_norm.default])
 def spyre_rms_norm(
     input: torch.Tensor,
@@ -389,67 +379,68 @@ def spyre_rms_norm(
             f"spyre_rms_norm: only supports spyre device with normalized_shape of length 1, "
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
-    
+
     # TODO: limitation with mean on dim=-1, transpose for now to avoid
     # https://github.com/torch-spyre/torch-spyre/issues/632
     input = input.transpose(-1, -2).contiguous()
-    eps_tensor = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
-    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
+    eps_tensor = torch.ops.spyre.full(
+        input.shape, eps, dtype=torch.float16, device="spyre"
+    )
+    rsqrt_inp = (
+        torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
+    )
     output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
     if weight is not None:
         output = output * weight
     return output
 
 
-# torch.nn.functional.rms_norm = spyre_rms_norm
+orig_gelu = torch.nn.functional.gelu
 
 
-# orig_gelu = torch.nn.functional.gelu
+def spyre_gelu(
+    input: torch.Tensor,
+    approximate: str = "none",
+) -> torch.Tensor:
+    if input.device.type == "spyre":
+        return torch.ops.spyre.gelu(input, approximate)
+    else:
+        return orig_gelu(input, approximate=approximate)
 
 
-# def spyre_gelu(
-#     input: torch.Tensor,
-#     approximate: str = "none",
-# ) -> torch.Tensor:
-#     if input.device.type == "spyre":
-#         return torch.ops.spyre.gelu(input, approximate)
-#     else:
-#         return orig_gelu(input, approximate=approximate)
+torch.nn.functional.gelu = spyre_gelu
 
 
-# torch.nn.functional.gelu = spyre_gelu
+orig_softplus = torch.nn.functional.softplus
 
 
-# orig_softplus = torch.nn.functional.softplus
+def spyre_softplus(
+    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
+) -> torch.Tensor:
+    if input.device.type == "spyre":
+        return torch.ops.spyre.softplus(input, beta, threshold)
+    else:
+        return orig_softplus(input, beta, threshold)
 
 
-# def spyre_softplus(
-#     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
-# ) -> torch.Tensor:
-#     if input.device.type == "spyre":
-#         return torch.ops.spyre.softplus(input, beta, threshold)
-#     else:
-#         return orig_softplus(input, beta, threshold)
+torch.nn.functional.softplus = spyre_softplus
 
 
-# torch.nn.functional.softplus = spyre_softplus
+@register_spyre_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
+def gt_decomp(
+    input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # TODO: Implement greaterthan in the backend compiler
+    out_ge = torch.ge(input, other).to(dtype=torch.float16)
+    out_ne = torch.ne(input, other).to(dtype=torch.float16)
+    return torch.mul(out_ge, out_ne, out=out).to(dtype=torch.bool)
 
 
-# @register_spyre_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
-# def gt_decomp(
-#     input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
-# ) -> torch.Tensor:
-#     # TODO: Implement greaterthan in the backend compiler
-#     out_ge = torch.ge(input, other).to(dtype=torch.float16)
-#     out_ne = torch.ne(input, other).to(dtype=torch.float16)
-#     return torch.mul(out_ge, out_ne, out=out).to(dtype=torch.bool)
-
-
-# @register_spyre_decomposition([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Tensor_out])
-# def lt_decomp(
-#     input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
-# ) -> torch.Tensor:
-#     # TODO: Implement lessthan in the backend compiler
-#     out_le = torch.le(input, other).to(dtype=torch.float16)
-#     out_ne = torch.ne(input, other).to(dtype=torch.float16)
-#     return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
+@register_spyre_decomposition([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Tensor_out])
+def lt_decomp(
+    input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # TODO: Implement lessthan in the backend compiler
+    out_le = torch.le(input, other).to(dtype=torch.float16)
+    out_ne = torch.ne(input, other).to(dtype=torch.float16)
+    return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
