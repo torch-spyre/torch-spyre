@@ -986,35 +986,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(fn, *args)
 
     def test_layernorm_cpu(self, input, weight, bias):
-        # Note, this is only done for demonstration purposes so that the
-        # decomposition.py file and its content is loaded.
-        t = torch.randn(4, dtype=torch.float16).to("spyre")
-
-        def dummy_fn(x):
-            return x * x
-
-        res = torch.compile(dummy_fn)(t)
-        print(res)
-
-        from torch_spyre._inductor.decompositions import (
-            enable_spyre_decomposition_via_dispatchkey,
-        )
-
         def fn(input, weight, bias):
-            with enable_spyre_decomposition_via_dispatchkey():
-                out = torch.nn.functional.layer_norm(
-                    input, input.shape[1:], weight=weight, bias=bias
-                )
-            return out
+            return torch.nn.functional.layer_norm(
+                input, input.shape[1:], weight=weight, bias=bias
+            )
 
-        compare_with_cpu(fn, input, weight, bias, compile_only=False)
+        compare_with_cpu(fn, input, weight, bias)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_rmsnorm_cpu(self, x):
         def fn(input):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
 
-        compare_with_cpu(fn, x, compile=True)
+        compare_with_cpu(fn, x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

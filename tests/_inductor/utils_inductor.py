@@ -169,20 +169,17 @@ class ParameterizedTestMeta(type):
 
 
 # Helper functions for compare operations
-def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile=True):
+def _compile_and_run(fn, args, device, backend=None, needs_device=False):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     device = torch.device(device) if isinstance(device, str) else device
     device_args = [arg.to(device) for arg in args]
     device_kwargs = {"device": device} if needs_device else {}
 
-    if compile:
-        if backend:
-            result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
-        else:
-            result = torch.compile(fn)(*device_args, **device_kwargs)
+    if backend:
+        result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
     else:
-        result = fn(*device_args, **device_kwargs)
+        result = torch.compile(fn)(*device_args, **device_kwargs)
 
     if not isinstance(result, int):
         assert result.device.type == device.type, (
@@ -220,21 +217,20 @@ def compare_with_cpu(
     needs_device=False,
     cpu_compile=True,
     target=None,
-    compile=True
 ):
     """Compare compiled Spyre execution against uncompiled (and optionally compiled) CPU execution."""
     cpu_result = fn(*args)
 
     # compiled spyre execution
     if target is None:
-        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device, compile=compile)
+        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
 
     _assert_results_close(target, cpu_result, atol, rtol, "compiled spyre <-> cpu")
 
     # compiled cpu execution
     if cpu_compile:
         cpu_compiled_result = _compile_and_run(
-            fn, args, "cpu", needs_device=needs_device, compile=compile
+            fn, args, "cpu", needs_device=needs_device
         )
         _assert_results_close(
             target,

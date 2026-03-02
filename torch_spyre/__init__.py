@@ -67,9 +67,10 @@ class _SpyreImpl:
 
             ts_autoload()
 
-            # Permanently register PrivateUse1 kernels so that eager-mode
-            # dispatch reaches the Spyre implementations.  customops must be
-            # imported first because decompositions.py references
+            # Permanently register PrivateUse1 kernels for DispatchKeys
+            # so that eager-mode dispatch reaches the Spyre implementations
+            # without requiring global monkey-patching.
+            # Customops must be imported here because decompositions.py references
             # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
             import torch_spyre._inductor.customops  # noqa: F401
             from torch_spyre._inductor.decompositions import (
