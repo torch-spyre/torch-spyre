@@ -13,8 +13,10 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+from typing import Callable
 
 import torch
+from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
 
@@ -33,7 +35,28 @@ def spyre_data_types():
 
 
 @contextmanager
-def enable_spyre_context(example_inputs, cloned_decompositions):
+def enable_spyre_context(
+    example_inputs: list[InputType],
+    decomps: dict[torch._ops.OperatorBase, Callable],
+):
+    """
+    Context manager that sets up the complete Spyre compilation environment.
+
+    This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
+      - Enabling Spyre-specific data type handling
+      - Activating Spyre lowerings and decompositions
+      - Configuring Inductor settings optimized for Spyre
+      - Setting up custom pre/post compilation passes
+      - Disabling incompatible optimizations (e.g., reduction splitting, permute fusion)
+
+    Args:
+        example_inputs: List of example inputs to the graph being compiled. Used to
+            set real inputs in the virtualized context for shape inference and
+            optimization decisions.
+        decomps: Decomposition table to be populated with Spyre-specific
+            decompositions. Maps operator overloads to their decomposition implementations.
+            This is typically a clone of PyTorch Inductor's global decomposition registry.
+    """
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
     # Ensure decorators run (custom ops/decomp/lowerings modules)
@@ -91,12 +114,12 @@ def enable_spyre_context(example_inputs, cloned_decompositions):
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
-        enable_spyre_decompositions(cloned_decompositions),
+        enable_spyre_decompositions(decomps=decomps) as spyre_context_decompositions,
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
     ):
         try:
-            yield
+            yield spyre_context_decompositions
         finally:
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
