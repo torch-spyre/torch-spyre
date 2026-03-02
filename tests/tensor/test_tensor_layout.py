@@ -25,6 +25,9 @@ from torch_spyre._C import (
 
 
 class TestSpyreTensorLayout(TestCase):
+    def setUp(self):
+        torch.manual_seed(0xAFFE)
+
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
@@ -157,6 +160,22 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(sparse_stl.dim_map, [1, -1, 0, -1])
         dense_stl = compute_view_layout((5, 128), (5, 128, 1), sparse_stl)
         self.assertEqual(stl, dense_stl)
+
+    def test_add_with_mixed_layout_dim_orders(self):
+        """Compiled add where x and y have different device layouts."""
+        x = torch.rand(3, 2, 2048, dtype=torch.float16)
+        y = torch.rand(3, 2, 2048, dtype=torch.float16)
+        cpu_result = x + y  # linter won't allow lambdas
+        x_stl = SpyreTensorLayout(x.size(), torch.float16, [1, 0, 2])
+        y_stl = SpyreTensorLayout(x.size(), torch.float16, [0, 1, 2])
+        _ = x.to("spyre")  # required for lazy device initialization
+        x_dev = to_with_layout(x, x_stl)
+        y_dev = to_with_layout(y, y_stl)
+        compiled = torch.compile(torch.add)
+        compiled_result = compiled(x_dev, y_dev).cpu()
+        torch.testing.assert_close(
+            cpu_result, compiled_result, rtol=0.001, atol=0.00001
+        )
 
 
 if __name__ == "__main__":
