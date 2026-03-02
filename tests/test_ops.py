@@ -296,7 +296,7 @@ class TestOps(TestCase):
         z = (x_spyre + y).to("cpu")
         torch.testing.assert_close(z, x + y, rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("xfail: Swapping stick dimension is unsupported in new DCI")
+    @unittest.skip("xfail: contiguous crashes in eager mode")
     def test_add_Tensor_transpose(self):
         x = torch.arange(8, dtype=self.dtype).view(2, 4)
         y = torch.arange(8, dtype=self.dtype).view(4, 2) * 10
