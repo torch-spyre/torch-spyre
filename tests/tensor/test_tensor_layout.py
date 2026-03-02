@@ -25,11 +25,18 @@ from torch_spyre._C import (
 
 
 class TestSpyreTensorLayout(TestCase):
+    def setUp(self):
+        torch.manual_seed(0xAFFE)
+
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    # Test generic stick shorthands
-    def test_generic_stick(self):
+    def test_default_layout(self):
+        stl = SpyreTensorLayout([], torch.float16)
+        self.assertEqual(stl.device_size, [1, 64])
+        self.assertEqual(stl.dim_map, [-1, -1])
+        self.assertEqual(stl.host_stick_dim(), None)
+
         stl = SpyreTensorLayout([128], torch.float16)
         self.assertEqual(stl.device_size, [2, 64])
         self.assertEqual(stl.dim_map, [0, 0])
@@ -157,6 +164,44 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(sparse_stl.dim_map, [1, -1, 0, -1])
         dense_stl = compute_view_layout((5, 128), (5, 128, 1), sparse_stl)
         self.assertEqual(stl, dense_stl)
+
+    def test_add_with_mixed_layout_dim_orders(self):
+        """Compiled add where x and y have different device layouts."""
+        x = torch.rand(3, 2, 2048, dtype=torch.float16)
+        y = torch.rand(3, 2, 2048, dtype=torch.float16)
+        cpu_result = x + y  # linter won't allow lambdas
+        x_stl = SpyreTensorLayout(x.size(), torch.float16, [1, 0, 2])
+        y_stl = SpyreTensorLayout(x.size(), torch.float16, [0, 1, 2])
+        _ = x.to("spyre")  # required for lazy device initialization
+        x_dev = to_with_layout(x, x_stl)
+        y_dev = to_with_layout(y, y_stl)
+        compiled = torch.compile(torch.add)
+        compiled_result = compiled(x_dev, y_dev).cpu()
+        torch.testing.assert_close(
+            cpu_result, compiled_result, rtol=0.001, atol=0.00001
+        )
+
+    def test_add_with_incompatible_mixed_layout_dim_orders(self):
+        """
+        Compiled add where x and y have incompatible device layouts.
+
+        When we implement https://github.com/torch-spyre/torch-spyre/issues/738,
+        this test will be updated to expect cpu_result and compiled_result to be equal.
+        """
+        x = torch.rand(3, 2, 2048, dtype=torch.float16)
+        y = torch.rand(3, 2, 2048, dtype=torch.float16)
+        x_stl = SpyreTensorLayout(x.size(), torch.float16, [1, 0, 2])
+        y_stl = SpyreTensorLayout(x.size(), torch.float16, [2, 1, 0])
+        _ = x.to("spyre")  # required for lazy device initialization
+        x_dev = to_with_layout(x, x_stl)
+        y_dev = to_with_layout(y, y_stl)
+        compiled = torch.compile(torch.add)
+        with self.assertRaises(RuntimeError) as context:
+            _ = compiled(x_dev, y_dev).cpu()
+        self.assertIn(
+            "pointwise op with multiple non-broadcasted stick dims",
+            str(context.exception),
+        )
 
 
 if __name__ == "__main__":

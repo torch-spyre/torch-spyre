@@ -502,6 +502,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
+                # Reorder scale of the output  to implement transpositions
+                (
+                    ks.scales[-1][ks.op_info["transposed_dims"][0]],
+                    ks.scales[-1][ks.op_info["transposed_dims"][1]],
+                ) = (
+                    ks.scales[-1][ks.op_info["transposed_dims"][1]],
+                    ks.scales[-1][ks.op_info["transposed_dims"][0]],
+                )
 
             # TODO(aviros): Remove this piece of code when real relayout is implemented
             if generic_relayout:

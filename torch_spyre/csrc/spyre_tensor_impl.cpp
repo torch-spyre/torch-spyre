@@ -115,7 +115,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(2);
     this->dim_map.resize(2);
-    this->device_size[0] = this->elems_per_stick();
+    this->device_size[0] = 1;
     this->device_size[1] = this->elems_per_stick();
     this->dim_map[0] = -1;
     this->dim_map[1] = -1;

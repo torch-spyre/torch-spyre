@@ -18,6 +18,7 @@ from typing import Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
 from .errors import Unsupported
+from . import customops  # noqa: F401
 
 import threading
 
