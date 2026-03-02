@@ -343,6 +343,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     2,
                     cached_randn((128, 128, 128), abs=True),
                 ),
+                "dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((128, 64, 128), abs=True),
+                ),
             }
         },
         ("test_transpose_4d_cpu", "test_transpose_4d_cpu"): {
@@ -361,6 +366,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     cached_randn((3, 256, 17, 64), abs=True),
+                ),
+                "dim_1_2": (
+                    1,
+                    3,
+                    cached_randn((3, 256, 64, 64), abs=True),
+                ),
+                "dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((64, 25, 7, 64), abs=True),
                 ),
             }
         },

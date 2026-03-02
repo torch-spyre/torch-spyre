@@ -25,7 +25,7 @@ from .data_ops import (
     generate_transpose,
     generate_transpose_3d_stick,
     generate_transpose_4d_stick,
-    generate_clone,
+    generate_identity,
 )
 
 
@@ -71,7 +71,7 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
             inputs[0]["device_layout"].device_dtype
             == outputs[0]["device_layout"].device_dtype
         ):
-            return generate_clone(
+            return generate_identity(
                 pointers,
                 op=CLONE_OP,
                 dimensions=dimensions,
@@ -97,10 +97,9 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
         transposed_dims = [
             dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
         ]
-        is_stick_transpose = (
-            0 in transposed_dims or 1 in transposed_dims
-        ) and 2 in transposed_dims
-        if is_stick_transpose:
+        if (
+            inputs[0]["device_layout"].host_stick_dim() in transposed_dims
+        ):  # stick transpose implemented through restickify
             return generate_transpose_3d_stick(
                 pointers,
                 op=op,
@@ -110,15 +109,22 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
                 transposed_dims=transposed_dims,
                 **kwargs,
             )
-        else:
-            # Non-stick transpose currently unsupported
-            raise Unsupported("Transposition not changing the stick dimension")
+        else:  # non-stick transpose implemented through identity
+            return generate_identity(
+                pointers,
+                op=op,
+                dimensions=dimensions,
+                inputs=inputs,
+                outputs=outputs,
+                **kwargs,
+            )
     if op == TRANSPOSE_OP and len(dimensions) == 4:
         transposed_dims = [
             dim % len(dimensions) for dim in kwargs["op_info"]["transposed_dims"]
         ]
-        is_supported = 3 in transposed_dims
-        if is_supported:
+        if (
+            inputs[0]["device_layout"].host_stick_dim() in transposed_dims
+        ):  # stick transpose implemented through restickify
             return generate_transpose_4d_stick(
                 pointers,
                 op=op,
@@ -128,12 +134,17 @@ def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwa
                 transposed_dims=transposed_dims,
                 **kwargs,
             )
-        else:
-            raise Unsupported(
-                f"4D transposition on dimensions {transposed_dims[0]} and {transposed_dims[1]}"
+        else:  # non-stick transpose implemented through identity
+            return generate_identity(
+                pointers,
+                op=op,
+                dimensions=dimensions,
+                inputs=inputs,
+                outputs=outputs,
+                **kwargs,
             )
     if op == CLONE_OP:
-        return generate_clone(
+        return generate_identity(
             pointers,
             op=op,
             dimensions=dimensions,

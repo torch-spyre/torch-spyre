@@ -401,8 +401,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
         op_info = {}
-        if hasattr(self.current_node, "spyre_core_division"):
-            op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
+        if hasattr(self.current_node, "op_dim_splits"):
+            op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
 
@@ -502,6 +502,14 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
+                # Reorder scale of the output  to implement transpositions
+                (
+                    ks.scales[-1][ks.op_info["transposed_dims"][0]],
+                    ks.scales[-1][ks.op_info["transposed_dims"][1]],
+                ) = (
+                    ks.scales[-1][ks.op_info["transposed_dims"][1]],
+                    ks.scales[-1][ks.op_info["transposed_dims"][0]],
+                )
 
             # TODO(aviros): Remove this piece of code when real relayout is implemented
             if generic_relayout:
@@ -535,8 +543,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         op_info = {}
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
-        if hasattr(self.current_node, "spyre_core_division"):
-            op_info["core_division"] = self.current_node.spyre_core_division  # type: ignore[union-attr]
+        if hasattr(self.current_node, "op_dim_splits"):
+            op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
 

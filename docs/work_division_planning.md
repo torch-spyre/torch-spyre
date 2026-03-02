@@ -67,16 +67,25 @@ Batched matrix multiplication extends matrix multiplication with an additional b
 
 ## Core Division Representation
 
-The planning phase annotates each operation with a _core division_ specification. This is a list of split counts, one per tensor (inputs and outputs), where each split count list has one element per device dimension.
+The planning phase annotates each operation with an `op_dim_splits` list — a single list of split counts, one per **operation dimension**, in the same order as the dimension labels used during code generation.
 
-For example, a matrix multiplication with 8 cores might have:
-- Input 0 (left matrix): [1, 4, 1] - split dimension 1 by 4
-- Input 1 (right matrix): [2, 1, 1] - split dimension 0 by 2
-- Output: [2, 4, 1] - split dimensions 0 and 1 by 2 and 4 respectively
+The operation dimension ordering is:
 
-Note that the length of `core_division` of the tensor corresponds to its `device_size`.
+| Op | Dimension labels | `op_dim_splits` |
+|---|---|---|
+| matmul | `["mb", "in", "out"]` | `[M_split, 1, N_split]` |
+| 3D bmm | `["x", "mb", "in", "out"]` | `[B_split, M_split, 1, N_split]` |
+| 4D bmm | `["x", "y", "mb", "in", "out"]` | `[B1_split, B2_split, M_split, 1, N_split]` |
+| pointwise 2D | `["mb", "out"]` | `[1, cores]` |
+| pointwise 3D | `["mb", "x", "out"]` | `[1, 1, cores]` |
+| pointwise 4D | `["mb", "x", "y", "out"]` | `[1, 1, 1, cores]` |
 
-The product of splits in any tensor equals the total cores used (4 × 2 = 8 in this example). Different tensors may have different split patterns because they have different device layouts, but the splits are coordinated to ensure each core processes corresponding slices of all tensors.
+The reduction dimension (K / "in") is always 1 since it is never split. The product of all splits equals the total number of cores used.
+
+For example, a matrix multiplication with 8 cores and M_split=4, N_split=2 would have:
+- `op_dim_splits = [4, 1, 2]`  — matching `["mb", "in", "out"]`
+
+This representation is operation-centric: it describes how the logical computation is divided, independent of how any particular tensor is laid out in device memory. The code generation phase uses `op_dim_splits` directly without any mapping through device dimensions.
 
 ## Planning Pipeline
 

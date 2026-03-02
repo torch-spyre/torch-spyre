@@ -99,12 +99,14 @@ The batch dimension is typically split first because batch elements are complete
 ## Integration with Planning Phase
 
 The code generation phase reads the work division plan produced by the planning phase. The plan specifies:
-- The split count for each dimension of each tensor
-- The total number of cores used
+- `op_dim_splits`: a list of split counts, one per operation dimension, in the same order as the dimension labels used in code generation (e.g. `["mb", "in", "out"]` for matmul)
+- The total number of cores used (equal to the product of all splits)
+
+The `op_dim_splits` list is operation-centric: it describes how the logical computation is divided, independent of how any particular tensor is laid out in device memory. The code generator uses it directly as `dim_splits` without any mapping through device dimensions.
 
 The code generator uses this information to:
-1. Create the core-to-slice mapping
-2. Calculate memory offsets
+1. Create the core-to-slice mapping via `calculate_core_to_slice_mapping(dim_labels, dim_splits)`
+2. Calculate memory offsets for each core
 3. Generate dimension metadata
 4. Produce the SuperDSC structure
 

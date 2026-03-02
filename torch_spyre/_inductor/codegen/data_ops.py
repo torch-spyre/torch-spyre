@@ -931,7 +931,7 @@ def generate_transpose_4d_stick(
     }
 
 
-def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+def generate_identity(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     tensors = inputs + outputs
     input_dtype = inputs[0]["device_layout"].device_dtype
     data_format = input_dtype
@@ -974,7 +974,7 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         }
 
     return {
-        "clone": {
+        "identity": {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
             "sdscFolds_": {
                 "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
@@ -1038,11 +1038,11 @@ def generate_clone(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "component_": "hbm"
                                 if tensor["lx_addr"] is None
                                 else "lx",
-                                "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
-                                    tensor, op
+                                "layoutDimOrder_": dim_infos.get_tensor_layout_order(
+                                    tensor
                                 ),
                                 "maxDimSizes_": [-1]
-                                * len(dim_infos.get_tensor_op_layout_order(tensor, op)),
+                                * len(dim_infos.get_tensor_layout_order(tensor)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},

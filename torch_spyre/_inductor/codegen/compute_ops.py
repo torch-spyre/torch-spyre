@@ -499,26 +499,26 @@ def create_tensor_specific_layouts(
 
 def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
     tensors = inputs + outputs
-
     data_format = inputs[0]["device_layout"].device_dtype
-
-    d3 = len(dimensions) >= 3
-
     ndim = len(dimensions)
 
     # implement core division on stick dimension
     cores = 1
+    dim_splits = [1] * ndim
 
-    if "op_info" in kwargs and "core_division" in kwargs["op_info"]:
-        # enable work division for non-reduction only for now
-        if not reduction:
-            split_idx = len(dimensions) * -1 if d3 else 0  # split along stick dim
-            cores = kwargs["op_info"]["core_division"][-1][split_idx]
-            # FIXME: cores should be the product of list of splits
+    if "op_info" in kwargs:
+        if "n_cores_used" in kwargs["op_info"]:
+            cores = kwargs["op_info"]["n_cores_used"]
+
+        if "op_dim_splits" in kwargs["op_info"]:
+            # enable work division for non-reduction only for now
+            if not reduction:
+                dim_splits = list(kwargs["op_info"]["op_dim_splits"])
 
     # TODO: fix constant generation with multiple cores
     if "op_info" in kwargs and "constants" in kwargs["op_info"]:
         cores = 1
+        dim_splits = [1] * ndim
 
     if reduction and tensors[-1]["scale"][-1] >= 0:
         op += "nonstick"
@@ -528,7 +528,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
-    dim_splits = [1] * (ndim - 1) + [cores]
 
     # Obtain (padded) dimensions of the op from a spyre tensor layout
     padded_op_dimensions = [
@@ -553,11 +552,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     # Compute the stick label from the op tensor.
     op_stick_labels = dim_infos.get_tensor_stick_dim_labels(op_dims_tensor)
 
-    core_id_to_wk_slice = {}
-    for i in range(cores):
-        core_id_to_wk_slice[str(i)] = {
-            str(s): i if s in op_stick_labels else 0 for s in dim_labels
-        }
+    core_id_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
     return {
         op: {
@@ -992,16 +987,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         if "n_cores_used" in kwargs["op_info"]:
             cores = kwargs["op_info"]["n_cores_used"]
 
-        if "core_division" in kwargs["op_info"]:
-            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
-            for dev_dim_idx, nsplit in enumerate(
-                core_div[:-1]
-            ):  # exclude the last device dim
-                if nsplit > 1:
-                    # dev_dim_idx -> host_dim_idx
-                    host_dim_idx = outputs[0]["device_layout"].dim_map[dev_dim_idx]
-                    # host_dim_idx -> op_dim_idx for nsplit assignment
-                    dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
+        if "op_dim_splits" in kwargs["op_info"]:
+            dim_splits = list(kwargs["op_info"]["op_dim_splits"])
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
@@ -1041,16 +1028,8 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         if "n_cores_used" in kwargs["op_info"]:
             cores = kwargs["op_info"]["n_cores_used"]
 
-        if "core_division" in kwargs["op_info"]:
-            core_div = kwargs["op_info"]["core_division"][-1]  # output core division
-            for dev_dim_idx, nsplit in enumerate(
-                core_div[:-1]
-            ):  # exclude the last device dim
-                if nsplit > 1:
-                    # dev_dim_idx -> host_dim_idx
-                    host_dim_idx = outputs[0]["device_layout"].dim_map[dev_dim_idx]
-                    # host_dim_idx -> op_dim_idx for nsplit assignment
-                    dim_splits[outputs[0]["scale"].index(host_dim_idx)] = nsplit
+        if "op_dim_splits" in kwargs["op_info"]:
+            dim_splits = list(kwargs["op_info"]["op_dim_splits"])
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
