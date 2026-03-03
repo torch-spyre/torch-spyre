@@ -23,6 +23,7 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 from torch._inductor.scheduler import BaseSchedulerNode
+from .multi_dim_reduction_pass import decompose_multi_dim_reductions
 
 from .temp_passes import relayout_linear_weights
 from .stickify import propagate_spyre_tensor_layouts
