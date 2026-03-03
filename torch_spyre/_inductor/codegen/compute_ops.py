@@ -677,6 +677,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                         for c in range(cores)
                                     },
                                 },
+
+                                "isStartAddrSymbolic_": kwargs['isStartAddrSymbolic_'],
                                 "coordinates_": {
                                     "coordInfo": {
                                         di.label: gen_coord_info_value(

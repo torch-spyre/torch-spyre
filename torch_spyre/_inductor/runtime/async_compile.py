@@ -91,6 +91,7 @@ class SpyreAsyncCompile:
             "dimensions": ks.dimensions,
             "inputs": inputs,
             "outputs": outputs,
+            "isStartAddrSymbolic_" : 1,
         }
         if ks.op_info is not None:
             kernel_descriptor["op_info"] = ks.op_info
