@@ -74,6 +74,10 @@ class FixedTiledLayout(FixedLayout):
     A Tensor layout for a tensor that is on a Spyre device.
     It augments FixedLayout (the "host" tensor layout) with
     the device tensor layout and the information needed to map between them.
+    
+    NOTE: This layout should be propagated from FakeTensor level through
+    the entire compilation pipeline for better semantic clarity and to
+    enable earlier optimization decisions based on device layout constraints.
     """
 
     def __init__(
@@ -83,10 +87,12 @@ class FixedTiledLayout(FixedLayout):
         size: list[Expr],
         stride: list[Expr],
         device_layout: SpyreTensorLayout,
+        propagate_early: bool = True,  # Enable early propagation through FakeTensor
     ) -> None:
         super().__init__(device, dtype, size, stride)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
+        self.propagate_early = propagate_early  # Track if early propagation is enabled
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
