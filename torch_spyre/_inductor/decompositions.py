@@ -20,6 +20,8 @@ from typing_extensions import ParamSpec
 import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
+
+from .constants import DEVICE_NAME
 from .errors import Unsupported
 from . import customops  # noqa: F401
 
@@ -283,6 +285,16 @@ def register_spyre_decompositions_via_dispatchkey(
                     ):
                         return self.op(*args, **kwargs)
 
+                # We are about to execute the op on spyre, hence the inputs are expected to be on spyre
+                if any(
+                    isinstance(x, torch.Tensor)
+                    and getattr(x.device, "type", None) != DEVICE_NAME
+                    for x in (pytree.tree_leaves(args) + pytree.tree_leaves(kwargs))
+                ):
+                    raise RuntimeError(
+                        "Spyre decomposition function called with inputs being on a different device!"
+                    )
+
                 # Check if we're already inside a torch.compile context
                 if torch.compiler.is_compiling():
                     # Already compiling, call the function directly
@@ -345,56 +357,6 @@ def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
 
-@register_spyre_decomposition([torch.ops.spyre.layer_norm])
-def layernorm_decomp(
-    input: torch.Tensor,
-    normalized_shape: list[int],
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
-    norm_mean = torch.ops.spyre.layernormscale(mean, eps)
-    return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
-
-
-# Register PrivateUse1 kernel for aten.rms_norm that decomposes directly into
-# lower-level Spyre ops. This works for both eager mode and torch.compile.
-# The decomposition uses a transpose workaround for Spyre issue #632 (mean on dim=-1
-# is broken) and converts eps to a tensor via spyre.full to avoid constant folding.
-#
-# Note: Both decorators are needed:
-# - @register_spyre_decomposition: Registers in decomposition table for make_fx (torch.compile)
-# - @register_spyre_decompositions_via_dispatchkey: Registers PrivateUse1 kernel for eager mode
-@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.rms_norm.default])
-@register_spyre_decomposition([torch.ops.aten.rms_norm.default])
-def spyre_rms_norm(
-    input: torch.Tensor,
-    normalized_shape: list[int],
-    weight: Optional[torch.Tensor] = None,
-    eps: Optional[float] = 1e-5,
-) -> torch.Tensor:
-    if input.device.type != "spyre" or len(normalized_shape) != 1:
-        raise Unsupported(
-            f"spyre_rms_norm: only supports spyre device with normalized_shape of length 1, "
-            f"got device={input.device.type}, normalized_shape={normalized_shape}"
-        )
-
-    # TODO: limitation with mean on dim=-1, transpose for now to avoid
-    # https://github.com/torch-spyre/torch-spyre/issues/632
-    input = input.transpose(-1, -2).contiguous()
-    eps_tensor = torch.ops.spyre.full(
-        input.shape, eps, dtype=torch.float16, device="spyre"
-    )
-    rsqrt_inp = (
-        torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
-    )
-    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
-    if weight is not None:
-        output = output * weight
-    return output
-
-
 # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
 # a one-element Spyre tensor. This currently fails because Spyre does not handle
 # single-element tensors well.
@@ -417,58 +379,6 @@ def full_decomp(
     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
 
 
-"""
-Hook torch.nn.functional.layer_norm to select spyre optimized version where applicable
-"""
-orig_layer_norm = torch.nn.functional.layer_norm
-
-
-def spyre_layer_norm(
-    input: torch.Tensor,
-    normalized_shape: Sequence[int],
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    if input.device.type == "spyre" and len(normalized_shape) == 1:
-        return torch.ops.spyre.layer_norm(input, normalized_shape, weight, bias, eps)
-    else:
-        return orig_layer_norm(input, normalized_shape, weight, bias, eps)
-
-
-torch.nn.functional.layer_norm = spyre_layer_norm
-
-orig_gelu = torch.nn.functional.gelu
-
-
-def spyre_gelu(
-    input: torch.Tensor,
-    approximate: str = "none",
-) -> torch.Tensor:
-    if input.device.type == "spyre":
-        return torch.ops.spyre.gelu(input, approximate)
-    else:
-        return orig_gelu(input, approximate=approximate)
-
-
-torch.nn.functional.gelu = spyre_gelu
-
-
-orig_softplus = torch.nn.functional.softplus
-
-
-def spyre_softplus(
-    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
-) -> torch.Tensor:
-    if input.device.type == "spyre":
-        return torch.ops.spyre.softplus(input, beta, threshold)
-    else:
-        return orig_softplus(input, beta, threshold)
-
-
-torch.nn.functional.softplus = spyre_softplus
-
-
 @register_spyre_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
 def gt_decomp(
     input: torch.Tensor, other: torch.Tensor, *, out: Optional[torch.Tensor] = None
@@ -487,3 +397,74 @@ def lt_decomp(
     out_le = torch.le(input, other).to(dtype=torch.float16)
     out_ne = torch.ne(input, other).to(dtype=torch.float16)
     return torch.mul(out_le, out_ne, out=out).to(dtype=torch.bool)
+
+
+###############################################################################################
+##                           Functions requiring dispatch keys                               ##
+###############################################################################################
+# Note: Both decorators are needed for such operators:
+# - @register_spyre_decomposition: Registers in decomposition table for make_fx (torch.compile)
+# - @register_spyre_decompositions_via_dispatchkey: Registers PrivateUse1 kernel for eager mode
+@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.rms_norm.default])
+@register_spyre_decomposition([torch.ops.aten.rms_norm.default])
+def spyre_rms_norm(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: Optional[float] = 1e-5,
+) -> torch.Tensor:
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"spyre_rms_norm: only supports spyre device with normalized_shape of length 1, "
+            f"got device={input.device.type}, normalized_shape={normalized_shape}"
+        )
+
+    # TODO: limitation with mean on dim=-1, transpose for now to avoid
+    # https://github.com/torch-spyre/torch-spyre/issues/632
+    input = input.transpose(-1, -2).contiguous()
+    eps_tensor = torch.ops.spyre.full(
+        input.shape, eps, dtype=torch.float16, device="spyre"
+    )
+    rsqrt_inp = (
+        torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
+    )
+    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
+    if weight is not None:
+        output = output * weight
+    return output
+
+
+@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.layer_norm.default])
+@register_spyre_decomposition([torch.ops.aten.layer_norm.default])
+def spyre_layer_norm(
+    input: torch.Tensor,
+    normalized_shape: Sequence[int],
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"spyre_layer_norm: only supports spyre device with normalized_shape of length 1, "
+            f"got device={input.device.type}, normalized_shape={normalized_shape}"
+        )
+    mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
+    norm_mean = torch.ops.spyre.layernormscale(mean, eps)
+    return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.gelu.default])
+@register_spyre_decomposition([torch.ops.aten.gelu.default])
+def spyre_gelu(
+    input: torch.Tensor,
+    approximate: str = "none",
+) -> torch.Tensor:
+    return torch.ops.spyre.gelu(input, approximate)
+
+
+@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.softplus.default])
+@register_spyre_decomposition([torch.ops.aten.softplus.default])
+def spyre_softplus(
+    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
+) -> torch.Tensor:
+    return torch.ops.spyre.softplus(input, beta, threshold)
