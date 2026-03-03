@@ -692,11 +692,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(128, dtype=torch.bool),  # bool tensor
                     (cached_randn((128,)) > 0),  # bool tensor
                 ),
-                # TODO: Copying bool tensors to host is not working yet. See issue #488.
-                # "float2bool": (
-                #     torch.zeros(128, dtype=torch.bool),  # bool tensor
-                #     (cached_randn((128,)) > 0).to(dtype=torch.float16),  # float tensor
-                # ),
+                "float2bool": (
+                    torch.zeros(128, dtype=torch.bool),  # bool tensor
+                    (cached_randn((128,)) > 0).to(dtype=torch.float16),  # float tensor
+                ),
                 "bool2float": (
                     torch.zeros(128, dtype=torch.float16),  # float tensor
                     cached_randn((128,)) > 0,  # bool tensor
