@@ -180,14 +180,6 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Core division not supported if there are broadcasts
             return
 
-    dl = output.device_layout
-    stick_host_dim = dl.host_stick_dim()
-
-    # sparse tensor - can't split stick dimensions
-    if stick_host_dim is None:
-        # FIXME: should try split non-stick dimensions
-        return
-
     # Collect parallelizable sizes for all host dimensions
     # For stick dimension: this returns the number of sticks
     # For non-stick dimensions: this returns the dimension size
