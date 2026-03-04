@@ -171,7 +171,7 @@ def enable_spyre_decompositions(
             enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
 
-@register_spyre_decomposition([torch.ops.spyre.compact])
+@decomp.register_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 

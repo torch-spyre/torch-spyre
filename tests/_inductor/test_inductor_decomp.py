@@ -237,6 +237,84 @@ class <lambda>(torch.nn.Module):
         )
         assert inductor_graph_str == expected_graph_str, "Graphs are not identical"
 
+    @pytest.mark.filterwarnings(
+        "ignore::UserWarning"
+    )  # because of forced cache disabling
+    def test_custom_decomposition_kwarg(self):
+        """
+        Test that custom decompositions passed as kwargs are properly handled for Spyre.
+        This test creates a custom decomposition that decomposes add as multiplication,
+        and verifies it's applied during compilation alongside Spyre-specific decompositions.
+        """
+        import torch._inductor.config as config
+        from torch._dynamo.testing import normalize_gm
+
+        # Disable all Inductor caches
+        config.force_disable_caches = True
+
+        # Create a custom decomposition table that decomposes add as mul
+        custom_decomps = {}
+
+        @torch._decomp.register_decomposition(
+            [torch.ops.aten.add.Tensor], custom_decomps
+        )
+        def custom_add_decomp(x, y):
+            # Decompose add as multiplication (for testing purposes)
+            return torch.mul(x, y)
+
+        # Custom backend that accepts decompositions
+        class InductorAndRecordGraphsWithDecomps:
+            def __init__(self, decompositions=None):
+                self.graphs = []
+                self.inductor_graphs = []
+                self.decompositions = decompositions
+
+            def __call__(self, gm, example_inputs):
+                import torch._inductor.compile_fx as compile_fx_mod
+                from unittest.mock import patch
+
+                self.graphs.append(gm)
+
+                old_compile_fx_inner = compile_fx_mod._compile_fx_inner
+
+                def patched(*args, **kwargs):
+                    self.inductor_graphs.append(args[0])
+                    return old_compile_fx_inner(*args, **kwargs)
+
+                with patch.object(compile_fx_mod, "_compile_fx_inner", new=patched):
+                    return compile_fx_mod.compile_fx(
+                        gm, example_inputs, decompositions=self.decompositions
+                    )
+
+        def fn(x, y):
+            return torch.add(x, y)
+
+        # Test with custom decomposition on Spyre
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphsWithDecomps(decompositions=custom_decomps)
+        cmp = torch.compile(fn, backend=backend)
+
+        for device in ["cpu", "spyre"]:
+            x = torch.randn(10).to(device=device)
+            y = torch.randn(10).to(device=device)
+            out = cmp(x, y)
+
+            # Verify the graph uses mul instead of add
+            inductor_graph_str = normalize_gm(
+                backend.inductor_graphs[0].print_readable(print_output=False)
+            )
+            # The custom decomposition should have converted add to mul
+            assert "mul" in inductor_graph_str, (
+                "Custom decomposition not applied: expected 'mul' in graph"
+            )
+            assert "add" not in inductor_graph_str, (
+                "Custom decomposition not applied: 'add' still present in graph"
+            )
+
+            # Verify the result matches the custom decomposition (mul, not add)
+            expected = torch.mul(x, y)
+            torch.testing.assert_close(out.cpu(), expected.cpu())
+
 
 if __name__ == "__main__":
     unittest.main()
