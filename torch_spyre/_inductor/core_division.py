@@ -53,6 +53,9 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     the parallelizable unit is the number of sticks rather than the number of
     elements.
 
+    This function properly consults the dim_map to find which device dimension
+    corresponds to the requested host dimension, handling tiling and sparse tensors.
+
     Args:
         layout: The tensor's FixedTiledLayout
         host_dim_idx: The host dimension index (negative indices are supported)
@@ -65,10 +68,19 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
 
     assert host_dim_idx < len(layout.size)
 
-    if host_dim_idx != layout.device_layout.host_stick_dim():
-        return int(layout.size[host_dim_idx])
-    else:  # stick dim: parallelizable unit is number of sticks
-        return int(layout.size[host_dim_idx]) // layout.device_layout.elems_per_stick()
+    dl = layout.device_layout
+
+    # Use dim_map to find the device dimension that corresponds to this host dimension
+    # For tiled dimensions (appearing multiple times in dim_map), we use the first occurrence
+    # which corresponds to the outermost device dimension for that host dimension
+    try:
+        device_dim_idx = dl.dim_map.index(host_dim_idx)
+    except ValueError:
+        raise RuntimeError(
+            f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
+        )
+
+    return dl.device_size[device_dim_idx]
 
 
 def core_split(size: int, max_cores: int) -> int:
