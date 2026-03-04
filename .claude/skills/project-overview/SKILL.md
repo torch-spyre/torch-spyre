@@ -1,10 +1,6 @@
 ---
 name: project-overview
-description: >-
-  Overview of the torch-spyre repository, Spyre device architecture,
-  compilation pipeline, and codebase structure. Use when asking about
-  how torch-spyre works, the repo layout, Spyre hardware, the Inductor
-  backend, or getting oriented in the codebase.
+description: "Overview of the torch-spyre repository, Spyre device architecture, compilation pipeline, and codebase structure. Use when asking about how torch-spyre works, the repo layout, Spyre hardware, the Inductor backend, or getting oriented in the codebase."
 ---
 
 # torch-spyre Project Overview

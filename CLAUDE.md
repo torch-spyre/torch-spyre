@@ -74,3 +74,15 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
 - **write-rfc** — design proposal workflow
+
+### Writing SKILL.md Files
+
+When creating or editing `.claude/skills/*/SKILL.md` files:
+
+- **YAML frontmatter `description`:** Use a quoted single-line string, not
+  a multi-line `>-` block scalar. Pymarkdown does not understand YAML
+  frontmatter and will mangle indented continuation lines.
+  - Good: `description: "One line describing the skill."`
+  - Bad: `description: >-` followed by indented lines
+- **Python templates in skills:** Add `# noqa: F401` to imports that are
+  only used in commented-out example code, so ruff does not remove them.
