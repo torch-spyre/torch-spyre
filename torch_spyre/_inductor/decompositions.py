@@ -64,7 +64,7 @@ _dispatchkey_kernels_registered = False
 # of a torch.compile context. Set by
 # _register_spyre_dispatchkey_kernels_permanently() and set to
 # False when context manager enable_spyre_decompositions_via_dispatchkey is left.
-_spyre_eager_mode_enabled = False
+_spyre_eager_mode_enabled = True
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
