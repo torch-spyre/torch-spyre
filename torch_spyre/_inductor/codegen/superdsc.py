@@ -19,6 +19,8 @@ from torch_spyre._inductor.constants import (
     CLONE_OP,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+import logging
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (
     generate_slice,
@@ -28,8 +30,16 @@ from .data_ops import (
     generate_identity,
 )
 
+logger = get_inductor_logger("codegen.superdsc")
+
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"SDSC generation: op={op}, dimensions={dimensions}, "
+            f"is_reduction={reduction}, num_inputs={len(inputs)}, num_outputs={len(outputs)}"
+        )
+
     if op == MATMUL_REDUCTION_OP:
         return generate_matmul(
             pointers,

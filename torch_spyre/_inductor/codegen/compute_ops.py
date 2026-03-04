@@ -502,7 +502,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     data_format = inputs[0]["device_layout"].device_dtype
     ndim = len(dimensions)
 
-    # implement core division on stick dimension
     cores = 1
     dim_splits = [1] * ndim
 

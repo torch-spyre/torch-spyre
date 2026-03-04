@@ -34,6 +34,10 @@ from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps
+from .logging_utils import get_inductor_logger
+import logging
+
+logger = get_inductor_logger("core_division")
 
 
 aten = torch.ops.aten
@@ -49,6 +53,9 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     the parallelizable unit is the number of sticks rather than the number of
     elements.
 
+    This function properly consults the dim_map to find which device dimension
+    corresponds to the requested host dimension, handling tiling and sparse tensors.
+
     Args:
         layout: The tensor's FixedTiledLayout
         host_dim_idx: The host dimension index (negative indices are supported)
@@ -61,10 +68,19 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
 
     assert host_dim_idx < len(layout.size)
 
-    if host_dim_idx != layout.device_layout.host_stick_dim():
-        return int(layout.size[host_dim_idx])
-    else:  # stick dim: parallelizable unit is number of sticks
-        return int(layout.size[host_dim_idx]) // layout.device_layout.elems_per_stick()
+    dl = layout.device_layout
+
+    # Use dim_map to find the device dimension that corresponds to this host dimension
+    # For tiled dimensions (appearing multiple times in dim_map), we use the first occurrence
+    # which corresponds to the outermost device dimension for that host dimension
+    try:
+        device_dim_idx = dl.dim_map.index(host_dim_idx)
+    except ValueError:
+        raise RuntimeError(
+            f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
+        )
+
+    return dl.device_size[device_dim_idx]
 
 
 def core_split(size: int, max_cores: int) -> int:
@@ -148,8 +164,6 @@ def multi_dim_core_split(
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    # pw: Pointwise = n.node.data
-    # op = pw.get_origin_node().target
     output: FixedTiledLayout = n.node.get_layout()
     ndim = len(output.size)
     n.n_cores_used = 1
@@ -166,29 +180,27 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Core division not supported if there are broadcasts
             return
 
-    # Split along the stick dimension
-    # Find the stick count device dimension: the device dim where dim_map[i] ==
-    # host_stick_dim() and i is not the last device dim (the last device dim is
-    # always the intra-stick dimension). This is correct for all device layout
-    # shapes (2D, 3D, 4D) and avoids the zero-division issue when the unpadded
-    # element count is smaller than elems_per_stick.
-    dl = output.device_layout
-    stick_host_dim = dl.host_stick_dim()
+    # Collect parallelizable sizes for all host dimensions
+    # For stick dimension: this returns the number of sticks
+    # For non-stick dimensions: this returns the dimension size
+    sizes = [get_host_dim_size(output, i) for i in range(ndim)]
 
-    # sparse tensor - can't split stick dimensions
-    if stick_host_dim is None:
-        return
+    # Use sizes as priorities (larger dimensions get higher priority)
+    priorities = sizes.copy()
 
-    stick_count_dev_dim = next(
-        i for i, d in enumerate(dl.dim_map[:-1]) if d == stick_host_dim
-    )
-    num_sticks = dl.device_size[stick_count_dev_dim]
-    num_cores = core_split(num_sticks, max_cores)
-    if num_cores > 1:
-        n.n_cores_used = num_cores
-        n.op_dim_splits = [
-            (1 if i != stick_host_dim else num_cores) for i in range(ndim)
-        ]
+    # Use multi-dimensional core splitting
+    splits = multi_dim_core_split(sizes, max_cores, priorities)
+    n.n_cores_used = math.prod(splits)
+
+    if n.n_cores_used > 1:
+        n.op_dim_splits = splits
+
+        # Consolidated DEBUG log for pointwise work division
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
+                f"sizes={sizes}, priorities={priorities}, op_dim_splits={n.op_dim_splits}"
+            )
 
 
 def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
@@ -219,6 +231,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # K (index 1, "in") is never split
         n.op_dim_splits = [splits[0], 1, splits[1]]  # [M_split, K=1, N_split]
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"matmul work_division: M={M}, N={N}, cores={n.n_cores_used}, "
+                f"splits=[M={splits[0]}, K=1, N={splits[1]}], op_dim_splits={n.op_dim_splits}"
+            )
+
     if red.reduction_type == BATCH_MATMUL_OP:
         assert len(args) == 2, "bmm has exactly 2 input args"
 
@@ -245,6 +263,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Store op_dim_splits directly matching dim_labels = ["x", "mb", "in", "out"]
             # K (index 2, "in") is never split
             n.op_dim_splits = [splits[0], splits[1], 1, splits[2]]  # [B, M, K=1, N]
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"bmm_3d work_division: B={B}, M={M}, N={N}, cores={n.n_cores_used}, "
+                    f"splits=[B={splits[0]}, M={splits[1]}, K=1, N={splits[2]}], op_dim_splits={n.op_dim_splits}"
+                )
 
         elif num_dims == 4:
             # 4D BMM: [B1, B2, M, K] @ [B1, B2, K, N] --> [B1, B2, M, N]
@@ -274,6 +298,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                 splits[3],
             ]  # [B1, B2, M, K=1, N]
 
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"bmm_4d work_division: B1={B1}, B2={B2}, M={M}, N={N}, cores={n.n_cores_used}, "
+                    f"splits=[B1={splits[0]}, B2={splits[1]}, M={splits[2]}, K=1, N={splits[3]}], op_dim_splits={n.op_dim_splits}"
+                )
+
         else:
             raise RuntimeError(f"Unsupported BMM dimension count: {num_dims}")
 
@@ -281,7 +311,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 def core_division_planning(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    # Nodes are in topological order (guarenteed by caller).
+    # Nodes are in topological order (guaranteed by caller).
     max_cores = int(os.getenv("SENCORES", "32"))
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
@@ -308,10 +338,10 @@ def core_division_planning(
                 # Core division not supported on fallback kernels
                 pass
             else:
-                print(f"Warning: unhandled node type {type(n.node)}")
+                logger.warning(f"unhandled node type {type(n.node)}")
         elif isinstance(n, NopKernelSchedulerNode):
             pass
         else:
-            print(f"Warning: unhandled scheduler node type {type(n)}")
+            logger.warning(f"unhandled scheduler node type {type(n)}")
 
     return nodes
