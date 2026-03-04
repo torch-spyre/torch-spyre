@@ -152,8 +152,6 @@ def multi_dim_core_split(
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    # pw: Pointwise = n.node.data
-    # op = pw.get_origin_node().target
     output: FixedTiledLayout = n.node.get_layout()
     ndim = len(output.size)
     n.n_cores_used = 1
@@ -170,35 +168,34 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Core division not supported if there are broadcasts
             return
 
-    # Split along the stick dimension
-    # Find the stick count device dimension: the device dim where dim_map[i] ==
-    # host_stick_dim() and i is not the last device dim (the last device dim is
-    # always the intra-stick dimension). This is correct for all device layout
-    # shapes (2D, 3D, 4D) and avoids the zero-division issue when the unpadded
-    # element count is smaller than elems_per_stick.
     dl = output.device_layout
     stick_host_dim = dl.host_stick_dim()
 
     # sparse tensor - can't split stick dimensions
     if stick_host_dim is None:
+        # FIXME: should try split non-stick dimensions
         return
 
-    stick_count_dev_dim = next(
-        i for i, d in enumerate(dl.dim_map[:-1]) if d == stick_host_dim
-    )
-    num_sticks = dl.device_size[stick_count_dev_dim]
-    num_cores = core_split(num_sticks, max_cores)
-    if num_cores > 1:
-        n.n_cores_used = num_cores
-        n.op_dim_splits = [
-            (1 if i != stick_host_dim else num_cores) for i in range(ndim)
-        ]
+    # Collect parallelizable sizes for all host dimensions
+    # For stick dimension: this returns the number of sticks
+    # For non-stick dimensions: this returns the dimension size
+    sizes = [get_host_dim_size(output, i) for i in range(ndim)]
+
+    # Use sizes as priorities (larger dimensions get higher priority)
+    priorities = sizes.copy()
+
+    # Use multi-dimensional core splitting
+    splits = multi_dim_core_split(sizes, max_cores, priorities)
+    n.n_cores_used = math.prod(splits)
+
+    if n.n_cores_used > 1:
+        n.op_dim_splits = splits
 
         # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise work_division {n.node.get_name()}: cores={num_cores}, "
-                f"stick_dim={stick_host_dim}, num_sticks={num_sticks}, op_dim_splits={n.op_dim_splits}"
+                f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
+                f"sizes={sizes}, priorities={priorities}, op_dim_splits={n.op_dim_splits}"
             )
 
 
