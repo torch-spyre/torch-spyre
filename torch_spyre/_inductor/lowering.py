@@ -29,6 +29,10 @@ from .ir import SpyreReduction
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 import threading
+from .logging_utils import get_inductor_logger
+import logging
+
+logger = get_inductor_logger("lowering")
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
 _lowerings_lock = threading.RLock()
@@ -252,6 +256,14 @@ def lower_mm(x, y):
         )
 
     result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"mm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}, "
+            f"x_layout={x.get_layout()}, y_layout={y.get_layout()}, out_layout={result_buf.get_layout()}"
+        )
+
     return result
 
 
@@ -261,6 +273,7 @@ def lower_bmm(x, y):
     y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()
     y_loader = y.make_loader()
+
     if len(x.get_size()) == 3 and len(y.get_size()) == 3:
 
         def inner_fn(index, reduction_index):
@@ -326,6 +339,13 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
     result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"bmm: x{[int(s) for s in x.get_size()]} @ y{[int(s) for s in y.get_size()]} -> {[int(s) for s in result_buf.get_size()]}"
+        )
+
     return result
 
 

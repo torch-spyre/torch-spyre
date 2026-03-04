@@ -44,6 +44,10 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import map_dims_to_vars, wildcard_symbol
 from .stickify import is_sparse
+from .logging_utils import get_inductor_logger
+import logging
+
+logger = get_inductor_logger("spyre_kernel")
 
 
 class RValue(ABC):
@@ -379,6 +383,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"kernel_load: {name}, shape={[int(s) for s in layout.size]}, "
+                f"device_size={list(layout.device_layout.device_size)}"
+            )
+
         return TensorAccess(name, index, layout).unsqueeze_if_sparse()
 
     def store(
@@ -405,6 +416,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
+
+        if logger.isEnabledFor(logging.DEBUG):
+            value_type = type(value).__name__
+            logger.debug(
+                f"kernel_store: {name} (type: {value_type}), shape={[int(s) for s in layout.size]}, "
+                f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
+            )
 
         if isinstance(value, UnimplementedOp):
             self.kernel_specs.append(value)
@@ -547,6 +565,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"kernel_store_reduction: {name} (op: {value.op}), shape={[int(s) for s in layout.size]}, "
+                f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
+            )
 
         actuals = self.args.python_argdefs()[1]
         if value.op == MATMUL_REDUCTION_OP:
@@ -725,6 +749,16 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if len(self.kernel_specs) != 1:
             raise Unsupported(f"found {len(self.kernel_specs)} KernelSpecs")
         ks = self.kernel_specs[0]
+
+        if logger.isEnabledFor(logging.DEBUG):
+            if isinstance(ks, UnimplementedOp):
+                logger.debug(f"kernel_spec: UnimplementedOp({ks.op})")
+            else:
+                logger.debug(
+                    f"kernel_spec: {ks.op}, is_reduction={ks.is_reduction}, "
+                    f"dimensions={ks.dimensions}, scales={ks.scales}, op_info={ks.op_info}"
+                )
+
         if isinstance(ks, UnimplementedOp):
             buf.writeline(f"UnimplementedOp(op='{ks.op}')")
         else:

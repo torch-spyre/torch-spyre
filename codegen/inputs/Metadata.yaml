@@ -68,6 +68,8 @@
   template_name: base
 - operator_name: maximum
   template_name: base
+- operator_name: mean
+  template_name: base
 - operator_name: mul
   template_name: base
 - operator_name: neg

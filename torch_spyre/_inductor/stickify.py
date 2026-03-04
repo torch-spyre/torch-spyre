@@ -15,6 +15,7 @@
 import logging
 
 import torch
+from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
     FallbackKernel,
@@ -45,7 +46,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps, map_dims_to_vars, is_wildcard
 
-logger = logging.getLogger(__name__)
+logger = get_inductor_logger("stickify")
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -131,6 +132,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     output: FixedLayout = n.node.get_layout()
     origin_node = next(iter(pw.origins))
     op = origin_node.target
+
     if len(args) == 1:
         x = args[0]
         x_stl = x.layout.device_layout
@@ -240,9 +242,20 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 
         dim_order = derive_dim_order(chosen.layout.device_layout, len(output.size))
         stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
-        return FixedTiledLayout(
+        result = FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            input_info = ", ".join(
+                [f"in{i}:{list(arg.layout.size)}" for i, arg in enumerate(args)]
+            )
+            logger.debug(
+                f"{op.__name__} layout: {input_info} -> out:{list(result.size)}, "
+                f"device_size={list(result.device_layout.device_size)}"
+            )
+
+        return result
 
 
 def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
@@ -308,9 +321,17 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         if stick_dim_var not in output_dims.values():
             out_dim_order = out_dim_order + [-1]
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
-        return FixedTiledLayout(
+        result = FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"{red.reduction_type} layout: in:{list(args[0].layout.size)} -> out:{list(result.size)}, "
+                f"device_size={list(result.device_layout.device_size)}"
+            )
+
+        return result
 
 
 def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
@@ -336,6 +357,7 @@ def propagate_spyre_tensor_layouts(
                     raise Unsupported(
                         f"missing device_tensor_layout on graph input {name}"
                     )
+
                 tb = V.graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
