@@ -14,7 +14,7 @@ repos:
     rev: v0.9.31
     hooks:
       - id: pymarkdown
-        exclude: .*\.inc\.md
+        exclude: .*\.inc\.md|\.claude/skills/.*
         args: [fix]
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7

@@ -169,6 +169,21 @@ class ParameterizedTestMeta(type):
 
 
 # Helper functions for compare operations
+def _to_cpu(result, device):
+    """Move a result (tensor, tuple/list of tensors, or scalar) to CPU, with device validation."""
+    if isinstance(result, torch.Tensor):
+        assert result.device.type == device.type, (
+            f"Output not on expected device. Expected {device}, got {result.device}"
+        )
+        return result.cpu()
+    elif isinstance(result, (tuple, list)):
+        cpu_items = [_to_cpu(r, device) for r in result]
+        return type(result)(cpu_items)
+    else:
+        # Scalars (e.g. Python int from torch.numel()) are returned as-is
+        return result
+
+
 def _compile_and_run(fn, args, device, backend=None, needs_device=False):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
@@ -181,25 +196,28 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False):
     else:
         result = torch.compile(fn)(*device_args, **device_kwargs)
 
-    if not isinstance(result, int):
-        assert result.device.type == device.type, (
-            f"Output not on expected device. Expected {device}, got {result.device}"
-        )
-        result = result.cpu()
-
-    return result
+    return _to_cpu(result, device)
 
 
 def _assert_results_close(actual, expected, atol, rtol, comparison_name):
     """Assert two results are close with formatted error message."""
-    torch.testing.assert_close(
-        actual,
-        expected,
-        equal_nan=True,
-        atol=atol,
-        rtol=rtol,
-        msg=lambda msg: f"{comparison_name} mismatch\n\n{msg}\n",
-    )
+    if isinstance(actual, (tuple, list)):
+        assert isinstance(actual, type(expected)) and len(actual) == len(expected), (
+            f"{comparison_name} mismatch: result types or lengths differ "
+            f"(actual: {type(actual).__name__}[{len(actual)}], "
+            f"expected: {type(expected).__name__}[{len(expected)}])"
+        )
+        for i, (a, e) in enumerate(zip(actual, expected)):
+            _assert_results_close(a, e, atol, rtol, f"{comparison_name}[{i}]")
+    else:
+        torch.testing.assert_close(
+            actual,
+            expected,
+            equal_nan=True,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"{comparison_name} mismatch\n\n{msg}\n",
+        )
 
 
 # Compare functions

@@ -32,7 +32,7 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
-from .runtime import ConstantArg, KernelSpec, TensorArg
+from .runtime import ConstantArg, OpSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -323,27 +323,45 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
+def analyze_tensor_access(
+    op_dimensions: Sequence[DimensionInfo],
+    access: TensorAccess,
+) -> list[int]:
+    """
+    Return the scale implied by the given iteration space and indexing expression
+    """
+    dim_map = map_dims_to_vars(access.layout, access.index)
+    var_map = {v: k for k, v in dim_map.items()}
+
+    # Special case: single dimension of size 1 is not elided by inductor
+    if len(op_dimensions) == 1 and op_dimensions[0].numel == 1:
+        return [access.layout.device_layout.dim_map[0]]
+
+    return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
+
+
 def create_tensor_arg(
-    is_input: bool, arg_index: int, layout: FixedTiledLayout
+    is_input: bool, arg_index: int, tensor: TensorAccess, di: list[DimensionInfo]
 ) -> TensorArg:
+    scales = analyze_tensor_access(di, tensor)
     return TensorArg(
         is_input,
         arg_index,
-        layout.dtype,
-        layout.size,
-        layout.allocation,
-        layout.device_layout,
+        tensor.layout.dtype,
+        tensor.layout.size,
+        scales,
+        tensor.layout.allocation,
+        tensor.layout.device_layout,
     )
 
 
-def create_kernel_spec(
+def create_op_spec(
     op: str,
     is_reduction: bool,
     dims: list[DimensionInfo],
     args: Sequence[TensorArg | ConstantArg],
-    scales: list[list[int]],
     op_info: dict[str, Any],
-) -> KernelSpec:
+) -> OpSpec:
     for arg in args:
         if arg.dtype == torch.float32 and op not in SPYRE_FP32_OPS:
             raise Unsupported(f"{op} on {arg.dtype} dtype")
@@ -354,7 +372,7 @@ def create_kernel_spec(
             torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
-    return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
+    return OpSpec(op, is_reduction, [d.numel for d in dims], args, op_info)
 
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
@@ -366,7 +384,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         **kwargs,
     ) -> None:
         super().__init__(tiling, **kwargs)
-        self.kernel_specs: list[KernelSpec | UnimplementedOp] = []
+        self.op_specs: list[OpSpec | UnimplementedOp] = []
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -425,56 +443,34 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             )
 
         if isinstance(value, UnimplementedOp):
-            self.kernel_specs.append(value)
+            self.op_specs.append(value)
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.derive_dim_info(dst)
             args: list[TensorArg | ConstantArg] = []
-            scales = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
-                    scale = self.analyze_tensor_access(di, input)
                     args.append(
-                        create_tensor_arg(
-                            True,
-                            actuals.index(input.name),
-                            input.layout,
-                        )
+                        create_tensor_arg(True, actuals.index(input.name), input, di)
                     )
-                    scales.append(scale)
                 elif isinstance(input, Constant):
                     args.append(ConstantArg(input.value, input.dtype))
-                    scales.append([-1] * len(di))
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
-            scale = self.analyze_tensor_access(di, dst)
-            args.append(
-                create_tensor_arg(
-                    False,
-                    actuals.index(real_dst_name),
-                    dst.layout,
-                )
-            )
-            scales.append(scale)
+            args.append(create_tensor_arg(False, actuals.index(real_dst_name), dst, di))
             op_info.update(value.op_info)
-            self.kernel_specs.append(
-                create_kernel_spec(value.op, False, di, args, scales, op_info)
-            )
+            self.op_specs.append(create_op_spec(value.op, False, di, args, op_info))
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
             in_di = self.derive_dim_info(value)
             out_di = self.derive_dim_info(dst)
             args = [
-                create_tensor_arg(True, actuals.index(value.name), value.layout),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
-            ]
-            scales = [
-                self.analyze_tensor_access(in_di, value),
-                self.analyze_tensor_access(out_di, dst),
+                create_tensor_arg(True, actuals.index(value.name), value, in_di),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst, out_di),
             ]
             generic_relayout = False
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
-                # Determine data op based on tensor arg and scales
+                # Determine data op based on tensor args
                 if (
                     Counter(args[0].host_size) == Counter(args[1].host_size)
                     and args[0].host_size != args[1].host_size
@@ -515,26 +511,26 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 # Unsupported data operation on ConstantArg
                 raise Unsupported(f"Data operation on {type(args[0])}")
 
-            ks = create_kernel_spec(op, False, in_di, args, scales, op_info)
+            op_spec = create_op_spec(op, False, in_di, args, op_info)
             if in_di != out_di:
-                ks.op_info["transposed_dims"] = [
+                op_spec.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
                 # Reorder scale of the output  to implement transpositions
                 (
-                    ks.scales[-1][ks.op_info["transposed_dims"][0]],
-                    ks.scales[-1][ks.op_info["transposed_dims"][1]],
+                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
                 ) = (
-                    ks.scales[-1][ks.op_info["transposed_dims"][1]],
-                    ks.scales[-1][ks.op_info["transposed_dims"][0]],
+                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
                 )
 
             # TODO(aviros): Remove this piece of code when real relayout is implemented
             if generic_relayout:
-                ks.dimensions.reverse()
-                ks.op_info["transposed_dims"] = [0, 1]
+                op_spec.iteration_space.reverse()
+                op_spec.op_info["transposed_dims"] = [0, 1]
 
-            self.kernel_specs.append(ks)
+            self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
 
@@ -555,7 +551,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             V.graph.removed_buffers.add(name)
 
         if isinstance(value, UnimplementedOp):
-            self.kernel_specs.append(value)
+            self.op_specs.append(value)
             return
 
         op_info = {}
@@ -588,29 +584,22 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 di = [di_x[0], di_x[1], di_y[1]]
             elif len(di_x) == 1 and len(di_y) == 2:
                 di = [di_x[0], DimensionInfo(wildcard_symbol(1), 1), di_y[1]]
-                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # TODO:  The OpSpec we generate is correct, but the SDSC we generate
                 # will not compute the correct result.  Raise Unsupported to make this explicit.
                 raise Unsupported(f"matmul requires padding support: {value.arguments}")
             elif len(di_x) == 2 and len(di_y) == 1:
                 di = [di_x[0], di_x[1], DimensionInfo(wildcard_symbol(1), 1)]
-                # TODO:  The KernelSpec we generate is correct, but the SDSC we generate
+                # TODO:  The OpSpec we generate is correct, but the SDSC we generate
                 # will not compute the correct result.  Raise Unsupported to make this explicit.
                 raise Unsupported(f"matmul requires padding support: {value.arguments}")
             else:
                 raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
-                create_tensor_arg(True, actuals.index(x.name), x.layout),
-                create_tensor_arg(True, actuals.index(y.name), y.layout),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
+                create_tensor_arg(True, actuals.index(x.name), x, di),
+                create_tensor_arg(True, actuals.index(y.name), y, di),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst, di),
             ]
-            scales = [
-                self.analyze_tensor_access(di, x),
-                self.analyze_tensor_access(di, y),
-                self.analyze_tensor_access(di, dst),
-            ]
-            self.kernel_specs.append(
-                create_kernel_spec(value.op, True, di, args, scales, op_info)
-            )
+            self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
         elif value.op == BATCH_MATMUL_OP:
             if (
                 len(value.arguments) != 2
@@ -680,18 +669,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             else:
                 raise Unsupported(f"malformed bmm {di_x} {di_y}")
             args = [
-                create_tensor_arg(True, actuals.index(x.name), x.layout),
-                create_tensor_arg(True, actuals.index(y.name), y.layout),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
+                create_tensor_arg(True, actuals.index(x.name), x, di),
+                create_tensor_arg(True, actuals.index(y.name), y, di),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst, di),
             ]
-            scales = [
-                self.analyze_tensor_access(di, x),
-                self.analyze_tensor_access(di, y),
-                self.analyze_tensor_access(di, dst),
-            ]
-            self.kernel_specs.append(
-                create_kernel_spec(value.op, True, di, args, scales, op_info)
-            )
+            self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
         else:
             # All other reductions have exactly one input which is a tensor
             if (not len(value.arguments) == 1) or (
@@ -701,33 +683,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             x = value.arguments[0]
             di = self.derive_dim_info(x)
             args = [
-                create_tensor_arg(True, actuals.index(x.name), x.layout),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
+                create_tensor_arg(True, actuals.index(x.name), x, di),
+                create_tensor_arg(False, actuals.index(real_dst_name), dst, di),
             ]
-            scales = [
-                self.analyze_tensor_access(di, x),
-                self.analyze_tensor_access(di, dst),
-            ]
-            self.kernel_specs.append(
-                create_kernel_spec(value.op, True, di, args, scales, op_info)
-            )
-
-    def analyze_tensor_access(
-        self,
-        op_dimensions: Sequence[DimensionInfo],
-        access: TensorAccess,
-    ) -> list[int]:
-        """
-        Return the scale implied by the given iteration space and indexing expression
-        """
-        dim_map = map_dims_to_vars(access.layout, access.index)
-        var_map = {v: k for k, v in dim_map.items()}
-
-        # Special case: single dimension of size 1 is not elided by inductor
-        if len(op_dimensions) == 1 and op_dimensions[0].numel == 1:
-            return [access.layout.device_layout.dim_map[0]]
-
-        return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
+            self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
 
     def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
         """
@@ -744,38 +703,36 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             return [DimensionInfo(wildcard_symbol(0), 1)]
 
     def codegen_kernel(self):
-        """Codegen the body of this kernel by pretty printing its KernelSpec"""
+        """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
         buf = IndentedBuffer()
-        if len(self.kernel_specs) != 1:
-            raise Unsupported(f"found {len(self.kernel_specs)} KernelSpecs")
-        ks = self.kernel_specs[0]
+        buf.writeline("[")
+        with buf.indent():
+            for op_spec in self.op_specs:
+                if logger.isEnabledFor(logging.DEBUG):
+                    if isinstance(op_spec, UnimplementedOp):
+                        logger.debug(f"op_spec: UnimplementedOp({op_spec.op})")
+                    else:
+                        logger.debug(
+                            f"op_spec: {op_spec.op}, is_reduction={op_spec.is_reduction}, "
+                            f"iteration_space={op_spec.iteration_space}, op_info={op_spec.op_info}"
+                        )
 
-        if logger.isEnabledFor(logging.DEBUG):
-            if isinstance(ks, UnimplementedOp):
-                logger.debug(f"kernel_spec: UnimplementedOp({ks.op})")
-            else:
-                logger.debug(
-                    f"kernel_spec: {ks.op}, is_reduction={ks.is_reduction}, "
-                    f"dimensions={ks.dimensions}, scales={ks.scales}, op_info={ks.op_info}"
-                )
-
-        if isinstance(ks, UnimplementedOp):
-            buf.writeline(f"UnimplementedOp(op='{ks.op}')")
-        else:
-            buf.writeline("KernelSpec(")
-            with buf.indent():
-                buf.writeline(f"op='{ks.op}',")
-                buf.writeline(f"is_reduction={ks.is_reduction},")
-                buf.writeline(f"dimensions={ks.dimensions!r},")
-                buf.writeline(f"scales={ks.scales!r},")
-                buf.writeline(f"op_info={ks.op_info!r},")
-                buf.writeline("args=[")
-                with buf.indent():
-                    for arg in ks.args:
-                        buf.writeline(f"{arg!r},")
-                buf.writeline("]")
-            buf.writeline(")")
-
+                if isinstance(op_spec, UnimplementedOp):
+                    buf.writeline(f"UnimplementedOp(op='{op_spec.op}')")
+                else:
+                    buf.writeline("OpSpec(")
+                    with buf.indent():
+                        buf.writeline(f"op='{op_spec.op}',")
+                        buf.writeline(f"is_reduction={op_spec.is_reduction},")
+                        buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
+                        buf.writeline(f"op_info={op_spec.op_info!r},")
+                        buf.writeline("args=[")
+                        with buf.indent():
+                            for arg in op_spec.args:
+                                buf.writeline(f"{arg!r},")
+                        buf.writeline("]")
+                    buf.writeline("),")
+        buf.writeline("]")
         return buf.getvalue()
 
     def call_kernel(self, name: str, node=None):
