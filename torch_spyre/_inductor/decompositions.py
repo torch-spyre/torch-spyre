@@ -362,3 +362,46 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     else:
         zero = torch.zeros_like(input)
     return torch.eq(input, zero)
+
+
+@register_spyre_decomposition(
+    [torch.ops.aten._native_batch_norm_legit_no_training.default]
+)
+def batch_norm_decomp(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    momentum: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Based on upstream PyTorch decomposition:
+    # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/_decomp/decompositions.py#L1932-L1969
+
+    # TODO: Upstream uses float32 internally. Add float16/float32 type conversion
+    # once implemented. See #937
+
+    # TODO: Replace full_like CPU-fallback with scalar constant once constant
+    # arguments are supported. See #238
+    e = torch.full_like(running_var, eps)
+
+    invstd = running_var.add(e).sqrt().reciprocal()
+
+    # TODO: Using transpose instead of unsqueeze because unsqueeze requires
+    # restickify. See #738
+    input = input.transpose(1, -1).contiguous()
+
+    output = (input - running_mean) * invstd
+
+    if weight is not None:
+        weight = weight.flatten()
+        output = output * weight
+
+    if bias is not None:
+        bias = bias.flatten()
+        output = output + bias
+
+    output = output.transpose(1, -1).contiguous()
+
+    return (output, running_mean, invstd)

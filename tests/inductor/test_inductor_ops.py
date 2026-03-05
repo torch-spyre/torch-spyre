@@ -880,6 +880,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        ("test_batchnorm", "test_batchnorm_cpu"): {
+            # TODO: Using eps=1e-4 instead of default 1e-5 because our batch_norm
+            # implementation operates internally in float16 (unlike the original which uses
+            # float32). Once float16/float32 type conversion is implemented, this can be
+            # decreased. See #937
+            "param_sets": {
+                "2d": (
+                    cached_randn((2, 2048), dtype=torch.float16),  # input
+                    cached_randn(2048, scale=1.00, dtype=torch.float16),  # mean
+                    cached_randn(2048, abs=True, dtype=torch.float16),  # var
+                    cached_randn(2048, scale=0.99, dtype=torch.float16),  # weight
+                    cached_randn(2048, scale=1.01, dtype=torch.float16),  # bias
+                    1e-4,  # eps
+                ),
+                "3d": (
+                    cached_randn((2, 2048, 896), dtype=torch.float16),  # input
+                    cached_randn(2048, scale=1.00, dtype=torch.float16),  # mean
+                    cached_randn(2048, abs=True, dtype=torch.float16),  # var
+                    cached_randn(2048, scale=0.99, dtype=torch.float16),  # weight
+                    cached_randn(2048, scale=1.01, dtype=torch.float16),  # bias
+                    1e-4,  # eps
+                ),
+                "4d": (
+                    cached_randn((2, 2048, 64, 64), dtype=torch.float16),  # input
+                    cached_randn(2048, scale=1.00, dtype=torch.float16),  # mean
+                    cached_randn(2048, abs=True, dtype=torch.float16),  # var
+                    cached_randn(2048, scale=0.99, dtype=torch.float16),  # weight
+                    cached_randn(2048, scale=1.01, dtype=torch.float16),  # bias
+                    1e-4,  # eps
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1086,6 +1118,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
 
         compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_batchnorm_cpu(self, input, mean, var, weight, bias, eps):
+        def fn(input, mean, var, weight, bias):
+            return torch.nn.functional.batch_norm(
+                input, mean, var, weight, bias, eps=eps
+            )
+
+        compare_with_cpu(fn, input, mean, var, weight, bias)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
