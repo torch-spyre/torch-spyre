@@ -53,6 +53,9 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     the parallelizable unit is the number of sticks rather than the number of
     elements.
 
+    This function properly consults the dim_map to find which device dimension
+    corresponds to the requested host dimension, handling tiling and sparse tensors.
+
     Args:
         layout: The tensor's FixedTiledLayout
         host_dim_idx: The host dimension index (negative indices are supported)
@@ -65,10 +68,19 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
 
     assert host_dim_idx < len(layout.size)
 
-    if host_dim_idx != layout.device_layout.host_stick_dim():
-        return int(layout.size[host_dim_idx])
-    else:  # stick dim: parallelizable unit is number of sticks
-        return int(layout.size[host_dim_idx]) // layout.device_layout.elems_per_stick()
+    dl = layout.device_layout
+
+    # Use dim_map to find the device dimension that corresponds to this host dimension
+    # For tiled dimensions (appearing multiple times in dim_map), we use the first occurrence
+    # which corresponds to the outermost device dimension for that host dimension
+    try:
+        device_dim_idx = dl.dim_map.index(host_dim_idx)
+    except ValueError:
+        raise RuntimeError(
+            f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
+        )
+
+    return dl.device_size[device_dim_idx]
 
 
 def core_split(size: int, max_cores: int) -> int:
@@ -152,8 +164,6 @@ def multi_dim_core_split(
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    # pw: Pointwise = n.node.data
-    # op = pw.get_origin_node().target
     output: FixedTiledLayout = n.node.get_layout()
     ndim = len(output.size)
     n.n_cores_used = 1
@@ -170,35 +180,26 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Core division not supported if there are broadcasts
             return
 
-    # Split along the stick dimension
-    # Find the stick count device dimension: the device dim where dim_map[i] ==
-    # host_stick_dim() and i is not the last device dim (the last device dim is
-    # always the intra-stick dimension). This is correct for all device layout
-    # shapes (2D, 3D, 4D) and avoids the zero-division issue when the unpadded
-    # element count is smaller than elems_per_stick.
-    dl = output.device_layout
-    stick_host_dim = dl.host_stick_dim()
+    # Collect parallelizable sizes for all host dimensions
+    # For stick dimension: this returns the number of sticks
+    # For non-stick dimensions: this returns the dimension size
+    sizes = [get_host_dim_size(output, i) for i in range(ndim)]
 
-    # sparse tensor - can't split stick dimensions
-    if stick_host_dim is None:
-        return
+    # Use sizes as priorities (larger dimensions get higher priority)
+    priorities = sizes.copy()
 
-    stick_count_dev_dim = next(
-        i for i, d in enumerate(dl.dim_map[:-1]) if d == stick_host_dim
-    )
-    num_sticks = dl.device_size[stick_count_dev_dim]
-    num_cores = core_split(num_sticks, max_cores)
-    if num_cores > 1:
-        n.n_cores_used = num_cores
-        n.op_dim_splits = [
-            (1 if i != stick_host_dim else num_cores) for i in range(ndim)
-        ]
+    # Use multi-dimensional core splitting
+    splits = multi_dim_core_split(sizes, max_cores, priorities)
+    n.n_cores_used = math.prod(splits)
+
+    if n.n_cores_used > 1:
+        n.op_dim_splits = splits
 
         # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise work_division {n.node.get_name()}: cores={num_cores}, "
-                f"stick_dim={stick_host_dim}, num_sticks={num_sticks}, op_dim_splits={n.op_dim_splits}"
+                f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
+                f"sizes={sizes}, priorities={priorities}, op_dim_splits={n.op_dim_splits}"
             )
 
 
