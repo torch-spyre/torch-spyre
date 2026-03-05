@@ -524,3 +524,12 @@ def spyre_linear(
 # called directly; outside (eager mode) the pre-compiled wrapper is used.
 # Note: This has to stay at the end of the file.
 _register_spyre_dispatchkey_kernels_permanently()
+
+
+@register_spyre_decomposition([torch.ops.aten.is_nonzero.default])
+def is_nonzero_decomp(input: torch.Tensor):
+    if input.numel() != 1:
+        raise RuntimeError(
+            "RuntimeError: Boolean value of Tensor with no values is ambiguous"
+        )
+    return torch.ne(input, 0).item()
