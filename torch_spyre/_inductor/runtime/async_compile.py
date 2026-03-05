@@ -29,9 +29,9 @@ from .kernel_runner import (
 )
 
 #_argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
+#_argument_names = [f'arg{i}' for i in range(N)]
 N=7
-_argument_names = [f'arg{i}' for i in range(N)]
-
+_argument_names = [i for i in range(-1, -N, -1)]
 
 def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")

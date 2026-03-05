@@ -663,7 +663,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     # },
                                         "data_": {
                                         f"[{c}, 0, 0]": str(
-                                            Symbol(tensor["name"])
+                                            Symbol(str(tensor["name"]))
                                             + c
                                             # calculate the prod of dim sizes
                                             # less significant than chosen split dim i.e. the stick
@@ -673,7 +673,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                             * num_bytes(
                                                 tensor["device_layout"].device_dtype
                                             )
+                                            // cores
                                         )
+                                        if tensor["lx_addr"] is None
+                                        else tensor["lx_addr"]
                                         for c in range(cores)
                                     },
                                 },
