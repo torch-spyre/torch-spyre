@@ -218,3 +218,13 @@ def _(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(size, dtype=dtype, device="spyre")
+
+
+@torch.library.custom_op("spyre::logical_not", mutates_args=(), device_types="spyre")
+def logical_not(input: torch.Tensor) -> torch.Tensor:
+    pass
+
+
+@logical_not.register_fake
+def _(input: torch.Tensor):
+    return input.new_empty(input.size())

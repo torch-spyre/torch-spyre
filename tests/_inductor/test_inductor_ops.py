@@ -646,6 +646,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_logical_not",
+            "test_fallback_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "logical_not": torch.logical_not,
+            },
+            "param_sets": {
+                "1d_fp16": (cached_randn(128, dtype=torch.float16),),
+                "1d_bool": (cached_randn(128, dtype=torch.float16) > 0,),
+                "2d_fp16": (cached_randn((4, 128), dtype=torch.float16),),
+                "2d_bool": (cached_randn((4, 128), dtype=torch.float16) > 0,),
+                "3d_fp16": (cached_randn((2, 4, 128), dtype=torch.float16),),
+                "3d_bool": (cached_randn((2, 4, 128), dtype=torch.float16) > 0,),
+                "4d_fp16": (cached_randn((1, 2, 4, 128), dtype=torch.float16),),
+                "4d_bool": (cached_randn((1, 2, 4, 128), dtype=torch.float16) > 0,),
+                "fp16_single_elem": (cached_randn(1, dtype=torch.float16),),
+                "bool_single_elem": (cached_randn(1, dtype=torch.float16) > 0,),
+                # TODO: Fix torch.eq(-0.0,0.0) equality bug (Issue 628)
+                # "fp16_signed_0": (torch.tensor([0.0, -0.0, 1.0, -1.0], dtype=torch.float16),),
+            },
+        },
+        (
             "test_inplace_op",
             "test_inplace_op_cpu",
         ): {
@@ -868,6 +890,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(result, torch.eq(x, y))
 
     def test_unary_op_cpu(self, op, x):
+        compare_with_cpu(op, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_fallback_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
 
     def test_binary_op(self, op, a, b):
