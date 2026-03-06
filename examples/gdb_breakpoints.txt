@@ -1,0 +1,189 @@
+# GDB Breakpoint Configuration for torch-spyre Educational Walkthrough
+#
+# Usage:
+#   1. Compile torch-spyre with debug symbols:
+#      CFLAGS="-g -O0" CXXFLAGS="-g -O0" pip install -e .
+#
+#   2. Start GDB:
+#      gdb --args python examples/mul_debug.py
+#
+#   3. Load this file:
+#      (gdb) source examples/gdb_breakpoints.txt
+#
+#   4. Run:
+#      (gdb) run
+
+# ============================================================================
+# MEMORY ALLOCATION BREAKPOINTS
+# ============================================================================
+
+# Break when allocating device memory
+break spyre::SpyreAllocator::allocate
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: SpyreAllocator::allocate\n"
+  printf "========================================\n"
+  printf "Allocating %zu bytes on Spyre device\n", nbytes
+  printf "Current device: %d\n", curr_device.index()
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# Break when computing tensor layout
+break spyre::SpyreTensorLayout::init
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: SpyreTensorLayout::init\n"
+  printf "========================================\n"
+  printf "Computing device layout for tensor\n"
+  printf "Host rank: %zu\n", host_size.size()
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# ============================================================================
+# DATA TRANSFER BREAKPOINTS
+# ============================================================================
+
+# Break when copying host to device
+break spyre::copy_host_to_device
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: copy_host_to_device\n"
+  printf "========================================\n"
+  printf "Transferring tensor from CPU to Spyre\n"
+  printf "Source tensor shape: "
+  call self.sizes()
+  printf "\nDestination tensor shape: "
+  call dst.sizes()
+  printf "\n\nThis will:\n"
+  printf "  1. Create DMA graph\n"
+  printf "  2. Apply layout transformation\n"
+  printf "  3. Execute DMA transfer\n"
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# Break when copying device to host
+break spyre::copy_device_to_host
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: copy_device_to_host\n"
+  printf "========================================\n"
+  printf "Transferring result from Spyre to CPU\n"
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# ============================================================================
+# RUNTIME INITIALIZATION BREAKPOINTS
+# ============================================================================
+
+# Break when starting runtime
+break spyre::_startRuntime
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: _startRuntime\n"
+  printf "========================================\n"
+  printf "Initializing Spyre runtime\n"
+  printf "This happens once per process\n"
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# ============================================================================
+# KERNEL EXECUTION BREAKPOINTS
+# ============================================================================
+
+# Break when launching kernel
+break spyre::launchKernel
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: launchKernel\n"
+  printf "========================================\n"
+  printf "Launching compiled kernel on Spyre\n"
+  printf "Kernel binary: %s\n", g2_path.c_str()
+  printf "Number of arguments: %zu\n", args.size()
+  printf "\nExecution steps:\n"
+  printf "  1. Load compiled binary (g2.graph.cbor)\n"
+  printf "  2. Patch graph with tensor pointers\n"
+  printf "  3. Compile and parse graph\n"
+  printf "  4. Create sendnn tensors\n"
+  printf "  5. Execute on device\n"
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# ============================================================================
+# TENSOR LAYOUT BREAKPOINTS
+# ============================================================================
+
+# Break when getting device size in bytes
+break spyre::get_device_size_in_bytes
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: get_device_size_in_bytes\n"
+  printf "========================================\n"
+  printf "Computing device memory size\n"
+  printf "Device rank: %zu\n", stl.device_size.size()
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# Break when computing view layout
+break spyre::compute_view_layout
+commands
+  silent
+  printf "\n========================================\n"
+  printf "BREAKPOINT: compute_view_layout\n"
+  printf "========================================\n"
+  printf "Computing layout for view operation\n"
+  printf "Old rank: %zu, New rank: %zu\n", old_sizes.size(), new_sizes.size()
+  printf "\nPress 'c' to continue...\n"
+  printf "========================================\n\n"
+end
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Set pagination off for cleaner output
+set pagination off
+
+# Set print settings
+set print pretty on
+set print array on
+set print array-indexes on
+
+# Display instructions
+printf "\n"
+printf "========================================\n"
+printf "GDB BREAKPOINTS LOADED\n"
+printf "========================================\n"
+printf "\n"
+printf "Breakpoints set at:\n"
+printf "  - Memory allocation\n"
+printf "  - Data transfer\n"
+printf "  - Runtime initialization\n"
+printf "  - Kernel execution\n"
+printf "  - Tensor layout operations\n"
+printf "\n"
+printf "Useful GDB commands:\n"
+printf "  c       - Continue to next breakpoint\n"
+printf "  bt      - Show backtrace\n"
+printf "  info locals - Show local variables\n"
+printf "  p var   - Print variable\n"
+printf "  finish  - Run until function returns\n"
+printf "  disable - Disable all breakpoints\n"
+printf "  enable  - Enable all breakpoints\n"
+printf "\n"
+printf "Type 'run' to start execution\n"
+printf "========================================\n"
+printf "\n"
