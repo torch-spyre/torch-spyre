@@ -231,6 +231,9 @@ def spyre__normal_(self, mean=0.0, std=1.0, generator=None):
     return self
 
 
+# Manually append to fallback_ops: register_fallback cannot be used here because
+# normal_ is an in-place op — register_fallback is designed for out-of-place ops
+# and would leave the original Spyre tensor unfilled.
 fallback_ops.append(aten.normal_.default)
 
 
