@@ -198,6 +198,7 @@ def enable_spyre_decompositions(
             enable_spyre_decompositions._removed_decompositions_to_exclude = {}
             enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
+
 def _register_spyre_dispatchkey_kernels_permanently():
     """
     Permanently register PrivateUse1 / AutogradPrivateUse1 kernels for all ops

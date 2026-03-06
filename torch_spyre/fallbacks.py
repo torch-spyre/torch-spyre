@@ -221,6 +221,19 @@ def spyre__cos(input, **kwargs):
     return torch.cos(input, **kwargs)
 
 
+@torch.library.register_kernel("aten::normal_", ["spyre"])
+def spyre__normal_(self, mean=0.0, std=1.0, generator=None):
+    warn_fallback(aten.normal_.default)
+    cpu_data = torch.empty_like(self, device="cpu").normal_(
+        mean, std, generator=generator
+    )
+    self.copy_(cpu_data)
+    return self
+
+
+fallback_ops.append(aten.normal_.default)
+
+
 @register_fallback([aten.embedding.default])
 def spyre__embedding(
     weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
