@@ -564,6 +564,20 @@ class TestOps(TestCase):
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
+    def test_normal_randn(self):
+        gen = torch.manual_seed(42)
+
+        y_spyre = torch.randn(3, 5, device="spyre", generator=gen)
+
+        # torch.Generator is stateful, hence reset
+        gen.manual_seed(42)
+
+        y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
+
+        torch.testing.assert_close(
+            y_spyre.to("cpu"), y_cpu, rtol=self.rtol, atol=self.atol
+        )
+
     def test_zeros(self):
         x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
         x = torch.zeros(3, 64, dtype=self.dtype)
