@@ -29,7 +29,8 @@ def cached_randn(
     return out if not abs else torch.abs(out)
 
 
-def create_unique_val_along_dim(
+@functools.lru_cache(maxsize=None)
+def unique_randn_along_dim(
     shape,
     dim=-1,
     min_val=-100.0,
