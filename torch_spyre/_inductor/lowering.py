@@ -509,29 +509,3 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
-
-
-@register_spyre_lowering(torch.ops.aten.sum.dim_IntList)
-def lower_sum_dim(x, dim, keepdim=False, *, dtype=None):
-    if isinstance(dim, int):
-        dim = [dim]
-
-    kwargs = lowering._make_reduction_inner(
-        x,
-        axis=dim,
-        keepdims=keepdim,
-        dtype=dtype or x.get_dtype(),
-        override_return_dtype=dtype
-    )
-
-    op_info = {}
-
-    result = SpyreReduction.create(
-        reduction_type="sum",
-        input_node=x,
-        op_info=op_info,
-        **kwargs
-    )
-
-    result.realize()
-    return result

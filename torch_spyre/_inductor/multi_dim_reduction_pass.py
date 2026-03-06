@@ -147,14 +147,17 @@ def _decompose_multi_dim_reduction(
 
         # Create the single-dimension reduction node
         with graph.inserting_before(node):
-            # Build kwargs for the reduction
-            kwargs = {"dim": adjusted_dim, "keepdim": keepdim}
+            # Build positional args for the reduction
+            args = (current, adjusted_dim, keepdim)
+            # Build kwargs for the reduction 
+            # only dtype as kwargs only for the last reduction as needed basis.
+            kwargs = {}
             if dtype is not None and is_last:
                 kwargs["dtype"] = dtype
 
             current = graph.call_function(
                 node.target,
-                args=(current,),
+                args=args,
                 kwargs=kwargs,
             )
 
