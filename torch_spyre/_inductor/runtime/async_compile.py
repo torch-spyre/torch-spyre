@@ -22,11 +22,14 @@ from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-from . import KernelSpec, ConstantArg, UnimplementedOp
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+from . import OpSpec, ConstantArg, UnimplementedOp
 from .kernel_runner import (
     SpyreSDSCKernelRunner,
     SpyreUnimplementedRunner,
 )
+
+logger = get_inductor_logger("sdsc_compile")
 
 _argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
 
@@ -42,67 +45,78 @@ class SpyreAsyncCompile:
     def __init__(self) -> None:
         pass
 
-    def sdsc(self, kernel_name: str, ks: Union[KernelSpec | UnimplementedOp]):
-        if isinstance(ks, UnimplementedOp):
-            print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
-            return SpyreUnimplementedRunner(kernel_name, ks.op)
+    def sdsc(self, kernel_name: str, specs: list[Union[OpSpec | UnimplementedOp]]):
+        # 1. Generate SDSC.json for each OpSpec
+        sdsc_dirs = []
+        arg_mappings = []
+        for ks in specs:
+            if isinstance(ks, UnimplementedOp):
+                print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
+                return SpyreUnimplementedRunner(kernel_name, ks.op)
 
-        inputs = []
-        outputs = []
-        arg_mapping = []
-        for index, ts in enumerate(ks.args):
-            # use node seq (idx in nodes) to verify whether to reuse lx for this buffer,
-            # in case same Op used twice in sequence and only want pin 1 of them
-            lx_addr = None
-            for k, addr in getattr(ts, "allocation", {}).items():
-                if kernel_name.split("_")[-1] == k.replace("lx:", ""):
-                    lx_addr = addr
+            inputs = []
+            outputs = []
+            arg_map = []
+            for index, ts in enumerate(ks.args):
+                # use node seq (idx in nodes) to verify whether to reuse lx for this buffer,
+                # in case same Op used twice in sequence and only want pin 1 of them
+                lx_addr = None
+                for k, addr in getattr(ts, "allocation", {}).items():
+                    if kernel_name.split("_")[-1] == k.replace("lx:", ""):
+                        lx_addr = addr
 
-            if isinstance(ts, ConstantArg):
-                raise RuntimeError("TOOO: implement SDSC generation for constants")
-            elif ts.is_input:
-                inputs.append(
-                    {
-                        "name": _argument_names[index],
-                        "scale": ks.scales[index],
-                        "device_layout": ts.device_layout,
-                        "host_size": ts.host_size,
-                        "lx_addr": lx_addr,
-                    }
-                )
-                arg_mapping.append(ts.arg_index)
-            else:
-                outputs.append(
-                    {
-                        "name": _argument_names[index],
-                        "scale": ks.scales[index],
-                        "device_layout": ts.device_layout,
-                        "host_size": ts.host_size,
-                        "lx_addr": lx_addr,
-                    }
-                )
-                arg_mapping.append(ts.arg_index)
-        kernel_descriptor = {
-            "name": kernel_name,
-            "reduction": ks.is_reduction,
-            "op": ks.op,
-            "dimensions": ks.dimensions,
-            "inputs": inputs,
-            "outputs": outputs,
-        }
-        if ks.op_info is not None:
-            kernel_descriptor["op_info"] = ks.op_info
-        pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
-        dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
-        kernel_output_dir = get_output_dir(kernel_name)
-        subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
-        os.makedirs(subdir, exist_ok=True)
-        with open(os.path.join(subdir, "sdsc.json"), "w") as file:
-            print(f"Generating {file.name}")
-            json.dump(dt_sdsc, file, indent=2)
-        subprocess.run(["dxp_standalone", "-d", kernel_output_dir], check=True)
-        convert_artifacts(kernel_output_dir)
-        return SpyreSDSCKernelRunner(kernel_name, kernel_output_dir, arg_mapping)
+                if isinstance(ts, ConstantArg):
+                    raise RuntimeError("TOOO: implement SDSC generation for constants")
+                elif ts.is_input:
+                    inputs.append(
+                        {
+                            "name": _argument_names[index],
+                            "scale": ts.it_dim_map,
+                            "device_layout": ts.device_layout,
+                            "host_size": ts.host_size,
+                            "lx_addr": lx_addr,
+                        }
+                    )
+                    arg_map.append(ts.arg_index)
+                else:
+                    outputs.append(
+                        {
+                            "name": _argument_names[index],
+                            "scale": ts.it_dim_map,
+                            "device_layout": ts.device_layout,
+                            "host_size": ts.host_size,
+                            "lx_addr": lx_addr,
+                        }
+                    )
+                    arg_map.append(ts.arg_index)
+            kernel_descriptor = {
+                "name": kernel_name,
+                "reduction": ks.is_reduction,
+                "op": ks.op,
+                "dimensions": ks.iteration_space,
+                "inputs": inputs,
+                "outputs": outputs,
+            }
+            if ks.op_info is not None:
+                kernel_descriptor["op_info"] = ks.op_info
+            pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
+            dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
+            kernel_output_dir = get_output_dir(kernel_name)
+            subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
+            os.makedirs(subdir, exist_ok=True)
+            with open(os.path.join(subdir, "sdsc.json"), "w") as file:
+                logger.info(f"Generating {file.name}")
+                json.dump(dt_sdsc, file, indent=2)
+            sdsc_dirs.append(kernel_output_dir)
+            arg_mappings.append(arg_map)
+
+        # 2. Invoke the backend compiler on each sdsc.json
+        for dir in sdsc_dirs:
+            subprocess.run(["dxp_standalone", "-d", dir], check=True)
+            convert_artifacts(dir)
+
+        # 3. Construct the KernelRunner
+        return SpyreSDSCKernelRunner(kernel_name, sdsc_dirs, arg_mappings)
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass

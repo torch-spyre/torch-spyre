@@ -52,7 +52,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         super().write_header()
         self.imports.splice(
             """
-                from torch_spyre._inductor.runtime import ConstantArg, TensorArg, KernelSpec, UnimplementedOp
+                from torch_spyre._inductor.runtime import ConstantArg, TensorArg, OpSpec, UnimplementedOp
                 from torch_spyre._inductor.runtime.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
                 import subprocess

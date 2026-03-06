@@ -48,9 +48,9 @@ Some key entry points to the front-end compiler are:
 + [custom_ops.py](../torch_spyre/_inductor/customops.py) is where we define new Spyre-specific operations.
 + [passes.py](../torch_spyre/_inductor/passes.py) is where we add Spyre-specific compiler passes into the three exported
 extension points of Inductor. It supports adding passes to both the FX Graph and LoopLevelIR stages of compilation.
-+ [spyre_kernel.py](../torch_spyre/_inductor/spyre_kernel.py) defines our compilation from LoopLevelIR into `KernelSpec`, our
++ [spyre_kernel.py](../torch_spyre/_inductor/spyre_kernel.py) defines our compilation from LoopLevelIR into `OpSpec`, our
 high-level description of a single operation to be performed on the device.
-+ [codegen](../torch_spyre/_inductor/codegen/) defines the compilation from a `KernelSpec` into a lower-level SuperDSC json file which is the input to the backend compiler.
++ [codegen](../torch_spyre/_inductor/codegen/) defines the compilation from a `OpSpec` into a lower-level SuperDSC json file which is the input to the backend compiler.
 
 ## Additional Topics
 
