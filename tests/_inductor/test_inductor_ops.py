@@ -190,7 +190,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_3": (3, cached_randn((3, 7, 9, 32))),
             },
         },
-        ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
+        ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu_no_eager"): {
             "ops_dict": {"amin": torch.amin},
             "param_sets": {
                 "dim_0": (0, torch.ones((3, 7), dtype=torch.float16)),
@@ -229,7 +229,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_alias_operands_cpu",
-            "test_unary_op_cpu",
+            "test_unary_op_cpu_no_eager",
         ): {
             "ops_dict": {
                 "pow": lambda x: torch.pow(x, 2),
@@ -243,7 +243,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
-        ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
+        ("test_max_keepdim0", "test_reduce_keepdim0_cpu_no_eager"): {
             "ops_dict": {
                 "sum": torch.max,
             },
@@ -259,7 +259,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_3": (3, cached_randn((6, 17, 7, 64))),  # sparse tensor output
             },
         },
-        ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
+        ("test_max_keepdim1", "test_reduce_keepdim1_cpu_no_eager"): {
             "ops_dict": {
                 "sum": torch.max,
             },
@@ -892,6 +892,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
 
+    def test_unary_op_cpu_no_eager(self, op, x):
+        # pow's Spyre eager kernel creates an int32 scalar tensor and then tries
+        # to convert it to fp16, which is unsupported by the Spyre codegen backend
+        compare_with_cpu(op, x, run_eager=False)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
@@ -926,11 +931,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x)
 
+    def test_reduce_keepdim0_cpu_no_eager(self, op, dim: int, x):
+        # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
+        if op == torch.max:
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
+            )
+        else:
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
+            )
+
     def test_reduce_keepdim1_cpu(self, op, dim: int, x):
         if op == torch.max:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True)[0], x)
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
+
+    def test_reduce_keepdim1_cpu_no_eager(self, op, dim: int, x):
+        # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
+        if op == torch.max:
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=True)[0], x, run_eager=False
+            )
+        else:
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
 
     def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
@@ -950,13 +975,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
 
     def test_where_cpu(self, cond_op, x, y):
-        compare_with_cpu(lambda x, y: torch.where(cond_op(x, y), x, y), x, y)
+        # aten::where.self is not registered for the Spyre backend
+        compare_with_cpu(
+            lambda x, y: torch.where(cond_op(x, y), x, y), x, y, run_eager=False
+        )
 
     def test_range_op(self, op, input, min, max, err):
-        compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
+        # aten::clamp is not registered for Spyre eager dispatch; it uses the
+        # spyre::clamp custom op which only works inside torch.compile
+        compare_with_cpu(
+            lambda x: op(x, min, max), input, atol=err, rtol=err, run_eager=False
+        )
 
     def test_activation_cls(self, op, input, kwargs, err):
-        compare_with_cpu(lambda x: op(**kwargs)(x), input, atol=err, rtol=err)
+        # Spyre activation custom ops (e.g. spyre::gelu) have a pass-through
+        # implementation that returns None in eager mode; they only work inside
+        # torch.compile where the inductor lowering handles them
+        compare_with_cpu(
+            lambda x: op(**kwargs)(x), input, atol=err, rtol=err, run_eager=False
+        )
 
     def test_activation_fn(self, op, input, err):
         compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
@@ -965,7 +1002,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         "ignore:Backend Spyre does not support int64:UserWarning"
     )
     def test_clone(self, x):
-        compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
+        # Bool Spyre tensors cause SIGBUS during _to_cpu after an eager clone;
+        # fp16/fp32 work correctly in eager mode
+        compare_with_cpu(
+            lambda a: torch.clone(a).contiguous(), x, run_eager=(x.dtype != torch.bool)
+        )
 
     def test_dropout_functional(self, input, kwargs):
         compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
@@ -1024,7 +1065,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             p = qk.softmax(dim=-1) * sm_scale
             return p @ v
 
-        compare_with_cpu(fn, *args)
+        # mm/bmm on Spyre tensors segfaults in libsenlib without the torch.compile
+        # execution context that normally initialises the hardware session
+        compare_with_cpu(fn, *args, run_eager=False)
 
     def test_layernorm_cpu(self, input, weight, bias):
         def fn(input, weight, bias):
@@ -1032,7 +1075,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 input, input.shape[1:], weight=weight, bias=bias
             )
 
-        compare_with_cpu(fn, input, weight, bias)
+        # In eager mode the spyre::layer_norm custom op calls torch.native_layer_norm
+        # which internally dispatches to aten::native_batch_norm, not registered for Spyre
+        compare_with_cpu(fn, input, weight, bias, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_rmsnorm_cpu(self, x):
