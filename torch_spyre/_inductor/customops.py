@@ -228,3 +228,23 @@ def logical_not(input: torch.Tensor) -> torch.Tensor:
 @logical_not.register_fake
 def _(input: torch.Tensor):
     return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::ones_scalar", mutates_args=(), device_types="spyre")
+def spyre_ones_scalar(
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Return a 1-element tensor containing 1 on Spyre. Used for ones via identity broadcast."""
+    warn_fallback("torch.ops.spyre.ones_scalar")
+    out = torch.empty(1, dtype=dtype, device=device)
+    out.fill_(1)
+    return out
+
+
+@spyre_ones_scalar.register_fake
+def _ones_scalar_fake(
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+):
+    return torch.empty(1, dtype=dtype, device="spyre")

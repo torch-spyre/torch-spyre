@@ -567,6 +567,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_ones",
+            "test_ones_cpu",
+        ): {
+            "param_sets": {
+                "1d": ((64,),),
+                "2d_square": ((64, 64),),
+                "2d": ((64, 128),),
+                "3d": ((4, 3, 64),),
+                "2d_padded": ((3, 50),),
+            },
+        },
+        (
             "test_numel",
             "test_numel_cpu",
         ): {
@@ -1023,8 +1035,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, needs_device=True)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_new_ones_cpu(self, x, y):
         compare_with_cpu(lambda x: x.new_ones((x.size())), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_ones_cpu(self, size):
+        """Compiled torch.ones(size) on Spyre (identity broadcast) matches CPU."""
+
+        def fn(device=None):
+            return torch.ones(size, dtype=torch.float16, device=device)
+
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
     def test_numel_cpu(self, x):
         compare_with_cpu(lambda x: torch.numel(x), x)

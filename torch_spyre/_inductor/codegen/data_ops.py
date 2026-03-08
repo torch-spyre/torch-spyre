@@ -941,7 +941,7 @@ def generate_identity(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     cores = 1
 
     # Get operation dim map from the tensor that represents the operation space
-    op_dims_tensor = inputs[0]
+    op_dims_tensor = outputs[0]
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
@@ -1038,11 +1038,11 @@ def generate_identity(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "component_": "hbm"
                                 if tensor["lx_addr"] is None
                                 else "lx",
-                                "layoutDimOrder_": dim_infos.get_tensor_layout_order(
-                                    tensor
+                                "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
+                                    tensor, op
                                 ),
                                 "maxDimSizes_": [-1]
-                                * len(dim_infos.get_tensor_layout_order(tensor)),
+                                * len(dim_infos.get_tensor_op_layout_order(tensor, op)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},

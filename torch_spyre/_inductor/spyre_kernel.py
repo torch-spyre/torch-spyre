@@ -42,7 +42,7 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import map_dims_to_vars, wildcard_symbol
+from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 import logging
@@ -483,6 +483,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     #   - check that the input / output DimensionInfo are the same, but in different order.
                     #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
                     op = TRANSPOSE_OP
+                elif all(is_wildcard(d.var) for d in in_di) and not all(
+                    is_wildcard(d.var) for d in out_di
+                ):
+                    # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
+                    op = CLONE_OP
+                    in_di = out_di
+                    args[0] = self.create_tensor_arg(True, value.name, value, in_di)
                 elif in_stl.device_size == out_stl.device_size:
                     # Clone: check that device layout is the same.
                     op = CLONE_OP
