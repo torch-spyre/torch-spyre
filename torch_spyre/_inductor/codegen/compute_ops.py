@@ -519,7 +519,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         cores = 1
         dim_splits = [1] * ndim
 
-    if reduction and tensors[-1]["scale"][-1] >= 0:
+    # If the output tensor is sparse, then this is a stick reduction.
+    if reduction and tensors[-1]["device_layout"].host_stick_dim() is not None:
         op += "nonstick"
 
     # Get operation dim map from the tensor that represents the operation space
