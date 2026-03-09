@@ -73,7 +73,6 @@ class SpyreAsyncCompile:
                             "name": _argument_names[index],
                             "scale": ts.it_dim_map,
                             "device_layout": ts.device_layout,
-                            "host_size": ts.host_size,
                             "lx_addr": lx_addr,
                         }
                     )
@@ -84,7 +83,6 @@ class SpyreAsyncCompile:
                             "name": _argument_names[index],
                             "scale": ts.it_dim_map,
                             "device_layout": ts.device_layout,
-                            "host_size": ts.host_size,
                             "lx_addr": lx_addr,
                         }
                     )
