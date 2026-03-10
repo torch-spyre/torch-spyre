@@ -253,6 +253,7 @@ The correlation chain:
 
 ### With `with_stack=True`:
 Each event additionally captures Python source location:
+
 ```python
 # Example from key_averages().table(sort_by="cuda_time_total", row_limit=10)
 # Name    | Source Location
@@ -262,12 +263,14 @@ Each event additionally captures Python source location:
 
 ### With `with_flops=True`:
 FLOPS estimates for supported ops (matmul, conv2d, BMM):
+
 ```
 aten::addmm  | 81920 FLOPS  (M=32, K=128, N=10 -> 2*M*K*N)
 ```
 
 ### With `with_modules=True`:
 Module hierarchy for TorchScript models:
+
 ```
 nn.Module: Linear | aten::addmm
 ```

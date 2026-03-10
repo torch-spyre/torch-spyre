@@ -62,6 +62,7 @@ Additionally, **Google TPU** uses a completely separate profiling path via **XPr
 - No driver-level API tracing
 
 ### Chrome Trace JSON Differences (vs CUDA)
+
 ```
 CUDA kernel args:
   "registers per thread": 86, "shared memory": 32768,
@@ -100,6 +101,7 @@ The standalone `rocprof` CLI can capture hardware counters NOT available in PyTo
 - Visualization via **TensorBoard** with `tensorboard-plugin-profile`
 
 ### How to Profile
+
 ```python
 import torch_xla.debug.profiler as xp
 
