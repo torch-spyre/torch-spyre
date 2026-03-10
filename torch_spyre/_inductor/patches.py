@@ -67,7 +67,6 @@ def enable_spyre_context(
     import torch_spyre._inductor.customops  # noqa: F401
     from torch_spyre._inductor.decompositions import (
         enable_spyre_decompositions,
-        enable_spyre_decompositions_via_dispatchkey,
     )
 
     import torch_spyre._inductor.lowering  # noqa: F401
@@ -120,7 +119,6 @@ def enable_spyre_context(
         spyre_data_types(),
         enable_spyre_lowerings(),
         enable_spyre_decompositions(decomps=decomps) as spyre_context_decompositions,
-        enable_spyre_decompositions_via_dispatchkey(),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
     ):

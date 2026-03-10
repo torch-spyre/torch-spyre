@@ -273,25 +273,7 @@ def register_spyre_decompositions_via_dispatchkey(
     return decomposition_decorator
 
 
-@contextmanager
-def enable_spyre_decompositions_via_dispatchkey():
-    """
-    Context manager that ensures the Spyre PrivateUse1 kernels are registered
-    for the duration of a ``torch.compile`` call.
-
-    Kernels are registered permanently in the C++ dispatcher by
-    ``_register_spyre_dispatchkey_kernels_permanently()`` (idempotent).
-    Once registered, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
-    to route dispatch: inside a ``torch.compile`` context the Spyre function is
-    called directly; outside (eager mode) the pre-compiled wrapper is used.
-
-    The CM is reentrant.
-    """
-    _register_spyre_dispatchkey_kernels_permanently()
-    yield
-
-
-@decomp.register_decomposition([torch.ops.spyre.compact])
+@register_spyre_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
@@ -426,3 +408,14 @@ def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
     return torch.ops.spyre.softplus(input, beta, threshold)
+
+
+###############################################################################################
+##                           Register custom kernels for Spyre.                              ##
+###############################################################################################
+# Kernels are registered permanently in the C++ dispatcher by
+# ``_register_spyre_dispatchkey_kernels_permanently()`` (idempotent).
+# Once registered, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
+# to route dispatch: inside a ``torch.compile`` context the Spyre function is
+# called directly; outside (eager mode) the pre-compiled wrapper is used.
+_register_spyre_dispatchkey_kernels_permanently()
