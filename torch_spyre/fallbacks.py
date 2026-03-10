@@ -221,19 +221,10 @@ def spyre__cos(input, **kwargs):
     return torch.cos(input, **kwargs)
 
 
-@torch.library.register_kernel("aten::normal_", ["spyre"])
-def spyre__normal_(self, mean=0.0, std=1.0, generator=None):
-    warn_fallback(aten.normal_.default)
-    cpu_data = torch.empty_like(self, device="cpu").normal_(
-        mean, std, generator=generator
-    )
-    self.copy_(cpu_data)
-    return self
-
-
 # Manually append to fallback_ops: register_fallback cannot be used here because
 # normal_ is an in-place op — register_fallback is designed for out-of-place ops
 # and would leave the original Spyre tensor unfilled.
+# The kernel itself is registered in ops.py (and therefore codegen_ops.py).
 fallback_ops.append(aten.normal_.default)
 
 
