@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Self, Sequence, Union
+from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
 from collections import Counter
 
@@ -340,21 +340,6 @@ def analyze_tensor_access(
     return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
 
 
-def create_tensor_arg(
-    is_input: bool, arg_index: int, tensor: TensorAccess, di: list[DimensionInfo]
-) -> TensorArg:
-    scales = analyze_tensor_access(di, tensor)
-    return TensorArg(
-        is_input,
-        arg_index,
-        tensor.layout.dtype,
-        tensor.layout.size,
-        scales,
-        tensor.layout.allocation,
-        tensor.layout.device_layout,
-    )
-
-
 def create_op_spec(
     op: str,
     is_reduction: bool,
@@ -385,6 +370,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
     ) -> None:
         super().__init__(tiling, **kwargs)
         self.op_specs: list[OpSpec | UnimplementedOp] = []
+        self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -392,6 +378,26 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             V.set_ops_handler(SpyreKernelOpsHandler(self, SpyreOpFuncs()))
         )
         return self
+
+    def create_tensor_arg(
+        self, is_input: bool, name: str, tensor: TensorAccess, di: list[DimensionInfo]
+    ) -> TensorArg:
+        scales = analyze_tensor_access(di, tensor)
+        tensor_arg = TensorArg(
+            is_input,
+            -1,
+            tensor.layout.dtype,
+            tensor.layout.size,
+            scales,
+            tensor.layout.allocation,
+            tensor.layout.device_layout,
+        )
+        self.spyre_kernel_args.append((name, tensor_arg))
+        return tensor_arg
+
+    def remove_kernel_local_buffers(self) -> None:
+        """Do not remove kernel local buffers becasue we need the allocate in hbm/lx"""
+        pass
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
@@ -424,7 +430,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
-        actuals = self.args.python_argdefs()[1]
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
@@ -450,14 +455,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             args: list[TensorArg | ConstantArg] = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
-                    args.append(
-                        create_tensor_arg(True, actuals.index(input.name), input, di)
-                    )
+                    args.append(self.create_tensor_arg(True, input.name, input, di))
                 elif isinstance(input, Constant):
                     args.append(ConstantArg(input.value, input.dtype))
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
-            args.append(create_tensor_arg(False, actuals.index(real_dst_name), dst, di))
+            args.append(self.create_tensor_arg(False, real_dst_name, dst, di))
             op_info.update(value.op_info)
             self.op_specs.append(create_op_spec(value.op, False, di, args, op_info))
         elif isinstance(value, TensorAccess):
@@ -465,8 +468,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             in_di = self.derive_dim_info(value)
             out_di = self.derive_dim_info(dst)
             args = [
-                create_tensor_arg(True, actuals.index(value.name), value, in_di),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst, out_di),
+                self.create_tensor_arg(True, value.name, value, in_di),
+                self.create_tensor_arg(False, real_dst_name, dst, out_di),
             ]
             generic_relayout = False
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
@@ -568,7 +571,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        actuals = self.args.python_argdefs()[1]
         if value.op == MATMUL_REDUCTION_OP:
             if (
                 len(value.arguments) != 2
@@ -595,9 +597,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             else:
                 raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
-                create_tensor_arg(True, actuals.index(x.name), x, di),
-                create_tensor_arg(True, actuals.index(y.name), y, di),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst, di),
+                self.create_tensor_arg(True, x.name, x, di),
+                self.create_tensor_arg(True, y.name, y, di),
+                self.create_tensor_arg(False, real_dst_name, dst, di),
             ]
             self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
         elif value.op == BATCH_MATMUL_OP:
@@ -669,9 +671,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             else:
                 raise Unsupported(f"malformed bmm {di_x} {di_y}")
             args = [
-                create_tensor_arg(True, actuals.index(x.name), x, di),
-                create_tensor_arg(True, actuals.index(y.name), y, di),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst, di),
+                self.create_tensor_arg(True, x.name, x, di),
+                self.create_tensor_arg(True, y.name, y, di),
+                self.create_tensor_arg(False, real_dst_name, dst, di),
             ]
             self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
         else:
@@ -683,8 +685,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             x = value.arguments[0]
             di = self.derive_dim_info(x)
             args = [
-                create_tensor_arg(True, actuals.index(x.name), x, di),
-                create_tensor_arg(False, actuals.index(real_dst_name), dst, di),
+                self.create_tensor_arg(True, x.name, x, di),
+                self.create_tensor_arg(False, real_dst_name, dst, di),
             ]
             self.op_specs.append(create_op_spec(value.op, True, di, args, op_info))
 
@@ -704,6 +706,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
+
+        # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
+        actuals = self.args.python_argdefs()[1]
+        for name, tensor_arg in self.spyre_kernel_args:
+            tensor_arg.arg_index = actuals.index(name)
+
         buf = IndentedBuffer()
         buf.writeline("[")
         with buf.indent():

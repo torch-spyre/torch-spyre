@@ -38,11 +38,11 @@ class DimInfo:
 def get_scales_sdsc_format(tensor, op):
     # SDSC needs non-negative scale values to be 1
     if op == "layernormscale" and tensor["name"] == "arg0":
-        return [1] * (len(tensor["scale"]) - 1) + [-1]
+        return [1] * (len(tensor["it_dim_map"]) - 1) + [-1]
     elif op == "layernormnorm" and tensor["name"] == "arg1":
-        return [1] * (len(tensor["scale"]) - 1) + [-1]
+        return [1] * (len(tensor["it_dim_map"]) - 1) + [-1]
     else:
-        return [1 if s >= 0 else s for s in tensor["scale"]]
+        return [1 if s >= 0 else s for s in tensor["it_dim_map"]]
 
 
 @dataclass
@@ -129,8 +129,8 @@ class DimInfos:
     #     by any remaining dimensions not in the tensor
     def get_tensor_op_index_order(self, tensor):
         dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-        scale = tensor["scale"]
-        tensor_op_dims = [scale.index(i) for i in dev_dim_order if i in scale]
+        it_dim_map = tensor["it_dim_map"]
+        tensor_op_dims = [it_dim_map.index(i) for i in dev_dim_order if i in it_dim_map]
         remaining_op_dims = [i for i in self.dim_indices if i not in tensor_op_dims]
         return tensor_op_dims + remaining_op_dims
 
@@ -165,9 +165,9 @@ class DimInfos:
     # Length of returned list == num tensor dimensions
     def get_tensor_layout_order(self, tensor):
         dl = tensor["device_layout"]
-        scale = tensor["scale"]
+        it_dim_map = tensor["it_dim_map"]
         dev_dim_order = dl.dim_map[::-1][1:]
-        return [self.rows["label"][scale.index(dmv)] for dmv in dev_dim_order]
+        return [self.rows["label"][it_dim_map.index(dmv)] for dmv in dev_dim_order]
 
     # Returns dim infos for dimensions of the tensor,
     # in the tensor's device layout order.
@@ -180,7 +180,7 @@ class DimInfos:
 
     def get_tensor_stick_dim_labels(self, tensor):
         dl = tensor["device_layout"]
-        idx = tensor["scale"].index(dl.host_stick_dim())
+        idx = tensor["it_dim_map"].index(dl.host_stick_dim())
         return [self.rows["label"][idx]]
 
 
@@ -188,7 +188,7 @@ class DimInfos:
 # Assumption is that the passed tensor operate in host dimension space
 def get_device_size(op_dim, tensor):
     dl = tensor["device_layout"]
-    scale = tensor["scale"][op_dim]
+    scale = tensor["it_dim_map"][op_dim]
     assert scale >= 0, "Scale value should be non-negative for tensor provided"
     size = dl.device_size[dl.dim_map.index(scale)]
     if scale == dl.host_stick_dim():
@@ -519,7 +519,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
         cores = 1
         dim_splits = [1] * ndim
 
-    if reduction and tensors[-1]["scale"][-1] >= 0:
+    # If the output tensor is sparse, then this is a stick reduction.
+    if reduction and tensors[-1]["device_layout"].host_stick_dim() is not None:
         op += "nonstick"
 
     # Get operation dim map from the tensor that represents the operation space
