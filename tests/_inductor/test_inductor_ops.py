@@ -990,13 +990,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_silu_and_mul(self, input, err):
         def silu_and_mul(x):
-            # Note: This is not fully SiluAndMul yet,
-            # as for that x needs to be sliced in half (typically along the last dimension).
-            # However, this is currently not supported, see issue #
-            # The proper operation would be
-            # d = x.shape[-1] // 2
-            # return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
-            return torch.nn.functional.silu(x) * x
+            d = x.shape[-1] // 2
+            return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
 
         compare_with_cpu(silu_and_mul, input, atol=err, rtol=err)
 
