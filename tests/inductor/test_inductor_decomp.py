@@ -57,7 +57,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_decompositions_change(self, x):
         import torch_spyre
         import types
@@ -108,7 +108,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             global_decomposition_table["pre_autograd"]
         )
 
-        with pytest.warns(torch_spyre.fallbacks.FallbackWarning) as record:
+        with pytest.warns(torch_spyre.ops.fallbacks.FallbackWarning) as record:
             compare_with_cpu(fn, x, cpu_compile=True)
 
         assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
@@ -131,7 +131,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             after_pre_autograd_decomposition_table,
         )
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings(
         "ignore::UserWarning"
     )  # because of forced cache disabling
