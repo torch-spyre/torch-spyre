@@ -507,6 +507,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_silu_and_mul",
+            "test_silu_and_mul",
+        ): {
+            "param_sets": {
+                # Small shape for basic correctness
+                "2d_small": (
+                    cached_randn((128, 256), dtype=torch.float16),
+                    0.01,
+                ),
+                # Shape from vllm-spyre SiluAndMul failure: [1024, 25600]
+                "2d_vllm": (
+                    cached_randn((1024, 25600), dtype=torch.float16, differentiation=1),
+                    0.01,
+                ),
+                # 3d shape for generality
+                "3d": (
+                    cached_randn((4, 64, 512), dtype=torch.float16),
+                    0.01,
+                ),
+                # issue #708: odd last dim (844) from Granite3 Speech, halved to 422
+                "3d_issue708": (
+                    cached_randn((1, 2048, 1688), dtype=torch.float16),
+                    0.01,
+                ),
+            },
+        },
+        (
             "test_clone",
             "test_clone",
         ): {
@@ -960,6 +987,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_activation_fn(self, op, input, err):
         compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
+
+    def test_silu_and_mul(self, input, err):
+        def silu_and_mul(x):
+            # Note: This is not fully SiluAndMul yet,
+            # as for that x needs to be sliced in half (typically along the last dimension).
+            # However, this is currently not supported, see issue #
+            # The proper operation would be
+            # d = x.shape[-1] // 2
+            # return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+            return torch.nn.functional.silu(x) * x
+
+        compare_with_cpu(silu_and_mul, input, atol=err, rtol=err)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
