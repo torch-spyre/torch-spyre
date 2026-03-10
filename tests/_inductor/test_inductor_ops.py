@@ -524,6 +524,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_permute",
+            "test_permute",
+        ): {
+            "param_sets": {
+                "4d_0_2_1_3": ((2, 3, 16, 64), (0, 2, 1, 3)),
+                "3d_0_2_1": ((2, 1024, 844), (0, 2, 1)),
+                "4d_0_3_1_2": ((2, 2, 256, 48), (0, 3, 1, 2)),
+                "4d_0_m2_m1_1": ((2, 48, 2, 256), (0, -2, -1, 1)),
+                "5d_0_2_3_4_1": ((2, 48, 2, 256, 265), (0, 2, 3, 4, 1)),
+            },
+        },
+        (
             "test_fallback",
             "test_fallback_cpu",
         ): {
@@ -966,6 +978,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     )
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
+
+    def test_permute(self, input_dims, dims):
+        compare_with_cpu(
+            lambda input: torch.permute(input, dims),
+            cached_randn(input_dims, dtype=torch.float16),
+        )
 
     def test_dropout_functional(self, input, kwargs):
         compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
