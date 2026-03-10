@@ -21,6 +21,7 @@ from torch._inductor.utils import (
     get_fused_kernel_name,
 )
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
 
@@ -28,6 +29,12 @@ from .spyre_kernel import SpyreKernel
 class SuperDSCScheduling(SIMDScheduling):
     kernel_type: type[Any] = SpyreKernel
     dsc_type: str = "sdsc"
+
+    def can_buffer_be_removed_through_fusion(
+        self, name: str, fused_node_names: OrderedSet[str]
+    ) -> bool:
+        """We need intermediate buffers to be allocated even if only used within a single Kernel"""
+        return False
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """Codegen kernel definition to go in output wrapper code"""
