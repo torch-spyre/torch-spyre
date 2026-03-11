@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import dataclasses
-from typing import Any, Sequence, Union
+from typing import Any, Sequence
 import torch
 from torch_spyre._C import SpyreTensorLayout
 
@@ -44,20 +44,6 @@ class TensorArg:
 
 
 @dataclasses.dataclass
-class ConstantArg:
-    """
-    A class representing a Constant argument to an OpSpec
-
-    Attributes:
-        value: The value of the constant.
-        dtype: The PyTorch (host) dtype of the constant.
-    """
-
-    value: Union[bool, float, int]
-    dtype: torch.dtype
-
-
-@dataclasses.dataclass
 class OpSpec:
     """
     A class representing a single operation to perform on the device
@@ -73,7 +59,7 @@ class OpSpec:
     op: str
     is_reduction: bool
     iteration_space: list[int]
-    args: Sequence[TensorArg | ConstantArg]
+    args: Sequence[TensorArg]
     op_info: dict[str, Any]
 
 

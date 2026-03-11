@@ -32,7 +32,7 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
-from torch_spyre.execution import ConstantArg, OpSpec, TensorArg
+from torch_spyre.execution import OpSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -344,7 +344,7 @@ def create_op_spec(
     op: str,
     is_reduction: bool,
     dims: list[DimensionInfo],
-    args: Sequence[TensorArg | ConstantArg],
+    args: Sequence[TensorArg],
     op_info: dict[str, Any],
 ) -> OpSpec:
     for arg in args:
@@ -451,12 +451,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.derive_dim_info(dst)
-            args: list[TensorArg | ConstantArg] = []
+            args: list[TensorArg] = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input, di))
-                elif isinstance(input, Constant):
-                    args.append(ConstantArg(input.value, input.dtype))
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst, di))
@@ -473,32 +471,28 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ]
             in_stl = args[0].device_layout  # type: ignore[union-attr]
             out_stl = args[1].device_layout  # type: ignore[union-attr]
-            if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
-                # Determine data op based on tensor args
-                if (
-                    Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
-                    and in_stl.device_size != out_stl.device_size
-                ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
-                    # Transpose:
-                    #   - check that the input / output DimensionInfo are the same, but in different order.
-                    #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
-                    op = TRANSPOSE_OP
-                elif all(is_wildcard(d.var) for d in in_di) and not all(
-                    is_wildcard(d.var) for d in out_di
-                ):
-                    # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
-                    op = CLONE_OP
-                    in_di = out_di
-                    args[0] = self.create_tensor_arg(True, value.name, value, in_di)
-                elif in_stl.device_size == out_stl.device_size:
-                    # Clone: check that device layout is the same.
-                    op = CLONE_OP
-                else:
-                    # Unsupported data operation on TensorArg
-                    raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
+            # Determine data op based on tensor args
+            if (
+                Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
+                and in_stl.device_size != out_stl.device_size
+            ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
+                # Transpose:
+                #   - check that the input / output DimensionInfo are the same, but in different order.
+                #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
+                op = TRANSPOSE_OP
+            elif all(is_wildcard(d.var) for d in in_di) and not all(
+                is_wildcard(d.var) for d in out_di
+            ):
+                # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
+                op = CLONE_OP
+                in_di = out_di
+                args[0] = self.create_tensor_arg(True, value.name, value, in_di)
+            elif in_stl.device_size == out_stl.device_size:
+                # Clone: check that device layout is the same.
+                op = CLONE_OP
             else:
-                # Unsupported data operation on ConstantArg
-                raise Unsupported(f"Data operation on {type(args[0])}")
+                # Unsupported data operation on TensorArg
+                raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
             op_spec = create_op_spec(op, False, in_di, args, op_info)
             if op == TRANSPOSE_OP:

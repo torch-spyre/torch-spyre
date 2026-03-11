@@ -23,7 +23,7 @@ from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from . import ConstantArg, OpSpec, UnimplementedOp
+from . import OpSpec, UnimplementedOp
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -62,9 +62,7 @@ class SpyreAsyncCompile:
                     if kernel_name.split("_")[-1] == k.replace("lx:", ""):
                         lx_addr = addr
 
-                if isinstance(ts, ConstantArg):
-                    raise RuntimeError("TOOO: implement SDSC generation for constants")
-                elif ts.is_input:
+                if ts.is_input:
                     inputs.append(
                         {
                             "name": _argument_names[index],
