@@ -387,7 +387,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             is_input,
             -1,
             tensor.layout.dtype,
-            tensor.layout.size,
             scales,
             tensor.layout.allocation,
             tensor.layout.device_layout,
