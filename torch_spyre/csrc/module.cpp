@@ -17,15 +17,18 @@
 #include "module.h"
 
 #include <c10/core/ScalarType.h>
+#include <execinfo.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <csignal>
 #include <cstdlib>  // std::getenv
 #include <dee_internal/dee_graph_converter.hpp>
 #include <flex/flex_factory.hpp>
+#include <iostream>
 #include <memory>
 #include <sendnn/graph.hpp>
 #include <sendnn/graph/graph_builder.hpp>
@@ -248,7 +251,30 @@ int device_count() {
 }  // namespace spyre
 
 namespace py = pybind11;
+
+void print_backtrace() {
+  void *buffer[40];
+  int nptrs = backtrace(buffer, sizeof(buffer) / sizeof(void *));
+  char **stacks = backtrace_symbols(buffer, nptrs);
+  if (stacks == NULL) {
+    return;
+  }
+  for (int i = 0; i < nptrs; ++i) {
+    std::cout << stacks[i] << std::endl;
+  }
+  free(stacks);
+}
+
+void handler(int signal) {
+  print_backtrace();
+
+  throw std::runtime_error("Error in backend!");
+}
+
 PYBIND11_MODULE(_C, m) {
+  signal(SIGSEGV, handler);
+  signal(SIGFPE, handler);
+
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);

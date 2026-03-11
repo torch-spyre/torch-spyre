@@ -125,7 +125,13 @@ LIBRARIES = ["sendnn", "sendnn_interface", "flex", "dee_internal"]
 # Set TORCH_SPYRE_DEBUG=1 to build with -O0 for easier debugging
 NO_OPT_BUILD = os.environ.get("TORCH_SPYRE_DEBUG", "0") == "1"
 
-EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
+EXTRA_CXX_FLAGS = [
+    "-g",
+    "-Wall",
+    "-Wno-deprecated",
+    "-std=c++17",
+    "-fnon-call-exceptions",
+]
 if NO_OPT_BUILD:
     EXTRA_CXX_FLAGS += ["-O0"]
 
