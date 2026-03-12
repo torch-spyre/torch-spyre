@@ -51,6 +51,8 @@ from .pass_utils import (
     get_mem_deps,
     map_dims_to_vars,
     map_host_dims_to_exprs,
+    host_coordinates,
+    device_coordinates,
 )
 
 logger = get_inductor_logger("stickify")
@@ -101,7 +103,7 @@ def device_layout_like(
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
-    output_index = next(iter(n.read_writes.writes)).index
+    output_dep = next(iter(n.read_writes.writes))
     origin_node = next(iter(pw.origins))
     op = origin_node.target
 
@@ -144,20 +146,20 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 )
 
             case _:
-                in_exprs = map_host_dims_to_exprs(x.layout, x.index)
-                out_exprs = map_host_dims_to_exprs(output, output_index)
-                if in_exprs == out_exprs and x.index == output_index:
+                in_coords = host_coordinates(x.layout, x.dep)
+                out_coords = host_coordinates(output, output_dep)
+                if in_coords == out_coords and x.index == output_dep.index:
                     # Input and output tensors are being accessed identically.
                     # We can simply propagate the device_layout.
                     stl = device_layout_like(x.layout, output.dtype)
                 else:
                     # Use row major adjusted to put stick dimension last
-                    in_stick_dim = x.layout.device_layput.host_stick_dim()
-                    stick_expr = in_exprs[in_stick_dim]
-                    if stick_expr is None:
+                    in_device_coords = device_coordinates(x.layout, x.dep)
+                    stick_expr = in_device_coords[-1]
+                    if stick_expr == 0:
                         raise Unsupported("TODO: unary op with view on sparse tensor")
                     try:
-                        out_stick_dim = out_exprs.index(stick_expr)
+                        out_stick_dim = out_coords.index(stick_expr)
                     except ValueError:
                         raise Unsupported("output stick dim not well-defined")
                     dim_order = [
@@ -183,17 +185,18 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
-        in_exprs = [map_host_dims_to_exprs(arg.layout, arg.dep.index) for arg in args]
-        out_exprs = map_host_dims_to_exprs(output, output_index)
+        in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
+        in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
+        out_coords = host_coordinates(output, output_dep)
 
         # Stick compatability check.
         # For all tensors whose stick dimension is being iterated over,
         # the indexing expression must be identical.
         stick_exprs = set()
-        for arg, in_exprs in zip(args, in_exprs):
-            out_stick_dim = arg.layout.device_layout.host_stick_dim()
-            if out_stick_dim is not None:
-                stick_exprs.add(in_exprs[out_stick_dim])
+        for idc in in_device_coords:
+            if idc[-1] != 0:
+                stick_exprs.add(idc[-1])
+
         if len(stick_exprs) > 1:
             # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
             raise Unsupported(
@@ -202,8 +205,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 
         # See if the indexing across all inputs and the output is identical.
         can_use_same_layout = True
-        for arg, in_exprs in zip(args, in_exprs):
-            if in_exprs != out_exprs or arg.dep.index != output_index:
+        for arg, arg_coors in zip(args, in_coords):
+            if arg_coors != out_coords or arg.dep.index != output_dep.index:
                 can_use_same_layout = False
                 break
 
@@ -219,7 +222,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 
             stick_expr = next(iter(stick_exprs))
             try:
-                out_stick_dim = out_exprs.index(stick_expr)
+                out_stick_dim = out_coords.index(stick_expr)
             except ValueError:
                 raise Unsupported("output stick dim not well-defined")
 

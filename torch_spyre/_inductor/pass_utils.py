@@ -24,6 +24,7 @@ from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
 from .ir import FixedTiledLayout
+from .views import compute_device_coordinates, compute_coordinates
 
 
 class SchedNodeArg(NamedTuple):
@@ -92,21 +93,16 @@ def map_host_dims_to_exprs(layout: FixedLayout, index: Expr) -> list[Expr]:
     return [host_map[d] if d in host_map else S.zero for d in range(len(layout.size))]
 
 
-def map_device_dims_to_exprs(layout: FixedTiledLayout, index: Expr) -> list[Expr]:
-    """
-    Construct a list of len(layout.device_size) of the Exprs that are used to index
-    elements of each host dimension.
-    A dimension of size 1 will have an expr of `0`.
-    """
+def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
 
-    # TEMPORARY.  Replicate logic of map_dims_to_vars.
-    # To be replaced by @tardieu's new algorithm.
-    host_map = {}
-    for sym in index.free_symbols:
-        stride_val = sympy_subs(index, {sym: 1}) - sympy_subs(index, {sym: 0})
-        if stride_val in layout.stride:
-            idx = layout.stride.index(stride_val)
-            host_map[idx] = sym
-    return [
-        host_map[d] if d in host_map else S.zero for d in layout.device_layout.dim_map
-    ]
+
+def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    return compute_device_coordinates(
+        layout.size,
+        layout.stride,
+        layout.device_layout.device_size,
+        layout.device_layout.dim_map,
+        dep.ranges,
+        dep.index,
+    )
