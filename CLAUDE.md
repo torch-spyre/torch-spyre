@@ -32,8 +32,8 @@ Test sub-suites:
 | Suite | Path |
 |---|---|
 | Eager ops | `tests/test_ops.py` |
-| Compiled ops | `tests/_inductor/test_inductor_ops.py` |
-| Building blocks | `tests/_inductor/test_building_blocks.py` |
+| Compiled ops | `tests/inductor/test_inductor_ops.py` |
+| Building blocks | `tests/inductor/test_building_blocks.py` |
 | Tensor layout | `tests/tensor/` |
 
 ## Key Environment Variables

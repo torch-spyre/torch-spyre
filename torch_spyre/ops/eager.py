@@ -14,7 +14,7 @@
 
 import torch
 from torch_spyre._C import SpyreTensorLayout, as_strided_with_layout
-import torch_spyre.fallbacks  # noqa: F401
+import torch_spyre.ops.fallbacks  # noqa: F401
 
 
 def maybe_wrap_dim(dim: int, ndims: int) -> int:

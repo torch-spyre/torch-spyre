@@ -21,7 +21,7 @@ os.environ.setdefault(
     "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
 )  # must be before torch import
 os.environ.setdefault(
-    "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "senbfcc")
+    "SEN_COMMON_HEADERS", str(Path(__file__).resolve().parent.parent / "flex")
 )
 
 

@@ -25,6 +25,11 @@ from torch_spyre._inductor.constants import (
 )
 
 
+def swap_last_two_elements(x: list):
+    assert len(x) >= 2
+    return x[:-2] + x[-1:] + x[-2:-1]
+
+
 class DimInfo:
     def __init__(self, index: int, fields: dict = {}):
         self.index = index
@@ -763,7 +768,6 @@ def _generate_matmul_common(
     dim_labels,
     dim_indices,
     dim_splits,
-    coreid_to_wk_slice,
     cores,
 ):
     """
@@ -801,6 +805,14 @@ def _generate_matmul_common(
     )
 
     layouts = create_tensor_specific_layouts(tensors, dim_infos, op, is_matmul=True)
+
+    # swap_last_two_elements moves the "in" (reduction) dimension to the last
+    # so that the core assignment keeps partial sum results that require cross-core
+    # communications close
+    coreid_to_wk_slice = calculate_core_to_slice_mapping(
+        swap_last_two_elements(dim_labels),
+        swap_last_two_elements(dim_splits),
+    )
 
     return {
         op: {
@@ -990,8 +1002,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         if "op_dim_splits" in kwargs["op_info"]:
             dim_splits = list(kwargs["op_info"]["op_dim_splits"])
 
-    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
-
     return _generate_matmul_common(
         pointers,
         op=op,
@@ -1001,7 +1011,6 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_labels=dim_labels,
         dim_indices=dim_indices,
         dim_splits=dim_splits,
-        coreid_to_wk_slice=coreid_to_wk_slice,
         cores=cores,
     )
 
@@ -1031,8 +1040,6 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         if "op_dim_splits" in kwargs["op_info"]:
             dim_splits = list(kwargs["op_info"]["op_dim_splits"])
 
-    coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
-
     return _generate_matmul_common(
         pointers,
         op=op,
@@ -1042,6 +1049,5 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         dim_labels=dim_labels,
         dim_indices=dim_indices,
         dim_splits=dim_splits,
-        coreid_to_wk_slice=coreid_to_wk_slice,
         cores=cores,
     )

@@ -59,7 +59,10 @@ torch-spyre/
 │   │   ├── spyre_views.*        # View/reshape layout computation
 │   │   └── spyre_sendnn_utils.* # SendNN tensor descriptor utilities
 │   ├── _inductor/               # Inductor compiler backend (see below)
-│   └── utils/                   # Device interface and override utilities
+│   ├── ops/                     # Ops team: eager, fallbacks, decompositions, lowering, customops
+│   ├── execution/               # Runtime: async_compile, kernel_runner, OpSpec
+│   ├── device/                  # Device interface and override utilities
+│   └── memory/                  # Memory/DMA (placeholder for future work)
 │
 ├── codegen/                     # Eager-mode codegen (generates codegen_ops.py)
 │   ├── gen.py                   # Main codegen script
@@ -70,7 +73,7 @@ torch-spyre/
 ├── tests/                       # Test suite
 │   ├── test_ops.py              # Eager operator tests
 │   ├── test_modules.py          # nn.Module tests
-│   ├── _inductor/               # Compiled-mode tests
+│   ├── inductor/                # Compiled-mode tests
 │   │   ├── test_inductor_ops.py # Parameterized compile-path op tests
 │   │   ├── test_building_blocks.py # End-to-end block tests (MLP, attention)
 │   │   └── utils_inductor.py    # Test utilities (compare_with_cpu, ParameterizedTestMeta)
@@ -223,7 +226,7 @@ Key external deps: `torch~=2.10.0`, `sendnn`, `flex`, `dee_internal`,
 ```bash
 python3 -m pytest tests/                  # All tests
 python3 -m pytest tests/test_ops.py       # Eager ops
-python3 -m pytest tests/_inductor/        # Compiled ops
+python3 -m pytest tests/inductor/        # Compiled ops
 python3 -m pytest tests/tensor/           # Layout tests
 ```
 
