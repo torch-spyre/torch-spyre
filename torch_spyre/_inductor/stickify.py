@@ -154,12 +154,13 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     # Use row major adjusted to put stick dimension last
                     in_device_coords = device_coordinates(x.layout, x.dep)
                     stick_expr = in_device_coords[-1]
-                    if stick_expr == 0:
+                    if is_sparse(x_stl):
                         raise Unsupported("TODO: unary op with view on sparse tensor")
-                    try:
+
+                    if stick_expr in out_coords:
                         out_stick_dim = out_coords.index(stick_expr)
-                    except ValueError:
-                        raise Unsupported("output stick dim not well-defined")
+                    else:
+                        out_stick_dim = -1
                     dim_order = [
                         d for d in range(len(output.size)) if d != out_stick_dim
                     ]
@@ -219,10 +220,10 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 )
 
             stick_expr = next(iter(stick_exprs))
-            try:
+            if stick_expr in out_coords:
                 out_stick_dim = out_coords.index(stick_expr)
-            except ValueError:
-                raise Unsupported("output stick dim not well-defined")
+            else:
+                out_stick_dim = -1
 
             dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
             dim_order += [out_stick_dim]
@@ -257,7 +258,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = x.layout.device_layout
         y_stl = y.layout.device_layout
         if is_sparse(x_stl) or is_sparse(y_stl):
-            raise Unsupported(f"{red.reduction_type} on sparse tensors {x_stl} {y_stl}")
+            raise Unsupported(f"{red.reduction_type} on sparse tensor {x_stl} {y_stl}")
 
         x_coords = host_coordinates(x.layout, x.dep)
         x_dev_coords = device_coordinates(x.layout, x.dep)
@@ -306,8 +307,6 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         x_stl = x.layout.device_layout
         if is_sparse(x_stl) or x_stl.host_stick_dim() != (len(x.layout.size) - 1):
             raise Unsupported(f"exx2 unsupported layout {x_stl}")
-        if list(x.layout.size)[:-1] != output.size:
-            raise Unsupported("views not supported for exx2")
         dim_map = list(range(len(output.size))) + [-1]
         stl = SpyreTensorLayout(output.size, output.dtype, dim_map)
         return FixedTiledLayout(
