@@ -14,7 +14,7 @@
 
 from typing import NamedTuple
 
-from sympy import Expr, Symbol, S
+from sympy import Expr, Symbol
 
 import sympy
 from torch._inductor.ir import FixedLayout
@@ -73,24 +73,6 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
             result[d] = wildcard_symbol(d)
 
     return result
-
-
-def map_host_dims_to_exprs(layout: FixedLayout, index: Expr) -> list[Expr]:
-    """
-    Construct a list of len(layout.size) of the Exprs that are used to index
-    elements of each host dimension.
-    A dimension of size 1 will have an expr of `0`.
-    """
-
-    # TEMPORARY.  Replicate logic of map_dims_to_vars.
-    # To be replaced by @tardieu's new algorithm.
-    host_map = {}
-    for sym in index.free_symbols:
-        stride_val = sympy_subs(index, {sym: 1}) - sympy_subs(index, {sym: 0})
-        if stride_val in layout.stride:
-            idx = layout.stride.index(stride_val)
-            host_map[idx] = sym
-    return [host_map[d] if d in host_map else S.zero for d in range(len(layout.size))]
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
