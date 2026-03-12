@@ -32,7 +32,6 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
-from torch_spyre.execution import OpSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -45,6 +44,7 @@ from .ir import FixedTiledLayout
 from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
+from .op_spec import OpSpec, TensorArg
 import logging
 
 logger = get_inductor_logger("spyre_kernel")

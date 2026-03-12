@@ -23,7 +23,7 @@ from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from . import OpSpec, UnimplementedOp
+from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
