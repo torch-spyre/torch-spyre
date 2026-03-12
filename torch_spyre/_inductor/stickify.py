@@ -146,7 +146,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             case _:
                 in_coords = host_coordinates(x.layout, x.dep)
                 out_coords = host_coordinates(output, output_dep)
-                if in_coords == out_coords and x.index == output_dep.index:
+                if in_coords == out_coords and x.dep.index == output_dep.index:
                     # Input and output tensors are being accessed identically.
                     # We can simply propagate the device_layout.
                     stl = device_layout_like(x.layout, output.dtype)
