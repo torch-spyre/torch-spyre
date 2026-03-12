@@ -32,12 +32,8 @@ spyre_decompositions: dict = {}
 # Some Inductor decompositions do not work reliably on the Spyre backend yet.
 # We disable them here and rely on implicit fallbacks to eager ops instead. Once
 # the blocking issues are resolved, these exclusions can be removed.
-spyre_decompositions_to_exclude = [
-    # The default decomposition for torch.new_ones (defined in pytorch/torch/refs/__init__.py)
-    # uses torch.full, which is not yet supported in Spyre eager mode.
-    # See: https://github.com/torch-spyre/torch-spyre/issues/128#issuecomment-3576168221
-    torch.ops.aten.new_ones,
-]
+#
+spyre_decompositions_to_exclude: list = []
 
 
 def register_spyre_decomposition(
@@ -71,7 +67,7 @@ def enable_spyre_decompositions(
         decomps = torch._inductor.decomposition.decompositions
 
     with _decompositions_lock:
-        from torch_spyre.fallbacks import fallback_ops
+        from torch_spyre.ops.fallbacks import fallback_ops
         from torch._ops import OpOverload, OpOverloadPacket
 
         # Helper function to remove ops from decompositions
@@ -212,6 +208,43 @@ def rmsnorm_decomp(
 # single-element tensors well.
 # Ref: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/fx_passes/joint_graph.py#L324-L335
 #
+# Implement ones via identity broadcast: create a size-1 tensor (ones_scalar), expand to
+# target size, then clone (identity) to materialize. Clone op with identity is merged.
+@register_spyre_decomposition([torch.ops.aten.ones.default])
+def ones_decomp(
+    size: Union[list, tuple],
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    scalar = torch.ops.spyre.ones_scalar(device, dtype=dtype)
+    expanded = scalar.expand(size)
+    return expanded.clone()
+
+
+@register_spyre_decomposition([torch.ops.aten.new_ones.default])
+def new_ones_decomp(
+    self: torch.Tensor,
+    size: Union[list, tuple],
+    *,
+    dtype: Optional[torch.dtype] = None,
+    layout: Optional[torch.layout] = None,
+    device: Optional[torch.device] = None,
+    pin_memory: Optional[bool] = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    dev = device if device is not None else self.device
+    dt = dtype if dtype is not None else self.dtype
+    scalar = torch.ops.spyre.ones_scalar(dev, dtype=dt)
+    expanded = scalar.expand(size)
+    return expanded.clone()
+
+
 # To avoid constant folding, we introduce a custom op `spyre::full` that runs
 # torch.full on CPU and copies the result to Spyre. Remove this workaround once
 # Spyre supports one-element tensors.

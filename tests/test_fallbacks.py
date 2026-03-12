@@ -23,7 +23,7 @@ from torch.testing._internal.common_utils import (
     subtest,
 )
 import warnings
-from torch_spyre.fallbacks import FallbackWarning
+from torch_spyre.ops.fallbacks import FallbackWarning
 
 
 class Op(subtest):

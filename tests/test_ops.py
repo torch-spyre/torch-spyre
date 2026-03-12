@@ -773,7 +773,7 @@ class TestOps(TestCase):
         )
 
     # NOTE: embedding / indirect indexing / index_select are not supported yet
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding(self):
         # an embedding matrix containing 10 tensors of size 3
         embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
@@ -787,7 +787,7 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding_with_padding_idx(self):
         # an embedding matrix containing 10 tensors of size 3
         embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
