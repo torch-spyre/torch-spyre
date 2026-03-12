@@ -151,7 +151,10 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     # We can simply propagate the device_layout.
                     stl = device_layout_like(x.layout, output.dtype)
                 else:
-                    # Use row major adjusted to put stick dimension last
+                    # TODO: This needs further work
+                    # Use row major adjusted to put stick dimension last and any
+                    # non-stick size one dimensions in the output to the interior
+                    # to avoid tiling them.
                     in_device_coords = device_coordinates(x.layout, x.dep)
                     stick_expr = in_device_coords[-1]
                     if is_sparse(x_stl):
@@ -162,7 +165,12 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                     else:
                         out_stick_dim = -1
                     dim_order = [
-                        d for d in range(len(output.size)) if d != out_stick_dim
+                        d
+                        for d in range(len(output.size))
+                        if d != out_stick_dim and out_coords[d] != 0
+                    ]
+                    dim_order += [
+                        d for d in range(len(output.size)) if out_coords[d] == 0
                     ]
                     dim_order += [out_stick_dim]
                     stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
@@ -214,6 +222,7 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             stl = device_layout_like(args[0].layout, output.dtype)
         else:
             # Use row major adjusted to put stick dimension last
+            # TODO: Should we also push size 1 dims to the interior here like in unary above??
             if len(stick_exprs) == 0:
                 raise Unsupported(
                     "pointwise op with views/broadcasts without stick dim"
