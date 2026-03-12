@@ -418,4 +418,5 @@ def spyre_softplus(
 # Once registered, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
 # to route dispatch: inside a ``torch.compile`` context the Spyre function is
 # called directly; outside (eager mode) the pre-compiled wrapper is used.
+# Note: This has to stay at the end of the file.
 _register_spyre_dispatchkey_kernels_permanently()
