@@ -1094,7 +1094,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, x)
 
-
     def test_softplus_cpu(self, x):
         beta = 1.0
         threshold = 20.0
@@ -1103,7 +1102,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.softplus(input, beta, threshold)
 
         compare_with_cpu(fn, x)
-
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
