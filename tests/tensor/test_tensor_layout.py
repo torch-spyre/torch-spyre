@@ -199,7 +199,7 @@ class TestSpyreTensorLayout(TestCase):
         with self.assertRaises(RuntimeError) as context:
             _ = compiled(x_dev, y_dev).cpu()
         self.assertIn(
-            "pointwise op with multiple non-broadcasted stick dims",
+            "pointwise op with nonuniform stick indexing",
             str(context.exception),
         )
 

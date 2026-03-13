@@ -20,7 +20,7 @@ from collections import Counter
 import torch
 import sympy
 
-from torch_spyre._C import compute_view_layout
+from torch_spyre._C import compute_view_layout, DataFormats
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -32,7 +32,6 @@ from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
 
-from torch_spyre.execution import OpSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -45,6 +44,7 @@ from .ir import FixedTiledLayout
 from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
+from .op_spec import OpSpec, TensorArg
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -348,13 +348,14 @@ def create_op_spec(
     op_info: dict[str, Any],
 ) -> OpSpec:
     for arg in args:
-        if arg.dtype == torch.float32 and op not in SPYRE_FP32_OPS:
+        if (
+            arg.device_layout.device_dtype == DataFormats.IEEE_FP32
+            and op not in SPYRE_FP32_OPS
+        ):
             raise Unsupported(f"{op} on {arg.dtype} dtype")
-        elif arg.dtype not in [
-            torch.bool,
-            torch.float16,
-            torch.float32,
-            torch.int64,
+        elif arg.device_layout.device_dtype not in [
+            DataFormats.IEEE_FP32,
+            DataFormats.SEN169_FP16,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return OpSpec(op, is_reduction, [d.numel for d in dims], args, op_info)
