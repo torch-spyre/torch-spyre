@@ -470,6 +470,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
             },
         },
+        ("test_sub_scalar", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "sub_scalar_5": lambda x: torch.sub(x, 5.0),
+                "sub_scalar_neg": lambda x: torch.sub(x, -3.5),
+                "sub_scalar_zero": lambda x: torch.sub(x, 0.0),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),),
+                    ((67, 256),),
+                    ((67, 71, 256),),
+                ]
+            ),
+        },
+        ("test_sub_broadcast", "test_binary_op_cpu"): {
+            "ops_dict": {"sub": torch.sub},
+            "param_sets": {
+                "1d_2d": (
+                    cached_randn((256,)),
+                    cached_randn((67, 256)),
+                ),
+                "2d_3d": (
+                    cached_randn((71, 256)),
+                    cached_randn((67, 71, 256)),
+                ),
+                "scalar_broadcast": (
+                    cached_randn((1,)),
+                    cached_randn((67, 256)),
+                ),
+                "3d_4d": (
+                    cached_randn((12, 32, 64)),
+                    cached_randn((7, 12, 32, 64)),
+                ),
+            },
+        },
+        # TODO
+        # ("test_sub_alpha", "test_binary_op_cpu"): {
+        #     "ops_dict": {
+        #         "sub_alpha_2": lambda a, b: torch.sub(a, b, alpha=2.0),
+        #         "sub_alpha_0.5": lambda a, b: torch.sub(a, b, alpha=0.5),
+        #         "sub_alpha_neg": lambda a, b: torch.sub(a, b, alpha=-1.0),
+        #     },
+        #     "param_sets": make_param_dict(
+        #         [
+        #             ((256,),) * 2,
+        #             ((67, 256),) * 2,
+        #         ]
+        #     ),
+        # },
         (
             "test_alias_operands",
             "test_unary_op",
