@@ -25,7 +25,9 @@ import torch
 from torch import fx
 
 # Reduction operations that support multi-dimensional reduction
-# TODO: Only sum is tested for multi-dimensional reduction. 
+# TODO: Only sum is tested for multi-dimensional reduction.
+# Please note this is an example implementation for now. 
+# It can be considered for future implementation.
 MULTI_DIM_REDUCTION_OPS = {
     torch.ops.aten.sum.dim_IntList,
     torch.ops.aten.mean.dim,
@@ -136,14 +138,8 @@ def _decompose_multi_dim_reduction(
         is_last = (i == len(dims) - 1)
 
         # Adjust dimension index based on previous reductions
-        # When keepdim=False, each reduction removes a dimension, so we need to adjust
         # Since dims is sorted in descending order, we reduce from highest to lowest
-        # After reducing dimension d, all dimensions > d shift down by 1
         adjusted_dim = dim
-        if not keepdim and i > 0:
-            # Count how many higher dimensions have been removed
-            # Since we're processing in descending order, all previous dims were higher
-            adjusted_dim = dim - i
 
         # Create the single-dimension reduction node
         with graph.inserting_before(node):
