@@ -50,10 +50,6 @@ def enable_spyre_context(example_inputs):
         scheduler_passes,
         _maybe_run_scheduler_pass,
     )
-    from .multi_dim_reduction_pass import decompose_multi_dim_reductions
-
-    # Register the multi-dimensional reduction decomposition pass
-    CustomPostPasses.passes.append(decompose_multi_dim_reductions)
 
     # *) Inductor config tweaks (saved/restored)
     import torch._inductor.config as inductor_config
