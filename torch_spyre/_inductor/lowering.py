@@ -445,9 +445,6 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     kwargs = lowering._make_reduction_inner(
         x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
     )
-    if isinstance(axis, int):
-        axis = [axis]
-
     size = x.get_size()
     denom = torch._inductor.utils.sympy_product(size[i] for i in axis)
     scaling_factor = 1.0 / denom
