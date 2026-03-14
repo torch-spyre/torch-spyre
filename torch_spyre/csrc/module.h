@@ -52,5 +52,6 @@ class GlobalRuntime {
   }
 };
 bool get_downcast_warn_enabled();
+bool is_supported_dtype(c10::ScalarType dtype);
 
 }  // namespace spyre

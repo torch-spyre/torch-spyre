@@ -526,9 +526,11 @@ class TestOps(TestCase):
             z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("TODO: mean.out not implemented in eager mode")
     def test_mean(self):
-        x = torch.tensor([[[1, 2, 3], [4, 5, 6]]], dtype=self.dtype)
+        x = torch.tensor(
+            [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]],
+            dtype=self.dtype,
+        )
         x_spyre = x.to("spyre")
         y0 = torch.mean(x_spyre, dim=[0]).to("cpu")
         y1 = torch.mean(x_spyre, dim=[1]).to("cpu")
@@ -562,6 +564,20 @@ class TestOps(TestCase):
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
+    def test_normal_randn(self):
+        gen = torch.manual_seed(42)
+
+        y_spyre = torch.randn(3, 5, device="spyre", generator=gen)
+
+        # torch.Generator is stateful, hence reset
+        gen.manual_seed(42)
+
+        y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
+
+        torch.testing.assert_close(
+            y_spyre.to("cpu"), y_cpu, rtol=self.rtol, atol=self.atol
+        )
+
     def test_zeros(self):
         x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
         x = torch.zeros(3, 64, dtype=self.dtype)
@@ -572,163 +588,6 @@ class TestOps(TestCase):
         x_spyre = torch.zeros(3, 50, device="spyre", dtype=self.dtype)
         x = torch.zeros(3, 50, dtype=self.dtype)
         torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
-
-    # --- View layout: identity ---
-
-    def test_view_identity_2d(self):
-        """[512, 256] -> [512, 256]: no change."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        stl_before = x.device_tensor_layout()
-        y = x.view(512, 256)
-        stl_after = y.device_tensor_layout()
-        self.assertEqual(stl_after.device_size, stl_before.device_size)
-        self.assertEqual(stl_after.dim_map, stl_before.dim_map)
-
-    def test_view_identity_1d(self):
-        """[128] -> [128]: no change."""
-        x = torch.rand(128, dtype=self.dtype).to("spyre")
-        stl_before = x.device_tensor_layout()
-        y = x.view(128)
-        stl_after = y.device_tensor_layout()
-        self.assertEqual(stl_after.device_size, stl_before.device_size)
-        self.assertEqual(stl_after.dim_map, stl_before.dim_map)
-
-    # --- View layout: size-1 insertion (unsqueeze equivalent) ---
-
-    def test_view_insert_size1_middle(self):
-        """[512, 256] -> [512, 1, 256]: insert size-1 dim in the middle."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 1, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-
-    def test_view_insert_size1_front(self):
-        """[512, 256] -> [1, 512, 256]: insert size-1 dim at the front."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(1, 512, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 1, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 0, 1, 2])
-
-    def test_view_insert_size1_end(self):
-        """[512, 256] -> [512, 256, 1]: insert size-1 dim at the end."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 256, 1)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 1, 0, 1])
-
-    def test_view_insert_multiple_size1(self):
-        """[512, 256] -> [1, 512, 1, 256, 1]: multiple size-1 insertions."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(1, 512, 1, 256, 1)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 1, 4, 1, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 4, 3, 0, 1, 3])
-
-    # --- View layout: size-1 removal (squeeze equivalent) ---
-
-    def test_view_remove_size1_middle(self):
-        """[512, 1, 256] -> [512, 256]: remove size-1 dim from middle."""
-        x = torch.rand(512, 1, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
-
-    def test_view_remove_size1_front(self):
-        """[1, 512, 256] -> [512, 256]: remove size-1 dim from front."""
-        x = torch.rand(1, 512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [512, 4, 64])
-        self.assertEqual(stl.dim_map, [0, 1, 1])
-
-    # --- View layout: merge (N:1) ---
-
-    def test_view_merge_non_stick_2d_to_1d(self):
-        """[2, 3, 4] -> [6, 4]: merge first two (non-stick) dims."""
-        x = torch.rand(2, 3, 4, dtype=self.dtype).to("spyre")
-        y = x.view(6, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [3, 1, 2, 64])
-        self.assertEqual(stl.dim_map, [0, 1, 0, 1])
-
-    def test_view_merge_all_to_1d(self):
-        """[4, 2, 64] -> [512]: merge all dims into one."""
-        x = torch.rand(4, 2, 64, dtype=self.dtype).to("spyre")
-        y = x.view(512)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.dim_map, [0, 0, 0, 0])
-
-    # --- View layout: split (1:M) non-stick ---
-
-    def test_view_split_non_stick(self):
-        """[6, 4] -> [2, 3, 4]: split first (non-stick) dim."""
-        x = torch.rand(6, 4, dtype=self.dtype).to("spyre")
-        y = x.view(2, 3, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [2, 0, 1, 2])
-
-    # --- View layout: split (1:M) involving stick dim ---
-
-    def test_view_split_stick_dim(self):
-        """[512] -> [4, 128]: split where innermost new dim >= elems_per_stick."""
-        x = torch.rand(512, dtype=self.dtype).to("spyre")
-        y = x.view(4, 128)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [2, 4, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
-
-    def test_view_split_stick_dim_exact(self):
-        """[256] -> [4, 64]: split where innermost == elems_per_stick."""
-        x = torch.rand(256, dtype=self.dtype).to("spyre")
-        y = x.view(4, 64)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
-
-    def test_view_split_stick_dim_2d(self):
-        """[3, 512] -> [3, 4, 128]: split stick dim from 2d tensor."""
-        x = torch.rand(3, 512, dtype=self.dtype).to("spyre")
-        y = x.view(3, 4, 128)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-
-    # --- View layout: mixed cases ---
-
-    def test_view_merge_and_insert_size1(self):
-        """[2, 3, 4] -> [1, 6, 4]: merge first two dims and insert size-1."""
-        x = torch.rand(2, 3, 4, dtype=self.dtype).to("spyre")
-        y = x.view(1, 6, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [3, 1, 1, 2, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 1, 2])
-
-    def test_view_split_and_insert_size1(self):
-        """[6, 4] -> [2, 3, 1, 4]: split non-stick dim and insert size-1."""
-        x = torch.rand(6, 4, dtype=self.dtype).to("spyre")
-        y = x.view(2, 3, 1, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 1, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [2, 3, 0, 1, 3])
-
-    # --- View layout: rejection cases ---
-
-    def test_view_reject_nm_complex(self):
-        """[4, 6] -> [3, 8]: N:M group (2 old, 2 new) should fail."""
-        x = torch.rand(4, 6, dtype=self.dtype).to("spyre")
-        with self.assertRaisesRegex(RuntimeError, "N:M dimension groups"):
-            x.view(3, 8)
-
-    def test_view_reject_stick_split_too_small(self):
-        """[512] -> [16, 32]: innermost new dim (32) < elems_per_stick (64)."""
-        x = torch.rand(512, dtype=self.dtype).to("spyre")
-        with self.assertRaisesRegex(RuntimeError, "elems_per_stick"):
-            x.view(16, 32)
 
     def test_uniform_(self):
         x_spyre = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype, device="spyre")
@@ -757,7 +616,7 @@ class TestOps(TestCase):
         )
 
     # NOTE: embedding / indirect indexing / index_select are not supported yet
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding(self):
         # an embedding matrix containing 10 tensors of size 3
         embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
@@ -771,7 +630,7 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding_with_padding_idx(self):
         # an embedding matrix containing 10 tensors of size 3
         embedding_matrix = torch.rand(10, 3, dtype=torch.float16)

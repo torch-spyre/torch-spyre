@@ -24,11 +24,15 @@ from typing import Any, Callable, Union
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
-from torch_spyre.fallbacks import fallback_ops
+from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 import threading
+from .logging_utils import get_inductor_logger
+import logging
+
+logger = get_inductor_logger("lowering")
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
 _lowerings_lock = threading.RLock()
@@ -57,7 +61,6 @@ def register_spyre_lowering(
         type_promotion_kind=type_promotion_kind,
         override_return_dtype=override_return_dtype,
     )
-
     return lowering.register_lowering(
         op,
         broadcast=broadcast,
@@ -252,6 +255,14 @@ def lower_mm(x, y):
         )
 
     result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"mm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}, "
+            f"x_layout={x.get_layout()}, y_layout={y.get_layout()}, out_layout={result_buf.get_layout()}"
+        )
+
     return result
 
 
@@ -261,6 +272,7 @@ def lower_bmm(x, y):
     y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()
     y_loader = y.make_loader()
+
     if len(x.get_size()) == 3 and len(y.get_size()) == 3:
 
         def inner_fn(index, reduction_index):
@@ -326,6 +338,13 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
     result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"bmm: x{[int(s) for s in x.get_size()]} @ y{[int(s) for s in y.get_size()]} -> {[int(s) for s in result_buf.get_size()]}"
+        )
+
     return result
 
 
@@ -509,3 +528,28 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
+def clone(x, *, memory_format=None):
+    from torch._inductor.ir import FlexibleLayout, get_stride_order
+    from torch._inductor.lowering import clone as clone_lowering
+
+    result = clone_lowering(x, memory_format=memory_format)
+    # Upstream Inductor ignores memory_format (TODO in clone lowering).
+    # The output gets a FlexibleLayout whose stride order is inferred from
+    # the input's strides via ComputedBuffer.get_fill_order(). When the
+    # input is a non-contiguous view (e.g. a permute), the clone output
+    # inherits those strides instead of the requested memory format.
+    # This causes index/stride mismatches during Spyre's stickify pass.
+    # Fix: freeze the layout to the requested stride order so that
+    # decide_layout() respects the memory_format contract.
+    if memory_format is not None and memory_format != torch.preserve_format:
+        stride_order = get_stride_order(
+            FlexibleLayout.stride_ordered_for_memory_format(
+                result.get_size(), memory_format
+            )
+        )
+        result.realize()
+        result.freeze_layout_with_stride_order(stride_order)
+    return result

@@ -133,7 +133,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             )
         },
-        ("test_mm", "test_binary_op"): {
+        ("test_mm", "test_mm_relaxed"): {
             "ops_dict": {
                 "mm": torch.mm,
                 # "einsum": lambda a, b: torch.einsum('mk, kn -> mn', a, b),  # bmm not supported yet
@@ -147,7 +147,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        ("test_bmm", "test_binary_op"): {
+        ("test_bmm", "test_mm_relaxed"): {
             "ops_dict": {"bmm": torch.bmm},
             "param_sets": make_param_dict(
                 [
@@ -524,6 +524,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_permute",
+            "test_permute",
+        ): {
+            "param_sets": {
+                "4d_0_2_1_3": ((2, 3, 16, 64), (0, 2, 1, 3)),
+                "3d_0_2_1": ((2, 1024, 844), (0, 2, 1)),
+                "4d_0_3_1_2": ((2, 2, 256, 48), (0, 3, 1, 2)),
+                "4d_0_m2_m1_1": ((2, 48, 2, 256), (0, -2, -1, 1)),
+                "5d_0_2_3_4_1": ((2, 48, 2, 256, 265), (0, 2, 3, 4, 1)),
+            },
+        },
+        (
             "test_fallback",
             "test_fallback_cpu",
         ): {
@@ -552,6 +564,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((64, 256)),
                     ([64, 256]),
                 ),
+            },
+        },
+        (
+            "test_ones",
+            "test_ones_cpu",
+        ): {
+            "param_sets": {
+                "1d": ((64,),),
+                "2d_square": ((64, 64),),
+                "2d": ((64, 128),),
+                "3d": ((4, 3, 64),),
+                "2d_padded": ((3, 50),),
             },
         },
         (
@@ -643,6 +667,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d013": {cached_randn((1, 1, 4, 1), dtype=torch.float16)},
                 "4d023": {cached_randn((1, 3, 1, 1), dtype=torch.float16)},
                 "4d123": {cached_randn((2, 1, 1, 1), dtype=torch.float16)},
+            },
+        },
+        (
+            "test_logical_not",
+            "test_fallback_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "logical_not": torch.logical_not,
+            },
+            "param_sets": {
+                "1d_fp16": (cached_randn(128, dtype=torch.float16),),
+                "1d_bool": (cached_randn(128, dtype=torch.float16) > 0,),
+                "2d_fp16": (cached_randn((4, 128), dtype=torch.float16),),
+                "2d_bool": (cached_randn((4, 128), dtype=torch.float16) > 0,),
+                "3d_fp16": (cached_randn((2, 4, 128), dtype=torch.float16),),
+                "3d_bool": (cached_randn((2, 4, 128), dtype=torch.float16) > 0,),
+                "4d_fp16": (cached_randn((1, 2, 4, 128), dtype=torch.float16),),
+                "4d_bool": (cached_randn((1, 2, 4, 128), dtype=torch.float16) > 0,),
+                "fp16_single_elem": (cached_randn(1, dtype=torch.float16),),
+                "bool_single_elem": (cached_randn(1, dtype=torch.float16) > 0,),
+                # TODO: Fix torch.eq(-0.0,0.0) equality bug (Issue 628)
+                # "fp16_signed_0": (torch.tensor([0.0, -0.0, 1.0, -1.0], dtype=torch.float16),),
             },
         },
         (
@@ -839,7 +885,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):
         if op == torch.reciprocal:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
@@ -870,6 +916,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_fallback_unary_op_cpu(self, op, x):
+        compare_with_cpu(op, x)
+
     def test_binary_op(self, op, a, b):
         if op == torch.div:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
@@ -878,9 +928,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         if a.dtype == torch.float32:
             compare_with_cpu(op, a, b)
-        elif op == torch.bmm:
-            compare(op, a, b)
         else:
+            compare(op, a, b)
+
+    # Increased mm test tolerance for splitk
+    def test_mm_relaxed(self, op, a, b):
+        K = b.shape[-2]
+        if K >= (128 // b.element_size()):  # multiple sticks
+            compare(op, a, b, atol=0.1, rtol=0.1)
+        else:  # single stick, no need to relax
             compare(op, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
@@ -941,6 +997,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
 
+    def test_permute(self, input_dims, dims):
+        compare_with_cpu(
+            lambda input: torch.permute(input, dims),
+            cached_randn(input_dims, dtype=torch.float16),
+        )
+
     def test_dropout_functional(self, input, kwargs):
         compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
 
@@ -953,7 +1015,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, dst, src)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
         def fn(t):
             t = torch.exp(t)  # compiled op
@@ -966,20 +1028,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         print(f"Warn {len(record)}")
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_arange_cpu(self, *args):
         def fn(device=None):
             return torch.arange(*args, dtype=torch.float16, device=device)
 
         compare_with_cpu(fn, needs_device=True)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_new_ones_cpu(self, x, y):
         compare_with_cpu(lambda x: x.new_ones((x.size())), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_ones_cpu(self, size):
+        """Compiled torch.ones(size) on Spyre (identity broadcast) matches CPU."""
+
+        def fn(device=None):
+            return torch.ones(size, dtype=torch.float16, device=device)
+
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
     def test_numel_cpu(self, x):
         compare_with_cpu(lambda x: torch.numel(x), x)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
         def fn(device=None):
             return torch.full(*args, dtype=torch.float16, device=device)
@@ -1008,14 +1080,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, input, weight, bias)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_rmsnorm_cpu(self, x):
         def fn(input):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
 
         compare_with_cpu(fn, x)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
         def test(end, device=None):
             return torch.arange(end, device=device, dtype=torch.float16)

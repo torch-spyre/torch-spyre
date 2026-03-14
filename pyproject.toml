@@ -81,7 +81,7 @@ line-length = 88
 
 [tool.mypy]
 ignore_missing_imports = true
-exclude=["tests/_inductor"]
+exclude=["tests/inductor"]
 
 [[tool.mypy.overrides]]
 module = ["torch_spyre._inductor.*"]

@@ -119,6 +119,8 @@ class SpyreTensorImpl : public at::TensorImpl {
   ~SpyreTensorImpl() = default;
 
   SpyreTensorLayout spyre_layout;
+  std::vector<int64_t> dma_sizes;
+  std::vector<int64_t> dma_strides;
 
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);

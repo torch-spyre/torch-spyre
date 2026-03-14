@@ -27,6 +27,9 @@ import math
 
 
 def generate_transpose(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    # dimensions is in output order; swap back to input order
+    dimensions = list(dimensions)
+    dimensions[0], dimensions[1] = dimensions[1], dimensions[0]
     return {
         "reshape": {
             "numCoresUsed_": 1,
@@ -206,6 +209,10 @@ def generate_transpose(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 def generate_transpose_3d_stick(
     pointers, *, op, dimensions, inputs, outputs, transposed_dims, **kwargs
 ):
+    # dimensions is in output order; swap back to input order
+    dimensions = list(dimensions)
+    d0, d1 = transposed_dims
+    dimensions[d0], dimensions[d1] = dimensions[d1], dimensions[d0]
     transpose_0_2 = 0 in transposed_dims and 2 in transposed_dims
     return {
         "reshape": {
@@ -646,6 +653,10 @@ def generate_slice(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 def generate_transpose_4d_stick(
     pointers, *, op, dimensions, inputs, outputs, transposed_dims, **kwargs
 ):
+    # dimensions is in output order; swap back to input order
+    dimensions = list(dimensions)
+    d0, d1 = transposed_dims
+    dimensions[d0], dimensions[d1] = dimensions[d1], dimensions[d0]
     transpose_0_3 = 0 in transposed_dims
     transpose_2_3 = 2 in transposed_dims
     input_dtype = inputs[0]["device_layout"].device_dtype
@@ -941,7 +952,7 @@ def generate_identity(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     cores = 1
 
     # Get operation dim map from the tensor that represents the operation space
-    op_dims_tensor = inputs[0]
+    op_dims_tensor = outputs[0]
     dl = op_dims_tensor["device_layout"]
     dim_map = dl.dim_map[::-1][1:]
     dim_labels = INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
@@ -1038,11 +1049,11 @@ def generate_identity(pointers, *, op, dimensions, inputs, outputs, **kwargs):
                                 "component_": "hbm"
                                 if tensor["lx_addr"] is None
                                 else "lx",
-                                "layoutDimOrder_": dim_infos.get_tensor_layout_order(
-                                    tensor
+                                "layoutDimOrder_": dim_infos.get_tensor_op_layout_order(
+                                    tensor, op
                                 ),
                                 "maxDimSizes_": [-1]
-                                * len(dim_infos.get_tensor_layout_order(tensor)),
+                                * len(dim_infos.get_tensor_op_layout_order(tensor, op)),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
