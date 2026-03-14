@@ -20,13 +20,13 @@ The transformation is applied to reduction operations that reduce along multiple
 dimensions, rewriting them as a sequence of single-dimension reductions.
 """
 
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 import torch
 from torch import fx
 
 # Reduction operations that support multi-dimensional reduction
 # TODO: Only sum is tested for multi-dimensional reduction.
-# Example implementation for now  
+# Example implementation for now
 MULTI_DIM_REDUCTION_OPS = {
     torch.ops.aten.sum.dim_IntList,
     torch.ops.aten.mean.dim,
@@ -42,15 +42,17 @@ def _normalize_dims(dims: Union[int, List[int]], ndim: int) -> List[int]:
     """
     if isinstance(dims, int):
         dims = [dims]
-    
+
     normalized = []
     for d in dims:
         if d < 0:
             d = ndim + d
         if d < 0 or d >= ndim:
-            raise ValueError(f"Dimension {d} out of range for tensor with {ndim} dimensions")
+            raise ValueError(
+                f"Dimension {d} out of range for tensor with {ndim} dimensions"
+            )
         normalized.append(d)
-    
+
     return sorted(set(normalized), reverse=True)
 
 
@@ -60,9 +62,9 @@ def _get_reduction_dims(node: fx.Node) -> Optional[Union[int, List[int]]]:
     """
     if "dim" in node.kwargs:
         return node.kwargs["dim"]
-   
-    # Sanity check for dim - sum, mean, amax, amin, prod 
-   
+
+    # Sanity check for dim - sum, mean, amax, amin, prod
+
     if node.target in {torch.ops.aten.sum.dim_IntList, torch.ops.aten.mean.dim}:
         if len(node.args) >= 2:
             return node.args[1]
@@ -72,7 +74,7 @@ def _get_reduction_dims(node: fx.Node) -> Optional[Union[int, List[int]]]:
     elif node.target == torch.ops.aten.prod.dim_int:
         if len(node.args) >= 2:
             return node.args[1]
-    
+
     return None
 
 
@@ -82,7 +84,7 @@ def _get_keepdim(node: fx.Node) -> bool:
     """
     if "keepdim" in node.kwargs:
         return node.kwargs["keepdim"]
-    
+
     if node.target in {
         torch.ops.aten.sum.dim_IntList,
         torch.ops.aten.mean.dim,
@@ -90,10 +92,10 @@ def _get_keepdim(node: fx.Node) -> bool:
         torch.ops.aten.amin.default,
         torch.ops.aten.prod.dim_int,
     }:
-    # most of cases keepdim is there  the 3rd argument
+        # most of cases keepdim is there  the 3rd argument
         if len(node.args) >= 3:
             return node.args[2]
-    
+
     return False
 
 
@@ -103,7 +105,7 @@ def _get_dtype(node: fx.Node) -> Optional[torch.dtype]:
     """
     if "dtype" in node.kwargs:
         return node.kwargs["dtype"]
-    
+
     if node.target in {
         torch.ops.aten.sum.dim_IntList,
         torch.ops.aten.mean.dim,
@@ -112,9 +114,8 @@ def _get_dtype(node: fx.Node) -> Optional[torch.dtype]:
         # dtype is typically the 4th argument
         if len(node.args) >= 4:
             return node.args[3]
-    
-    return None
 
+    return None
 
 
 def _decompose_multi_dim_reduction(
@@ -134,7 +135,7 @@ def _decompose_multi_dim_reduction(
     # Strategy: Always use the user's keepdim setting for ALL reductions
     # When keepdim=False, we need to adjust dimension indices after each reduction
     for i, dim in enumerate(dims):
-        is_last = (i == len(dims) - 1)
+        is_last = i == len(dims) - 1
 
         # Since dims is sorted in descending order, we reduce from highest to lowest
         adjusted_dim = dim
@@ -143,7 +144,7 @@ def _decompose_multi_dim_reduction(
         with graph.inserting_before(node):
             # Build positional args for the reduction
             args = (current, adjusted_dim, keepdim)
-            # Build kwargs for the reduction 
+            # Build kwargs for the reduction
             # only dtype as kwargs only for the last reduction as needed basis.
             kwargs = {}
             if dtype is not None and is_last:
@@ -156,6 +157,7 @@ def _decompose_multi_dim_reduction(
             )
 
     return current
+
 
 def decompose_multi_dim_reductions(graph: fx.Graph) -> None:
     """
@@ -171,7 +173,7 @@ def decompose_multi_dim_reductions(graph: fx.Graph) -> None:
         if node.op != "call_function" or node.target not in MULTI_DIM_REDUCTION_OPS:
             continue
 
-        # helper function to get reduction parameter 
+        # helper function to get reduction parameter
         dims = _get_reduction_dims(node)
         if dims is None:
             continue
