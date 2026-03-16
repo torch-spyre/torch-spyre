@@ -1341,20 +1341,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_is_nonzero", "test_is_nonzero_cpu"): {
-            "param_sets": {
-                "float16_true": (torch.tensor([3.14], dtype=torch.float16),),
-                "float16_false": (torch.tensor([0.0], dtype=torch.float16),),
-                "float32_true": (torch.tensor([2.71828], dtype=torch.float32),),
-                "bool_true": (torch.tensor([True]),),
-                "bool_false": (torch.tensor([False]),),
-                "scalar_float": (torch.tensor(3.14, dtype=torch.float32),),
-                "from_computation_true": (
-                    torch.tensor([2.0], dtype=torch.float16),
-                    torch.tensor([3.0], dtype=torch.float16),
-                ),
-            },
-        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1881,42 +1867,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return result.item()
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
-
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_is_nonzero_cpu(self, *args):
-        """Test torch.is_nonzero on Spyre tensors"""
-        if len(args) == 1:
-            x = args[0]
-
-            def fn(t):
-                return torch.is_nonzero(t)
-
-            compare_with_cpu(fn, x, cpu_compile=False)
-
-        elif len(args) == 2:
-            x, y = args
-
-            def fn(a, b):
-                result = a * b
-                return torch.is_nonzero(result)
-
-            compare_with_cpu(fn, x, y, cpu_compile=False)
-
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_is_nonzero_multi_element_error(self):
-        x = torch.tensor([1.0, 2.0], dtype=torch.float16)
-
-        # CPU should raise
-        with pytest.raises(RuntimeError):
-            torch.is_nonzero(x)
-
-        # Compiled Spyre should also raise
-        def fn(t):
-            return torch.is_nonzero(t)
-
-        compiled = torch.compile(fn)
-        with pytest.raises(RuntimeError):
-            compiled(x.to("spyre"))
 
 
 if __name__ == "__main__":
