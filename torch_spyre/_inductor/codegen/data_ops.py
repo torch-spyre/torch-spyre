@@ -27,6 +27,9 @@ import math
 
 
 def generate_transpose(pointers, *, op, dimensions, inputs, outputs, **kwargs):
+    # dimensions is in output order; swap back to input order
+    dimensions = list(dimensions)
+    dimensions[0], dimensions[1] = dimensions[1], dimensions[0]
     return {
         "reshape": {
             "numCoresUsed_": 1,
@@ -206,6 +209,10 @@ def generate_transpose(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 def generate_transpose_3d_stick(
     pointers, *, op, dimensions, inputs, outputs, transposed_dims, **kwargs
 ):
+    # dimensions is in output order; swap back to input order
+    dimensions = list(dimensions)
+    d0, d1 = transposed_dims
+    dimensions[d0], dimensions[d1] = dimensions[d1], dimensions[d0]
     transpose_0_2 = 0 in transposed_dims and 2 in transposed_dims
     return {
         "reshape": {
@@ -646,6 +653,10 @@ def generate_slice(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 def generate_transpose_4d_stick(
     pointers, *, op, dimensions, inputs, outputs, transposed_dims, **kwargs
 ):
+    # dimensions is in output order; swap back to input order
+    dimensions = list(dimensions)
+    d0, d1 = transposed_dims
+    dimensions[d0], dimensions[d1] = dimensions[d1], dimensions[d0]
     transpose_0_3 = 0 in transposed_dims
     transpose_2_3 = 2 in transposed_dims
     input_dtype = inputs[0]["device_layout"].device_dtype

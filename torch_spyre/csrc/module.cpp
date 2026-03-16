@@ -234,6 +234,15 @@ DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
   return sen_dtype_dev;
 }
 
+bool is_supported_dtype(c10::ScalarType dtype) {
+  // TODO(kmehant,yoheiueda): Replace this heuristic with a reliable method to
+  // determine supported dtypes. Using elems_per_stick can miss certain
+  // unsupported dtypes. See #950
+  DataFormats sen_dtype_dev = get_device_dtype(dtype);
+  return sen_dtype_dev != DataFormats::INVALID &&
+         elems_per_stick(sen_dtype_dev) > 0;
+}
+
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -268,7 +277,9 @@ PYBIND11_MODULE(_C, m) {
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
-  m.def("spyre_reinterpret_tensor", &spyre::spyre_reinterpret_tensor);
+  m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
+  m.def("reinterpret_tensor_with_layout",
+        &spyre::reinterpret_tensor_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
@@ -295,7 +306,6 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
-  m.def("compute_view_layout", &spyre::compute_view_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
