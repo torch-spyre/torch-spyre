@@ -41,6 +41,27 @@ class TensorArg:
 
 
 @dataclasses.dataclass
+class ShapeArg:
+    """
+    A class representing a Tensor argument to a KernelSpec
+
+    Attributes:
+        is_input: Is the Tensor used as an input to the operation?
+        arg_index: The index of the Tensor in the argument array of the Kernel.
+        dtype: The PyTorch (host) dtype of the tensor elements.
+        host_size: The PyTorch (host) size of the Tensor.
+        allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        device_layout: The SpyreTensorLayout describe the on device shape of the Tensor.
+    """
+
+    name: str
+    min: int
+    max: int
+    dtype: torch.dtype
+   
+ 
+
+@dataclasses.dataclass
 class ConstantArg:
     """
     A class representing a Constant argument to a KernelSpec
@@ -74,7 +95,8 @@ class KernelSpec:
 
     op: str
     is_reduction: bool
-    dimensions: list[int]
+    #dimensions: list[int]
+    dimensions: Union[int, torch.SymInt]
     args: Sequence[TensorArg | ConstantArg]
     scales: list[list[int]]
     op_info: dict[str, Any]

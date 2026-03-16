@@ -19,6 +19,7 @@ from collections import Counter
 
 import torch
 import sympy
+from sympy import Symbol
 
 from torch_spyre._C import compute_view_layout
 
@@ -31,8 +32,10 @@ from torch._inductor.ops_handler import DefaultHandler
 from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import StoreMode, V
+from typing import Any, Sequence, Union
+from torch.fx.experimental.symbolic_shapes import SymInt
 
-from .runtime import ConstantArg, KernelSpec, TensorArg
+from .runtime import ConstantArg, KernelSpec, TensorArg, ShapeArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -352,7 +355,6 @@ def create_kernel_spec(
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
 
-
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -411,11 +413,13 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.derive_dim_info(dst)
-            args: list[TensorArg | ConstantArg] = []
+            args: list[TensorArg | ConstantArg | ShapeArg] = []
             scales = []
+           
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     scale = self.analyze_tensor_access(di, input)
+                    size = [s if isinstance(s, int) else str(s) for s in input.layout.size]
                     args.append(
                         create_tensor_arg(
                             True,
@@ -437,6 +441,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     dst.layout,
                 )
             )
+            #if isinstance(input,SymInt) in args:
+            args.append(ShapeArg(str(di[0].numel) if isinstance(di[0].numel, Symbol) else di.numel, 0, 2048, torch.float16))
             scales.append(scale)
             op_info.update(value.op_info)
             self.kernel_specs.append(
@@ -697,19 +703,35 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
 
         return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
 
+    # def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
+    #     """
+    #     Return the iteration space implied by the tensor access
+    #     """
+    #     var_ranges = self.var_ranges()
+    #     if var_ranges:
+    #         dim_map = map_dims_to_vars(access.layout, access.index)
+    #         return [
+    #             #DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
+    #             DimensionInfo(dim_map[v], (var_ranges.get(dim_map[v], 1)))
+    #             for v in sorted(dim_map)
+    #         ]
+    #     else:
+    #         return [DimensionInfo(wildcard_symbol(0), 1)]
+        
     def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
-        """
-        Return the iteration space implied by the tensor access
-        """
         var_ranges = self.var_ranges()
-        if var_ranges:
-            dim_map = map_dims_to_vars(access.layout, access.index)
-            return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
-                for v in sorted(dim_map)
-            ]
-        else:
-            return [DimensionInfo(wildcard_symbol(0), 1)]
+        dim_map = map_dims_to_vars(access.layout, access.index)
+    
+        infos = []
+        for v in sorted(dim_map):
+            var_name = dim_map[v] # e.g., s52
+            var_size = var_ranges.get(var_name, 1)
+            
+            # Ensure var_name is treated as a symbol, not just a string
+            infos.append(DimensionInfo(var_name, var_size))
+                
+        return infos
+
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its KernelSpec"""
@@ -724,15 +746,22 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             with buf.indent():
                 buf.writeline(f"op='{ks.op}',")
                 buf.writeline(f"is_reduction={ks.is_reduction},")
-                buf.writeline(f"dimensions={ks.dimensions!r},")
+                buf.writeline(f"dimensions={[str(d) if isinstance(d, Symbol) else d for d in ks.dimensions]!r},")
+                #buf.writeline(f"dimensions={ks.dimensions!r},")
                 buf.writeline(f"scales={ks.scales!r},")
                 buf.writeline(f"op_info={ks.op_info!r},")
                 buf.writeline("args=[")
                 with buf.indent():
                     for arg in ks.args:
-                        buf.writeline(f"{arg!r},")
+                        if hasattr(arg, 'host_size'):
+                            arg.host_size = [str(s) if isinstance(s, Symbol) else s for s in arg.host_size]
+                            buf.writeline(f"{arg!r},")
+                        else:
+                            buf.writeline(f"{arg!r},")
+                       # [str(d) if isinstance(d, torch.SymInt) for d in ks.dimensions]
+                       # buf.writeline(f"{['{arg}' str(d) if not isinstance(d, int) else d for d in ks.dimensions]},")
                 buf.writeline("]")
-            buf.writeline(")")
+            buf.writeline(")") 
 
         return buf.getvalue()
 

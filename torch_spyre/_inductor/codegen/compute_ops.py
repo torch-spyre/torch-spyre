@@ -15,6 +15,7 @@
 import math
 from dataclasses import dataclass
 from sympy import Symbol
+from sympy import sympify
 
 
 from torch_spyre._C import encode_constant, DataFormats
@@ -73,13 +74,16 @@ class DimInfos:
         # Non-consecutive dim_indices can occur because dims of size 1 are deleted on device.
         # Current code expects dim_indices to be consecutive, so reindex them.
         # If this creates problems in the future, update Diminfos to support non-consecutive indices
-        reindex_map = {v: k for k, v in enumerate(sorted(dim_indices))}
-        self.dim_indices = [reindex_map[x] for x in dim_indices]
+        # reindex_map = {v: k for k, v in enumerate(sorted(dim_indices))}
+        # self.dim_indices = [reindex_map[x] for x in dim_indices]
+        self.dim_indices =dim_indices
         self.ndim = len(dim_indices)
         self.rows: dict[str, list] = {}
         self.add_row("label", labels)
         self.add_row("unpadded_size", unpadded_sizes)
+        unpadded_sizes =[sympify(item) for item in unpadded_sizes]
         self.add_row("padded_size", padded_sizes)
+        padded_sizes ==[sympify(item) for item in padded_sizes]
         self.add_row("nsplits", nsplits)
         self.add_row(
             "split_size",
@@ -92,9 +96,14 @@ class DimInfos:
                 for padded_size, unpadded_size in zip(padded_sizes, unpadded_sizes)
             ],
         )
-        assert all(p >= 0 for p in self.rows["padding"]), (
-            "Negative padding found, check padded and unpadded sizes"
-        )
+        #assert all(p >= 0 for p in self.rows["padding"]), (
+            #"Negative padding found, check padded and unpadded sizes"
+        for p in self.rows["padding"]:
+            if p.is_number and p < 0:
+                raise ValueError(f"Negative padding found: {p}")
+            if p.is_negative:  # SymPy logic for symbols known to be negative
+                raise ValueError(f"Symbolic padding {p} is guaranteed to be negative")
+        #)
 
     # Internal implementation functions.
     def add_row(self, name, info_list):
