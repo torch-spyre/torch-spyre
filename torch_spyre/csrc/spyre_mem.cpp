@@ -25,43 +25,22 @@
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
 #include <torch/library.h>
-#include <util/sen_data_convert.h>
 
 #include <algorithm>
-#include <cassert>
-#include <flex/flex_graph_builder.hpp>
-#include <memory>
-#include <sendnn/graph/graph_builder.hpp>
-#include <sendnn/interface/graph_loader.hpp>
-#include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/sentensor_info.hpp>
-#include <sendnn/util/status.hpp>
-#include <string>
 #include <utility>
 #include <vector>
 
 #include "logging.h"
 #include "module.h"
+#include "spyre_allocator.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_storage_impl.h"
+#include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "types_mapping.h"
 
 namespace spyre {
 
-using DataConversionStrideInfo = data_conversion_stride_info;
-using DataConversionInfo = data_conversion_info;
-
-/* struct holding the parameters for DMA-based copy
-   size_bytes: number of bytes to transfer
-   src_offset: offset from src base pointer
-   dst_offset: offset from destination base pointer
- */
-struct DMAParameters {
-  const int64_t size_bytes;
-  const off64_t src_offset;
-  const off64_t dst_offset;
-};
 /*
  * CPU stride for a dimension.
  *
@@ -241,16 +220,15 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * Generate description of data conversion for a tensor.
  *
  * @param tensor: tensor to convert
- * @return data conversion information in string
+ * @return data conversion information
  */
 auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
-                  bool host2device) -> std::string {
+                  bool host2device) -> DataConversionInfo {
   /*   host2device = true : then 'tensor' is CPU-tensor
    *   host2device = false: then 'tensor' is Spyre-tensor
    */
   auto str_type = torchScalarToString[tensor->scalar_type()];
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
-  std::stringstream s;
 
   DataConversionInfo dci{};
   dci.dci_dsName_ = "DCI-Tensor-0";
@@ -283,244 +261,8 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
-  dci.exportJson(s);
-  DEBUGINFO("DataConversionInfo: ", s.str());
-  return s.str();
+  return dci;
 }
-
-auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
-                      bool host2device)
-    -> std::shared_ptr<sendnn::GraphLoader> {
-  /* self = source
-   * dst  = destination
-   */
-  const at::Tensor* dev_tensor;
-  const at::Tensor* cpu_tensor;
-  if (host2device) {
-    cpu_tensor = &self;
-    dev_tensor = &dst;
-  } else {
-    cpu_tensor = &dst;
-    dev_tensor = &self;
-  }
-
-  auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
-  const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
-  auto layout = sendnn::TensorLayout::NHWC;
-  SpyreTensorLayout stl = get_spyre_tensor_layout(host2device ? dst : self);
-  sendnn::TensorShape dev_tensor_shape(stl.device_size);
-
-  // ti = transfer info
-  // dci = data conversion info
-  sendnn::TensorInfo cpu_ti(sen_dtype_cpu,
-                            sendnn::TensorShape(cpu_tensor->sizes().vec()),
-                            layout, sendnn::TensorLocation::HOST());
-  sendnn::TensorInfo dev_ti(sen_dtype_dev, dev_tensor_shape, layout,
-                            sendnn::TensorLocation::DEVICE());
-  sendnn::TensorInfo dci_ti(sen_dtype_dev, dev_tensor_shape, layout,
-                            sendnn::TensorLocation::HOST());
-  //  STAGE 1: execution graph
-  sendnn::SubGraph sub_graph;
-  const auto [elem_bytes_cpu, elem_bytes_spyre] =
-      spyre::elementSize(cpu_tensor->scalar_type());
-  int64_t xfer_size = dev_tensor_shape.Volume() * elem_bytes_spyre;
-  {
-    flex::FlexGraphBuilder gb;
-    DMAParameters dma_param{xfer_size, 0, 0};
-    if (host2device) {
-      auto inp_node = gb.PrimaryInput("Input", dci_ti);
-      auto xfer_node = gb.SenDataTransfer(
-          "Host2Sen-Transfer",
-          dev_ti,    // output (holding shape, type, and location DEVICE)
-          inp_node,  // input (node created using PrimaryInput and on HOST)
-          dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
-      auto out_node = gb.PrimaryOutput("Output", xfer_node);
-    } else {
-      auto inp_node = gb.PrimaryInput("Input", dev_ti);
-      auto xfer_node = gb.SenDataTransfer(
-          "Sen2Host-Transfer",
-          dci_ti,    // output (holding shape, type and location HOST)
-          inp_node,  // input (node created as a result of SenDataTransfer)
-          dev_ti.DataSize(), dma_param.src_offset, dma_param.dst_offset);
-      auto out_node = gb.PrimaryOutput("Output", xfer_node);
-    }
-
-    SEN_THROW_NOK(gb.Finalize(&sub_graph));
-  }
-  sendnn::SubGraph exec_graph;
-  {  // add above subgraph as part of SenFusedDeviceCompute node
-    flex::FlexGraphBuilder gb;
-    auto dci = generate_dci(dev_tensor, stl, host2device);
-    if (host2device) {
-      auto inp_node = gb.PrimaryInput("Input", cpu_ti);
-      auto dci_node = gb.SenHostCompute("Host2Sen-HostPrep", {dci_ti},
-                                        {inp_node}, "SenDataConvert", dci);
-
-      auto dev_node = gb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
-                                               {dci_node}, sub_graph);
-      gb.PrimaryOutput("Output", dev_node->OutputPort(0));
-    } else {
-      sendnn::Node* inp_node = gb.PrimaryInput("Input", dci_ti);
-      auto dev_node = gb.SenFusedDeviceCompute("SenFusedDeviceNode_0", {dci_ti},
-                                               {inp_node}, sub_graph);
-      auto dci_node = gb.SenHostCompute("Sen2Host-HostPrep", cpu_ti, dev_node,
-                                        "SenDataConvert", dci);
-
-      gb.PrimaryOutput("Output", dci_node->OutputPort(0));
-    }
-
-    SEN_THROW_NOK(gb.Finalize(&exec_graph));
-  }
-
-  sendnn::SegmentTable segment_table = {
-      sendnn::Segment::PRIMARY_OUT(xfer_size),
-      sendnn::Segment::PRIMARY_IN(xfer_size),
-      sendnn::Segment::INVALID,
-      sendnn::Segment::INVALID,
-      sendnn::Segment::INVALID,
-      sendnn::Segment::INVALID,
-      sendnn::Segment::INVALID,
-      sendnn::Segment::PROGRAM(128),
-  };
-  // STAGE 2: SenSuperNodeV2 graph
-  sendnn::Graph sn_graph;  // sn = supernode
-  {                        // SenSuperNodeV2 graph
-    flex::FlexGraphBuilder gb;
-
-    sendnn::TensorInfo inp_ti =
-        sendnn::TensorInfo(exec_graph.input_ops_.front()->OutputAt(0));
-    sendnn::TensorInfo out_ti =
-        sendnn::TensorInfo(exec_graph.output_ops_.front()->InputAt(0));
-    sendnn::NodeOrIndexedNode inp_node = gb.PrimaryInput("Input", inp_ti);
-
-    std::string k_uuid = "dma-network";
-    sendnn::attributes::SenPartitionInit part_init;
-    part_init.network_uuid_ = k_uuid;
-    part_init.partition_idx_ = 0;
-    part_init.segment_table_ = segment_table;
-
-    auto sn =
-        gb.SenSuperNodeV2("SenSuperNodeV2_0", {out_ti}, {inp_node}, k_uuid, 0,
-                          1, part_init, exec_graph, {}, false, true, true);
-    gb.PrimaryOutput("Output", {0, sn});
-
-    SEN_THROW_NOK(gb.Finalize(&sn_graph));
-  }
-
-  // STAGE 3:
-  std::shared_ptr<sendnn::GraphLoader> gl;
-  gl = std::make_shared<sendnn::GraphLoader>(GlobalRuntime::get());
-  {
-    SEN_THROW_NOK(gl->LoadGraph(sn_graph));
-    SEN_THROW_NOK(gl->CompileGraph());
-    SEN_THROW_NOK(gl->ParseGraph());
-  }
-  return gl;
-}
-
-auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
-  std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, true);
-  if (!gl) {
-    DEBUGINFO("GraphLoader is null!");
-    return;
-  }
-  // execute
-  constexpr int sn_idx = 0;
-  constexpr int tensor_idx = 0;
-  auto inp_tensor = createInputTensor(*gl, self.storage().data_ptr().get(),
-                                      tensor_idx, sn_idx);
-  auto* ctx =
-      static_cast<SharedOwnerCtx*>(dst.storage().data_ptr().get_context());
-  flex::DeviceMemoryAllocationPtr& dev_data = ctx->owner;
-  inp_tensor.SetSpyreData(dev_data);  // ctx->owner;
-
-  SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
-}
-
-auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
-  std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, false);
-  // execute
-  constexpr int sn_idx = 0;
-  constexpr int tensor_idx = 0;
-  auto out_tensor = createOutputTensor(*gl, dst.storage().data_ptr().get(),
-                                       tensor_idx, sn_idx);
-  auto* ctx =
-      static_cast<SharedOwnerCtx*>(self.storage().data_ptr().get_context());
-  out_tensor.SetSpyreData(ctx->owner);
-  SEN_THROW_NOK(gl->Copy({out_tensor}, sendnn::Inputs(), sn_idx));
-}
-
-// A custom allocator for our custom device, what returns is a handle to the
-// allocated memory not the actual pointer
-struct SpyreAllocator final : public at::Allocator {
- private:
-  SpyreAllocator() = default;
-  flex::DeviceMemoryAllocatorPtr getAllocator(unsigned int dev_id) {
-    return GlobalRuntime::get()
-        ->GetDeviceHandle(dev_id)
-        ->GetDeviceMemoryAllocator();
-  }
-
- public:
-  static SpyreAllocator& instance() {
-    static SpyreAllocator allocator;
-    return allocator;
-  }
-
-  at::DataPtr allocate(size_t nbytes) override {
-    c10::Device curr_device =
-        c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
-            ->getDevice();
-
-    auto device_id = curr_device.index();
-    DEBUGINFO("allocating ", nbytes, " (bytes) on Spyre", curr_device);
-    if (nbytes <= 0) {
-      return {nullptr, nullptr, &ReportAndDelete, curr_device};
-    }
-    auto allocator = getAllocator(device_id);
-    flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-    // NOTE: last argument should be set to 0
-    allocator->TryAllocate(&data, nbytes, 0);
-    TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-    auto* ctx = new SharedOwnerCtx{std::move(data), device_id};
-    void* ctx_void = static_cast<void*>(ctx);
-
-    void* data_void = static_cast<void*>(ctx->owner.get());
-
-    auto data_ptr_result =
-        at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
-
-    return data_ptr_result;
-  }
-
-  static void ReportAndDelete(void* ctx_void) {
-    if (!ctx_void) {
-      return;
-    }
-    auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-    delete ctx;
-  }
-
-  // The raw deleter only gets passed the data ptr, no context, so
-  // it would not work right now. To implement this, we first need to
-  // create a runtime interface that can correctly free an allocation
-  // only based on the data ptr, without the allocation idx from the
-  // context
-  at::DeleterFnPtr raw_deleter() const override {
-    return nullptr;
-  }
-
-  void copy_data(void* dest, const void* src, std::size_t count) const final {
-    py::gil_scoped_acquire acquire;
-    DEBUGINFO("entering allocator->copy_data method");
-    // do nothing -- look into when this is called
-    // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
-    // reinterpret_cast<spyre_ptr_t>(src));
-  }
-};
-
-// Register our custom allocator
-REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
 
 // Empty op needs C++ code and cannot be handled by python side fallback
 at::Tensor spyre_empty(c10::IntArrayRef size,
@@ -664,46 +406,17 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
-  DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
-  at::Storage source_storage;
-  at::Storage dest_storage;
-
-  // TODO(tmhoangt): add type conversion node
-  TORCH_CHECK(
-      self.scalar_type() == dst.scalar_type(),
-      "Spyre backend does not support type conversion yet during copy.");
-
-  if (self.is_cpu() && dst.is_privateuseone()) {
-    if (self.dim() == 0) {
-      at::Tensor tmp_tensor = self.reshape({1});
-      copy_host_to_device(tmp_tensor, dst);
-    } else {
-      copy_host_to_device(self, dst);
-    }
-    return dst;
-
-  } else if (self.is_privateuseone() && dst.is_cpu()) {
-    copy_device_to_host(self, dst);
-    return dst;
-
-  } else if (self.is_privateuseone() && dst.is_privateuseone()) {
-    // Copy from Spyre to Spyre
-    // FIXME: This will need to be addressed for proper spyre to spyre copy
-    source_storage =
-        (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->storage();
-    dest_storage =
-        (static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl()))->storage();
-    DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
-              source_storage.device(), "to", dest_storage.device());
-    std::memcpy(dest_storage.data_ptr().get(), source_storage.data_ptr().get(),
-                source_storage.nbytes());
-    DEBUGINFO("Finished Copying ");
-    return dst;
+  SpyreStream stream;
+  if (dst.is_privateuseone()) {
+    stream = getCurrentStream(dst.device());
   } else {
-    // For all other cases fallback to the upstream implementation
-    return at::_copy_from(self, dst, non_blocking);
+    stream = getCurrentStream(self.device());
   }
+  stream.copyAsync(self, dst);
+  if (!non_blocking) {
+    stream.synchronize();
+  }
+  return dst;
 }
 
 at::Tensor to_with_layout(const at::Tensor& self,
