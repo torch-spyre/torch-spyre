@@ -913,6 +913,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
         torch.testing.assert_close(result, torch.eq(x, y))
 
+    def test_scalar_cpu(self):
+        def fn(x):
+            a = torch.add(x, 1.0)
+            b = torch.add(1.0, a)
+            c = torch.add(b, 1.0)
+            d = torch.sub(c, 2.0)
+            e = torch.mul(5, d)
+            out = torch.add(e, e)
+            return out
+
+        x = torch.rand(512, 1024, dtype=torch.float16)
+        compare_with_cpu(fn, x)
+
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
 

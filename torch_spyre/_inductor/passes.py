@@ -24,7 +24,7 @@ from torch._inductor.custom_graph_pass import (
 )
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from .temp_passes import relayout_linear_weights
+from .temp_passes import relayout_linear_weights, replace_scalar_with_tensor
 from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
@@ -72,7 +72,10 @@ class CustomPostPasses(CustomGraphPass):
     """
     The list of custom passes to run
     """
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = [relayout_linear_weights]
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        relayout_linear_weights,
+        replace_scalar_with_tensor,
+    ]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPostPasses.passes:

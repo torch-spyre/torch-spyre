@@ -39,3 +39,54 @@ def relayout_linear_weights(graph: torch.fx.Graph) -> None:
                         kwargs={"memory_format": torch.contiguous_format},
                     )
                     node.update_arg(1, contiguous_node)
+
+
+def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
+    """
+    Replace constant arguments to any operation with tensor.
+    Scalars are converted to size=1 tensor and passed to the corresponding
+    operations which was consuming the scalar value.
+    """
+
+    ops_support_list = [
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.mul.Tensor,
+    ]
+
+    # Created node cache for scalar values, and reuse the node when
+    # the scalar found again.
+    const_node_map: dict[int | float, torch.fx.node.Node] = {}
+
+    for node in graph.nodes:
+        if node.target not in ops_support_list:
+            continue
+        scalar_indexes = []
+        for i in range(len(node.args)):
+            in_arg = node.args[i]
+            if not isinstance(in_arg, torch.fx.node.Node):
+                if isinstance(in_arg, (int, float)):
+                    scalar_indexes.append(i)
+                else:
+                    print(f"Warning: unhandled node type {type(in_arg)}")
+
+        if len(scalar_indexes) > 0:
+            with graph.inserting_before(node):
+                for idx in scalar_indexes:
+                    scalar_val = node.args[idx]
+                    if scalar_val in const_node_map:
+                        full_node = const_node_map[scalar_val]
+                    else:
+                        # Currently the dtype of the scalar tensor is set as same as the output dtype.
+                        # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
+                        # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
+                        dtype = torch.float16
+                        meta = node.meta.get("tensor_meta", None)
+                        if meta:
+                            dtype = meta.dtype
+                        full_node = graph.call_function(
+                            torch.ops.spyre.full.default,
+                            args=((1,), scalar_val, torch.device("spyre"), dtype),
+                        )
+                        const_node_map[scalar_val] = full_node
+                    node.update_arg(idx, full_node)
