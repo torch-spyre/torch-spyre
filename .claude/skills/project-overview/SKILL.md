@@ -85,7 +85,6 @@ torch-spyre/
 │   ├── adding_operations.md     # How to add new ops
 │   └── work_division_*.md       # Multi-core parallelism docs
 │
-├── RFCs/                        # Design RFCs (0047-TiledTensors, 0171-SpyreDevice, 0682-KtirSpec)
 ├── examples/                    # Usage examples (softmax, gelu, mul, etc.)
 ├── setup.py                     # Build: codegen + C++ extension compilation
 ├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.10.0)
