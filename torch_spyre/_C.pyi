@@ -11,7 +11,6 @@ __all__: list[str] = [
     "DataFormats",
     "SpyreTensorLayout",
     "as_strided_with_layout",
-    "compute_view_layout",
     "convert_artifacts",
     "empty_with_layout",
     "encode_constant",
@@ -151,9 +150,6 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def compute_view_layout(
-    arg0: tuple[int, ...], arg1: tuple[int, ...], arg2: SpyreTensorLayout
-) -> SpyreTensorLayout: ...
 def convert_artifacts(arg0: str) -> None: ...
 def empty_with_layout(
     arg0: tuple[int, ...],

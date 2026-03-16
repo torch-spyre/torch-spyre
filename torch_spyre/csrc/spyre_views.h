@@ -23,13 +23,19 @@ namespace spyre {
 
 class SpyreTensorLayout;
 
-SpyreTensorLayout compute_view_layout(c10::IntArrayRef old_sizes,
-                                      c10::IntArrayRef new_sizes,
-                                      const SpyreTensorLayout& old_stl);
+at::Tensor reinterpret_tensor(const at::Tensor& self, c10::IntArrayRef size,
+                              c10::IntArrayRef stride,
+                              int64_t offset_increment);
 
-at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
-                                    c10::IntArrayRef size,
-                                    c10::IntArrayRef stride,
-                                    int64_t offset_increment);
+at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
+                                          c10::IntArrayRef size,
+                                          c10::IntArrayRef stride,
+                                          int64_t offset_increment,
+                                          SpyreTensorLayout stl);
+
+at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
+                                  c10::IntArrayRef stride,
+                                  std::optional<int64_t> storage_offset_,
+                                  SpyreTensorLayout device_layout);
 
 }  // namespace spyre

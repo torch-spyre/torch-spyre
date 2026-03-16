@@ -1,0 +1,78 @@
+model: template
+
+default:
+  dtype: fp16
+  seed: 123
+  rtol: 5.0e-3
+  atol: 5.0e-3
+
+cases:
+  - name: mul_basic
+    op: torch.mul
+    inputs:
+      - tensor: {shape: [4, 128, 768], init: rand}
+      - tensor: {shape: [4, 128, 768], init: rand}
+    description: |
+      This is some of the text File: site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:138 in forward, code: next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+
+  - name: op_bool_tensors
+    op: torch.logical_and
+    inputs:
+      - tensor: {shape: [11, 6], dtype: bool}
+      - tensor: {shape: [11, 6], dtype: bool}
+    description: |
+      ops with args of randomly generated bool tensors (50% chance of True)
+
+  - name: op_different_dtypes
+    op: torch.add
+    inputs:
+      - tensor: {shape: [11, 6], dtype: fp32, init: rand}
+      - tensor: {shape: [11, 6], dtype: int64, init: randint, init_args: {high: 100}}
+    description: |
+      ops with args of different dtypes
+
+  - name: mul_tensor_scalar
+    op: torch.mul
+    inputs:
+      - tensor: {shape: [1, 64], init: rand, init_args: {low: -1.0, high: 1.0}}
+      - value: 3.0
+    description: |
+      ops with tensor and scalar as args 
+
+  - name: mul_inttensor_scalar
+    op: torch.mul
+    inputs:
+      - tensor: {shape: [1, 64], init: randint, init_args: {low: 1, high: 100}}
+      - value: 3
+    description: |
+      ops with tensor and scalar as args 
+
+  - name: aten_view
+    op: torch.ops.aten.view
+    inputs:
+      - tensor: {shape: [1, 64]}
+      - value: [2, 32]
+    description: |
+      value can accept scalar, list or tuple
+
+  - name: softmax_lastdim
+    op: torch.nn.functional.softmax
+    attrs: {dim: -1}
+    inputs:
+      - tensor: {shape: [2, 4, 8], init: rand}
+
+  - name: cat_list
+    op: torch.cat
+    attrs: {dim: -1}
+    inputs:
+      - tensor_list:
+          - {shape: [2, 3, 4], init: rand}
+          - {shape: [2, 3, 5], init: rand}
+
+  - name: getitem_ellipsis_none_fullslice
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [32, 5760]
+          init: rand
+      - py: (Ellipsis, None, slice(None, None, None))

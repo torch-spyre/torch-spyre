@@ -23,6 +23,7 @@ from torch._inductor.codegen.wrapper import (
 from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
+
 from .stickify import FixedTiledLayout
 
 
@@ -52,7 +53,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         super().write_header()
         self.imports.splice(
             """
-                from torch_spyre.execution import ConstantArg, TensorArg, OpSpec, UnimplementedOp
+                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
                 import subprocess
@@ -60,7 +61,10 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             strip=True,
         )
         self.header.writeline(
-            "from torch_spyre._C import spyre_reinterpret_tensor as reinterpret_tensor"
+            "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
+        )
+        self.header.writeline(
+            "from torch_spyre._C import reinterpret_tensor_with_layout"
         )
         self.header.writeline("del async_compile")
         self.header.writeline("async_compile = SpyreAsyncCompile()")
@@ -83,6 +87,21 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         )
 
         return out
+
+    def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
+        assert old.get_dtype() == new.get_dtype()
+        old_name = old.get_name()
+        new_name = new.get_name()
+        del_line = ";"
+        if old_name not in V.graph.get_output_names() and delete_old:
+            del_line = f"; {self.make_buffer_free(old)}"
+
+        if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
+            return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
+
+        new_stl = new.get_layout().device_layout
+        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
+        return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
 
 def noop_simplify_loops_impl(

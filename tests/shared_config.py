@@ -1,0 +1,1 @@
+_PYTEST_CONFIG = None

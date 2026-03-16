@@ -14,6 +14,9 @@
 
 import logging
 
+from sympy import Symbol
+
+
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
@@ -39,12 +42,16 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
-    compute_view_layout,
 )
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps, map_dims_to_vars, is_wildcard
+from .pass_utils import (
+    SchedNodeArg,
+    get_mem_deps,
+    host_coordinates,
+    device_coordinates,
+)
 
 logger = get_inductor_logger("stickify")
 
@@ -91,45 +98,10 @@ def device_layout_like(
         )
 
 
-def derive_dim_order(template: SpyreTensorLayout, rank: int) -> list[int]:
-    """
-    Given a template device layout and a desired rank, return a dim_order
-    that can be used to construct a SpyreTensorLayout whose on device tiling
-    will be similar to the template.
-
-    If the template is using the default tiling pattern where the stick dimension
-    is split and tiled with one other dimension, we are able to do this exactly.
-    In the unusual case of there being multiple dimensions tiled with the stick dimension,
-    there is no such dim_map.  In this case, we log a warning and return a dim map that
-    corresponds to the default tiling for the given rank.
-    """
-
-    # 1 D template; nothing to learn
-    if len(template.dim_map) == 2:
-        return list(range(rank))
-
-    # Recognize default tiling
-    if (template.dim_map[-1] == template.dim_map[-3]) and (
-        len(template.dim_map) == len(set(template.dim_map)) + 1
-    ):
-        # Invert tiling to construct matching dim_order
-        dim_order = template.dim_map[-2:-1] + template.dim_map[:-2]
-        dim_order = [d for d in dim_order if d < rank and d >= 0]
-        if len(dim_order) == rank:
-            return dim_order
-        # Add any missing ranks to the front
-        for r in range(rank):
-            if r not in dim_order:
-                dim_order = [r] + dim_order
-        return dim_order
-
-    logger.warning(f"could not derive dim order from {template}")
-    return list(range(rank))
-
-
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
+    output_dep = next(iter(n.read_writes.writes))
     origin_node = next(iter(pw.origins))
     op = origin_node.target
 
@@ -143,6 +115,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 if len(x.layout.size) != 1:
                     raise Unsupported("slice on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype)
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
 
             case spyreop.swap.default:
                 if not is_sparse(x_stl):
@@ -150,6 +125,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 if len(x.layout.size) != 1:
                     raise Unsupported("swap on non 1-D tensor")
                 stl = SpyreTensorLayout(output.size, output.dtype, [0, -1])
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
 
             case aten.clone.default:
                 if is_sparse(x_stl):
@@ -161,87 +139,105 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 stl = SpyreTensorLayout(
                     output.size, output.dtype, list(range(len(output.size)))
                 )
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
 
             case _:
-                in_size = x.layout.size
-                out_size = output.size
-
-                if in_size == out_size:
-                    # Sizes match exactly; propagate the input's SpyreTensorLayout
+                in_coords = host_coordinates(x.layout, x.dep)
+                out_coords = host_coordinates(output, output_dep)
+                if in_coords == out_coords and x.dep.index == output_dep.index:
+                    # Input and output tensors are being accessed identically.
+                    # We can simply propagate the device_layout.
                     stl = device_layout_like(x.layout, output.dtype)
-                elif [s for s in in_size if s != 1] == [s for s in out_size if s != 1]:
-                    # Squeezed sizes match; use view machinery to compute output layout
-                    try:
-                        stl = compute_view_layout(
-                            torch.Size(in_size), torch.Size(out_size), x_stl
-                        )
-                    except RuntimeError:
-                        # TODO: This is a legal PyTorch operation.
-                        # However, it may require us to inject a restickify to perform it.
-                        raise Unsupported(
-                            f"Spyre limitation: incompatible device sizes: {op}({in_size})=>{out_size}) "
-                        )
                 else:
-                    # This should have been rejected by PyTorch. This is not a legal operation.
-                    raise Unsupported(f"size mismatch: {op}({in_size})=>{out_size}) ")
+                    # TODO: This needs further work
+                    # Use row major adjusted to put stick dimension last and any
+                    # non-stick size one dimensions in the output to the interior
+                    # to avoid tiling them.
+                    in_device_coords = device_coordinates(x.layout, x.dep)
+                    stick_expr = in_device_coords[-1]
+                    if is_sparse(x_stl):
+                        raise Unsupported("TODO: unary op with view on sparse tensor")
 
-        return FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
+                    if stick_expr in out_coords:
+                        out_stick_dim = out_coords.index(stick_expr)
+                    else:
+                        out_stick_dim = -1
+                    dim_order = [
+                        d
+                        for d in range(len(output.size))
+                        if d != out_stick_dim and out_coords[d] != 0
+                    ]
+                    dim_order += [
+                        d for d in range(len(output.size)) if out_coords[d] == 0
+                    ]
+                    dim_order += [out_stick_dim]
+                    stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
+
     elif op == spyreop.layernormnorm.default:
         # Output layout is determined by layout of first argument only
         x = args[0]
         x_stl = x.layout.device_layout
-        if not x.layout.size == output.size:
+        if x.layout.size != output.size or x.layout.stride != output.stride:
             raise Unsupported(
-                f"device size mismatch:  layernormnorm({x.layout.size})=>{output.size}) "
+                f"views not supported for spyre.layernormnorm({x.layout.size})=>{output.size}) "
             )
         stl = SpyreTensorLayout(x_stl.device_size, x_stl.dim_map, x_stl.device_dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
     else:
+        in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
+        in_device_coords = [device_coordinates(arg.layout, arg.dep) for arg in args]
+        out_coords = host_coordinates(output, output_dep)
+
         # Stick compatability check.
-        # All stick dimensions not being broadcast must correspond to the same variable in the iteration space.
-        input_dim_to_vars = [
-            map_dims_to_vars(arg.layout, arg.dep.index) for arg in args
-        ]
-        stick_vars = set()
-        for arg, arg_dim_map in zip(args, input_dim_to_vars):
-            stick_dim = arg.layout.device_layout.host_stick_dim()
-            if stick_dim is not None and stick_dim in arg_dim_map:
-                sv = arg_dim_map[stick_dim]
-                if not is_wildcard(sv):
-                    stick_vars.add(arg_dim_map[stick_dim])
-        if len(stick_vars) > 1:
+        # For all tensors whose stick dimension is being iterated over,
+        # the indexing expression must be identical.
+        stick_exprs = set()
+        for idc in in_device_coords:
+            if idc[-1] != 0:
+                stick_exprs.add(idc[-1])
+
+        if len(stick_exprs) > 1:
             # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
             raise Unsupported(
-                "Spyre limitation: pointwise op with multiple non-broadcasted stick dims"
+                f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
             )
 
-        # Case 1: There exists a non-broadcasting input.
-        # Propagate its device_layout to the output.
-        for arg in args:
-            if arg.layout.size == output.size:
-                stl = device_layout_like(arg.layout, output.dtype)
-                return FixedTiledLayout(
-                    output.device, output.dtype, output.size, output.stride, stl
+        # See if the indexing across all inputs and the output is identical.
+        can_use_same_layout = True
+        for arg, arg_coors in zip(args, in_coords):
+            if arg_coors != out_coords or arg.dep.index != output_dep.index:
+                can_use_same_layout = False
+                break
+
+        if can_use_same_layout:
+            # Identical indexing. Therefore no views or broadcasts. Just propagate layout
+            stl = device_layout_like(args[0].layout, output.dtype)
+        else:
+            # Use row major adjusted to put stick dimension last
+            # TODO: Should we also push size 1 dims to the interior here like in unary above??
+            if len(stick_exprs) == 0:
+                raise Unsupported(
+                    "pointwise op with views/broadcasts without stick dim"
                 )
 
-        # Case 2: All inputs are broadcasting at least one dimension.
-        #         If we haven't already rejected the operation as needing
-        #         restickification, it must be the case that output is a dense tensor.
-        #         Hueristically pick the tensor with most non-broadcast dimensions
-        #         and derive a dim_order to use for the output from it.
-        chosen = args[0]
-        used_dims = len(input_dim_to_vars[0])
-        for arg, arg_dim_map in zip(args, input_dim_to_vars):
-            if len(arg_dim_map) > used_dims:
-                chosen = arg
-                used_dims = len(arg_dim_map)
+            stick_expr = next(iter(stick_exprs))
+            if stick_expr in out_coords:
+                out_stick_dim = out_coords.index(stick_expr)
+            else:
+                out_stick_dim = -1
 
-        dim_order = derive_dim_order(chosen.layout.device_layout, len(output.size))
-        stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+            dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+            dim_order += [out_stick_dim]
+            stl = SpyreTensorLayout(output.size, output.dtype, dim_order)
+
         result = FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
@@ -261,43 +257,56 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
-    output_dims = map_dims_to_vars(output, list(n.read_writes.writes)[0].index)
-    if red.reduction_type == MATMUL_REDUCTION_OP:
-        x_stl = args[0].layout.device_layout
-        y_stl = args[1].layout.device_layout
+    output_dep = next(iter(n.read_writes.writes))
+    if (
+        red.reduction_type == MATMUL_REDUCTION_OP
+        or red.reduction_type == BATCH_MATMUL_OP
+    ):
+        x = args[0]
+        y = args[1]
+        x_stl = x.layout.device_layout
+        y_stl = y.layout.device_layout
         if is_sparse(x_stl) or is_sparse(y_stl):
-            raise Unsupported(f"matmul on sparse tensors {x_stl} {y_stl}")
-        if x_stl.host_stick_dim() == 0 and y_stl.host_stick_dim() == 0:
-            out_dim_order = [1, 0]
-        elif x_stl.host_stick_dim() != 0 and y_stl.host_stick_dim() != 0:
-            out_dim_order = [0, 1]
-        else:
-            raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
-        stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
-        return FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
-    elif red.reduction_type == BATCH_MATMUL_OP:
-        x_layout = args[0].layout
-        y_layout = args[1].layout
-        x_stl = x_layout.device_layout
-        y_stl = y_layout.device_layout
-        x_dims = len(x_layout.size)
-        y_dims = len(y_layout.size)
+            raise Unsupported(f"{red.reduction_type} on sparse tensor {x_stl} {y_stl}")
+
+        x_coords = host_coordinates(x.layout, x.dep)
+        x_dev_coords = device_coordinates(x.layout, x.dep)
+        y_coords = host_coordinates(y.layout, y.dep)
+        y_dev_coords = device_coordinates(y.layout, y.dep)
+        out_coords = host_coordinates(output, output_dep)
+        x_stick_expr = x_dev_coords[-1]
+        y_stick_expr = y_dev_coords[-1]
+        try:
+            x_stick_dim = x_coords.index(x_stick_expr)
+            y_stick_dim = y_coords.index(y_stick_expr)
+        except ValueError:
+            raise Unsupported(
+                f"{red.reduction_type}: failed to map stick_dims to host coords"
+            )
+
+        if (
+            x_stick_dim != len(x.layout.size) - 1
+            or y_stick_dim != len(y.layout.size) - 1
+            or not isinstance(x_stick_expr, Symbol)
+            or not isinstance(y_stick_expr, Symbol)
+        ):
+            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
+            raise Unsupported(
+                f"Spyre limitation: {red.reduction_type} requires restickify"
+            )
+        try:
+            out_stick_dim = out_coords.index(y_stick_expr)
+        except ValueError:
+            raise Unsupported(
+                f"{red.reduction_type}: failed to map output stick_dim to host coords {out_coords} {y_stick_expr}"
+            )
+
         out_dims = len(output.size)
-        if is_sparse(x_stl) or is_sparse(y_stl):
-            raise Unsupported(f"bmm on sparse tensors {x_stl} {y_stl}")
         out_dim_order = list(range(out_dims - 2))
-        if (x_stl.host_stick_dim() == (x_dims - 1)) and (
-            y_stl.host_stick_dim() == (y_dims - 1)
-        ):
+        if out_stick_dim == out_dims - 1:
             out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
-        elif (x_stl.host_stick_dim() == (x_dims - 1)) and (
-            y_stl.host_stick_dim() == (y_dims - 1)
-        ):
-            out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
         else:
-            raise Unsupported(f"bmm stick dimensions mismatch {x_stl} {y_stl}")
+            out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
@@ -315,11 +324,23 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     else:
         x = args[0]
         x_stl = x.layout.device_layout
-        out_dim_order = derive_dim_order(x_stl, len(output.size))
-        in_dims = map_dims_to_vars(x.layout, x.dep.index)
-        stick_dim_var = in_dims.get(x_stl.host_stick_dim(), None)
-        if stick_dim_var not in output_dims.values():
-            out_dim_order = out_dim_order + [-1]
+
+        x_coords = host_coordinates(x.layout, x.dep)
+        x_dev_coords = device_coordinates(x.layout, x.dep)
+        out_coords = host_coordinates(output, output_dep)
+        x_stick_expr = x_dev_coords[-1]
+        if not isinstance(x_stick_expr, Symbol) or x_stick_expr == 0:
+            # TODO: Not clear if we can do this or not; defer for now
+            raise Unsupported("reduction with transposed stick dim")
+        sparse = x_stick_expr not in out_coords
+        if sparse:
+            out_dim_order = list(range(len(output.size))) + [-1]
+        else:
+            out_stick_dim = out_coords.index(x_stick_expr)
+            out_dim_order = [
+                d for d in list(range(len(output.size))) if d != out_stick_dim
+            ]
+            out_dim_order = out_dim_order + [out_stick_dim]
         stl = SpyreTensorLayout(output.size, output.dtype, out_dim_order)
         result = FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
@@ -376,7 +397,7 @@ def propagate_spyre_tensor_layouts(
 
     # Nodes are in topological order (guarenteed by caller).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
-    # performed by the node to convert its output FixedLayouts to FixedTiledLayouts.
+    # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
 
     it = iter(nodes)
     for n in it:

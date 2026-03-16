@@ -20,19 +20,17 @@ from collections import Counter
 import torch
 import sympy
 
-from torch_spyre._C import compute_view_layout
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 
 from torch._inductor.codegen.common import (
     CSEVariable,
-    IndentedBuffer,
     Kernel,
 )
-from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.codegen.simd import SIMDKernel
-from torch._inductor.utils import sympy_subs
-from torch._inductor.virtualized import StoreMode, V
+from torch._inductor.utils import IndentedBuffer, sympy_subs
+from torch._inductor.virtualized import V
 
-from torch_spyre.execution import ConstantArg, OpSpec, TensorArg
 from .constants import (
     MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
@@ -42,9 +40,14 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol
+from .pass_utils import (
+    is_wildcard,
+    map_dims_to_vars,
+    wildcard_symbol,
+)
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
+from .op_spec import OpSpec, TensorArg
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -70,10 +73,12 @@ class TensorAccess(RValue):
         if is_sparse(self.layout.device_layout):
             new_size = self.layout.size + [1]
             new_stride = self.layout.stride + [1]
-            new_stl = compute_view_layout(
-                torch.Size(self.layout.size),
-                torch.Size(new_size),
-                self.layout.device_layout,
+            old_stl = self.layout.device_layout
+            new_dim_map = [
+                len(self.layout.size) if d == -1 else d for d in old_stl.dim_map
+            ]
+            new_stl = SpyreTensorLayout(
+                old_stl.device_size, new_dim_map, old_stl.device_dtype
             )
             new_layout = FixedTiledLayout(
                 self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
@@ -344,17 +349,18 @@ def create_op_spec(
     op: str,
     is_reduction: bool,
     dims: list[DimensionInfo],
-    args: Sequence[TensorArg | ConstantArg],
+    args: Sequence[TensorArg],
     op_info: dict[str, Any],
 ) -> OpSpec:
     for arg in args:
-        if arg.dtype == torch.float32 and op not in SPYRE_FP32_OPS:
+        if (
+            arg.device_layout.device_dtype == DataFormats.IEEE_FP32
+            and op not in SPYRE_FP32_OPS
+        ):
             raise Unsupported(f"{op} on {arg.dtype} dtype")
-        elif arg.dtype not in [
-            torch.bool,
-            torch.float16,
-            torch.float32,
-            torch.int64,
+        elif arg.device_layout.device_dtype not in [
+            DataFormats.IEEE_FP32,
+            DataFormats.SEN169_FP16,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return OpSpec(op, is_reduction, [d.numel for d in dims], args, op_info)
@@ -451,12 +457,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
             di = self.derive_dim_info(dst)
-            args: list[TensorArg | ConstantArg] = []
+            args: list[TensorArg] = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input, di))
-                elif isinstance(input, Constant):
-                    args.append(ConstantArg(input.value, input.dtype))
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst, di))
@@ -473,45 +477,41 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             ]
             in_stl = args[0].device_layout  # type: ignore[union-attr]
             out_stl = args[1].device_layout  # type: ignore[union-attr]
-            if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
-                # Determine data op based on tensor args
-                if (
-                    Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
-                    and in_stl.device_size != out_stl.device_size
-                ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
-                    # Transpose:
-                    #   - check that the input / output DimensionInfo are the same, but in different order.
-                    #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
-                    op = TRANSPOSE_OP
-                elif all(is_wildcard(d.var) for d in in_di) and not all(
-                    is_wildcard(d.var) for d in out_di
-                ):
-                    # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
-                    op = CLONE_OP
-                    in_di = out_di
-                    args[0] = self.create_tensor_arg(True, value.name, value, in_di)
-                elif in_stl.device_size == out_stl.device_size:
-                    # Clone: check that device layout is the same.
-                    op = CLONE_OP
-                else:
-                    # Unsupported data operation on TensorArg
-                    raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
+            # Determine data op based on tensor args
+            if (
+                Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
+                and in_stl.device_size != out_stl.device_size
+            ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
+                # Transpose:
+                #   - check that the input / output DimensionInfo are the same, but in different order.
+                #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
+                op = TRANSPOSE_OP
+            elif all(is_wildcard(d.var) for d in in_di) and not all(
+                is_wildcard(d.var) for d in out_di
+            ):
+                # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
+                op = CLONE_OP
+                in_di = out_di
+                args[0] = self.create_tensor_arg(True, value.name, value, in_di)
+            elif in_stl.device_size == out_stl.device_size:
+                # Clone: check that device layout is the same.
+                op = CLONE_OP
             else:
-                # Unsupported data operation on ConstantArg
-                raise Unsupported(f"Data operation on {type(args[0])}")
+                # Unsupported data operation on TensorArg
+                raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
-            op_spec = create_op_spec(op, False, in_di, args, op_info)
+            op_spec = create_op_spec(op, False, out_di, args, op_info)
             if op == TRANSPOSE_OP:
                 op_spec.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d] != out_di[d]
                 ]
-                # Reorder scale of the output  to implement transpositions
+                # Reorder it_dim_map of the input to implement transpositions
                 (
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
                 ) = (
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
                 )
             self.op_specs.append(op_spec)
         else:
