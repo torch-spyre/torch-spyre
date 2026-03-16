@@ -23,11 +23,8 @@ from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from . import OpSpec, ConstantArg, UnimplementedOp
-from .kernel_runner import (
-    SpyreSDSCKernelRunner,
-    SpyreUnimplementedRunner,
-)
+from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
+from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
 
@@ -65,15 +62,12 @@ class SpyreAsyncCompile:
                     if kernel_name.split("_")[-1] == k.replace("lx:", ""):
                         lx_addr = addr
 
-                if isinstance(ts, ConstantArg):
-                    raise RuntimeError("TOOO: implement SDSC generation for constants")
-                elif ts.is_input:
+                if ts.is_input:
                     inputs.append(
                         {
                             "name": _argument_names[index],
-                            "scale": ts.it_dim_map,
+                            "it_dim_map": ts.it_dim_map,
                             "device_layout": ts.device_layout,
-                            "host_size": ts.host_size,
                             "lx_addr": lx_addr,
                         }
                     )
@@ -82,9 +76,8 @@ class SpyreAsyncCompile:
                     outputs.append(
                         {
                             "name": _argument_names[index],
-                            "scale": ts.it_dim_map,
+                            "it_dim_map": ts.it_dim_map,
                             "device_layout": ts.device_layout,
-                            "host_size": ts.host_size,
                             "lx_addr": lx_addr,
                         }
                     )

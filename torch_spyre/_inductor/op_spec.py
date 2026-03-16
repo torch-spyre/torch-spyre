@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import dataclasses
-from typing import Any, Sequence, Union
+from typing import Any, Sequence
 import torch
 from torch_spyre._C import SpyreTensorLayout
 
@@ -27,12 +28,10 @@ class TensorArg:
         is_input: Is the Tensor used as an input to the operation?
         arg_index: The index of the Tensor in the argument array of the Kernel.
         dtype: The PyTorch (host) dtype of the tensor elements.
-        host_size: The PyTorch (host) size of the Tensor.
         it_dim_map: A mapping between the op's iteration_space and the PyTorch (host) dimensions of the Tensor.
             it_dim_map[d] is an integer that is interpreted as follows:
                 -1 indicates the the d-th dimension of ks.iteration_space is a broadcast or reduction dimension for this Tensor.
                 A non-negative value is the PyTorch (host) dimension of the Tensor that corresponds to the d-th dimension of ks.iteration_space.
-                For non-negative values it must be true that ks.iteration_space[d] == host_size[it_dim_map[d]].
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
         device_layout: The SpyreTensorLayout describe the device shape of the Tensor.
     """
@@ -40,24 +39,9 @@ class TensorArg:
     is_input: bool
     arg_index: int
     dtype: torch.dtype
-    host_size: torch.Size
     it_dim_map: list[int]
     allocation: Any
     device_layout: SpyreTensorLayout
-
-
-@dataclasses.dataclass
-class ConstantArg:
-    """
-    A class representing a Constant argument to an OpSpec
-
-    Attributes:
-        value: The value of the constant.
-        dtype: The PyTorch (host) dtype of the constant.
-    """
-
-    value: Union[bool, float, int]
-    dtype: torch.dtype
 
 
 @dataclasses.dataclass
@@ -76,7 +60,7 @@ class OpSpec:
     op: str
     is_reduction: bool
     iteration_space: list[int]
-    args: Sequence[TensorArg | ConstantArg]
+    args: Sequence[TensorArg]
     op_info: dict[str, Any]
 
 

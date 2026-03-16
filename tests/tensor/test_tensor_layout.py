@@ -20,7 +20,6 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     to_with_layout,
     get_device_dtype,
-    compute_view_layout,
 )
 
 
@@ -144,27 +143,6 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
         self.assertEqual(x_stl.dim_map, [1, -1, 0, -1])
 
-    def test_compute_view_layout(self):
-        stl = SpyreTensorLayout((3, 5, 128), torch.float16)
-        self.assertEqual(stl.device_size, [5, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-        unsqueeze_stl = compute_view_layout((3, 5, 128), (3, 5, 1, 128), stl)
-        self.assertEqual(unsqueeze_stl.device_size, [5, 1, 2, 3, 64])
-        self.assertEqual(unsqueeze_stl.dim_map, [1, 2, 3, 0, 3])
-        fused_stl = compute_view_layout((3, 5, 128), (15, 1, 128), stl)
-        self.assertEqual(fused_stl.device_size, [5, 1, 2, 3, 64])
-        self.assertEqual(fused_stl.dim_map, [0, 1, 2, 0, 2])
-
-        # A k-dim tensor with a size 1 stick dimension is interchangeable with a sparse tensor of dim k-1
-        stl = SpyreTensorLayout((5, 128, 1), torch.float16)
-        self.assertEqual(stl.device_size, [128, 1, 5, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-        sparse_stl = compute_view_layout((5, 128, 1), (5, 128), stl)
-        self.assertEqual(sparse_stl.device_size, [128, 1, 5, 64])
-        self.assertEqual(sparse_stl.dim_map, [1, -1, 0, -1])
-        dense_stl = compute_view_layout((5, 128), (5, 128, 1), sparse_stl)
-        self.assertEqual(stl, dense_stl)
-
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
         x = torch.rand(3, 2, 2048, dtype=torch.float16)
@@ -199,7 +177,7 @@ class TestSpyreTensorLayout(TestCase):
         with self.assertRaises(RuntimeError) as context:
             _ = compiled(x_dev, y_dev).cpu()
         self.assertIn(
-            "pointwise op with multiple non-broadcasted stick dims",
+            "pointwise op with nonuniform stick indexing",
             str(context.exception),
         )
 
