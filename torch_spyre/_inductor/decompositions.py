@@ -195,7 +195,6 @@ def rmsnorm_decomp(
     # TODO: limitation with mean on dim=-1, transpose for now to avoid
     # https://github.com/torch-spyre/torch-spyre/issues/632
     input = input.transpose(-1, -2).contiguous()
-    eps = torch.ops.spyre.full(input.shape, eps, dtype=torch.float16, device="spyre")
     rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps
     output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
     if weight is not None:
