@@ -40,12 +40,12 @@ class SpyreTensorLayout {
   std::vector<int64_t> device_size;
 
   /**
-   * DEPRECATED: use stride_map instead.
    * Record the mapping from host size to device_size.
    * It has len(device_size) entires whose values are indices in the host size
    * vector. Stick dimensions will appear twice; non-stick dimensions will
    * appear once.
    */
+  [[deprecated("Use stride_map instead.")]]
   std::vector<int32_t> dim_map;
 
   /**
