@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import shutil
 from pathlib import Path
-import os
 from typing import cast
 
 os.environ.setdefault(
@@ -27,8 +27,7 @@ os.environ.setdefault(
 
 import glob
 
-
-from setuptools import setup, Command
+from setuptools import Command, setup
 
 PATH_NAME = "torch_spyre"
 PACKAGE_NAME = "torch_spyre"
@@ -116,7 +115,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-LIBRARIES = ["sendnn", "sendnn_interface", "flex", "dee_internal"]
+LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
@@ -151,8 +150,8 @@ class clean(Command):
 
 
 def run_codegen():
-    import sys
     import importlib
+    import sys
 
     is_meta = any(
         cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]

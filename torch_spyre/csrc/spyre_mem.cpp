@@ -29,7 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
-#include <flex/flex_graph_builder.hpp>
+#include <flex/graph/graph_builder/flex_graph_builder.hpp>
 #include <memory>
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/interface/graph_loader.hpp>

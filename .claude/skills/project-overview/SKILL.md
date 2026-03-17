@@ -199,11 +199,10 @@ Two separate pybind11 modules:
 1. **Codegen**: `codegen/gen.py` → generates `torch_spyre/codegen_ops.py`
    (requires `sendnn`)
 2. **C++ compilation**: Two `CppExtension` targets (`_C` and `_hooks`) linking
-   against `sendnn`, `flex`, `dee_internal`
+   against `sendnn`, `flex`
 3. **Entry point**: `torch.backends` → `torch_spyre = torch_spyre:_autoload`
 
-Key external deps: `torch~=2.10.0`, `sendnn`, `flex`, `dee_internal`,
-`dxp_standalone`
+Key external deps: `torch~=2.10.0`, `sendnn`, `flex`, `dxp_standalone`
 
 ---
 
