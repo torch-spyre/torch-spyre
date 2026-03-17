@@ -442,7 +442,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 )
             )
             #if isinstance(input,SymInt) in args:
-            args.append(ShapeArg(str(di[0].numel) if isinstance(di[0].numel, Symbol) else di.numel, 0, 2048, torch.float16))
+            for item in di:
+                num_elements = str(item.numel) if isinstance(item.numel, Symbol) else item.numel
+                args.append(ShapeArg(num_elements, 0, 2048, torch.float16))
+            # args.append(ShapeArg(str(di[0].numel) if isinstance(di[0].numel, Symbol) else di.numel, 0, 2048, torch.float16))
             scales.append(scale)
             op_info.update(value.op_info)
             self.kernel_specs.append(
