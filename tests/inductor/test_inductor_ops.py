@@ -1020,9 +1020,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         # torch.amax is not registered for Spyre eager dispatch
         if op == torch.max:
-            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False)
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
+            )
         else:
-            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False)
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
+            )
 
     def test_reduce_keepdim0_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
@@ -1038,7 +1042,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_reduce_keepdim1_cpu(self, op, dim: int, x):
         # torch.amax is not registered for Spyre eager dispatch
         if op == torch.max:
-            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True)[0], x, run_eager=False)
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=True)[0], x, run_eager=False
+            )
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
 
@@ -1065,11 +1071,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
         # Eager mode crashes with SIGBUS when calling .cpu() on transposed Spyre tensors
-        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False)
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+        )
 
     def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
         # Eager mode crashes with SIGBUS when calling .cpu() on transposed Spyre tensors
-        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False)
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+        )
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
@@ -1102,9 +1112,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Eager clone + .cpu() causes heap corruption (invalid fastbin / corrupted
         # double-linked list) in libsenlib for fp16/fp32 small tensors, and SIGBUS
         # for bool tensors.  Disable eager mode for all dtypes.
-        compare_with_cpu(
-            lambda a: torch.clone(a).contiguous(), x, run_eager=False
-        )
+        compare_with_cpu(lambda a: torch.clone(a).contiguous(), x, run_eager=False)
 
     def test_permute(self, input_dims, dims):
         compare_with_cpu(
