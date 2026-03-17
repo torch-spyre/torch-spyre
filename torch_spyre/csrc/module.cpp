@@ -41,6 +41,7 @@
 #include "logging.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
+#include "spyre_stream.h"
 #include "spyre_views.h"
 #include "types_mapping.h"
 
@@ -69,12 +70,8 @@ static void init_from_env() {
 
 void _startRuntime() {
   DEBUGINFO("starting runtime");
-  // TODO(tmhoangt): move sendnn::RuntimeInterface to flex to isolate from
-  // sendnn
-  std::shared_ptr<sendnn::RuntimeInterface> base_runtime;
-  auto s = flex::CreateRuntimeInterface(&base_runtime);
-  std::shared_ptr<flex::Runtime> runtime =
-      std::dynamic_pointer_cast<flex::Runtime>(base_runtime);
+  std::shared_ptr<Runtime> runtime;
+  auto s = flex::initializeRuntime(&runtime);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
@@ -82,6 +79,7 @@ void _startRuntime() {
     DEBUGINFO("runtime started");
   } else {
     DEBUGINFO("runtime FAILED TO START.");
+    throw std::runtime_error("Failed to initialize Spyre runtime. ");
   }
 }
 void startRuntime() {
@@ -242,9 +240,14 @@ bool is_supported_dtype(c10::ScalarType dtype) {
   return sen_dtype_dev != DataFormats::INVALID &&
          elems_per_stick(sen_dtype_dev) > 0;
 }
+// TODO(tmhoangt): add real code
+int device_count() {
+  return 1;
+}
 
 }  // namespace spyre
 
+namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
@@ -312,4 +315,37 @@ PYBIND11_MODULE(_C, m) {
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // Stream management functions
+  m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
+        py::arg("priority") = 0,
+        "Get a stream from the pool with specified device and priority");
+
+  m.def("current_stream", &spyre::getCurrentStream, py::arg("device"),
+        "Get the current stream for a device");
+
+  m.def("set_current_stream", &spyre::setCurrentStream, py::arg("stream"),
+        "Set the current stream and return the previous one");
+
+  m.def("default_stream", &spyre::getDefaultStream, py::arg("device"),
+        "Get the default stream for a device");
+
+  m.def("synchronize", &spyre::synchronizeDevice,
+        py::arg("device") = py::none(), "Synchronize a device or all devices");
+
+  // Expose SpyreStream class to Python
+  py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
+      .def("synchronize", &spyre::SpyreStream::synchronize,
+           "Wait for all operations on this stream to complete")
+      .def("query", &spyre::SpyreStream::query,
+           "Check if all operations on this stream have completed")
+      .def("device", &spyre::SpyreStream::device,
+           "Get the device associated with this stream")
+      .def("id", &spyre::SpyreStream::id, "Get the stream ID")
+      .def("priority", &spyre::SpyreStream::priority, "Get the stream priority")
+      .def("__repr__", [](const spyre::SpyreStream &stream) {
+        return "<torch_spyre.Stream device=" +
+               std::to_string(stream.device().index()) +
+               " id=" + std::to_string(stream.id()) + ">";
+      });
 }
