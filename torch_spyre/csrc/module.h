@@ -31,8 +31,7 @@ namespace spyre {
 using Runtime = flex::StreamRuntime;
 
 struct SharedOwnerCtx {
-  flex::DeviceMemoryAllocationPtr owner;
-  // test
+  flex::CompositeAddress owner;
   signed char device_id;
 };
 
