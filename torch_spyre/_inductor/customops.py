@@ -248,3 +248,18 @@ def _ones_scalar_fake(
     dtype: Optional[torch.dtype] = None,
 ):
     return torch.empty(1, dtype=dtype, device="spyre")
+
+# @torch.library.custom_op("aten::_local_scalar_dense", mutates_args=())
+# def _local_scalar_dense(self: torch.Tensor) -> torch.types.Number:
+#     """Extract scalar value from a single-element tensor. Falls back to CPU."""
+#     warn_fallback("aten::_local_scalar_dense")
+#     return self.cpu().item()
+
+
+# @_local_scalar_dense.register_fake
+# def _local_scalar_dense_fake(self: torch.Tensor) -> torch.types.Number:
+#     """Fake implementation for shape inference during compilation."""
+#     # Return a dummy scalar value for shape inference
+#     # The actual value doesn't matter for compilation
+#     return 0.0
+#     return torch.empty(1, dtype=dtype, device="spyre")
