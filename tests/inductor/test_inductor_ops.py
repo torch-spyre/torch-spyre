@@ -965,6 +965,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
         torch.testing.assert_close(result, torch.eq(x, y))
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_scalar_cpu(self):
         def fn(x):
             a = torch.add(x, 1.0)
