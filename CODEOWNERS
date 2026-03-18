@@ -21,10 +21,11 @@
 /torch_spyre/csrc/       @JRosenkranz @thoangtrvn
 
 # Operations (eager ops and fallbacks)
-/torch_spyre/ops/        @JRosenkranz @thoangtrvn
+/torch_spyre/ops/        @ani300 @moriohara @pradghos
+/codegen/                @ani300 @moriohara @pradghos
 
 # Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss
