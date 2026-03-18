@@ -273,6 +273,12 @@ class TestOps(TestCase):
         y = torch.tanh(x_spyre).to("cpu")
         torch.testing.assert_close(y, torch.tanh(x), rtol=self.rtol, atol=self.atol)
 
+    def test_pow_scalar_exponent(self):
+        x = torch.randn((1, 1, 4096), dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.pow(x_spyre, 2).to("cpu")
+        torch.testing.assert_close(y, torch.pow(x, 2), rtol=self.rtol, atol=self.atol)
+
     @unittest.skip("TODO: Needs more debug")
     def test_clone(self):
         x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
