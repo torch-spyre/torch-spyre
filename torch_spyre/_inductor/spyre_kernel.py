@@ -78,7 +78,10 @@ class TensorAccess(RValue):
                 len(self.layout.size) if d == -1 else d for d in old_stl.dim_map
             ]
             new_stl = SpyreTensorLayout(
-                old_stl.device_size, new_dim_map, old_stl.device_dtype
+                old_stl.device_size,
+                new_dim_map,
+                old_stl.stride_map,
+                old_stl.device_dtype,
             )
             new_layout = FixedTiledLayout(
                 self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
