@@ -73,7 +73,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
-- **write-rfc** — design proposal workflow
+- **write-rfc** — design proposal workflow (RFCs now at https://github.com/torch-spyre/rfcs)
 
 ### Writing SKILL.md Files
 

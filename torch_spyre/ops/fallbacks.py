@@ -233,3 +233,25 @@ def spyre__embedding(
     """
     # TODO: Remove this fallback once we enable gather/scatter ops on spyre
     return aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse)
+
+
+@register_fallback(
+    [
+        aten.isin.Tensor_Tensor,
+        aten.isin.Tensor_Tensor_out,
+        aten.isin.Tensor_Scalar,
+        aten.isin.Tensor_Scalar_out,
+        aten.isin.Scalar_Tensor,
+        aten.isin.Scalar_Tensor_out,
+    ]
+)
+def spyre__isin(
+    elements, test_elements, *, assume_unique=False, invert=False, **kwargs
+):
+    """
+    Fallback for torch.isin on Spyre.
+
+    """
+    return torch.isin(
+        elements, test_elements, assume_unique=assume_unique, invert=invert, **kwargs
+    )

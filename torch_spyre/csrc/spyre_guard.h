@@ -40,8 +40,13 @@ struct SpyreGuardImpl final : c10::impl::DeviceGuardImplInterface {
   // getStream/exchangeStream/.../recordDataPtrOnStream
   c10::Stream getStream(c10::Device device) const override;
 
+  c10::Stream getNewStream(c10::Device device, int priority = 0) const override;
+
   c10::Stream exchangeStream(c10::Stream stream) const override;
 
+  void synchronizeStream(const c10::Stream& stream) const override;
+  void synchronizeDevice(c10::DeviceIndex device_index) const override;
+  bool queryStream(const c10::Stream& stream) const override;
   void recordDataPtrOnStream(const c10::DataPtr&, const c10::Stream&) const;
 };
 
