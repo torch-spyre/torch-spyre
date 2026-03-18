@@ -20,7 +20,7 @@
 #include <torch/csrc/utils/pybind.h>
 #include <util/sen_host_ops.h>
 
-#include <flex/stream_runtime.hpp>
+#include <flex/stream/stream_runtime.hpp>
 #include <memory>
 
 using DataConversionStrideInfo = data_conversion_stride_info;

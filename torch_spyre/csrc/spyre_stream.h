@@ -19,7 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
-#include <flex/stream_handle.hpp>
+#include <flex/stream/stream_handle.hpp>
 
 #include "module.h"
 
