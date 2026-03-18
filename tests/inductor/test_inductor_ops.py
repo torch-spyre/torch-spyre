@@ -199,6 +199,58 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
+        ("test_amax_keepdim1", "test_reduce_keepdim1_cpu"): {
+            "ops_dict": {"amax": torch.amax},
+            "param_sets": {
+                # 1D tensor
+                "1d_dim_0": (0, cached_randn((10,))),
+                "1d_dim_none": (None, cached_randn((10,))),
+                # 2D tensor
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                "2d_dim_1": (1, cached_randn((67, 256))),
+                "2d_dim_none": (None, cached_randn((67, 256))),
+                # 3D tensor
+                "3d_dim_0": (0, cached_randn((3, 7, 9))),
+                "3d_dim_1": (1, cached_randn((3, 7, 9))),
+                "3d_dim_2": (2, cached_randn((3, 7, 9))),
+                "3d_dim_none": (None, cached_randn((3, 7, 9))),
+                "3d_dim_01": ((0, 1), cached_randn((3, 7, 9))),
+                "3d_dim_12": ((1, 2), cached_randn((3, 7, 9))),
+                "3d_dim_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+                "3d_dim_unsorted": ((2, 0), cached_randn((3, 7, 9))),
+                # Negative dims
+                "3d_dim_neg1": (-1, cached_randn((3, 7, 9))),
+                "3d_dim_neg12": ((-1, -2), cached_randn((3, 7, 9))),
+                # 0D / scalar tensor
+                # "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)), #TODO
+            },
+        },
+        ("test_amax_keepdim0", "test_reduce_keepdim0_cpu"): {
+            "ops_dict": {"amax": torch.amax},
+            "param_sets": {
+                # 1D tensor
+                "1d_dim_0": (0, cached_randn((10,))),
+                "1d_dim_none": (None, cached_randn((10,))),
+                # 2D tensor
+                "2d_dim_0": (0, cached_randn((67, 256))),
+                "2d_dim_1": (1, cached_randn((67, 256))),
+                "2d_dim_none": (None, cached_randn((67, 256))),
+                # 3D tensor
+                "3d_dim_0": (0, cached_randn((3, 7, 9))),
+                "3d_dim_1": (1, cached_randn((3, 7, 9))),
+                "3d_dim_2": (2, cached_randn((3, 7, 9))),
+                "3d_dim_none": (None, cached_randn((3, 7, 9))),
+                "3d_dim_01": ((0, 1), cached_randn((3, 7, 9))),
+                "3d_dim_12": ((1, 2), cached_randn((3, 7, 9))),
+                "3d_dim_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+                "3d_dim_unsorted": ((2, 0), cached_randn((3, 7, 9))),
+                # Negative dims
+                "3d_dim_neg1": (-1, cached_randn((3, 7, 9))),
+                "3d_dim_neg12": ((-1, -2), cached_randn((3, 7, 9))),
+                # 0D / scalar tensor:
+                # "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)), # TODO
+            },
+        },
         ("test_max_sub_broadcast", "test_max_sub_broadcast"): {
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((128, 256))),
@@ -912,6 +964,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y_spyre = y.to("spyre")
         result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
         torch.testing.assert_close(result, torch.eq(x, y))
+
+    def test_scalar_cpu(self):
+        def fn(x):
+            a = torch.add(x, 1.0)
+            b = torch.add(1.0, a)
+            c = torch.add(b, 1.0)
+            d = torch.sub(c, 2.0)
+            e = torch.mul(5, d)
+            out = torch.add(e, e)
+            return out
+
+        x = torch.rand(512, 1024, dtype=torch.float16)
+        compare_with_cpu(fn, x)
 
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)

@@ -10,6 +10,12 @@ import typing
 __all__: list[str] = [
     "DataFormats",
     "SpyreTensorLayout",
+    "_SpyreStreamBase",
+    "current_stream",
+    "default_stream",
+    "get_stream_from_pool",
+    "set_current_stream",
+    "synchronize",
     "as_strided_with_layout",
     "convert_artifacts",
     "empty_with_layout",
@@ -142,6 +148,89 @@ class SpyreTensorLayout:
     def device_size(self) -> list[int]: ...
     @property
     def dim_map(self) -> list[int]: ...
+
+class _SpyreStreamBase:
+    """
+    C++ SpyreStream wrapper class.
+
+    Represents a stream of execution on a Spyre device.
+    """
+    def synchronize(self) -> None:
+        """Wait for all operations on this stream to complete"""
+        ...
+
+    def query(self) -> bool:
+        """Check if all operations on this stream have completed"""
+        ...
+
+    def device(self) -> torch.device:
+        """Get the device associated with this stream"""
+        ...
+
+    def id(self) -> int:
+        """Get the stream ID"""
+        ...
+
+    def priority(self) -> int:
+        """Get the stream priority"""
+        ...
+
+    def __repr__(self) -> str: ...
+
+def get_stream_from_pool(device: torch.device, priority: int = 0) -> _SpyreStreamBase:
+    """
+    Get a stream from the pool for the specified device and priority.
+
+    Args:
+        device: The device for which to get a stream
+        priority: Stream priority (lower = higher priority). Default: 0
+
+    Returns:
+        A SpyreStream object from the pool
+    """
+    ...
+
+def current_stream(device: torch.device) -> _SpyreStreamBase:
+    """
+    Get the current stream for a device.
+
+    Args:
+        device: The device to query
+
+    Returns:
+        The current stream for the device
+    """
+    ...
+
+def default_stream(device: torch.device) -> _SpyreStreamBase:
+    """
+    Get the default stream for a device.
+
+    Args:
+        device: The device to query
+
+    Returns:
+        The default stream (stream ID 0) for the device
+    """
+    ...
+
+def set_current_stream(stream: _SpyreStreamBase) -> None:
+    """
+    Set the current stream for the stream's device.
+
+    Args:
+        stream: The stream to set as current
+    """
+    ...
+
+def synchronize(device: torch.device | None = None) -> None:
+    """
+    Synchronize all streams on a device or all devices.
+
+    Args:
+        device: The device to synchronize. If None, synchronizes all devices.
+    """
+    ...
 
 def as_strided_with_layout(
     arg0: torch.Tensor,

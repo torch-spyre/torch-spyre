@@ -288,7 +288,6 @@ class TestOps(TestCase):
         z = torch.add(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.add(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.expectedFailure
     def test_add_Scalar(self):
         x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype)
         y = 5
@@ -629,6 +628,88 @@ class TestOps(TestCase):
         spyre_y = torch.nn.functional.embedding(indices_spyre, embed_spyre).to("cpu")
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_tensor(self):
+        """Test aten.isin.Tensor_Tensor: both inputs are tensors."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = torch.tensor([2, 4], dtype=torch.int64)
+        expected = torch.isin(elements, test_elements)
+
+        elements_spyre = elements.to("spyre")
+        test_elements_spyre = test_elements.to("spyre")
+        actual = torch.isin(elements_spyre, test_elements_spyre).cpu()
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_tensor_out(self):
+        """Test aten.isin.Tensor_Tensor_out: out-variant."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = torch.tensor([2, 4], dtype=torch.int64)
+        out_cpu = torch.empty(elements.shape, dtype=torch.bool)
+        torch.isin(elements, test_elements, out=out_cpu)
+
+        elements_spyre = elements.to("spyre")
+        test_elements_spyre = test_elements.to("spyre")
+        out_spyre = torch.empty(elements.shape, dtype=torch.bool, device="spyre")
+        torch.isin(elements_spyre, test_elements_spyre, out=out_spyre)
+
+        torch.testing.assert_close(out_spyre.cpu(), out_cpu)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_scalar(self):
+        """Test aten.isin.Tensor_Scalar: test_elements is a scalar."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = 3
+        expected = torch.isin(elements, test_elements)
+
+        elements_spyre = elements.to("spyre")
+        actual = torch.isin(elements_spyre, test_elements).cpu()
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_scalar_out(self):
+        """Test aten.isin.Tensor_Scalar_out: test_elements is a scalar, out-variant."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = 3
+        out_cpu = torch.empty(elements.shape, dtype=torch.bool)
+        torch.isin(elements, test_elements, out=out_cpu)
+
+        elements_spyre = elements.to("spyre")
+        out_spyre = torch.empty(elements.shape, dtype=torch.bool, device="spyre")
+        torch.isin(elements_spyre, test_elements, out=out_spyre)
+
+        torch.testing.assert_close(out_spyre.cpu(), out_cpu)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_scalar_tensor(self):
+        """Test aten.isin.Scalar_Tensor: elements is a scalar."""
+        elements = 3
+        test_elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        expected = torch.isin(elements, test_elements)
+
+        test_elements_spyre = test_elements.to("spyre")
+        actual = torch.isin(elements, test_elements_spyre).cpu()
+
+        # Compare boolean values (scalar tensor shape may differ due to Spyre backend)
+        self.assertEqual(actual.item(), expected.item())
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_scalar_tensor_out(self):
+        """Test aten.isin.Scalar_Tensor_out: elements is a scalar, out-variant."""
+        elements = 3
+        test_elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        out_cpu = torch.empty(0, dtype=torch.bool)
+        torch.isin(elements, test_elements, out=out_cpu)
+
+        test_elements_spyre = test_elements.to("spyre")
+        out_spyre = torch.empty((), dtype=torch.bool, device="spyre")
+        torch.isin(elements, test_elements_spyre, out=out_spyre)
+
+        # Compare boolean values (scalar tensor shape may differ due to Spyre backend)
+        self.assertEqual(out_spyre.cpu().item(), out_cpu.item())
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding_with_padding_idx(self):

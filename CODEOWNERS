@@ -24,7 +24,7 @@
 /torch_spyre/ops/        @JRosenkranz @thoangtrvn
 
 # Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss
