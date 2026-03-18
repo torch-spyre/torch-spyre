@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    name: Run Spyre unit tests
+    runs-on: official-aiu-x86-64-arc-runner-set-v1
+    timeout-minutes: 30
+    # env: {}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: get some info
+        run: |
+          echo 'gather info start'
+          pwd
+          ls -la
+          whoami
+          id
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+          echo 'gather info end'
+      - name: Install package with test dependencies
+        run: pip install -e . --no-deps --no-build-isolation -vvv --verbose
+      - name: Run unit tests
+        run: |
+          echo 'Run unit tests start'
+          pytest tests/ -vvv -s || EXIT_CODE=$?
+          EXIT_CODE=${EXIT_CODE:-0}
+          echo "pytest EXIT_CODE: ${EXIT_CODE}"
+          if [[ "$EXIT_CODE" == '0' ]] ; then
+            echo 'pytest success'
+          else
+            echo 'pytest failed'
+          fi
+          echo 'Run unit tests end'
+          exit "$EXIT_CODE"
