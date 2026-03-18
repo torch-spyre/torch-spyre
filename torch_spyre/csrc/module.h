@@ -32,6 +32,7 @@ using Runtime = flex::StreamRuntime;
 
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
+  // test
   signed char device_id;
 };
 
