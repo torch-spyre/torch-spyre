@@ -122,10 +122,12 @@ class SpyreAsyncCompile:
                 file.write("\t}\n")
                 file.write("}\n")
 
-            print("TODO: Invoke backend compiler on MLIR file")
+            subprocess.run(
+                ["dxp_standalone", "--bundle", "-d", kernel_output_dir], check=True
+            )
+            convert_artifacts(kernel_output_dir)
 
-            print("TODO: Return proper KernelRunner")
-            return SpyreUnimplementedRunner(kernel_name, "SuperDSCBundle")
+            return SpyreSDSCKernelRunner(kernel_name, [kernel_output_dir], arg_mappings)
         else:
             # Process each SuperDSC separately
             sdsc_dirs = []
