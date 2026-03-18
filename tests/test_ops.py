@@ -288,6 +288,7 @@ class TestOps(TestCase):
         z = torch.add(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.add(x, y), rtol=self.rtol, atol=self.atol)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_add_Scalar(self):
         x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype)
         y = 5
@@ -428,7 +429,6 @@ class TestOps(TestCase):
             z, torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.expectedFailure
     def test_addmm_ab_bc_scaled(self):
         mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_a, self.mm_c
