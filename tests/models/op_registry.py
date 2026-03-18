@@ -315,11 +315,13 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.all": OpAdapter("torch.all", torch.all),
     "torch.numel": OpAdapter("torch.numel", _tensor_numel),
     "torch.exp": OpAdapter("torch.exp", torch.exp),
+    "torch.log": OpAdapter("torch.log", torch.log),
     "torch.rsqrt": OpAdapter("torch.rsqrt", torch.rsqrt),
     "torch.sigmoid": OpAdapter("torch.sigmoid", torch.sigmoid),
     "torch.sin": OpAdapter("torch.sin", torch.sin),
     "torch.cos": OpAdapter("torch.cos", torch.cos),
     "torch.clamp": OpAdapter("torch.clamp", torch.clamp),
+    "torch.floor": OpAdapter("torch.floor", torch.floor),
     "torch.where": OpAdapter("torch.where", torch.where),
     "torch.tril": OpAdapter("torch.tril", torch.tril),
     "torch.triu": OpAdapter("torch.triu", torch.triu),
@@ -508,6 +510,11 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch._C._functorch._vmap_decrement_nesting": OpAdapter(
         "torch._C._functorch._vmap_decrement_nesting",
         lazy_torch("_C._functorch._vmap_decrement_nesting"),
+    ),
+    # Internal logging
+    "torch._C._log_api_usage_once": OpAdapter(
+        "torch._C._log_api_usage_once",
+        lazy_torch("_C._log_api_usage_once"),
     ),
     # Symbolic sum (present in some builds; fallback provided)
     "torch.sym_sum": OpAdapter("torch.sym_sum", _sym_sum),

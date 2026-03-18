@@ -61,7 +61,6 @@ def register_spyre_lowering(
         type_promotion_kind=type_promotion_kind,
         override_return_dtype=override_return_dtype,
     )
-
     return lowering.register_lowering(
         op,
         broadcast=broadcast,
@@ -529,3 +528,28 @@ def lower_clamp(x, min=None, max=None):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
+def clone(x, *, memory_format=None):
+    from torch._inductor.ir import FlexibleLayout, get_stride_order
+    from torch._inductor.lowering import clone as clone_lowering
+
+    result = clone_lowering(x, memory_format=memory_format)
+    # Upstream Inductor ignores memory_format (TODO in clone lowering).
+    # The output gets a FlexibleLayout whose stride order is inferred from
+    # the input's strides via ComputedBuffer.get_fill_order(). When the
+    # input is a non-contiguous view (e.g. a permute), the clone output
+    # inherits those strides instead of the requested memory format.
+    # This causes index/stride mismatches during Spyre's stickify pass.
+    # Fix: freeze the layout to the requested stride order so that
+    # decide_layout() respects the memory_format contract.
+    if memory_format is not None and memory_format != torch.preserve_format:
+        stride_order = get_stride_order(
+            FlexibleLayout.stride_ordered_for_memory_format(
+                result.get_size(), memory_format
+            )
+        )
+        result.realize()
+        result.freeze_layout_with_stride_order(stride_order)
+    return result

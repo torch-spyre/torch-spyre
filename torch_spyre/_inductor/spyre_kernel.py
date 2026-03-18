@@ -20,17 +20,16 @@ from collections import Counter
 import torch
 import sympy
 
-from torch_spyre._C import compute_view_layout, DataFormats
+from torch_spyre._C import DataFormats, SpyreTensorLayout
 
 from torch._inductor.codegen.common import (
     CSEVariable,
-    IndentedBuffer,
     Kernel,
 )
-from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.codegen.simd import SIMDKernel
-from torch._inductor.utils import sympy_subs
-from torch._inductor.virtualized import StoreMode, V
+from torch._inductor.utils import IndentedBuffer, sympy_subs
+from torch._inductor.virtualized import V
 
 from .constants import (
     MATMUL_REDUCTION_OP,
@@ -41,7 +40,11 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol
+from .pass_utils import (
+    is_wildcard,
+    map_dims_to_vars,
+    wildcard_symbol,
+)
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -70,10 +73,12 @@ class TensorAccess(RValue):
         if is_sparse(self.layout.device_layout):
             new_size = self.layout.size + [1]
             new_stride = self.layout.stride + [1]
-            new_stl = compute_view_layout(
-                torch.Size(self.layout.size),
-                torch.Size(new_size),
-                self.layout.device_layout,
+            old_stl = self.layout.device_layout
+            new_dim_map = [
+                len(self.layout.size) if d == -1 else d for d in old_stl.dim_map
+            ]
+            new_stl = SpyreTensorLayout(
+                old_stl.device_size, new_dim_map, old_stl.device_dtype
             )
             new_layout = FixedTiledLayout(
                 self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
@@ -495,18 +500,18 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 # Unsupported data operation on TensorArg
                 raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
 
-            op_spec = create_op_spec(op, False, in_di, args, op_info)
+            op_spec = create_op_spec(op, False, out_di, args, op_info)
             if op == TRANSPOSE_OP:
                 op_spec.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d] != out_di[d]
                 ]
-                # Reorder scale of the output  to implement transpositions
+                # Reorder it_dim_map of the input to implement transpositions
                 (
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
                 ) = (
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                    op_spec.args[-1].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
+                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
                 )
             self.op_specs.append(op_spec)
         else:
