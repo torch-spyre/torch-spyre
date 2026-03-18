@@ -60,8 +60,38 @@ def register_spyre_decomposition(
     """
     Register decompositions specifically for Spyre device.
     These will only be active when compiling for the Spyre device.
+
+    For ``aten`` ops, this also registers a PrivateUse1 dispatch kernel
+    (via ``register_spyre_decompositions_via_dispatchkey``) so that
+    eager-mode dispatch on a Spyre tensor reaches the Spyre implementation.
+    This is necessary for ops with CompositeImplicitAutograd (CIA) in
+    upstream PyTorch, and harmless for non-CIA ops.
     """
-    return decomp.register_decomposition(ops, spyre_decompositions)
+
+    def decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # 1. Register in the Spyre decomposition table (for compile mode / make_fx)
+        decomp.register_decomposition(ops, spyre_decompositions)(fn)
+
+        # 2. For aten ops, also register via PrivateUse1 dispatch key (for eager mode).
+        #    Non-aten ops (e.g. spyre::compact) are custom Spyre ops that don't need
+        #    PrivateUse1 kernel registration.
+        #    Skip ops that already have a PrivateUse1 kernel (e.g. from codegen_ops.py
+        #    or eager.py) to avoid registration conflicts.
+        ops_list = ops if isinstance(ops, list) else [ops]
+        aten_ops = [
+            op
+            for op in ops_list
+            if getattr(op, "namespace", None) == "aten"
+            and not torch._C._dispatch_has_kernel_for_dispatch_key(
+                op._name, "PrivateUse1"
+            )
+        ]
+        if aten_ops:
+            register_spyre_decompositions_via_dispatchkey(aten_ops)(fn)
+
+        return fn
+
+    return decorator
 
 
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
@@ -365,20 +395,13 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
 
 
 ###############################################################################################
-##                           Functions requiring dispatch keys                               ##
+##                           Spyre decompositions for aten ops                               ##
 ###############################################################################################
-# The ops below require BOTH decorators:
-#
-# @register_spyre_decompositions_via_dispatchkey  — registers the PrivateUse1 kernel so that
-#     eager-mode dispatch on a Spyre tensor reaches the Spyre implementation.
-#
-# @register_spyre_decomposition  — inserts the function into the Spyre decomposition table
-#     so that make_fx (inside AOT Autograd) uses the Spyre implementation when tracing.
-#     This is necessary because these ops are CompositeImplicitAutograd (CIA): make_fx
-#     normally expands them via their default PyTorch implementation regardless of the
-#     decompositions dict.  Explicitly registering a decomposition overrides that CIA
-#     expansion and ensures the Spyre-specific path is traced instead.
-@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.rms_norm.default])
+# For aten ops, ``register_spyre_decomposition`` automatically registers both a
+# decomposition table entry (for compile mode / make_fx) and a PrivateUse1
+# dispatch kernel (for eager mode).  The latter is essential for ops with
+# CompositeImplicitAutograd (CIA) in upstream PyTorch (e.g. rms_norm,
+# layer_norm), and harmless for non-CIA ops (e.g. gelu, softplus).
 @register_spyre_decomposition([torch.ops.aten.rms_norm.default])
 def spyre_rms_norm(
     input: torch.Tensor,
@@ -407,7 +430,6 @@ def spyre_rms_norm(
     return output
 
 
-@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.layer_norm.default])
 @register_spyre_decomposition([torch.ops.aten.layer_norm.default])
 def spyre_layer_norm(
     input: torch.Tensor,
@@ -426,7 +448,6 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
-@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.gelu.default])
 @register_spyre_decomposition([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
@@ -435,7 +456,6 @@ def spyre_gelu(
     return torch.ops.spyre.gelu(input, approximate)
 
 
-@register_spyre_decompositions_via_dispatchkey([torch.ops.aten.softplus.default])
 @register_spyre_decomposition([torch.ops.aten.softplus.default])
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
