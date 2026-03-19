@@ -45,7 +45,7 @@ from .pass_utils import (
     map_dims_to_vars,
     wildcard_symbol,
 )
-from .views import compute_device_coordinates
+from .views import compute_coordinates
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -400,11 +400,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         self, is_input: bool, name: str, tensor: TensorAccess, di: list[DimensionInfo]
     ) -> TensorArg:
         scales = analyze_tensor_access(di, tensor)
-        device_coords = compute_device_coordinates(
-            tensor.layout.size,
-            tensor.layout.stride,
+        device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
-            tensor.layout.device_layout.dim_map,
+            tensor.layout.device_layout.stride_map,
             self.var_ranges(),
             tensor.index,
         )

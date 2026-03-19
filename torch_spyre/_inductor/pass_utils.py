@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from sympy import Expr, Symbol
 
@@ -24,7 +24,7 @@ from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 
 from .ir import FixedTiledLayout
-from .views import compute_device_coordinates, compute_coordinates
+from .views import compute_coordinates
 
 
 class SchedNodeArg(NamedTuple):
@@ -52,6 +52,7 @@ def is_wildcard(s: Symbol) -> bool:
     return s.name.startswith("*_")
 
 
+# @deprecated("switch to _coordinates")
 def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
     """
     Construct a mapping from the dimensions of layout
@@ -80,11 +81,26 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
 
 
 def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    return compute_device_coordinates(
-        layout.size,
-        layout.stride,
+    return compute_coordinates(
         layout.device_layout.device_size,
-        layout.device_layout.dim_map,
+        layout.device_layout.stride_map,
         dep.ranges,
         dep.index,
     )
+
+
+def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
+    """
+    Given a coordinate array and an expression, determine if there is a unique
+    dimension in coords whose coordinate expression is exactly the one free variable
+    in the expression.  Return None if expr does not have exactly one free variable
+    or if there is not exactly one matching dimension in coords.
+    """
+    if len(expr.free_symbols) != 1:
+        return None
+    v = next(iter(expr.free_symbols))
+    dims = [d for d, e in enumerate(coords) if e == v]
+    if len(dims) != 1:
+        return None
+    else:
+        return dims[0]
