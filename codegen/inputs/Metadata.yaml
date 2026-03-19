@@ -16,6 +16,8 @@
   template_name: base
 - operator_name: add
   template_name: base
+- operator_name: addmm
+  template_name: base
 - operator_name: bitwise_not
   template_name: base
 - operator_name: bmm

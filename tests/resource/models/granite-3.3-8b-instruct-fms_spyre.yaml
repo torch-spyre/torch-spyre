@@ -1,0 +1,1859 @@
+model: granite-3.3-8b-instruct-fms
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 0.005
+  rtol: 0.005
+cases:
+  - name: torch.nn.functional.embedding.1_spyre
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 41]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [49159, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 0
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:291 in forward, code: x_in = self.embedding(x_in)'
+    marks: constant
+  - name: torch.mul.1_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 12.0
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:292 in forward, code: x_in = x_in * self.config.embedding_multiplier'
+    marks: constant
+  - name: torch.float.1_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:62 in forward, code: xf = x.float()'
+  - name: torch.pow.1_spyre
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+    marks: constant
+  - name: torch.mean.1_spyre
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+    marks: constant
+    kwmap:
+      keepdim: true
+  - name: torch.add.1_spyre
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 41, 1]
+          dtype: torch.float16
+          init: rand
+      - value: 1.0e-05
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+    marks: constant
+  - name: torch.rsqrt.1_spyre
+    op: torch.rsqrt
+    inputs:
+      - tensor:
+          shape: [1, 41, 1]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+  - name: torch.mul.2_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 1]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+  - name: torch.type_as.1_spyre
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:64 in forward, code: x = xf.type_as(x)'
+  - name: torch.mul.3_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:66 in forward, code: x = self.weight * x'
+  - name: torch.nn.functional.linear.1_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4096, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:556 in forward, code: queries = self.query(q)'
+    marks: constant
+  - name: torch.nn.functional.linear.2_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1024, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:557 in forward, code: keys = self.key(k)'
+    marks: constant
+  - name: torch.Tensor.view.1_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 41
+      - value: 32
+      - value: 128
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:792 in forward, code: queries = q_out.view(batch_size, q_len, self.nheads,
+      self.emb_kq_per_head)'
+    marks: constant
+  - name: torch.Tensor.view.2_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 41, 1024]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 41
+      - value: 8
+      - value: 128
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:793 in forward, code: keys = k_out.view(batch_size, q_len, self.kvheads,
+      self.emb_kq_per_head)'
+    marks: constant
+  - name: torch.arange.1_spyre
+    op: torch.arange
+    inputs:
+      - value: 0
+      - value: 41
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:395 in adjusted_qk, code: position_ids = torch.arange('
+    marks: constant
+    kwmap:
+      dtype: torch.int64
+      device: cuda:0
+  - name: torch.repeat.1_spyre
+    op: torch.repeat
+    inputs:
+      - tensor:
+          shape: [41]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 1
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:397 in adjusted_qk, code: ).repeat(k.size(0), 1)'
+    marks: constant
+  - name: torch.getitem.1_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 41]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - py: (0,)
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:407 in adjusted_qk, code: max_start_pos = torch.max(position_ids[:,
+      0])'
+    marks: constant
+  - name: torch.max.1
+    op: torch.max
+    inputs:
+      - tensor:
+          shape: [1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:407 in adjusted_qk, code: max_start_pos = torch.max(position_ids[:,
+      0])'
+  - name: torch.float.2_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:415 in adjusted_qk, code: q_ = q_rope.float().view(*q.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+  - name: torch.Tensor.view.3_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 41
+      - value: 32
+      - value: -1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:415 in adjusted_qk, code: q_ = q_rope.float().view(*q.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+    marks: constant
+  - name: torch.float.3_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:416 in adjusted_qk, code: k_ = k_rope.float().view(*k.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+  - name: torch.Tensor.view.4_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 41
+      - value: 8
+      - value: -1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:416 in adjusted_qk, code: k_ = k_rope.float().view(*k.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+    marks: constant
+  - name: torch.add.2_spyre
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: []
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 41
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:421 in adjusted_qk, code: alpha = self.compute_freqs_cis(q.device,
+      max_start_pos + seq_len)'
+    marks: constant
+  - name: torch.getitem.2
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [8192, 64, 2, 2]
+          dtype: torch.float32
+          init: rand
+      - tensor:
+          shape: [1, 41]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 8192
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:438 in adjusted_qk, code: freqs = self.cached_freqs[q.device.index][alpha][position_ids]'
+  - name: torch.clamp.1
+    op: torch.clamp
+    inputs:
+      - tensor:
+          shape: [1, 41]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:440 in adjusted_qk, code: position_ids = position_ids.clamp(max=freqs.size(0)
+      - 1)'
+    kwmap:
+      max: 0
+  - name: torch.float.4_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 41, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:442 in adjusted_qk, code: freqs = freqs.float()  # 1 L D/2 2 2'
+  - name: torch.getitem.3_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 41, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(-41, None, None), None, slice(None, None, None), slice(None, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:445 in adjusted_qk, code: freqs[:, -q.size(1) :, None, :, :, :]'
+    marks: constant
+  - name: torch.unsqueeze.1_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: -2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:446 in adjusted_qk, code: .mul(q_.unsqueeze(-2))'
+    marks: constant
+  - name: torch.mul.4_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 41, 1, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 32, 64, 1, 2]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:446 in adjusted_qk, code: .mul(q_.unsqueeze(-2))'
+  - name: torch.sum.1_spyre
+    op: torch.sum
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 5
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:447 in adjusted_qk, code: .sum(5)'
+    marks: constant
+  - name: torch.flatten.1_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 3
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:448 in adjusted_qk, code: .flatten(3)'
+    marks: constant
+  - name: torch.type_as.2_spyre
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:449 in adjusted_qk, code: ).type_as(q)'
+  - name: torch.unsqueeze.2_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: -2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:452 in adjusted_qk, code: .mul(k_.unsqueeze(-2))'
+    marks: constant
+  - name: torch.mul.5_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 41, 1, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 8, 64, 1, 2]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:452 in adjusted_qk, code: .mul(k_.unsqueeze(-2))'
+  - name: torch.sum.2_spyre
+    op: torch.sum
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 5
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:453 in adjusted_qk, code: .sum(5)'
+    marks: constant
+  - name: torch.flatten.2_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 3
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:454 in adjusted_qk, code: .flatten(3)'
+    marks: constant
+  - name: torch.type_as.3_spyre
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:455 in adjusted_qk, code: ).type_as(k)'
+  - name: torch.view_as.1_spyre
+    op: torch.view_as
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:461 in adjusted_qk, code: q_out = q_out.view_as(q_rope)'
+  - name: torch.view_as.2_spyre
+    op: torch.view_as
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:462 in adjusted_qk, code: k_out = k_out.view_as(k_rope)'
+  - name: torch.transpose.1_spyre
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 41, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:192 in _sdpa_store_op, code: keys = keys.transpose(2, 1)'
+    marks: constant
+  - name: torch.transpose.2_spyre
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:224 in _sdpa_compute_op, code: queries = query.transpose(2, 1)'
+    marks: constant
+  - name: torch.unsqueeze.3_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.1_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.3_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.1_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 41, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: true
+      scale: 0.0078125
+  - name: torch.transpose.3_spyre
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 32, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:292 in _sdpa_compute_op, code: attn = attn.transpose(2, 1).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.1_spyre
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:292 in _sdpa_compute_op, code: attn = attn.transpose(2, 1).contiguous()'
+  - name: torch.Tensor.view.5_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 41, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 41
+      - value: 4096
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:854 in forward, code: attn = attn.view(batch_size, q_len, self.nheads
+      * self.emb_v_per_head)'
+    marks: constant
+  - name: torch.add.3_spyre
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:145 in forward, code: x = x * self.config.residual_multiplier + residual'
+  - name: torch.nn.functional.linear.3_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [12800, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
+    marks: constant
+  - name: torch.nn.functional.silu.1_spyre
+    op: torch.nn.functional.silu
+    inputs:
+      - tensor:
+          shape: [1, 41, 12800]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
+    kwmap:
+      inplace: false
+  - name: torch.mul.6_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 41, 12800]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 41, 12800]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
+  - name: torch.nn.functional.linear.4_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 41, 12800]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4096, 12800]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:297 in forward, code: return self.w2(out)'
+    marks: constant
+  - name: torch.getitem.4_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 41, 4096]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/utils/headless.py:25 in gather_outputs, code: base_model_output = base_model_output[:,
+      -last_n_tokens:, :]'
+    marks: constant
+  - name: torch.nn.functional.linear.5_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [49159, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:391 in forward, code: preds = self.head(output)'
+    marks: constant
+  - name: torch.truediv.1_spyre
+    op: torch.truediv
+    inputs:
+      - tensor:
+          shape: [1, 1, 49159]
+          dtype: torch.float16
+          init: rand
+      - value: 16.0
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:392 in forward, code: preds = preds / self.config.logits_scaling'
+    marks: constant
+  - name: torch.nn.functional.embedding.2_spyre
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [49159, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 0
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:291 in forward, code: x_in = self.embedding(x_in)'
+    marks: constant
+  - name: torch.mul.7_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 12.0
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:292 in forward, code: x_in = x_in * self.config.embedding_multiplier'
+    marks: constant
+  - name: torch.float.5_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:62 in forward, code: xf = x.float()'
+  - name: torch.pow.2_spyre
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+    marks: constant
+  - name: torch.mean.2_spyre
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+    marks: constant
+    kwmap:
+      keepdim: true
+  - name: torch.add.4_spyre
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 1, 1]
+          dtype: torch.float16
+          init: rand
+      - value: 1.0e-05
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+    marks: constant
+  - name: torch.rsqrt.2_spyre
+    op: torch.rsqrt
+    inputs:
+      - tensor:
+          shape: [1, 1, 1]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+  - name: torch.mul.8_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 1]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:63 in forward, code: xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True)
+      + self.eps)'
+  - name: torch.type_as.4_spyre
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:64 in forward, code: x = xf.type_as(x)'
+  - name: torch.mul.9_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/layernorm.py:66 in forward, code: x = self.weight * x'
+  - name: torch.nn.functional.linear.6_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4096, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:556 in forward, code: queries = self.query(q)'
+    marks: constant
+  - name: torch.nn.functional.linear.7_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1024, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:557 in forward, code: keys = self.key(k)'
+    marks: constant
+  - name: torch.Tensor.view.6_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 1
+      - value: 32
+      - value: 128
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:792 in forward, code: queries = q_out.view(batch_size, q_len, self.nheads,
+      self.emb_kq_per_head)'
+    marks: constant
+  - name: torch.Tensor.view.7_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 1, 1024]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 1
+      - value: 8
+      - value: 128
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:793 in forward, code: keys = k_out.view(batch_size, q_len, self.kvheads,
+      self.emb_kq_per_head)'
+    marks: constant
+  - name: torch.repeat.2_spyre
+    op: torch.repeat
+    inputs:
+      - tensor:
+          shape: [1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - value: 1
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:397 in adjusted_qk, code: ).repeat(k.size(0), 1)'
+    marks: constant
+  - name: torch.getitem.5_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+      - py: (0,)
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:407 in adjusted_qk, code: max_start_pos = torch.max(position_ids[:,
+      0])'
+    marks: constant
+  - name: torch.float.6_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:415 in adjusted_qk, code: q_ = q_rope.float().view(*q.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+  - name: torch.Tensor.view.8_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 1
+      - value: 32
+      - value: -1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:415 in adjusted_qk, code: q_ = q_rope.float().view(*q.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+    marks: constant
+  - name: torch.float.7_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:416 in adjusted_qk, code: k_ = k_rope.float().view(*k.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+  - name: torch.Tensor.view.9_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 1
+      - value: 8
+      - value: -1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:416 in adjusted_qk, code: k_ = k_rope.float().view(*k.size()[:-1],
+      -1, 2)  # B L H D/2 2'
+    marks: constant
+  - name: torch.getitem.6
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [8192, 64, 2, 2]
+          dtype: torch.float32
+          init: rand
+      - tensor:
+          shape: [1, 1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 8192
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:438 in adjusted_qk, code: freqs = self.cached_freqs[q.device.index][alpha][position_ids]'
+  - name: torch.clamp.2
+    op: torch.clamp
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          dtype: torch.int64
+          init: randint
+          init_args:
+            high: 1000
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:440 in adjusted_qk, code: position_ids = position_ids.clamp(max=freqs.size(0)
+      - 1)'
+    kwmap:
+      max: 0
+  - name: torch.float.8_spyre
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:442 in adjusted_qk, code: freqs = freqs.float()  # 1 L D/2 2 2'
+  - name: torch.getitem.7_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(-1, None, None), None, slice(None, None, None), slice(None, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:445 in adjusted_qk, code: freqs[:, -q.size(1) :, None, :, :, :]'
+    marks: constant
+  - name: torch.unsqueeze.4_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: -2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:446 in adjusted_qk, code: .mul(q_.unsqueeze(-2))'
+    marks: constant
+  - name: torch.mul.10_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 1, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 32, 64, 1, 2]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:446 in adjusted_qk, code: .mul(q_.unsqueeze(-2))'
+  - name: torch.sum.3_spyre
+    op: torch.sum
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 5
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:447 in adjusted_qk, code: .sum(5)'
+    marks: constant
+  - name: torch.flatten.4_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 3
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:448 in adjusted_qk, code: .flatten(3)'
+    marks: constant
+  - name: torch.type_as.5_spyre
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:449 in adjusted_qk, code: ).type_as(q)'
+  - name: torch.unsqueeze.5_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: -2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:452 in adjusted_qk, code: .mul(k_.unsqueeze(-2))'
+    marks: constant
+  - name: torch.mul.11_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 1, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 8, 64, 1, 2]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:452 in adjusted_qk, code: .mul(k_.unsqueeze(-2))'
+  - name: torch.sum.4_spyre
+    op: torch.sum
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 64, 2, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 5
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:453 in adjusted_qk, code: .sum(5)'
+    marks: constant
+  - name: torch.flatten.5_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 64, 2]
+          dtype: torch.float16
+          init: rand
+      - value: 3
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:454 in adjusted_qk, code: .flatten(3)'
+    marks: constant
+  - name: torch.type_as.6_spyre
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:455 in adjusted_qk, code: ).type_as(k)'
+  - name: torch.view_as.3_spyre
+    op: torch.view_as
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:461 in adjusted_qk, code: q_out = q_out.view_as(q_rope)'
+  - name: torch.view_as.4_spyre
+    op: torch.view_as
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/positions.py:462 in adjusted_qk, code: k_out = k_out.view_as(k_rope)'
+  - name: torch.transpose.4_spyre
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 1, 8, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:192 in _sdpa_store_op, code: keys = keys.transpose(2, 1)'
+    marks: constant
+  - name: torch.getitem.8_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 41, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.1_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 41, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.transpose.5_spyre
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:224 in _sdpa_compute_op, code: queries = query.transpose(2, 1)'
+    marks: constant
+  - name: torch.sym_sum.1
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 41]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.6_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 42, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.2_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 42, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.6_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 42, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.2_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 42, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 42, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125
+  - name: torch.transpose.6_spyre
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+      - value: 1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:292 in _sdpa_compute_op, code: attn = attn.transpose(2, 1).contiguous()'
+    marks: constant
+  - name: torch.Tensor.contiguous.2_spyre
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:292 in _sdpa_compute_op, code: attn = attn.transpose(2, 1).contiguous()'
+  - name: torch.Tensor.view.10_spyre
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 1, 32, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 1
+      - value: 4096
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:854 in forward, code: attn = attn.view(batch_size, q_len, self.nheads
+      * self.emb_v_per_head)'
+    marks: constant
+  - name: torch.add.5_spyre
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/models/granite.py:145 in forward, code: x = x * self.config.residual_multiplier + residual'
+  - name: torch.nn.functional.linear.8_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [12800, 4096]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
+    marks: constant
+  - name: torch.nn.functional.silu.2_spyre
+    op: torch.nn.functional.silu
+    inputs:
+      - tensor:
+          shape: [1, 1, 12800]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
+    kwmap:
+      inplace: false
+  - name: torch.mul.12_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 12800]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 1, 12800]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
+  - name: torch.nn.functional.linear.9_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 12800]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [4096, 12800]
+          dtype: torch.float16
+          init: rand
+      - value: null
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/feedforward.py:297 in forward, code: return self.w2(out)'
+    marks: constant
+  - name: torch.getitem.9_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1, 4096]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/utils/headless.py:25 in gather_outputs, code: base_model_output = base_model_output[:,
+      -last_n_tokens:, :]'
+    marks: constant
+  - name: torch.getitem.10_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 42, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.2_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 42, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.sym_sum.2
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 42]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.7_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 43, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.3_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 43, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.7_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 43, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.3_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 43, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 43, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125
+  - name: torch.getitem.11_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 43, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.3_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 43, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.sym_sum.3
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 43]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.8_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 44, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.4_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 44, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.8_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 44, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.4_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 44, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 44, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125
+  - name: torch.getitem.12_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 44, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.4_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 44, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.sym_sum.4
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 44]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.9_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 45, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.5_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 45, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.9_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 45, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.5_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 45, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 45, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125
+  - name: torch.getitem.13_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 45, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.5_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 45, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.sym_sum.5
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 45]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.10_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 46, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.6_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 46, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.10_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 46, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.6_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 46, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 46, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125
+  - name: torch.getitem.14_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 46, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.6_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 46, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.sym_sum.6
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 46]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.11_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 47, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.7_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 47, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.11_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 47, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.7_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 47, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 47, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125
+  - name: torch.getitem.15_spyre
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 47, 128]
+          dtype: torch.float16
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(0, None, None), slice(None, None, None))
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+  - name: torch.cat.7_spyre
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 8, 47, 128]
+            dtype: torch.float16
+            init: rand
+          - shape: [1, 8, 1, 128]
+            dtype: torch.float16
+            init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:200 in _sdpa_store_op, code: key_cache_result = torch.cat((key_cache[:,
+      :, sliding_window:, :], keys), dim=2)'
+    marks: constant
+    kwmap:
+      dim: 2
+  - name: torch.sym_sum.7
+    op: torch.sym_sum
+    inputs:
+      - value: [1, 47]
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:227 in _sdpa_compute_op, code: if key_cache.shape[1] != kvheads
+      and key_cache.shape[2] == kvheads:'
+  - name: torch.unsqueeze.12_spyre
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 8, 48, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.Tensor.expand.8_spyre
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 48, 128]
+          dtype: torch.float16
+          init: rand
+      - value: -1
+      - value: -1
+      - value: 4
+      - value: -1
+      - value: -1
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.flatten.12_spyre
+    op: torch.flatten
+    inputs:
+      - tensor:
+          shape: [1, 8, 4, 48, 128]
+          dtype: torch.float16
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:243 in _sdpa_compute_op, code: keys_e = key_cache.unsqueeze(2).expand(-1,
+      -1, expansion, -1, -1).flatten(1, 2)'
+    marks: constant
+  - name: torch.nn.functional.scaled_dot_product_attention.8_spyre
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 48, 128]
+          dtype: torch.float16
+          init: rand
+      - tensor:
+          shape: [1, 32, 48, 128]
+          dtype: torch.float16
+          init: rand
+    description: 'foundation-model-stack/foundation-model-stack/fms/modules/attention.py:273 in _sdpa_compute_op, code: attn = F.scaled_dot_product_attention('
+    kwmap:
+      dropout_p: 0.0
+      is_causal: false
+      scale: 0.0078125

@@ -133,6 +133,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             )
         },
+        ("test_addmm", "test_addmm_cpu"): {
+            "param_sets": make_param_dict(
+                [
+                    ((1152,), (10, 1152), (1152, 1152)),
+                ],
+            ),
+        },
         ("test_mm", "test_mm_relaxed"): {
             "ops_dict": {
                 "mm": torch.mm,
@@ -165,7 +172,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((512, 256), (256, 128)),
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
-                    ((3, 17, 128, 256), (3, 17, 256, 128)),
+                    # Modify the second dimension from 17 to 18 to avoid the issue of a prime
+                    # tensor shape until https://github.com/torch-spyre/torch-spyre/issues/399
+                    # is resolved.
+                    ((3, 18, 128, 256), (3, 18, 256, 128)),
                     ((2, 64, 128), (128, 16384)),
                 ]
             ),
@@ -972,6 +982,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
         torch.testing.assert_close(result, torch.eq(x, y))
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_scalar_cpu(self):
         def fn(x):
             a = torch.add(x, 1.0)
@@ -1021,6 +1032,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # Example where base function is not parameterized
     def test_add_broadcast_cpu(self, x, y):
         compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
+
+    def test_addmm_cpu(self, input, mat1, mat2):
+        compare_with_cpu(torch.addmm, input, mat1, mat2, atol=2e-1, rtol=2e-1)
 
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         if op == torch.max:

@@ -9,7 +9,7 @@
 #
 
 # Default owners (fallback for anything not matched below)
-*  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy
+*  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy @elpidatz
 
 # Inductor / compiler backend
 /torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
