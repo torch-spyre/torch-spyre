@@ -730,7 +730,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        ("test_softmax", "test_dim_op_cpu"): {
+        ("test_softmax", "test_dim_op_cpu_eager"): {
             "ops_dict": {
                 "softmax": lambda dim, x: torch.softmax(x, dim=dim),
             },
@@ -861,10 +861,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_squeeze",
-            "test_dim_op_cpu",
+            "test_dim_op_cpu_eager",
         ): {
             "ops_dict": {
                 "single": lambda dim, x: torch.squeeze(x, dim),
+            },
+            "param_sets": {
+                "2d0": (0, cached_randn((1, 128))),
+                "2d1": (1, cached_randn((4, 1))),
+                "3d0": (0, cached_randn((1, 4, 128))),
+                "3d1": (1, cached_randn((3, 1, 128))),
+                "3d2": (2, cached_randn((3, 4, 1))),
+                "4d0": (0, cached_randn((1, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 1, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 1, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 1))),
+            },
+        },
+        (
+            "test_squeeze",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                # exp(squeeze(x)) triggers internal compile in eager mode that
+                # fails on shapes where the squeezed dim is the last dimension
                 "combined": lambda dim, x: torch.exp(torch.squeeze(x, dim)),
             },
             "param_sets": {
@@ -881,7 +901,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_squeeze_reduction",
-            "test_dim_op_cpu",
+            "test_dim_op_cpu_eager",
         ): {
             "ops_dict": {
                 "sum": lambda dim, x: torch.squeeze(
@@ -903,10 +923,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_unsqueeze",
-            "test_dim_op_cpu",
+            "test_dim_op_cpu_eager",
         ): {
             "ops_dict": {
                 "single": lambda dim, x: torch.unsqueeze(x, dim),
+            },
+            "param_sets": {
+                "1d0": (0, cached_randn((128,))),
+                "1d1": (1, cached_randn((128,))),
+                "2d0": (0, cached_randn((4, 128))),
+                "2d1": (1, cached_randn((4, 128))),
+                "2d2": (2, cached_randn((4, 128))),
+                "3d0": (0, cached_randn((3, 4, 128))),
+                "3d1": (1, cached_randn((3, 4, 128))),
+                "3d2": (2, cached_randn((3, 4, 128))),
+                "3d3": (3, cached_randn((3, 4, 128))),
+                "4d0": (0, cached_randn((2, 3, 4, 128))),
+                "4d1": (1, cached_randn((2, 3, 4, 128))),
+                "4d2": (2, cached_randn((2, 3, 4, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 128))),
+                "4d4": (4, cached_randn((2, 3, 4, 128))),
+            },
+        },
+        (
+            "test_unsqueeze",
+            "test_dim_op_cpu",
+        ): {
+            "ops_dict": {
+                # exp(unsqueeze(x)) triggers internal compile in eager mode that
+                # fails with "Host dimension not found in dim_map" errors
                 "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
             },
             "param_sets": {
@@ -1096,9 +1141,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare(op, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
-        # Some binary operations (cmp ops: gt, le, ne; some matmul configs) fail with
-        # NotImplementedError in eager mode or backend compiler errors in compiled mode
-        compare_with_cpu(op, x, y, run_eager=False)
+        # Eager mode support varies by op:
+        # - torch.eq, torch.ge, torch.gt, torch.lt: work eagerly
+        # - torch.ne, torch.le: aten::ne.Tensor_out / aten::le.Tensor_out not registered
+        # - torch.matmul: numerical divergence (close=False) in eager 2d case
+        eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt)
+        compare_with_cpu(op, x, y, run_eager=eager_supported)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -1112,14 +1160,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(torch.addmm, input, mat1, mat2, atol=2e-1, rtol=2e-1)
 
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
-        # torch.amax is not registered for Spyre eager dispatch
+        # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch
         if op == torch.max:
             compare_with_cpu(
                 lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
             )
-        else:
+        elif op == torch.amax:
+            # aten::amax.out is not registered for the Spyre backend
             compare_with_cpu(
                 lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
+            )
+        else:
+            compare_with_cpu(
+                lambda x: op(x, dim=dim, keepdim=False), x
             )
 
     def test_reduce_keepdim0_cpu_no_eager(self, op, dim: int, x):
@@ -1134,13 +1187,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_reduce_keepdim1_cpu(self, op, dim: int, x):
-        # torch.amax is not registered for Spyre eager dispatch
+        # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch
         if op == torch.max:
             compare_with_cpu(
                 lambda x: op(x, dim=dim, keepdim=True)[0], x, run_eager=False
             )
-        else:
+        elif op == torch.amax:
+            # aten::amax.out is not registered for the Spyre backend
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
+        else:
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
     def test_reduce_keepdim1_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
@@ -1282,9 +1338,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(*args):
             return op(dim, *args)
 
-        # Some dim operations (squeeze_combined, unsqueeze_combined, unsqueeze_broadcast)
-        # fail with backend compiler errors in compiled mode
+        # Combined ops (exp+squeeze, exp+unsqueeze, add+unsqueeze) fail in eager
+        # because the eager exp/add dispatch internally triggers torch.compile on
+        # shapes that the Spyre backend compiler cannot handle
         compare_with_cpu(fn, *args, run_eager=False)
+
+    def test_dim_op_cpu_eager(self, op, dim, *args):
+        def fn(*args):
+            return op(dim, *args)
+
+        # Simple dim ops (softmax, squeeze, unsqueeze, sum+squeeze) work in eager
+        compare_with_cpu(fn, *args)
 
     def test_attention_cpu(self, *args):
         def fn(q, k, v, sm_scale):
