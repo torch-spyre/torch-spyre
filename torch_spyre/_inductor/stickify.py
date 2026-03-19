@@ -49,8 +49,8 @@ from .pass_utils import (
     get_mem_deps,
     host_coordinates,
     device_coordinates,
-    matching_dim,
 )
+from .views import matching_dim
 
 logger = get_inductor_logger("stickify")
 

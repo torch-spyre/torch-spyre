@@ -15,7 +15,7 @@
 # Helper methods to handle views
 
 import sympy
-from typing import Sequence
+from typing import Optional, Sequence
 
 
 def compute_relative_stride(
@@ -121,3 +121,20 @@ def compute_device_coordinates(
             if limit > rel_stride[dim] and step < rel_stride[dim] * device_size[dim]:
                 coordinates[dim] += term // rel_stride[dim]
     return coordinates
+
+
+def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
+    """
+    Given a coordinate array and an expression, determine if there is a unique
+    dimension in coords whose coordinate expression is exactly the one free variable
+    in the expression.  Return None if expr does not have exactly one free variable
+    or if there is not exactly one matching dimension in coords.
+    """
+    if len(expr.free_symbols) != 1:
+        return None
+    v = next(iter(expr.free_symbols))
+    dims = [d for d, e in enumerate(coords) if e == v]
+    if len(dims) != 1:
+        return None
+    else:
+        return dims[0]
