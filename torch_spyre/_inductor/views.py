@@ -41,31 +41,60 @@ def compute_coordinates(
     index: sympy.Expr,
 ) -> list[sympy.Expr]:
     """
-    Derive an array of coordinate expressions into a tensor from an index
+    Compute an array of coordinate expressions from an index expression.
+
+    Stride and index must be relative to the same storage (both host or device).
+    Stride values<=0 are ignored.
     """
-    coordinates = [sympy.S.Zero] * len(size)
+    # find stride immediately strictly larger that dim stride
+    n = len(size)
+    next_stride = [sympy.oo] * n
+    for i in range(n):
+        for j in range(n):
+            # n^2 is ok since n is small
+            if next_stride[i] > stride[j] and stride[j] > stride[i]:
+                next_stride[i] = stride[j]
+    # compute coordinate expressions
+    coordinates = [sympy.S.Zero] * n
     vars = index.free_symbols
     for var in vars:
         if var_ranges[var] <= 1:
-            continue
+            continue  # ignore var with trivial range
+        # isolate current var
         term = index.subs({v: 0 for v in vars - {var}})
+        # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.subs(var, 1)
         limit = term.subs(var, var_ranges[var])
+        # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
-        for dim in range(len(size)):
+        for dim in range(n):
             if size[dim] == 1:
-                continue
+                continue  # ignore dim with size 1
             st = stride[dim]
-            if st > step and st < limit:
-                coordinates[dim] += var * step // st
-            elif st <= step and st > primary_stride:
+            if st <= step and st > primary_stride:
+                # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
-        coordinates[primary_dim] += var * step // primary_stride
+            elif st > step and st < limit:
+                # var range intersects dim, add term
+                if next_stride[dim] < limit:
+                    # var range overflows dim
+                    coordinates[dim] += var * step % next_stride[dim] // st
+                else:
+                    coordinates[dim] += var * step // st
+        # add term for primary dim
+        if next_stride[primary_dim] < limit:
+            coordinates[primary_dim] += (
+                # var range overflows primary dim
+                var * step % next_stride[primary_dim] // primary_stride
+            )
+        else:
+            coordinates[primary_dim] += var * step // primary_stride
     return coordinates
 
 
+# deprecated: replace with compute_coordinates with stride_map
 def compute_device_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
