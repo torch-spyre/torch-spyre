@@ -267,7 +267,7 @@ def register_spyre_decompositions_via_dispatchkey(
                 # Pre-compile once so that repeated eager-mode calls reuse the
                 # same compiled entry point rather than constructing a new
                 # torch.compile wrapper on every invocation.
-                self._compiled_fn = torch.compile(spyre_fn)
+                self._compiled_fn = torch.compile(spyre_fn, dynamic=False)
 
             def __call__(self, *args, **kwargs):
                 # We are about to execute the op on spyre, hence the inputs are expected to be on spyre
