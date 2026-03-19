@@ -367,7 +367,14 @@ def create_op_spec(
             DataFormats.SEN169_FP16,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
-    return OpSpec(op, is_reduction, [d.numel for d in dims], args, op_info)
+    return OpSpec(
+        op,
+        is_reduction,
+        [d.numel for d in dims],
+        {d.var: d.numel for d in dims},
+        args,
+        op_info,
+    )
 
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
@@ -728,6 +735,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                         buf.writeline(f"op='{op_spec.op}',")
                         buf.writeline(f"is_reduction={op_spec.is_reduction},")
                         buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
+                        buf.writeline(
+                            "iteration_space_dict={"
+                            + f"{', '.join([sympy.srepr(k) + ': ' + sympy.srepr(v) for k, v in op_spec.iteration_space_dict.items()])}"
+                            + "},"
+                        )
                         buf.writeline(f"op_info={op_spec.op_info!r},")
                         buf.writeline("args=[")
                         with buf.indent():
@@ -742,7 +754,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                                         f"# device_coordinates: {arg.device_coordinates}"
                                     )
                                     buf.writeline(
-                                        f"device_coordinates={['eval(' + sympy.python(e) + ')' for e in arg.device_coordinates]},"
+                                        f"device_coordinates=[{', '.join([sympy.srepr(e) for e in arg.device_coordinates])}],"
                                     )
                                     buf.writeline(
                                         f"allocation={arg.allocation!r}, dtype={arg.dtype!r}, it_dim_map={arg.it_dim_map!r}, "
