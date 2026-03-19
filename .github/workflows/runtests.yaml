@@ -44,6 +44,7 @@ jobs:
         run: |
           # pip install -e . --no-deps --no-build-isolation -vvv --verbose
           echo 'installing with dependencies, this could take a while...'
+          pip install uv
           uv sync --all-extras --active --inexact --no-build-isolation --reinstall-package torch-spyre -v
       - name: Run unit tests
         run: |
