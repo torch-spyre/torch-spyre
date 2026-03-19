@@ -29,3 +29,9 @@
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss
+
+# CI/CD
+/.github/                 @ashokponkumar
+/.pre-commit-config.yaml  @ashokponkumar
+/pytest.ini               @ashokponkumar
+/pytest_models.ini        @ashokponkumar
