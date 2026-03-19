@@ -49,14 +49,6 @@
   template_name: base
 - operator_name: ge
   template_name: base
-- operator_name: gelu
-  template_name: base
-  torch_prefix: torch.nn.functional
-  extra_arguments:
-  - name: approximate
-    type: bool
-    default: False
-    overwrite: True
 - operator_name: linalg_vector_norm
   template_name: base
   torch_prefix: torch.linalg

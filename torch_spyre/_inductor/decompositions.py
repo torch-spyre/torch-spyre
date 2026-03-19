@@ -14,9 +14,13 @@
 
 from contextlib import contextmanager
 
-from typing import Callable, Optional, Sequence, Union
+from typing import Optional, Union, Sequence, Callable, TypeVar
+from typing_extensions import ParamSpec
 import torch
+from torch.utils import _pytree as pytree
 import torch._decomp as decomp
+
+from .constants import DEVICE_NAME
 from .errors import Unsupported
 from . import customops  # noqa: F401
 
@@ -35,15 +39,59 @@ spyre_decompositions: dict = {}
 #
 spyre_decompositions_to_exclude: list = []
 
+# Dict for Spyre-specific decompositions to be registered via DispatchKey
+spyre_decompositions_via_dispatchkey: dict = {}
+
+# Module-level Library objects kept alive permanently so that the registered
+# PrivateUse1 / AutogradPrivateUse1 kernels are never unregistered by garbage collector.
+# (torch.library.Library uses weakref.finalize → m.reset() on GC, which would
+# silently remove the kernels from the C++ dispatcher.)
+_spyre_autograd_lib = None
+_spyre_lib = None
+_dispatchkey_kernels_registered = False
+
+_T = TypeVar("_T")
+_P = ParamSpec("_P")
+
 
 def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
-):
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
     Register decompositions specifically for Spyre device.
     These will only be active when compiling for the Spyre device.
+
+    For ``aten`` ops, this also registers a PrivateUse1 dispatch kernel
+    (via ``register_spyre_decompositions_via_dispatchkey``) so that
+    eager-mode dispatch on a Spyre tensor reaches the Spyre implementation.
+    This is necessary for ops with CompositeImplicitAutograd (CIA) in
+    upstream PyTorch, and harmless for non-CIA ops.
     """
-    return decomp.register_decomposition(ops, spyre_decompositions)
+
+    def decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # 1. Register in the Spyre decomposition table (for compile mode / make_fx)
+        decomp.register_decomposition(ops, spyre_decompositions)(fn)
+
+        # 2. For aten ops, also register via PrivateUse1 dispatch key (for eager mode).
+        #    Non-aten ops (e.g. spyre::compact) are custom Spyre ops that don't need
+        #    PrivateUse1 kernel registration.
+        #    Skip ops that already have a PrivateUse1 kernel (e.g. from codegen_ops.py
+        #    or eager.py) to avoid registration conflicts.
+        ops_list = ops if isinstance(ops, list) else [ops]
+        aten_ops = [
+            op
+            for op in ops_list
+            if getattr(op, "namespace", None) == "aten"
+            and not torch._C._dispatch_has_kernel_for_dispatch_key(
+                op._name, "PrivateUse1"
+            )
+        ]
+        if aten_ops:
+            register_spyre_decompositions_via_dispatchkey(aten_ops)(fn)
+
+        return fn
+
+    return decorator
 
 
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
@@ -167,39 +215,93 @@ def enable_spyre_decompositions(
             enable_spyre_decompositions._removed_decompositions_fallback_ops = {}
 
 
-@decomp.register_decomposition([torch.ops.spyre.compact])
+def _register_spyre_dispatchkey_kernels_permanently():
+    """
+    Permanently register PrivateUse1 / AutogradPrivateUse1 kernels for all ops
+    in ``spyre_decompositions_via_dispatchkey``.
+
+    This must be called once before any eager-mode dispatch can reach the Spyre
+    kernels (typically from ``_SpyreImpl._lazy_init()``).  It is idempotent:
+    subsequent calls are no-ops.
+
+    The ``Library`` objects are stored in module-level globals so they are never
+    garbage-collected (and therefore never unregistered from the C++ dispatcher).
+
+    After registration, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
+    to route dispatch: inside a ``torch.compile`` context the Spyre function is called
+    directly; outside (eager mode) the pre-compiled wrapper is used.
+    """
+    global _spyre_autograd_lib, _spyre_lib, _dispatchkey_kernels_registered
+
+    if _dispatchkey_kernels_registered:
+        return
+
+    from torch.library import Library, fallthrough_kernel
+
+    _spyre_autograd_lib = Library("aten", "IMPL", "AutogradPrivateUse1")
+    _spyre_lib = Library("aten", "IMPL", "PrivateUse1")
+
+    for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
+        # Autograd key: fall through so that the PrivateUse1 kernel is reached.
+        _spyre_autograd_lib.impl(op._name, fallthrough_kernel)
+        # PrivateUse1 key: the OPWrapper dispatches to spyre_fn.
+        _spyre_lib.impl(op._name, wrapper_cls)
+
+    _dispatchkey_kernels_registered = True
+
+
+def register_spyre_decompositions_via_dispatchkey(
+    ops: Union[torch._ops.OperatorBase, list],
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """
+    Register decompositions specifically for Spyre device via the PyTorch dispatcher
+    This replaces the need for global patching of operations in order to enable them for
+    eager mode.
+    """
+
+    def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        class OPWrapper:
+            def __init__(self, op, spyre_fn):
+                self.op = op
+                self.spyre_fn = spyre_fn
+                # Pre-compile once so that repeated eager-mode calls reuse the
+                # same compiled entry point rather than constructing a new
+                # torch.compile wrapper on every invocation.
+                self._compiled_fn = torch.compile(spyre_fn, dynamic=False)
+
+            def __call__(self, *args, **kwargs):
+                # We are about to execute the op on spyre, hence the inputs are expected to be on spyre
+                if any(
+                    isinstance(x, torch.Tensor)
+                    and getattr(x.device, "type", None) != DEVICE_NAME
+                    for x in (pytree.tree_leaves(args) + pytree.tree_leaves(kwargs))
+                ):
+                    raise RuntimeError(
+                        "Spyre decomposition function called with inputs being on a different device!"
+                    )
+
+                # Inside a torch.compile context (make_fx tracing, Inductor
+                # lowering, etc.) call the function directly — wrapping it in
+                # another torch.compile call would be incorrect.
+                if torch.compiler.is_compiling():
+                    return self.spyre_fn(*args, **kwargs)
+                else:
+                    # Eager mode: use the pre-compiled wrapper.
+                    return self._compiled_fn(*args, **kwargs)
+
+        def register(op):
+            spyre_decompositions_via_dispatchkey[op] = OPWrapper(op, fn)
+
+        # To handle allowing multiple aten_ops at once
+        pytree.tree_map_(register, ops)
+        return fn
+
+    return decomposition_decorator
+
+
+@register_spyre_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
-
-
-@register_spyre_decomposition([torch.ops.spyre.layer_norm])
-def layernorm_decomp(
-    input: torch.Tensor,
-    normalized_shape: list[int],
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
-    norm_mean = torch.ops.spyre.layernormscale(mean, eps)
-    return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
-
-
-@register_spyre_decomposition([torch.ops.spyre.rms_norm])
-def rmsnorm_decomp(
-    input: torch.Tensor,
-    normalized_shape: list[int],
-    weight: Optional[torch.Tensor] = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    # TODO: limitation with mean on dim=-1, transpose for now to avoid
-    # https://github.com/torch-spyre/torch-spyre/issues/632
-    input = input.transpose(-1, -2).contiguous()
-    rsqrt_inp = torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps
-    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
-    if weight is not None:
-        output = output * weight
-    return output
 
 
 # TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
@@ -259,77 +361,6 @@ def full_decomp(
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
-
-
-"""
-Hook torch.nn.functional.layer_norm to select spyre optimized version where applicable
-"""
-orig_layer_norm = torch.nn.functional.layer_norm
-
-
-def spyre_layer_norm(
-    input: torch.Tensor,
-    normalized_shape: Sequence[int],
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    if input.device.type == "spyre" and len(normalized_shape) == 1:
-        return torch.ops.spyre.layer_norm(input, normalized_shape, weight, bias, eps)
-    else:
-        return orig_layer_norm(input, normalized_shape, weight, bias, eps)
-
-
-torch.nn.functional.layer_norm = spyre_layer_norm
-
-orig_rms_norm = torch.nn.functional.rms_norm
-
-
-def spyre_rms_norm(
-    input: torch.Tensor,
-    normalized_shape: list[int],
-    weight: Optional[torch.Tensor] = None,
-    eps: Optional[float] = None,
-) -> torch.Tensor:
-    if input.device.type == "spyre" and len(normalized_shape) == 1:
-        return torch.ops.spyre.rms_norm(input, normalized_shape, weight, eps)
-    elif input.device.type == "spyre" and len(normalized_shape) != 1:
-        raise Unsupported("RMSNorm reducing more than 1 dimension")
-    else:
-        return orig_rms_norm(input, normalized_shape, weight, eps)
-
-
-torch.nn.functional.rms_norm = spyre_rms_norm
-
-orig_gelu = torch.nn.functional.gelu
-
-
-def spyre_gelu(
-    input: torch.Tensor,
-    approximate: str = "none",
-) -> torch.Tensor:
-    if input.device.type == "spyre":
-        return torch.ops.spyre.gelu(input, approximate)
-    else:
-        return orig_gelu(input, approximate=approximate)
-
-
-torch.nn.functional.gelu = spyre_gelu
-
-
-orig_softplus = torch.nn.functional.softplus
-
-
-def spyre_softplus(
-    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
-) -> torch.Tensor:
-    if input.device.type == "spyre":
-        return torch.ops.spyre.softplus(input, beta, threshold)
-    else:
-        return orig_softplus(input, beta, threshold)
-
-
-torch.nn.functional.softplus = spyre_softplus
 
 
 @register_spyre_decomposition([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Tensor_out])
@@ -397,3 +428,84 @@ def addmm_decomp(
         return out
 
     return result
+
+
+###############################################################################################
+##                           Spyre decompositions for aten ops                               ##
+###############################################################################################
+# For aten ops, ``register_spyre_decomposition`` automatically registers both a
+# decomposition table entry (for compile mode / make_fx) and a PrivateUse1
+# dispatch kernel (for eager mode).  The latter is essential for ops with
+# CompositeImplicitAutograd (CIA) in upstream PyTorch (e.g. rms_norm,
+# layer_norm), and harmless for non-CIA ops (e.g. gelu, softplus).
+@register_spyre_decomposition([torch.ops.aten.rms_norm.default])
+def spyre_rms_norm(
+    input: torch.Tensor,
+    normalized_shape: list[int],
+    weight: Optional[torch.Tensor] = None,
+    eps: Optional[float] = 1e-5,
+) -> torch.Tensor:
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"spyre_rms_norm: only supports spyre device with normalized_shape of length 1, "
+            f"got device={input.device.type}, normalized_shape={normalized_shape}"
+        )
+
+    # TODO: limitation with mean on dim=-1, transpose for now to avoid
+    # https://github.com/torch-spyre/torch-spyre/issues/632
+    input = input.transpose(-1, -2).contiguous()
+    eps_tensor = torch.ops.spyre.full(
+        input.shape, eps, dtype=torch.float16, device="spyre"
+    )
+    rsqrt_inp = (
+        torch.rsqrt(torch.mean(input * input, dim=-2, keepdim=True)) + eps_tensor
+    )
+    output = (input * rsqrt_inp).transpose(-1, -2).contiguous()
+    if weight is not None:
+        output = output * weight
+    return output
+
+
+@register_spyre_decomposition([torch.ops.aten.layer_norm.default])
+def spyre_layer_norm(
+    input: torch.Tensor,
+    normalized_shape: Sequence[int],
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    if len(normalized_shape) != 1:
+        raise Unsupported(
+            f"spyre_layer_norm: only supports spyre device with normalized_shape of length 1, "
+            f"got device={input.device.type}, normalized_shape={normalized_shape}"
+        )
+    mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
+    norm_mean = torch.ops.spyre.layernormscale(mean, eps)
+    return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+@register_spyre_decomposition([torch.ops.aten.gelu.default])
+def spyre_gelu(
+    input: torch.Tensor,
+    approximate: str = "none",
+) -> torch.Tensor:
+    return torch.ops.spyre.gelu(input, approximate)
+
+
+@register_spyre_decomposition([torch.ops.aten.softplus.default])
+def spyre_softplus(
+    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
+) -> torch.Tensor:
+    return torch.ops.spyre.softplus(input, beta, threshold)
+
+
+###############################################################################################
+##                           Register custom kernels for Spyre.                              ##
+###############################################################################################
+# Kernels are registered permanently in the C++ dispatcher by
+# ``_register_spyre_dispatchkey_kernels_permanently()`` (idempotent).
+# Once registered, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
+# to route dispatch: inside a ``torch.compile`` context the Spyre function is
+# called directly; outside (eager mode) the pre-compiled wrapper is used.
+# Note: This has to stay at the end of the file.
+_register_spyre_dispatchkey_kernels_permanently()

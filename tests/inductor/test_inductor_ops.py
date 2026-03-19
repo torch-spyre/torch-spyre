@@ -958,6 +958,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        ("test_softplus", "test_softplus_cpu"): {
+            "param_sets": {
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+            },
+        },
         ("test_scalar_cpu", "test_scalar_cpu"): {
             "ops_dict": {
                 "add": torch.add,
@@ -1204,6 +1211,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_rmsnorm_cpu(self, x):
         def fn(input):
             return torch.nn.functional.rms_norm(input, [input.shape[-1]], eps=1e-6)
+
+        compare_with_cpu(fn, x)
+
+    def test_softplus_cpu(self, x):
+        beta = 1.0
+        threshold = 20.0
+
+        def fn(input):
+            return torch.nn.functional.softplus(input, beta, threshold)
 
         compare_with_cpu(fn, x)
 
