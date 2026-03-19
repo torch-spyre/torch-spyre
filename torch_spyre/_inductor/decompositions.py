@@ -393,6 +393,7 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
         zero = torch.zeros_like(input)
     return torch.eq(input, zero)
 
+
 @register_spyre_decomposition([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
 def addmm_decomp(
     input: torch.Tensor,
