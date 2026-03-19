@@ -73,6 +73,7 @@ def device_layout_like(
         return SpyreTensorLayout(
             layout.device_layout.device_size,
             layout.device_layout.dim_map,
+            layout.device_layout.stride_map,
             get_device_dtype(dtype),
         )
     else:
@@ -94,7 +95,10 @@ def device_layout_like(
                 adjusted_device_size[stick_dim_idx] * scaling_factor
             )
         return SpyreTensorLayout(
-            adjusted_device_size, layout.device_layout.dim_map, get_device_dtype(dtype)
+            adjusted_device_size,
+            layout.device_layout.dim_map,
+            layout.device_layout.stride_map,
+            get_device_dtype(dtype),
         )
 
 
@@ -187,7 +191,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             raise Unsupported(
                 f"views not supported for spyre.layernormnorm({x.layout.size})=>{output.size}) "
             )
-        stl = SpyreTensorLayout(x_stl.device_size, x_stl.dim_map, x_stl.device_dtype)
+        stl = SpyreTensorLayout(
+            x_stl.device_size, x_stl.dim_map, x_stl.stride_map, x_stl.device_dtype
+        )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
