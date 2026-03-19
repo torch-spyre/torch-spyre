@@ -20,15 +20,12 @@ import subprocess
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
-from torch_spyre._inductor.codegen.superdsc import generate_sdsc
-from torch_spyre._inductor.constants import SEGMENT_OFFSETS
+from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.logging_utils import get_inductor_logger, _get_env_bool
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
-
-_argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
 
 _SDSC_BUNDLE = _get_env_bool("SPYRE_SUPERDSC_BUNDLE")
 
@@ -53,49 +50,7 @@ class SpyreAsyncCompile:
                 print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
                 return SpyreUnimplementedRunner(kernel_name, ks.op)
 
-            inputs = []
-            outputs = []
-            arg_map = []
-            for index, ts in enumerate(ks.args):
-                # use node seq (idx in nodes) to verify whether to reuse lx for this buffer,
-                # in case same Op used twice in sequence and only want pin 1 of them
-                lx_addr = None
-                for k, addr in getattr(ts, "allocation", {}).items():
-                    if kernel_name.split("_")[-1] == k.replace("lx:", ""):
-                        lx_addr = addr
-
-                if ts.is_input:
-                    inputs.append(
-                        {
-                            "name": _argument_names[index],
-                            "it_dim_map": ts.it_dim_map,
-                            "device_layout": ts.device_layout,
-                            "lx_addr": lx_addr,
-                        }
-                    )
-                    arg_map.append(ts.arg_index)
-                else:
-                    outputs.append(
-                        {
-                            "name": _argument_names[index],
-                            "it_dim_map": ts.it_dim_map,
-                            "device_layout": ts.device_layout,
-                            "lx_addr": lx_addr,
-                        }
-                    )
-                    arg_map.append(ts.arg_index)
-            kernel_descriptor = {
-                "name": kernel_name,
-                "reduction": ks.is_reduction,
-                "op": ks.op,
-                "dimensions": ks.iteration_space,
-                "inputs": inputs,
-                "outputs": outputs,
-            }
-            if ks.op_info is not None:
-                kernel_descriptor["op_info"] = ks.op_info
-            pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
-            dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
+            dt_sdsc, arg_map = compile_op_spec(kernel_name, ks)
             sdscs.append(dt_sdsc)
             arg_mappings.append(arg_map)
 
