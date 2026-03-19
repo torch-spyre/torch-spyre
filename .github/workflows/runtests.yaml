@@ -40,8 +40,12 @@ jobs:
           python3 --version
           python3 -c 'import sys; print(sys.path)'
           echo 'gather info end'
-      - name: Install package with test dependencies
-        run: pip install -e . --no-deps --no-build-isolation -vvv --verbose
+      - name: Install the torch-spyre package and dependencies
+        run: |
+          echo 'installing with dependencies, this could take a while...'
+          pip install uv
+          # avoid the extra step required by --no-build-isolation
+          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
       - name: Run unit tests
         run: |
           echo 'Run unit tests start'
