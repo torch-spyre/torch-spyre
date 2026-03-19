@@ -14,29 +14,15 @@
 
 # Owner(s): ["module: cpp"]
 
-import pathlib
 import pytest
-import yaml
-import unittest
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch.testing._internal.common_methods_invocations import op_db
 
 
 class TestOps(TestCase):
     def __init__(self, method_name="runTest", methodName="runTest"):
         super().__init__(method_name, methodName)
-        declarations_path = (
-            pathlib.Path(__file__).parent.parent
-            / "codegen"
-            / "outputs"
-            / "GeneratedDeclarations.yaml"
-        )
-        declarations_path.resolve()
-
-        with declarations_path.open() as f:
-            self.declarations = yaml.safe_load(f)
 
         # NOTE: needs to be at most 1e-3
         self.rtol = 1e-1
@@ -140,299 +126,12 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    def test_t_1d(self):
-        x = torch.tensor([1, -2, 3], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        assert x_spyre.t().device_tensor_layout() is not None
-        y = x_spyre.t().to("cpu")
-        torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
-
-    def test_t_2d(self):
-        x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = x_spyre.t().to("cpu")
-        torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
-
-    def test_transpose_2d(self):
-        x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = x_spyre.transpose(0, 1).to("cpu")
-        torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
-
-    def test_transpose_3d(self):
-        x = torch.tensor(
-            [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
-            dtype=self.dtype,
-        )
-        x_spyre = x.to("spyre")
-        y = x_spyre.transpose(0, 1).to("cpu")
-        torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
-
-    def test_permute_2d(self):
-        x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = x_spyre.permute(1, 0).to("cpu")
-        torch.testing.assert_close(y, x.permute(1, 0), rtol=self.rtol, atol=self.atol)
-
-    def test_bool(self):
-        dtype = torch.bool
-        x = torch.randint(0, 2, (2, 64), dtype=dtype)
-        x_spyre = x.to("spyre")
-        y = torch.randint(0, 2, (2, 64), dtype=dtype)
-        y_spyre = y.to("spyre")
-        result = torch.eq(x_spyre, y_spyre).cpu()
-        torch.testing.assert_close(result, torch.eq(x, y))
-
-    def test_eq(self):
-        x = torch.tensor([1, -2, 3], dtype=self.dtype)
-        y = torch.tensor([0, -2, 4], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        # FIXME: equal is currently returning back the same dtype as the original tensor, we need to have this return a bool
-        actual = (x_spyre == y_spyre).cpu().bool()
-        torch.testing.assert_close(actual, x == y, rtol=self.rtol, atol=self.atol)
-
-    def test_ge(self):
-        x = torch.tensor([1, -2, 3], dtype=self.dtype)
-        y = torch.tensor([0, -2, 4], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        # FIXME: equal is currently returning back the same dtype as the original tensor, we need to have this return a bool
-        actual = (x_spyre >= y_spyre).cpu().bool()
-        torch.testing.assert_close(actual, x >= y, rtol=self.rtol, atol=self.atol)
-
-    def test_abs(self):
-        x = torch.tensor([1, -2, 3], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.abs(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.abs(x), rtol=self.rtol, atol=self.atol)
-
-    def test_relu(self):
-        x = torch.tensor([1, -2, 3], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.relu(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.relu(x), rtol=self.rtol, atol=self.atol)
-
-    def test_silu(self):
-        x = torch.rand([2, 100, 12800], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.nn.functional.silu(x_spyre).to("cpu")
-        torch.testing.assert_close(
-            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
-        )
-
     def test_mish(self):
         x = torch.rand([2, 100, 12800], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.nn.functional.mish(x_spyre).to("cpu")
         torch.testing.assert_close(
             y, torch.nn.functional.mish(x), rtol=self.rtol, atol=self.atol
-        )
-
-    def test_exp(self):
-        x = torch.tensor([-10, -1, 0, 1, 10], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.exp(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.exp(x), rtol=self.rtol, atol=self.atol)
-
-    def test_exp_transpose(self):
-        x = torch.tensor([[-10, -1, 0, 1, 10], [1, 2, 3, 4, 5]], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.exp(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.exp(x), rtol=self.rtol, atol=self.atol)
-
-    def test_log(self):
-        x = torch.tensor([0.1, 1, 10, 100], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.log(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.log(x), rtol=self.rtol, atol=self.atol)
-
-    def test_reciprocal(self):
-        x = torch.tensor([-2, 1, 3], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.reciprocal(x_spyre).to("cpu")
-        torch.testing.assert_close(
-            y, torch.reciprocal(x), rtol=self.rtol, atol=self.atol
-        )
-
-    def test_sigmoid(self):
-        x = torch.tensor([-2, 1, 3], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.sigmoid(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.sigmoid(x), rtol=self.rtol, atol=self.atol)
-
-    def test_sqrt(self):
-        x = torch.tensor([0, 1, 2.25, 4, 10000], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.sqrt(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.sqrt(x), rtol=self.rtol, atol=self.atol)
-
-    def test_tanh(self):
-        x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.tanh(x_spyre).to("cpu")
-        torch.testing.assert_close(y, torch.tanh(x), rtol=self.rtol, atol=self.atol)
-
-    def test_pow_scalar_exponent(self):
-        x = torch.randn((1, 1, 4096), dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.pow(x_spyre, 2).to("cpu")
-        torch.testing.assert_close(y, torch.pow(x, 2), rtol=self.rtol, atol=self.atol)
-
-    @unittest.skip("TODO: Needs more debug")
-    def test_clone(self):
-        x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.clone(x_spyre).to("cpu")
-        torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
-
-    def test_add_Tensor(self):
-        x = torch.tensor([1, 2, 3], dtype=self.dtype)
-        y = torch.tensor([4, 5, 6], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.add(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.add(x, y), rtol=self.rtol, atol=self.atol)
-
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_add_Scalar(self):
-        x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype)
-        y = 5
-        x_spyre = x.to("spyre")
-        z = (x_spyre + y).to("cpu")
-        torch.testing.assert_close(z, x + y, rtol=self.rtol, atol=self.atol)
-
-    @unittest.skip("xfail: contiguous crashes in eager mode")
-    def test_add_Tensor_transpose(self):
-        x = torch.arange(8, dtype=self.dtype).view(2, 4)
-        y = torch.arange(8, dtype=self.dtype).view(4, 2) * 10
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z_01 = torch.add(x_spyre, y_spyre.t().contiguous()).to("cpu")
-        z_10 = torch.add(x_spyre.t().contiguous(), y_spyre).to("cpu")
-        torch.testing.assert_close(
-            z_01, torch.add(x, y.t()), rtol=self.rtol, atol=self.atol
-        )
-        torch.testing.assert_close(
-            z_10, torch.add(x.t(), y), rtol=self.rtol, atol=self.atol
-        )
-
-    def test_sub(self):
-        x = torch.tensor([10, 20, 3], dtype=self.dtype)
-        y = torch.tensor([4, 5, 6], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.subtract(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(
-            z, torch.subtract(x, y), rtol=self.rtol, atol=self.atol
-        )
-
-    def test_mul(self):
-        x = torch.tensor([1, 0, -3], dtype=self.dtype)
-        y = torch.tensor([4, 5, 6], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mul(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mul(x, y), rtol=self.rtol, atol=self.atol)
-
-    # https://github.com/torch-spyre/torch-spyre/issues/740
-    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
-    def test_mm_ab_bc(self):
-        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
-            self.mm_a, self.mm_b
-        )
-        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
-            self.mm_b, self.mm_c
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
-
-    # https://github.com/torch-spyre/torch-spyre/issues/740
-    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
-    def test_mm_ac_cb(self):
-        x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
-            self.mm_a, self.mm_c
-        )
-        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
-            self.mm_c, self.mm_b
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
-
-    # https://github.com/torch-spyre/torch-spyre/issues/740
-    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
-    def test_mm_ba_ac(self):
-        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
-            self.mm_b, self.mm_a
-        )
-        y = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
-            self.mm_a, self.mm_c
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
-
-    def test_mm_bc_ca(self):
-        x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
-            self.mm_b, self.mm_c
-        )
-        y = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
-            self.mm_c, self.mm_a
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
-
-    # https://github.com/torch-spyre/torch-spyre/issues/740
-    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
-    def test_mm_ca_ab(self):
-        x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
-            self.mm_c, self.mm_a
-        )
-        y = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
-            self.mm_a, self.mm_b
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
-
-    # https://github.com/torch-spyre/torch-spyre/issues/740
-    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
-    def test_mm_cb_ba(self):
-        x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
-            self.mm_c, self.mm_b
-        )
-        y = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
-            self.mm_b, self.mm_a
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.mm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
-
-    def test_addmm_ab_bc(self):
-        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
-            self.mm_a, self.mm_c
-        )
-        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
-            self.mm_a, self.mm_b
-        )
-        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
-            self.mm_b, self.mm_c
-        )
-        mat_spyre = mat.to("spyre")
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.addmm(mat_spyre, x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(
-            z, torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -474,64 +173,6 @@ class TestOps(TestCase):
             out_spyre.to("cpu"), torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
         )
 
-    def test_bmm_ab_bc(self):
-        B = 1
-        x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
-            B, self.mm_a, self.mm_b
-        )
-        y = torch.randn(B * self.mm_b * self.mm_c, dtype=self.dtype).view(
-            B, self.mm_b, self.mm_c
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.bmm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
-
-    def test_bmm_cb_ba(self):
-        B = 1
-        x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
-            B, self.mm_c, self.mm_b
-        )
-        y = torch.randn(B * self.mm_b * self.mm_a, dtype=self.dtype).view(
-            B, self.mm_b, self.mm_a
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.bmm(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
-
-    # https://github.com/torch-spyre/torch-spyre/issues/740
-    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
-    def test_matmul_ab_bc(self):
-        B = 1
-        x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
-            B, self.mm_a, self.mm_b
-        )
-        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
-            self.mm_b, self.mm_c
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.matmul(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(
-            z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
-        )
-
-    def test_matmul_cb_ba(self):
-        B = 1
-        x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
-            B, self.mm_c, self.mm_b
-        )
-        y = torch.randn(self.mm_b * self.mm_a, dtype=self.dtype).view(
-            self.mm_b, self.mm_a
-        )
-        x_spyre = x.to("spyre")
-        y_spyre = y.to("spyre")
-        z = torch.matmul(x_spyre, y_spyre).to("cpu")
-        torch.testing.assert_close(
-            z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
-        )
-
     def test_mean(self):
         x = torch.tensor(
             [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]],
@@ -552,22 +193,6 @@ class TestOps(TestCase):
             torch.mean(x, dim=[0], keepdim=True),
             rtol=self.rtol,
             atol=self.atol,
-        )
-
-    def test_sum(self):
-        x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
-        x_spyre = x.to("spyre")
-        y0 = torch.sum(x_spyre, dim=[0]).to("cpu")
-        torch.testing.assert_close(
-            y0, torch.sum(x, dim=[0]), rtol=self.rtol, atol=self.atol
-        )
-
-    def test_softmax(self):
-        x = torch.arange(0, 64, dtype=self.dtype).unsqueeze(0).repeat(3, 1)
-        x_spyre = x.to("spyre")
-        y1 = torch.softmax(x_spyre, dim=1).to("cpu")
-        torch.testing.assert_close(
-            y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
     def test_normal_randn(self):
@@ -733,76 +358,6 @@ class TestOps(TestCase):
         ).to("cpu")
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
-
-    @unittest.skip("TODO: Needs more debug")
-    def test_all_ops(self):
-        def test_op(declaration):
-            op_handle = getattr(torch.ops.aten, declaration["operator_name"])
-            if declaration["overload_name"]:
-                try:
-                    op_handle = getattr(op_handle, declaration["overload_name"])
-                except AttributeError:
-                    pass
-
-            op_info = [op for op in op_db if op.name == declaration["name"]]
-
-            close = True
-            if op_info:
-                op_info = op_info[0]
-                sample_inputs = list(
-                    op_info.sample_inputs(device="cpu", dtype=torch.float16)
-                )
-                for s in sample_inputs:
-                    sample_input = [
-                        s.input,
-                        *s.args[: len(declaration["arguments"]) - 1],
-                    ]
-                    try:
-                        outputs_cpu = op_handle(*sample_input)
-
-                        sample_input_spyre = [
-                            s_.to("spyre") if isinstance(s_, torch.Tensor) else s_
-                            for s_ in sample_input
-                        ]
-                        outputs_spyre = op_handle(*sample_input_spyre)
-
-                        for j in range(len(outputs_cpu)):
-                            close_ = torch.allclose(
-                                outputs_cpu[j],
-                                outputs_spyre[j].to("cpu"),
-                                rtol=self.rtol,
-                                atol=self.atol,
-                            )
-                            if not close_:
-                                close = False
-                                print(
-                                    f"spyre output is different for {declaration['operator_name']}"
-                                )
-
-                        # check if something happens to inputs as well
-                        for j in range(len(sample_input)):
-                            if isinstance(sample_input[j], torch.Tensor):
-                                close_ = torch.allclose(
-                                    sample_input[j],
-                                    sample_input_spyre[j].to("cpu"),
-                                    rtol=self.rtol,
-                                    atol=self.atol,
-                                )
-                                if not close_:
-                                    close = False
-                                    print(
-                                        f"spyre inputs changed after operation for {declaration['operator_name']}"
-                                    )
-
-                    except Exception:
-                        print(f"Could not run test for {declaration['operator_name']}")
-            else:
-                print(f"Could not find op_info for {declaration['operator_name']}")
-
-            return close
-
-        for dec in self.declarations:
-            test_op(dec)
 
 
 if __name__ == "__main__":

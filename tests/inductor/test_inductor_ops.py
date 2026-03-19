@@ -292,7 +292,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         (
             "test_alias_operands_cpu",
-            "test_unary_op_cpu_no_eager",
+            "test_unary_op_cpu",
         ): {
             "ops_dict": {
                 "pow": lambda x: torch.pow(x, 2),
@@ -396,13 +396,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_3": (3, cached_randn((6, 7, 12, 256), scale=0.1)),
             },
         },
-        ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
+        ("test_t_1d_cpu", "test_t_1d_cpu"): {
+            "param_sets": make_param_dict(
+                [
+                    ((3,),),
+                ]
+            ),
+        },
+        ("test_t_2d_cpu", "test_t_2d_cpu"): {
             "param_sets": make_param_dict(
                 [
                     ((1088, 320),),
                     ((320, 320),),
                 ]
             ),
+        },
+        ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
+            "param_sets": {
+                "dim_0_2": (
+                    0,
+                    2,
+                    cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_1_2": (
+                    1,
+                    2,
+                    cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_0_2_same_dim": (
+                    0,
+                    2,
+                    cached_randn((128, 128, 128), abs=True),
+                ),
+                "dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((128, 64, 128), abs=True),
+                ),
+            }
         },
         ("test_transpose_3d_cpu", "test_transpose_3d_cpu"): {
             "param_sets": {
@@ -606,6 +637,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_permute",
         ): {
             "param_sets": {
+                "2d_1_0": ((2, 3), (1, 0)),
                 "4d_0_2_1_3": ((2, 3, 16, 64), (0, 2, 1, 3)),
                 "3d_0_2_1": ((2, 1024, 844), (0, 2, 1)),
                 "4d_0_3_1_2": ((2, 2, 256, 48), (0, 3, 1, 2)),
@@ -1127,9 +1159,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare(fn, x)
 
-    def test_transpose_2d_cpu(self, x):
-        # Eager mode crashes with SIGBUS when calling .cpu() on transposed Spyre tensors
-        compare_with_cpu(lambda x: x.t().contiguous(), x, run_eager=False)
+    def test_t_1d_cpu(self, x):
+        # Note: .contiguous() has been removed, as it causes issues with eager mode
+        compare_with_cpu(lambda x: x.t(), x)
+        
+    def test_t_2d_cpu(self, x):
+        compare_with_cpu(lambda x: x.t(), x)
+
+    def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1), x
+        )
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
         # Eager mode crashes with SIGBUS when calling .cpu() on transposed Spyre tensors
