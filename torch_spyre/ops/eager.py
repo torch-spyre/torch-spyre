@@ -57,35 +57,6 @@ def spyre__linear(
     return compiled_linear(input, weight, bias)
 
 
-@torch.library.register_kernel("aten::addmm", ["spyre"])  # type:ignore
-def spyre__addmm_default(
-    self: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    beta: int | float | bool | complex = 1,
-    alpha: int | float | bool | complex = 1,
-) -> torch.Tensor:
-    # TODO: Add support for beta when constants work
-    # TODO: Use inductor decomp when available
-    mm_result = torch.ops.aten.mm(mat1, mat2)
-    return torch.ops.aten.add.Tensor(mm_result, self, alpha=alpha)
-
-
-@torch.library.register_kernel("aten::addmm.out", ["spyre"])  # type:ignore
-def spyre__addmm_out(
-    self: torch.Tensor,
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    beta: int | float | bool | complex = 1,
-    alpha: int | float | bool | complex = 1,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    # TODO: Add support for beta when constants work
-    # TODO: Use inductor decomp when available
-    mm_result = torch.ops.aten.mm(mat1, mat2)
-    return torch.ops.aten.add.out(mm_result, self, alpha=alpha, out=out)
-
-
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
