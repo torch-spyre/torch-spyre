@@ -942,6 +942,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        ("test_scalar_cpu", "test_scalar_cpu"): {
+            "ops_dict": {
+                "add": torch.add,
+                "sub": torch.sub,
+                "mul": torch.mul,
+                "div": torch.div,
+                "true_divide": torch.true_divide,
+                "combined": lambda scalar, x: (
+                    a := torch.add(x, scalar),
+                    b := torch.add(scalar, a),
+                    c := torch.add(b, scalar),
+                    d := torch.sub(c, scalar),
+                    e := torch.mul(5, d),
+                    out := torch.add(e, e),
+                    out,
+                ),
+            },
+            "param_sets": {
+                "1d": (cached_randn((1024,), dtype=torch.float16), 3.0),
+                "2d": (cached_randn((512, 1024), dtype=torch.float16), 1.0),
+                "3d": (cached_randn((8, 64, 1024), dtype=torch.float16), 1.5),
+                "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -976,18 +1000,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         torch.testing.assert_close(result, torch.eq(x, y))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_scalar_cpu(self):
-        def fn(x):
-            a = torch.add(x, 1.0)
-            b = torch.add(1.0, a)
-            c = torch.add(b, 1.0)
-            d = torch.sub(c, 2.0)
-            e = torch.mul(5, d)
-            out = torch.add(e, e)
-            return out
+    def test_scalar_cpu(self, op, *args):
+        def fn(*tensor_args):
+            # Scalar args are preserved as scalars
+            tensor_args = list(tensor_args)
+            updated_args = [
+                tensor_args.pop(0) if isinstance(arg, torch.Tensor) else arg
+                for arg in args
+            ]
+            return op(*updated_args)
 
-        x = torch.rand(512, 1024, dtype=torch.float16)
-        compare_with_cpu(fn, x)
+        tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
+
+        compare_with_cpu(fn, *tensor_args)
 
     def test_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)

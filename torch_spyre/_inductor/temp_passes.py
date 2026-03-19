@@ -52,6 +52,8 @@ def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
         torch.ops.aten.add.Tensor,
         torch.ops.aten.sub.Tensor,
         torch.ops.aten.mul.Tensor,
+        torch.ops.aten.true_divide.Tensor,
+        torch.ops.aten.div.Tensor,
     ]
 
     # Created node cache for scalar values, and reuse the node when
