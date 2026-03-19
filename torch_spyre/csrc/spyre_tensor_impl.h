@@ -45,7 +45,15 @@ class SpyreTensorLayout {
    * vector. Stick dimensions will appear twice; non-stick dimensions will
    * appear once.
    */
+  [[deprecated("Use stride_map instead.")]]
   std::vector<int32_t> dim_map;
+
+  /**
+   * Record the mapping from device dimensions to host strides.
+   * It has len(device_size) entries whose values are offsets in the host tensor
+   * memory.
+   */
+  std::vector<int64_t> stride_map;
 
   DataFormats device_dtype;
 
@@ -80,9 +88,11 @@ class SpyreTensorLayout {
    * that all device layout invariants are satisfied.
    */
   SpyreTensorLayout(std::vector<int64_t> device_size,
-                    std::vector<int32_t> dim_map, DataFormats device_dtype)
+                    std::vector<int32_t> dim_map,
+                    std::vector<int64_t> stride_map, DataFormats device_dtype)
       : device_size(device_size),
         dim_map(dim_map),
+        stride_map(stride_map),
         device_dtype(device_dtype) {}
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
@@ -105,6 +115,7 @@ class SpyreTensorLayout {
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
            this->dim_map == other.dim_map &&
+           this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype;
   }
 };
