@@ -42,10 +42,8 @@ jobs:
           echo 'gather info end'
       - name: Install the torch-spyre package and dependencies
         run: |
-          # pip install -e . --no-deps --no-build-isolation -vvv --verbose
           echo 'installing with dependencies, this could take a while...'
           pip install uv
-          # uv sync --all-extras --active --inexact --no-build-isolation --reinstall-package torch-spyre -v
           # avoid the extra step required by --no-build-isolation
           uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
       - name: Run unit tests
