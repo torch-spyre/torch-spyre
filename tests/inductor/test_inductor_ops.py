@@ -20,6 +20,7 @@ from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
     make_param_dict,
+    unique_randn_along_dim,
 )
 from utils_inductor import compare, compare_with_cpu
 
@@ -203,9 +204,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_sdsc_padding_amin_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"amin": torch.amin},
             "param_sets": {
-                "dim_0": (0, torch.ones((3, 7), dtype=torch.float16)),
+                "dim_0": (0, unique_randn_along_dim((3, 7), dim=0)),
+                "dim_1": (1, unique_randn_along_dim((3, 7), dim=1)),
                 #  Disabled because torch-sendnn fails
-                # "dim_1": (1, torch.ones((3, 7), dtype=torch.float16)),
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
@@ -310,15 +311,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "sum": torch.max,
             },
             "param_sets": {
-                "2d_dim_0": (0, cached_randn((67, 256))),
-                "2d_dim_1": (1, cached_randn((67, 256))),  #  sparse tensor output
+                "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
+                "2d_dim_1": (
+                    1,
+                    unique_randn_along_dim((67, 256), dim=1),
+                ),  #  sparse tensor output
                 # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
-                "3d_dim_1": (1, cached_randn((67, 71, 256))),
-                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
-                "4d_dim_0": (0, cached_randn((6, 17, 7, 64))),
-                "4d_dim_1": (1, cached_randn((6, 17, 7, 64))),
-                "4d_dim_2": (2, cached_randn((6, 17, 7, 64))),
-                "4d_dim_3": (3, cached_randn((6, 17, 7, 64))),  # sparse tensor output
+                "3d_dim_1": (1, unique_randn_along_dim((67, 71, 256), dim=1)),
+                "3d_dim_2": (
+                    2,
+                    unique_randn_along_dim((67, 71, 256), dim=2),
+                ),  # sparse tensor output
+                "4d_dim_0": (0, unique_randn_along_dim((6, 17, 7, 64), dim=0)),
+                "4d_dim_1": (1, unique_randn_along_dim((6, 17, 7, 64), dim=1)),
+                "4d_dim_2": (2, unique_randn_along_dim((6, 17, 7, 64), dim=2)),
+                "4d_dim_3": (
+                    3,
+                    unique_randn_along_dim((6, 17, 7, 64), dim=3),
+                ),  # sparse tensor output
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -326,15 +336,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "sum": torch.max,
             },
             "param_sets": {
-                "2d_dim_0": (0, cached_randn((67, 256))),
-                "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
-                "3d_dim_0": (0, cached_randn((67, 71, 256))),
-                "3d_dim_1": (1, cached_randn((67, 71, 256))),
-                "3d_dim_2": (2, cached_randn((67, 71, 256))),  # sparse tensor output
-                "4d_dim_0": (0, cached_randn((6, 7, 12, 256))),
-                "4d_dim_1": (1, cached_randn((6, 7, 12, 256))),
-                "4d_dim_2": (2, cached_randn((6, 7, 12, 256))),
-                "4d_dim_3": (3, cached_randn((6, 7, 12, 256))),
+                "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
+                "2d_dim_1": (
+                    1,
+                    unique_randn_along_dim((67, 256), dim=1),
+                ),  # sparse tensor output
+                "3d_dim_0": (0, unique_randn_along_dim((67, 71, 256), dim=0)),
+                "3d_dim_1": (1, unique_randn_along_dim((67, 71, 256), dim=1)),
+                "3d_dim_2": (
+                    2,
+                    unique_randn_along_dim((67, 71, 256), dim=2),
+                ),  # sparse tensor output
+                "4d_dim_0": (0, unique_randn_along_dim((6, 7, 12, 256), dim=0)),
+                "4d_dim_1": (1, unique_randn_along_dim((6, 7, 12, 256), dim=1)),
+                "4d_dim_2": (2, unique_randn_along_dim((6, 7, 12, 256), dim=2)),
+                "4d_dim_3": (3, unique_randn_along_dim((6, 7, 12, 256), dim=3)),
             },
         },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {

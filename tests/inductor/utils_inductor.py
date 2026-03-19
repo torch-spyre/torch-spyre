@@ -29,6 +29,215 @@ def cached_randn(
     return out if not abs else torch.abs(out)
 
 
+@functools.lru_cache(maxsize=None)
+def unique_randn_along_dim(
+    shape,
+    dim=-1,
+    min_val=-100.0,
+    max_val=100.0,
+    dtype=torch.float16,
+    seed=None,
+    warn_precision=True,
+):
+    """
+    Generate tensor with unique values along a specified dimension.
+
+    This is useful for testing operations like argmax/argmin where you want
+    to avoid that multiple elements in a tensor have the same maximum value,
+    whcih is called "tie-breaking". For large tensors, generating globally
+    unique values can cause float16 overflow. This function generates unique
+    values only along the specified dimension, keeping values in a safe range.
+
+    The function automatically checks for float16 precision issues and warns
+    if the spacing between values is too small to guarantee uniqueness after
+    float16 conversion.
+
+    Args:
+        shape: Tuple specifying tensor shape (e.g., (64, 128, 256))
+        dim: Dimension along which to ensure uniqueness (default: -1, last dim)
+             Can be negative to count from the end
+        min_val: Minimum value in the range
+        max_val: Maximum value in the range
+        dtype: Target data type (torch.float16 or torch.float32)
+        seed: Random seed for reproducibility
+        warn_precision: If True, warn about potential float16 precision issues
+
+    Returns:
+        Tensor with unique values along the specified dimension
+
+    Raises:
+        ValueError: If parameters would cause float16 overflow or precision loss
+
+    Examples:
+        >>> # Unique values along last dimension (rows)
+        >>> tensor = create_unique_along_dim((64, 128), dim=-1)
+        >>> # Each row has 128 unique values
+
+        >>> # Unique values along first dimension (columns)
+        >>> tensor = create_unique_along_dim((64, 128), dim=0)
+        >>> # Each column has 64 unique values
+
+        >>> # 3D tensor with unique values along middle dimension
+        >>> tensor = create_unique_along_dim((32, 64, 128), dim=1)
+        >>> # For each (i, k), tensor[i, :, k] has 64 unique values
+
+        >>> # Large tensor - automatically uses safe range
+        >>> tensor = create_unique_along_dim((1000, 1000), dim=-1)
+        >>> # Warns if range is too large for float16 precision
+    """
+
+    if seed is not None:
+        torch.random.manual_seed(seed)
+
+    # Normalize dimension to positive index
+    ndim = len(shape)
+    if dim < 0:
+        dim = ndim + dim
+
+    if dim < 0 or dim >= ndim:
+        raise ValueError(f"dim {dim} out of range for tensor with {ndim} dimensions")
+
+    # Size along the dimension we want to make unique
+    unique_size = shape[dim]
+
+    # Calculate total number of "slices" along the unique dimension
+    # For shape (A, B, C) with dim=1, we have A*C slices of size B each
+    num_slices = 1
+    for i, s in enumerate(shape):
+        if i != dim:
+            num_slices *= s
+
+    # Check for float16 overflow
+    if dtype == torch.float16:
+        float16_max = torch.finfo(torch.float16).max  # 65504.0
+        if abs(min_val) > float16_max or abs(max_val) > float16_max:
+            raise ValueError(
+                f"Values [{min_val}, {max_val}] exceed float16 range "
+                f"[{-float16_max}, {float16_max}]. Use smaller range or float32."
+            )
+
+    # Check for float16 precision issues
+    value_range = max_val - min_val
+    min_spacing = value_range / unique_size
+
+    if dtype == torch.float16 and warn_precision:
+        # Estimate float16 precision at this value range
+        # Float16 precision degrades with larger absolute values
+        max_abs_val = max(abs(min_val), abs(max_val))
+
+        # Float16 precision formula: eps * value
+        # For values around 1000, precision is ~0.5
+        # For values around 100, precision is ~0.05
+        float16_eps = 0.001  # Approximate relative precision
+        estimated_precision = max_abs_val * float16_eps
+
+        if min_spacing < estimated_precision * 2:  # 2x safety margin
+            import warnings
+
+            warnings.warn(
+                f"Float16 precision warning: Spacing between values ({min_spacing:.4f}) "
+                f"is close to float16 precision (~{estimated_precision:.4f}) at this range. "
+                f"With {unique_size} unique values in range [{min_val}, {max_val}], "
+                f"some values may become equal after float16 conversion.\n"
+                f"Recommendations:\n"
+                f"  1. Use smaller range (e.g., [{-max_abs_val / 2:.0f}, {max_abs_val / 2:.0f}])\n"
+                f"  2. Use fewer unique values (reduce size along dim {dim})\n"
+                f"  3. Use dtype=torch.float32 instead",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    # Create result tensor
+    result = torch.zeros(shape, dtype=torch.float32)
+
+    # Flatten all dimensions except the unique dimension
+    # This makes it easier to iterate over slices
+    if dim == 0:
+        # Special case: unique along first dimension
+        for slice_idx in range(num_slices):
+            # Generate unique values
+            unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+            scaled = min_val + (unique_ints / unique_size) * value_range
+
+            # Compute multi-dimensional index for this slice
+            remaining_shape = shape[1:]
+            multi_idx = []
+            temp_idx = slice_idx
+            for s in reversed(remaining_shape):
+                multi_idx.insert(0, temp_idx % s)
+                temp_idx //= s
+
+            # Assign to result
+            result[(slice(None),) + tuple(multi_idx)] = scaled
+
+    elif dim == ndim - 1:
+        # Special case: unique along last dimension (most common, optimized)
+        result_flat = result.view(-1, unique_size)
+        for i in range(num_slices):
+            unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+            scaled = min_val + (unique_ints / unique_size) * value_range
+            result_flat[i] = scaled
+
+    else:
+        # General case: unique along middle dimension
+        # Move the unique dimension to the last position for easier processing
+        perm = list(range(ndim))
+        perm[dim], perm[-1] = perm[-1], perm[dim]
+
+        # Permute and flatten
+        result_permuted = result.permute(perm)
+        result_flat = result_permuted.reshape(-1, unique_size)
+        # Generate unique values for each slice
+        for i in range(num_slices):
+            unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+            scaled = min_val + (unique_ints / unique_size) * value_range
+            result_flat[i] = scaled
+        # Reshape and permute back
+        result_permuted = result_flat.reshape(result_permuted.shape)
+        result = result_permuted.permute(perm)
+    # Convert to target dtype
+    result = result.to(dtype)
+
+    # Verify uniqueness after conversion (for float16)
+    if dtype == torch.float16 and warn_precision:
+        # Check a sample of slices for uniqueness
+        sample_size = min(10, num_slices)
+        issues_found = 0
+
+        if dim == ndim - 1:
+            # Check sample rows
+            result_flat = result.view(-1, unique_size)
+            for i in range(sample_size):
+                unique_count = len(torch.unique(result_flat[i]))
+                if unique_count < unique_size:
+                    issues_found += 1
+        elif dim == 0:
+            # Check sample columns
+            for j in range(min(sample_size, shape[1] if ndim > 1 else 1)):
+                if ndim == 2:
+                    unique_count = len(torch.unique(result[:, j]))
+                else:
+                    # For higher dimensions, check first slice
+                    unique_count = len(
+                        torch.unique(result[:, j, 0] if ndim > 2 else result[:, j])
+                    )
+                if unique_count < unique_size:
+                    issues_found += 1
+
+        if issues_found > 0:
+            import warnings
+
+            warnings.warn(
+                f"Float16 precision loss detected: {issues_found}/{sample_size} sampled slices "
+                f"have duplicate values after float16 conversion. "
+                f"Consider using a smaller range or dtype=torch.float32.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    return result.contiguous()
+
+
 # init_helper initiates tensors given a list of shape tuples
 def init_helper(shapes, dtype=torch.float16, cached=True):
     randn_func = cached_randn if cached else torch.randn
