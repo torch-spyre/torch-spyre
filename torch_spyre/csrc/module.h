@@ -20,6 +20,8 @@
 #include <torch/csrc/utils/pybind.h>
 #include <util/sen_host_ops.h>
 
+#include <flex/allocator/alloc_address.hpp>
+#include <flex/device_types/device_memory_allocator.hpp>
 #include <flex/stream/stream_runtime.hpp>
 #include <memory>
 
@@ -31,7 +33,8 @@ namespace spyre {
 using Runtime = flex::StreamRuntime;
 
 struct SharedOwnerCtx {
-  flex::CompositeAddress owner;
+  flex::DeviceMemoryAllocationPtr allocation;  // Keep for now (transitional)
+  flex::CompositeAddress owner;                // New interface
   signed char device_id;
 };
 

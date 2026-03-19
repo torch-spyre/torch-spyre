@@ -52,6 +52,26 @@ namespace spyre {
 using DataConversionStrideInfo = data_conversion_stride_info;
 using DataConversionInfo = data_conversion_info;
 
+// Helper function to create a single-chunk CompositeAddress from
+// DeviceMemoryAllocationPtr This is a transitional bridge until FlexAllocator
+// is fully wired up
+static flex::CompositeAddress CreateSingleChunkAddress(
+    const flex::DeviceMemoryAllocationPtr& alloc) {
+  // For VF mode: use allocation index as region_id
+  // For PF mode: use DMPA as region_id
+  uint64_t region_id =
+      alloc->AllocIndex() != 0 ? alloc->AllocIndex() : alloc->DmpaAsBytes();
+
+  // Create LogicalAddress with region_id and offset 0
+  flex::LogicalAddress addr(region_id, 0);
+
+  // Create single Chunk with domain_id = 0 (default domain for now)
+  flex::Chunk chunk(addr, alloc->SizeAsBytes(), 0);
+
+  // Return CompositeAddress with single chunk
+  return flex::CompositeAddress(chunk);
+}
+
 /* struct holding the parameters for DMA-based copy
    size_bytes: number of bytes to transfer
    src_offset: offset from src base pointer
@@ -431,8 +451,9 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
                                       tensor_idx, sn_idx);
   auto* ctx =
       static_cast<SharedOwnerCtx*>(dst.storage().data_ptr().get_context());
-  flex::DeviceMemoryAllocationPtr& dev_data = ctx->owner;
-  inp_tensor.SetSpyreData(dev_data);  // ctx->owner;
+  // SetSpyreData currently expects DeviceMemoryAllocationWeakPtr
+  // The CompositeAddress (ctx->owner) is stored for future use
+  inp_tensor.SetSpyreData(ctx->allocation);
 
   SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
 }
@@ -446,7 +467,9 @@ auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
                                        tensor_idx, sn_idx);
   auto* ctx =
       static_cast<SharedOwnerCtx*>(self.storage().data_ptr().get_context());
-  out_tensor.SetSpyreData(ctx->owner);
+  // SetSpyreData currently expects DeviceMemoryAllocationWeakPtr
+  // The CompositeAddress (ctx->owner) is stored for future use
+  out_tensor.SetSpyreData(ctx->allocation);
   SEN_THROW_NOK(gl->Copy({out_tensor}, sendnn::Inputs(), sn_idx));
 }
 
@@ -482,10 +505,15 @@ struct SpyreAllocator final : public at::Allocator {
     // NOTE: last argument should be set to 0
     allocator->TryAllocate(&data, nbytes, 0);
     TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-    auto* ctx = new SharedOwnerCtx{std::move(data), device_id};
+
+    // Create CompositeAddress from DeviceMemoryAllocationPtr (transitional
+    // bridge)
+    flex::CompositeAddress composite_addr = CreateSingleChunkAddress(data);
+
+    auto* ctx = new SharedOwnerCtx{data, std::move(composite_addr), device_id};
     void* ctx_void = static_cast<void*>(ctx);
 
-    void* data_void = static_cast<void*>(ctx->owner.get());
+    void* data_void = static_cast<void*>(ctx->allocation.get());
 
     auto data_ptr_result =
         at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
