@@ -43,8 +43,6 @@
 #   - name: arg_2
 #     type: int
 #     default: 0
-- operator_name: expand
-  template_name: view
 - operator_name: exp
   template_name: base
 - operator_name: ge
@@ -95,6 +93,4 @@
 - operator_name: t
   template_name: view
 - operator_name: tanh
-  template_name: base
-- operator_name: tril
   template_name: base
