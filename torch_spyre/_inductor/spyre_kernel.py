@@ -87,6 +87,7 @@ class TensorAccess(RValue):
             new_layout = FixedTiledLayout(
                 self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
             )
+            new_layout.allocation = self.layout.allocation
             return TensorAccess(self.name, self.index, new_layout)
 
         return self

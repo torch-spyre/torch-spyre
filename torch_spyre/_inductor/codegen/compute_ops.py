@@ -663,6 +663,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                                 tensor["device_layout"].device_dtype
                                             )
                                         )
+                                        if tensor["lx_addr"] is None
+                                        else str(tensor["lx_addr"])
                                         for c in range(cores)
                                     },
                                 },
