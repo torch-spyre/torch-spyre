@@ -217,7 +217,7 @@ def prioritize_dimensions(
     coords: list[Expr], iteration_space: dict[Symbol, Expr]
 ) -> list[Symbol]:
     """
-    Return the free variables in coords, in the order they should be considered for work division.
+    Return the free variables in coords, in the order they should be considered for core division.
     The order combines two considerations:
       1. If the iteration space is large, prioritize outer dimensions of the tensor
          to keep span-per-core under the hardware limit.
