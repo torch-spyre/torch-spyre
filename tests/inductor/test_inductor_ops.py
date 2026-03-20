@@ -1195,6 +1195,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16), 2.4),
             },
         },
+        ("test_linear", "test_linear_fn"): {
+            "param_sets": {
+                "2d_no_bias": (
+                    cached_randn((67, 256)),
+                    cached_randn((128, 256)),
+                    None,
+                ),
+                "2d_bias": (
+                    cached_randn((67, 256)),
+                    cached_randn((128, 256)),
+                    cached_randn((128,)),
+                ),
+                "3d_no_bias": (
+                    cached_randn((3, 17, 256)),
+                    cached_randn((128, 256)),
+                    None,
+                ),
+                "3d_bias": (
+                    cached_randn((3, 17, 256)),
+                    cached_randn((128, 256)),
+                    cached_randn((128,)),
+                ),
+            }
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1276,6 +1300,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # - torch.matmul: numerical divergence (close=False) in eager 2d case
         eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt)
         compare_with_cpu(op, x, y, run_eager=eager_supported)
+
+    def test_linear_fn(self, x, weight, bias):
+        compare_with_cpu(torch.nn.functional.linear, x, weight, bias)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):

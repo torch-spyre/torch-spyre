@@ -45,6 +45,7 @@ from .pass_utils import (
     map_dims_to_vars,
     wildcard_symbol,
 )
+from .views import compute_device_coordinates
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -366,7 +367,14 @@ def create_op_spec(
             DataFormats.SEN169_FP16,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
-    return OpSpec(op, is_reduction, [d.numel for d in dims], args, op_info)
+    return OpSpec(
+        op,
+        is_reduction,
+        [d.numel for d in dims],
+        {d.var: d.numel for d in dims},
+        args,
+        op_info,
+    )
 
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
@@ -392,9 +400,20 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         self, is_input: bool, name: str, tensor: TensorAccess, di: list[DimensionInfo]
     ) -> TensorArg:
         scales = analyze_tensor_access(di, tensor)
+        device_coords = compute_device_coordinates(
+            tensor.layout.size,
+            tensor.layout.stride,
+            tensor.layout.device_layout.device_size,
+            tensor.layout.device_layout.dim_map,
+            self.var_ranges(),
+            tensor.index,
+        )
         tensor_arg = TensorArg(
             is_input,
             -1,
+            tensor.layout.device_layout.device_dtype,
+            tensor.layout.device_layout.device_size,
+            device_coords,
             tensor.layout.dtype,
             scales,
             tensor.layout.allocation,
@@ -716,11 +735,34 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                         buf.writeline(f"op='{op_spec.op}',")
                         buf.writeline(f"is_reduction={op_spec.is_reduction},")
                         buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
+                        buf.writeline(
+                            "iteration_space_dict={"
+                            + f"{', '.join([sympy.srepr(k) + ': ' + sympy.srepr(v) for k, v in op_spec.iteration_space_dict.items()])}"
+                            + "},"
+                        )
                         buf.writeline(f"op_info={op_spec.op_info!r},")
                         buf.writeline("args=[")
                         with buf.indent():
                             for arg in op_spec.args:
-                                buf.writeline(f"{arg!r},")
+                                buf.writeline("TensorArg(")
+                                with buf.indent():
+                                    buf.writeline(
+                                        f"is_input={arg.is_input}, arg_index={arg.arg_index}, device_dtype={arg.device_dtype},"
+                                    )
+                                    buf.writeline(f"device_size={arg.device_size},")
+                                    buf.writeline(
+                                        f"# device_coordinates: {arg.device_coordinates}"
+                                    )
+                                    buf.writeline(
+                                        f"device_coordinates=[{', '.join([sympy.srepr(e) for e in arg.device_coordinates])}],"
+                                    )
+                                    buf.writeline(
+                                        f"allocation={arg.allocation!r}, dtype={arg.dtype!r}, it_dim_map={arg.it_dim_map!r}, "
+                                    )
+                                    buf.writeline(
+                                        f"device_layout={arg.device_layout!r}"
+                                    )
+                                buf.writeline("),")
                         buf.writeline("]")
                     buf.writeline("),")
         buf.writeline("]")

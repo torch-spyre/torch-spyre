@@ -397,7 +397,9 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     device = torch.device(device) if isinstance(device, str) else device
-    device_args = [arg.to(device) for arg in args]
+    device_args = [
+        arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args
+    ]
     device_kwargs = {"device": device} if needs_device else {}
 
     if compile:

@@ -15,8 +15,10 @@
 
 import dataclasses
 from typing import Any, Sequence
+
+from sympy import Symbol, Expr
 import torch
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, DataFormats
 
 
 @dataclasses.dataclass
@@ -38,9 +40,15 @@ class TensorArg:
 
     is_input: bool
     arg_index: int
+    device_dtype: DataFormats
+    device_size: list[int]
+    device_coordinates: list[Expr]
+    # @deprecated("deprecating all host attributes")
     dtype: torch.dtype
+    # @deprecated("deprecating all host attributes")
     it_dim_map: list[int]
     allocation: Any
+    # @deprecated("deprecating all host attributes")
     device_layout: SpyreTensorLayout
 
 
@@ -59,7 +67,9 @@ class OpSpec:
 
     op: str
     is_reduction: bool
+    # @deprecated("switching to dictionary")
     iteration_space: list[int]
+    iteration_space_dict: dict[Symbol, Expr]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
 

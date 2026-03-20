@@ -499,6 +499,19 @@ def spyre_softplus(
     return torch.ops.spyre.softplus(input, beta, threshold)
 
 
+@register_spyre_decomposition([torch.ops.aten.linear.default])
+def spyre_linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    weight = weight.transpose(-1, -2).contiguous()
+    while weight.dim() < input.dim():
+        weight = torch.unsqueeze(weight, 0)
+    out = input @ weight
+    if bias is not None:
+        out = out + bias
+    return out
+
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
