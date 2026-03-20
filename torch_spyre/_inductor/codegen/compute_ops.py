@@ -517,7 +517,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     cores = 1
     dim_splits = [1] * ndim
 
-    if "op_info" in kwargs:
+    if False and "op_info" in kwargs:
         if "n_cores_used" in kwargs["op_info"]:
             cores = kwargs["op_info"]["n_cores_used"]
 

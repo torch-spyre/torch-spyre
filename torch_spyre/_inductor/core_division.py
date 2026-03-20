@@ -15,6 +15,9 @@
 
 import math
 import os
+from sympy import Expr, Symbol
+
+
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -33,7 +36,7 @@ from torch._inductor.scheduler import (
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps
+from .pass_utils import SchedNodeArg, get_mem_deps, device_coordinates, iteration_space
 from .logging_utils import get_inductor_logger
 import logging
 
@@ -98,6 +101,43 @@ def core_split(size: int, max_cores: int) -> int:
         if size % i == 0:
             return i
     return 1
+
+
+def multi_dim_iteration_space_split(
+    iteration_space: dict[Symbol, Expr],
+    max_cores: int,
+    priorities: list[Symbol],
+) -> dict[Symbol, int]:
+    """
+    Distribute max_cores across multiple dimensions of an iteration space optimally.
+
+    This function tries to split cores across multiple dimensions to maximize
+    parallelism while ensuring even division. It uses a greedy approach that
+    prioritizes dimensions based on:
+    1. User-specified priorities (if provided)
+    2. Divisibility (dimensions that divide evenly get priority)
+
+    Args:
+        iteration_space: The iteration space to be parallelized
+        max_cores: Total number of cores available
+        priorities: Order in which to consider the dimensions
+
+    Returns:
+        The core splits for the iteration_space
+        The product of all splits will be <= max_cores
+    """
+    n_cores_to_split = max_cores
+    splits = {v: 1 for v in iteration_space.keys()}
+
+    for v in priorities:
+        if n_cores_to_split <= 1:
+            break
+        best_split = core_split(iteration_space[v], n_cores_to_split)
+        if best_split > 1:
+            splits[v] = best_split
+            n_cores_to_split = n_cores_to_split // best_split
+
+    return splits
 
 
 def multi_dim_core_split(
@@ -173,43 +213,72 @@ def multi_dim_core_split(
     return splits
 
 
+def prioritize_dimensions(
+    coords: list[Expr], iteration_space: dict[Symbol, Expr]
+) -> list[Symbol]:
+    """
+    Return the free variables in coords, in the order they should be considered for work division.
+    The order combines two considerations:
+      1. If the iteration space is large, prioritize outer dimensions of the tensor
+         to keep span-per-core under the hardware limit.
+      2. After satisfiying the span restriction, order by size to maximize parallalism.
+    """
+    span = 1
+    for e in iteration_space.values():
+        span *= e
+
+    priority = []
+    while span > 64 * 1024 * 1024:
+        for e in coords:
+            vars = e.free_symbols
+            for v in vars:
+                if v not in priority:
+                    priority.append(v)
+                    span /= iteration_space[v]
+
+    # Now prioritize all remaining dimensions by sorting by decreasing size
+    remaining = [(s, e) for s, e in iteration_space.items() if s not in priority]
+    remaining.sort(key=lambda t: t[1], reverse=True)
+    priority += [t[0] for t in remaining]
+
+    return priority
+
+
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    output: FixedTiledLayout = n.node.get_layout()
-    ndim = len(output.size)
     n.n_cores_used = 1
 
     if max_cores == 1:
         return
 
-    if len(n.node.get_outputs()) > 2:
-        # Core division currently only implemented for 1 or 2 tensors
+    it_space = iteration_space(n)
+    output_layout: FixedTiledLayout = n.node.get_layout()
+    output_dep = next(iter(n.read_writes.writes))
+    output_dev_coords = device_coordinates(output_layout, output_dep)
+    stick_expr = output_dev_coords[-1]
+    if len(stick_expr.free_symbols) != 1:
+        # TODO: Can codegen handle core division for sparse tensors?
         return
 
-    for a in args:
-        if a.layout.size != output.size:
-            # Core division not supported if there are broadcasts
-            return
+    stick_var = next(iter(stick_expr.free_symbols))
+    elems_per_stick = output_layout.device_layout.elems_per_stick()
+    it_space[stick_var] = (it_space[stick_var] + elems_per_stick - 1) // elems_per_stick
+    priorities = prioritize_dimensions(output_dev_coords[:-1], it_space)
+    splits = multi_dim_iteration_space_split(it_space, max_cores, priorities)
 
-    # Collect parallelizable sizes for all host dimensions
-    # For stick dimension: this returns the number of sticks
-    # For non-stick dimensions: this returns the dimension size
-    sizes = [get_host_dim_size(output, i) for i in range(ndim)]
+    print(f"AJA: {splits} {math.prod(splits.values())}")
 
-    # Use sizes as priorities (larger dimensions get higher priority)
-    priorities = sizes.copy()
-
-    # Use multi-dimensional core splitting
-    splits = multi_dim_core_split(sizes, max_cores, priorities)
-    n.n_cores_used = math.prod(splits)
+    n.n_cores_used = math.prod(splits.values())
 
     if n.n_cores_used > 1:
-        n.op_dim_splits = splits
+        # TODO: This is a hack because op_info on OpSpec is untyped.
+        # Should keep these Symbols as Symbols
+        n.op_it_space_splits = {str(s): e for s, e in splits.items()}
 
         # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
-                f"sizes={sizes}, priorities={priorities}, op_dim_splits={n.op_dim_splits}"
+                f"iteration_space={it_space}, priorities={priorities}, op_dim_splits={n.op_it_space_splits}"
             )
 
 

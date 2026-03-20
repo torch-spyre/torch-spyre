@@ -17,11 +17,12 @@ from typing import NamedTuple
 from sympy import Expr, Symbol
 
 import sympy
-from torch._inductor.ir import FixedLayout
+from torch._inductor.ir import FixedLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
+from torch_spyre._inductor.errors import Unsupported
 
 from .ir import FixedTiledLayout
 from .views import compute_coordinates
@@ -87,3 +88,18 @@ def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.E
         dep.ranges,
         dep.index,
     )
+
+
+def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
+    if isinstance(n.node.data, Pointwise):
+        # The iteration space of a Pointwise is that of its output range
+        return next(iter(n.read_writes.writes)).ranges.copy()
+    elif isinstance(n.node.data, Reduction):
+        # The iteration space of a Reduction is the union of its input ranges.
+        iteration_space = {}
+        for arg in n.read_writes.reads:
+            if isinstance(arg, MemoryDep):
+                iteration_space.update(arg.ranges)
+        return iteration_space
+    else:
+        raise Unsupported("Unexpected node type")

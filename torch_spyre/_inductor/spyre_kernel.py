@@ -464,6 +464,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
+        if hasattr(self.current_node, "op_it_space_splits"):
+            op_info["op_it_space_splits"] = self.current_node.op_it_space_splits  # type: ignore[union-attr]
 
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -564,6 +566,8 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
+        if hasattr(self.current_node, "op_it_space_splits"):
+            op_info["op_it_space_splits"] = self.current_node.op_it_space_splits  # type: ignore[union-attr]
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
