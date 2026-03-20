@@ -406,12 +406,8 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
         result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
     else:
         result = torch.compile(fn)(*device_args, **device_kwargs)
-        # Handle scalar returns (int, float) from operations like .item()
-        if not isinstance(result, (int, float)):
-            assert result.device.type == device.type, (
-                f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
-            )
-            result = result.cpu()
+
+    if isinstance(result, (int, float)):
         return result
 
     return _to_cpu(result, device)
