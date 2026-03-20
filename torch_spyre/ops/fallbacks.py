@@ -262,3 +262,13 @@ def spyre__isin(
     return torch.isin(
         elements, test_elements, assume_unique=assume_unique, invert=invert, **kwargs
     )
+
+
+@register_fallback([aten.tril.default, aten.tril.out])
+def spyre__tril(input, diagonal=0, **kwargs):
+    return torch.tril(input, diagonal, **kwargs)
+
+
+@register_fallback([aten.triu.default, aten.triu.out])
+def spyre__triu(input, diagonal=0, **kwargs):
+    return torch.triu(input, diagonal, **kwargs)
