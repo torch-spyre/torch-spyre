@@ -36,8 +36,10 @@ spyre_decompositions: dict = {}
 # Some Inductor decompositions do not work reliably on the Spyre backend yet.
 # We disable them here and rely on implicit fallbacks to eager ops instead. Once
 # the blocking issues are resolved, these exclusions can be removed.
-#
-spyre_decompositions_to_exclude: list = []
+spyre_decompositions_to_exclude = [
+    torch.ops.aten.triu,
+    torch.ops.aten.tril,
+]
 
 # Dict for Spyre-specific decompositions to be registered via DispatchKey
 spyre_decompositions_via_dispatchkey: dict = {}
