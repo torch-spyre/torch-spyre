@@ -1481,7 +1481,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_t_1d_cpu(self, x):
         compare_with_cpu(lambda x: x.t(), x)
-        
+
     def test_t_1d_contiguous_cpu(self, x):
         # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
         compare_with_cpu(lambda x: x.t().contiguous(), x, run_eager=False)
@@ -1494,9 +1494,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: x.t().contiguous(), x, run_eager=False)
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
-        compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1), x
-        )
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_2d_contiguous_cpu(self, dim0: int, dim1: int, x):
         # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
@@ -1505,9 +1503,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
-        compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1), x
-        )
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_3d_contiguous_cpu(self, dim0: int, dim1: int, x):
         # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
@@ -1516,9 +1512,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
-        compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1), x
-        )
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_4d_contiguous_cpu(self, dim0: int, dim1: int, x):
         # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
