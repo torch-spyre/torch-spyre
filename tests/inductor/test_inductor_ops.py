@@ -1327,9 +1327,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
             )
         else:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False), x
-            )
+            compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x)
 
     def test_reduce_keepdim0_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
@@ -1374,28 +1372,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_t_1d_cpu(self, x):
         # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(lambda x: x.t(), x)
-        
+
     def test_t_2d_cpu(self, x):
         # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(lambda x: x.t(), x)
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
         # Note: .contiguous() has been removed, as it causes issues with eager mode
-        compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1), x
-        )
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
         # Note: .contiguous() has been removed, as it causes issues with eager mode
-        compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1), x
-        )
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
         # Note: .contiguous() has been removed, as it causes issues with eager mode
-        compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1), x
-        )
+        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
@@ -1548,9 +1540,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: x, x)
 
     def test_mean_cpu(self, dim, keepdim, x):
-        compare_with_cpu(
-            lambda x: torch.mean(x, dim=dim, keepdim=keepdim), x
-        )
+        compare_with_cpu(lambda x: torch.mean(x, dim=dim, keepdim=keepdim), x)
 
     def test_zeros_cpu(self, size):
         def fn(device=None):
