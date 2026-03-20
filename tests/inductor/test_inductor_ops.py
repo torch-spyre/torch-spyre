@@ -396,14 +396,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_3": (3, cached_randn((6, 7, 12, 256), scale=0.1)),
             },
         },
-        ("test_t_1d_cpu", "test_t_1d_cpu"): {
+        ("test_t_1d", "test_t_1d_cpu"): {
             "param_sets": make_param_dict(
                 [
                     ((3,),),
                 ]
             ),
         },
-        ("test_t_2d_cpu", "test_t_2d_cpu"): {
+        ("test_t_1d_contiguous", "test_t_1d_contiguous_cpu"): {
+            "param_sets": make_param_dict(
+                [
+                    ((3,),),
+                ]
+            ),
+        },
+        ("test_t_2d", "test_t_2d_cpu"): {
             "param_sets": make_param_dict(
                 [
                     ((1088, 320),),
@@ -411,7 +418,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        ("test_transpose_2d_cpu", "test_transpose_2d_cpu"): {
+        ("test_t_2d_contiguous", "test_t_2d_contiguous_cpu"): {
+            "param_sets": make_param_dict(
+                [
+                    ((1088, 320),),
+                    ((320, 320),),
+                ]
+            ),
+        },
+        ("test_transpose_2d", "test_transpose_2d_cpu"): {
             "param_sets": {
                 "dim_0_2": (
                     0,
@@ -435,7 +450,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
-        ("test_transpose_3d_cpu", "test_transpose_3d_cpu"): {
+        ("test_transpose_2d_contiguous", "test_transpose_2d_contiguous_cpu"): {
             "param_sets": {
                 "dim_0_2": (
                     0,
@@ -459,7 +474,84 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
-        ("test_transpose_4d_cpu", "test_transpose_4d_cpu"): {
+        ("test_transpose_3d", "test_transpose_3d_cpu"): {
+            "param_sets": {
+                "dim_0_2": (
+                    0,
+                    2,
+                    cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_1_2": (
+                    1,
+                    2,
+                    cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_0_2_same_dim": (
+                    0,
+                    2,
+                    cached_randn((128, 128, 128), abs=True),
+                ),
+                "dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((128, 64, 128), abs=True),
+                ),
+            }
+        },
+        ("test_transpose_3d_contiguous", "test_transpose_3d_contiguous_cpu"): {
+            "param_sets": {
+                "dim_0_2": (
+                    0,
+                    2,
+                    cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_1_2": (
+                    1,
+                    2,
+                    cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_0_2_same_dim": (
+                    0,
+                    2,
+                    cached_randn((128, 128, 128), abs=True),
+                ),
+                "dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((128, 64, 128), abs=True),
+                ),
+            }
+        },
+        ("test_transpose_4d", "test_transpose_4d_cpu"): {
+            "param_sets": {
+                "dim_0_3": (
+                    0,
+                    3,
+                    cached_randn((256, 3, 17, 64), abs=True),
+                ),
+                "dim_2_3": (
+                    2,
+                    3,
+                    cached_randn((3, 17, 128, 256), abs=True),
+                ),
+                "dim_1_3": (
+                    1,
+                    3,
+                    cached_randn((3, 256, 17, 64), abs=True),
+                ),
+                "dim_1_2": (
+                    1,
+                    3,
+                    cached_randn((3, 256, 64, 64), abs=True),
+                ),
+                "dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((64, 25, 7, 64), abs=True),
+                ),
+            }
+        },
+        ("test_transpose_4d_contiguous", "test_transpose_4d_contiguous_cpu"): {
             "param_sets": {
                 "dim_0_3": (
                     0,
@@ -1388,24 +1480,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare(fn, x)
 
     def test_t_1d_cpu(self, x):
-        # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(lambda x: x.t(), x)
+        
+    def test_t_1d_contiguous_cpu(self, x):
+        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
+        compare_with_cpu(lambda x: x.t().contiguous(), x, run_eager=False)
 
     def test_t_2d_cpu(self, x):
-        # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(lambda x: x.t(), x)
 
+    def test_t_2d_contiguous_cpu(self, x):
+        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
+        compare_with_cpu(lambda x: x.t().contiguous(), x, run_eager=False)
+
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
-        # Note: .contiguous() has been removed, as it causes issues with eager mode
-        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1), x
+        )
+
+    def test_transpose_2d_contiguous_cpu(self, dim0: int, dim1: int, x):
+        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+        )
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
-        # Note: .contiguous() has been removed, as it causes issues with eager mode
-        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1), x
+        )
+
+    def test_transpose_3d_contiguous_cpu(self, dim0: int, dim1: int, x):
+        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+        )
 
     def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
-        # Note: .contiguous() has been removed, as it causes issues with eager mode
-        compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1), x
+        )
+
+    def test_transpose_4d_contiguous_cpu(self, dim0: int, dim1: int, x):
+        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
+        compare_with_cpu(
+            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+        )
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
