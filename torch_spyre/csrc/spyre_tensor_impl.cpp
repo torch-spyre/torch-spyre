@@ -261,6 +261,8 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
 
+  impl->dma_sizes = this->dma_sizes;
+  impl->dma_strides = this->dma_strides;
   copy_tensor_metadata(
       /*src_impl=*/this,
       /*dest_impl=*/impl.get(),
