@@ -607,6 +607,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {
                 "silu": torch.nn.functional.silu,
                 "sigmoid": torch.sigmoid,
+                "mish": torch.nn.functional.mish,
             },
             "param_sets": {
                 "fp16": (
@@ -1042,6 +1043,134 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
         },
+        # --- Migrated from test_ops.py ---
+        ("test_copy_roundtrip", "test_copy_roundtrip"): {
+            "param_sets": {
+                # Aligned shapes
+                "1d": (cached_randn((256,), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16),),
+                "3d": (cached_randn((256, 128, 512), dtype=torch.float16),),
+                "4d": (cached_randn((2, 6, 3, 128), dtype=torch.float16),),
+                "5d": (cached_randn((4, 8, 3, 64, 256), dtype=torch.float16),),
+                "6d": (cached_randn((4, 8, 16, 12, 64, 128), dtype=torch.float16),),
+                # Padded (non-stick-aligned last dim)
+                "1d_padded": (cached_randn((511,), dtype=torch.float16),),
+                "2d_padded": (cached_randn((2, 205), dtype=torch.float16),),
+                "3d_padded": (cached_randn((2, 2, 72), dtype=torch.float16),),
+                "4d_padded": (cached_randn((2, 2, 2, 120), dtype=torch.float16),),
+                # Small tensors requiring stick padding
+                "1d_stick": (torch.tensor([1, 2, 3], dtype=torch.float16),),
+                "2d_stick": (
+                    torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=torch.float16),
+                ),
+                "3d_stick": (
+                    torch.tensor(
+                        [[[1, -2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "4d_stick": (torch.rand(2, 2, 2, 3, dtype=torch.float16),),
+                "5d_stick": (torch.rand(1, 2, 3, 4, 5, dtype=torch.float16),),
+                "6d_stick": (torch.rand(1, 3, 5, 2, 4, 62, dtype=torch.float16),),
+            },
+        },
+        ("test_mean", "test_mean_cpu"): {
+            "param_sets": {
+                "3d_dim0": (
+                    0,
+                    False,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "3d_dim1": (
+                    1,
+                    False,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "3d_dim0_keepdim": (
+                    0,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+            },
+        },
+        ("test_zeros", "test_zeros_cpu"): {
+            "param_sets": {
+                "aligned": ((3, 64),),
+                "padded": ((3, 50),),
+            },
+        },
+        ("test_fill_scalar", "test_fill_scalar_cpu"): {
+            "param_sets": {
+                "1d": (5.0, torch.tensor([1, -2, 3], dtype=torch.float16)),
+            },
+        },
+        ("test_addmm_scaled", "test_addmm_scaled_cpu"): {
+            "param_sets": {
+                "alpha_0_5": (
+                    0.5,
+                    cached_randn((67, 128), dtype=torch.float16),
+                    cached_randn((67, 256), dtype=torch.float16),
+                    cached_randn((256, 128), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_addmm_out", "test_addmm_out_cpu"): {
+            "param_sets": {
+                "basic": (
+                    cached_randn((67, 128), dtype=torch.float16),
+                    cached_randn((67, 256), dtype=torch.float16),
+                    cached_randn((256, 128), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_embedding", "test_embedding_cpu"): {
+            "param_sets": {
+                "basic": (
+                    torch.tensor([[1, 2, 4, 5], [4, 3, 2, 9]], dtype=torch.int64),
+                    torch.rand(10, 3, dtype=torch.float16),
+                    None,
+                ),
+                "padding_idx": (
+                    torch.tensor([[1, 2, 4, 5], [4, 3, 2, 9]], dtype=torch.int64),
+                    torch.rand(10, 3, dtype=torch.float16),
+                    0,
+                ),
+            },
+        },
+        ("test_isin", "test_isin_cpu"): {
+            "param_sets": {
+                "tensor_tensor": (
+                    torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64),
+                    torch.tensor([2, 4], dtype=torch.int64),
+                ),
+            },
+        },
+        ("test_isin_out", "test_isin_out_cpu"): {
+            "param_sets": {
+                "tensor_tensor": (
+                    torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64),
+                    torch.tensor([2, 4], dtype=torch.int64),
+                ),
+            },
+        },
         ("test_scalar_cpu", "test_scalar_cpu"): {
             "ops_dict": {
                 "add": torch.add,
@@ -1220,23 +1349,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x: x.t(), x)
         
     def test_t_2d_cpu(self, x):
+        # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(lambda x: x.t(), x)
 
     def test_transpose_2d_cpu(self, dim0: int, dim1: int, x):
+        # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(
             lambda x: torch.transpose(x, dim0, dim1), x
         )
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
-        # Eager mode crashes with SIGBUS when calling .cpu() on transposed Spyre tensors
+        # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+            lambda x: torch.transpose(x, dim0, dim1), x
         )
 
     def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
-        # Eager mode crashes with SIGBUS when calling .cpu() on transposed Spyre tensors
+        # Note: .contiguous() has been removed, as it causes issues with eager mode
         compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
+            lambda x: torch.transpose(x, dim0, dim1), x
         )
 
     def test_where_cpu(self, cond_op, x, y):
@@ -1366,9 +1497,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 input, input.shape[1:], weight=weight, bias=bias
             )
 
-        # In eager mode the spyre::layer_norm custom op calls torch.native_layer_norm
-        # which internally dispatches to aten::native_batch_norm, not registered for Spyre
-        compare_with_cpu(fn, input, weight, bias, run_eager=False)
+        compare_with_cpu(fn, input, weight, bias)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_rmsnorm_cpu(self, x):
@@ -1385,6 +1514,155 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.softplus(input, beta, threshold)
 
         compare_with_cpu(fn, x)
+
+    # --- Migrated from test_ops.py ---
+
+    def test_copy_roundtrip(self, x):
+        compare_with_cpu(lambda x: x, x)
+
+    def test_mean_cpu(self, dim, keepdim, x):
+        compare_with_cpu(
+            lambda x: torch.mean(x, dim=dim, keepdim=keepdim), x
+        )
+
+    def test_zeros_cpu(self, size):
+        def fn(device=None):
+            return torch.zeros(*size, dtype=torch.float16, device=device)
+
+        compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+
+    def test_fill_scalar_cpu(self, value, x):
+        def fn(x):
+            x = x.clone()
+            x.fill_(value)
+            return x
+
+        # spyre__fill_scalar crashes with SIGBUS in eager mode
+        compare_with_cpu(fn, x, run_eager=False)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_addmm_scaled_cpu(self, alpha, input, mat1, mat2):
+        compare_with_cpu(
+            lambda input, mat1, mat2: torch.addmm(input, mat1, mat2, alpha=alpha),
+            input,
+            mat1,
+            mat2,
+            atol=2e-1,
+            rtol=2e-1,
+        )
+
+    def test_addmm_out_cpu(self, input, mat1, mat2):
+        def fn(input, mat1, mat2):
+            out = torch.empty(
+                mat1.shape[0], mat2.shape[1], dtype=input.dtype, device=input.device
+            )
+            torch.addmm(input, mat1, mat2, out=out)
+            return out
+
+        compare_with_cpu(fn, input, mat1, mat2, atol=2e-1, rtol=2e-1)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_embedding_cpu(self, indices, weight, padding_idx):
+        compare_with_cpu(
+            lambda indices, weight: torch.nn.functional.embedding(
+                indices, weight, padding_idx=padding_idx
+            ),
+            indices,
+            weight,
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_cpu(self, elements, test_elements):
+        compare_with_cpu(torch.isin, elements, test_elements)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_out_cpu(self, elements, test_elements):
+        def fn(elements, test_elements):
+            out = torch.empty(elements.shape, dtype=torch.bool, device=elements.device)
+            torch.isin(elements, test_elements, out=out)
+            return out
+
+        compare_with_cpu(fn, elements, test_elements)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_scalar_cpu(self):
+        """Test aten.isin.Tensor_Scalar: test_elements is a Python scalar."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        expected = torch.isin(elements, 3)
+
+        elements_spyre = elements.to("spyre")
+        actual = torch.isin(elements_spyre, 3).cpu()
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_scalar_out_cpu(self):
+        """Test aten.isin.Tensor_Scalar_out: test_elements is a scalar, out-variant."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        out_cpu = torch.empty(elements.shape, dtype=torch.bool)
+        torch.isin(elements, 3, out=out_cpu)
+
+        elements_spyre = elements.to("spyre")
+        out_spyre = torch.empty(elements.shape, dtype=torch.bool, device="spyre")
+        torch.isin(elements_spyre, 3, out=out_spyre)
+        torch.testing.assert_close(out_spyre.cpu(), out_cpu)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_scalar_tensor_cpu(self):
+        """Test torch.isin with scalar element and tensor test_elements."""
+        test_elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        expected = torch.isin(3, test_elements)
+
+        test_elements_spyre = test_elements.to("spyre")
+        actual = torch.isin(3, test_elements_spyre).cpu()
+        assert actual.item() == expected.item()
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_scalar_tensor_out_cpu(self):
+        """Test torch.isin with scalar element, tensor test_elements, and out param."""
+        test_elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        out_cpu = torch.empty(0, dtype=torch.bool)
+        torch.isin(3, test_elements, out=out_cpu)
+
+        test_elements_spyre = test_elements.to("spyre")
+        out_spyre = torch.empty((), dtype=torch.bool, device="spyre")
+        torch.isin(3, test_elements_spyre, out=out_spyre)
+        assert out_spyre.cpu().item() == out_cpu.item()
+
+    def test_normal_randn_cpu(self):
+        """Test that torch.randn with a seeded generator produces matching results."""
+        gen = torch.manual_seed(42)
+        y_spyre = torch.randn(3, 5, device="spyre", generator=gen)
+        gen.manual_seed(42)
+        y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
+        torch.testing.assert_close(y_spyre.to("cpu"), y_cpu, rtol=0.1, atol=0.1)
+
+    def test_uniform_cpu(self):
+        """Test that tensor.uniform_() produces values in [0, 1)."""
+        x_spyre = torch.tensor(
+            [[1, 2, 3], [4, 5, 6]], dtype=torch.float16, device="spyre"
+        )
+        x_spyre.uniform_()
+        x_cpu = x_spyre.to("cpu")
+        assert torch.all(x_cpu >= 0.0) and torch.all(x_cpu < 1.0), (
+            f"uniform_ values out of range [0, 1): {x_cpu}"
+        )
+        assert not torch.all(x_cpu == x_cpu[0, 0]), (
+            "uniform_ produced all identical values"
+        )
+
+    def test_uniform_custom_range_cpu(self):
+        """Test that tensor.uniform_(-5, 5) produces values in [-5, 5)."""
+        x_spyre = torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float16, device="spyre"
+        )
+        x_spyre.uniform_(-5.0, 5.0)
+        x_cpu = x_spyre.to("cpu")
+        assert torch.all(x_cpu >= -5.0) and torch.all(x_cpu < 5.0), (
+            f"uniform_ values out of range [-5, 5): {x_cpu}"
+        )
+        assert not torch.all(x_cpu == x_cpu[0]), (
+            "uniform_ produced all identical values"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
