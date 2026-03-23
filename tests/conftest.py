@@ -287,6 +287,27 @@ def pytest_configure(config):
             "markers", f"{mark}: auto-generated mark for model {model}"
         )
 
+    # ── register upstream test tags from PYTORCH_TEST_CONFIG YAML ──
+    # Tags defined under test_suite_config.files[].tests[].tags are registered
+    # here so pytest does not emit PytestUnknownMarkWarning.
+    # Each tag becomes a pytest mark usable with -m for test selection:
+    #   pytest test_binary_ufuncs.py -m "model_1"
+    #   pytest test_ops.py -m "model_2"
+    yaml_path = os.environ.get("PYTORCH_TEST_CONFIG")
+    if yaml_path and Path(yaml_path).exists():
+        with open(yaml_path) as f:
+            raw = yaml.safe_load(f) or {}
+        tags: set = set()
+        for file_entry in raw.get("test_suite_config", {}).get("files", []):
+            for test_entry in file_entry.get("tests", []):
+                for tag in test_entry.get("tags", []):
+                    tags.add(tag)
+        for tag in sorted(tags):
+            config.addinivalue_line(
+                "markers",
+                f"{tag}: tests that depend on or are relevant to '{tag}'",
+            )
+
 
 def pytest_collection_modifyitems(config, items):
     selected_models = config.getoption("--model") or []

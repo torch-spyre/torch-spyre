@@ -1,0 +1,188 @@
+"""
+YAML config parsing and op_db filtering for the Spyre PyTorch test framework.
+
+Responsibilities:
+  - load_yaml_config: read YAML and return validated SpyreTestConfig
+  - resolve_rel_path: expand ${PYTORCH} / ${TORCH_SPYRE} tokens
+  - resolve_current_file: match a YAML file entry against cwd
+  - filter_op_db: monkey-patch pytorch op_db lists to supported_ops subset
+"""
+
+import os
+import sys
+import warnings
+from pathlib import Path
+from typing import Dict, Optional
+
+import yaml
+
+from spyre_test_constants import REL_PATH_TOKENS
+from spyre_test_config_models import FileEntry, SpyreTestConfig, SupportedOpConfig
+
+
+# ---------------------------------------------------------------------------
+# YAML loading
+# ---------------------------------------------------------------------------
+
+
+def load_yaml_config(path: str) -> SpyreTestConfig:
+    """Load YAML and return a validated SpyreTestConfig.
+
+    Pydantic validates structure, field types, dtype strings, mode values,
+    and test id format automatically.
+
+    Raises:
+        FileNotFoundError: if the YAML file does not exist.
+        pydantic.ValidationError: if the YAML structure is invalid.
+    """
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Spyre config file not found: {config_path}")
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    return SpyreTestConfig.model_validate(raw)
+
+
+# ---------------------------------------------------------------------------
+# Path resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_rel_path(path: str) -> str:
+    """Expand ${PYTORCH} and ${TORCH_SPYRE} tokens using env vars."""
+    for token, env_var in REL_PATH_TOKENS:
+        if token in path:
+            root = os.environ.get(env_var)
+            if not root:
+                raise EnvironmentError(
+                    f"path contains {token!r} but ${env_var} is not set."
+                )
+            path = path.replace(token, root)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Debug helper
+# ---------------------------------------------------------------------------
+
+
+def _debug(msg: str) -> None:
+    os.write(2, f"[DEBUG] resolve_current_file: {msg}\n".encode())
+
+
+# ---------------------------------------------------------------------------
+# Current file resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_current_file(config: SpyreTestConfig, config_path: str) -> FileEntry:
+    """Match a YAML file entry against the file pytest is currently running.
+
+    Searches sys.argv[1:] (skipping the pytest runner at argv[0]) for a .py
+    file argument, then finds the FileEntry whose resolved rel_path matches it.
+
+    Raises EnvironmentError if no match is found.
+    """
+
+    cwd = Path(os.getcwd()).resolve()
+
+    # sys.argv[0] is the pytest runner itself (e.g. pytest/__main__.py) -- skip it.
+    # The test file is one of the remaining args, e.g. 'test_ops.py'.
+    current_test_file: Optional[str] = None
+    for arg in sys.argv[1:]:
+        candidate = Path(arg)
+        if candidate.suffix == ".py":
+            candidate_resolved = (
+                (cwd / candidate).resolve()
+                if not candidate.is_absolute()
+                else candidate.resolve()
+            )
+            if candidate_resolved.exists():
+                current_test_file = str(candidate_resolved)
+                break
+
+    _debug(f"current_test_file: {current_test_file!r}")
+    _debug(f"cwd: {cwd!r}")
+
+    if current_test_file is None:
+        raise EnvironmentError(
+            f"Could not determine the test file being run from sys.argv[1:]={sys.argv[1:]!r}.\n"
+            f"Make sure you invoke pytest with an explicit test file, "
+            f"e.g. `pytest test_ops.py`."
+        )
+
+    for file_entry in config.files:
+        entry_resolved = str(Path(resolve_rel_path(file_entry.path)).resolve())
+        _debug(
+            f"entry: {file_entry.path!r} -> {entry_resolved!r} match={entry_resolved == current_test_file}"
+        )
+        if entry_resolved == current_test_file:
+            return file_entry
+
+    raise EnvironmentError(
+        f"No rel_path in {config_path!r} matches the test file being run "
+        f"({current_test_file!r}).\n"
+        f"sys.argv={sys.argv!r}\n"
+        f"Available entries:\n"
+        + "\n".join(f"  {resolve_rel_path(f.path)}" for f in config.files)
+    )
+
+
+def apply_op_config_overrides(
+    op_configs: Dict[str, "SupportedOpConfig"],
+) -> None:
+    """Apply per-op attribute overrides (dtypes, precision) to OpInfo objects.
+
+    Mutates OpInfo attributes in-place on op_db entries. Because @ops reads
+    op.dtypes / op.atol etc. from the OpInfo object at parametrize time,
+    these mutations propagate to test generation even though @ops.op_list
+    was copied at decoration time.
+
+    Op filtering for test generation is handled separately by
+    _SpyreOpListPatcher -- this function only handles attribute overrides.
+
+    Precision is now per (op, dtype) rather than per op. Since OpInfo stores
+    a single atol/rtol, we apply the precision from the first dtype entry
+    that has a precision override. Per-dtype precision at test runtime is
+    handled separately via cls.precision in instantiate_test.
+    """
+    import torch.testing._internal.common_methods_invocations as _cmi
+
+    op_db = getattr(_cmi, "op_db", [])
+    op_info_by_name = {op.name: op for op in op_db}
+
+    for op_name, cfg in op_configs.items():
+        op_info = op_info_by_name.get(op_name)
+        if op_info is None:
+            warnings.warn(
+                f"apply_op_config_overrides: op {op_name!r} not found in op_db.",
+                stacklevel=2,
+            )
+            continue
+
+        # Override dtypes if specified at op level.
+        # Bypass OpInfo.__setattr__ validation by writing to __dict__ directly
+        # with a frozenset -- frozenset supports set operations (.intersection
+        # etc.) that upstream _parametrize_test relies on, whereas
+        # _dispatch_dtypes does not.
+        resolved_dtypes = cfg.resolved_dtypes()
+        if resolved_dtypes is not None:
+            dtype_frozenset = frozenset(resolved_dtypes)
+            op_info.__dict__["dtypes"] = dtype_frozenset
+
+            # also set dtypesIfPrivateUse1 so supported_dtypes(device_type)
+            # returns the correct set for the privateuse1 device path.
+            # _parametrize_test calls op.supported_dtypes("privateuse1") which
+            # checks dtypesIfPrivateUse1 before falling back to dtypes.
+            # Without this, our dtypes override is bypassed for privateuse1 variants.
+            op_info.__dict__["dtypesIfPrivateUse1"] = dtype_frozenset
+
+        for dtype_cfg in cfg.dtypes:
+            if dtype_cfg.precision is not None:
+                if dtype_cfg.precision.atol is not None:
+                    op_info.atol = dtype_cfg.precision.atol  # type: ignore[attr-defined]
+                if dtype_cfg.precision.rtol is not None:
+                    op_info.rtol = dtype_cfg.precision.rtol  # type: ignore[attr-defined]
+                break  # apply first found, stop — OpInfo has one atol/rtol
