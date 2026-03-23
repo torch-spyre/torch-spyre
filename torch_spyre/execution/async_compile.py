@@ -25,11 +25,13 @@ from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
+from torch_spyre._inductor.op_spec import TensorArg, ShapeArg
 
 logger = get_inductor_logger("sdsc_compile")
 
-_argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
-
+# _argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
+N=7
+_argument_names = [i for i in range(-1, -N, -1)]
 
 def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
@@ -55,33 +57,34 @@ class SpyreAsyncCompile:
             outputs = []
             arg_map = []
             for index, ts in enumerate(ks.args):
-                # use node seq (idx in nodes) to verify whether to reuse lx for this buffer,
-                # in case same Op used twice in sequence and only want pin 1 of them
-                lx_addr = None
-                for k, addr in getattr(ts, "allocation", {}).items():
-                    if kernel_name.split("_")[-1] == k.replace("lx:", ""):
-                        lx_addr = addr
+                if isinstance(ts, TensorArg):
+                    # use node seq (idx in nodes) to verify whether to reuse lx for this buffer,
+                    # in case same Op used twice in sequence and only want pin 1 of them
+                    lx_addr = None
+                    for k, addr in getattr(ts, "allocation", {}).items():
+                        if kernel_name.split("_")[-1] == k.replace("lx:", ""):
+                            lx_addr = addr
 
-                if ts.is_input:
-                    inputs.append(
-                        {
-                            "name": _argument_names[index],
-                            "it_dim_map": ts.it_dim_map,
-                            "device_layout": ts.device_layout,
-                            "lx_addr": lx_addr,
-                        }
-                    )
-                    arg_map.append(ts.arg_index)
-                else:
-                    outputs.append(
-                        {
-                            "name": _argument_names[index],
-                            "it_dim_map": ts.it_dim_map,
-                            "device_layout": ts.device_layout,
-                            "lx_addr": lx_addr,
-                        }
-                    )
-                    arg_map.append(ts.arg_index)
+                    if ts.is_input:
+                        inputs.append(
+                            {
+                                "name": _argument_names[index],
+                                "it_dim_map": ts.it_dim_map,
+                                "device_layout": ts.device_layout,
+                                "lx_addr": lx_addr,
+                            }
+                        )
+                        arg_map.append(ts.arg_index)
+                    else:
+                        outputs.append(
+                            {
+                                "name": _argument_names[index],
+                                "it_dim_map": ts.it_dim_map,
+                                "device_layout": ts.device_layout,
+                                "lx_addr": lx_addr,
+                            }
+                        )
+                        arg_map.append(ts.arg_index)
             kernel_descriptor = {
                 "name": kernel_name,
                 "reduction": ks.is_reduction,
@@ -89,11 +92,14 @@ class SpyreAsyncCompile:
                 "dimensions": ks.iteration_space,
                 "inputs": inputs,
                 "outputs": outputs,
+                "isStartAddrSymbolic_" : 1,
             }
             if ks.op_info is not None:
                 kernel_descriptor["op_info"] = ks.op_info
-            pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
-            dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
+            #pointers = dict(zip(_argument_names, SEGMENT_OFFSETS))
+            symaddress = _argument_names
+            #dt_sdsc = generate_sdsc(pointers, **kernel_descriptor)
+            dt_sdsc = generate_sdsc(symaddress, **kernel_descriptor)
             kernel_output_dir = get_output_dir(kernel_name)
             subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
             os.makedirs(subdir, exist_ok=True)

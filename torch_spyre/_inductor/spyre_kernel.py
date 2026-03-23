@@ -19,6 +19,7 @@ from collections import Counter
 
 import torch
 import sympy
+from sympy import Symbol
 
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 
@@ -47,7 +48,7 @@ from .pass_utils import (
 )
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
-from .op_spec import OpSpec, TensorArg
+from .op_spec import OpSpec, TensorArg, ShapeArg
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -353,6 +354,9 @@ def create_op_spec(
     op_info: dict[str, Any],
 ) -> OpSpec:
     for arg in args:
+        if isinstance(arg, ShapeArg):
+            continue
+         
         if (
             arg.device_layout.device_dtype == DataFormats.IEEE_FP32
             and op not in SPYRE_FP32_OPS
@@ -444,7 +448,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
         if hasattr(self.current_node, "n_cores_used"):
             op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
-
+            #op_info["n_cores_used"] = 1
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
             logger.debug(
@@ -464,6 +468,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst, di))
+            for item in di:
+                num_elements = str(item.numel) if isinstance(item.numel, Symbol) else item.numel
+                args.append(ShapeArg(num_elements, 0, 2048, torch.float16))
             op_info.update(value.op_info)
             self.op_specs.append(create_op_spec(value.op, False, di, args, op_info))
         elif isinstance(value, TensorAccess):
@@ -678,7 +685,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if var_ranges:
             dim_map = map_dims_to_vars(access.layout, access.index)
             return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
+                DimensionInfo(dim_map[v], (var_ranges.get(dim_map[v], 1)))
                 for v in sorted(dim_map)
             ]
         else:
@@ -712,12 +719,19 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     with buf.indent():
                         buf.writeline(f"op='{op_spec.op}',")
                         buf.writeline(f"is_reduction={op_spec.is_reduction},")
-                        buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
+                        #buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
+                        buf.writeline(f"iteration_space={[str(s) if isinstance (s,Symbol) else s for s in op_spec.iteration_space]!r},")
                         buf.writeline(f"op_info={op_spec.op_info!r},")
                         buf.writeline("args=[")
                         with buf.indent():
                             for arg in op_spec.args:
-                                buf.writeline(f"{arg!r},")
+                                # if  hasattr(arg, 'ShapeArg'):
+                                #     arg.ShapeArg = [str(s) if isinstance (s,Symbol) else s for s in arg.ShapeArg]
+                                #     buf.writeline(f"{arg!r},")
+                                
+                                # else:
+
+                                 buf.writeline(f"{arg!r},")
                         buf.writeline("]")
                     buf.writeline("),")
         buf.writeline("]")

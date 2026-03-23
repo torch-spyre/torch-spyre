@@ -67,3 +67,26 @@ class OpSpec:
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
+
+
+@dataclasses.dataclass
+class ShapeArg:
+    """
+    A class representing a Tensor argument to an OpSpec
+
+    Attributes:
+        is_input: Is the Tensor used as an input to the operation?
+        arg_index: The index of the Tensor in the argument array of the Kernel.
+        dtype: The PyTorch (host) dtype of the tensor elements.
+        it_dim_map: A mapping between the op's iteration_space and the PyTorch (host) dimensions of the Tensor.
+            it_dim_map[d] is an integer that is interpreted as follows:
+                -1 indicates the the d-th dimension of ks.iteration_space is a broadcast or reduction dimension for this Tensor.
+                A non-negative value is the PyTorch (host) dimension of the Tensor that corresponds to the d-th dimension of ks.iteration_space.
+        allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        device_layout: The SpyreTensorLayout describe the device shape of the Tensor.
+    """
+
+    name: str
+    min: int
+    max: int
+    dtype: torch.dtype
