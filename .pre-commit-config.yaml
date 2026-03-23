@@ -14,7 +14,7 @@ repos:
     rev: v0.9.31
     hooks:
       - id: pymarkdown
-        exclude: .*\.inc\.md
+        exclude: .*\.inc\.md|\.claude/skills/.*
         args: [fix]
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
@@ -51,6 +51,11 @@ repos:
         exclude: codegen/.*
   - repo: local
     hooks:
+      - id: forbid-pytest-ini
+        name: Forbid pytest.ini (use pyproject.toml instead)
+        language: fail
+        entry: pytest.ini is forbidden. Use [tool.pytest.ini_options] in pyproject.toml instead.
+        files: ^pytest\.ini$
       - id: check-requirements-dev
         name: Check requirements/dev.txt sync
         entry: tools/check-requirements.sh

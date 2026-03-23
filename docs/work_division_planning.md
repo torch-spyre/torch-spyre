@@ -45,25 +45,28 @@ TODO
 
 ### Matrix Multiplication
 
-Matrix multiplication computes C = A × B where A is M×K, B is K×N, and C is M×N. The output can be parallelized along both the M and N dimensions.
+Matrix multiplication computes C = A × B where A is M×K, B is K×N, and C is M×N. The output can be parallelized along the M, N, and K dimensions.
 
 **Parallelization Strategy:**
-- Prioritize the M dimension (rows) over the N dimension (columns)
-- Split both dimensions when sufficient cores are available
-- The K dimension (reduction dimension) is not split
+- Prioritize the M dimension (rows) highest
+- Then prioritize the N dimension (columns)
+- The K dimension (reduction dimension) has the lowest priority and is only split when M and N cannot utilize all cores
+- When K is split, each core computes a partial result that is accumulated by the backend
 
-**Example:** With 8 cores and output size 128×256, the planner might choose splits [4, 2], dividing rows into 4 parts and columns into 2 parts. Each core computes a 32×128 block of the output.
+**Example:** With 8 cores and output size 128×256, the planner might choose splits [4, 1, 2] (M=4, K=1, N=2), dividing rows into 4 parts and columns into 2 parts. Each core computes a 32×128 block of the output. If M and N were smaller, K might be split to utilize more cores.
 
 ### Batched Matrix Multiplication
 
-Batched matrix multiplication extends matrix multiplication with an additional batch dimension, computing multiple independent matrix multiplications in parallel.
+Batched matrix multiplication extends matrix multiplication with additional batch dimensions, computing multiple independent matrix multiplications in parallel.
 
 **Parallelization Strategy:**
-- Prioritize the batch dimension highest (perfect parallelism)
+- Prioritize batch dimensions highest (perfect parallelism)
 - Then prioritize the N dimension (columns)
-- Finally consider the M dimension (rows)
+- Then consider the M dimension (rows)
+- The K dimension (reduction dimension) has the lowest priority and is only split when other dimensions cannot utilize all cores
+- When K is split, each core computes a partial result that is accumulated by the backend
 
-**Example:** With 8 cores, batch size 4, and output size 64×128 per batch, the planner might choose splits [4, 1, 2], splitting all 4 batches and dividing columns into 2 parts. Each core processes 2 complete batches with half the columns.
+**Example:** With 8 cores, batch size 4, and output size 64×128 per batch, the planner might choose splits [4, 1, 1, 2] (B=4, M=1, K=1, N=2), splitting all 4 batches and dividing columns into 2 parts. If batch and output dimensions were smaller, K might be split to utilize more cores.
 
 ## Core Division Representation
 
@@ -73,17 +76,20 @@ The operation dimension ordering is:
 
 | Op | Dimension labels | `op_dim_splits` |
 |---|---|---|
-| matmul | `["mb", "in", "out"]` | `[M_split, 1, N_split]` |
-| 3D bmm | `["x", "mb", "in", "out"]` | `[B_split, M_split, 1, N_split]` |
-| 4D bmm | `["x", "y", "mb", "in", "out"]` | `[B1_split, B2_split, M_split, 1, N_split]` |
+| matmul | `["mb", "in", "out"]` | `[M_split, K_split, N_split]` |
+| 3D bmm | `["x", "mb", "in", "out"]` | `[B_split, M_split, K_split, N_split]` |
+| 4D bmm | `["x", "y", "mb", "in", "out"]` | `[B1_split, B2_split, M_split, K_split, N_split]` |
 | pointwise 2D | `["mb", "out"]` | `[1, cores]` |
 | pointwise 3D | `["mb", "x", "out"]` | `[1, 1, cores]` |
 | pointwise 4D | `["mb", "x", "y", "out"]` | `[1, 1, 1, cores]` |
 
-The reduction dimension (K / "in") is always 1 since it is never split. The product of all splits equals the total number of cores used.
+The reduction dimension (K / "in") has the lowest priority and is typically 1 (not split) unless other dimensions cannot utilize all available cores. The product of all splits equals the total number of cores used.
 
-For example, a matrix multiplication with 8 cores and M_split=4, N_split=2 would have:
+For example, a matrix multiplication with 8 cores and M_split=4, K_split=1, N_split=2 would have:
 - `op_dim_splits = [4, 1, 2]`  — matching `["mb", "in", "out"]`
+
+If M and N were small (e.g., 4×4) but K was large (e.g., 1024), the planner might choose:
+- `op_dim_splits = [4, 2, 4]` — splitting M=4, K=2, N=4 to use all 32 cores
 
 This representation is operation-centric: it describes how the logical computation is divided, independent of how any particular tensor is laid out in device memory. The code generation phase uses `op_dim_splits` directly without any mapping through device dimensions.
 

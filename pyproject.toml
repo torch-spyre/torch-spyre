@@ -81,7 +81,7 @@ line-length = 88
 
 [tool.mypy]
 ignore_missing_imports = true
-exclude=["tests/_inductor"]
+exclude=["tests/inductor"]
 
 [[tool.mypy.overrides]]
 module = ["torch_spyre._inductor.*"]
@@ -94,6 +94,7 @@ filterwarnings = [
     # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/jit/_script.py#L363
     "ignore::DeprecationWarning:torch.jit._script",
 ]
+norecursedirs = ['tests/models']
 
 [tool.uv]
 required-version = ">=0.9.0"

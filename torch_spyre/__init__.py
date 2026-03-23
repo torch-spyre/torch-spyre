@@ -67,6 +67,18 @@ class _SpyreImpl:
 
             ts_autoload()
 
+            # Permanently register PrivateUse1 kernels for DispatchKeys
+            # so that eager-mode dispatch reaches the Spyre implementations
+            # without requiring global monkey-patching.
+            # Customops must be imported here because decompositions.py references
+            # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
+            import torch_spyre._inductor.customops  # noqa: F401
+            from torch_spyre._inductor.decompositions import (
+                _register_spyre_dispatchkey_kernels_permanently,
+            )
+
+            _register_spyre_dispatchkey_kernels_permanently()
+
     def _is_in_bad_fork(self) -> bool:
         return self._in_bad_fork
 
@@ -141,6 +153,30 @@ def make_spyre_module() -> types.ModuleType:
             return getattr(impl, name)
         if not hasattr(impl, "_C"):
             impl._lazy_init()
+        if name in {
+            "Stream",
+            "stream",
+            "current_stream",
+            "default_stream",
+            "synchronize",
+        }:
+            impl._lazy_init()
+            from torch_spyre.streams import (
+                Stream,
+                stream,
+                current_stream,
+                default_stream,
+                synchronize,
+            )
+
+            streams_map = {
+                "Stream": Stream,
+                "stream": stream,
+                "current_stream": current_stream,
+                "default_stream": default_stream,
+                "synchronize": synchronize,
+            }
+            return streams_map[name]
         if hasattr(impl._C, name):
             return getattr(impl._C, name)
         raise AttributeError(name)

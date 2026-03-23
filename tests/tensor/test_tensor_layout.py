@@ -20,7 +20,6 @@ from torch_spyre._C import (
     SpyreTensorLayout,
     to_with_layout,
     get_device_dtype,
-    compute_view_layout,
 )
 
 
@@ -66,9 +65,10 @@ class TestSpyreTensorLayout(TestCase):
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
         stl_y = SpyreTensorLayout(
-            [4, 512, 64], [1, 0, 1], get_device_dtype(torch.float16)
+            [4, 512, 64], [1, 0, 1], [64, 256, 1], get_device_dtype(torch.float16)
         )
         self.assertEqual(stl_x.dim_map, stl_y.dim_map)
+        self.assertEqual(stl_x.stride_map, stl_y.stride_map)
         self.assertEqual(stl_x.device_size, stl_y.device_size)
 
     def test_sparse_dim_order(self):
@@ -81,7 +81,7 @@ class TestSpyreTensorLayout(TestCase):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
             str(stl),
-            "SpyreTensorLayout(device_size=[4, 512, 64], dim_map =[1, 0, 1], device_dtype=DataFormats.SEN169_FP16)",
+            "SpyreTensorLayout(device_size=[4, 512, 64], dim_map =[1, 0, 1], stride_map =[64, 256, 1], device_dtype=DataFormats.SEN169_FP16)",
         )
 
     def test_device_alloc(self):
@@ -105,7 +105,7 @@ class TestSpyreTensorLayout(TestCase):
 
         y = torch.rand([512, 512], dtype=torch.float16)
         y_stl = SpyreTensorLayout(
-            [8, 512, 64], [1, 0, 1], get_device_dtype(torch.float16)
+            [8, 512, 64], [1, 0, 1], [64, 512, 1], get_device_dtype(torch.float16)
         )
         y_dev = to_with_layout(y, y_stl)
         self.assertEqual(y, y_dev.cpu())
@@ -144,27 +144,6 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
         self.assertEqual(x_stl.dim_map, [1, -1, 0, -1])
 
-    def test_compute_view_layout(self):
-        stl = SpyreTensorLayout((3, 5, 128), torch.float16)
-        self.assertEqual(stl.device_size, [5, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-        unsqueeze_stl = compute_view_layout((3, 5, 128), (3, 5, 1, 128), stl)
-        self.assertEqual(unsqueeze_stl.device_size, [5, 1, 2, 3, 64])
-        self.assertEqual(unsqueeze_stl.dim_map, [1, 2, 3, 0, 3])
-        fused_stl = compute_view_layout((3, 5, 128), (15, 1, 128), stl)
-        self.assertEqual(fused_stl.device_size, [5, 1, 2, 3, 64])
-        self.assertEqual(fused_stl.dim_map, [0, 1, 2, 0, 2])
-
-        # A k-dim tensor with a size 1 stick dimension is interchangeable with a sparse tensor of dim k-1
-        stl = SpyreTensorLayout((5, 128, 1), torch.float16)
-        self.assertEqual(stl.device_size, [128, 1, 5, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-        sparse_stl = compute_view_layout((5, 128, 1), (5, 128), stl)
-        self.assertEqual(sparse_stl.device_size, [128, 1, 5, 64])
-        self.assertEqual(sparse_stl.dim_map, [1, -1, 0, -1])
-        dense_stl = compute_view_layout((5, 128), (5, 128, 1), sparse_stl)
-        self.assertEqual(stl, dense_stl)
-
     def test_add_with_mixed_layout_dim_orders(self):
         """Compiled add where x and y have different device layouts."""
         x = torch.rand(3, 2, 2048, dtype=torch.float16)
@@ -199,7 +178,7 @@ class TestSpyreTensorLayout(TestCase):
         with self.assertRaises(RuntimeError) as context:
             _ = compiled(x_dev, y_dev).cpu()
         self.assertIn(
-            "pointwise op with multiple non-broadcasted stick dims",
+            "pointwise op with nonuniform stick indexing",
             str(context.exception),
         )
 

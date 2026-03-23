@@ -53,6 +53,9 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     the parallelizable unit is the number of sticks rather than the number of
     elements.
 
+    This function properly consults the dim_map to find which device dimension
+    corresponds to the requested host dimension, handling tiling and sparse tensors.
+
     Args:
         layout: The tensor's FixedTiledLayout
         host_dim_idx: The host dimension index (negative indices are supported)
@@ -65,10 +68,19 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
 
     assert host_dim_idx < len(layout.size)
 
-    if host_dim_idx != layout.device_layout.host_stick_dim():
-        return int(layout.size[host_dim_idx])
-    else:  # stick dim: parallelizable unit is number of sticks
-        return int(layout.size[host_dim_idx]) // layout.device_layout.elems_per_stick()
+    dl = layout.device_layout
+
+    # Use dim_map to find the device dimension that corresponds to this host dimension
+    # For tiled dimensions (appearing multiple times in dim_map), we use the first occurrence
+    # which corresponds to the outermost device dimension for that host dimension
+    try:
+        device_dim_idx = dl.dim_map.index(host_dim_idx)
+    except ValueError:
+        raise RuntimeError(
+            f"Host dimension {host_dim_idx} not found in dim_map {dl.dim_map}"
+        )
+
+    return dl.device_size[device_dim_idx]
 
 
 def core_split(size: int, max_cores: int) -> int:
@@ -101,11 +113,15 @@ def multi_dim_core_split(
     2. Dimension size (larger dimensions get priority)
     3. Divisibility (dimensions that divide evenly get priority)
 
+    Dimensions with negative priorities are excluded from splitting and will
+    always have a split value of 1.
+
     Args:
         sizes: List of dimension sizes that can be parallelized
         max_cores: Total number of cores available
         priorities: Optional list of priority values (higher = more important)
-                   If None, uses dimension sizes as priorities
+                   If None, uses dimension sizes as priorities.
+                   Use negative values to exclude dimensions from splitting.
 
     Returns:
         List of core splits for each dimension (same length as sizes)
@@ -117,6 +133,9 @@ def multi_dim_core_split(
 
         >>> multi_dim_core_split([100, 50], max_cores=10)
         [5, 2]  # 5*2 = 10 cores total
+
+        >>> multi_dim_core_split([128, 64, 32], max_cores=8, priorities=[3, -1, 2])
+        [4, 1, 2]  # Middle dimension excluded from splitting (priority=-1)
     """
     if not sizes:
         return []
@@ -129,7 +148,10 @@ def multi_dim_core_split(
         priorities = sizes.copy()
 
     # Create list of (dimension_index, size, priority) tuples
-    dim_info = [(i, sizes[i], priorities[i]) for i in range(n_dims)]
+    # Filter out dimensions with negative priorities (they should not be split)
+    dim_info = [
+        (i, sizes[i], priorities[i]) for i in range(n_dims) if priorities[i] >= 0
+    ]
 
     # Sort by priority (descending), then by size (descending)
     dim_info.sort(key=lambda x: (x[2], x[1]), reverse=True)
@@ -152,8 +174,6 @@ def multi_dim_core_split(
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    # pw: Pointwise = n.node.data
-    # op = pw.get_origin_node().target
     output: FixedTiledLayout = n.node.get_layout()
     ndim = len(output.size)
     n.n_cores_used = 1
@@ -170,39 +190,32 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Core division not supported if there are broadcasts
             return
 
-    # Split along the stick dimension
-    # Find the stick count device dimension: the device dim where dim_map[i] ==
-    # host_stick_dim() and i is not the last device dim (the last device dim is
-    # always the intra-stick dimension). This is correct for all device layout
-    # shapes (2D, 3D, 4D) and avoids the zero-division issue when the unpadded
-    # element count is smaller than elems_per_stick.
-    dl = output.device_layout
-    stick_host_dim = dl.host_stick_dim()
+    # Collect parallelizable sizes for all host dimensions
+    # For stick dimension: this returns the number of sticks
+    # For non-stick dimensions: this returns the dimension size
+    sizes = [get_host_dim_size(output, i) for i in range(ndim)]
 
-    # sparse tensor - can't split stick dimensions
-    if stick_host_dim is None:
-        return
+    # Use sizes as priorities (larger dimensions get higher priority)
+    priorities = sizes.copy()
 
-    stick_count_dev_dim = next(
-        i for i, d in enumerate(dl.dim_map[:-1]) if d == stick_host_dim
-    )
-    num_sticks = dl.device_size[stick_count_dev_dim]
-    num_cores = core_split(num_sticks, max_cores)
-    if num_cores > 1:
-        n.n_cores_used = num_cores
-        n.op_dim_splits = [
-            (1 if i != stick_host_dim else num_cores) for i in range(ndim)
-        ]
+    # Use multi-dimensional core splitting
+    splits = multi_dim_core_split(sizes, max_cores, priorities)
+    n.n_cores_used = math.prod(splits)
+
+    if n.n_cores_used > 1:
+        n.op_dim_splits = splits
 
         # Consolidated DEBUG log for pointwise work division
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise work_division {n.node.get_name()}: cores={num_cores}, "
-                f"stick_dim={stick_host_dim}, num_sticks={num_sticks}, op_dim_splits={n.op_dim_splits}"
+                f"pointwise work_division {n.node.get_name()}: cores={n.n_cores_used}, "
+                f"sizes={sizes}, priorities={priorities}, op_dim_splits={n.op_dim_splits}"
             )
 
 
-def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
+def divide_reduction_op(
+    n: SchedulerNode, args: list[SchedNodeArg], max_cores, enable_splitk=True
+):
     red: Reduction = n.node.data
     n.n_cores_used = 1
 
@@ -214,26 +227,27 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
         # Operation dimensions: [M, K] @ [K, N] --> [M, N]
         # dim_labels in codegen: ["mb", "in", "out"] = [M, K, N]
-        # op_dim_splits indices:   0=M,  1=K,  2=N
 
         # Get operation dimension sizes from host layouts.
         M = get_host_dim_size(args[0].layout, 0)
+        K = get_host_dim_size(args[0].layout, 1)
         N = get_host_dim_size(args[1].layout, 1)
 
-        # Parallelizable operation dimensions: M and N (not K, the reduction dim)
-        sizes = [M, N]
-        priorities = [2, 1]
+        # Parallelizable operation dimensions: M, K, and N
+        # K has lowest priority (1) - only split when M and N are exhausted
+        # Use negative priority to exclude K from splitting when splitk is disabled
+        sizes = [M, K, N]
+        priorities = [3, 1 if enable_splitk else -1, 2]
         splits = multi_dim_core_split(sizes, max_cores, priorities)
         n.n_cores_used = math.prod(splits)
 
         # Store op_dim_splits directly matching dim_labels = ["mb", "in", "out"]
-        # K (index 1, "in") is never split
-        n.op_dim_splits = [splits[0], 1, splits[1]]  # [M_split, K=1, N_split]
+        n.op_dim_splits = splits
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"matmul work_division: M={M}, N={N}, cores={n.n_cores_used}, "
-                f"splits=[M={splits[0]}, K=1, N={splits[1]}], op_dim_splits={n.op_dim_splits}"
+                f"matmul work_division: M={M}, K={K}, N={N}, cores={n.n_cores_used}, "
+                f"splits=[M={splits[0]}, K={splits[1]}, N={splits[2]}]"
             )
 
     if red.reduction_type == BATCH_MATMUL_OP:
@@ -246,61 +260,57 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # 3D BMM: [B, M, K] @ [B, K, N] --> [B, M, N]
             #     or  [B, M, K] @ [K, N] --> [B, M, N]
             # dim_labels in codegen: ["x", "mb", "in", "out"] = [B, M, K, N]
-            # op_dim_splits indices:   0=B,  1=M,  2=K,  3=N
 
             # Get operation dimension sizes from host layouts
             B = get_host_dim_size(args[0].layout, 0)
             M = get_host_dim_size(args[0].layout, 1)
+            K = get_host_dim_size(args[0].layout, 2)
             N = get_host_dim_size(args[1].layout, -1)
 
-            # Parallelizable operation dimensions: B, M, N (not K, the reduction dim)
-            sizes = [B, M, N]
-            priorities = [3, 1, 2]
+            # Parallelizable operation dimensions: B, M, K, and N
+            # K has lowest priority (1) - only split when B, M, and N are exhausted
+            # Use negative priority to exclude K from splitting when splitk is disabled
+            sizes = [B, M, K, N]
+            priorities = [4, 2, 1 if enable_splitk else -1, 3]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
 
             # Store op_dim_splits directly matching dim_labels = ["x", "mb", "in", "out"]
-            # K (index 2, "in") is never split
-            n.op_dim_splits = [splits[0], splits[1], 1, splits[2]]  # [B, M, K=1, N]
+            n.op_dim_splits = splits
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    f"bmm_3d work_division: B={B}, M={M}, N={N}, cores={n.n_cores_used}, "
-                    f"splits=[B={splits[0]}, M={splits[1]}, K=1, N={splits[2]}], op_dim_splits={n.op_dim_splits}"
+                    f"bmm_3d work_division: B={B}, M={M}, K={K}, N={N}, cores={n.n_cores_used}, "
+                    f"splits=[B={splits[0]}, M={splits[1]}, K={splits[2]}, N={splits[3]}]"
                 )
 
         elif num_dims == 4:
             # 4D BMM: [B1, B2, M, K] @ [B1, B2, K, N] --> [B1, B2, M, N]
             # dim_labels in codegen: ["x", "y", "mb", "in", "out"] = [B1, B2, M, K, N]
-            # op_dim_splits indices:   0=B1, 1=B2, 2=M,  3=K,  4=N
 
             # Get operation dimension sizes from host layouts
             B1 = get_host_dim_size(args[0].layout, 0)
             B2 = get_host_dim_size(args[0].layout, 1)
             M = get_host_dim_size(args[0].layout, 2)
+            K = get_host_dim_size(args[0].layout, 3)
             N = get_host_dim_size(args[1].layout, -1)
 
-            # Parallelizable operation dimensions: B1, B2, M, N (not K, the reduction dim)
-            sizes = [B1, B2, M, N]
+            # Parallelizable operation dimensions: B1, B2, M, K, and N
+            # K has lowest priority (1) - only split when B1, B2, M, and N are exhausted
+            # Use negative priority to exclude K from splitting when splitk is disabled
             # NOTE: split priority can affect numerical error in unit tests
-            priorities = [3, 4, 1, 2]
+            sizes = [B1, B2, M, K, N]
+            priorities = [4, 5, 2, 1 if enable_splitk else -1, 3]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
 
             # Store op_dim_splits directly matching dim_labels = ["x", "y", "mb", "in", "out"]
-            # K (index 3, "in") is never split
-            n.op_dim_splits = [
-                splits[0],
-                splits[1],
-                splits[2],
-                1,
-                splits[3],
-            ]  # [B1, B2, M, K=1, N]
+            n.op_dim_splits = splits
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    f"bmm_4d work_division: B1={B1}, B2={B2}, M={M}, N={N}, cores={n.n_cores_used}, "
-                    f"splits=[B1={splits[0]}, B2={splits[1]}, M={splits[2]}, K=1, N={splits[3]}], op_dim_splits={n.op_dim_splits}"
+                    f"bmm_4d work_division: B1={B1}, B2={B2}, M={M}, K={K}, N={N}, cores={n.n_cores_used}, "
+                    f"splits=[B1={splits[0]}, B2={splits[1]}, M={splits[2]}, K={splits[3]}, N={splits[4]}]"
                 )
 
         else:

@@ -18,6 +18,8 @@
 
 #include <ATen/core/op_registration/adaption.h>
 
+#include "spyre_stream.h"
+
 namespace spyre {
 
 c10::DeviceType SpyreGuardImpl::type() const {
@@ -47,14 +49,39 @@ c10::DeviceIndex SpyreGuardImpl::deviceCount() const noexcept {
   return 1;
 }
 
-// Do Spyre have streams, override
-// getStream/exchangeStream/.../recordDataPtrOnStream
 c10::Stream SpyreGuardImpl::getStream(c10::Device device) const {
-  return c10::Stream(c10::Stream::Default::DEFAULT, device);
+  return getCurrentStream(device).unwrap();
+}
+
+c10::Stream SpyreGuardImpl::getNewStream(c10::Device device,
+                                         int priority) const {
+  return getStreamFromPool(device, priority).unwrap();
+}
+
+void SpyreGuardImpl::synchronizeStream(const c10::Stream& stream) const {
+  TORCH_CHECK(stream.device().type() == this->type());
+  SpyreStream(stream).synchronize();
+}
+
+bool SpyreGuardImpl::queryStream(const c10::Stream& stream) const {
+  TORCH_CHECK(stream.device().type() == this->type());
+  return SpyreStream(stream).query();
+}
+
+void SpyreGuardImpl::synchronizeDevice(c10::DeviceIndex device_index) const {
+  c10::Device dev(c10::DeviceType::PrivateUse1, device_index);
+  spyre::synchronizeDevice(dev);
 }
 
 c10::Stream SpyreGuardImpl::exchangeStream(c10::Stream stream) const {
-  return stream;
+  SpyreStream ss(stream);
+
+  c10::Stream old = getCurrentStream(stream.device()).unwrap();
+
+  // Set TLS current stream for THAT device index
+  setCurrentStream(ss);
+
+  return old;
 }
 
 void SpyreGuardImpl::recordDataPtrOnStream(const c10::DataPtr&,

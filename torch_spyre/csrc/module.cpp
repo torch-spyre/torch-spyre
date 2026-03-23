@@ -24,8 +24,8 @@
 #include <util/sendefs.h>
 
 #include <cstdlib>  // std::getenv
-#include <dee_internal/dee_graph_converter.hpp>
-#include <flex/flex_factory.hpp>
+#include <flex/compiler_interface/dee_graph_converter.hpp>
+#include <flex/runtime/flex_factory.hpp>
 #include <memory>
 #include <sendnn/graph.hpp>
 #include <sendnn/graph/graph_builder.hpp>
@@ -41,6 +41,7 @@
 #include "logging.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
+#include "spyre_stream.h"
 #include "spyre_views.h"
 #include "types_mapping.h"
 
@@ -69,12 +70,8 @@ static void init_from_env() {
 
 void _startRuntime() {
   DEBUGINFO("starting runtime");
-  // TODO(tmhoangt): move sendnn::RuntimeInterface to flex to isolate from
-  // sendnn
-  std::shared_ptr<sendnn::RuntimeInterface> base_runtime;
-  auto s = flex::CreateRuntimeInterface(&base_runtime);
-  std::shared_ptr<flex::Runtime> runtime =
-      std::dynamic_pointer_cast<flex::Runtime>(base_runtime);
+  std::shared_ptr<Runtime> runtime;
+  auto s = flex::initializeRuntime(&runtime);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
@@ -82,6 +79,7 @@ void _startRuntime() {
     DEBUGINFO("runtime started");
   } else {
     DEBUGINFO("runtime FAILED TO START.");
+    throw std::runtime_error("Failed to initialize Spyre runtime. ");
   }
 }
 void startRuntime() {
@@ -234,8 +232,22 @@ DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
   return sen_dtype_dev;
 }
 
+bool is_supported_dtype(c10::ScalarType dtype) {
+  // TODO(kmehant,yoheiueda): Replace this heuristic with a reliable method to
+  // determine supported dtypes. Using elems_per_stick can miss certain
+  // unsupported dtypes. See #950
+  DataFormats sen_dtype_dev = get_device_dtype(dtype);
+  return sen_dtype_dev != DataFormats::INVALID &&
+         elems_per_stick(sen_dtype_dev) > 0;
+}
+// TODO(tmhoangt): add real code
+int device_count() {
+  return 1;
+}
+
 }  // namespace spyre
 
+namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
@@ -248,6 +260,7 @@ PYBIND11_MODULE(_C, m) {
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
+      .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
@@ -261,14 +274,18 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, c10::ScalarType,
                     std::vector<int32_t>>(),
            py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"))
-      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, DataFormats>(),
-           py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
+      .def(py::init<std::vector<int64_t>, std::vector<int32_t>,
+                    std::vector<int64_t>, DataFormats>(),
+           py::arg("device_size"), py::arg("dim_map"), py::arg("stride_map"),
+           py::arg("device_dtype"));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
-  m.def("spyre_reinterpret_tensor", &spyre::spyre_reinterpret_tensor);
+  m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
+  m.def("reinterpret_tensor_with_layout",
+        &spyre::reinterpret_tensor_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
@@ -295,11 +312,43 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
-  m.def("compute_view_layout", &spyre::compute_view_layout);
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // Stream management functions
+  m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
+        py::arg("priority") = 0,
+        "Get a stream from the pool with specified device and priority");
+
+  m.def("current_stream", &spyre::getCurrentStream, py::arg("device"),
+        "Get the current stream for a device");
+
+  m.def("set_current_stream", &spyre::setCurrentStream, py::arg("stream"),
+        "Set the current stream and return the previous one");
+
+  m.def("default_stream", &spyre::getDefaultStream, py::arg("device"),
+        "Get the default stream for a device");
+
+  m.def("synchronize", &spyre::synchronizeDevice,
+        py::arg("device") = py::none(), "Synchronize a device or all devices");
+
+  // Expose SpyreStream class to Python
+  py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
+      .def("synchronize", &spyre::SpyreStream::synchronize,
+           "Wait for all operations on this stream to complete")
+      .def("query", &spyre::SpyreStream::query,
+           "Check if all operations on this stream have completed")
+      .def("device", &spyre::SpyreStream::device,
+           "Get the device associated with this stream")
+      .def("id", &spyre::SpyreStream::id, "Get the stream ID")
+      .def("priority", &spyre::SpyreStream::priority, "Get the stream priority")
+      .def("__repr__", [](const spyre::SpyreStream &stream) {
+        return "<torch_spyre.Stream device=" +
+               std::to_string(stream.device().index()) +
+               " id=" + std::to_string(stream.id()) + ">";
+      });
 }

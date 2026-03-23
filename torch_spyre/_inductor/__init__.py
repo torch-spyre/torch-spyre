@@ -91,23 +91,30 @@ def enable_spyre_compile_fx_wrapper():
 
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
-            from torch._inductor.decomposition import decompositions
+            decomps = kwargs.setdefault(
+                "decompositions", torch._inductor.decomposition.decompositions
+            )
 
             if _uses_spyre(gm, example_inputs):
-                import torch
-
                 torch.spyre._impl._lazy_init()
-                with enable_spyre_context(example_inputs):
+
+                with enable_spyre_context(
+                    example_inputs, decomps=decomps
+                ) as spyre_context_decompositions:
+                    # The `decomps` is the updated in the context manager
+                    # with the appropriate spyre decompositions
+                    # and yielded as `spyre_context_decompositions` from the CM
+
+                    kwargs["decompositions"] = spyre_context_decompositions
+
                     return _orig(
                         gm,
                         example_inputs,
-                        decompositions=decompositions,
                         *args,
                         **kwargs,
                     )
-            return _orig(
-                gm, example_inputs, decompositions=decompositions, *args, **kwargs
-            )
+
+            return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True
@@ -128,7 +135,7 @@ def _autoload():
             return
         from torch._dynamo.device_interface import register_interface_for_device
 
-        from torch_spyre.utils.device_interface import SpyreInterface
+        from torch_spyre.device.interface import SpyreInterface
 
         register_interface_for_device(DEVICE_NAME, SpyreInterface)
 
@@ -141,7 +148,7 @@ def _autoload():
         from torch._inductor.codegen import cpu_device_op_overrides  # noqa: F401  # usort: skip
         from torch._inductor.codegen.cuda import device_op_overrides  # noqa: F401  # usort: skip
 
-        from torch_spyre.utils.device_op_overrides import SpyreDeviceOpOverrides
+        from torch_spyre.device.op_overrides import SpyreDeviceOpOverrides
 
         register_device_op_overrides(
             device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()

@@ -273,6 +273,12 @@ class TestOps(TestCase):
         y = torch.tanh(x_spyre).to("cpu")
         torch.testing.assert_close(y, torch.tanh(x), rtol=self.rtol, atol=self.atol)
 
+    def test_pow_scalar_exponent(self):
+        x = torch.randn((1, 1, 4096), dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.pow(x_spyre, 2).to("cpu")
+        torch.testing.assert_close(y, torch.pow(x, 2), rtol=self.rtol, atol=self.atol)
+
     @unittest.skip("TODO: Needs more debug")
     def test_clone(self):
         x = torch.tensor([-2, -1, 0, 1, 2], dtype=self.dtype)
@@ -288,7 +294,7 @@ class TestOps(TestCase):
         z = torch.add(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.add(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.expectedFailure
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_add_Scalar(self):
         x = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype)
         y = 5
@@ -429,7 +435,7 @@ class TestOps(TestCase):
             z, torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.expectedFailure
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_addmm_ab_bc_scaled(self):
         mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_a, self.mm_c
@@ -564,6 +570,20 @@ class TestOps(TestCase):
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
+    def test_normal_randn(self):
+        gen = torch.manual_seed(42)
+
+        y_spyre = torch.randn(3, 5, device="spyre", generator=gen)
+
+        # torch.Generator is stateful, hence reset
+        gen.manual_seed(42)
+
+        y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
+
+        torch.testing.assert_close(
+            y_spyre.to("cpu"), y_cpu, rtol=self.rtol, atol=self.atol
+        )
+
     def test_zeros(self):
         x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
         x = torch.zeros(3, 64, dtype=self.dtype)
@@ -574,163 +594,6 @@ class TestOps(TestCase):
         x_spyre = torch.zeros(3, 50, device="spyre", dtype=self.dtype)
         x = torch.zeros(3, 50, dtype=self.dtype)
         torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
-
-    # --- View layout: identity ---
-
-    def test_view_identity_2d(self):
-        """[512, 256] -> [512, 256]: no change."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        stl_before = x.device_tensor_layout()
-        y = x.view(512, 256)
-        stl_after = y.device_tensor_layout()
-        self.assertEqual(stl_after.device_size, stl_before.device_size)
-        self.assertEqual(stl_after.dim_map, stl_before.dim_map)
-
-    def test_view_identity_1d(self):
-        """[128] -> [128]: no change."""
-        x = torch.rand(128, dtype=self.dtype).to("spyre")
-        stl_before = x.device_tensor_layout()
-        y = x.view(128)
-        stl_after = y.device_tensor_layout()
-        self.assertEqual(stl_after.device_size, stl_before.device_size)
-        self.assertEqual(stl_after.dim_map, stl_before.dim_map)
-
-    # --- View layout: size-1 insertion (unsqueeze equivalent) ---
-
-    def test_view_insert_size1_middle(self):
-        """[512, 256] -> [512, 1, 256]: insert size-1 dim in the middle."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 1, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-
-    def test_view_insert_size1_front(self):
-        """[512, 256] -> [1, 512, 256]: insert size-1 dim at the front."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(1, 512, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 1, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 0, 1, 2])
-
-    def test_view_insert_size1_end(self):
-        """[512, 256] -> [512, 256, 1]: insert size-1 dim at the end."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 256, 1)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 1, 0, 1])
-
-    def test_view_insert_multiple_size1(self):
-        """[512, 256] -> [1, 512, 1, 256, 1]: multiple size-1 insertions."""
-        x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(1, 512, 1, 256, 1)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 1, 4, 1, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 4, 3, 0, 1, 3])
-
-    # --- View layout: size-1 removal (squeeze equivalent) ---
-
-    def test_view_remove_size1_middle(self):
-        """[512, 1, 256] -> [512, 256]: remove size-1 dim from middle."""
-        x = torch.rand(512, 1, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
-
-    def test_view_remove_size1_front(self):
-        """[1, 512, 256] -> [512, 256]: remove size-1 dim from front."""
-        x = torch.rand(1, 512, 256, dtype=self.dtype).to("spyre")
-        y = x.view(512, 256)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [512, 4, 64])
-        self.assertEqual(stl.dim_map, [0, 1, 1])
-
-    # --- View layout: merge (N:1) ---
-
-    def test_view_merge_non_stick_2d_to_1d(self):
-        """[2, 3, 4] -> [6, 4]: merge first two (non-stick) dims."""
-        x = torch.rand(2, 3, 4, dtype=self.dtype).to("spyre")
-        y = x.view(6, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [3, 1, 2, 64])
-        self.assertEqual(stl.dim_map, [0, 1, 0, 1])
-
-    def test_view_merge_all_to_1d(self):
-        """[4, 2, 64] -> [512]: merge all dims into one."""
-        x = torch.rand(4, 2, 64, dtype=self.dtype).to("spyre")
-        y = x.view(512)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.dim_map, [0, 0, 0, 0])
-
-    # --- View layout: split (1:M) non-stick ---
-
-    def test_view_split_non_stick(self):
-        """[6, 4] -> [2, 3, 4]: split first (non-stick) dim."""
-        x = torch.rand(6, 4, dtype=self.dtype).to("spyre")
-        y = x.view(2, 3, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [2, 0, 1, 2])
-
-    # --- View layout: split (1:M) involving stick dim ---
-
-    def test_view_split_stick_dim(self):
-        """[512] -> [4, 128]: split where innermost new dim >= elems_per_stick."""
-        x = torch.rand(512, dtype=self.dtype).to("spyre")
-        y = x.view(4, 128)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [2, 4, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
-
-    def test_view_split_stick_dim_exact(self):
-        """[256] -> [4, 64]: split where innermost == elems_per_stick."""
-        x = torch.rand(256, dtype=self.dtype).to("spyre")
-        y = x.view(4, 64)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 4, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
-
-    def test_view_split_stick_dim_2d(self):
-        """[3, 512] -> [3, 4, 128]: split stick dim from 2d tensor."""
-        x = torch.rand(3, 512, dtype=self.dtype).to("spyre")
-        y = x.view(3, 4, 128)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
-
-    # --- View layout: mixed cases ---
-
-    def test_view_merge_and_insert_size1(self):
-        """[2, 3, 4] -> [1, 6, 4]: merge first two dims and insert size-1."""
-        x = torch.rand(2, 3, 4, dtype=self.dtype).to("spyre")
-        y = x.view(1, 6, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [3, 1, 1, 2, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 0, 1, 2])
-
-    def test_view_split_and_insert_size1(self):
-        """[6, 4] -> [2, 3, 1, 4]: split non-stick dim and insert size-1."""
-        x = torch.rand(6, 4, dtype=self.dtype).to("spyre")
-        y = x.view(2, 3, 1, 4)
-        stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 1, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [2, 3, 0, 1, 3])
-
-    # --- View layout: rejection cases ---
-
-    def test_view_reject_nm_complex(self):
-        """[4, 6] -> [3, 8]: N:M group (2 old, 2 new) should fail."""
-        x = torch.rand(4, 6, dtype=self.dtype).to("spyre")
-        with self.assertRaisesRegex(RuntimeError, "N:M dimension groups"):
-            x.view(3, 8)
-
-    def test_view_reject_stick_split_too_small(self):
-        """[512] -> [16, 32]: innermost new dim (32) < elems_per_stick (64)."""
-        x = torch.rand(512, dtype=self.dtype).to("spyre")
-        with self.assertRaisesRegex(RuntimeError, "elems_per_stick"):
-            x.view(16, 32)
 
     def test_uniform_(self):
         x_spyre = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype, device="spyre")
@@ -759,7 +622,7 @@ class TestOps(TestCase):
         )
 
     # NOTE: embedding / indirect indexing / index_select are not supported yet
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding(self):
         # an embedding matrix containing 10 tensors of size 3
         embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
@@ -773,7 +636,89 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_tensor(self):
+        """Test aten.isin.Tensor_Tensor: both inputs are tensors."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = torch.tensor([2, 4], dtype=torch.int64)
+        expected = torch.isin(elements, test_elements)
+
+        elements_spyre = elements.to("spyre")
+        test_elements_spyre = test_elements.to("spyre")
+        actual = torch.isin(elements_spyre, test_elements_spyre).cpu()
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_tensor_out(self):
+        """Test aten.isin.Tensor_Tensor_out: out-variant."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = torch.tensor([2, 4], dtype=torch.int64)
+        out_cpu = torch.empty(elements.shape, dtype=torch.bool)
+        torch.isin(elements, test_elements, out=out_cpu)
+
+        elements_spyre = elements.to("spyre")
+        test_elements_spyre = test_elements.to("spyre")
+        out_spyre = torch.empty(elements.shape, dtype=torch.bool, device="spyre")
+        torch.isin(elements_spyre, test_elements_spyre, out=out_spyre)
+
+        torch.testing.assert_close(out_spyre.cpu(), out_cpu)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_scalar(self):
+        """Test aten.isin.Tensor_Scalar: test_elements is a scalar."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = 3
+        expected = torch.isin(elements, test_elements)
+
+        elements_spyre = elements.to("spyre")
+        actual = torch.isin(elements_spyre, test_elements).cpu()
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_tensor_scalar_out(self):
+        """Test aten.isin.Tensor_Scalar_out: test_elements is a scalar, out-variant."""
+        elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        test_elements = 3
+        out_cpu = torch.empty(elements.shape, dtype=torch.bool)
+        torch.isin(elements, test_elements, out=out_cpu)
+
+        elements_spyre = elements.to("spyre")
+        out_spyre = torch.empty(elements.shape, dtype=torch.bool, device="spyre")
+        torch.isin(elements_spyre, test_elements, out=out_spyre)
+
+        torch.testing.assert_close(out_spyre.cpu(), out_cpu)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_scalar_tensor(self):
+        """Test aten.isin.Scalar_Tensor: elements is a scalar."""
+        elements = 3
+        test_elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        expected = torch.isin(elements, test_elements)
+
+        test_elements_spyre = test_elements.to("spyre")
+        actual = torch.isin(elements, test_elements_spyre).cpu()
+
+        # Compare boolean values (scalar tensor shape may differ due to Spyre backend)
+        self.assertEqual(actual.item(), expected.item())
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_isin_scalar_tensor_out(self):
+        """Test aten.isin.Scalar_Tensor_out: elements is a scalar, out-variant."""
+        elements = 3
+        test_elements = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
+        out_cpu = torch.empty(0, dtype=torch.bool)
+        torch.isin(elements, test_elements, out=out_cpu)
+
+        test_elements_spyre = test_elements.to("spyre")
+        out_spyre = torch.empty((), dtype=torch.bool, device="spyre")
+        torch.isin(elements, test_elements_spyre, out=out_spyre)
+
+        # Compare boolean values (scalar tensor shape may differ due to Spyre backend)
+        self.assertEqual(out_spyre.cpu().item(), out_cpu.item())
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_embedding_with_padding_idx(self):
         # an embedding matrix containing 10 tensors of size 3
         embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
@@ -788,6 +733,34 @@ class TestOps(TestCase):
         ).to("cpu")
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_2d_no_bias(self):
+        x = torch.randn(67, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=False, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_2d_bias(self):
+        x = torch.randn(67, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=True, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_3d_no_bias(self):
+        x = torch.randn(3, 17, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=False, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
+
+    def test_linear_3d_bias(self):
+        x = torch.randn(3, 17, 256, dtype=self.dtype)
+        layer = torch.nn.Linear(256, 128, bias=True, dtype=self.dtype)
+        expected = layer(x)
+        actual = layer.to("spyre")(x.to("spyre")).cpu()
+        torch.testing.assert_close(expected, actual, rtol=self.rtol, atol=self.atol)
 
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):

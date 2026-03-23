@@ -52,9 +52,9 @@ def generate_and_register_wrappers(codegen_dir: Union[str, Path]):
     templates_path = codegen_path / "templates"
 
     print(os.getcwd())
-    base_body_path = codegen_path.parent / "torch_spyre" / "ops.py"
+    base_body_path = codegen_path.parent / "torch_spyre" / "ops" / "eager.py"
 
-    # Use torch_spyre/ops.py as the base file
+    # Use torch_spyre/ops/eager.py as the base file
     with base_body_path.open("r") as f:
         body_content = f.read()
 
@@ -110,7 +110,7 @@ def generate_and_register_wrappers(codegen_dir: Union[str, Path]):
     new_imports = "from typing import Optional, Any, List"
     target_index = None
     for i, line in enumerate(header_lines):
-        if "import torch_spyre.fallbacks" in line:
+        if "import torch_spyre.ops.fallbacks" in line:
             target_index = i
             break
     if target_index is not None:

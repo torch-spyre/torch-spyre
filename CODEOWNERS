@@ -8,4 +8,30 @@
 #  https://help.github.com/en/articles/about-code-owners
 #
 
-*  @ani300 @dgrove-oss @JRosenkranz @tardieu @avery-blanchard
+# Default owners (fallback for anything not matched below)
+*  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy @elpidatz
+
+# Inductor / compiler backend
+/torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
+
+# Device, execution, memory, and C++ runtime
+/torch_spyre/device/     @JRosenkranz @thoangtrvn
+/torch_spyre/execution/  @JRosenkranz @thoangtrvn
+/torch_spyre/memory/     @JRosenkranz @thoangtrvn
+/torch_spyre/csrc/       @JRosenkranz @thoangtrvn
+
+# Operations (eager ops and fallbacks)
+/torch_spyre/ops/        @ani300 @moriohara @pradghos
+/codegen/                @ani300 @moriohara @pradghos
+
+# Tests
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos
+
+# Documentation
+/docs/                   @kaoutar55 @dgrove-oss
+
+# CI/CD
+/.github/                 @ashokponkumar
+/.pre-commit-config.yaml  @ashokponkumar
+/pytest.ini               @ashokponkumar
+/pytest_models.ini        @ashokponkumar

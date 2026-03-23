@@ -37,8 +37,10 @@ def extract_scalar_arg_names(schema_string: str) -> List[str]:
     # Pattern: Scalar (optionally ?) followed by whitespace and name
     pattern = r"Scalar\??[\s]+([a-zA-Z_][a-zA-Z0-9_]*)"
     all_scalar_names = re.findall(pattern, args_str)
-    # Filter out alpha and beta
-    return [name for name in all_scalar_names if name not in ["alpha", "beta"]]
+    # Filter out alpha, beta, and exponent to allow upstream decompositions
+    return [
+        name for name in all_scalar_names if name not in ["alpha", "beta", "exponent"]
+    ]
 
 
 def get_args_with_default_vals(schema_string):

@@ -2,7 +2,7 @@
 
 In this document we discuss the rationale for Spyre tensor layouts, the
 specifics, and their relationship with PyTorch tensor layouts. This document
-complements the [Tiled Tensor RFC](../RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md)
+complements the [Tiled Tensor RFC](https://github.com/torch-spyre/rfcs/blob/main/0047-TiledTensors/0047-TiledTensorsRFC.md)
 by describing the specific device memory layouts and related APIs used for Tensors in Torch-Spyre.
 
 ## PyTorch Tensor Layouts

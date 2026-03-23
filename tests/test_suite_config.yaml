@@ -1,0 +1,62 @@
+test_suite_config:
+  files:
+    - path: ${PYTORCH}/test/test_binary_ufuncs.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestBinaryUfuncs::test_scalar_support
+            - TestBinaryUfuncs::test_contig_vs_transposed
+          mode: xfail
+          tags:
+            - model_1
+            - model_2
+          edits:
+            ops:
+              include:
+                - name: add
+                  description: inject add — binary_ufuncs_with_references excludes it if ref is None
+              exclude:
+                - name: gcd
+                  description: gcd causes buffer alignment errors for this test
+            dtypes:
+              include:
+                - name: float32
+              exclude:
+                - name: bfloat16
+                  description: bfloat16 unsupported on Spyre for this test
+
+        # Single test — name as a list with one entry (or plain string, both accepted)
+        - names:
+            - TestBinaryUfuncs::test_add
+          mode: mandatory_success
+          tags:
+            - tag_for_add
+
+    - path: ${PYTORCH}/test/test_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestCommon::test_compare_cpu
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: float32
+                  description: corrupted double-linked list
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: int64
+    supported_ops:
+      - name: add
+        dtypes:
+          - name: float16
+            precision:
+              atol: 1e-3
+              rtol: 1e-3
+          - name: int64
+      - name: mul
+      - name: sub
+      - name: gcd
+        force_xfail: true
