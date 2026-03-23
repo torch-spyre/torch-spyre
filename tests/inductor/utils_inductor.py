@@ -393,7 +393,7 @@ def _to_cpu(result, device):
         return result
 
 
-def _compile_and_run(fn, args, device, backend=None, needs_device=False):
+def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile=True):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     device = torch.device(device) if isinstance(device, str) else device
@@ -402,10 +402,16 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False):
     ]
     device_kwargs = {"device": device} if needs_device else {}
 
-    if backend:
-        result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+    if compile:
+        if backend:
+            result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+        else:
+            result = torch.compile(fn)(*device_args, **device_kwargs)
     else:
-        result = torch.compile(fn)(*device_args, **device_kwargs)
+        result = fn(*device_args, **device_kwargs)
+
+    if isinstance(result, (int, float)):
+        return result
 
     return _to_cpu(result, device)
 
@@ -446,28 +452,36 @@ def compare_with_cpu(
     needs_device=False,
     cpu_compile=True,
     target=None,
+    run_eager=True,
 ):
-    """Compare compiled Spyre execution against uncompiled (and optionally compiled) CPU execution."""
+    """Compare Spyre execution (compiled and optionally eager) against CPU execution."""
     cpu_result = fn(*args)
 
-    # compiled spyre execution
-    if target is None:
-        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
-
-    _assert_results_close(target, cpu_result, atol, rtol, "compiled spyre <-> cpu")
-
-    # compiled cpu execution
-    if cpu_compile:
-        cpu_compiled_result = _compile_and_run(
-            fn, args, "cpu", needs_device=needs_device
+    for compiled in [True, False] if run_eager else [True]:
+        mode = "compiled" if compiled else "eager"
+        spyre_result = (
+            target
+            if target is not None
+            else _compile_and_run(
+                fn, args, DEVICE, needs_device=needs_device, compile=compiled
+            )
         )
+
         _assert_results_close(
-            target,
-            cpu_compiled_result,
-            atol,
-            rtol,
-            "compiled spyre <-> compiled cpu",
+            spyre_result, cpu_result, atol, rtol, f"{mode} spyre <-> cpu"
         )
+
+        if cpu_compile:
+            cpu_other_result = _compile_and_run(
+                fn, args, "cpu", needs_device=needs_device, compile=compiled
+            )
+            _assert_results_close(
+                spyre_result,
+                cpu_other_result,
+                atol,
+                rtol,
+                f"{mode} spyre <-> {mode} cpu",
+            )
 
 
 def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None):
