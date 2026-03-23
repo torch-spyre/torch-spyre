@@ -402,10 +402,13 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
     ]
     device_kwargs = {"device": device} if needs_device else {}
 
-    if backend:
-        result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+    if compile:
+        if backend:
+            result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+        else:
+            result = torch.compile(fn)(*device_args, **device_kwargs)
     else:
-        result = torch.compile(fn)(*device_args, **device_kwargs)
+        result = fn(*device_args, **device_kwargs)
 
     if isinstance(result, (int, float)):
         return result

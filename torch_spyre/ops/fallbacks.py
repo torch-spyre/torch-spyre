@@ -272,4 +272,3 @@ def spyre__tril(input, diagonal=0, **kwargs):
 @register_fallback([aten.triu.default, aten.triu.out])
 def spyre__triu(input, diagonal=0, **kwargs):
     return torch.triu(input, diagonal, **kwargs)
-
