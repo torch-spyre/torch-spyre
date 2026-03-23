@@ -1341,6 +1341,97 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_sdpa", "test_sdpa_cpu"): {
+            "param_sets": {
+                "mha_prefill": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    False,
+                    False,
+                ),
+                "mha_prefill_causal": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    True,
+                    False,
+                ),
+                "mha_prefill_mask": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    torch.triu(
+                        torch.ones((256, 256), dtype=torch.float16) * -float("inf"),
+                        diagonal=1,
+                    ),
+                    False,
+                    False,
+                ),
+                # TODO(aviros): Implement expand
+                # "gqa_prefill": (
+                #     cached_randn(
+                #         (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                #     ),
+                #     False,
+                #     True,
+                # ),
+                # TODO(aviros): Implement broadcast for batch dim in batch matmul
+                # "mha_decode": (
+                #     cached_randn(
+                #         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
+                #     ),
+                #     False,
+                #     False,
+                # ),
+                # TODO(aviros): Implement broadcast for batch dim in batch matmul, expand
+                # "gqa_decode": (
+                #     cached_randn(
+                #         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
+                #     ),
+                #     cached_randn(
+                #         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
+                #     ),
+                #     False,
+                #     True,
+                # ),
+            }
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1837,6 +1928,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.triu(input, diagonal)
 
         compare_with_cpu(fn, x, diagonal)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_cpu(self, q, k, v, attn_mask, is_causal, enable_gqa):
+        def fn(q, k, v, attn_mask, is_causal, enable_gqa):
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask, is_causal=is_causal, enable_gqa=enable_gqa
+            )
+
+        compare_with_cpu(fn, q, k, v, attn_mask, is_causal, enable_gqa)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):

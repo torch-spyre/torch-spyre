@@ -202,8 +202,8 @@ def ensure_default_handler(op_name):
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
-    x = V.graph.get_buffer(x.realize())
-    y = V.graph.get_buffer(y.realize())
+    x.realize()
+    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
@@ -268,8 +268,8 @@ def lower_mm(x, y):
 
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
-    x = V.graph.get_buffer(x.realize())
-    y = V.graph.get_buffer(y.realize())
+    x.realize()
+    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
