@@ -190,8 +190,10 @@ class TestSpyreModelOps(PrivateUse1TestBase):
         def to_spyre(arg):
             if isinstance(arg, list):
                 return [x.to(test_device) for x in arg]
+            elif isinstance(arg, torch.Tensor):
+                return arg.to(test_device)
             else:
-                return arg.to(device=test_device)
+                return arg
 
         test_sample = cpu_sample.transform(to_spyre)
 
