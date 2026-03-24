@@ -260,7 +260,6 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
   }
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);
-
   impl->dma_sizes = this->dma_sizes;
   impl->dma_strides = this->dma_strides;
   copy_tensor_metadata(
@@ -290,8 +289,11 @@ at::intrusive_ptr<c10::TensorImpl> SpyreTensorImpl::shallow_copy_and_detach(
 // storage basic operation (view) to work
 void SpyreTensorImpl::shallow_copy_from(
     const at::intrusive_ptr<at::TensorImpl>& impl) {
-  DEBUGINFO("Parent's implementation");
+  auto spyre_impl = static_cast<SpyreTensorImpl*>(impl.get());
   at::TensorImpl::shallow_copy_from(impl);
+  this->dma_sizes = spyre_impl->dma_sizes;
+  this->dma_strides = spyre_impl->dma_strides;
+  this->spyre_layout = spyre_impl->spyre_layout;
 }
 
 uint64_t get_device_size_in_bytes(SpyreTensorLayout stl) {
