@@ -18,6 +18,7 @@ import os
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
+    DeviceCopy,
     FallbackKernel,
     MultiOutput,
     Pointwise,
@@ -345,6 +346,8 @@ def core_division_planning(
                     raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
                 # Core division not supported on fallback kernels
+                pass
+            elif isinstance(n.node, DeviceCopy):
                 pass
             else:
                 logger.warning(f"unhandled node type {type(n.node)}")

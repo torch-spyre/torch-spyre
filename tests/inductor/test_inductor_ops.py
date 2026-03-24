@@ -1432,6 +1432,74 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # ),
             }
         },
+        ("test_to_dtype", "test_to_dtype_cpu"): {
+            "param_sets": {
+                # Test parameters: (src_dtype, dst_dtype, is_fallback)
+                # conversion from float16
+                "float16_to_float16": (torch.float16, torch.float16, False),
+                "float16_to_float32": (torch.float16, torch.float32, True),
+                "float16_to_float8_e4m3fn": (torch.float16, torch.float8_e4m3fn, True),
+                # TODO: Copying bool tensors to host is not working yet. See #488
+                # "float16_to_bool": (torch.float16, torch.bool, False),
+                "float16_to_int8": (torch.float16, torch.int8, True),
+                "float16_to_int64": (torch.float16, torch.int64, True),
+                # conversion from float32
+                "float32_to_float16": (torch.float32, torch.float16, True),
+                "float32_to_float32": (torch.float32, torch.float32, False),
+                "float32_to_float8_e4m3fn": (torch.float32, torch.float8_e4m3fn, True),
+                "float32_to_bool": (torch.float32, torch.bool, True),
+                "float32_to_int8": (torch.float32, torch.int8, True),
+                "float32_to_int64": (torch.float32, torch.int64, True),
+                # conversion from float8_e4m3fn
+                "float8_e4m3fn_to_float16": (torch.float8_e4m3fn, torch.float16, True),
+                "float8_e4m3fn_to_float32": (torch.float8_e4m3fn, torch.float32, True),
+                "float8_e4m3fn_to_float8_e4m3fn": (
+                    torch.float8_e4m3fn,
+                    torch.float8_e4m3fn,
+                    False,
+                ),
+                "float8_e4m3fn_to_bool": (torch.float8_e4m3fn, torch.bool, True),
+                "float8_e4m3fn_to_int8": (torch.float8_e4m3fn, torch.int8, True),
+                "float8_e4m3fn_to_int64": (torch.float8_e4m3fn, torch.int64, True),
+                # conversion from bool
+                "bool_to_float16": (torch.bool, torch.float16, False),
+                "bool_to_float32": (torch.bool, torch.float32, True),
+                "bool_to_float8_e4m3fn": (torch.bool, torch.float8_e4m3fn, True),
+                "bool_to_bool": (torch.bool, torch.bool, False),
+                "bool_to_int8": (torch.bool, torch.int8, True),
+                "bool_to_int64": (torch.bool, torch.int64, True),
+                # conversion from int8
+                "int8_to_float16": (torch.int8, torch.float16, True),
+                "int8_to_float32": (torch.int8, torch.float32, True),
+                "int8_to_float8_e4m3fn": (torch.int8, torch.float8_e4m3fn, True),
+                "int8_to_bool": (torch.int8, torch.bool, True),
+                "int8_to_int8": (torch.int8, torch.int8, False),
+                "int8_to_int64": (torch.int8, torch.int64, True),
+                # conversion from int64
+                "int64_to_float16": (torch.int64, torch.float16, True),
+                "int64_to_float32": (torch.int64, torch.float32, True),
+                "int64_to_float8_e4m3fn": (torch.int64, torch.float8_e4m3fn, True),
+                "int64_to_bool": (torch.int64, torch.bool, True),
+                "int64_to_int8": (torch.int64, torch.int8, True),
+                "int64_to_int64": (torch.int64, torch.int64, False),
+            },
+        },
+        ("test_to_dtype_chained", "test_fallback_unary_op_cpu_no_eager"): {
+            "ops_dict": {
+                "case1": lambda x: (
+                    x.to(dtype=torch.float32).exp().to(dtype=torch.float16).log()
+                ),
+                "case2": lambda x: (
+                    torch.ge(x, torch.full_like(x, 0.0)).to(dtype=torch.float16).exp()
+                ),
+            },
+            "param_sets": {
+                "1d": (cached_randn((1024,), dtype=torch.float16),),
+                "2d": (cached_randn((512, 1024), dtype=torch.float16),),
+                "3d": (cached_randn((8, 64, 1024), dtype=torch.float16),),
+                "4d": (cached_randn((2, 4, 64, 1024), dtype=torch.float16),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1486,6 +1554,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_unary_op_cpu(self, op, x):
         compare_with_cpu(op, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_fallback_unary_op_cpu_no_eager(self, op, x):
+        compare_with_cpu(op, x, run_eager=False)
 
     def test_binary_op(self, op, a, b):
         if op == torch.div:
@@ -1967,6 +2039,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return result.item()
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
+
+    def test_to_dtype_cpu(self, src_dtype, dst_dtype, is_fallback):
+        import warnings
+        from contextlib import nullcontext
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        def fn(x):
+            return x.to(dst_dtype)
+
+        if dst_dtype == torch.bool or src_dtype == torch.bool:
+            src = torch.randint(0, 2, (64,)).to(dtype=src_dtype)
+        elif src_dtype == torch.float8_e4m3fn:
+            src = torch.randint(0, 16, (64,), dtype=torch.float16).to(dtype=src_dtype)
+        else:
+            src = torch.randint(0, 64, (64,), dtype=src_dtype)
+
+        if src_dtype == torch.bool and dst_dtype == torch.float8_e4m3fn:
+            # Inductor CPU backend compilation fails for this case.
+            # See: https://github.com/pytorch/pytorch/issues/178095
+            cpu_compile = False
+        else:
+            cpu_compile = True
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", ".*Backend Spyre does not support int64.*", UserWarning
+            )
+            if is_fallback:
+                # Expect fallback warning
+                warnings.simplefilter("always", FallbackWarning)
+                ctx = pytest.warns(FallbackWarning)
+            else:
+                # Expect no warning
+                warnings.simplefilter("error")
+                ctx = nullcontext()
+
+            with ctx:
+                compare_with_cpu(
+                    fn,
+                    src,
+                    atol=0.0,
+                    rtol=0.0,
+                    cpu_compile=cpu_compile,
+                    run_eager=False,
+                )
 
 
 if __name__ == "__main__":

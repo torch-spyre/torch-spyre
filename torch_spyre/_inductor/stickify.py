@@ -27,6 +27,7 @@ from torch._inductor.ir import (
     Reduction,
     StorageBox,
     TensorBox,
+    DeviceCopy,
 )
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
@@ -42,7 +43,7 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP, DEVICE_NAME
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -411,8 +412,13 @@ def propagate_spyre_tensor_layouts(
                 ):
                     raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
-                output_layout = generic_layout(n)
-                n.node.layout = output_layout
+                if n.node.layout.get_device().type == DEVICE_NAME:
+                    output_layout = generic_layout(n)
+                    n.node.layout = output_layout
+            elif isinstance(n.node, DeviceCopy):
+                if n.node.layout.get_device().type == DEVICE_NAME:
+                    output_layout = generic_layout(n)
+                    n.node.layout = output_layout
             else:
                 logger.warning(f"unhandled node type {type(n.node)}")
         elif isinstance(n, NopKernelSchedulerNode):

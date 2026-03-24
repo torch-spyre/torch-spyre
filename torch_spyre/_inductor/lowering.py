@@ -19,12 +19,13 @@ import torch
 
 from torch._inductor.ir import Reduction, Pointwise
 import torch._inductor.lowering as lowering
+import torch._inductor.config as config
 
 from typing import Any, Callable, Union
 
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
-from torch_spyre.ops.fallbacks import fallback_ops
+from torch_spyre.ops.fallbacks import fallback_ops, warn_fallback
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
 from .errors import Unsupported
@@ -198,6 +199,24 @@ def ensure_default_handler(op_name):
     if op_name not in cls.__dict__:
         method = cls._call_default(op_name)
         setattr(cls, op_name, method)
+
+
+def cpu_fallback(op, *args, **kwargs):
+    handler = lowering.fallback_handler(op, add_to_fallback_set=False)
+    return handler(*args, **kwargs)
+
+
+def to_device(x, device):
+    # Suppress noisy DeviceCopy warnings. Comprehensive fallback warning shown separately.
+    # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/_inductor/ir.py#L7457
+    old = config.developer_warnings
+    if old:
+        config.developer_warnings = False
+    try:
+        return lowering.to_device(x, device)
+    finally:
+        if old:
+            config.developer_warnings = old
 
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
@@ -553,3 +572,27 @@ def clone(x, *, memory_format=None):
         result.realize()
         result.freeze_layout_with_stride_order(stride_order)
     return result
+
+
+@register_spyre_lowering(
+    torch.ops.prims.convert_element_type.default,
+    type_promotion_kind=None,
+)
+def lower_convert_element_type(x, dst_dtype):
+    op = torch.ops.prims.convert_element_type.default
+
+    src_dtype = x.get_dtype()
+    supported_conversions = {
+        (torch.float16, torch.bool),
+        (torch.bool, torch.float16),
+    }
+    if src_dtype == dst_dtype or (src_dtype, dst_dtype) in supported_conversions:
+        # Use the original lowering
+        return lowering.to_dtype(x, dst_dtype, copy=True)
+
+    # Fallback to the CPU
+    warn_fallback(f"conversion from {src_dtype} to {dst_dtype}")
+
+    tmp = to_device(x, torch.device("cpu"))
+    out = cpu_fallback(op, tmp, dst_dtype)
+    return to_device(out, x.get_device())
