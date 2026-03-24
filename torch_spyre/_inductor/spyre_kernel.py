@@ -27,7 +27,6 @@ from torch._inductor.codegen.common import (
     Kernel,
 )
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
-from torch._inductor.codegen.simd import SIMDKernel
 from torch._inductor.utils import IndentedBuffer, sympy_subs
 from torch._inductor.virtualized import V
 
@@ -40,11 +39,7 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import (
-    is_wildcard,
-    map_dims_to_vars,
-    wildcard_symbol,
-)
+from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol, iteration_space
 from .views import compute_coordinates
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
@@ -263,7 +258,7 @@ class SpyreOpFuncs:
 
 class SpyreKernelOpsHandler(DefaultHandler):
     """
-    This class plays the same role for SpyreKernel as common.CSEProxy does for SIMDKernel and Kernel.
+    This class plays the same role for SpyreKernel as common.CSEProxy does for Kernel.
     """
 
     name = "SpyreKernelOpsHandler"
@@ -378,15 +373,11 @@ def create_op_spec(
     )
 
 
-class SpyreKernel(SIMDKernel[CSEVariable]):
+class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
-    def __init__(
-        self,
-        tiling: dict[str, sympy.Expr],
-        **kwargs,
-    ) -> None:
-        super().__init__(tiling, **kwargs)
+    def __init__(self) -> None:
+        super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
 
@@ -404,7 +395,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
-            self.var_ranges(),
+            iteration_space(self.current_node),
             tensor.index,
         )
         tensor_arg = TensorArg(
@@ -695,7 +686,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         Return the iteration space implied by the tensor access
         """
-        var_ranges = self.var_ranges()
+        var_ranges = iteration_space(self.current_node)
         if var_ranges:
             dim_map = map_dims_to_vars(access.layout, access.index)
             return [
