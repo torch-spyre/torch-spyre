@@ -704,6 +704,12 @@ class SpyreKernel(Kernel[CSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        def sympy_str(x: sympy.Expr) -> str:
+            if isinstance(x, int) or isinstance(x, sympy.Integer):
+                return str(x)
+            else:
+                return "sympify('" + str(x) + "')"
+
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
@@ -734,11 +740,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                             "iteration_space_dict={"
                             + ", ".join(
                                 [
-                                    "sympify('"
-                                    + str(k)
-                                    + "'): (sympify('"
-                                    + str(v[0])
-                                    + "'), "
+                                    sympy_str(k)
+                                    + ": ("
+                                    + sympy_str(v[0])
+                                    + ", "
                                     + str(v[1])
                                     + ")"
                                     for k, v in op_spec.iteration_space_dict.items()
@@ -760,7 +765,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                                         "device_coordinates=["
                                         + ", ".join(
                                             [
-                                                "sympify('" + str(e) + "')"
+                                                sympy_str(e)
                                                 for e in arg.device_coordinates
                                             ]
                                         )
