@@ -22,7 +22,9 @@ permissions:
 jobs:
   test:
     name: Run Spyre unit tests
-    runs-on: official-aiu-x86-64-arc-runner-set-v1
+    # runs-on: official-aiu-x86-64-arc-runner-set-v1
+    # runs-on: official-aiu-x86-64-arc-runner-set-v2
+    runs-on: official-aiu-x86-64-arc-runner-set-v3
     # increase timeout to 12 hours
     timeout-minutes: 720
     # env: {}
@@ -36,6 +38,7 @@ jobs:
           ls -la
           whoami
           id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
           echo "PATH $PATH"
           echo "HOME $HOME"
           python3 --version
