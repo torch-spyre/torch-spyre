@@ -46,11 +46,11 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
 
 
 def wildcard_symbol(dim) -> Symbol:
-    return sympy.Symbol(f"*_{dim}")
+    return sympy.Symbol(f"wc_{dim}")
 
 
 def is_wildcard(s: Symbol) -> bool:
-    return s.name.startswith("*_")
+    return s.name.startswith("wc_")
 
 
 # @deprecated("switch to _coordinates")

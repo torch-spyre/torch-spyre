@@ -732,7 +732,18 @@ class SpyreKernel(Kernel[CSEVariable]):
                         buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
                         buf.writeline(
                             "iteration_space_dict={"
-                            + f"{', '.join([sympy.srepr(k) + ': (' + sympy.srepr(v[0]) + ', ' + str(v[1]) + ')' for k, v in op_spec.iteration_space_dict.items()])}"
+                            + ", ".join(
+                                [
+                                    "sympify('"
+                                    + str(k)
+                                    + "'): (sympify('"
+                                    + str(v[0])
+                                    + "'), "
+                                    + str(v[1])
+                                    + ")"
+                                    for k, v in op_spec.iteration_space_dict.items()
+                                ]
+                            )
                             + "},"
                         )
                         buf.writeline(f"op_info={op_spec.op_info!r},")
@@ -746,10 +757,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                                     )
                                     buf.writeline(f"device_size={arg.device_size},")
                                     buf.writeline(
-                                        f"# device_coordinates: {arg.device_coordinates}"
-                                    )
-                                    buf.writeline(
-                                        f"device_coordinates=[{', '.join([sympy.srepr(e) for e in arg.device_coordinates])}],"
+                                        "device_coordinates=["
+                                        + ", ".join(
+                                            [
+                                                "sympify('" + str(e) + "')"
+                                                for e in arg.device_coordinates
+                                            ]
+                                        )
+                                        + "],"
                                     )
                                     buf.writeline(
                                         f"allocation={arg.allocation!r}, dtype={arg.dtype!r}, it_dim_map={arg.it_dim_map!r}, "
