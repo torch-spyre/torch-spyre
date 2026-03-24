@@ -69,7 +69,7 @@ class OpSpec:
     is_reduction: bool
     # @deprecated("switching to dictionary")
     iteration_space: list[int]
-    iteration_space_dict: dict[Symbol, Expr]
+    iteration_space_dict: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
 
