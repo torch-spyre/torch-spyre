@@ -79,6 +79,14 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
   return dim_map;
 }
 
+std::vector<int32_t> generic_stick_dim_order(int32_t num_dims) {
+  std::vector<int32_t> dim_order;
+  for (int32_t i = 0; i < num_dims; i++) {
+    dim_order.push_back(i);
+  }
+  return dim_order;
+}
+
 std::optional<int32_t> SpyreTensorLayout::host_stick_dim() {
   int32_t stick_dim = this->dim_map.back();
   if (stick_dim == -1) {
@@ -125,14 +133,13 @@ static std::vector<int64_t> dim_map_to_stride_map(
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
-  std::vector<int32_t> dim_order;
-  for (int32_t i = 0; i < host_dims; i++) {
-    dim_order.push_back(i);
-  }
-  init(host_size, dtype, dim_order);
+  auto host_strides = compute_host_stride(host_size);
+  auto dim_order = generic_stick_dim_order(host_dims);
+  init(host_size, host_strides, dtype, dim_order);
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
+                             std::vector<int64_t> host_strides,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order) {
   TORCH_CHECK((host_size.size() == dim_order.size()) ||
@@ -179,9 +186,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] = host_size[dim];
     }
   }
-  this->stride_map =
-      dim_map_to_stride_map(this->dim_map, host_size,
-                            compute_host_stride(host_size), this->device_size);
+  this->stride_map = dim_map_to_stride_map(this->dim_map, host_size,
+                                           host_strides, this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {

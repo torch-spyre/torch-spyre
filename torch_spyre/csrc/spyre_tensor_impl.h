@@ -29,6 +29,7 @@
 namespace spyre {
 
 int64_t elems_per_stick(const DataFormats& df);
+std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
 
 class SpyreTensorLayout {
  public:
@@ -70,14 +71,15 @@ class SpyreTensorLayout {
   }
 
   /**
-   * Construct a SpyreTensorLayout for the argument host_size
+   * Construct a SpyreTensorLayout for the argument host_size and host_strides
    * with the given order of dimensions in decreasing stride order
    * using the default device memory layout.
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
-  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype,
+  SpyreTensorLayout(std::vector<int64_t> host_size,
+                    std::vector<int64_t> host_strides, c10::ScalarType dtype,
                     std::vector<int32_t> dim_order) {
-    init(host_size, dtype, dim_order);
+    init(host_size, host_strides, dtype, dim_order);
   }
 
   /**
@@ -97,8 +99,8 @@ class SpyreTensorLayout {
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
-  void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
-            std::vector<int32_t> dim_order);
+  void init(std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
+            c10::ScalarType dtype, std::vector<int32_t> dim_order);
 
   std::string toString() const;
 

@@ -512,7 +512,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice());
   DEBUGINFO("Tensor info on CPU (Size:", size, ", Stride: ", stride,
             ", dtype: ", dtype, ") to be mapped onto device ", device);
-  auto device_layout = SpyreTensorLayout(size.vec(), scalar_type);
+  auto device_layout = SpyreTensorLayout(size.vec(), stride.vec(), scalar_type,
+                                         generic_stick_dim_order(size.size()));
   size_t size_bytes = get_device_size_in_bytes(device_layout);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(

@@ -52,12 +52,12 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.host_stick_dim(), 2)
 
     def test_dim_order(self):
-        stl = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
+        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(stl.device_size, [8, 256, 64])
         self.assertEqual(stl.dim_map, [0, 1, 0])
         self.assertEqual(stl.host_stick_dim(), 0)
 
-        stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
+        stl = SpyreTensorLayout([512, 8, 256], [4096, 256, 1], torch.float16, [2, 1, 0])
         self.assertEqual(stl.device_size, [8, 8, 256, 64])
         self.assertEqual(stl.dim_map, [1, 0, 2, 0])
         self.assertEqual(stl.host_stick_dim(), 0)
@@ -72,7 +72,7 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl_x.device_size, stl_y.device_size)
 
     def test_sparse_dim_order(self):
-        stl = SpyreTensorLayout([512, 256], torch.float16, [0, 1, -1])
+        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1, -1])
         self.assertEqual(stl.device_size, [256, 1, 512, 64])
         self.assertEqual(stl.dim_map, [1, -1, 0, -1])
         self.assertEqual(stl.host_stick_dim(), None)
@@ -92,8 +92,8 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_equality(self):
         x = SpyreTensorLayout([512, 256], torch.float16)
-        y = SpyreTensorLayout([512, 256], torch.float16, [0, 1])
-        z = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
+        y = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1])
+        z = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(x, y)
         self.assertNotEqual(y, z)
 
@@ -111,12 +111,14 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(y, y_dev.cpu())
 
         z = torch.rand([512, 8, 256], dtype=torch.float16)
-        z_stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
+        z_stl = SpyreTensorLayout(
+            [512, 8, 256], [4096, 256, 1], torch.float16, [2, 1, 0]
+        )
         z_dev = to_with_layout(z, z_stl)
         self.assertEqual(z_dev, z_dev.cpu())
 
         w = torch.rand([512, 256], dtype=torch.float16)
-        w_stl = SpyreTensorLayout([512, 256], torch.float16, [0, 1, -1])
+        w_stl = SpyreTensorLayout([512, 256], [4096, 256, 1], torch.float16, [0, 1, -1])
         w_dev = to_with_layout(w, w_stl)
         self.assertEqual(w, w_dev.cpu())
 
@@ -130,7 +132,9 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.dim_map, [1, 0, 1])
 
     def test_empty_layout_patched(self):
-        x_stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
+        x_stl = SpyreTensorLayout(
+            [512, 8, 256], [4096, 256, 1], torch.float16, [2, 1, 0]
+        )
         x = torch.empty((512, 8, 256), device_layout=x_stl, dtype=torch.float16)
         stl = x.device_tensor_layout()
         self.assertEqual(stl.device_size, [8, 8, 256, 64])
@@ -138,7 +142,7 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_to_sparse_layout_patched(self):
         x = torch.rand([512, 256], dtype=torch.float16)
-        x_stl = SpyreTensorLayout([512, 256], torch.float16, [0, 1, -1])
+        x_stl = SpyreTensorLayout([512, 256], [4096, 128, 1], torch.float16, [0, 1, -1])
         x_dev = x.to("spyre", device_layout=x_stl)
         self.assertEqual(x, x_dev.cpu())
         self.assertEqual(x_stl.device_size, [256, 1, 512, 64])
@@ -149,8 +153,8 @@ class TestSpyreTensorLayout(TestCase):
         x = torch.rand(3, 2, 2048, dtype=torch.float16)
         y = torch.rand(3, 2, 2048, dtype=torch.float16)
         cpu_result = x + y  # linter won't allow lambdas
-        x_stl = SpyreTensorLayout(x.size(), torch.float16, [1, 0, 2])
-        y_stl = SpyreTensorLayout(x.size(), torch.float16, [0, 1, 2])
+        x_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0, 2])
+        y_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [0, 1, 2])
         _ = x.to("spyre")  # required for lazy device initialization
         x_dev = to_with_layout(x, x_stl)
         y_dev = to_with_layout(y, y_stl)
@@ -169,8 +173,8 @@ class TestSpyreTensorLayout(TestCase):
         """
         x = torch.rand(3, 2, 2048, dtype=torch.float16)
         y = torch.rand(3, 2, 2048, dtype=torch.float16)
-        x_stl = SpyreTensorLayout(x.size(), torch.float16, [1, 0, 2])
-        y_stl = SpyreTensorLayout(x.size(), torch.float16, [2, 1, 0])
+        x_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0, 2])
+        y_stl = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [2, 1, 0])
         _ = x.to("spyre")  # required for lazy device initialization
         x_dev = to_with_layout(x, x_stl)
         y_dev = to_with_layout(y, y_stl)
