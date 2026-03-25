@@ -161,6 +161,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
+                    ((2, 256, 1), (2, 1, 128)),
                 ]
             ),
         },
@@ -178,6 +179,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     # is resolved.
                     ((3, 18, 128, 256), (3, 18, 256, 128)),
                     ((2, 64, 128), (128, 16384)),
+                    ((99, 1), (1, 55)),
+                    ((2, 99, 1), (2, 1, 55)),
+                    ((2, 99, 1), (1, 55)),
+                    ((2, 3, 99, 1), (2, 3, 1, 55)),
                 ]
             ),
         },
