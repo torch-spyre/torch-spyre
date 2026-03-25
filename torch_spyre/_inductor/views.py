@@ -123,17 +123,41 @@ def compute_device_coordinates(
     return coordinates
 
 
+def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bool:
+    """
+    Return True if the set of values expr can produce (as v varies) is a subset
+    of the values coord can produce.
+
+    Handles two cases:
+    - coord == v: coord is unbounded, so any expr in v is a subset.
+    - coord == Mod(v, b) and expr == Mod(v, a) with a <= b: [0,a-1] ⊆ [0,b-1].
+    """
+    if coord == v:
+        return True
+    if (
+        isinstance(coord, sympy.Mod)
+        and isinstance(expr, sympy.Mod)
+        and coord.args[0] == v
+        and expr.args[0] == v
+    ):
+        coord_mod = coord.args[1]
+        expr_mod = expr.args[1]
+        return bool(sympy.Le(expr_mod, coord_mod))
+    return False
+
+
 def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
     """
     Given a coordinate array and an expression, determine if there is a unique
-    dimension in coords whose coordinate expression is exactly the one free variable
-    in the expression.  Return None if expr does not have exactly one free variable
-    or if there is not exactly one matching dimension in coords.
+    dimension in coords whose possible values are a superset of expr's possible
+    values (both expressed in the single free variable of expr).  Return None if
+    expr does not have exactly one free variable or if there is not exactly one
+    matching dimension in coords.
     """
     if len(expr.free_symbols) != 1:
         return None
     v = next(iter(expr.free_symbols))
-    dims = [d for d, e in enumerate(coords) if e == v]
+    dims = [d for d, e in enumerate(coords) if _is_range_subset(expr, e, v)]
     if len(dims) != 1:
         return None
     else:
