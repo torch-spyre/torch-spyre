@@ -413,7 +413,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         if hasattr(self.current_node, "op_it_space_splits"):
             core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]
 
-        it_space = {d.var: (d.numel, core_division.get(d.var, 1)) for d in dims}
+        it_space = {
+            d.var: (d.numel, core_division.get(d.var, 1))
+            for d in dims
+            if not is_wildcard(d.var)
+        }
 
         return OpSpec(
             op,
@@ -704,6 +708,12 @@ class SpyreKernel(Kernel[CSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        def sympy_str(x: sympy.Expr) -> str:
+            if isinstance(x, int) or isinstance(x, sympy.Integer):
+                return str(x)
+            else:
+                return "sympify('" + str(x) + "')"
+
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
@@ -732,7 +742,17 @@ class SpyreKernel(Kernel[CSEVariable]):
                         buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
                         buf.writeline(
                             "iteration_space_dict={"
-                            + f"{', '.join([sympy.srepr(k) + ': (' + sympy.srepr(v[0]) + ', ' + str(v[1]) + ')' for k, v in op_spec.iteration_space_dict.items()])}"
+                            + ", ".join(
+                                [
+                                    sympy_str(k)
+                                    + ": ("
+                                    + sympy_str(v[0])
+                                    + ", "
+                                    + str(v[1])
+                                    + ")"
+                                    for k, v in op_spec.iteration_space_dict.items()
+                                ]
+                            )
                             + "},"
                         )
                         buf.writeline(f"op_info={op_spec.op_info!r},")
@@ -746,10 +766,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                                     )
                                     buf.writeline(f"device_size={arg.device_size},")
                                     buf.writeline(
-                                        f"# device_coordinates: {arg.device_coordinates}"
-                                    )
-                                    buf.writeline(
-                                        f"device_coordinates=[{', '.join([sympy.srepr(e) for e in arg.device_coordinates])}],"
+                                        "device_coordinates=["
+                                        + ", ".join(
+                                            [
+                                                sympy_str(e)
+                                                for e in arg.device_coordinates
+                                            ]
+                                        )
+                                        + "],"
                                     )
                                     buf.writeline(
                                         f"allocation={arg.allocation!r}, dtype={arg.dtype!r}, it_dim_map={arg.it_dim_map!r}, "
