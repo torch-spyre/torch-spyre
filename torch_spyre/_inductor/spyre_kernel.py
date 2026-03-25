@@ -413,7 +413,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         if hasattr(self.current_node, "op_it_space_splits"):
             core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]
 
-        it_space = {d.var: (d.numel, core_division.get(d.var, 1)) for d in dims}
+        it_space = {
+            d.var: (d.numel, core_division.get(d.var, 1))
+            for d in dims
+            if not is_wildcard(d.var)
+        }
 
         return OpSpec(
             op,
