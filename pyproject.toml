@@ -54,7 +54,6 @@ test = [
     "pytest~=9.0.0",
 #    "torch_sendnn", # must be installed manually
     "transformers~=5.3.0",
-    "accelerate~=1.13.0"
 ]
 lint = [
     "mypy~=1.13.0",
