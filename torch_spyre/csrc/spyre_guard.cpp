@@ -18,6 +18,7 @@
 
 #include <ATen/core/op_registration/adaption.h>
 
+#include "module.h"
 #include "spyre_stream.h"
 
 namespace spyre {
@@ -86,6 +87,21 @@ c10::Stream SpyreGuardImpl::exchangeStream(c10::Stream stream) const {
 
 void SpyreGuardImpl::recordDataPtrOnStream(const c10::DataPtr&,
                                            const c10::Stream&) const {}
+
+c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
+    c10::Device /*unused*/) const {
+  c10::DeviceCapability cap{};
+
+  cap.capability_data.capability_bits =
+      (1ULL << c10::kIndex_Float) | (1ULL << c10::kIndex_Half) |
+      (1ULL << c10::kIndex_Bool) | (1ULL << c10::kIndex_Char) |
+      (1ULL << c10::kIndex_Byte) | (1ULL << c10::kIndex_Short) |
+      (1ULL << c10::kIndex_Int4) | (1ULL << c10::kIndex_BFloat16) |
+      (1ULL << c10::kIndex_Float8_e4m3fn) |
+      (1ULL << c10::kIndex_Float8_e5m2fnuz);
+
+  return cap;
+}
 
 thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = 0;
 
