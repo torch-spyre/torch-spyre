@@ -19,22 +19,6 @@ import sympy
 from typing import Optional, Sequence
 
 
-def compute_relative_stride(
-    rank: int, device_size: Sequence[sympy.Expr], dim_map: Sequence[int]
-) -> list[sympy.Expr]:
-    """
-    Compute strides of device dimensions with respect to host dimensions
-    """
-    acc = [sympy.S.One] * rank
-    rel_stride = [-1] * len(dim_map)
-    for device_dim in range(len(dim_map) - 1, -1, -1):
-        dim = dim_map[device_dim]
-        if dim != -1:
-            rel_stride[device_dim] = acc[dim]
-            acc[dim] *= device_size[device_dim]
-    return rel_stride
-
-
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -92,35 +76,6 @@ def compute_coordinates(
             )
         else:
             coordinates[primary_dim] += var * step // primary_stride
-    return coordinates
-
-
-# deprecated: replace with compute_coordinates with stride_map
-def compute_device_coordinates(
-    size: Sequence[sympy.Expr],
-    stride: Sequence[sympy.Expr],
-    device_size: Sequence[sympy.Expr],
-    dim_map: Sequence[int],
-    var_ranges: dict[sympy.Symbol, sympy.Expr],
-    index: sympy.Expr,
-) -> list[sympy.Expr]:
-    """
-    Derive an array of coordinate expressions into a device tensor from an index
-    """
-    rel_stride = compute_relative_stride(len(size), device_size, dim_map)
-    host_coordinates = compute_coordinates(size, stride, var_ranges, index)
-    coordinates = [sympy.S.Zero] * len(device_size)
-    for dim in range(len(device_size)):
-        if dim_map[dim] == -1:
-            continue
-        expr = host_coordinates[dim_map[dim]]
-        vars = expr.free_symbols
-        for var in vars:
-            term = expr.subs({v: 0 for v in vars - {var}})
-            step = term.subs(var, 1)
-            limit = term.subs(var, var_ranges[var])
-            if limit > rel_stride[dim] and step < rel_stride[dim] * device_size[dim]:
-                coordinates[dim] += term // rel_stride[dim]
     return coordinates
 
 
