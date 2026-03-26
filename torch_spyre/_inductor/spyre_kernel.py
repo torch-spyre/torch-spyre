@@ -458,9 +458,15 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(True, value.name, value),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
-            in_stick_vars = args[0].device_coordinates[-1].free_symbols
-            out_stick_vars = args[1].device_coordinates[-1].free_symbols
-            op = RESTICKIFY_OP if in_stick_vars != out_stick_vars else IDENTITY_OP
+            in_coords = args[0].device_coordinates
+            out_coords = args[1].device_coordinates
+            if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+                # Broadcast: scalar input expanding to non-scalar output.
+                op = IDENTITY_OP
+            elif in_coords[-1].free_symbols == out_coords[-1].free_symbols:
+                op = RESTICKIFY_OP
+            else:
+                op = IDENTITY_OP
             op_spec = self.create_op_spec(op, False, args, op_info)
             self.op_specs.append(op_spec)
         else:
@@ -548,7 +554,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                     else:
                         logger.debug(
                             f"op_spec: {op_spec.op}, is_reduction={op_spec.is_reduction}, "
-                            f"iteration_space_dict={op_spec.iteration_space_dict}, op_info={op_spec.op_info}"
+                            f"iteration_space={op_spec.iteration_space}, op_info={op_spec.op_info}"
                         )
 
                 if isinstance(op_spec, UnimplementedOp):
@@ -559,7 +565,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                         buf.writeline(f"op='{op_spec.op}',")
                         buf.writeline(f"is_reduction={op_spec.is_reduction},")
                         buf.writeline(
-                            "iteration_space_dict={"
+                            "iteration_space={"
                             + ", ".join(
                                 [
                                     sympy_str(k)
@@ -568,7 +574,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                                     + ", "
                                     + str(v[1])
                                     + ")"
-                                    for k, v in op_spec.iteration_space_dict.items()
+                                    for k, v in op_spec.iteration_space.items()
                                 ]
                             )
                             + "},"
@@ -611,7 +617,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
 def simplify_op_spec(op_spec):
     new_op_space_splits, new_tensors = align_tensors(
-        op_spec.iteration_space_dict,
+        op_spec.iteration_space,
         [
             {
                 "size": arg.device_size,
@@ -620,7 +626,7 @@ def simplify_op_spec(op_spec):
             for arg in op_spec.args
         ],
     )
-    op_spec.iteration_space_dict = new_op_space_splits
+    op_spec.iteration_space = new_op_space_splits
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]

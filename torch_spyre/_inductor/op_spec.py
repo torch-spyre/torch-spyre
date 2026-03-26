@@ -51,14 +51,14 @@ class OpSpec:
     Attributes:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
-        iteration_space_dict: The iteration space of the operation.
+        iteration_space: The iteration space of the operation. The values are tuples of (range, core_division).
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
     """
 
     op: str
     is_reduction: bool
-    iteration_space_dict: dict[Symbol, tuple[Expr, int]]
+    iteration_space: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
 
