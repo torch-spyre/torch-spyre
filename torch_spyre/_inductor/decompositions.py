@@ -812,6 +812,28 @@ def where_scalar_decomp(condition, self, other):
     return torch.ops.aten.where.self(condition, self_t, other_t)
 
 
+@register_spyre_decomposition([torch.ops.aten.is_nonzero.default])
+def is_nonzero_decomp(input: torch.Tensor):
+    if input.numel() != 1:
+        raise RuntimeError(
+            "RuntimeError: Boolean value of Tensor with no values is ambiguous"
+        )
+    # For bool, FP32, and integer tensors, fallback to CPU since Spyre has limitations
+    if input.dtype in (
+        torch.bool,
+        torch.float32,
+        torch.int32,
+        torch.int64,
+        torch.int16,
+        torch.int8,
+    ):
+        return input.cpu().item() != 0
+    else:
+        # FP16 and other dtypes: direct comparison
+        zero = torch.zeros_like(input)
+        return torch.ne(input, zero).item()
+
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################

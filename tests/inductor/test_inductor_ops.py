@@ -2477,6 +2477,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([2.0], dtype=torch.float16),
                     torch.tensor([3.0], dtype=torch.float16),
                 ),
+                "int_true": (torch.tensor([1], dtype=torch.int64),),
+                "int_false": (torch.tensor([0], dtype=torch.int64),),
+                "negative_true": (torch.tensor([-1.0], dtype=torch.float32),),
             },
         },
         ("test_sdpa", "test_sdpa_cpu"): {
