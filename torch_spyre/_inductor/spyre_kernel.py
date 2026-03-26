@@ -19,7 +19,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import DataFormats
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -40,7 +40,6 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import iteration_space
 from .views import compute_coordinates, align_tensors
-from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
 import logging
@@ -59,32 +58,6 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
-
-    def unsqueeze_if_sparse(self):
-        """
-        If layout is sparse, construct a new layout that unsqueezes to a dense tensor
-        """
-
-        if is_sparse(self.layout.device_layout):
-            new_size = self.layout.size + [1]
-            new_stride = self.layout.stride + [1]
-            old_stl = self.layout.device_layout
-            new_dim_map = [
-                len(self.layout.size) if d == -1 else d for d in old_stl.dim_map
-            ]
-            new_stl = SpyreTensorLayout(
-                old_stl.device_size,
-                new_dim_map,
-                old_stl.stride_map,
-                old_stl.device_dtype,
-            )
-            new_layout = FixedTiledLayout(
-                self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
-            )
-            new_layout.allocation = self.layout.allocation
-            return TensorAccess(self.name, self.index, new_layout)
-
-        return self
 
 
 @dataclass
@@ -110,12 +83,6 @@ class ReductionOp(RValue):
 @dataclass
 class UnimplementedOp(RValue):
     op: str
-
-
-@dataclass(frozen=True)
-class DimensionInfo:
-    var: sympy.Symbol
-    numel: int
 
 
 class SpyreOpFuncs:
@@ -411,7 +378,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        return TensorAccess(name, index, layout).unsqueeze_if_sparse()
+        return TensorAccess(name, index, layout)
 
     def store(
         self,
@@ -426,7 +393,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
+        dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
