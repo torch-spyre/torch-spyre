@@ -40,7 +40,7 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol, iteration_space
-from .views import compute_coordinates
+from .views import compute_coordinates, align_tensors
 from .stickify import is_sparse
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -709,6 +709,9 @@ class SpyreKernel(Kernel[CSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        for op_spec in self.op_specs:
+            simplify_op_spec(op_spec)
+
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, int) or isinstance(x, sympy.Integer):
                 return str(x)
@@ -795,3 +798,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args.extend(self.args.python_argdefs()[1])
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+
+def simplify_op_spec(op_spec):
+    new_op_space_splits, new_tensors = align_tensors(
+        op_spec.iteration_space_dict,
+        [
+            {
+                "size": arg.device_size,
+                "coordinates": arg.device_coordinates,
+            }
+            for arg in op_spec.args
+        ],
+    )
+    op_spec.iteration_space_dict = new_op_space_splits
+    for arg, t in zip(op_spec.args, new_tensors):
+        arg.device_size = t["size"]
+        arg.device_coordinates = t["coordinates"]
