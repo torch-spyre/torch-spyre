@@ -27,7 +27,7 @@ from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
 
-_SDSC_BUNDLE = _get_env_bool("SPYRE_SUPERDSC_BUNDLE")
+_SDSC_BUNDLE = _get_env_bool("SPYRE_SUPERDSC_BUNDLE", True)
 
 
 def get_output_dir(kernel_name: str):
