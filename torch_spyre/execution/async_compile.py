@@ -14,7 +14,7 @@
 
 import json
 import tempfile
-from typing import Any, Union
+from typing import Any
 import os
 import subprocess
 
@@ -41,7 +41,7 @@ class SpyreAsyncCompile:
     def __init__(self) -> None:
         pass
 
-    def sdsc(self, kernel_name: str, specs: list[Union[OpSpec | UnimplementedOp]]):
+    def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
         # 1. Generate SDSC.json for each OpSpec
         sdscs = []
         arg_mappings = []
@@ -86,15 +86,14 @@ class SpyreAsyncCompile:
         else:
             # Process each SuperDSC separately
             sdsc_dirs = []
-            for sdsc in enumerate(sdscs):
+            for sdsc in sdscs:
                 kernel_output_dir = get_output_dir(kernel_name)
                 subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
                 os.makedirs(subdir, exist_ok=True)
                 with open(os.path.join(subdir, "sdsc.json"), "w") as file:
                     logger.info(f"Generating {file.name}")
-                    json.dump(dt_sdsc, file, indent=2)
+                    json.dump(sdsc, file, indent=2)
                 sdsc_dirs.append(kernel_output_dir)
-                arg_mappings.append(arg_map)
 
             for dir in sdsc_dirs:
                 subprocess.run(["dxp_standalone", "-d", dir], check=True)
