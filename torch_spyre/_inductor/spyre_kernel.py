@@ -463,7 +463,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
                 # Broadcast: scalar input expanding to non-scalar output.
                 op = IDENTITY_OP
-            elif in_coords[-1].free_symbols == out_coords[-1].free_symbols:
+            elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
