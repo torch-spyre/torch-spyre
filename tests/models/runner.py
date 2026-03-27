@@ -358,7 +358,30 @@ def run_test(
             test_out = test_sample.input
 
     ref_out_cpu = to_device(ref_out, torch.device("cpu"))
-    assert confirm_device(test_out, device), "this result must be on spyre"
+
+    # Check if the operation explicitly specifies CPU device
+    is_cpu_operation = False
+    if op_name == "torch.to":
+        # Check if device argument for torch.to is "cpu"
+        if str(test_sample.kwargs.get("device", "")) == "cpu" or (
+            test_sample.args
+            and len(test_sample.args) > 0
+            and str(test_sample.args[0]) == "cpu"
+        ):
+            is_cpu_operation = True
+    else:
+        # Check if device kwarg is "cpu"
+        if str(test_sample.kwargs.get("device", "")) == "cpu":
+            is_cpu_operation = True
+
+    # Check if the output tensor is on expected device
+    if is_cpu_operation:
+        assert confirm_device(test_out, torch.device("cpu")), (
+            "result must be on cpu for explicit cpu operations"
+        )
+    else:
+        assert confirm_device(test_out, device), "this result must be on spyre"
+
     test_out_cpu = to_device(test_out, torch.device("cpu"))
     _assert_same(
         testCase,

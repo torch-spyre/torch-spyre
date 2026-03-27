@@ -1,0 +1,38 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - .readthedocs.yaml
+  pull_request:
+    branches: [main]
+    paths:
+      - docs/**
+      - .readthedocs.yaml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build HTML
+        run: python -m sphinx docs/source docs/build/html -W --keep-going
+        # -W turns warnings into errors; --keep-going reports all warnings before failing

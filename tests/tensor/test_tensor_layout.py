@@ -14,6 +14,9 @@
 
 # Owner(s): ["module: cpp"]
 
+import copy
+import pickle
+
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_spyre._C import (
@@ -96,6 +99,14 @@ class TestSpyreTensorLayout(TestCase):
         z = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
         self.assertEqual(x, y)
         self.assertNotEqual(y, z)
+
+    def test_stl_pickleable(self):
+        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
+        self.assertEqual(stl, pickle.loads(pickle.dumps(stl)))
+
+    def test_stl_copyable(self):
+        stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
+        self.assertEqual(stl, copy.deepcopy(stl))
 
     def test_to_spyre_layout(self):
         x = torch.rand([512, 256], dtype=torch.float16)

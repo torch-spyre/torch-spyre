@@ -15,12 +15,11 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
-from collections import Counter
 
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats, SpyreTensorLayout
+from torch_spyre._C import DataFormats
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -39,9 +38,8 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import is_wildcard, map_dims_to_vars, wildcard_symbol, iteration_space
-from .views import compute_coordinates
-from .stickify import is_sparse
+from .pass_utils import iteration_space
+from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
 import logging
@@ -60,32 +58,6 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
-
-    def unsqueeze_if_sparse(self):
-        """
-        If layout is sparse, construct a new layout that unsqueezes to a dense tensor
-        """
-
-        if is_sparse(self.layout.device_layout):
-            new_size = self.layout.size + [1]
-            new_stride = self.layout.stride + [1]
-            old_stl = self.layout.device_layout
-            new_dim_map = [
-                len(self.layout.size) if d == -1 else d for d in old_stl.dim_map
-            ]
-            new_stl = SpyreTensorLayout(
-                old_stl.device_size,
-                new_dim_map,
-                old_stl.stride_map,
-                old_stl.device_dtype,
-            )
-            new_layout = FixedTiledLayout(
-                self.layout.device, self.layout.dtype, new_size, new_stride, new_stl
-            )
-            new_layout.allocation = self.layout.allocation
-            return TensorAccess(self.name, self.index, new_layout)
-
-        return self
 
 
 @dataclass
@@ -111,12 +83,6 @@ class ReductionOp(RValue):
 @dataclass
 class UnimplementedOp(RValue):
     op: str
-
-
-@dataclass(frozen=True)
-class DimensionInfo:
-    var: sympy.Symbol
-    numel: int
 
 
 class SpyreOpFuncs:
@@ -320,23 +286,6 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
-def analyze_tensor_access(
-    op_dimensions: Sequence[DimensionInfo],
-    access: TensorAccess,
-) -> list[int]:
-    """
-    Return the scale implied by the given iteration space and indexing expression
-    """
-    dim_map = map_dims_to_vars(access.layout, access.index)
-    var_map = {v: k for k, v in dim_map.items()}
-
-    # Special case: single dimension of size 1 is not elided by inductor
-    if len(op_dimensions) == 1 and op_dimensions[0].numel == 1:
-        return [access.layout.device_layout.dim_map[0]]
-
-    return [var_map[di.var] if di.var in var_map else -1 for di in op_dimensions]
-
-
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -353,9 +302,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         return self
 
     def create_tensor_arg(
-        self, is_input: bool, name: str, tensor: TensorAccess, di: list[DimensionInfo]
+        self, is_input: bool, name: str, tensor: TensorAccess
     ) -> TensorArg:
-        scales = analyze_tensor_access(di, tensor)
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
@@ -368,10 +316,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_dtype,
             tensor.layout.device_layout.device_size,
             device_coords,
-            tensor.layout.dtype,
-            scales,
             tensor.layout.allocation,
-            tensor.layout.device_layout,
         )
         self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
@@ -380,21 +325,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         self,
         op: str,
         is_reduction: bool,
-        dims: list[DimensionInfo],
         args: Sequence[TensorArg],
         op_info: dict[str, Any],
     ) -> OpSpec:
         for arg in args:
-            if (
-                arg.device_layout.device_dtype == DataFormats.IEEE_FP32
-                and op not in SPYRE_FP32_OPS
-            ):
-                raise Unsupported(f"{op} on {arg.dtype} dtype")
-            elif arg.device_layout.device_dtype not in [
+            if arg.device_dtype == DataFormats.IEEE_FP32 and op not in SPYRE_FP32_OPS:
+                raise Unsupported(f"{op} on {arg.device_dtype}")
+            elif arg.device_dtype not in [
                 DataFormats.IEEE_FP32,
                 DataFormats.SEN169_FP16,
             ]:
-                raise Unsupported(f"operations on {arg.dtype} dtype")
+                raise Unsupported(f"operation on {arg.device_dtype}")
 
         if hasattr(self.current_node, "op_dim_splits"):
             op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
@@ -405,17 +346,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         if hasattr(self.current_node, "op_it_space_splits"):
             core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]
 
-        it_space = {
-            d.var: (d.numel, core_division.get(d.var, 1))
-            for d in dims
-            if not is_wildcard(d.var)
+        it_space = iteration_space(self.current_node)
+        it_space_extended = {
+            k: (v, core_division.get(k, 1)) for k, v in it_space.items()
         }
 
         return OpSpec(
             op,
             is_reduction,
-            [d.numel for d in dims],
-            it_space,
+            it_space_extended,
             args,
             op_info,
         )
@@ -439,7 +378,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
-        return TensorAccess(name, index, layout).unsqueeze_if_sparse()
+        return TensorAccess(name, index, layout)
 
     def store(
         self,
@@ -454,7 +393,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
+        dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         if real_dst_name != name:
             # Skip allocating an output buffer; this name is an alias to another buffer
@@ -470,75 +409,32 @@ class SpyreKernel(Kernel[CSEVariable]):
         if isinstance(value, UnimplementedOp):
             self.op_specs.append(value)
         elif isinstance(value, PointwiseOp):
-            # Pointwise compute ops are defined by the output's index
-            di = self.derive_dim_info(dst)
+            # Pointwise compute ops
             args: list[TensorArg] = []
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
-                    args.append(self.create_tensor_arg(True, input.name, input, di))
+                    args.append(self.create_tensor_arg(True, input.name, input))
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
-            args.append(self.create_tensor_arg(False, real_dst_name, dst, di))
+            args.append(self.create_tensor_arg(False, real_dst_name, dst))
             op_info.update(value.op_info)
-            self.op_specs.append(
-                self.create_op_spec(value.op, False, di, args, op_info)
-            )
+            self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
-            in_di = self.derive_dim_info(value)
-            out_di = self.derive_dim_info(dst)
-
             args = [
-                self.create_tensor_arg(True, value.name, value, in_di),
-                self.create_tensor_arg(False, real_dst_name, dst, out_di),
+                self.create_tensor_arg(True, value.name, value),
+                self.create_tensor_arg(False, real_dst_name, dst),
             ]
-            in_stl = args[0].device_layout  # type: ignore[union-attr]
-            out_stl = args[1].device_layout  # type: ignore[union-attr]
-            transposed_dims = []
-            # Determine data op based on tensor args
-            if (
-                Counter(in_stl.dim_map) == Counter(out_stl.dim_map)
-                and in_stl.device_size != out_stl.device_size
-            ) or (Counter(in_di) == Counter(out_di) and in_di != out_di):
-                # Transpose:
-                #   - check that the input / output DimensionInfo are the same, but in different order.
-                #   - check that the dim map has the same dimensions (no duplicate dimensions), but device size differs.
-                transposed_dims = [
-                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
-                ]
-                op = (
-                    RESTICKIFY_OP
-                    if in_stl.host_stick_dim() in transposed_dims
-                    else IDENTITY_OP
-                )
-
-            elif all(is_wildcard(d.var) for d in in_di) and not all(
-                is_wildcard(d.var) for d in out_di
-            ):
-                # Broadcast: scalar input (all dims wildcards) expanding to non-scalar output.
+            in_coords = args[0].device_coordinates
+            out_coords = args[1].device_coordinates
+            if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+                # Broadcast: scalar input expanding to non-scalar output.
                 op = IDENTITY_OP
-                in_di = out_di
-                args[0] = self.create_tensor_arg(True, value.name, value, in_di)
-            elif in_stl.device_size == out_stl.device_size:
-                # Clone: check that device layout is the same.
-                op = IDENTITY_OP
+            elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
+                op = RESTICKIFY_OP
             else:
-                # Unsupported data operation on TensorArg
-                raise Unsupported(f"Data operation {args[0]})=>{args[1]}")
-
-            op_spec = self.create_op_spec(op, False, out_di, args, op_info)
-            if len(transposed_dims) > 0:
-                op_spec.op_info["transposed_dims"] = [
-                    d for d in range(len(in_di)) if in_di[d] != out_di[d]
-                ]
-                # Reorder it_dim_map of the input to implement transpositions
-                (
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                ) = (
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][1]],  # type: ignore[union-attr]
-                    op_spec.args[0].it_dim_map[op_spec.op_info["transposed_dims"][0]],  # type: ignore[union-attr]
-                )
+                op = IDENTITY_OP
+            op_spec = self.create_op_spec(op, False, args, op_info)
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
@@ -573,111 +469,21 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op == MATMUL_REDUCTION_OP:
+        if value.op == MATMUL_REDUCTION_OP or value.op == BATCH_MATMUL_OP:
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
                 or (not isinstance(value.arguments[1], TensorAccess))
             ):
-                raise Unsupported(f"invalid matmul arguments {value.arguments}")
+                raise Unsupported(f"invalid {value.op} arguments {value.arguments}")
             x = value.arguments[0]
             y = value.arguments[1]
-            di_x = self.derive_dim_info(x)
-            di_y = self.derive_dim_info(y)
-            if len(di_x) == 2 and len(di_y) == 2:
-                di = [di_x[0], di_x[1], di_y[1]]
-            elif len(di_x) == 1 and len(di_y) == 2:
-                di = [di_x[0], DimensionInfo(wildcard_symbol(1), 1), di_y[1]]
-                # TODO:  The OpSpec we generate is correct, but the SDSC we generate
-                # will not compute the correct result.  Raise Unsupported to make this explicit.
-                raise Unsupported(f"matmul requires padding support: {value.arguments}")
-            elif len(di_x) == 2 and len(di_y) == 1:
-                di = [di_x[0], di_x[1], DimensionInfo(wildcard_symbol(1), 1)]
-                # TODO:  The OpSpec we generate is correct, but the SDSC we generate
-                # will not compute the correct result.  Raise Unsupported to make this explicit.
-                raise Unsupported(f"matmul requires padding support: {value.arguments}")
-            else:
-                raise Unsupported(f"degenerate matmul: {value.arguments}")
             args = [
-                self.create_tensor_arg(True, x.name, x, di),
-                self.create_tensor_arg(True, y.name, y, di),
-                self.create_tensor_arg(False, real_dst_name, dst, di),
+                self.create_tensor_arg(True, x.name, x),
+                self.create_tensor_arg(True, y.name, y),
+                self.create_tensor_arg(False, real_dst_name, dst),
             ]
-            self.op_specs.append(self.create_op_spec(value.op, True, di, args, op_info))
-        elif value.op == BATCH_MATMUL_OP:
-            if (
-                len(value.arguments) != 2
-                or (not isinstance(value.arguments[0], TensorAccess))
-                or (not isinstance(value.arguments[1], TensorAccess))
-            ):
-                raise Unsupported(f"invalid batchmatmul arguments {value.arguments}")
-            x = value.arguments[0]
-            y = value.arguments[1]
-            di_x = self.derive_dim_info(x)
-            di_y = self.derive_dim_info(y)
-            if len(di_x) == 4 and len(di_y) == 4:
-                di = di_x[0:3] + di_y[2:]
-            elif len(di_x) == 3 and len(di_y) == 3:
-                di = di_x[0:3] + di_y[2:]
-            elif len(di_x) == 2 and len(di_y) == 3:
-                if di_x == di_y[0:2]:
-                    di = [
-                        di_x[0],
-                        DimensionInfo(wildcard_symbol(1), 1),
-                        di_x[1],
-                        di_y[2],
-                    ]
-                elif di_x[0] == di_y[0]:
-                    di = [
-                        di_x[0],
-                        di_x[1],
-                        DimensionInfo(wildcard_symbol(1), 1),
-                        di_y[2],
-                    ]
-                else:
-                    di = [
-                        DimensionInfo(wildcard_symbol(1), 1),
-                        di_x[0],
-                        di_x[1],
-                        di_y[2],
-                    ]
-            elif len(di_x) == 3 and len(di_y) == 2:
-                if di_x[:2] == di_y:
-                    di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
-                elif di_x[2] == di_y[0]:
-                    di = [di_x[0], di_x[1], di_x[2], di_y[1]]
-                else:
-                    raise Unsupported(f"malformed bmm {di_x} {di_y}")
-            elif len(di_x) == 2 and len(di_y) == 2:
-                if di_x == di_y:
-                    di = [
-                        di_x[0],
-                        DimensionInfo(wildcard_symbol(1), 1),
-                        di_x[1],
-                        DimensionInfo(wildcard_symbol(2), 1),
-                    ]
-                elif di_x[0] == di_y[0]:
-                    di = [
-                        di_x[0],
-                        di_x[1],
-                        DimensionInfo(wildcard_symbol(1), 1),
-                        di_y[1],
-                    ]
-                else:
-                    di = [
-                        DimensionInfo(wildcard_symbol(1), 1),
-                        di_x[0],
-                        di_x[1],
-                        di_y[1],
-                    ]
-            else:
-                raise Unsupported(f"malformed bmm {di_x} {di_y}")
-            args = [
-                self.create_tensor_arg(True, x.name, x, di),
-                self.create_tensor_arg(True, y.name, y, di),
-                self.create_tensor_arg(False, real_dst_name, dst, di),
-            ]
-            self.op_specs.append(self.create_op_spec(value.op, True, di, args, op_info))
+            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
         else:
             # All other reductions have exactly one input which is a tensor
             if (not len(value.arguments) == 1) or (
@@ -685,35 +491,20 @@ class SpyreKernel(Kernel[CSEVariable]):
             ):
                 raise Unsupported(f"reduction operands: {value.arguments}")
             x = value.arguments[0]
-            di = self.derive_dim_info(x)
             args = [
-                self.create_tensor_arg(True, x.name, x, di),
-                self.create_tensor_arg(False, real_dst_name, dst, di),
+                self.create_tensor_arg(True, x.name, x),
+                self.create_tensor_arg(False, real_dst_name, dst),
             ]
-            self.op_specs.append(self.create_op_spec(value.op, True, di, args, op_info))
-
-    def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
-        """
-        Return the iteration space implied by the tensor access
-        """
-        var_ranges = iteration_space(self.current_node)
-        if var_ranges:
-            dim_map = map_dims_to_vars(access.layout, access.index)
-            return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
-                for v in sorted(dim_map)
-            ]
-        else:
-            return [DimensionInfo(wildcard_symbol(0), 1)]
+            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        for op_spec in self.op_specs:
+            simplify_op_spec(op_spec)
+
         def sympy_str(x: sympy.Expr) -> str:
-            if isinstance(x, int) or isinstance(x, sympy.Integer):
-                return str(x)
-            else:
-                return "sympify('" + str(x) + "')"
+            return "sympify('" + str(x) + "')"
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
@@ -740,9 +531,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                     with buf.indent():
                         buf.writeline(f"op='{op_spec.op}',")
                         buf.writeline(f"is_reduction={op_spec.is_reduction},")
-                        buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
                         buf.writeline(
-                            "iteration_space_dict={"
+                            "iteration_space={"
                             + ", ".join(
                                 [
                                     sympy_str(k)
@@ -751,7 +541,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                                     + ", "
                                     + str(v[1])
                                     + ")"
-                                    for k, v in op_spec.iteration_space_dict.items()
+                                    for k, v in op_spec.iteration_space.items()
                                 ]
                             )
                             + "},"
@@ -776,12 +566,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                                         )
                                         + "],"
                                     )
-                                    buf.writeline(
-                                        f"allocation={arg.allocation!r}, dtype={arg.dtype!r}, it_dim_map={arg.it_dim_map!r}, "
-                                    )
-                                    buf.writeline(
-                                        f"device_layout={arg.device_layout!r}"
-                                    )
+                                    buf.writeline(f"allocation={arg.allocation!r},")
                                 buf.writeline("),")
                         buf.writeline("]")
                     buf.writeline("),")
@@ -795,3 +580,20 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args.extend(self.args.python_argdefs()[1])
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+
+def simplify_op_spec(op_spec):
+    new_op_space_splits, new_tensors = align_tensors(
+        op_spec.iteration_space,
+        [
+            {
+                "size": arg.device_size,
+                "coordinates": arg.device_coordinates,
+            }
+            for arg in op_spec.args
+        ],
+    )
+    op_spec.iteration_space = new_op_space_splits
+    for arg, t in zip(op_spec.args, new_tensors):
+        arg.device_size = t["size"]
+        arg.device_coordinates = t["coordinates"]
