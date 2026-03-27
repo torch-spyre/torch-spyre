@@ -318,7 +318,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             device_coords,
             tensor.layout.allocation,
         )
-        self.spyre_kernel_args.append((name, tensor_arg))
+        if not tensor.layout.allocation:
+            self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
     def create_op_spec(
@@ -355,17 +356,24 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
 
     def remove_kernel_local_buffers(self) -> None:
-        """Do not remove kernel local buffers becasue we need the allocate in hbm/lx"""
-        pass
+        """Remove buffers that have a scratchpad allocation from the kernel's arg list."""
+        for name in list(self.store_buffer_names):
+            buf = V.graph.get_buffer(name)
+            if buf is None:
+                continue
+            layout = buf.get_layout()
+            if isinstance(layout, FixedTiledLayout) and layout.allocation:
+                self.remove_buffer(name)
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
-        _ = self.args.input(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+        if not layout.allocation:
+            _ = self.args.input(name)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
