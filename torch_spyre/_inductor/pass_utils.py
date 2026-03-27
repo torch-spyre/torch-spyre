@@ -14,13 +14,11 @@
 
 from typing import NamedTuple
 
-from sympy import Expr, Symbol
 
 import sympy
 from torch._inductor.ir import FixedLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep
-from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
 from torch_spyre._inductor.errors import Unsupported
 
@@ -43,38 +41,6 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
                 raise RuntimeError(f"{buf} does not have FixedTiledLayout")
             res.append(SchedNodeArg(arg, layout))
     return res
-
-
-def wildcard_symbol(dim) -> Symbol:
-    return sympy.Symbol(f"*_{dim}")
-
-
-def is_wildcard(s: Symbol) -> bool:
-    return s.name.startswith("*_")
-
-
-# @deprecated("switch to _coordinates")
-def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
-    """
-    Construct a mapping from the dimensions of layout
-    to the free variables of index that correspond to them.
-    Dimensions of size 1 are mapped to a wild_card_symbol of `*`
-
-    This works by reversing the algorithm used by torch._inductor.ir. _fixed_indexer to build index.
-    """
-    result = {}
-    for sym in index.free_symbols:
-        stride_val = sympy_subs(index, {sym: 1}) - sympy_subs(index, {sym: 0})
-        if stride_val in layout.stride:
-            idx = layout.stride.index(stride_val)
-            result[idx] = sym
-
-    for d in range(len(layout.size)):
-        if d not in result:
-            assert layout.size[d] == 1, "non-trivial dim missing from index expression"
-            result[d] = wildcard_symbol(d)
-
-    return result
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:

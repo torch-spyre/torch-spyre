@@ -11,6 +11,9 @@
 # Default owners (fallback for anything not matched below)
 *  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy @elpidatz
 
+# torch_spyre top-level files (runtime infrastructure)
+/torch_spyre/*       @JRosenkranz @thoangtrvn
+
 # Inductor / compiler backend
 /torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
 

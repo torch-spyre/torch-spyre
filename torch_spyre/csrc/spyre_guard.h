@@ -48,6 +48,8 @@ struct SpyreGuardImpl final : c10::impl::DeviceGuardImplInterface {
   void synchronizeDevice(c10::DeviceIndex device_index) const override;
   bool queryStream(const c10::Stream& stream) const override;
   void recordDataPtrOnStream(const c10::DataPtr&, const c10::Stream&) const;
+
+  c10::DeviceCapability getDeviceCapability(c10::Device) const override;
 };
 
 }  // namespace spyre
