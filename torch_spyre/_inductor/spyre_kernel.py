@@ -42,6 +42,7 @@ from .pass_utils import iteration_space
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
+from .work_division_utils import extend_iteration_space_with_core_division
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -347,9 +348,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]
 
         it_space = iteration_space(self.current_node)
-        it_space_extended = {
-            k: (v, core_division.get(k, 1)) for k, v in it_space.items()
-        }
+        it_space_extended = extend_iteration_space_with_core_division(
+            it_space, core_division
+        )
 
         return OpSpec(
             op,

@@ -37,6 +37,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps, device_coordinates, iteration_space
 from .logging_utils import get_inductor_logger
+from .work_division_utils import multi_dim_core_split, multi_dim_iteration_space_split
 import logging
 
 logger = get_inductor_logger("core_division")
@@ -83,133 +84,6 @@ def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
         )
 
     return dl.device_size[device_dim_idx]
-
-
-def core_split(size: int, max_cores: int) -> int:
-    """
-    Find the largest divisor of size that doesn't exceed max_cores.
-
-    Args:
-        size: The dimension size to split
-        max_cores: Maximum number of cores to use for this dimension
-
-    Returns:
-        Number of cores to use (always divides size evenly)
-    """
-    for i in range(max_cores, 0, -1):
-        if size % i == 0:
-            return i
-    return 1
-
-
-def multi_dim_core_split(
-    sizes: list[int], max_cores: int, priorities: list[int] | None = None
-) -> list[int]:
-    """
-    Distribute max_cores across multiple dimensions optimally.
-
-    This function tries to split cores across multiple dimensions to maximize
-    parallelism while ensuring even division. It uses a greedy approach that
-    prioritizes dimensions based on:
-    1. User-specified priorities (if provided)
-    2. Dimension size (larger dimensions get priority)
-    3. Divisibility (dimensions that divide evenly get priority)
-
-    Dimensions with negative priorities are excluded from splitting and will
-    always have a split value of 1.
-
-    Args:
-        sizes: List of dimension sizes that can be parallelized
-        max_cores: Total number of cores available
-        priorities: Optional list of priority values (higher = more important)
-                   If None, uses dimension sizes as priorities.
-                   Use negative values to exclude dimensions from splitting.
-
-    Returns:
-        List of core splits for each dimension (same length as sizes)
-        The product of all splits will be <= max_cores
-
-    Example:
-        >>> multi_dim_core_split([128, 64, 32], max_cores=8)
-        [4, 2, 1]  # 4*2*1 = 8 cores total
-
-        >>> multi_dim_core_split([100, 50], max_cores=10)
-        [5, 2]  # 5*2 = 10 cores total
-
-        >>> multi_dim_core_split([128, 64, 32], max_cores=8, priorities=[3, -1, 2])
-        [4, 1, 2]  # Middle dimension excluded from splitting (priority=-1)
-    """
-    if not sizes:
-        return []
-
-    n_dims = len(sizes)
-    splits = [1] * n_dims
-
-    # Use provided priorities or default to the sizes of dimensions
-    if priorities is None:
-        priorities = sizes.copy()
-
-    # Create list of (dimension_index, size, priority) tuples
-    # Filter out dimensions with negative priorities (they should not be split)
-    dim_info = [
-        (i, sizes[i], priorities[i]) for i in range(n_dims) if priorities[i] >= 0
-    ]
-
-    # Sort by priority (descending), then by size (descending)
-    dim_info.sort(key=lambda x: (x[2], x[1]), reverse=True)
-
-    n_cores_to_split = max_cores
-
-    # Greedy allocation: try to split highest priority dimensions first
-    for dim_idx, size, _ in dim_info:
-        if n_cores_to_split <= 1:
-            break
-
-        # Find the best split for this dimension given n_cores_to_split
-        best_split = core_split(size, n_cores_to_split)
-
-        if best_split > 1:
-            splits[dim_idx] = best_split
-            n_cores_to_split = n_cores_to_split // best_split
-
-    return splits
-
-
-def multi_dim_iteration_space_split(
-    iteration_space: dict[Symbol, Expr],
-    max_cores: int,
-    priorities: list[Symbol],
-) -> dict[Symbol, int]:
-    """
-    Distribute max_cores across multiple dimensions of an iteration space.
-
-    This function tries to split cores across multiple dimensions to maximize
-    parallelism while ensuring even division. It uses a greedy approach that
-    prioritizes dimensions of the iteration space based on:
-    1. User-specified priorities
-    2. Divisibility (dimensions that divide evenly get priority)
-
-    Args:
-        iteration_space: The iteration space to be parallelized
-        max_cores: Total number of cores available
-        priorities: Order in which to consider the dimensions
-
-    Returns:
-        The core splits for the iteration_space
-        The product of all splits will be <= max_cores
-    """
-    n_cores_to_split = max_cores
-    splits = {v: 1 for v in iteration_space.keys()}
-
-    for v in priorities:
-        if n_cores_to_split <= 1:
-            break
-        best_split = core_split(iteration_space[v], n_cores_to_split)
-        if best_split > 1:
-            splits[v] = best_split
-            n_cores_to_split = n_cores_to_split // best_split
-
-    return splits
 
 
 def prioritize_dimensions(
