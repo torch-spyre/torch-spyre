@@ -43,31 +43,31 @@ class SpyreAsyncCompile:
 
     def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
         # 1. Generate SDSC.json for each OpSpec
-        sdscs = []
+        sdscs_json = []
         arg_mappings = []
         for ks in specs:
             if isinstance(ks, UnimplementedOp):
                 print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
                 return SpyreUnimplementedRunner(kernel_name, ks.op)
 
-            dt_sdsc, arg_map = compile_op_spec(kernel_name, ks)
-            sdscs.append(dt_sdsc)
+            sdsc_json, arg_map = compile_op_spec(kernel_name, ks)
+            sdscs_json.append(sdsc_json)
             arg_mappings.append(arg_map)
 
         # Write SDSCs to file system, invoke backend compiler, and return KernelRunner
         kernel_output_dir = get_output_dir(kernel_name)
         if _SDSC_BUNDLE:
-            for idx, sdsc in enumerate(sdscs):
+            for idx, sdsc_json in enumerate(sdscs_json):
                 with open(
                     os.path.join(kernel_output_dir, f"sdsc_{idx}.json"), "w"
                 ) as file:
                     logger.info(f"Generating {file.name}")
-                    json.dump(sdsc, file, indent=2)
+                    json.dump(sdsc_json, file, indent=2)
             with open(os.path.join(kernel_output_dir, "bundle.mlir"), "w") as file:
                 logger.info(f"Generating {file.name}")
                 file.write("module {\n")
                 file.write("\tfunc.func @sdsc_bundle() {\n")
-                for i in range(len(sdscs)):
+                for i in range(len(sdscs_json)):
                     file.write(
                         '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_'
                         + f"{i}"
@@ -86,13 +86,13 @@ class SpyreAsyncCompile:
         else:
             # Process each SuperDSC separately
             sdsc_dirs = []
-            for sdsc in sdscs:
+            for sdsc_json in sdscs_json:
                 kernel_output_dir = get_output_dir(kernel_name)
                 subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
                 os.makedirs(subdir, exist_ok=True)
                 with open(os.path.join(subdir, "sdsc.json"), "w") as file:
                     logger.info(f"Generating {file.name}")
-                    json.dump(sdsc, file, indent=2)
+                    json.dump(sdsc_json, file, indent=2)
                 sdsc_dirs.append(kernel_output_dir)
 
             for dir in sdsc_dirs:
