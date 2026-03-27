@@ -173,6 +173,30 @@ def adjust_it_space_for_sticks(
         adjusted[stick_var] = elems_per_stick
 
 
+def get_outermost_split_symbol(
+    td: TensorDep,
+    it_space: dict[Symbol, Expr],
+) -> Symbol | None:
+    """Return the free symbol of the outermost non-trivial device dimension, or None.
+
+    Iterates device_coords[:-1] (outer to inner, excluding the stick dim) and returns
+    the free symbol of the first coord whose size in it_space is > 1. Asserts that each
+    non-empty coord has exactly 1 free symbol.
+    """
+    for coord in td.device_coords[:-1]:
+        vars_ = coord.free_symbols
+        if not vars_:
+            continue
+        assert len(vars_) == 1, (
+            f"Expected exactly 1 free symbol in device coord {coord!r}, got {vars_}."
+        )
+        sym = next(iter(vars_))
+        if it_space.get(sym, 1) == 1:
+            continue
+        return sym
+    return None
+
+
 def must_split_vars(
     tensor_deps: list[TensorDep] | None,
     it_space_adjusted: dict[Symbol, Expr],
@@ -197,36 +221,59 @@ def must_split_vars(
         if total_sticks <= MAX_SPAN_STICKS:
             continue
 
-        for coord in td.device_coords[:-1]:
-            vars_ = coord.free_symbols
-            if not vars_:
-                continue  # skipping empty set (is it safe to assume no constant value > 1)?
-            assert len(vars_) == 1, (
-                f"Expected exactly 1 free symbol in device coord {coord!r}, got {vars_}."
+        sym = get_outermost_split_symbol(td, it_space_adjusted)
+        if sym is None:
+            continue
+
+        adjusted_size = it_space_adjusted[sym]
+        min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
+        min_split = next(
+            (
+                d
+                for d in range(min_split_raw, adjusted_size + 1)
+                if adjusted_size % d == 0
+            ),
+            adjusted_size,
+        )
+        if min_split == adjusted_size and adjusted_size < min_split_raw:
+            logger.warning(
+                f"Cannot fully satisfy span limit for {sym} "
+                f"(adjusted_size={adjusted_size}, need {min_split_raw} splits): "
+                f"using full split of {adjusted_size}."
             )
-            adjusted_size = it_space_adjusted[next(iter(vars_))]
-            if adjusted_size == 1:
-                continue
-            min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
-            min_split = next(
-                (
-                    d
-                    for d in range(min_split_raw, adjusted_size + 1)
-                    if adjusted_size % d == 0
-                ),
-                adjusted_size,
-            )
-            if min_split == adjusted_size and adjusted_size < min_split_raw:
-                logger.warning(
-                    f"Cannot fully satisfy span limit for {vars_} "
-                    f"(adjusted_size={adjusted_size}, need {min_split_raw} splits): "
-                    f"using full split of {adjusted_size}."
-                )
-            for var in vars_:
-                result[var] = max(result.get(var, 1), min_split)
-            break
+        result[sym] = max(result.get(sym, 1), min_split)
 
     return result
+
+
+def warn_if_per_core_overflow(
+    tensor_deps: list[TensorDep],
+    it_space: dict[Symbol, Expr],
+    splits: dict[Symbol, int],
+    op_name: str,
+) -> None:
+    """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_STICKS.
+
+    Uses get_outermost_split_symbol to find the split variable for each tensor, then
+    computes per-core sticks = total_sticks / splits.get(symbol, 1).
+    """
+    for td in tensor_deps:
+        total_sticks = math.prod(td.layout.device_layout.device_size[:-1])
+        if total_sticks <= MAX_SPAN_STICKS:
+            continue
+
+        sym = get_outermost_split_symbol(td, it_space)
+        outer_split = splits.get(sym, 1) if sym is not None else 1
+        per_core_sticks = math.ceil(total_sticks / outer_split)
+        if per_core_sticks > MAX_SPAN_STICKS:
+            dl = td.layout.device_layout
+            logger.critical(
+                f"{op_name}: per-core tensor span "
+                f"{per_core_sticks * 128 / (1024 * 1024):.2f} MB "
+                f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
+                f"device_size={list(dl.device_size)}, outer_split={outer_split}) "
+                f"exceeds hardware limit of {MAX_SPAN_BYTES / (1024 * 1024):.2f} MB"
+            )
 
 
 def prioritize_dimensions(
@@ -278,66 +325,59 @@ def prioritize_dimensions(
 
 
 def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    if max_cores == 1:
-        return
-
     it_space = iteration_space(n)
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    priorities, min_splits = prioritize_dimensions(output_td, it_space)
-    splits = multi_dim_iteration_space_split(
-        it_space,
-        max_cores,
-        priorities,
-        min_splits,
-    )
-
-    cores_used = math.prod(splits.values())
-
-    if cores_used > 1:
+    splits: dict[Symbol, int] = {}
+    if max_cores > 1:
+        priorities, min_splits = prioritize_dimensions(output_td, it_space)
+        splits = multi_dim_iteration_space_split(
+            it_space, max_cores, priorities, min_splits
+        )
         n.op_it_space_splits = splits
-
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise work_division {n.node.get_name()}: cores={cores_used}, "
+                f"pointwise work_division {n.node.get_name()}: "
                 f"iteration_space={it_space}, priorities={priorities}, "
-                f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
+                f"min_splits={min_splits}, op_it_space_splits={splits}"
             )
+
+    warn_if_per_core_overflow([output_td], it_space, splits, n.node.get_name())
 
 
 def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
-    if max_cores == 1:
-        return
-
     red: Reduction = n.node.data
     if red.reduction_type not in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP):
+        all_tds = [TensorDep(a.dep, a.layout) for a in args]
+        output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
+        warn_if_per_core_overflow(all_tds + [output_td], {}, {}, n.node.get_name())
         return
 
     it_space = iteration_space(n)
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
-
-    # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
-    splits = multi_dim_iteration_space_split(
-        it_space, max_cores, priorities, min_splits
-    )
-
-    cores_used = math.prod(splits.values())
-    if cores_used > 1:
+    splits: dict[Symbol, int] = {}
+    if max_cores > 1:
+        priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
+        splits = multi_dim_iteration_space_split(
+            it_space, max_cores, priorities, min_splits
+        )
         n.op_it_space_splits = splits
-
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"reduction work_division {n.node.get_name()}: cores={cores_used}, "
+                f"reduction work_division {n.node.get_name()}: "
                 f"iteration_space={it_space}, priorities={priorities}, "
-                f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
+                f"min_splits={min_splits}, op_it_space_splits={splits}"
             )
+
+    warn_if_per_core_overflow(
+        input_tds + [output_td], it_space, splits, n.node.get_name()
+    )
 
 
 def core_division_planning(
