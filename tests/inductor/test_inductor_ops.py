@@ -1531,7 +1531,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
 
     def test_addmm_cpu(self, input, mat1, mat2):
-        compare_with_cpu(torch.addmm, input, mat1, mat2, atol=2e-1, rtol=2e-1)
+        # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
+        compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
 
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch

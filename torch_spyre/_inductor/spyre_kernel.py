@@ -337,11 +337,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]:
                 raise Unsupported(f"operation on {arg.device_dtype}")
 
-        if hasattr(self.current_node, "op_dim_splits"):
-            op_info["op_dim_splits"] = self.current_node.op_dim_splits  # type: ignore[union-attr]
-        if hasattr(self.current_node, "n_cores_used"):
-            op_info["n_cores_used"] = self.current_node.n_cores_used  # type: ignore[union-attr]
-
         core_division: dict[sympy.Symbol, int] = {}
         if hasattr(self.current_node, "op_it_space_splits"):
             core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]

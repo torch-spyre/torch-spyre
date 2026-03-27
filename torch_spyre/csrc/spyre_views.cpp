@@ -190,13 +190,6 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
   return self_;
 }
 
-// A group maps a set of old host dims to a set of new host dims.
-// The product of sizes on each side must be equal.
-struct DimGroup {
-  std::vector<size_t> old_dims;
-  std::vector<size_t> new_dims;
-};
-
 static inline at::Tensor spyre_view_impl(const at::Tensor& self,
                                          c10::IntArrayRef size) {
   c10::DimVector inferred_size = at::infer_size_dv(size, self.numel());
