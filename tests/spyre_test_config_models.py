@@ -80,6 +80,19 @@ class OpsEdits(BaseModel):
         return {item.name for item in self.exclude}
 
 
+class ModulesEdits(BaseModel):
+    """Per-test module list overrides."""
+
+    include: List[NamedItem] = []  # inject modules into @modules.module_info_list
+    exclude: List[NamedItem] = []  # remove modules from @modules.module_info_list
+
+    def included_module_names(self) -> Set[str]:
+        return {item.name for item in self.include}
+
+    def excluded_module_names(self) -> Set[str]:
+        return {item.name for item in self.exclude}
+
+
 class DtypesEdits(BaseModel):
     """Per-test dtype overrides."""
 
@@ -114,6 +127,7 @@ class DtypesEdits(BaseModel):
 class TestEdits(BaseModel):
     ops: OpsEdits = OpsEdits()
     dtypes: DtypesEdits = DtypesEdits()
+    modules: ModulesEdits = ModulesEdits()
 
 
 class TestEntry(BaseModel):
@@ -240,11 +254,22 @@ class SupportedOpConfig(BaseModel):
         return None
 
 
+class SupportedModuleConfig(BaseModel):
+    """Model for storing supported modules config: name, force_xfail"""
+
+    name: str
+    force_xfail: bool = False
+
+    def get_name(self) -> str:
+        return self.name
+
+
 class GlobalConfig(BaseModel):
     """Model for global configs: supported_dtypes, supported_ops"""
 
     supported_dtypes: List[NamedItem] = []
     supported_ops: Optional[List[SupportedOpConfig]] = None
+    supported_modules: Optional[List[SupportedModuleConfig]] = None
 
     @field_validator("supported_dtypes", mode="before")
     @classmethod
@@ -265,12 +290,20 @@ class GlobalConfig(BaseModel):
 
         Plain strings are normalised to dicts so SupportedOpConfig can parse them.
         """
-        if isinstance(values, dict) and "supported_ops" in values:
-            ops = values["supported_ops"]
-            if ops is not None:
-                values["supported_ops"] = [
-                    {"name": op} if isinstance(op, str) else op for op in ops
-                ]
+        if isinstance(values, dict):
+            if "supported_ops" in values:
+                ops = values["supported_ops"]
+                if ops is not None:
+                    values["supported_ops"] = [
+                        {"name": op} if isinstance(op, str) else op for op in ops
+                    ]
+
+            if "supported_modules" in values:
+                mods = values["supported_modules"]
+                if mods is not None:
+                    values["supported_modules"] = [
+                        {"name": m} if isinstance(m, str) else m for m in mods
+                    ]
         return values
 
     def resolved_supported_dtypes(self) -> Optional[Set[torch.dtype]]:
@@ -284,10 +317,22 @@ class GlobalConfig(BaseModel):
             return None
         return {op.name for op in self.supported_ops}
 
+    def resolved_supported_modules(self) -> Optional[Set[str]]:
+        if self.supported_modules is None:
+            return None
+        return {m.name for m in self.supported_modules}
+
     def resolved_supported_ops_config(self) -> Optional[Dict[str, SupportedOpConfig]]:
         if self.supported_ops is None:
             return None
         return {op.name: op for op in self.supported_ops}
+
+    def resolved_supported_modules_config(
+        self,
+    ) -> Optional[Dict[str, SupportedModuleConfig]]:
+        if self.supported_modules is None:
+            return None
+        return {m.name: m for m in self.supported_modules}
 
 
 class TestsBlock(BaseModel):

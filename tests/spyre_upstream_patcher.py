@@ -19,7 +19,7 @@ each call has its own fresh decorator instances. A one-time global patch
 would not affect these copies.
 """
 
-from typing import Set
+from typing import Set, Optional
 import torch
 
 
@@ -284,3 +284,109 @@ class _OOTOpDtypeExpander:
                 # dtypesIfPrivateUse1 was not set but dtypes was — initialize it
                 # from the already-expanded dtypes so privateuse1 path sees it too
                 op_info.__dict__["dtypesIfPrivateUse1"] = op_info.__dict__["dtypes"]
+
+
+class _OOTModuleListPatcher:
+    """Filters @modules.module_info_list to supported_modules before
+    super().instantiate_test() runs.
+
+    Mirrors the behaviour of _OOTOpListPatcher exactly - include injects modules from
+    module_db that are not already present, exclude removes them, and
+    if the result would be empty the list is left untouched.
+
+    Step 1: inject edits.modules.include (additive -- not bounded by
+            global.supported_modules, same semantics as edits.ops.include).
+    Step 2: filter to global.supported_modules if specified.
+    Step 3: apply edits.modules.exclude
+    """
+
+    def __init__(
+        self,
+        test: object,
+        supported_modules: Optional[Set[str]],
+        included_modules: Optional[Set[str]] = None,
+        excluded_modules: Optional[Set[str]] = None,
+    ) -> None:
+        from torch.testing._internal.common_modules import modules as _modules_cls
+
+        underlying_fn = test.__func__ if hasattr(test, "__func__") else test
+        p = getattr(underlying_fn, "parametrize_fn", None)
+        self._modules_instance = (
+            p.__self__
+            if p is not None
+            and hasattr(p, "__self__")
+            and isinstance(p.__self__, _modules_cls)
+            else None
+        )
+        self._supported_modules = supported_modules
+        self._included_modules: Set[str] = included_modules or set()
+        self._excluded_modules: Set[str] = excluded_modules or set()
+
+    def patch(self) -> None:
+        if self._modules_instance is None:
+            return
+
+        from torch.testing._internal.common_modules import module_db
+
+        module_db_by_name = {m.name: m for m in module_db}
+
+        # inject edits.modules.include
+        if self._included_modules:
+            existing_names = {m.name for m in self._modules_instance.module_info_list}
+            for name in self._included_modules:
+                if name not in existing_names:
+                    mod_info = module_db_by_name.get(name)
+                    if mod_info is not None:
+                        self._modules_instance.module_info_list.append(mod_info)
+
+        # filter to global.supported_modules
+        # included_modules will exist even if not in supported_modules
+        if self._supported_modules is not None:
+            filtered = [
+                m
+                for m in self._modules_instance.module_info_list
+                if m.name in self._supported_modules or m.name in self._included_modules
+            ]
+            if filtered:
+                self._modules_instance.module_info_list[:] = filtered
+
+        # apply edits.modules.exclude
+        if self._excluded_modules:
+            filtered = [
+                m
+                for m in self._modules_instance.module_info_list
+                if m.name not in self._excluded_modules
+            ]
+            if filtered:
+                self._modules_instance.module_info_list[:] = filtered
+
+
+class _OOTModuleDtypePatcher:
+    """Patches @modules.allowed_dtypes to inject extra dtypes.
+
+    Mirrors the behaviour of _OOTDtypePatcher exactly but targets the @modules decorator.
+    Needed when edits.dtypes.include adds dtypes that are not in
+    @modules.allowed_dtypes - without this, _parametrize_test's
+    intersection would filter them out before variants are generated.
+    """
+
+    def __init__(self, test: object, extra_dtypes: Set[torch.dtype]) -> None:
+        from torch.testing._internal.common_modules import modules as _modules_cls
+
+        underlying_fn = test.__func__ if hasattr(test, "__func__") else test
+        p = getattr(underlying_fn, "parametrize_fn", None)
+        self._modules_instance = (
+            p.__self__
+            if p is not None
+            and hasattr(p, "__self__")
+            and isinstance(p.__self__, _modules_cls)
+            else None
+        )
+        self._extra_dtypes = extra_dtypes
+
+    def patch(self) -> None:
+        if (
+            self._modules_instance is not None
+            and self._modules_instance.allowed_dtypes is not None
+        ):
+            self._modules_instance.allowed_dtypes |= self._extra_dtypes

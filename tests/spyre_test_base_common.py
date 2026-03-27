@@ -47,8 +47,15 @@ from spyre_upstream_patcher import (
     _OOTOnlyOnPatcher,
     _OOTOpDtypeExpander,
     _OOTOpListPatcher,
+    _OOTModuleListPatcher,
+    _OOTModuleDtypePatcher,
 )
-from spyre_test_config_models import OOTTestConfig, SupportedOpConfig, TestEntry
+from spyre_test_config_models import (
+    OOTTestConfig,
+    SupportedOpConfig,
+    SupportedModuleConfig,
+    TestEntry,
+)
 
 
 # Resolve the actual backend name registered for privateuse1.
@@ -154,6 +161,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     TEST_ENTRIES: Dict[str, "TestEntry"] = {}  # {method_name -> TestEntry}
     UNLISTED_TEST_MODE: str = UNLISTED_MODE_XFAIL  # file-level default
     SUPPORTED_OPS_CONFIG: Dict[str, "SupportedOpConfig"] = {}  # {op_name -> config}
+    SUPPORTED_MODULES_CONFIG: Dict[
+        str, "SupportedModuleConfig"
+    ] = {}  # {module_name -> config}
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
 
     @classmethod
@@ -186,6 +196,12 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         if op_configs:
             apply_op_config_overrides(op_configs)
             cls.SUPPORTED_OPS_CONFIG = op_configs
+
+        # global modules filtering and overrides
+        cls._supported_modules = config.global_config.resolved_supported_modules()
+        module_configs = config.global_config.resolved_supported_modules_config()
+        if module_configs:
+            cls.SUPPORTED_MODULES_CONFIG = module_configs
 
         cls.GLOBAL_SUPPORTED_DTYPES = config.global_config.resolved_supported_dtypes()
 
@@ -272,6 +288,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         """Return the set of supported op names, or None if no filtering is configured."""
         return getattr(cls, "_supported_ops", None)
 
+    @classmethod
+    def _get_supported_modules(cls) -> Optional[Set[str]]:
+        """Return the set of supported modules names, or None if no filtering is configured."""
+        return getattr(cls, "_supported_modules", None)
+
     # ------------------------------------------------------------------
     # instantiate_test override
     # ------------------------------------------------------------------
@@ -295,6 +316,22 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         if supported_ops is not None:
             _OOTOpListPatcher(test, supported_ops).patch()
 
+        # @modules filtering
+        supported_modules = cls._get_supported_modules()
+        included_modules = (
+            entry.edits.modules.included_module_names() if entry is not None else set()
+        )
+        excluded_modules = (
+            entry.edits.modules.excluded_module_names() if entry is not None else set()
+        )
+        if supported_modules is not None or included_modules or excluded_modules:
+            _OOTModuleListPatcher(
+                test,
+                supported_modules=supported_modules,
+                included_modules=included_modules,
+                excluded_modules=excluded_modules,
+            ).patch()
+
         op_level_dtypes: Set[torch.dtype] = set()
         if cls.SUPPORTED_OPS_CONFIG:
             from torch.testing._internal.common_device_type import ops as _ops_cls
@@ -315,6 +352,28 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         if op_level_dtypes:
             _OOTDtypePatcher(test, op_level_dtypes).patch()
+
+        # module-level dtype injection from SUPPORTED_MODULES_CONFIG
+        module_level_dtypes: Set[torch.dtype] = set()
+        if cls.SUPPORTED_MODULES_CONFIG:
+            from torch.testing._internal.common_modules import modules as _modules_cls
+
+            underlying_fn = test.__func__ if hasattr(test, "__func__") else test
+            p = getattr(underlying_fn, "parametrize_fn", None)
+            if (
+                p is not None
+                and hasattr(p, "__self__")
+                and isinstance(p.__self__, _modules_cls)
+            ):
+                for mod_info in p.__self__.module_info_list:
+                    mod_cfg = cls.SUPPORTED_MODULES_CONFIG.get(mod_info.name)
+                    if mod_cfg is not None:
+                        resolved = mod_cfg.resolved_dtypes()
+                        if resolved is not None:
+                            module_level_dtypes |= resolved
+
+        if module_level_dtypes:
+            _OOTModuleDtypePatcher(test, module_level_dtypes).patch()
 
         if entry is not None:
             extra_dtypes = entry.edits.dtypes.resolved_include()

@@ -263,13 +263,13 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
 
+        if use_op_dims and dim_order != dims:
+            reduced_dims = [d for d in op_dim_order if d not in dim_order]
+            dim_order = dim_order + reduced_dims
         if op_stick_dim is None:
             # No stick dim found in op - add one
             stick_dim = next(d for d in dims if d not in op_dim_order)
             dim_order = dim_order + [stick_dim]
-        elif use_op_dims and dim_order != dims:
-            reduced_dims = [d for d in op_dim_order if d not in dim_order]
-            dim_order = dim_order + reduced_dims
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
         for dim_idx, dim in enumerate(dim_order):

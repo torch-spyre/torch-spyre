@@ -10,13 +10,19 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41]
+          stride: [41, 1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 1000
       - tensor:
           shape: [49159, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 0
       - value: null
@@ -32,7 +38,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 12.0
     description: 'site-packages/transformers/models/granite/modeling_granite.py:439 in forward, code: inputs_embeds = inputs_embeds * self.embedding_multiplier  #
@@ -45,7 +54,10 @@ cases:
     inputs:
       - tensor:
           shape: [64]
+          stride: [1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - py: (None, slice(None, None, None), None)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:373 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
@@ -58,7 +70,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 1]
+          stride: [64, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:373 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
       -1, 1).to(x.device)'
@@ -68,7 +83,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 1]
+          stride: [64, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1
       - value: -1
@@ -83,7 +101,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 1]
+          stride: [64, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: cuda:0
     description: 'site-packages/transformers/models/granite/modeling_granite.py:373 in forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0],
@@ -96,7 +117,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41]
+          stride: [41, 1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 1000
@@ -108,7 +132,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 41]
+          stride: [41, 41, 1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 1000
@@ -118,7 +145,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 41]
+          stride: [41, 41, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:378 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
       2)'
@@ -128,11 +158,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 1]
+          stride: [64, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 41]
+          stride: [41, 41, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:378 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
       2)'
@@ -142,7 +178,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 41]
+          stride: [2624, 41, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -156,10 +195,16 @@ cases:
     inputs:
       - tensor_list:
           - shape: [1, 41, 64]
+            stride: [2624, 1, 41]
+            storage_offset: 0
             dtype: torch.float32
+            device: cuda:0
             init: rand
           - shape: [1, 41, 64]
+            stride: [2624, 1, 41]
+            storage_offset: 0
             dtype: torch.float32
+            device: cuda:0
             init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:379 in forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
     marks:
@@ -172,7 +217,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 128]
+          stride: [5248, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:380 in forward, code: cos = emb.cos() * self.attention_scaling'
     marks: fp32operation
@@ -181,7 +229,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 128]
+          stride: [5248, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1.0
     description: 'site-packages/transformers/models/granite/modeling_granite.py:380 in forward, code: cos = emb.cos() * self.attention_scaling'
@@ -193,7 +244,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 128]
+          stride: [5248, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:381 in forward, code: sin = emb.sin() * self.attention_scaling'
     marks: fp32operation
@@ -202,7 +256,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 128]
+          stride: [5248, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:383 in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks: fp32operation
@@ -219,7 +276,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 2
     description: 'site-packages/transformers/models/granite/modeling_granite.py:201 in forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
@@ -231,7 +291,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: -1
     description: 'site-packages/transformers/models/granite/modeling_granite.py:201 in forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
@@ -245,7 +308,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 1]
+          stride: [41, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1.0e-05
     description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
@@ -258,7 +324,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 1]
+          stride: [41, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
@@ -268,11 +337,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 41, 1]
+          stride: [41, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
@@ -282,11 +357,17 @@ cases:
     inputs:
       - tensor:
           shape: [4096]
+          stride: [1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:203 in forward, code: return self.weight * hidden_states.to(input_dtype)'
     marks: bf16operation
@@ -295,11 +376,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [4096, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:156 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -312,7 +399,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 41, -1, 128)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:156 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -325,7 +415,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 32, 128]
+          stride: [167936, 4096, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -339,11 +432,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1024, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -356,7 +455,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 1024]
+          stride: [41984, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 41, -1, 128)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -369,7 +471,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 8, 128]
+          stride: [41984, 1024, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -383,7 +488,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 128]
+          stride: [5248, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
     description: 'site-packages/transformers/models/granite/modeling_granite.py:73 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
@@ -395,11 +503,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 41, 128]
+          stride: [167936, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 41, 128]
+          stride: [5248, 5248, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:75 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
@@ -409,7 +523,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 41, 128]
+          stride: [167936, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (Ellipsis, slice(None, 64, None))
     description: 'site-packages/transformers/models/granite/modeling_granite.py:49 in rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
@@ -421,7 +538,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 41, 64]
+          stride: [167936, 128, 4096, 1]
+          storage_offset: 64
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks: bf16operation
@@ -430,10 +550,16 @@ cases:
     inputs:
       - tensor_list:
           - shape: [1, 32, 41, 64]
+            stride: [83968, 64, 2048, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
           - shape: [1, 32, 41, 64]
+            stride: [167936, 128, 4096, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks:
@@ -446,11 +572,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 41, 128]
+          stride: [167936, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 32, 41, 128]
+          stride: [167936, 5248, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:75 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
@@ -460,11 +592,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 41, 128]
+          stride: [41984, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 41, 128]
+          stride: [5248, 5248, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:76 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
       * sin)'
@@ -474,7 +612,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 41, 128]
+          stride: [41984, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (Ellipsis, slice(None, 64, None))
     description: 'site-packages/transformers/models/granite/modeling_granite.py:49 in rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
@@ -486,7 +627,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 41, 64]
+          stride: [41984, 128, 1024, 1]
+          storage_offset: 64
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks: bf16operation
@@ -495,10 +639,16 @@ cases:
     inputs:
       - tensor_list:
           - shape: [1, 8, 41, 64]
+            stride: [20992, 64, 512, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
           - shape: [1, 8, 41, 64]
+            stride: [41984, 128, 1024, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks:
@@ -511,11 +661,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 41, 128]
+          stride: [41984, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 8, 41, 128]
+          stride: [41984, 5248, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:76 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
       * sin)'
@@ -534,18 +690,27 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 2048, 128]
+          stride: [2097152, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 2
       - tensor:
           shape: [41]
+          stride: [1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 2048
       - tensor:
           shape: [1, 8, 41, 128]
+          stride: [41984, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
     marks:
@@ -556,7 +721,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 2048, 128]
+          stride: [2097152, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
     description: 'site-packages/transformers/integrations/sdpa_attention.py:24 in repeat_kv, code: hidden_states = hidden_states[:, :, None, :, :].expand(batch,
@@ -569,7 +737,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 1, 2048, 128]
+          stride: [2097152, 262144, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 8
@@ -586,7 +757,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 4, 2048, 128]
+          stride: [2097152, 262144, 0, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 32, 2048, 128)
     description: 'site-packages/transformers/integrations/sdpa_attention.py:25 in repeat_kv, code: return hidden_states.reshape(batch, num_key_value_heads
@@ -599,15 +773,24 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 41, 128]
+          stride: [167936, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 32, 2048, 128]
+          stride: [8388608, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 32, 2048, 128]
+          stride: [8388608, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/integrations/sdpa_attention.py:92 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks: bf16operation
@@ -620,7 +803,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 41, 128]
+          stride: [167936, 5248, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -634,7 +820,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 32, 128]
+          stride: [167936, 128, 5248, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/integrations/sdpa_attention.py:102 in sdpa_attention_forward, code: attn_output = attn_output.transpose(1,
       2).contiguous()'
@@ -644,7 +833,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 32, 128]
+          stride: [167936, 4096, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 41, -1)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:183 in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
@@ -656,7 +848,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:183 in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
     marks: bf16operation
@@ -665,11 +860,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:286 in forward, code: hidden_states = residual + hidden_states * self.residual_multiplier'
     marks: bf16operation
@@ -678,11 +879,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [12800, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:221 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
@@ -695,7 +902,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 12800]
+          stride: [524800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
     marks: bf16operation
@@ -704,11 +914,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 12800]
+          stride: [524800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 41, 12800]
+          stride: [524800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:221 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
       * self.up_proj(x))'
@@ -718,11 +934,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 12800]
+          stride: [524800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [4096, 12800]
+          stride: [12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:221 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
@@ -735,7 +957,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 41, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
     description: 'site-packages/transformers/models/granite/modeling_granite.py:575 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
@@ -748,11 +973,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [167936, 4096, 1]
+          storage_offset: 163840
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [49159, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:575 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
@@ -765,7 +996,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 49159]
+          stride: [49159, 49159, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 16.0
     description: 'site-packages/transformers/models/granite/modeling_granite.py:576 in forward, code: logits = logits / self.config.logits_scaling  # main
@@ -778,13 +1012,19 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 1000
       - tensor:
           shape: [49159, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 0
       - value: null
@@ -800,7 +1040,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 12.0
     description: 'site-packages/transformers/models/granite/modeling_granite.py:439 in forward, code: inputs_embeds = inputs_embeds * self.embedding_multiplier  #
@@ -813,7 +1056,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 1000
@@ -825,7 +1071,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 1000
@@ -835,7 +1084,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:378 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
       2)'
@@ -845,11 +1097,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 1]
+          stride: [64, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:378 in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1,
       2)'
@@ -859,7 +1117,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 64, 1]
+          stride: [64, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -873,10 +1134,16 @@ cases:
     inputs:
       - tensor_list:
           - shape: [1, 1, 64]
+            stride: [64, 1, 1]
+            storage_offset: 0
             dtype: torch.float32
+            device: cuda:0
             init: rand
           - shape: [1, 1, 64]
+            stride: [64, 1, 1]
+            storage_offset: 0
             dtype: torch.float32
+            device: cuda:0
             init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:379 in forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
     marks:
@@ -889,7 +1156,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 128]
+          stride: [128, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:380 in forward, code: cos = emb.cos() * self.attention_scaling'
     marks: fp32operation
@@ -898,7 +1168,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 128]
+          stride: [128, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1.0
     description: 'site-packages/transformers/models/granite/modeling_granite.py:380 in forward, code: cos = emb.cos() * self.attention_scaling'
@@ -910,7 +1183,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 128]
+          stride: [128, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:381 in forward, code: sin = emb.sin() * self.attention_scaling'
     marks: fp32operation
@@ -919,7 +1195,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 128]
+          stride: [128, 128, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:383 in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks: fp32operation
@@ -930,7 +1209,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 2
     description: 'site-packages/transformers/models/granite/modeling_granite.py:201 in forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
@@ -942,7 +1224,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: -1
     description: 'site-packages/transformers/models/granite/modeling_granite.py:201 in forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
@@ -956,7 +1241,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - value: 1.0e-05
     description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
@@ -969,7 +1257,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
@@ -979,11 +1270,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
           dtype: torch.float32
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:202 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
@@ -993,11 +1290,17 @@ cases:
     inputs:
       - tensor:
           shape: [4096]
+          stride: [1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:203 in forward, code: return self.weight * hidden_states.to(input_dtype)'
     marks: bf16operation
@@ -1006,11 +1309,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [4096, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:156 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -1023,7 +1332,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 1, -1, 128)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:156 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -1036,7 +1348,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 32, 128]
+          stride: [4096, 4096, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -1050,11 +1365,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1024, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -1067,7 +1388,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 1024]
+          stride: [1024, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 1, -1, 128)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:157 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
@@ -1080,7 +1404,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 8, 128]
+          stride: [1024, 1024, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -1094,7 +1421,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 128]
+          stride: [128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
     description: 'site-packages/transformers/models/granite/modeling_granite.py:73 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
@@ -1106,11 +1436,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 1, 128]
+          stride: [4096, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 1, 128]
+          stride: [128, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:75 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
@@ -1120,7 +1456,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 1, 128]
+          stride: [4096, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (Ellipsis, slice(None, 64, None))
     description: 'site-packages/transformers/models/granite/modeling_granite.py:49 in rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
@@ -1132,7 +1471,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 1, 64]
+          stride: [4096, 128, 4096, 1]
+          storage_offset: 64
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks: bf16operation
@@ -1141,10 +1483,16 @@ cases:
     inputs:
       - tensor_list:
           - shape: [1, 32, 1, 64]
+            stride: [2048, 64, 64, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
           - shape: [1, 32, 1, 64]
+            stride: [4096, 128, 4096, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks:
@@ -1157,11 +1505,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 1, 128]
+          stride: [4096, 128, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 32, 1, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:75 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
@@ -1171,11 +1525,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 1, 128]
+          stride: [1024, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 1, 128]
+          stride: [128, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:76 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
       * sin)'
@@ -1185,7 +1545,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 1, 128]
+          stride: [1024, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (Ellipsis, slice(None, 64, None))
     description: 'site-packages/transformers/models/granite/modeling_granite.py:49 in rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
@@ -1197,7 +1560,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 1, 64]
+          stride: [1024, 128, 1024, 1]
+          storage_offset: 64
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks: bf16operation
@@ -1206,10 +1572,16 @@ cases:
     inputs:
       - tensor_list:
           - shape: [1, 8, 1, 64]
+            stride: [512, 64, 64, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
           - shape: [1, 8, 1, 64]
+            stride: [1024, 128, 1024, 1]
+            storage_offset: 0
             dtype: torch.bfloat16
+            device: cuda:0
             init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:51 in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
     marks:
@@ -1222,11 +1594,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 1, 128]
+          stride: [1024, 128, 1024, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 8, 1, 128]
+          stride: [1024, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:76 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
       * sin)'
@@ -1236,18 +1614,27 @@ cases:
     inputs:
       - tensor:
           shape: [1, 8, 2048, 128]
+          stride: [2097152, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 2
       - tensor:
           shape: [1]
+          stride: [1]
+          storage_offset: 0
           dtype: torch.int64
+          device: cuda:0
           init: randint
           init_args:
             high: 2048
       - tensor:
           shape: [1, 8, 1, 128]
+          stride: [1024, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
     marks:
@@ -1258,15 +1645,24 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 1, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 32, 2048, 128]
+          stride: [8388608, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 32, 2048, 128]
+          stride: [8388608, 262144, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/integrations/sdpa_attention.py:92 in sdpa_attention_forward, code: attn_output = torch.nn.functional.scaled_dot_product_attention('
     marks: bf16operation
@@ -1279,7 +1675,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 32, 1, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: 1
       - value: 2
@@ -1293,7 +1692,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 32, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/integrations/sdpa_attention.py:102 in sdpa_attention_forward, code: attn_output = attn_output.transpose(1,
       2).contiguous()'
@@ -1303,7 +1705,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 32, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: (1, 1, -1)
     description: 'site-packages/transformers/models/granite/modeling_granite.py:183 in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
@@ -1315,7 +1720,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 128, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:183 in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
     marks: bf16operation
@@ -1324,11 +1732,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:286 in forward, code: hidden_states = residual + hidden_states * self.residual_multiplier'
     marks: bf16operation
@@ -1337,11 +1751,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [12800, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:221 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
@@ -1354,7 +1774,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 12800]
+          stride: [12800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
     marks: bf16operation
@@ -1363,11 +1786,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 12800]
+          stride: [12800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [1, 1, 12800]
+          stride: [12800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/granite/modeling_granite.py:221 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
       * self.up_proj(x))'
@@ -1377,11 +1806,17 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 12800]
+          stride: [12800, 12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - tensor:
           shape: [4096, 12800]
+          stride: [12800, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - value: null
     description: 'site-packages/transformers/models/granite/modeling_granite.py:221 in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x))
@@ -1394,7 +1829,10 @@ cases:
     inputs:
       - tensor:
           shape: [1, 1, 4096]
+          stride: [4096, 4096, 1]
+          storage_offset: 0
           dtype: torch.bfloat16
+          device: cuda:0
           init: rand
       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
     description: 'site-packages/transformers/models/granite/modeling_granite.py:575 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
