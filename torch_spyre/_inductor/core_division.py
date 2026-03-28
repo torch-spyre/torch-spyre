@@ -64,19 +64,24 @@ class TensorDep:
         self.device_coords = device_coordinates(self.layout, self.dep)
 
 
-def core_split(size: int, max_cores: int) -> int:
+def core_split(size: int, max_cores: int, min_slice: int = 1) -> int:
     """
-    Find the largest divisor of size that doesn't exceed max_cores.
+    Find the largest divisor of size that doesn't exceed max_cores,
+    such that the resulting slice size (size // divisor) is a multiple
+    of min_slice.
 
     Args:
         size: The dimension size to split
         max_cores: Maximum number of cores to use for this dimension
+        min_slice: Each core's slice must be a multiple of this value
+                   (e.g. stick size for clone ops)
 
     Returns:
-        Number of cores to use (always divides size evenly)
+        Number of cores to use (always divides size evenly and leaves
+        each core with a slice that is a multiple of min_slice)
     """
     for i in range(max_cores, 0, -1):
-        if size % i == 0:
+        if size % i == 0 and (size // i) % min_slice == 0:
             return i
     return 1
 
@@ -86,6 +91,7 @@ def multi_dim_iteration_space_split(
     max_cores: int,
     priorities: list[Symbol],
     min_splits: dict[Symbol, int] | None = None,
+    min_slice: int = 1,
 ) -> dict[Symbol, int]:
     """
     Distribute max_cores across multiple dimensions of an iteration space.
@@ -100,6 +106,8 @@ def multi_dim_iteration_space_split(
         max_cores: Total number of cores available
         priorities: Order in which to consider the dimensions
         min_splits: Minimum splits required for each dimension (optional)
+        min_slice: Each core's slice must be a multiple of this value
+                   (e.g. stick size for clone ops)
 
     Returns:
         The core splits for the iteration_space
@@ -131,7 +139,7 @@ def multi_dim_iteration_space_split(
         if min_splits and v in min_splits:
             continue  # Already handled in first pass
 
-        best_split = core_split(iteration_space[v], n_cores_remaining)
+        best_split = core_split(iteration_space[v], n_cores_remaining, min_slice)
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
@@ -282,10 +290,17 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
     adjust_it_space_for_sticks(it_space, [output_td])
+    origin_node = next(iter(n.node.data.origins))
+    is_clone = origin_node is not None and origin_node.target == aten.clone.default
 
+    elems_per_stick = output_td.layout.device_layout.elems_per_stick()
     priorities, min_splits = prioritize_dimensions(output_td, it_space)
     splits = multi_dim_iteration_space_split(
-        it_space, max_cores, priorities, min_splits
+        it_space,
+        max_cores,
+        priorities,
+        min_splits,
+        min_slice=elems_per_stick if is_clone else 1,
     )
 
     cores_used = math.prod(splits.values())

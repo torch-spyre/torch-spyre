@@ -428,6 +428,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((1088, 320),),
                     ((320, 320),),
+                    ((49280, 4096),),
+                    ((4096, 49280),),
                 ]
             ),
         },

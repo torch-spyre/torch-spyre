@@ -48,10 +48,11 @@ SPYRE_FP32_OPS = [
     "identity",
 ]
 
-LAYOUT_INPUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
-LAYOUT_OUTPUT_LABELS = ["OUTPUT"]
 LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
+MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+
+
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j"]
 OUTPUT_DIM_LABELS = ["out"]
-MATMUL_DIM_LABELS = ["x", "y", "mb", "in", "out"]
+MATMUL_DIM_LABELS = ["y", "x", "mb", "out", "in"]
