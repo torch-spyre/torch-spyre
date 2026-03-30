@@ -18,12 +18,14 @@ The back-end compiler is responsible for taking the core-level specifications
 produced by the front-end compiler, mapping them to optimized Spyre dataflows, and producing
 executable programs binaries.
 
-:::{figure} ../_static/images/spyre-sw-stack.svg
+:::{figure} ../_static/images/spyre-sw-stack.png
 :alt: Torch-Spyre frontend compilation stack from PyTorch to SDSC/KTIR
-:width: 35%
+:width: 90%
 :align: center
 
-The Torch-Spyre frontend compilation stack. PyTorch programs pass through Dynamo to produce an FX graph, which Torch Inductor lowers to Loop-Level IR. The Spyre Kernel path generates SDSC specifications; the Triton path produces KT IR for the MLIR-based backend.
+The Torch-Spyre front-end compilation stack. PyTorch programs pass through Dynamo to produce an FX graph, which Inductor lowers to LoopLevel IR.
+The SpyreKernel code generator compiles LoopLevel IR into an OpSpec that is in turn used to generates SDSC specifications
+that are the input to the backend-compiler. In a future version, we intend to replace SDSCs with a purely MLIR-based interface that includes a new [KTIR](https://github.com/torch-spyre/RFCs/tree/main/0682-KtirSpec) MLIR dialect.
 :::
 
 # Background

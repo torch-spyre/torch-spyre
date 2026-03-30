@@ -40,6 +40,6 @@ In addition, when defining a custom op, you will also need to do one of:
   add a method to `SpyreOpFuncs` in [spyre_kernel.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/spyre_kernel.py).
   A canonical example is `spyre.clamp`.
 + register a decomposition for the custom op in [decompositions.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/decompositions.py)
-  that removes the custom op from the graph before lowering. A canonical example is `spyre.compact`.
+  that removes the custom op from the graph before lowering. We currently do not have any custom ops that use this option.
 + define a `CustomPrePass` or `CustomPostPass` that implements a more general graph
   rewrite that removes the custom op from the graph before lowering. We currently do not have any custom ops that use this option.
