@@ -1,3 +1,17 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Any, Callable
 
 import unittest
@@ -39,26 +53,16 @@ class BaseScratchpadTest(unittest.TestCase):
             # Clear build cache
             torch.compiler.reset()
 
-    def add_post_fusion_mapping_pass(
+    def post_fusion_mapping_pass(
         self,
         f: Callable[[BaseSchedulerNode], BaseSchedulerNode],
     ):
         """Set a post fusion custom pass that processes each node independently."""
-        old_pass = inductor_config._post_fusion_custom_pass
 
         def new_pass(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             return [f(node) for node in nodes]
 
-        if old_pass is None:
-            inductor_config._post_fusion_custom_pass = new_pass
-        else:
-
-            def combined_pass(
-                nodes: list[BaseSchedulerNode],
-            ) -> list[BaseSchedulerNode]:
-                return new_pass(old_pass(nodes))
-
-            inductor_config._post_fusion_custom_pass = combined_pass
+        return inductor_config.patch(_post_fusion_custom_pass=new_pass)
 
     def extended_mem_usages(
         self,
@@ -82,15 +86,14 @@ class BaseScratchpadTest(unittest.TestCase):
                 mem_usages.append(mem_usage)
             return node
 
-        self.add_post_fusion_mapping_pass(visitor)
-
-        compiled_kernel = torch.compile(self.kernel)
-        try:
-            result = compiled_kernel(self.x).cpu()
-        except:  # noqa: E722
-            # When https://github.com/torch-spyre/torch-spyre/issues/1257 is fixed, we can remove
-            # the try/except block here and the None in the return type.
-            result = None
+        with self.post_fusion_mapping_pass(visitor):
+            compiled_kernel = torch.compile(self.kernel)
+            try:
+                result = compiled_kernel(self.x).cpu()
+            except:  # noqa: E722
+                # When https://github.com/torch-spyre/torch-spyre/issues/1257 is fixed, we can remove
+                # the try/except block here and the None in the return type.
+                result = None
 
         return (result, mem_usages)
 
