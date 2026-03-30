@@ -154,7 +154,7 @@ def _autoload():
             device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()
         )
 
-        from .dsc import SuperDSCScheduling
+        from .scheduler import SuperDSCScheduling
         from .wrapper import SpyrePythonWrapperCodegen
 
         register_backend_for_device(
