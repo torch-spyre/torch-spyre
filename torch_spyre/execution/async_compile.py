@@ -21,13 +21,11 @@ import subprocess
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
-from torch_spyre._inductor.logging_utils import get_inductor_logger, _get_env_bool
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
-
-_SDSC_BUNDLE = _get_env_bool("SPYRE_SUPERDSC_BUNDLE", True)
 
 
 def get_output_dir(kernel_name: str):
@@ -44,7 +42,6 @@ class SpyreAsyncCompile:
     def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
         # 1. Generate SDSC.json for each OpSpec
         sdscs_json = []
-        arg_mappings = []
         for ks in specs:
             if isinstance(ks, UnimplementedOp):
                 print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
@@ -52,54 +49,33 @@ class SpyreAsyncCompile:
 
             sdsc_json, arg_map = compile_op_spec(kernel_name, ks)
             sdscs_json.append(sdsc_json)
-            arg_mappings.append(arg_map)
 
         # Write SDSCs to file system, invoke backend compiler, and return KernelRunner
         kernel_output_dir = get_output_dir(kernel_name)
-        if _SDSC_BUNDLE:
-            for idx, sdsc_json in enumerate(sdscs_json):
-                with open(
-                    os.path.join(kernel_output_dir, f"sdsc_{idx}.json"), "w"
-                ) as file:
-                    logger.info(f"Generating {file.name}")
-                    json.dump(sdsc_json, file, indent=2)
-            with open(os.path.join(kernel_output_dir, "bundle.mlir"), "w") as file:
+        for idx, sdsc_json in enumerate(sdscs_json):
+            with open(os.path.join(kernel_output_dir, f"sdsc_{idx}.json"), "w") as file:
                 logger.info(f"Generating {file.name}")
-                file.write("module {\n")
-                file.write("\tfunc.func @sdsc_bundle() {\n")
-                for i in range(len(sdscs_json)):
-                    file.write(
-                        '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_'
-                        + f"{i}"
-                        + '.json"}\n'
-                    )
-                file.write("\t\treturn\n")
-                file.write("\t}\n")
-                file.write("}\n")
+                json.dump(sdsc_json, file, indent=2)
+        with open(os.path.join(kernel_output_dir, "bundle.mlir"), "w") as file:
+            logger.info(f"Generating {file.name}")
+            file.write("module {\n")
+            file.write("\tfunc.func @sdsc_bundle() {\n")
+            for i in range(len(sdscs_json)):
+                file.write(
+                    '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_'
+                    + f"{i}"
+                    + '.json"}\n'
+                )
+            file.write("\t\treturn\n")
+            file.write("\t}\n")
+            file.write("}\n")
 
-            subprocess.run(
-                ["dxp_standalone", "--bundle", "-d", kernel_output_dir], check=True
-            )
-            convert_artifacts(kernel_output_dir)
+        subprocess.run(
+            ["dxp_standalone", "--bundle", "-d", kernel_output_dir], check=True
+        )
+        convert_artifacts(kernel_output_dir)
 
-            return SpyreSDSCKernelRunner(kernel_name, [kernel_output_dir], arg_mappings)
-        else:
-            # Process each SuperDSC separately
-            sdsc_dirs = []
-            for sdsc_json in sdscs_json:
-                kernel_output_dir = get_output_dir(kernel_name)
-                subdir = os.path.join(kernel_output_dir, "execute", kernel_name)
-                os.makedirs(subdir, exist_ok=True)
-                with open(os.path.join(subdir, "sdsc.json"), "w") as file:
-                    logger.info(f"Generating {file.name}")
-                    json.dump(sdsc_json, file, indent=2)
-                sdsc_dirs.append(kernel_output_dir)
-
-            for dir in sdsc_dirs:
-                subprocess.run(["dxp_standalone", "-d", dir], check=True)
-                convert_artifacts(dir)
-
-            return SpyreSDSCKernelRunner(kernel_name, sdsc_dirs, arg_mappings)
+        return SpyreSDSCKernelRunner(kernel_name, kernel_output_dir)
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass

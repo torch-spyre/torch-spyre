@@ -282,7 +282,8 @@ def _create_sdsc_tensors(
                     else dim_size
                 )
     sdsc_args: list[SDSCArgs] = []
-    for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
+    for arg in op_spec.args:
+        addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
