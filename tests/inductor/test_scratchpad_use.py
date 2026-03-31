@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable
+from collections.abc import Sequence
+import functools
+from typing import Any, Callable, TypeVarTuple, Unpack
 
 import unittest
 import torch
@@ -25,26 +27,17 @@ import torch._inductor.config as inductor_config
 from torch_spyre._inductor.scratchpad import mem_usage_by_node
 from torch._inductor.virtualized import V
 
+Ts = TypeVarTuple("Ts")
 
-class BaseScratchpadTest(unittest.TestCase):
-    def kernel(self, x: torch.Tensor) -> torch.Tensor:
-        """All derived classes should override this; this base class should be skipped."""
-        assert False, "Override the kernel method in all subclasses"
 
-    @classmethod
-    def setUpClass(cls):
-        if cls is BaseScratchpadTest:
-            raise unittest.SkipTest("Skip BaseScratchpadTest tests, it's a base class")
-        super(BaseScratchpadTest, cls).setUpClass()
-
+class ScratchpadUsageTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0xAFFE)
-
-        # Prepare a device tensor
-        x = cached_randn((512, 1024))
-        self.x = x.to("spyre")
-
         torch.compiler.reset()
+
+    def cached_randn_device(self, shape: Sequence[int], *args, **kwargs):
+        result = cached_randn(shape, *args, **kwargs)
+        return result.to("spyre")
 
     def set_lx_planning(self, enable: bool):
         old_value = os.environ.get("LX_PLANNING", "0")
@@ -57,7 +50,8 @@ class BaseScratchpadTest(unittest.TestCase):
         self,
         f: Callable[[BaseSchedulerNode], BaseSchedulerNode],
     ):
-        """Set a post fusion custom pass that processes each node independently."""
+        """Context manager to set a post fusion custom pass that processes each node independently
+        using `f`."""
 
         def new_pass(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             return [f(node) for node in nodes]
@@ -65,7 +59,7 @@ class BaseScratchpadTest(unittest.TestCase):
         return inductor_config.patch(_post_fusion_custom_pass=new_pass)
 
     def extended_mem_usages(
-        self,
+        self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
     ) -> tuple[torch.Tensor | None, list[dict[str, dict[str, Any]]]]:
         mem_usages = []
 
@@ -87,9 +81,9 @@ class BaseScratchpadTest(unittest.TestCase):
             return node
 
         with self.post_fusion_mapping_pass(visitor):
-            compiled_kernel = torch.compile(self.kernel)
+            compiled_kernel = torch.compile(f, fullgraph=True)
             try:
-                result = compiled_kernel(self.x).cpu()
+                result = compiled_kernel(*args)
             except:  # noqa: E722
                 # When https://github.com/torch-spyre/torch-spyre/issues/1257 is fixed, we can remove
                 # the try/except block here and the None in the return type.
@@ -97,20 +91,45 @@ class BaseScratchpadTest(unittest.TestCase):
 
         return (result, mem_usages)
 
-    def test_lx_is_used(self):
-        """Basic test to see if the LX is used in any allocation when LX planning is turned on."""
+    def run_test(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+    ):
+        """Run the current class's test procedure on the given model and arguments. Override this
+        in each subclass."""
         self.set_lx_planning(True)
-
-        _, emus = self.extended_mem_usages()
+        _, emus = self.extended_mem_usages(model, args)
         self.assertTrue(
             any(usage["location"] == "LX" for emu in emus for usage in emu.values())
         )
 
-    def measure_hbm_transfers(self) -> tuple[torch.Tensor | None, int]:
+    def common(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+    ):
+        """This method runs some sanity checks common to all subclasses and then calls
+        `run_test`."""
+        for t in args:
+            self.assertIsInstance(t, torch.Tensor)
+            self.assertEqual(t.device.type, "spyre")
+        return self.run_test(model, args)
+
+    def test_softmax(self):
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.cached_randn_device((512, 1024))
+        self.common(f, (x,))
+
+
+class MeasureHBMUsageScratchPadTest(ScratchpadUsageTest):
+    def measure_hbm_transfers(
+        self, model: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
+    ) -> tuple[torch.Tensor | None, int]:
         """Estimates the HBM transfers for a given operation. This assumes that any buffer that
         has an entry in its allocations that starts with "lx" is free and that any other node's HBM
         transfers are accurately returned by `mem_usage_by_node`."""
-        result, emus = self.extended_mem_usages()
+        result, emus = self.extended_mem_usages(model, args)
         hbm_transfers = sum(
             usage["size"]
             for emu in emus
@@ -119,25 +138,24 @@ class BaseScratchpadTest(unittest.TestCase):
         )
         return (result, hbm_transfers)
 
-    def test_compare_hbm_use(self):
+    def run_test(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+    ):
         """Test that estimates the total amount of HBM transfers with LX planning turned off and
         turned on, and then compares them."""
         self.set_lx_planning(False)
-        result_without_lx, hbm_without_lx = self.measure_hbm_transfers()
+        result_without_lx, hbm_without_lx = self.measure_hbm_transfers(model, args)
 
         self.set_lx_planning(True)
-        result_with_lx, hbm_with_lx = self.measure_hbm_transfers()
+        result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
 
         self.assertLess(hbm_with_lx, hbm_without_lx)
 
         if result_without_lx is not None and result_with_lx is not None:
             delta = torch.abs(result_without_lx - result_with_lx).max().item()
             self.assertLess(delta, 1e-5)
-
-
-class SoftMaxScratchPadTest(BaseScratchpadTest):
-    def kernel(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(x, dim=0)
 
 
 if __name__ == "__main__":
