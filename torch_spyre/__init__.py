@@ -16,7 +16,9 @@ import os
 import threading
 import types
 import importlib
+
 from .constants import DEVICE_NAME
+from . import profiler
 
 _runtime_init_lock = threading.Lock()
 
@@ -228,3 +230,7 @@ def _autoload():
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
+
+
+if not profiler.is_available():
+    profiler = None
