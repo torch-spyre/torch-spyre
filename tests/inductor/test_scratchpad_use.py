@@ -30,7 +30,7 @@ from torch._inductor.virtualized import V
 Ts = TypeVarTuple("Ts")
 
 
-class ScratchpadUsageTest(unittest.TestCase):
+class TestScratchpadUsage(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0xAFFE)
         torch.compiler.reset()
@@ -122,7 +122,7 @@ class ScratchpadUsageTest(unittest.TestCase):
         self.common(f, (x,))
 
 
-class MeasureHBMUsageScratchPadTest(ScratchpadUsageTest):
+class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
     def measure_hbm_transfers(
         self, model: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
     ) -> tuple[torch.Tensor | None, int]:
