@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Sequence, Union
+from typing import Sequence, Union
 
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import (
@@ -35,22 +35,26 @@ from .pass_utils import iteration_space
 
 
 class SuperDSCScheduling(BaseScheduling):
-    kernel_type: type[Any] = SpyreKernel
-    dsc_type: str = "sdsc"
-
     def group_fn(self, sizes):
+        """
+        Process the iteration sizes in case a transformation needs to be applied.
+        """
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
     def flush(self):
+        """
+        Flush the generated kernel and python wrapper code to the source code file.
+        """
+        # Overrides superclass method that raises NotImplementedError.
         pass
-
-    def ready_to_flush(self) -> bool:
-        return False
 
     def can_buffer_be_removed_through_fusion(
         self, name: str, fused_node_names: OrderedSet[str]
     ) -> bool:
-        """We need intermediate buffers to be allocated even if only used within a single Kernel"""
+        """
+        Spyre currently needs intermediate buffers to be allocated even if only used within a single Kernel.
+        TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/1266
+        """
         return False
 
     def can_fuse_vertical(
@@ -59,6 +63,7 @@ class SuperDSCScheduling(BaseScheduling):
         """
         Check whether node1 and node2 can be vertically fused or not.
         """
+        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def can_fuse_horizontal(
@@ -67,35 +72,26 @@ class SuperDSCScheduling(BaseScheduling):
         """
         Check whether node1 and node2 can be horizontally fused or not.
         """
+        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
-    def codegen_node_schedule_with_kernel(
-        self, node_schedule: Sequence[BaseSchedulerNode], kernel: SpyreKernel
-    ):
-        with kernel:
-            for node in node_schedule:
-                if isinstance(node, SchedulerNode):
-                    var_ranges = iteration_space(node)
-                    vars = list(var_ranges.keys())
-                    index_vars = [
-                        vars[: len(node._body.iter_vars)],
-                        vars[len(node._body.iter_vars) :],
-                    ]
-                    node.codegen(index_vars)
-                else:
-                    raise RuntimeError(f"TODO: implement for {node}")
-
-    def generate_node_schedule(self, nodes: Sequence[BaseSchedulerNode]):
-        node_schedule: list[BaseSchedulerNode] = []
+    def generate_node_schedule(self, nodes: Sequence[SchedulerNode]):
+        node_schedule: list[SchedulerNode] = []
         done = OrderedSet[BaseSchedulerNode]()
         for node in nodes:
             if node in done:
                 continue
             done.add(node)
-            node_schedule.append(node)
+            if isinstance(node, SchedulerNode):
+                node_schedule.append(node)
+            else:
+                raise RuntimeError(f"Unexpected node type: {type(node)}")
         return node_schedule
 
     def codegen_node(self, node: Union[FusedSchedulerNode, SchedulerNode]) -> None:
+        """
+        Generate a kernel given a list of pre-fused nodes.
+        """
         assert self.scheduler
         nodes = [
             node
@@ -107,7 +103,15 @@ class SuperDSCScheduling(BaseScheduling):
 
         node_schedule = self.generate_node_schedule(nodes)
         kernel = SpyreKernel()
-        self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+        with kernel:
+            for node in node_schedule:
+                var_ranges = iteration_space(node)
+                vars = list(var_ranges.keys())
+                index_vars = [
+                    vars[: len(node._body.iter_vars)],
+                    vars[len(node._body.iter_vars) :],
+                ]
+                node.codegen(index_vars)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -128,18 +132,18 @@ class SuperDSCScheduling(BaseScheduling):
         self.free_buffers_in_scheduler()
 
     def define_kernel(self, src_code, node_schedule, kernel):
-        """Codegen kernel definition to go in output wrapper code"""
+        """
+        Codegen kernel definition to go in output wrapper code
+        """
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join(
-                [self.dsc_type, fused_name, wrapper.next_kernel_suffix()]
-            )
+            kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
-            buf.writeline(f"async_compile.{self.dsc_type}('{kernel_name}',")
+            buf.writeline(f"async_compile.sdsc('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
             buf.writeline(")")
