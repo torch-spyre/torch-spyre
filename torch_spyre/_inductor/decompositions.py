@@ -453,12 +453,9 @@ def spyre_rms_norm(
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
 
-    eps_tensor = torch.ops.spyre.full(
-        input.shape, eps, dtype=torch.float16, device="spyre"
-    )
-    rsqrt_inp = (
-        torch.rsqrt(torch.mean(input * input, dim=-1, keepdim=True)) + eps_tensor
-    )
+    mean = torch.mean(input * input, dim=-1, keepdim=True)
+    eps_tensor = torch.ops.spyre.full((1,), eps, dtype=torch.float16, device="spyre")
+    rsqrt_inp = torch.rsqrt(mean + eps_tensor)
     output = input * rsqrt_inp
     if weight is not None:
         output = output * weight
