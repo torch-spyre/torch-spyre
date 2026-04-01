@@ -20,6 +20,7 @@ from typing_extensions import ParamSpec
 import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
+import warnings
 
 from .constants import DEVICE_NAME
 from .errors import Unsupported
@@ -814,24 +815,25 @@ def where_scalar_decomp(condition, self, other):
 
 @register_spyre_decomposition([torch.ops.aten.is_nonzero.default])
 def is_nonzero_decomp(input: torch.Tensor):
-    if input.numel() != 1:
+    if input.numel() == 0:
+        raise RuntimeError("Boolean value of Tensor with no values is ambiguous")
+
+    if input.numel() > 1:
         raise RuntimeError(
-            "RuntimeError: Boolean value of Tensor with no values is ambiguous"
+            "Boolean value of Tensor with more than one value is ambiguous"
         )
-    # For bool, FP32, and integer tensors, fallback to CPU since Spyre has limitations
-    if input.dtype in (
-        torch.bool,
-        torch.float32,
-        torch.int32,
-        torch.int64,
-        torch.int16,
-        torch.int8,
-    ):
-        return input.cpu().item() != 0
-    else:
-        # FP16 and other dtypes: direct comparison
+
+    SUPPORTED_SPYRE_DTYPES = (torch.float16, torch.float32, torch.bfloat16)
+
+    if input.dtype in SUPPORTED_SPYRE_DTYPES:
         zero = torch.zeros_like(input)
         return torch.ne(input, zero).item()
+
+    warnings.warn(
+        f"Falling back to CPU for dtype {input.dtype} in is_nonzero", RuntimeWarning
+    )
+
+    return input.cpu().item() != 0
 
 
 ###############################################################################################

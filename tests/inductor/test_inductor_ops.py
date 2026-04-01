@@ -2470,6 +2470,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "float16_true": (torch.tensor([3.14], dtype=torch.float16),),
                 "float16_false": (torch.tensor([0.0], dtype=torch.float16),),
                 "float32_true": (torch.tensor([2.71828], dtype=torch.float32),),
+                # "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),), # TODO: will be supported soon
+                # "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),), # TODO: will be supported soon
                 "bool_true": (torch.tensor([True]),),
                 "bool_false": (torch.tensor([False]),),
                 "scalar_float": (torch.tensor(3.14, dtype=torch.float32),),
@@ -5549,20 +5551,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare_with_cpu(fn, x, y, cpu_compile=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_is_nonzero_multi_element_error(self):
-        x = torch.tensor([1.0, 2.0], dtype=torch.float16)
+    def test_is_nonzero_error_cases(self):
+        # Empty tensor
+        x_empty = torch.tensor([], dtype=torch.float32)
 
-        # CPU should raise
-        with pytest.raises(RuntimeError):
-            torch.is_nonzero(x)
+        with pytest.raises(
+            RuntimeError,
+            match="Boolean value of Tensor with no values is ambiguous",
+        ):
+            torch.is_nonzero(x_empty)
 
-        # Compiled Spyre should also raise
-        def fn(t):
-            return torch.is_nonzero(t)
+        # Empty tensor is not supported on spyre
+        # def fn(t):
+        #     return torch.is_nonzero(t)
 
-        compiled = torch.compile(fn)
-        with pytest.raises(RuntimeError):
-            compiled(x.to("spyre"))
+        # compiled = torch.compile(fn)
+
+        # with pytest.raises(
+        #     RuntimeError,
+        #     match="Boolean value of Tensor with no values is ambiguous",
+        # ):
+        #     compiled(x_empty.to("spyre"))
+
+        # Multi-element tensor
+        x_multi = torch.tensor([1.0, 2.0], dtype=torch.float16)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Boolean value of Tensor with more than one value is ambiguous",
+        ):
+            torch.is_nonzero(x_multi)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Boolean value of Tensor with more than one value is ambiguous",
+        ):
+            compiled(x_multi.to("spyre"))
 
 
 if __name__ == "__main__":
