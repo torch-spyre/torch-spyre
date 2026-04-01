@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 import functools
 from typing import Any, Callable, TypeVarTuple, Unpack
 
@@ -39,26 +40,40 @@ class TestScratchpadUsage(unittest.TestCase):
         result = cached_randn(shape, *args, **kwargs)
         return result.to("spyre")
 
+    @contextmanager
     def set_lx_planning(self, enable: bool):
+        """Context manager to set the LX_PLANNING environment variable to enable or disable LX
+        planning."""
         old_value = os.environ.get("LX_PLANNING", "0")
         os.environ["LX_PLANNING"] = "1" if enable else "0"
-        if os.environ.get("LX_PLANNING") != old_value:
-            # Clear build cache
+        modifying = os.environ.get("LX_PLANNING") != old_value
+        if modifying:
+            # Clear build cache so that old builds with the previous value of LX_PLANNING don't
+            # interfere with the test
             torch.compiler.reset()
+        yield
+        if modifying:
+            # Again clear build cache so that builds with the modified value of LX_PLANNING don't
+            # interfere with future tests
+            torch.compiler.reset()
+            os.environ["LX_PLANNING"] = old_value
 
     def post_fusion_mapping_pass(
         self,
         f: Callable[[BaseSchedulerNode], BaseSchedulerNode],
     ):
-        """Context manager to set a post fusion custom pass that processes each node independently
+        """Context manager to add a post fusion custom pass that processes each node independently
         using `f`."""
+        old_pass = inductor_config._post_fusion_custom_pass
 
         def new_pass(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+            if old_pass is not None:
+                nodes = old_pass(nodes)
             return [f(node) for node in nodes]
 
         return inductor_config.patch(_post_fusion_custom_pass=new_pass)
 
-    def extended_mem_usages(
+    def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
     ) -> tuple[torch.Tensor | None, list[dict[str, dict[str, Any]]]]:
         mem_usages = []
@@ -98,8 +113,9 @@ class TestScratchpadUsage(unittest.TestCase):
     ):
         """Run the current class's test procedure on the given model and arguments. Override this
         in each subclass."""
-        self.set_lx_planning(True)
-        _, emus = self.extended_mem_usages(model, args)
+        with self.set_lx_planning(True):
+            _, emus = self.compile_and_collect_mem_usage(model, args)
+
         self.assertTrue(
             any(usage["location"] == "LX" for emu in emus for usage in emu.values())
         )
@@ -129,7 +145,7 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         """Estimates the HBM transfers for a given operation. This assumes that any buffer that
         has an entry in its allocations that starts with "lx" is free and that any other node's HBM
         transfers are accurately returned by `mem_usage_by_node`."""
-        result, emus = self.extended_mem_usages(model, args)
+        result, emus = self.compile_and_collect_mem_usage(model, args)
         hbm_transfers = sum(
             usage["size"]
             for emu in emus
@@ -145,11 +161,11 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
     ):
         """Test that estimates the total amount of HBM transfers with LX planning turned off and
         turned on, and then compares them."""
-        self.set_lx_planning(False)
-        result_without_lx, hbm_without_lx = self.measure_hbm_transfers(model, args)
+        with self.set_lx_planning(False):
+            result_without_lx, hbm_without_lx = self.measure_hbm_transfers(model, args)
 
-        self.set_lx_planning(True)
-        result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
+        with self.set_lx_planning(True):
+            result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
 
         self.assertLess(hbm_with_lx, hbm_without_lx)
 
