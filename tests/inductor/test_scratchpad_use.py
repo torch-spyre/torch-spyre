@@ -24,14 +24,31 @@ import os
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
 from tests.inductor.utils_inductor import cached_randn
 
-import torch._inductor.config as inductor_config
 from torch_spyre._inductor.scratchpad import mem_usage_by_node
+from torch_spyre._inductor import passes
 from torch._inductor.virtualized import V
 
 Ts = TypeVarTuple("Ts")
 
 
 class TestScratchpadUsage(unittest.TestCase):
+    our_scheduler_post_passes: list[
+        Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]
+    ] = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.old_scheduler_post_passes = passes.scheduler_post_passes
+        passes.scheduler_post_passes = self.post_passes_bypass
+
+    def post_passes_bypass(
+        self, nodes: list[BaseSchedulerNode]
+    ) -> list[BaseSchedulerNode]:
+        nodes = self.old_scheduler_post_passes(nodes)
+        for our_pass in self.our_scheduler_post_passes:
+            nodes = our_pass(nodes)
+        return nodes
+
     def setUp(self):
         torch.manual_seed(0xAFFE)
         torch.compiler.reset()
@@ -58,20 +75,20 @@ class TestScratchpadUsage(unittest.TestCase):
             torch.compiler.reset()
             os.environ["LX_PLANNING"] = old_value
 
+    @contextmanager
     def post_fusion_mapping_pass(
         self,
         f: Callable[[BaseSchedulerNode], BaseSchedulerNode],
     ):
         """Context manager to add a post fusion custom pass that processes each node independently
         using `f`."""
-        old_pass = inductor_config._post_fusion_custom_pass
 
         def new_pass(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-            if old_pass is not None:
-                nodes = old_pass(nodes)
             return [f(node) for node in nodes]
 
-        return inductor_config.patch(_post_fusion_custom_pass=new_pass)
+        self.our_scheduler_post_passes.append(new_pass)
+        yield
+        self.our_scheduler_post_passes.remove(new_pass)
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
