@@ -27,93 +27,11 @@
 #include <torch/library.h>
 #include <util/sen_data_convert.h>
 
-#include <cstddef>
-#include <set>
 #include <vector>
 
-#include "logging.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
-
-// IMPORTANT NOTE: The squeeze view has to break the assumption that the STL
-// stays constant since allocation. There will be a better fix in the short
-// term, but this is required as Pytorch/AOTAutograd likes squeezing tensors
-// without telling you through the view op
-SpyreTensorLayout get_squeezed_layout(const SpyreTensorLayout& old_stl,
-                                      const std::set<size_t>& removed_ones) {
-  DEBUGINFO("We are correcting STL for squeeze");
-  std::vector<int64_t> new_device_size;
-  std::vector<int32_t> new_dim_map;
-
-  for (size_t i = 0; i < old_stl.dim_map.size(); ++i) {
-    int32_t dim = old_stl.dim_map[i];
-    if (removed_ones.count(dim)) {
-      if (dim != old_stl.dim_map[old_stl.dim_map.size() - 1]) {
-        // Remove non-stick squeezed dimensions
-        continue;
-      } else {
-        // Keep squeezed stick dimension but mark as sparse
-        new_device_size.push_back(
-            (i == old_stl.device_size.size() - 1)
-                ? spyre::elems_per_stick(old_stl.device_dtype)
-                : 1);
-        new_dim_map.push_back(-1);
-      }
-    } else {
-      // Do the normal logic for squeeze otherwise
-      auto below = std::count_if(
-          removed_ones.begin(), removed_ones.end(),
-          [dim](size_t r) { return static_cast<int32_t>(r) < dim; });
-
-      new_dim_map.push_back(dim - static_cast<int32_t>(below));
-      new_device_size.push_back(old_stl.device_size[i]);
-    }
-  }
-
-  DEBUGINFO(new_device_size, new_dim_map)
-
-  return SpyreTensorLayout(new_device_size, new_dim_map, old_stl.stride_map,
-                           old_stl.device_dtype);
-}
-
-template <typename Vec>
-SpyreTensorLayout maybe_get_squeezed_layout(const SpyreTensorLayout& old_stl,
-                                            const Vec& old_sizes,
-                                            const Vec& new_sizes) {
-  // A squeeze will always remove dimensions
-  if (new_sizes.size() >= old_sizes.size()) {
-    return old_stl;
-  }
-  // Get all 1 removed
-  using ElemType = typename Vec::value_type;
-  std::vector<ElemType> squeezed_old_sizes, squeezed_new_sizes;
-  std::set<size_t> removed_old_idxs, removed_new_idxs;
-  for (size_t i = 0; i < old_sizes.size(); ++i) {
-    if (old_sizes[i] != 1) {
-      squeezed_old_sizes.push_back(old_sizes[i]);
-    } else {
-      removed_old_idxs.insert(i);
-    }
-  }
-  for (size_t i = 0; i < new_sizes.size(); ++i) {
-    if (new_sizes[i] != 1) {
-      squeezed_new_sizes.push_back(new_sizes[i]);
-    } else {
-      removed_new_idxs.insert(i);
-    }
-  }
-
-  if (squeezed_new_sizes.size() != squeezed_old_sizes.size()) {
-    return old_stl;
-  }
-
-  std::set<size_t> removed_ones;
-  std::set_difference(removed_old_idxs.begin(), removed_old_idxs.end(),
-                      removed_new_idxs.begin(), removed_new_idxs.end(),
-                      std::inserter(removed_ones, removed_ones.begin()));
-  return get_squeezed_layout(old_stl, removed_ones);
-}
 
 //
 // templated for ArrayRef<int64_t> and SmallVector<int64_t> use cases
@@ -135,17 +53,9 @@ static at::Tensor spyre_alias_with_sizes_and_strides(const at::Tensor& self,
       static_cast<SpyreTensorImpl*>(self_.unsafeGetTensorImpl());
   spyre_tensor_impl_->set_storage_offset(self.storage_offset());
   spyre_tensor_impl_->set_sizes_and_strides(sizes, strides);
-  spyre_tensor_impl_->spyre_layout =
-      maybe_get_squeezed_layout(stl, Vec(self.sizes()), sizes);
-  if (spyre_tensor_impl_->spyre_layout == orig_impl->spyre_layout) {
-    spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-    spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
-  } else {
-    spyre_tensor_impl_->dma_sizes =
-        std::vector<int64_t>(sizes.begin(), sizes.end());
-    spyre_tensor_impl_->dma_strides =
-        std::vector<int64_t>(strides.begin(), strides.end());
-  }
+  spyre_tensor_impl_->spyre_layout = stl;
+  spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
+  spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   return self_;
 }
 
@@ -169,24 +79,9 @@ static at::Tensor spyre_alias_with_sizes_and_strides(
       static_cast<SpyreTensorImpl*>(self_.unsafeGetTensorImpl());
   spyre_tensor_impl_->set_sizes_and_strides(sizes, strides,
                                             self.sym_storage_offset());
-  spyre_tensor_impl_->spyre_layout = maybe_get_squeezed_layout(
-      stl, Container<c10::SymInt>(self.sym_sizes()), sizes);
-  if (spyre_tensor_impl_->spyre_layout == orig_impl->spyre_layout) {
-    spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
-    spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
-  } else {
-    std::vector<int64_t> dma_sizes, dma_strides;
-    dma_sizes.reserve(sizes.size());
-    dma_strides.reserve(strides.size());
-    for (const auto& s : sizes) {
-      dma_sizes.push_back(s.expect_int());
-    }
-    for (const auto& s : strides) {
-      dma_strides.push_back(s.expect_int());
-    }
-    spyre_tensor_impl_->dma_sizes = dma_sizes;
-    spyre_tensor_impl_->dma_strides = dma_strides;
-  }
+  spyre_tensor_impl_->spyre_layout = stl;
+  spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
+  spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   return self_;
 }
 
@@ -231,9 +126,8 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
       self.dtype());
   at::native::setStrided(result, size, stride, storage_offset);
   auto spyre_impl = static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
-  spyre_impl->spyre_layout =
-      maybe_get_squeezed_layout(device_layout, self.sizes(), size);
-  if (spyre_impl->spyre_layout == orig_impl->spyre_layout) {
+  spyre_impl->spyre_layout = device_layout;
+  if (device_layout == orig_impl->spyre_layout) {
     spyre_impl->dma_sizes = orig_impl->dma_sizes;
     spyre_impl->dma_strides = orig_impl->dma_strides;
   } else {
@@ -270,9 +164,8 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
   spyre_tensor_impl_->set_storage_offset(self.storage_offset() +
                                          offset_increment);
   spyre_tensor_impl_->set_sizes_and_strides(size, stride);
-  spyre_tensor_impl_->spyre_layout =
-      maybe_get_squeezed_layout(stl, self.sizes(), size);
-  if (spyre_tensor_impl_->spyre_layout == orig_stl) {
+  spyre_tensor_impl_->spyre_layout = stl;
+  if (stl == orig_stl) {
     spyre_tensor_impl_->dma_sizes = orig_impl->dma_sizes;
     spyre_tensor_impl_->dma_strides = orig_impl->dma_strides;
   } else {
