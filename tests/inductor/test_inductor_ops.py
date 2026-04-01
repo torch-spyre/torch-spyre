@@ -792,6 +792,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 32, 64), dtype=torch.float16),
                     cached_randn((2, 32, 128), dtype=torch.float16),
                 ),
+                "3d_dim1_size1": (
+                    1,
+                    cached_randn((8, 64, 128), dtype=torch.float16),
+                    cached_randn((8, 1, 128), dtype=torch.float16),
+                ),
                 "4d_dim0": (
                     0,
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
