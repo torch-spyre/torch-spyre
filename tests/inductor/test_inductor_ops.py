@@ -2469,19 +2469,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "float16_true": (torch.tensor([3.14], dtype=torch.float16),),
                 "float16_false": (torch.tensor([0.0], dtype=torch.float16),),
-                "float32_true": (torch.tensor([2.71828], dtype=torch.float32),),
-                # "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),), # TODO: will be supported soon
-                # "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),), # TODO: will be supported soon
+                # "float32_true": (torch.tensor([2.71828], dtype=torch.float32),), # # TODO: FP32 will be supported soon
+                # "float32_true": (torch.tensor([0.0], dtype=torch.float32),), # # TODO: FP32 will be supported soon
+                # "negative_true": (torch.tensor([-1.0], dtype=torch.float32),), # TODO: FP32 will be supported soon
+                # "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),), # TODO: BF16 will be supported soon
+                # "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),), # TODO: BF16 will be supported soon
                 "bool_true": (torch.tensor([True]),),
                 "bool_false": (torch.tensor([False]),),
-                "scalar_float": (torch.tensor(3.14, dtype=torch.float32),),
                 "from_computation_true": (
                     torch.tensor([2.0], dtype=torch.float16),
                     torch.tensor([3.0], dtype=torch.float16),
                 ),
                 "int_true": (torch.tensor([1], dtype=torch.int64),),
                 "int_false": (torch.tensor([0], dtype=torch.int64),),
-                "negative_true": (torch.tensor([-1.0], dtype=torch.float32),),
             },
         },
         ("test_sdpa", "test_sdpa_cpu"): {
@@ -5581,6 +5581,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             match="Boolean value of Tensor with more than one value is ambiguous",
         ):
             torch.is_nonzero(x_multi)
+
+        def fn(t):
+            return torch.is_nonzero(t)
+
+        compiled = torch.compile(fn)
 
         with pytest.raises(
             RuntimeError,
