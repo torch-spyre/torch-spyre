@@ -131,7 +131,7 @@ class ScratchPadAllocator:
             if can_reuse or force_pinning:
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
-                layout.allocation[f"lx:{idx}"] = addr  # see doctring Note 3
+                layout.allocation["lx"] = addr  # see doctring Note 3
                 # Record usage history for debugging
                 self.lx_usage_hist.append(
                     {
