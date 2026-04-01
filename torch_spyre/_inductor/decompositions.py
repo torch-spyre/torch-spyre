@@ -24,6 +24,7 @@ import torch._decomp as decomp
 from .constants import DEVICE_NAME
 from .errors import Unsupported
 from . import customops  # noqa: F401
+import torch_spyre.tensor
 
 import threading
 
@@ -294,6 +295,9 @@ def register_spyre_decompositions_via_dispatchkey(
                     return self.spyre_fn(*args, **kwargs)
                 else:
                     # Eager mode: use the pre-compiled wrapper.
+                    args, kwargs = torch_spyre.tensor.wrap_spyre_tensor_args(
+                        *args, **kwargs
+                    )
                     return self._compiled_fn(*args, **kwargs)
 
         def register(op):

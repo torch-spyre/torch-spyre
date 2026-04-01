@@ -312,6 +312,8 @@ PYBIND11_MODULE(_C, m) {
                                             t[4].cast<DataFormats>());
           }));
 
+  m.def("spyre_empty", &spyre::spyre_empty);
+  m.def("spyre_empty_strided", &spyre::spyre_empty_strided);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::py_empty_with_layout);

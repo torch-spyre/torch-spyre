@@ -17,6 +17,7 @@ import torch
 from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
+import torch_spyre.tensor
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
@@ -110,7 +111,8 @@ def rms_norm(
         raise Unsupported(
             f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
         )
-    return torch.compile(torch.ops.spyre.rms_norm)(x, normalized_shape, weight, eps)
+    args = torch_spyre.tensor.wrap_spyre_tensor_args(x, normalized_shape, weight, eps)
+    return torch.compile(torch.ops.spyre.rms_norm)(*args)
 
 
 @rms_norm.register_fake

@@ -22,12 +22,13 @@ def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length >
     {{ scalar_name }}_scaTensor = torch.tensor([{{ scalar_name }}], device="spyre")
     {% endfor %}
     {% endif %}
+    args, kwargs = torch_spyre.tensor.wrap_spyre_tensor_args({{ arg_names }})
     {% if "out" in overload_name %}
     # Out variant
     compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
-    return compiled_{{ operator_name }}({{ arg_names }}, out=out)
+    return compiled_{{ operator_name }}(*args, out=out, **kwargs)
     {% else %}
     # Standard variant
     compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
-    return compiled_{{ operator_name }}({{ arg_names }})
+    return compiled_{{ operator_name }}(*args, **kwargs)
     {% endif %}

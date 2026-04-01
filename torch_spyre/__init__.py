@@ -161,6 +161,7 @@ def make_spyre_module() -> types.ModuleType:
             "current_stream",
             "default_stream",
             "synchronize",
+            "SpyreTensor",
         }:
             impl._lazy_init()
             from torch_spyre.streams import (
@@ -170,6 +171,7 @@ def make_spyre_module() -> types.ModuleType:
                 default_stream,
                 synchronize,
             )
+            from torch_spyre.tensor import SpyreTensor
 
             streams_map = {
                 "Stream": Stream,
@@ -177,6 +179,7 @@ def make_spyre_module() -> types.ModuleType:
                 "current_stream": current_stream,
                 "default_stream": default_stream,
                 "synchronize": synchronize,
+                "SpyreTensor": SpyreTensor,
             }
             return streams_map[name]
         if hasattr(impl._C, name):
@@ -212,6 +215,7 @@ def _autoload():
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
+    import torch_spyre.tensor  # noqa: F401
     import torch_spyre.codegen_ops  # noqa: F401
     from torch_spyre._inductor import _light_autoload
 

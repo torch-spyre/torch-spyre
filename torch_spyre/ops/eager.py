@@ -14,6 +14,8 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
+from torch_spyre._C import spyre_empty, spyre_empty_strided
+import torch_spyre.tensor
 
 
 def maybe_wrap_dim(dim: int, ndims: int) -> int:
@@ -22,10 +24,35 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
+@torch.library.register_kernel("aten::empty.memory_format", ["spyre"])
+def _spyre_empty_memory_format(
+    size, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
+) -> torch.Tensor:
+    # layout is omitted; c10::Layout has no pybind11 type caster,
+    # so we drop that parameter and always uses the default (Strided).
+    assert layout in (None, torch.strided)
+    return torch_spyre.tensor.wrap_spyre_tensor(
+        spyre_empty(size, dtype, None, device, pin_memory, memory_format)
+    )
+
+
+@torch.library.register_kernel("aten::empty_strided", ["spyre"])
+def _spyre_empty_strided(
+    size, stride, *, dtype=None, layout=None, device=None, pin_memory=None
+) -> torch.Tensor:
+    # layout is omitted; c10::Layout has no pybind11 type caster,
+    # so we drop that parameter and always uses the default (Strided).
+    assert layout in (None, torch.strided)
+    return torch_spyre.tensor.wrap_spyre_tensor(
+        spyre_empty_strided(size, stride, dtype, None, device, pin_memory)
+    )
+
+
 @torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
 def spyre__mm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
     compiled_mm = torch.compile(torch.mm, dynamic=False)
-    return compiled_mm(self, mat2)
+    args, _ = torch_spyre.tensor.wrap_spyre_tensor_args(self, mat2)
+    return compiled_mm(*args)
 
 
 @torch.library.register_kernel("aten::mm.out", ["spyre"])  # type:ignore
@@ -33,7 +60,8 @@ def spyre__mm_out(
     self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor
 ) -> torch.Tensor:
     compiled_mm = torch.compile(torch.mm, dynamic=False)
-    return compiled_mm(self, mat2, out=out)
+    args, _ = torch_spyre.tensor.wrap_spyre_tensor_args(self, mat2)
+    return compiled_mm(*args, out=out)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -73,6 +101,7 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
 def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     # Out variant
     compiled_silu = torch.compile(torch.ops.aten.silu.out, dynamic=False)
+    (self,), _ = torch_spyre.tensor.wrap_spyre_tensor_args(self)
     return compiled_silu(self, out=out)
 
 
@@ -80,6 +109,7 @@ def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tenso
 def spyre__mish_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     # Out variant
     compiled_mish = torch.compile(torch.ops.aten.mish.out, dynamic=False)
+    (self,), _ = torch_spyre.tensor.wrap_spyre_tensor_args(self)
     return compiled_mish(self, out=out)
 
 

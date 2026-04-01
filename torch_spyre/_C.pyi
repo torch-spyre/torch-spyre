@@ -19,6 +19,8 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "convert_artifacts",
     "empty_with_layout",
+    "spyre_empty",
+    "spyre_empty_strided",
     "encode_constant",
     "free_runtime",
     "get_device_dtype",
@@ -251,6 +253,22 @@ def empty_with_layout(
     arg3: torch.device | None,
     arg4: bool | None,
     arg5: torch.memory_format | None,
+) -> torch.Tensor: ...
+def spyre_empty(
+    arg0: tuple[int, ...],
+    arg1: torch.dtype | None,
+    arg2: torch.layout | None,
+    arg3: torch.device | None,
+    arg4: bool | None,
+    arg5: torch.memory_format | None,
+) -> torch.Tensor: ...
+def spyre_empty_strided(
+    arg0: tuple[int, ...],
+    arg1: tuple[int, ...],
+    arg2: torch.dtype | None,
+    arg3: torch.layout | None,
+    arg4: torch.device | None,
+    arg5: bool | None,
 ) -> torch.Tensor: ...
 def encode_constant(arg0: typing.SupportsFloat, arg1: DataFormats) -> int: ...
 def free_runtime() -> None: ...

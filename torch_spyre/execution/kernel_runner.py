@@ -15,8 +15,13 @@
 import os
 from torch_spyre._C import launch_kernel
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre.tensor import SpyreTensor
 
 logger = get_inductor_logger("kernel_runner")
+
+
+def _unwrap_spyre_tensor(arg):
+    return arg._t if isinstance(arg, SpyreTensor) else arg
 
 
 class SpyreUnimplementedRunner:
@@ -40,5 +45,5 @@ class SpyreSDSCKernelRunner:
         for i in range(len(self.code_dirs)):
             g2 = os.path.join(self.code_dirs[i], "g2.graph.cbor")
             logger.info(f"RUN: {self.kernel_name}_{i} {g2}")
-            actuals = [args[i] for i in self.arg_mappings[i]]
+            actuals = [_unwrap_spyre_tensor(args[i]) for i in self.arg_mappings[i]]
             launch_kernel(g2, actuals)
