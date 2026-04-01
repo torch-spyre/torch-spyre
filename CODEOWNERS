@@ -23,6 +23,9 @@
 /torch_spyre/memory/     @JRosenkranz @thoangtrvn
 /torch_spyre/csrc/       @JRosenkranz @thoangtrvn
 
+# Profiler
+/torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971
+
 # Operations (eager ops and fallbacks)
 /torch_spyre/ops/        @ani300 @moriohara @pradghos
 /codegen/                @ani300 @moriohara @pradghos
