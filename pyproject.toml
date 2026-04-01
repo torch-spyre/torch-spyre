@@ -4,7 +4,6 @@ requires = [
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",
     "expecttest>=0.3.0",
-    "hypothesis",
     "jinja2",
     "ninja",
     "numpy",
@@ -39,7 +38,6 @@ build = [ # no-isolation build
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",
     "expecttest>=0.3.0",
-    "hypothesis",
     "jinja2",
     "ninja",
     "numpy",
