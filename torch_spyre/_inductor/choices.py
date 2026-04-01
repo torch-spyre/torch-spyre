@@ -18,10 +18,6 @@ import torch
 from torch._inductor.choices import InductorChoices
 from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 
-from torch_spyre._inductor.logging_utils import _get_env_bool
-
-_FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION")
-
 
 class SpyreHeuristics(InductorChoices):
     @staticmethod
@@ -43,7 +39,7 @@ class SpyreHeuristics(InductorChoices):
         node2: BaseSchedulerNode,
         shared_data_score: int,
     ) -> bool:
-        return _FUSION_ENABLED
+        return False
 
     @staticmethod
     def can_fuse_vertical(
@@ -52,7 +48,7 @@ class SpyreHeuristics(InductorChoices):
         node2: BaseSchedulerNode,
         shared_data_score: int,
     ) -> bool:
-        return _FUSION_ENABLED
+        return False
 
     @staticmethod
     def can_fuse_horizontal(
@@ -61,4 +57,4 @@ class SpyreHeuristics(InductorChoices):
         node2: BaseSchedulerNode,
         shared_data_score: int,
     ) -> bool:
-        return _FUSION_ENABLED
+        return False
