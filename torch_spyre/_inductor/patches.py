@@ -74,7 +74,8 @@ def enable_spyre_context(
     from torch_spyre._inductor.passes import (
         CustomPrePasses,
         CustomPostPasses,
-        scheduler_passes,
+        scheduler_pre_passes,
+        scheduler_post_passes,
         _maybe_run_scheduler_pass,
     )
 
@@ -95,7 +96,10 @@ def enable_spyre_context(
     inductor_config.post_grad_custom_pre_pass = CustomPrePasses()
     inductor_config.post_grad_custom_post_pass = CustomPostPasses()
     inductor_config._pre_fusion_custom_pass = lambda nodes: _maybe_run_scheduler_pass(
-        scheduler_passes, nodes
+        scheduler_pre_passes, nodes
+    )
+    inductor_config._post_fusion_custom_pass = lambda nodes: _maybe_run_scheduler_pass(
+        scheduler_post_passes, nodes
     )
     # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
