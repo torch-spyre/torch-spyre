@@ -272,3 +272,8 @@ def spyre__tril(input, diagonal=0, **kwargs):
 @register_fallback([aten.triu.default, aten.triu.out])
 def spyre__triu(input, diagonal=0, **kwargs):
     return torch.triu(input, diagonal, **kwargs)
+
+
+@register_fallback([aten.slice.Tensor])
+def spyre__slice(self, dim=0, start=None, end=None, step=1):
+    return torch.ops.aten.slice(self, dim, start, end, step)
