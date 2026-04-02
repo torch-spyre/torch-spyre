@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import tempfile
 from typing import Any
 import os
@@ -20,9 +19,9 @@ import subprocess
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
-from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
+from torch_spyre._inductor.codegen.bundle import generate_bundle
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -40,42 +39,23 @@ class SpyreAsyncCompile:
         pass
 
     def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
-        # 1. Generate SDSC.json for each OpSpec
-        sdscs_json = []
-        for ks in specs:
-            if isinstance(ks, UnimplementedOp):
-                print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
-                return SpyreUnimplementedRunner(kernel_name, ks.op)
+        unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
+        if len(unimp) != 0:
+            logger.warning(
+                f"WARNING: Compiling unimplemented {unimp[0].op}to runtime exception"
+            )
+            return SpyreUnimplementedRunner(kernel_name, unimp[0].op)
 
-            sdsc_json, arg_map = compile_op_spec(kernel_name, ks)
-            sdscs_json.append(sdsc_json)
+        # Generate SDSC Bundle from OpSpecs
+        output_dir = get_output_dir(kernel_name)
+        op_specs = [s for s in specs if isinstance(s, OpSpec)]
+        generate_bundle(kernel_name, output_dir, op_specs)
 
-        # Write SDSCs to file system, invoke backend compiler, and return KernelRunner
-        kernel_output_dir = get_output_dir(kernel_name)
-        for idx, sdsc_json in enumerate(sdscs_json):
-            with open(os.path.join(kernel_output_dir, f"sdsc_{idx}.json"), "w") as file:
-                logger.info(f"Generating {file.name}")
-                json.dump(sdsc_json, file, indent=2)
-        with open(os.path.join(kernel_output_dir, "bundle.mlir"), "w") as file:
-            logger.info(f"Generating {file.name}")
-            file.write("module {\n")
-            file.write("\tfunc.func @sdsc_bundle() {\n")
-            for i in range(len(sdscs_json)):
-                file.write(
-                    '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_'
-                    + f"{i}"
-                    + '.json"}\n'
-                )
-            file.write("\t\treturn\n")
-            file.write("\t}\n")
-            file.write("}\n")
+        # Invoke backend compiler of SDSC Bundle
+        subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
+        convert_artifacts(output_dir)
 
-        subprocess.run(
-            ["dxp_standalone", "--bundle", "-d", kernel_output_dir], check=True
-        )
-        convert_artifacts(kernel_output_dir)
-
-        return SpyreSDSCKernelRunner(kernel_name, kernel_output_dir)
+        return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass
