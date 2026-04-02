@@ -66,7 +66,8 @@ class CustomPrePasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPrePasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 class CustomPostPasses(CustomGraphPass):
@@ -91,7 +92,8 @@ class CustomPostPasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPostPasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 def _maybe_run_scheduler_pass(
