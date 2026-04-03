@@ -42,7 +42,7 @@ class SpyreAsyncCompile:
         unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
         if len(unimp) != 0:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp[0].op}to runtime exception"
+                f"WARNING: Compiling unimplemented {unimp[0].op} to runtime exception"
             )
             return SpyreUnimplementedRunner(kernel_name, unimp[0].op)
 
