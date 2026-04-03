@@ -49,7 +49,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
 | `torch.ne` | | Y | Spyre | |
-| `torch.gt` | | Y | Spyre | Custom decomposition |
+| `torch.gt` | | Y | Spyre | |
 | `torch.lt` | Y | Y | Spyre | |
 | `torch.ge` | Y | Y | Spyre | |
 | `torch.le` | | Y | Spyre | |

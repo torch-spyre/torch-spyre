@@ -132,6 +132,10 @@ class SpyreOpFuncs:
         return PointwiseOp("gelufwd", [x])
 
     @staticmethod
+    def gt(a, b):
+        return PointwiseOp("greaterthan", [a, b])
+
+    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 
@@ -147,6 +151,10 @@ class SpyreOpFuncs:
     @staticmethod
     def log(x):
         return PointwiseOp("log", [x])
+
+    @staticmethod
+    def lt(a, b):
+        return PointwiseOp("lesserthan", [a, b])
 
     @staticmethod
     def mul(a, b):
