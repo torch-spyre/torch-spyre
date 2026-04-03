@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import inspect
-import os
 from typing import Optional, Any, Callable, List
 
 import torch
@@ -35,6 +34,7 @@ from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
+from . import config
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -121,7 +121,7 @@ def scheduler_pre_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
 
     nodes = propagate_spyre_tensor_layouts(nodes)
     nodes = core_division_planning(nodes)
-    if os.environ.get("LX_PLANNING", "0") == "1":
+    if config.lx_planning:
         nodes = scratchpad_planning(nodes)
     return nodes
 

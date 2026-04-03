@@ -15,7 +15,6 @@
 
 import dataclasses
 import math
-import os
 from sympy import Expr, Symbol
 
 import torch
@@ -40,6 +39,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps, device_coordinates, iteration_space
 from .logging_utils import get_inductor_logger
+from . import config
 import logging
 
 logger = get_inductor_logger("core_division")
@@ -351,7 +351,7 @@ def core_division_planning(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
     # Nodes are in topological order (guaranteed by caller).
-    max_cores = int(os.getenv("SENCORES", "32"))
+    max_cores = config.sencores
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
 

@@ -14,6 +14,7 @@
 
 from .constants import DEVICE_NAME
 from .patches import enable_spyre_context
+from . import config
 
 import threading
 from functools import wraps
@@ -158,7 +159,10 @@ def _autoload():
         from .wrapper import SpyrePythonWrapperCodegen
 
         register_backend_for_device(
-            DEVICE_NAME, SuperDSCScheduling, SpyrePythonWrapperCodegen
+            DEVICE_NAME,
+            SuperDSCScheduling,
+            SpyrePythonWrapperCodegen,
+            device_custom_config=config,
         )
 
         _autoload._ran = True
