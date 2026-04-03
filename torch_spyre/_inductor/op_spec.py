@@ -15,8 +15,9 @@
 
 import dataclasses
 from typing import Any, Sequence
-import torch
-from torch_spyre._C import SpyreTensorLayout
+
+from sympy import Symbol, Expr
+from torch_spyre._C import DataFormats
 
 
 @dataclasses.dataclass
@@ -27,21 +28,19 @@ class TensorArg:
     Attributes:
         is_input: Is the Tensor used as an input to the operation?
         arg_index: The index of the Tensor in the argument array of the Kernel.
-        dtype: The PyTorch (host) dtype of the tensor elements.
-        it_dim_map: A mapping between the op's iteration_space and the PyTorch (host) dimensions of the Tensor.
-            it_dim_map[d] is an integer that is interpreted as follows:
-                -1 indicates the the d-th dimension of ks.iteration_space is a broadcast or reduction dimension for this Tensor.
-                A non-negative value is the PyTorch (host) dimension of the Tensor that corresponds to the d-th dimension of ks.iteration_space.
+        device_dtype: The device dtype of the tensor elements.
+        device_size: The device size (as per SpyreTensorLayout) of the Tensor
+        device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
+                Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
-        device_layout: The SpyreTensorLayout describe the device shape of the Tensor.
     """
 
     is_input: bool
     arg_index: int
-    dtype: torch.dtype
-    it_dim_map: list[int]
+    device_dtype: DataFormats
+    device_size: list[int]
+    device_coordinates: list[Expr]
     allocation: Any
-    device_layout: SpyreTensorLayout
 
 
 @dataclasses.dataclass
@@ -52,14 +51,14 @@ class OpSpec:
     Attributes:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
-        iteration_space: The iteration space of the operation.
+        iteration_space: The iteration space of the operation. The values are tuples of (range, core_division).
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
     """
 
     op: str
     is_reduction: bool
-    iteration_space: list[int]
+    iteration_space: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
 

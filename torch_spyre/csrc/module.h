@@ -30,11 +30,6 @@ namespace spyre {
 
 using Runtime = flex::StreamRuntime;
 
-struct SharedOwnerCtx {
-  flex::DeviceMemoryAllocationPtr owner;
-  signed char device_id;
-};
-
 class GlobalRuntime {
  public:
   static void set(const std::shared_ptr<Runtime>& runtime) {

@@ -109,7 +109,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
         with pytest.warns(torch_spyre.ops.fallbacks.FallbackWarning) as record:
-            compare_with_cpu(fn, x, cpu_compile=True)
+            # run_eager=False: the eager path also triggers a FallbackWarning
+            # (sin dispatches to the CPU fallback kernel), and pytest.warns
+            # overrides the module-level "once" filter, so we'd capture 2
+            # warnings instead of 1.  This test only cares about decomposition
+            # table integrity, so skip eager.
+            compare_with_cpu(fn, x, cpu_compile=True, run_eager=False)
 
         assert len(record) == 1, "Exactly one FallbackWarning should be encountered!"
 

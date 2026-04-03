@@ -256,7 +256,9 @@ def parse_dtype(spec) -> torch.dtype:
     )
 
 
-def make_SampleInput(case: Dict[str, Any], seed, dtype: torch.dtype) -> SampleInput:
+def make_SampleInput(
+    case: Dict[str, Any], seed, dtype: torch.dtype, test_device: torch.device
+) -> SampleInput:
     dtype_str = str(dtype)
     cpu_args = []
     for i, inp in enumerate(case.get("inputs", [])):
@@ -286,6 +288,11 @@ def make_SampleInput(case: Dict[str, Any], seed, dtype: torch.dtype) -> SampleIn
                     val = ast.literal_eval(val)
                 except (ValueError, SyntaxError):
                     pass
+                # if test target is tensor.to("cuda:0"), replace "cuda:0" with test_device
+                op_name = case.get("op")
+                if test_device is not None and op_name == "torch.to":
+                    if "cuda" in val:
+                        val = test_device
             cpu_args.append(val)  # python scalar or list, etc.
         elif "py" in inp:
             cpu_args.append(parse_py_value(inp["py"]))
@@ -302,6 +309,10 @@ def make_SampleInput(case: Dict[str, Any], seed, dtype: torch.dtype) -> SampleIn
                     value = ast.literal_eval(value)
                 except (ValueError, SyntaxError):
                     pass
+            # if test target has (device="cuda:0"), replace "cuda:0" with test_device
+            if test_device is not None and key == "device":
+                if "cuda" in value:
+                    value = test_device
         attrs[key] = value
 
     args = tuple(cpu_args[1:]) if len(cpu_args) > 1 else None
@@ -347,7 +358,30 @@ def run_test(
             test_out = test_sample.input
 
     ref_out_cpu = to_device(ref_out, torch.device("cpu"))
-    assert confirm_device(test_out, device), "this result must be on spyre"
+
+    # Check if the operation explicitly specifies CPU device
+    is_cpu_operation = False
+    if op_name == "torch.to":
+        # Check if device argument for torch.to is "cpu"
+        if str(test_sample.kwargs.get("device", "")) == "cpu" or (
+            test_sample.args
+            and len(test_sample.args) > 0
+            and str(test_sample.args[0]) == "cpu"
+        ):
+            is_cpu_operation = True
+    else:
+        # Check if device kwarg is "cpu"
+        if str(test_sample.kwargs.get("device", "")) == "cpu":
+            is_cpu_operation = True
+
+    # Check if the output tensor is on expected device
+    if is_cpu_operation:
+        assert confirm_device(test_out, torch.device("cpu")), (
+            "result must be on cpu for explicit cpu operations"
+        )
+    else:
+        assert confirm_device(test_out, device), "this result must be on spyre"
+
     test_out_cpu = to_device(test_out, torch.device("cpu"))
     _assert_same(
         testCase,

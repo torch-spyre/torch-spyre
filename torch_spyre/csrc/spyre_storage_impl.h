@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include <ATen/ATen.h>
+#include <c10/core/CachingDeviceAllocator.h>
 #include <c10/core/StorageImpl.h>
 #include <c10/core/SymInt.h>
 
@@ -32,7 +32,7 @@ namespace spyre {
 class SpyreStorageImpl : public c10::StorageImpl {
  public:
   SpyreStorageImpl(use_byte_size_t, c10::SymInt size_bytes,
-                   at::Allocator* allocator, bool resizable);
+                   c10::DeviceAllocator* allocator, bool resizable);
 };
 
 }  // namespace spyre

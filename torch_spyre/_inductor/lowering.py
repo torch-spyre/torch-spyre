@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import Reduction, Pointwise
+from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -202,8 +202,8 @@ def ensure_default_handler(op_name):
 
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
-    x = V.graph.get_buffer(x.realize())
-    y = V.graph.get_buffer(y.realize())
+    x.realize()
+    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
@@ -212,46 +212,45 @@ def lower_mm(x, y):
     x_ndim = len(x_size)
     y_ndim = len(y_size)
 
+    reduction_numel = x_size[-1]  # K
+
     # Handle 3D input with 2D weight (batched matmul)
     if x_ndim == 3 and y_ndim == 2:
+        reduction_type = BATCH_MATMUL_OP  # Use BATCH_MATMUL_OP for 3D×2D
+        ranges = [x_size[0], x_size[1], y_size[1]]  # [B, M, N]
 
         def inner_fn(index, reduction_index):
             i0, i1, i2 = index  # batch, row, col
             (r0,) = reduction_index
             return (x_loader([i0, i1, r0]), y_loader([r0, i2]))
-
-        result = Reduction.create(
-            reduction_type=BATCH_MATMUL_OP,  # Use BATCH_MATMUL_OP for 3D×2D
-            input_node=[x, y],
-            device=x.get_device(),
-            dst_dtype=x.get_dtype(),
-            src_dtype=x.get_dtype(),
-            inner_fn=inner_fn,
-            ranges=[x_size[0], x_size[1], y_size[1]],  # [B, M, N]
-            reduction_ranges=[x_size[2]],  # K
-        )
-    # Standard 2D × 2D matrix multiplication
     elif x_ndim == 2 and y_ndim == 2:
+        reduction_type = MATMUL_REDUCTION_OP  # Use MATMUL_REDUCTION_OP for 2D×2D
+        ranges = [x_size[0], y_size[1]]
 
         def inner_fn(index, reduction_index):
             i0, i1 = index
             (r0,) = reduction_index
             return (x_loader([i0, r0]), y_loader([r0, i1]))
+    else:
+        raise ValueError(
+            f"Unsupported tensor dimensions for mm: x.shape={x_size}, y.shape={y_size}. "
+            f"Expected (2D, 2D) or (3D, 2D), got ({x_ndim}D, {y_ndim}D)"
+        )
 
+    if reduction_numel == 1:
+        # Reduction degenerates to a pointwise mul
+        # TODO: Arguments reversed to work around #1165
+        result = lowering.mul(y, x)
+    else:
         result = Reduction.create(
-            reduction_type=MATMUL_REDUCTION_OP,  # Use MATMUL_REDUCTION_OP for 2D×2D
+            reduction_type=reduction_type,
             input_node=[x, y],
             device=x.get_device(),
             dst_dtype=x.get_dtype(),
             src_dtype=x.get_dtype(),
             inner_fn=inner_fn,
-            ranges=[x_size[0], y_size[1]],
-            reduction_ranges=[x_size[1]],
-        )
-    else:
-        raise ValueError(
-            f"Unsupported tensor dimensions for mm: x.shape={x_size}, y.shape={y_size}. "
-            f"Expected (2D, 2D) or (3D, 2D), got ({x_ndim}D, {y_ndim}D)"
+            ranges=ranges,
+            reduction_ranges=[reduction_numel],
         )
 
     result.realize()
@@ -268,12 +267,20 @@ def lower_mm(x, y):
 
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
-    x = V.graph.get_buffer(x.realize())
-    y = V.graph.get_buffer(y.realize())
+    x.realize()
+    y.realize()
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
-    if len(x.get_size()) == 3 and len(y.get_size()) == 3:
+    x_size = x.get_size()
+    y_size = y.get_size()
+    x_ndim = len(x_size)
+    y_ndim = len(y_size)
+
+    reduction_numel = x_size[-1]  # K
+
+    if x_ndim == 3 and y_ndim == 3:
+        ranges = [x_size[0], x_size[1], y_size[2]]  # B, M, N
 
         def inner_fn(index, reduction_index):
             i0, i1, i2 = index
@@ -281,18 +288,8 @@ def lower_bmm(x, y):
             tmp1 = x_loader([i0, i1, r0])
             tmp2 = y_loader([i0, r0, i2])
             return (tmp1, tmp2)
-
-        result = Reduction.create(
-            reduction_type=BATCH_MATMUL_OP,
-            input_node=[x, y],
-            device=x.get_device(),
-            dst_dtype=x.get_dtype(),
-            src_dtype=x.get_dtype(),
-            inner_fn=inner_fn,
-            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[2]],  # B, M, N
-            reduction_ranges=[x.get_size()[2]],  # K
-        )
-    elif len(x.get_size()) == 4 and len(y.get_size()) == 4:
+    elif x_ndim == 4 and y_ndim == 4:
+        ranges = [x_size[0], x_size[1], x_size[2], y_size[-1]]
 
         def inner_fn(index, reduction_index):
             i0, i1, i2, i3 = index
@@ -300,23 +297,8 @@ def lower_bmm(x, y):
             tmp1 = x_loader([i0, i1, i2, r0])
             tmp2 = y_loader([i0, i1, r0, i3])
             return (tmp1, tmp2)
-
-        result = Reduction.create(
-            reduction_type=BATCH_MATMUL_OP,
-            input_node=[x, y],
-            device=x.get_device(),
-            dst_dtype=x.get_dtype(),
-            src_dtype=x.get_dtype(),
-            inner_fn=inner_fn,
-            ranges=[
-                x.get_size()[0],
-                x.get_size()[1],
-                x.get_size()[2],
-                y.get_size()[-1],
-            ],
-            reduction_ranges=[x.get_size()[-1]],
-        )
-    elif len(x.get_size()) == 3 and len(y.get_size()) == 2:
+    elif x_ndim == 3 and y_ndim == 2:
+        ranges = [x_size[0], x_size[1], y_size[1]]  # B, M, N
 
         def inner_fn(index, reduction_index):
             i0, i1, i2 = index
@@ -324,7 +306,14 @@ def lower_bmm(x, y):
             tmp1 = x_loader([i0, i1, r0])
             tmp2 = y_loader([r0, i2])
             return (tmp1, tmp2)
+    else:
+        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
 
+    if reduction_numel == 1:
+        # Reduction degenerates to a pointwise mul
+        # TODO: Arguments reversed to work around #1165
+        result = lowering.mul(y, x)
+    else:
         result = Reduction.create(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
@@ -332,58 +321,19 @@ def lower_bmm(x, y):
             dst_dtype=x.get_dtype(),
             src_dtype=x.get_dtype(),
             inner_fn=inner_fn,
-            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[1]],  # B, M, N
-            reduction_ranges=[x.get_size()[2]],  # K
+            ranges=ranges,
+            reduction_ranges=[reduction_numel],
         )
-    else:
-        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
+
     result.realize()
 
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"bmm: x{[int(s) for s in x.get_size()]} @ y{[int(s) for s in y.get_size()]} -> {[int(s) for s in result_buf.get_size()]}"
+            f"bmm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}"
         )
 
     return result
-
-
-@register_spyre_lowering(torch.ops.spyre.swap)
-def lower_swap(x):
-    fn = lowering.ops_wrapper(torch.ops.spyre.swap.__name__)
-
-    def inner_fn(index):
-        return fn(x.make_loader()(index))
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.slice)
-def lower_slice(x):
-    fn = lowering.ops_wrapper(torch.ops.spyre.slice.__name__)
-
-    def inner_fn(index):
-        return fn(x.make_loader()(index))
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
 
 
 @register_spyre_lowering(torch.ops.spyre.exx2)
@@ -553,3 +503,43 @@ def clone(x, *, memory_format=None):
         result.realize()
         result.freeze_layout_with_stride_order(stride_order)
     return result
+
+
+@register_spyre_lowering(torch.ops.spyre.overwrite)
+def lower_overwrite(input, output, dim, offset):
+    fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
+
+    def inner_fn(index):
+        return fn(
+            input.make_loader()(index),
+            int(output.get_layout().stride[dim]),
+            offset,
+            int(output.get_layout().size[dim] - input.get_layout().size[dim]),
+        )
+
+    inp = Pointwise(
+        device=input.get_device(),
+        dtype=input.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=input.get_size(),
+    )
+
+    output.realize()
+
+    try:
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+    except ImportError:
+        raise RuntimeError(
+            "spyre::overwrite lowering: MutationLayoutSHOULDREMOVE is not available. "
+            "Upstream likely removed/renamed it."
+        )
+
+    buffer = ComputedBuffer(
+        name=None,
+        layout=MutationLayoutSHOULDREMOVE(output),
+        data=inp,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    return output

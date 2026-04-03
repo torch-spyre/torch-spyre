@@ -292,6 +292,12 @@ class TestSpyre(TestCase):
                 x = torch.empty(64, dtype=dtype)
                 x.to("spyre")
 
+    def test_detach(self):
+        # exercises the shallow copy code path
+        for dtype in [torch.float16, torch.float32, torch.bool, torch.int8]:
+            x = torch.empty(64, dtype=dtype, device="spyre")
+            x.detach().cpu()
+
     def test_hooks_on_import(self):
         import torch
 

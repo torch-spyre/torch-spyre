@@ -221,6 +221,13 @@ def spyre__cos(input, **kwargs):
     return torch.cos(input, **kwargs)
 
 
+# Manually append to fallback_ops: register_fallback cannot be used here because
+# normal_ is an in-place op — register_fallback is designed for out-of-place ops
+# and would leave the original Spyre tensor unfilled.
+# The kernel itself is registered in ops.py (and therefore codegen_ops.py).
+fallback_ops.append(aten.normal_.default)
+
+
 @register_fallback([aten.embedding.default])
 def spyre__embedding(
     weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
@@ -255,3 +262,18 @@ def spyre__isin(
     return torch.isin(
         elements, test_elements, assume_unique=assume_unique, invert=invert, **kwargs
     )
+
+
+@register_fallback([aten.tril.default, aten.tril.out])
+def spyre__tril(input, diagonal=0, **kwargs):
+    return torch.tril(input, diagonal, **kwargs)
+
+
+@register_fallback([aten.triu.default, aten.triu.out])
+def spyre__triu(input, diagonal=0, **kwargs):
+    return torch.triu(input, diagonal, **kwargs)
+
+
+@register_fallback([aten.slice.Tensor])
+def spyre__slice(self, dim=0, start=None, end=None, step=1):
+    return torch.ops.aten.slice(self, dim, start, end, step)

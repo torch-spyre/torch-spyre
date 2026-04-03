@@ -24,10 +24,16 @@ from torch._inductor.custom_graph_pass import (
 )
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from .temp_passes import relayout_linear_weights, replace_scalar_with_tensor
+from .temp_passes import (
+    bmm_unflatten_pass,
+    mm_to_bmm_pass,
+    relayout_linear_weights,
+    replace_scalar_with_tensor,
+)
 from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
+from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 
 
@@ -60,7 +66,8 @@ class CustomPrePasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPrePasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 class CustomPostPasses(CustomGraphPass):
@@ -73,8 +80,10 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
-        relayout_linear_weights,
         replace_scalar_with_tensor,
+        relayout_linear_weights,
+        mm_to_bmm_pass.apply,
+        bmm_unflatten_pass.apply,
     ]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
@@ -83,7 +92,8 @@ class CustomPostPasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPostPasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 def _maybe_run_scheduler_pass(
@@ -100,10 +110,10 @@ def _maybe_run_scheduler_pass(
     return nodes
 
 
-def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+def scheduler_pre_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     This inductor extension point enables Spyre-specific passes to run over
-    the graph of LoopLevelIR nodes immediately before fusion is applied.
+    the graph of LoopLevelIR nodes immediately before Inductor's fusion pass runs.
 
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
@@ -114,3 +124,15 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     if os.environ.get("LX_PLANNING", "0") == "1":
         nodes = scratchpad_planning(nodes)
     return nodes
+
+
+def scheduler_post_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    """
+    This inductor extension point enables Spyre-specific passes to run over
+    the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
+
+    The list of nodes is guarenteed by the caller to be in topological order.
+    The returned list of nodes must also be in topological order.
+    """
+
+    return spyre_fuse_nodes(nodes)

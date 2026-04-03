@@ -1,0 +1,15 @@
+/* Custom CSS overrides for Torch-Spyre documentation */
+
+/* Widen the content area slightly */
+.wy-nav-content {
+    max-width: 960px;
+}
+
+/* Style inline code to stand out */
+code.literal {
+    background-color: #f5f5f5;
+    border: 1px solid #e0e0e0;
+    border-radius: 3px;
+    padding: 0 3px;
+    font-size: 90%;
+}

@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 470" font-family="monospace, sans-serif" font-size="12">
+  <rect width="700" height="470" fill="white"/>
+  <defs>
+    <marker id="ab"  markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#1e40af"/></marker>
+    <marker id="abr" markerWidth="7" markerHeight="7" refX="1" refY="3.5" orient="auto-start-reverse"><path d="M0,0 L7,3.5 L0,7 Z" fill="#1e40af"/></marker>
+    <marker id="ao"  markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#b45309"/></marker>
+    <marker id="aor" markerWidth="7" markerHeight="7" refX="1" refY="3.5" orient="auto-start-reverse"><path d="M0,0 L7,3.5 L0,7 Z" fill="#b45309"/></marker>
+    <marker id="ag"  markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#065f46"/></marker>
+    <marker id="agr" markerWidth="7" markerHeight="7" refX="1" refY="3.5" orient="auto-start-reverse"><path d="M0,0 L7,3.5 L0,7 Z" fill="#065f46"/></marker>
+  </defs>
+
+  <!-- TITLE -->
+  <text x="350" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">PyTorch Tensor — shape (4, 6),  stride (6, 1)</text>
+
+  <!-- DIM 1 annotation (top, double arrow) -->
+  <line x1="120" y1="50" x2="492" y2="50" stroke="#1e40af" stroke-width="1.5" marker-start="url(#abr)" marker-end="url(#ab)"/>
+  <text x="306" y="43" text-anchor="middle" fill="#1e40af" font-size="11">dim 1 (columns)  —  size[1] = 6  —  stride[1] = 1</text>
+
+  <!-- Column labels -->
+  <text x="151" y="70" text-anchor="middle" fill="#1e40af" font-weight="bold" font-size="11">j=0</text>
+  <text x="213" y="70" text-anchor="middle" fill="#1e40af" font-weight="bold" font-size="11">j=1</text>
+  <text x="275" y="70" text-anchor="middle" fill="#1e40af" font-weight="bold" font-size="11">j=2</text>
+  <text x="337" y="70" text-anchor="middle" fill="#1e40af" font-weight="bold" font-size="11">j=3</text>
+  <text x="399" y="70" text-anchor="middle" fill="#1e40af" font-weight="bold" font-size="11">j=4</text>
+  <text x="461" y="70" text-anchor="middle" fill="#1e40af" font-weight="bold" font-size="11">j=5</text>
+
+  <!-- DIM 0 annotation (left, double arrow) -->
+  <line x1="70" y1="100" x2="70" y2="276" stroke="#1e40af" stroke-width="1.5" marker-start="url(#abr)" marker-end="url(#ab)"/>
+  <text x="62" y="188" text-anchor="middle" fill="#1e40af" font-size="11" transform="rotate(-90 62 188)">dim 0 (rows)  —  size[0] = 4  —  stride[0] = 6</text>
+
+  <!-- Row labels -->
+  <text x="108" y="122" text-anchor="end" fill="#1e40af" font-weight="bold" font-size="11">i=0</text>
+  <text x="108" y="166" text-anchor="end" fill="#1e40af" font-weight="bold" font-size="11">i=1</text>
+  <text x="108" y="210" text-anchor="end" fill="#1e40af" font-weight="bold" font-size="11">i=2</text>
+  <text x="108" y="254" text-anchor="end" fill="#1e40af" font-weight="bold" font-size="11">i=3</text>
+
+  <!-- GRID CELLS (4 rows x 6 cols), offset values inside -->
+  <!-- Row 0 -->
+  <rect x="120" y="100" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="151" y="127" text-anchor="middle" fill="#1e3a8a" font-weight="bold">0</text>
+  <rect x="182" y="100" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="213" y="127" text-anchor="middle" fill="#1e3a8a" font-weight="bold">1</text>
+  <rect x="244" y="100" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="275" y="127" text-anchor="middle" fill="#1e3a8a" font-weight="bold">2</text>
+  <rect x="306" y="100" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="337" y="127" text-anchor="middle" fill="#1e3a8a" font-weight="bold">3</text>
+  <rect x="368" y="100" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="399" y="127" text-anchor="middle" fill="#1e3a8a" font-weight="bold">4</text>
+  <rect x="430" y="100" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="461" y="127" text-anchor="middle" fill="#1e3a8a" font-weight="bold">5</text>
+  <!-- Row 1 — cell (1,2)=8 highlighted -->
+  <rect x="120" y="144" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="151" y="171" text-anchor="middle" fill="#1e3a8a" font-weight="bold">6</text>
+  <rect x="182" y="144" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="213" y="171" text-anchor="middle" fill="#1e3a8a" font-weight="bold">7</text>
+  <rect x="244" y="144" width="62" height="44" fill="#fde68a" stroke="#f59e0b" stroke-width="2.5"/>
+  <text x="275" y="171" text-anchor="middle" fill="#92400e" font-weight="bold" font-size="14">8</text>
+  <rect x="306" y="144" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="337" y="171" text-anchor="middle" fill="#1e3a8a" font-weight="bold">9</text>
+  <rect x="368" y="144" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="399" y="171" text-anchor="middle" fill="#1e3a8a" font-weight="bold">10</text>
+  <rect x="430" y="144" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="461" y="171" text-anchor="middle" fill="#1e3a8a" font-weight="bold">11</text>
+  <!-- Row 2 -->
+  <rect x="120" y="188" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="151" y="215" text-anchor="middle" fill="#1e3a8a" font-weight="bold">12</text>
+  <rect x="182" y="188" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="213" y="215" text-anchor="middle" fill="#1e3a8a" font-weight="bold">13</text>
+  <rect x="244" y="188" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="275" y="215" text-anchor="middle" fill="#1e3a8a" font-weight="bold">14</text>
+  <rect x="306" y="188" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="337" y="215" text-anchor="middle" fill="#1e3a8a" font-weight="bold">15</text>
+  <rect x="368" y="188" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="399" y="215" text-anchor="middle" fill="#1e3a8a" font-weight="bold">16</text>
+  <rect x="430" y="188" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="461" y="215" text-anchor="middle" fill="#1e3a8a" font-weight="bold">17</text>
+  <!-- Row 3 -->
+  <rect x="120" y="232" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="151" y="259" text-anchor="middle" fill="#1e3a8a" font-weight="bold">18</text>
+  <rect x="182" y="232" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="213" y="259" text-anchor="middle" fill="#1e3a8a" font-weight="bold">19</text>
+  <rect x="244" y="232" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="275" y="259" text-anchor="middle" fill="#1e3a8a" font-weight="bold">20</text>
+  <rect x="306" y="232" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="337" y="259" text-anchor="middle" fill="#1e3a8a" font-weight="bold">21</text>
+  <rect x="368" y="232" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="399" y="259" text-anchor="middle" fill="#1e3a8a" font-weight="bold">22</text>
+  <rect x="430" y="232" width="62" height="44" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+  <text x="461" y="259" text-anchor="middle" fill="#1e3a8a" font-weight="bold">23</text>
+
+  <!-- STRIDE[0]=6 annotation (right side, between rows 0 and 1 of column j=2) -->
+  <line x1="306" y1="122" x2="508" y2="122" stroke="#b45309" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="306" y1="166" x2="508" y2="166" stroke="#b45309" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="508" y1="128" x2="508" y2="160" stroke="#b45309" stroke-width="2" marker-start="url(#aor)" marker-end="url(#ao)"/>
+  <text x="514" y="140" fill="#b45309" font-size="11" font-weight="bold">stride[0]=6</text>
+  <text x="514" y="154" fill="#b45309" font-size="10">(1 full row)</text>
+
+  <!-- STRIDE[1]=1 annotation (between columns j=2 and j=3, shown at memory level) -->
+
+  <!-- DASHED CONNECTOR: grid cell (1,2) → memory cell 8 -->
+  <line x1="275" y1="188" x2="263" y2="318" stroke="#92400e" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#ao)"/>
+
+  <!-- LINEAR MEMORY STRIP label -->
+  <text x="350" y="316" text-anchor="middle" fill="#374151" font-size="11" font-weight="bold">Linear memory (row-major order):</text>
+
+  <!-- Memory cells 0–23, each 24px wide, y=322 -->
+  <!-- x_start=62, cell_w=24 -->
+  <!-- n=0: x=62, n=8: x=62+192=254 -->
+  <rect x="62"  y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="74"  y="340" text-anchor="middle" fill="#475569" font-size="9">0</text>
+  <rect x="86"  y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="98"  y="340" text-anchor="middle" fill="#475569" font-size="9">1</text>
+  <rect x="110" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="122" y="340" text-anchor="middle" fill="#475569" font-size="9">2</text>
+  <rect x="134" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="146" y="340" text-anchor="middle" fill="#475569" font-size="9">3</text>
+  <rect x="158" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="170" y="340" text-anchor="middle" fill="#475569" font-size="9">4</text>
+  <rect x="182" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="194" y="340" text-anchor="middle" fill="#475569" font-size="9">5</text>
+  <rect x="206" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="218" y="340" text-anchor="middle" fill="#475569" font-size="9">6</text>
+  <rect x="230" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="242" y="340" text-anchor="middle" fill="#475569" font-size="9">7</text>
+  <!-- cell 8 highlighted -->
+  <rect x="254" y="320" width="24" height="30" fill="#fde68a" stroke="#f59e0b" stroke-width="2"/><text x="266" y="340" text-anchor="middle" fill="#92400e" font-weight="bold" font-size="9">8</text>
+  <!-- stride[1]=1: arrow from cell 8 to cell 9 above memory strip -->
+  <line x1="266" y1="318" x2="290" y2="318" stroke="#065f46" stroke-width="1.5" marker-start="url(#agr)" marker-end="url(#ag)"/>
+  <text x="278" y="312" text-anchor="middle" fill="#065f46" font-size="9" font-weight="bold">+1</text>
+  <rect x="278" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="290" y="340" text-anchor="middle" fill="#475569" font-size="9">9</text>
+  <rect x="302" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="314" y="340" text-anchor="middle" fill="#475569" font-size="9">10</text>
+  <rect x="326" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="338" y="340" text-anchor="middle" fill="#475569" font-size="9">11</text>
+  <rect x="350" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="362" y="340" text-anchor="middle" fill="#475569" font-size="9">12</text>
+  <rect x="374" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="386" y="340" text-anchor="middle" fill="#475569" font-size="9">13</text>
+  <rect x="398" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="410" y="340" text-anchor="middle" fill="#475569" font-size="9">14</text>
+  <rect x="422" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="434" y="340" text-anchor="middle" fill="#475569" font-size="9">15</text>
+  <rect x="446" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="458" y="340" text-anchor="middle" fill="#475569" font-size="9">16</text>
+  <rect x="470" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="482" y="340" text-anchor="middle" fill="#475569" font-size="9">17</text>
+  <rect x="494" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="506" y="340" text-anchor="middle" fill="#475569" font-size="9">18</text>
+  <rect x="518" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="530" y="340" text-anchor="middle" fill="#475569" font-size="9">19</text>
+  <rect x="542" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="554" y="340" text-anchor="middle" fill="#475569" font-size="9">20</text>
+  <rect x="566" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="578" y="340" text-anchor="middle" fill="#475569" font-size="9">21</text>
+  <rect x="590" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="602" y="340" text-anchor="middle" fill="#475569" font-size="9">22</text>
+  <rect x="614" y="322" width="24" height="26" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1"/><text x="626" y="340" text-anchor="middle" fill="#475569" font-size="9">23</text>
+
+  <!-- FORMULA BOX -->
+  <rect x="115" y="364" width="470" height="54" rx="6" fill="#f0f9ff" stroke="#bae6fd" stroke-width="1.2"/>
+  <text x="350" y="384" text-anchor="middle" fill="#0c4a6e" font-size="12">offset(i, j)  =  i × stride[0]  +  j × stride[1]</text>
+  <text x="350" y="406" text-anchor="middle" fill="#0c4a6e" font-size="12">offset(1, 2)  =  1 × 6  +  2 × 1  =  <tspan font-weight="bold" fill="#92400e">8</tspan></text>
+
+  <!-- stride[1] legend near formula -->
+  <text x="350" y="432" text-anchor="middle" fill="#065f46" font-size="10">stride[1] = 1: one column step in memory (arrow ↑ above cell 8→9)</text>
+  <text x="350" y="446" text-anchor="middle" fill="#b45309" font-size="10">stride[0] = 6: one row step in memory = 6 elements (bracket ↑ right of grid)</text>
+</svg>

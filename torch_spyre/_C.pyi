@@ -127,6 +127,7 @@ class SpyreTensorLayout:
     def __init__(
         self,
         host_size: collections.abc.Sequence[typing.SupportsInt],
+        host_strides: collections.abc.Sequence[typing.SupportsInt],
         dtype: torch.dtype,
         dim_order: collections.abc.Sequence[typing.SupportsInt],
     ) -> None: ...
@@ -135,6 +136,7 @@ class SpyreTensorLayout:
         self,
         device_size: collections.abc.Sequence[typing.SupportsInt],
         dim_map: collections.abc.Sequence[typing.SupportsInt],
+        stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
     ) -> None: ...
     def __repr__(self) -> str: ...
@@ -148,6 +150,8 @@ class SpyreTensorLayout:
     def device_size(self) -> list[int]: ...
     @property
     def dim_map(self) -> list[int]: ...
+    @property
+    def stride_map(self) -> list[int]: ...
 
 class _SpyreStreamBase:
     """

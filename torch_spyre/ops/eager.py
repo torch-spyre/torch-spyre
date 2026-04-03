@@ -36,27 +36,6 @@ def spyre__mm_out(
     return compiled_mm(self, mat2, out=out)
 
 
-@torch.library.register_kernel("aten::linear", ["spyre"])  # type:ignore
-def spyre__linear(
-    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
-) -> torch.Tensor:
-    def _linear(input, weight, bias):
-        weight = weight.transpose(-1, -2).contiguous()
-        while weight.dim() < input.dim():
-            weight = torch.unsqueeze(weight, 0)
-        out = input @ weight
-        if bias:
-            out += bias
-        return out
-
-    # Prevents double tracing
-    if not torch.compiler.is_compiling():
-        compiled_linear = torch.compile(_linear, dynamic=False)
-    else:
-        compiled_linear = _linear
-    return compiled_linear(input, weight, bias)
-
-
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
@@ -116,6 +95,11 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     self.copy_(cpu_tmp)
 
     return self
+
+
+@torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
+def spyre__local_scalar_dense(self):
+    return self.cpu().item()
 
 
 # INSERT_CODEGEN_HERE

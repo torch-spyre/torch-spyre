@@ -1,0 +1,160 @@
+<svg viewBox="0 0 740 510" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+  <!-- Background -->
+  <rect width="740" height="510" fill="#f8f9fa" rx="8"/>
+
+  <!-- Title -->
+  <text x="370" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#222">Dataflow Execution — operations fire when all inputs arrive</text>
+  <text x="370" y="42" text-anchor="middle" font-size="10" font-style="italic" fill="#666">Execution is continuous — nodes fire as soon as inputs arrive (not in discrete steps)</text>
+
+  <!-- ========== BRANCH 1 (left): Linear layer ========== -->
+
+  <!-- Node: Tensor A -->
+  <rect x="20" y="75" width="100" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="70" y="99" text-anchor="middle" fill="#1e40af" font-weight="bold">Tensor A</text>
+
+  <!-- Node: Tensor B -->
+  <rect x="20" y="155" width="100" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="70" y="179" text-anchor="middle" fill="#1e40af" font-weight="bold">Tensor B</text>
+
+  <!-- Node: MatMul 1 — READY: thick border + subtle glow -->
+  <rect x="170" y="108" width="100" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="3" filter="url(#readyGlow)"/>
+  <text x="220" y="132" text-anchor="middle" fill="#065f46" font-weight="bold">MatMul</text>
+  <!-- Badge -->
+  <rect x="160" y="82" width="120" height="16" rx="4" fill="#10b981"/>
+  <text x="220" y="93" text-anchor="middle" font-size="8" fill="white" font-weight="bold">FIRES NOW — all inputs ready</text>
+
+  <!-- Arrows with token dots and labels -->
+  <line x1="120" y1="94" x2="170" y2="120" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="145" cy="107" r="4" fill="#3b82f6" opacity="0.7"/>
+  <text x="148" y="100" font-size="9" fill="#3b82f6" font-style="italic" dy="-4">A</text>
+
+  <line x1="120" y1="174" x2="170" y2="135" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="145" cy="155" r="4" fill="#3b82f6" opacity="0.7"/>
+  <text x="148" y="166" font-size="9" fill="#3b82f6" font-style="italic" dy="6">B</text>
+
+  <!-- Node: Bias -->
+  <rect x="20" y="240" width="100" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="70" y="264" text-anchor="middle" fill="#1e40af" font-weight="bold">Bias</text>
+
+  <!-- Node: Add — WAITING: faded background, dashed border -->
+  <rect x="170" y="210" width="100" height="38" rx="6" fill="#fef9c3" fill-opacity="0.5" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="220" y="234" text-anchor="middle" fill="#78350f" font-weight="bold">Add</text>
+  <!-- Badge -->
+  <rect x="160" y="184" width="120" height="16" rx="4" fill="#ca8a04"/>
+  <text x="220" y="195" text-anchor="middle" font-size="8" fill="white" font-weight="bold">WAITING — need MatMul out</text>
+
+  <!-- MatMul → Add -->
+  <line x1="220" y1="146" x2="220" y2="184" stroke="#10b981" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <circle cx="220" cy="165" r="4" fill="#10b981" opacity="0.7"/>
+  <text x="240" y="162" font-size="9" fill="#10b981" font-style="italic">MatMul_out</text>
+
+  <!-- Bias → Add -->
+  <line x1="120" y1="259" x2="170" y2="234" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="145" cy="247" r="4" fill="#3b82f6" opacity="0.7"/>
+  <text x="128" y="258" font-size="9" fill="#3b82f6" font-style="italic" dy="12">Bias</text>
+
+  <!-- ========== BRANCH 2 (right): Independent norm ========== -->
+
+  <!-- Node: Tensor C -->
+  <rect x="400" y="75" width="100" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="450" y="99" text-anchor="middle" fill="#1e40af" font-weight="bold">Tensor C</text>
+
+  <!-- Node: Weights -->
+  <rect x="400" y="155" width="100" height="38" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="450" y="179" text-anchor="middle" fill="#1e40af" font-weight="bold">Weights</text>
+
+  <!-- Node: MatMul 2 — READY: thick border + glow -->
+  <rect x="545" y="108" width="100" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="3" filter="url(#readyGlow)"/>
+  <text x="595" y="132" text-anchor="middle" fill="#065f46" font-weight="bold">MatMul</text>
+  <!-- Badge -->
+  <rect x="535" y="82" width="120" height="16" rx="4" fill="#10b981"/>
+  <text x="595" y="93" text-anchor="middle" font-size="8" fill="white" font-weight="bold">FIRES NOW — all inputs ready</text>
+
+  <line x1="500" y1="94" x2="545" y2="120" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="522" cy="107" r="4" fill="#3b82f6" opacity="0.7"/>
+  <text x="525" y="100" font-size="9" fill="#3b82f6" font-style="italic" dy="-4">C</text>
+
+  <line x1="500" y1="174" x2="545" y2="135" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <circle cx="522" cy="155" r="4" fill="#3b82f6" opacity="0.7"/>
+  <text x="525" y="166" font-size="9" fill="#3b82f6" font-style="italic" dy="6">W</text>
+
+  <!-- Node: LayerNorm — WAITING: faded -->
+  <rect x="545" y="210" width="100" height="38" rx="6" fill="#fef9c3" fill-opacity="0.5" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="595" y="234" text-anchor="middle" fill="#78350f" font-weight="bold">LayerNorm</text>
+  <!-- Badge -->
+  <rect x="535" y="184" width="120" height="16" rx="4" fill="#ca8a04"/>
+  <text x="595" y="195" text-anchor="middle" font-size="8" fill="white" font-weight="bold">WAITING — need MatMul out</text>
+
+  <line x1="595" y1="146" x2="595" y2="184" stroke="#10b981" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <circle cx="595" cy="165" r="4" fill="#10b981" opacity="0.7"/>
+  <text x="615" y="162" font-size="9" fill="#10b981" font-style="italic">MatMul_out</text>
+
+  <!-- ========== PARALLEL annotation ========== -->
+  <rect x="295" y="105" width="85" height="30" rx="14" fill="#eff6ff" stroke="#3b82f6" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="337" y="124" text-anchor="middle" font-size="10" font-weight="bold" fill="#3b82f6">PARALLEL</text>
+  <text x="337" y="155" text-anchor="middle" font-size="9" fill="#6b7280">Both MatMuls fire</text>
+  <text x="337" y="167" text-anchor="middle" font-size="9" fill="#6b7280">simultaneously</text>
+
+  <!-- ========== MERGE: Concat — sync point: emphasized border ========== -->
+  <rect x="320" y="300" width="100" height="38" rx="6" fill="#fef9c3" fill-opacity="0.5" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="4,2"/>
+  <text x="370" y="324" text-anchor="middle" fill="#78350f" font-weight="bold">Concat</text>
+  <!-- Badge -->
+  <rect x="318" y="270" width="145" height="20" rx="4" fill="#dc2626"/>
+  <text x="390" y="284" text-anchor="middle" font-size="9" fill="white" font-weight="bold">SYNC POINT — need both paths</text>
+
+  <!-- Add → Concat -->
+  <line x1="270" y1="240" x2="320" y2="310" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <circle cx="295" cy="275" r="4" fill="#ca8a04" opacity="0.7"/>
+  <text x="248" y="280" font-size="9" fill="#ca8a04" font-style="italic">Add_out</text>
+
+  <!-- LayerNorm → Concat -->
+  <line x1="595" y1="248" x2="420" y2="310" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+  <circle cx="507" cy="279" r="4" fill="#ca8a04" opacity="0.7"/>
+  <text x="536" y="280" font-size="9" fill="#ca8a04" font-style="italic">Norm_out</text>
+
+  <!-- ========== OUTPUT ========== -->
+  <rect x="320" y="365" width="100" height="38" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="370" y="389" text-anchor="middle" fill="#4c1d95" font-weight="bold">Output</text>
+  <line x1="370" y1="338" x2="370" y2="365" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+
+  <!-- ========== CONTROL FLOW CONTRAST (bottom-left) ========== -->
+  <rect x="15" y="425" width="265" height="72" rx="6" fill="#fff" stroke="#d1d5db" stroke-width="1"/>
+  <text x="28" y="445" font-size="10" font-weight="bold" fill="#374151">Control Flow (sequential):</text>
+  <text x="28" y="461" font-size="9" fill="#6b7280" font-family="monospace">PC → MatMul → Add → MatMul → Norm → Concat</text>
+  <text x="28" y="480" font-size="10" font-weight="bold" fill="#10b981">Dataflow: order determined by data readiness</text>
+
+  <!-- ========== LEGEND (bottom-center) ========== -->
+  <rect x="295" y="425" width="165" height="72" rx="6" fill="#fff" stroke="#d1d5db" stroke-width="1"/>
+  <rect x="308" y="435" width="16" height="16" rx="4" fill="#d1fae5" stroke="#10b981" stroke-width="2"/>
+  <text x="330" y="447" font-size="9" fill="#444">Ready (fires now)</text>
+  <rect x="308" y="457" width="16" height="16" rx="4" fill="#fef9c3" fill-opacity="0.5" stroke="#ca8a04" stroke-width="1.5" stroke-dasharray="4,2"/>
+  <text x="330" y="469" font-size="9" fill="#444">Waiting (blocked)</text>
+  <rect x="308" y="479" width="16" height="16" rx="4" fill="#fef9c3" fill-opacity="0.5" stroke="#dc2626" stroke-width="2"/>
+  <text x="330" y="491" font-size="9" fill="#444">Sync point (bottleneck)</text>
+
+  <!-- ========== TIMING annotations (bottom-right) ========== -->
+  <rect x="475" y="425" width="250" height="72" rx="6" fill="#fff" stroke="#d1d5db" stroke-width="1"/>
+  <text x="488" y="445" font-size="10" font-weight="bold" fill="#374151">Continuous firing sequence:</text>
+  <text x="488" y="463" font-size="9" fill="#10b981" font-family="monospace">Both MatMuls execute in parallel</text>
+  <text x="488" y="478" font-size="9" fill="#ca8a04" font-family="monospace">Add + LayerNorm become ready and fire</text>
+  <text x="488" y="493" font-size="9" fill="#dc2626" font-family="monospace">Concat fires when both inputs arrive</text>
+
+  <defs>
+    <!-- Subtle glow for READY nodes -->
+    <filter id="readyGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3" result="blur"/>
+      <feFlood flood-color="#10b981" flood-opacity="0.25" result="color"/>
+      <feComposite in="color" in2="blur" operator="in" result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ca8a04"/>
+    </marker>
+  </defs>
+</svg>

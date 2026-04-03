@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 580 440" font-family="monospace, sans-serif" font-size="12">
+  <rect width="580" height="440" fill="white"/>
+  <defs>
+    <marker id="ah"  markerWidth="7" markerHeight="7" refX="6"  refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#374151"/></marker>
+    <marker id="ahr" markerWidth="7" markerHeight="7" refX="1"  refY="3.5" orient="auto-start-reverse"><path d="M0,0 L7,3.5 L0,7 Z" fill="#374151"/></marker>
+  </defs>
+
+  <!-- TITLE -->
+  <text x="290" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">Work Division: matmul C = A × B with 8 cores</text>
+  <text x="290" y="40" text-anchor="middle" font-size="12" fill="#374151">op_dim_splits = [4, 1, 2]  —  M_split=4,  K not split,  N_split=2</text>
+
+  <!-- ===== MATRIX A (M=128 × K=64) ===== -->
+  <!-- K=64 arrow: 96px — same scale as N=64 in B and C -->
+  <line x1="48" y1="66" x2="144" y2="66" stroke="#374151" stroke-width="1.2" marker-start="url(#ahr)" marker-end="url(#ah)"/>
+  <text x="96"  y="60" text-anchor="middle" fill="#374151" font-size="11">K=64</text>
+
+  <!-- 4 row bands, M_split=4, each h=48 -->
+  <rect x="48" y="72" width="96" height="48" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="96" y="100" text-anchor="middle" fill="#1e40af" font-size="10">M-tile 0</text>
+  <rect x="48" y="120" width="96" height="48" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+  <text x="96" y="148" text-anchor="middle" fill="#166534" font-size="10">M-tile 1</text>
+  <rect x="48" y="168" width="96" height="48" fill="#fef9c3" stroke="#fde047" stroke-width="1.5"/>
+  <text x="96" y="196" text-anchor="middle" fill="#854d0e" font-size="10">M-tile 2</text>
+  <rect x="48" y="216" width="96" height="48" fill="#fce7f3" stroke="#f9a8d4" stroke-width="1.5"/>
+  <text x="96" y="244" text-anchor="middle" fill="#9d174d" font-size="10">M-tile 3</text>
+
+  <!-- M=128 bracket, left of A -->
+  <line x1="36" y1="72"  x2="36" y2="264" stroke="#374151" stroke-width="1.2"/>
+  <line x1="36" y1="72"  x2="48" y2="72"  stroke="#374151" stroke-width="1.2"/>
+  <line x1="36" y1="264" x2="48" y2="264" stroke="#374151" stroke-width="1.2"/>
+  <text x="28" y="168" text-anchor="middle" fill="#374151" font-size="11" transform="rotate(-90 28 168)">M=128</text>
+
+  <!-- A label — 16px below bottom edge y=264 -->
+  <text x="96" y="280" text-anchor="middle" font-weight="bold" font-size="15" fill="#1e3a8a">A</text>
+  <text x="96" y="294" text-anchor="middle" fill="#6b7280" font-size="10">(M_split = 4)</text>
+
+  <!-- × centered in gap (144..174), vertical center of A = 72+96 = 168 -->
+  <text x="159" y="174" text-anchor="middle" font-size="20" fill="#374151" font-weight="bold">×</text>
+
+  <!-- ===== MATRIX B (K=64 × N=64): 96×96 square ===== -->
+  <!-- N=64 arrow: 96px — same as K=64 above A -->
+  <line x1="174" y1="66" x2="270" y2="66" stroke="#374151" stroke-width="1.2" marker-start="url(#ahr)" marker-end="url(#ah)"/>
+  <text x="222" y="60" text-anchor="middle" fill="#374151" font-size="11">N=64</text>
+
+  <!-- K=64 label left of B (plain text only, no bracket) — y=120 is vertical center of B -->
+  <text x="168" y="120" text-anchor="end" fill="#374151" font-size="11">K=64</text>
+
+  <!-- 2 col bands, N_split=2, each w=48 — "tile N" fits in 48px at font-size 10 -->
+  <rect x="174" y="72" width="48" height="96" fill="#e0e7ff" stroke="#a5b4fc" stroke-width="1.5"/>
+  <text x="198" y="118" text-anchor="middle" fill="#3730a3" font-size="10">tile 0</text>
+  <rect x="222" y="72" width="48" height="96" fill="#ffe4e6" stroke="#fda4af" stroke-width="1.5"/>
+  <text x="246" y="118" text-anchor="middle" fill="#9f1239" font-size="10">tile 1</text>
+
+  <!-- B label — B bottom = y=168; label 16px below -->
+  <text x="222" y="184" text-anchor="middle" font-weight="bold" font-size="15" fill="#1e3a8a">B</text>
+  <text x="222" y="198" text-anchor="middle" fill="#6b7280" font-size="10">(N_split = 2)</text>
+
+  <!-- = centered in gap (270..300), same y as × -->
+  <text x="285" y="174" text-anchor="middle" font-size="20" fill="#374151" font-weight="bold">=</text>
+
+  <!-- ===== MATRIX C (M=128 × N=64) ===== -->
+  <!-- N=64 arrow: 96px — same as K=64 above A and N=64 above B -->
+  <line x1="300" y1="66" x2="396" y2="66" stroke="#374151" stroke-width="1.2" marker-start="url(#ahr)" marker-end="url(#ah)"/>
+  <text x="348" y="60" text-anchor="middle" fill="#374151" font-size="11">N=64</text>
+
+  <!-- 4×2 grid, each cell 48×48 -->
+  <rect x="300" y="72"  width="48" height="48" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="324" y="100" text-anchor="middle" fill="#1e40af" font-size="10" font-weight="bold">Core 0</text>
+  <rect x="348" y="72"  width="48" height="48" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="372" y="100" text-anchor="middle" fill="#1e40af" font-size="10" font-weight="bold">Core 1</text>
+
+  <rect x="300" y="120" width="48" height="48" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+  <text x="324" y="148" text-anchor="middle" fill="#166534" font-size="10" font-weight="bold">Core 2</text>
+  <rect x="348" y="120" width="48" height="48" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+  <text x="372" y="148" text-anchor="middle" fill="#166534" font-size="10" font-weight="bold">Core 3</text>
+
+  <rect x="300" y="168" width="48" height="48" fill="#fef9c3" stroke="#fde047" stroke-width="1.5"/>
+  <text x="324" y="196" text-anchor="middle" fill="#854d0e" font-size="10" font-weight="bold">Core 4</text>
+  <rect x="348" y="168" width="48" height="48" fill="#fef9c3" stroke="#fde047" stroke-width="1.5"/>
+  <text x="372" y="196" text-anchor="middle" fill="#854d0e" font-size="10" font-weight="bold">Core 5</text>
+
+  <rect x="300" y="216" width="48" height="48" fill="#fce7f3" stroke="#f9a8d4" stroke-width="1.5"/>
+  <text x="324" y="244" text-anchor="middle" fill="#9d174d" font-size="10" font-weight="bold">Core 6</text>
+  <rect x="348" y="216" width="48" height="48" fill="#fce7f3" stroke="#f9a8d4" stroke-width="1.5"/>
+  <text x="372" y="244" text-anchor="middle" fill="#9d174d" font-size="10" font-weight="bold">Core 7</text>
+
+  <!-- C label — C bottom = y=264; label 16px below -->
+  <text x="348" y="280" text-anchor="middle" font-weight="bold" font-size="15" fill="#1e3a8a">C</text>
+
+  <!-- ===== ANNOTATION BOX ===== -->
+  <rect x="30" y="310" width="520" height="112" rx="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+
+  <text x="290" y="329" text-anchor="middle" fill="#0f172a" font-size="12" font-weight="bold">op_dim_splits = [<tspan fill="#1e40af">4</tspan>, <tspan fill="#374151">1</tspan>, <tspan fill="#7c3aed">2</tspan>]   &#x2192;   4 &#xd7; 1 &#xd7; 2 = <tspan fill="#1e3a8a">8 cores total</tspan></text>
+
+  <line x1="50" y1="337" x2="540" y2="337" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="88"  y="350" text-anchor="middle" fill="#6b7280" font-size="10" font-weight="bold">Dim</text>
+  <text x="190" y="350" text-anchor="middle" fill="#6b7280" font-size="10" font-weight="bold">Code label</text>
+  <text x="278" y="350" text-anchor="middle" fill="#6b7280" font-size="10" font-weight="bold">Split</text>
+  <text x="420" y="350" text-anchor="middle" fill="#6b7280" font-size="10" font-weight="bold">Note</text>
+  <line x1="50" y1="354" x2="540" y2="354" stroke="#e2e8f0" stroke-width="1"/>
+
+  <text x="88"  y="368" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="bold">M</text>
+  <text x="190" y="368" text-anchor="middle" fill="#374151" font-size="11">"mb"</text>
+  <text x="278" y="368" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="bold">4</text>
+  <text x="420" y="368" text-anchor="middle" fill="#374151" font-size="10">4 row tiles — each core takes one M-tile</text>
+
+  <text x="88"  y="384" text-anchor="middle" fill="#374151" font-size="11">K</text>
+  <text x="190" y="384" text-anchor="middle" fill="#374151" font-size="11">"in"</text>
+  <text x="278" y="384" text-anchor="middle" fill="#374151" font-size="11">1</text>
+  <text x="420" y="384" text-anchor="middle" fill="#6b7280" font-size="10">not split — every core iterates all K</text>
+
+  <text x="88"  y="400" text-anchor="middle" fill="#7c3aed" font-size="11" font-weight="bold">N</text>
+  <text x="190" y="400" text-anchor="middle" fill="#374151" font-size="11">"out"</text>
+  <text x="278" y="400" text-anchor="middle" fill="#7c3aed" font-size="11" font-weight="bold">2</text>
+  <text x="420" y="400" text-anchor="middle" fill="#374151" font-size="10">2 column tiles — each core takes one N-tile</text>
+</svg>

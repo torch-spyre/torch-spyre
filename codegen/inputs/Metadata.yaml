@@ -43,20 +43,10 @@
 #   - name: arg_2
 #     type: int
 #     default: 0
-- operator_name: expand
-  template_name: view
 - operator_name: exp
   template_name: base
 - operator_name: ge
   template_name: base
-- operator_name: gelu
-  template_name: base
-  torch_prefix: torch.nn.functional
-  extra_arguments:
-  - name: approximate
-    type: bool
-    default: False
-    overwrite: True
 - operator_name: linalg_vector_norm
   template_name: base
   torch_prefix: torch.linalg
@@ -67,6 +57,8 @@
 - operator_name: logical_not
   template_name: base
 - operator_name: lt
+  template_name: base
+- operator_name: gt
   template_name: base
 - operator_name: maximum
   template_name: base
@@ -103,6 +95,4 @@
 - operator_name: t
   template_name: view
 - operator_name: tanh
-  template_name: base
-- operator_name: tril
   template_name: base

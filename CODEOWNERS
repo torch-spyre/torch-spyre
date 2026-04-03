@@ -11,6 +11,9 @@
 # Default owners (fallback for anything not matched below)
 *  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy @elpidatz
 
+# torch_spyre top-level files (runtime infrastructure)
+/torch_spyre/*       @JRosenkranz @thoangtrvn
+
 # Inductor / compiler backend
 /torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
 
@@ -20,11 +23,21 @@
 /torch_spyre/memory/     @JRosenkranz @thoangtrvn
 /torch_spyre/csrc/       @JRosenkranz @thoangtrvn
 
+# Profiler
+/torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971
+
 # Operations (eager ops and fallbacks)
-/torch_spyre/ops/        @JRosenkranz @thoangtrvn
+/torch_spyre/ops/        @ani300 @moriohara @pradghos
+/codegen/                @ani300 @moriohara @pradghos
 
 # Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss
+
+# CI/CD
+/.github/                 @ashokponkumar
+/.pre-commit-config.yaml  @ashokponkumar
+/pytest.ini               @ashokponkumar
+/pytest_models.ini        @ashokponkumar
