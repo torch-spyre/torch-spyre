@@ -38,5 +38,5 @@ class SpyreSDSCKernelRunner:
     def run(self, *args, **kw_args):
         g2 = os.path.join(self.code_dir, "g2.graph.cbor")
         logger.info(f"RUN: {self.kernel_name} {g2}")
-        actuals = [a for a in args]
+        actuals = list(args)
         launch_kernel(g2, actuals)
