@@ -88,6 +88,7 @@ def enable_spyre_context(
         "post_grad_custom_pre_pass": inductor_config.post_grad_custom_pre_pass,
         "post_grad_custom_post_pass": inductor_config.post_grad_custom_post_pass,
         "_pre_fusion_custom_pass": inductor_config._pre_fusion_custom_pass,
+        "_post_fusion_custom_pass": inductor_config._post_fusion_custom_pass,
         "unroll_reductions_threshold": inductor_config.unroll_reductions_threshold,
         "permute_fusion": inductor_config.permute_fusion,
     }
