@@ -31,14 +31,12 @@ class SpyreUnimplementedRunner:
 
 
 class SpyreSDSCKernelRunner:
-    def __init__(self, name: str, code_dirs: list[str], arg_mappings: list[list[int]]):
+    def __init__(self, name: str, code_dir: str):
         self.kernel_name = name
-        self.code_dirs = code_dirs
-        self.arg_mappings = arg_mappings
+        self.code_dir = code_dir
 
     def run(self, *args, **kw_args):
-        for i in range(len(self.code_dirs)):
-            g2 = os.path.join(self.code_dirs[i], "g2.graph.cbor")
-            logger.info(f"RUN: {self.kernel_name}_{i} {g2}")
-            actuals = [args[i] for i in self.arg_mappings[i]]
-            launch_kernel(g2, actuals)
+        g2 = os.path.join(self.code_dir, "g2.graph.cbor")
+        logger.info(f"RUN: {self.kernel_name} {g2}")
+        actuals = list(args)
+        launch_kernel(g2, actuals)
