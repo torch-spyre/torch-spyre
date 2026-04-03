@@ -29,7 +29,7 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list[OpSpec]):
     # 1. Generate SDSC.json for each OpSpec
     sdscs_json = []
     for ks in specs:
-        sdsc_json, arg_map = compile_op_spec(kernel_name, ks)
+        sdsc_json = compile_op_spec(kernel_name, ks)
         sdscs_json.append(sdsc_json)
 
     # Write JSON SDSCs to file system
