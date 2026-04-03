@@ -14,6 +14,7 @@
 
 import inspect
 from typing import Optional, Any, Callable, List
+from abc import abstractmethod
 
 import torch
 import torch.fx.graph
@@ -110,7 +111,24 @@ def _maybe_run_scheduler_pass(
     return nodes
 
 
-def scheduler_pre_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+class CustomNodePassBase(CustomGraphPass):
+    def __call__(self, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+        for _pass in self.get_passes():
+            nodes = _maybe_run_scheduler_pass(_pass, nodes)
+        return nodes
+
+    @abstractmethod
+    def get_passes(
+        self,
+    ) -> list[Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]]:
+        pass
+
+    def uuid(self) -> Optional[Any]:
+        files = [inspect.getfile(c) for c in self.get_passes()]
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
+
+
+class CustomPreFusionPasses(CustomNodePassBase):
     """
     This inductor extension point enables Spyre-specific passes to run over
     the graph of LoopLevelIR nodes immediately before Inductor's fusion pass runs.
@@ -119,14 +137,14 @@ def scheduler_pre_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
     The returned list of nodes must also be in topological order.
     """
 
-    nodes = propagate_spyre_tensor_layouts(nodes)
-    nodes = core_division_planning(nodes)
-    if config.lx_planning:
-        nodes = scratchpad_planning(nodes)
-    return nodes
+    def get_passes(self):
+        passes = [propagate_spyre_tensor_layouts, core_division_planning]
+        if config.lx_planning:
+            passes.append(scratchpad_planning)
+        return passes
 
 
-def scheduler_post_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+class CustomPostFusionPasses(CustomNodePassBase):
     """
     This inductor extension point enables Spyre-specific passes to run over
     the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
@@ -135,4 +153,5 @@ def scheduler_post_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerN
     The returned list of nodes must also be in topological order.
     """
 
-    return spyre_fuse_nodes(nodes)
+    def get_passes(self):
+        return [spyre_fuse_nodes]
