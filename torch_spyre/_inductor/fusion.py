@@ -27,6 +27,14 @@ _FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION", True)
 _MAX_BUNDLE_TENSORS = 6
 
 
+def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
+    if len(nodes) > 1:
+        return FusedSchedulerNode(nodes[0].scheduler, nodes)
+    elif len(nodes) == 1:
+        return nodes[0]
+    return None
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
@@ -42,12 +50,6 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_nodes: list[SchedulerNode] = []
     cur_tensors: set[str] = set()
 
-    def fuse_cur_nodes():
-        if len(cur_nodes) > 1:
-            fused_nodes.append(FusedSchedulerNode(cur_nodes[0].scheduler, cur_nodes))
-        elif len(cur_nodes) == 1:
-            fused_nodes.append(cur_nodes[0])
-
     for n in nodes:
         if isinstance(n, SchedulerNode):
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
@@ -58,17 +60,20 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
                 cur_tensors = candidate
             else:
                 # Would be too many tensors in the Bundle; start a new one.
-                fuse_cur_nodes()
+                if fused := _make_fused(cur_nodes):
+                    fused_nodes.append(fused)
                 cur_nodes = [n]
                 cur_tensors = n_tensors
 
         else:
             # Other node types (eg Fallback nodes) force a bundle boundary.
-            fuse_cur_nodes()
+            if fused := _make_fused(cur_nodes):
+                fused_nodes.append(fused)
             fused_nodes.append(n)
             cur_nodes = []
             cur_tensors = set()
 
-    fuse_cur_nodes()
+    if fused := _make_fused(cur_nodes):
+        fused_nodes.append(fused)
 
     return fused_nodes
