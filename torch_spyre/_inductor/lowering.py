@@ -239,8 +239,7 @@ def lower_mm(x, y):
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
-        # TODO: Arguments reversed to work around #1165
-        result = lowering.mul(y, x)
+        result = lowering.mul(x, y)
     else:
         result = Reduction.create(
             reduction_type=reduction_type,
@@ -311,8 +310,7 @@ def lower_bmm(x, y):
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
-        # TODO: Arguments reversed to work around #1165
-        result = lowering.mul(y, x)
+        result = lowering.mul(x, y)
     else:
         result = Reduction.create(
             reduction_type=BATCH_MATMUL_OP,
