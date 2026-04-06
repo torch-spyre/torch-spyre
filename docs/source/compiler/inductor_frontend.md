@@ -14,7 +14,7 @@ The Torch-Spyre compilation pipeline. The left end (green) is entirely upstream 
 
 ## Extending Compilation
 
-The front-end adds compilation passes into upstream Inductor via three extension points,
+The front-end adds compilation passes into upstream Inductor via four extension points,
 all registered in
 [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py):
 
@@ -23,6 +23,7 @@ all registered in
 | `CustomPrePasses` | FX Graph (pre-lowering) | Graph rewrites before decomposition |
 | `CustomPostPasses` | FX Graph (late post-grad) | Graph rewrites late in the post-grad FX graph passes |
 | `_pre_fusion_custom_pass` | Scheduler | Passes on LoopLevelIR immediately before nodes are fused into kernels |
+| `_post_fusion_custom_pass` | Scheduler | Passes on LoopLevelIR immediately after nodes are fused into kernels |
 
 ### FX Graph Passes
 
