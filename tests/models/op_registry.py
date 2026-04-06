@@ -226,6 +226,10 @@ def _torch_truediv(a, b):
     return a.__truediv__(b)
 
 
+def _torch_floordiv(a, b):
+    return torch.div(a, b, rounding_mode="floor")
+
+
 # -----------------------------
 # Special / internal wrappers
 # -----------------------------
@@ -305,6 +309,7 @@ def _tensor_index_copy_(
 OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.cat": OpAdapter("torch.cat", torch.cat),
     "torch.chunk": OpAdapter("torch.chunk", torch.chunk),
+    "torch.stack": OpAdapter("torch.stack", torch.stack),
     # Basic math / reductions
     "torch.add": OpAdapter("torch.add", torch.add),
     "torch.Tensor.add": OpAdapter("torch.add", torch.add),
@@ -318,12 +323,14 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.pow": OpAdapter("torch.pow", torch.pow),
     "torch.div": OpAdapter("torch.div", torch.div),
     "torch.truediv": OpAdapter("torch.truediv", _torch_truediv),
+    "torch.floordiv": OpAdapter("torch.floordiv", _torch_floordiv),
     "torch.neg": OpAdapter("torch.neg", _torch_neg),
     "torch.sum": OpAdapter("torch.sum", torch.sum),
     "torch.mean": OpAdapter("torch.mean", torch.mean),
     "torch.max": OpAdapter("torch.max", torch.max),
     "torch.softmax": OpAdapter("torch.softmax", torch.softmax),
     "torch.cumsum": OpAdapter("torch.cumsum", torch.cumsum),
+    "torch.prod": OpAdapter("torch.prod", torch.prod),
     "torch.all": OpAdapter("torch.all", torch.all),
     "torch.numel": OpAdapter("torch.numel", _tensor_numel),
     "torch.exp": OpAdapter("torch.exp", torch.exp),
@@ -417,6 +424,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.scalar_tensor": OpAdapter("torch.scalar_tensor", _scalar_tensor),
     "torch.new_ones": OpAdapter("torch.new_ones", _tensor_new_ones),
     "torch.full": OpAdapter("torch.full", torch.full),
+    "torch.as_tensor": OpAdapter("torch.as_tensor", torch.as_tensor),
     # Sort / Topk
     "torch.sort": OpAdapter("torch.sort", torch.sort),
     "torch.topk": OpAdapter("torch.topk", torch.topk),
@@ -537,6 +545,10 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.sym_sum": OpAdapter("torch.sym_sum", _sym_sum),
     # Misc
     "torch.item": OpAdapter("torch.item", _tensor_item),
+    "torch.functional.meshgrid": OpAdapter(
+        "torch.functional.meshgrid",
+        torch.functional.meshgrid,
+    ),
     # In-place add_ listed separately
     "torch.add_": OpAdapter("torch.add_", _tensor_add_, is_inplace=True),
     "torch.and_": OpAdapter("torch.and_", _tensor_and_, is_inplace=True),

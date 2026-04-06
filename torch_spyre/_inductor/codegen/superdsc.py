@@ -264,22 +264,33 @@ def _create_sdsc_tensors(
     missing_dim = None
     backGap = {}
     op_info = dict(op_spec.op_info.get("overwrite_info", {})) if op_spec.op_info else {}
+    adjusted_output_size = op_spec.args[-1].device_size.copy()
     if op_info and (
         "gap" in op_info and "device_offset" in op_info and "device_stride" in op_info
     ):
         device_stride = op_info["device_stride"]
         gap = op_info["gap"]
         output_offset = op_info["device_offset"] * device_stride
-
+        output = op_spec.args[-1]
+        dim_order, stick_dim = _get_device_dim_order(output, symbol_mapping)
+        for dim_idx, dim in enumerate(reversed(dim_order)):
+            if device_stride == math.prod(output.device_size[dim_idx + 1 :]):
+                dim_size = iteration_space.get(dim, 1)
+                adjusted_output_size[dim_idx] = (
+                    dim_size // output.device_dtype.elems_per_stick()
+                    if dim == stick_dim
+                    else dim_size
+                )
     sdsc_args: list[SDSCArgs] = []
-    for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
+    for arg in op_spec.args:
+        addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
-
+        use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims:
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
@@ -296,12 +307,16 @@ def _create_sdsc_tensors(
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
+            strides[dim] = _calculate_device_stride(
+                dim_idx,
+                arg.device_size if not use_adjusted_size else adjusted_output_size,
+            )
             if (
                 device_stride == math.prod(arg.device_size[-dim_idx - 1 :])
                 and not arg.is_input
             ):
                 backGap[dim] = gap
+                use_adjusted_size = False
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
 
@@ -363,10 +378,6 @@ def _ref_arg(op_spec):
     if op_spec.is_reduction:
         return op_spec.args[0]
 
-    # op specific layout choice
-    if op_spec.op == "overwrite":
-        return op_spec.args[0]
-
     return op_spec.args[-1]
 
 
@@ -389,13 +400,12 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     }
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] if op_spec.op != "overwrite" else 1
-        for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice if op_spec.op != "overwrite" else 1
+        symbol_mapping[sym]: wk_slice
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
@@ -457,10 +467,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
 
-def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> tuple[Any, list[int]]:
+def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> Any:
     sdsc_spec = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-
-    arg_map = [ts.arg_index for ts in op_spec.args]
-    dt_sdsc = generate_sdsc(sdsc_spec)
-    return dt_sdsc, arg_map
+    return generate_sdsc(sdsc_spec)

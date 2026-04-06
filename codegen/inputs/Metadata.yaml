@@ -58,6 +58,8 @@
   template_name: base
 - operator_name: lt
   template_name: base
+- operator_name: gt
+  template_name: base
 - operator_name: maximum
   template_name: base
 - operator_name: mean
