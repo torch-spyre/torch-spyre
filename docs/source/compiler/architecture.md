@@ -25,7 +25,7 @@ executable programs binaries.
 
 The Torch-Spyre front-end compilation stack. PyTorch programs pass through Dynamo to produce an FX graph, which Inductor lowers to LoopLevel IR.
 The SpyreKernel code generator compiles LoopLevel IR into an OpSpec that is in turn used to generates SDSC specifications
-that are the input to the backend-compiler. In a future version, we intend to replace SDSCs with a purely MLIR-based interface that includes a new [KTIR](https://github.com/torch-spyre/RFCs/tree/main/0682-KtirSpec) MLIR dialect.
+that are the input to the backend-compiler. In a future version, we intend to replace SDSCs with a purely MLIR-based interface that includes a new [KTIR](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) MLIR dialect.
 :::
 
 # Background
