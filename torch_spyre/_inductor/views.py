@@ -16,9 +16,157 @@
 
 import math
 import sympy
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 
+
+def symbolic_bool(expr) -> bool:
+    """
+    Safely evaluate a symbolic expression to a boolean.
+    
+    Returns:
+        - True if expression is definitely true
+        - False if expression is definitely false or cannot be determined
+    """
+    # Handle already-boolean values
+    if isinstance(expr, bool):
+        return expr
+    
+    # Handle numeric values
+    if isinstance(expr, (int, float)):
+        return bool(expr)
+    
+    # Handle sympy expressions
+    if isinstance(expr, sympy.Basic):
+        # Try to simplify the expression
+        simplified = sympy.simplify(expr)
+        
+        # Check if it simplified to a concrete boolean
+        if simplified == sympy.true or simplified is True:
+            return True
+        if simplified == sympy.false or simplified is False:
+            return False
+        
+        # Check if it's a number we can evaluate
+        if simplified.is_number:
+            try:
+                return bool(simplified)
+            except:
+                pass
+        
+        # Cannot determine - return False conservatively
+        return False
+    
+    # Fallback for other types
+    try:
+        return bool(expr)
+    except:
+        return False
+
+
+def symbolic_gt(a, b) -> bool:
+    """Check if a > b, handling symbolic expressions."""
+    return symbolic_bool(a > b)
+
+
+def symbolic_lt(a, b) -> bool:
+    """Check if a < b, handling symbolic expressions."""
+    return symbolic_bool(a < b)
+
+
+def symbolic_le(a, b) -> bool:
+    """Check if a <= b, handling symbolic expressions."""
+    return symbolic_bool(a <= b)
+
+
+def symbolic_eq(a, b) -> bool:
+    """Check if a == b, handling symbolic expressions."""
+    return symbolic_bool(a == b)
+
+
+## Step 2: Fixed compute_coordinates Function
+
+def compute_coordinates(
+    size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
+    var_ranges: dict[sympy.Symbol, sympy.Expr],
+    index: sympy.Expr,
+) -> list[sympy.Expr]:
+    """
+    Compute an array of coordinate expressions from an index expression.
+
+    Stride and index must be relative to the same storage (both host or device).
+    Stride values<=0 are ignored.
+    """
+    # find stride immediately strictly larger that dim stride
+    n = len(size)
+    next_stride = [sympy.oo] * n
+    
+    for i in range(n):
+        for j in range(n):
+            # n^2 is ok since n is small
+            # FIX #1: Use symbolic-safe comparisons
+            if (symbolic_gt(next_stride[i], stride[j]) and 
+                symbolic_gt(stride[j], stride[i]) and 
+                symbolic_gt(size[j], 1)):
+                next_stride[i] = stride[j]
+    
+    # compute coordinate expressions
+    coordinates = [sympy.S.Zero] * n
+    vars = index.free_symbols
+    
+    for var in vars:
+        if var not in var_ranges:
+            continue  # Skip variables that aren't loop variables
+        
+        # Use symbolic-safe comparison
+        if symbolic_le(var_ranges[var], 1):
+            continue  # ignore var with trivial range
+            
+        # isolate current var
+        term = index.subs({v: 0 for v in vars - {var}})
+        # compute index({var=1}) and index({var=var_ranges[var]})
+        step = term.subs(var, 1)
+        limit = term.subs(var, var_ranges[var])
+        
+        # find primary dim with largest stride less than or equal to step
+        primary_stride = 0
+        primary_dim = -1
+        
+        for dim in range(n):
+            #3: Use symbolic-safe comparison
+            if symbolic_eq(size[dim], 1):
+                continue  # ignore dim with size 1
+                
+            st = stride[dim]
+            
+            #4: Use symbolic-safe comparisons
+            if symbolic_le(st, step) and symbolic_gt(st, primary_stride):
+                # found candidate primary dim
+                primary_stride = st
+                primary_dim = dim
+            #5: Use symbolic-safe comparisons
+            elif symbolic_gt(st, step) and symbolic_lt(st, limit):
+                # var range intersects dim, add term
+                #6: Use symbolic-safe comparison
+                if symbolic_lt(next_stride[dim], limit):
+                    # var range overflows dim
+                    coordinates[dim] += var * step % next_stride[dim] // st
+                else:
+                    coordinates[dim] += var * step // st
+        
+        # add term for primary dim
+        # Use symbolic-safe comparison
+        if primary_dim >= 0 and primary_stride > 0:
+            if symbolic_lt(next_stride[primary_dim], limit):
+                coordinates[primary_dim] += (
+                    # var range overflows primary dim
+                    var * step % next_stride[primary_dim] // primary_stride
+                )
+            else:
+                coordinates[primary_dim] += var * step // primary_stride
+                
+    return coordinates
 # def compute_coordinates(
 #     size: Sequence[sympy.Expr],
 #     stride: Sequence[sympy.Expr],
@@ -51,65 +199,66 @@ from typing import Optional, Sequence
 #         coordinates[primary_dim] += var * step // primary_stride
 #     return coordinates
 
-def compute_coordinates(
-    size: Sequence[sympy.Expr],
-    stride: Sequence[sympy.Expr],
-    var_ranges: dict[sympy.Symbol, sympy.Expr],
-    index: sympy.Expr,
-) -> list[sympy.Expr]:
-    """
-    Compute an array of coordinate expressions from an index expression.
+# def compute_coordinates(
+#     size: Sequence[sympy.Expr],
+#     stride: Sequence[sympy.Expr],
+#     var_ranges: dict[sympy.Symbol, sympy.Expr],
+#     index: sympy.Expr,
+# ) -> list[sympy.Expr]:
+#     """
+#     Compute an array of coordinate expressions from an index expression.
 
-    Stride and index must be relative to the same storage (both host or device).
-    Stride values<=0 are ignored.
-    """
-    # find stride immediately strictly larger that dim stride
-    n = len(size)
-    next_stride = [sympy.oo] * n
-    for i in range(n):
-        for j in range(n):
-            # n^2 is ok since n is small
-            if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
-                next_stride[i] = stride[j]
-    # compute coordinate expressions
-    coordinates = [sympy.S.Zero] * n
-    vars = index.free_symbols
+#     Stride and index must be relative to the same storage (both host or device).
+#     Stride values<=0 are ignored.
+#     """
+#     # find stride immediately strictly larger that dim stride
+#     n = len(size)
+#     next_stride = [sympy.oo] * n
+#     for i in range(n):
+#         for j in range(n):
+#             # n^2 is ok since n is small
+#             if next_stride[i] > stride[j] and stride[j] > stride[i] and size[j] > 1:
+#                 next_stride[i] = stride[j]
     
-    for var in vars:
-        if var_ranges[var] <= 1:
-            continue  # ignore var with trivial range
-        # isolate current var
-        term = index.subs({v: 0 for v in vars - {var}})
-        # compute index({var=1}) and index({var=var_ranges[var]})
-        step = term.subs(var, 1)
-        limit = term.subs(var, var_ranges[var])
-        # find primary dim with largest stride less than or equal to step
-        primary_stride = 0
-        primary_dim = -1
-        for dim in range(n):
-            if size[dim] == 1:
-                continue  # ignore dim with size 1
-            st = stride[dim]
-            if st <= step and st > primary_stride:
-                # found candidate primary dim
-                primary_stride = st
-                primary_dim = dim
-            elif st > step and st < limit:
-                # var range intersects dim, add term
-                if next_stride[dim] < limit:
-                    # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
-                else:
-                    coordinates[dim] += var * step // st
-        # add term for primary dim
-        if next_stride[primary_dim] < limit:
-            coordinates[primary_dim] += (
-                # var range overflows primary dim
-                var * step % next_stride[primary_dim] // primary_stride
-            )
-        else:
-            coordinates[primary_dim] += var * step // primary_stride
-    return coordinates
+#     # compute coordinate expressions
+#     coordinates = [sympy.S.Zero] * n
+#     vars = index.free_symbols
+    
+#     for var in vars:
+#         if var_ranges[var] <= 1:
+#             continue  # ignore var with trivial range
+#         # isolate current var
+#         term = index.subs({v: 0 for v in vars - {var}})
+#         # compute index({var=1}) and index({var=var_ranges[var]})
+#         step = term.subs(var, 1)
+#         limit = term.subs(var, var_ranges[var])
+#         # find primary dim with largest stride less than or equal to step
+#         primary_stride = 0
+#         primary_dim = -1
+#         for dim in range(n):
+#             if size[dim] == 1:
+#                 continue  # ignore dim with size 1
+#             st = stride[dim]
+#             if st <= step and st > primary_stride:
+#                 # found candidate primary dim
+#                 primary_stride = st
+#                 primary_dim = dim
+#             elif st > step and st < limit:
+#                 # var range intersects dim, add term
+#                 if next_stride[dim] < limit:
+#                     # var range overflows dim
+#                     coordinates[dim] += var * step % next_stride[dim] // st
+#                 else:
+#                     coordinates[dim] += var * step // st
+#         # add term for primary dim
+#         if next_stride[primary_dim] < limit:
+#             coordinates[primary_dim] += (
+#                 # var range overflows primary dim
+#                 var * step % next_stride[primary_dim] // primary_stride
+#             )
+#         else:
+#             coordinates[primary_dim] += var * step // primary_stride
+#     return coordinates
 
 
 def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bool:
@@ -212,6 +361,33 @@ def normalize_coordinates(var_ranges, size, coordinates):
     return new_results
 
 
+def symbolic_gcd(a, b):
+    """
+    Compute GCD handling symbolic expressions.
+    
+    Returns:
+        - Concrete GCD if both values are concrete
+        - sympy.gcd() result if either is symbolic
+        - 1 as fallback
+    """
+    # Try concrete math.gcd first
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        try:
+            return math.gcd(int(a), int(b))
+        except:
+            pass
+    
+    # Try sympy.gcd for symbolic expressions
+    try:
+        result = sympy.gcd(a, b)
+        # If result is concrete, return as int
+        if isinstance(result, sympy.Basic) and result.is_number:
+            return int(result)
+        return result
+    except:
+        # Fallback to 1 (identity for GCD)
+        return 1
+
 def align_tensors(iteration_space, tensors):
     var_ranges = {var: val[0] for var, val in iteration_space.items()}
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
@@ -248,7 +424,8 @@ def align_tensors(iteration_space, tensors):
                 new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
             for v in reversed(remap[var]):
-                new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
+                # new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
+                new_op_it_space_splits[v] = symbolic_gcd(div, new_var_ranges[v])
                 div //= new_op_it_space_splits[v]
         else:
             new_var_ranges[var] = var_ranges[var]

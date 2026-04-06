@@ -16,6 +16,7 @@
 import dataclasses
 import math
 import os
+import sympy
 from sympy import Expr, Symbol
 
 import torch
@@ -228,6 +229,35 @@ def must_split_vars(
 
     return result
 
+def symbolic_sort_key(expr):
+    """
+    Create a sortable key from a potentially symbolic expression.
+    
+    Strategy:
+    1. If concrete number, return it directly
+    2. If symbolic, try to extract a numeric hint or use string representation
+    3. Ensure stable, deterministic ordering
+    """
+    if isinstance(expr, (int, float)):
+        return (0, float(expr), "")  # Concrete numbers sort first
+    
+    if isinstance(expr, sympy.Basic):
+        # Try to evaluate to a number
+        if expr.is_number:
+            try:
+                return (0, float(expr), "")
+            except:
+                pass
+        
+        # For symbolic expressions, use a tuple for stable sorting:
+        # (1, complexity, string_repr)
+        # This ensures symbolic expressions sort after concrete numbers
+        # and among themselves by complexity then lexicographically
+        complexity = len(expr.free_symbols)
+        return (1, -complexity, str(expr))
+    
+    # Fallback for other types
+    return (2, 0, str(expr))
 
 def prioritize_dimensions(
     output: TensorDep,
@@ -271,8 +301,10 @@ def prioritize_dimensions(
         else:
             reduction_dims.append((s, e))
 
-    remaining_output.sort(key=lambda t: t[1], reverse=True)
-    reduction_dims.sort(key=lambda t: t[1], reverse=True)
+    # remaining_output.sort(key=lambda t: t[1], reverse=True)
+    # reduction_dims.sort(key=lambda t: t[1], reverse=True)
+    remaining_output.sort(key=lambda t: symbolic_sort_key(t[1]), reverse=True)
+    reduction_dims.sort(key=lambda t: symbolic_sort_key(t[1]), reverse=True)
     priority += [t[0] for t in remaining_output]
     if not exclude_reduction:
         priority += [t[0] for t in reduction_dims]

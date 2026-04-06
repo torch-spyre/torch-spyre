@@ -15,6 +15,7 @@
 import dataclasses
 import math
 from typing import Any
+from torch_spyre._inductor.views import symbolic_bool, symbolic_lt, symbolic_gt, symbolic_gcd
 
 from sympy import Integer, Symbol, Expr, Mod, floor
 
@@ -231,7 +232,8 @@ def _get_padded_iteration_space(
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
             dim_size = dev_size[idx] * layout["stick_size"]
-            if sdsc_iteration_space[dim] < dim_size:
+            if symbolic_lt(sdsc_iteration_space[dim], dim_size):
+            #if sdsc_iteration_space[dim] < dim_size:
                 padding[dim] = dim_size - sdsc_iteration_space[dim]
                 sdsc_iteration_space[dim] = dim_size
     return padding

@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import logging
+import sympy
+from torch_spyre._inductor.views import symbolic_bool, symbolic_lt, symbolic_gt, symbolic_gcd
+
 
 
 import torch
@@ -272,6 +275,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
         else:
             out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
+     
         stl = SpyreTensorLayout(output.size, output.stride, output.dtype, out_dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl

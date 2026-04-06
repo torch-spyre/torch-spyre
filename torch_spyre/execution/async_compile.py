@@ -17,6 +17,7 @@ import tempfile
 from typing import Any
 import os
 import subprocess
+import sympy
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
@@ -37,6 +38,27 @@ def get_output_dir(kernel_name: str):
     kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{kernel_name}_")
     return kernel_output_dir
 
+def make_json_serializable(obj):
+    """
+    Recursively convert sympy objects to JSON-serializable types.
+    """
+    if isinstance(obj, sympy.Symbol):
+        return f"Symbol({obj.name})"
+    
+    if isinstance(obj, sympy.Basic):
+        return str(obj)
+    
+    if isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    
+    if isinstance(obj, (list, tuple)):
+        return [make_json_serializable(item) for item in obj]
+    
+    if isinstance(obj, set):
+        return [make_json_serializable(item) for item in obj]
+    
+    return obj
+
 
 class SpyreAsyncCompile:
     def __init__(self) -> None:
@@ -54,7 +76,7 @@ class SpyreAsyncCompile:
             sdsc_json, arg_map = compile_op_spec(kernel_name, ks)
             sdscs_json.append(sdsc_json)
             arg_mappings.append(arg_map)
-
+        sdscs_json=make_json_serializable(sdscs_json)
         # Write SDSCs to file system, invoke backend compiler, and return KernelRunner
         kernel_output_dir = get_output_dir(kernel_name)
         if _SDSC_BUNDLE:
