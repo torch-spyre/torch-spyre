@@ -204,10 +204,14 @@ if __name__ == "__main__":
         if OUTPUT_CODEGEN_DIR:
             sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
 
-        # Filenames that belong to the tiny hooks module
-        hook_files = {"spyre_hooks.cpp"}
-        hooks_src_paths = [p for p in sources if p.name in hook_files]
-        core_src_paths = [p for p in sources if p.name not in hook_files]
+        # Filenames that belong to the tiny hooks module.
+        # "shared" files are compiled into both _hooks.so and _C.so.
+        hooks_only_files = {"spyre_hooks.cpp"}
+        shared_files = {"spyre_device_enum.cpp", "logging.cpp"}
+        hooks_src_paths = [
+            p for p in sources if p.name in hooks_only_files | shared_files
+        ]
+        core_src_paths = [p for p in sources if p.name not in hooks_only_files]
         hooks_src_paths = [
             p.relative_to(ROOT_DIR).as_posix() for p in sorted(hooks_src_paths)
         ]

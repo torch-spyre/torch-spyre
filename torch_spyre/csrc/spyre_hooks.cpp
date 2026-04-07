@@ -19,6 +19,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "spyre_device_enum.h"
+
 namespace py = pybind11;
 
 namespace spyre {
@@ -55,6 +57,7 @@ PYBIND11_MODULE(_hooks, m) {
   at::RegisterPrivateUse1HooksInterface(hooks);
   m.doc() =
       "Spyre bootstrap: registers PrivateUse1 hooks only (no heavy init).";
+  m.def("device_count", &spyre::getVisibleDeviceCount);
 }
 
 c10::Device current_device = c10::Device(c10::DeviceType::PrivateUse1, 0);
@@ -212,8 +215,7 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * you should report that there are zero available devices.
    */
   c10::DeviceIndex deviceCount() const noexcept override {
-    py::gil_scoped_acquire acquire;
-    return c10::DeviceIndex(1);
+    return c10::DeviceIndex(spyre::getVisibleDeviceCount());
   }
   /**
    * Return true if all the work previously enqueued on the stream for
