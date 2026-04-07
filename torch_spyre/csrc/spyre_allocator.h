@@ -26,6 +26,7 @@ namespace spyre {
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
   signed char device_id;
+  size_t nbytes;
 };
 
 // A custom allocator for our custom device, which returns a handle to the
@@ -33,6 +34,9 @@ struct SharedOwnerCtx {
 struct SpyreAllocator final : public c10::DeviceAllocator {
  private:
   SpyreAllocator();
+  static c10::CachingDeviceAllocator::DeviceStats stats_;
+  static c10::CachingDeviceAllocator::StatTypes
+      stat_types;  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
   flex::DeviceMemoryAllocatorPtr getAllocator(unsigned int dev_id);
 
@@ -50,6 +54,10 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   void resetAccumulatedStats(c10::DeviceIndex device) override;
 
   void resetPeakStats(c10::DeviceIndex device) override;
+
+  void recordAlloc(size_t nbytes, void* data, int device);
+
+  void recordRelease(size_t nbytes, void* data, int device);
 
   c10::DataPtr allocate(size_t nbytes) override;
 

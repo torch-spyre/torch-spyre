@@ -18,6 +18,8 @@ import types
 import importlib
 
 from .constants import DEVICE_NAME
+
+from . import memory
 from . import profiler
 
 _runtime_init_lock = threading.Lock()
@@ -144,6 +146,7 @@ def make_spyre_module() -> types.ModuleType:
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
+    mod.memory = memory
 
     # Optional: forward unknown attrs to the impl or _C for convenience
     def __getattr__(name):
@@ -224,6 +227,19 @@ def _autoload():
     # to have enough cache space for all eager ops
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
+
+    _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
+
+    def _patched_isAllocatorInitialized():
+        try:
+            return _orig_isAllocatorInitialized()
+        except RuntimeError as e:
+            if "not a DeviceAllocator" in str(e):
+                return False
+            raise
+            return False
+
+    torch._C._accelerator_isAllocatorInitialized = _patched_isAllocatorInitialized
 
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging
