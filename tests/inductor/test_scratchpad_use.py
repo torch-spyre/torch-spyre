@@ -15,20 +15,43 @@
 from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
-from typing import Any, Callable, TypeVarTuple, Unpack
+from typing import Any, Callable, TypeVarTuple, Unpack, Optional
 
 import unittest
 import torch
-import os
 
 from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
-from tests.inductor.utils_inductor import cached_randn
+from torch._inductor.virtualized import V
+from torch._inductor import config as t_inductor_config
 
 from torch_spyre._inductor.scratchpad import mem_usage_by_node
+from torch_spyre._inductor.passes import CustomNodePassBase, CustomPostFusionPasses
 from torch_spyre._inductor import passes
-from torch._inductor.virtualized import V
+from torch_spyre._inductor import config as ts_inductor_config
+
+from tests.inductor.utils_inductor import cached_randn
 
 Ts = TypeVarTuple("Ts")
+
+
+class CustomPostFusionPassesWithOurPasses(CustomNodePassBase):
+    test_instance = Optional["TestScratchpadUsage"]
+    base_pass_list: list[
+        Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]
+    ] = []
+
+    @classmethod
+    def initialize(cls, test_instance: "TestScratchpadUsage"):
+        cls.base_pass_list = CustomPostFusionPasses().get_passes()
+        cls.test_instance = test_instance
+        passes.CustomPostFusionPasses = CustomPostFusionPassesWithOurPasses
+
+    def get_passes(self):
+        assert self.test_instance is not None, (
+            "CustomPostFusionPassesWithOurPasses.test_instance must be set to an instance of "
+            "TestScratchpadUsage before get_passes is called"
+        )
+        return self.test_instance.our_scheduler_post_passes + self.base_pass_list
 
 
 class TestScratchpadUsage(unittest.TestCase):
@@ -38,42 +61,19 @@ class TestScratchpadUsage(unittest.TestCase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.old_scheduler_post_passes = passes.scheduler_post_passes
-        passes.scheduler_post_passes = self.post_passes_bypass
-
-    def post_passes_bypass(
-        self, nodes: list[BaseSchedulerNode]
-    ) -> list[BaseSchedulerNode]:
-        nodes = self.old_scheduler_post_passes(nodes)
-        for our_pass in self.our_scheduler_post_passes:
-            nodes = our_pass(nodes)
-        return nodes
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
+        t_inductor_config.force_disable_caches = True
         torch.compiler.reset()
+        if not CustomPostFusionPassesWithOurPasses.base_pass_list:
+            # Monkey patch CustomPostFusionPasses to call our passes as well. We can't do it in
+            # the class definition or in setUpClass because we need access to the test instance.
+            CustomPostFusionPassesWithOurPasses.initialize(self)
 
     def cached_randn_device(self, shape: Sequence[int], *args, **kwargs):
         result = cached_randn(shape, *args, **kwargs)
         return result.to("spyre")
-
-    @contextmanager
-    def set_lx_planning(self, enable: bool):
-        """Context manager to set the LX_PLANNING environment variable to enable or disable LX
-        planning."""
-        old_value = os.environ.get("LX_PLANNING", "0")
-        os.environ["LX_PLANNING"] = "1" if enable else "0"
-        modifying = os.environ.get("LX_PLANNING") != old_value
-        if modifying:
-            # Clear build cache so that old builds with the previous value of LX_PLANNING don't
-            # interfere with the test
-            torch.compiler.reset()
-        yield
-        if modifying:
-            # Again clear build cache so that builds with the modified value of LX_PLANNING don't
-            # interfere with future tests
-            torch.compiler.reset()
-            os.environ["LX_PLANNING"] = old_value
 
     @contextmanager
     def post_fusion_mapping_pass(
@@ -92,7 +92,7 @@ class TestScratchpadUsage(unittest.TestCase):
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
-    ) -> tuple[torch.Tensor | None, list[dict[str, dict[str, Any]]]]:
+    ) -> tuple[torch.Tensor, list[dict[str, dict[str, Any]]]]:
         mem_usages = []
 
         def visitor(node: BaseSchedulerNode) -> BaseSchedulerNode:
@@ -114,12 +114,7 @@ class TestScratchpadUsage(unittest.TestCase):
 
         with self.post_fusion_mapping_pass(visitor):
             compiled_kernel = torch.compile(f, fullgraph=True)
-            try:
-                result = compiled_kernel(*args)
-            except:  # noqa: E722
-                # When https://github.com/torch-spyre/torch-spyre/issues/1257 is fixed, we can remove
-                # the try/except block here and the None in the return type.
-                result = None
+            result = compiled_kernel(*args).to("cpu")
 
         return (result, mem_usages)
 
@@ -130,11 +125,17 @@ class TestScratchpadUsage(unittest.TestCase):
     ):
         """Run the current class's test procedure on the given model and arguments. Override this
         in each subclass."""
-        with self.set_lx_planning(True):
-            _, emus = self.compile_and_collect_mem_usage(model, args)
+        with ts_inductor_config.patch(lx_planning=True):
+            _, mem_usages = self.compile_and_collect_mem_usage(model, args)
+
+        print(mem_usages)
 
         self.assertTrue(
-            any(usage["location"] == "LX" for emu in emus for usage in emu.values())
+            any(
+                usage["location"] == "LX"
+                for mem_usage in mem_usages
+                for usage in mem_usage.values()
+            )
         )
 
     def common(
@@ -162,11 +163,11 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         """Estimates the HBM transfers for a given operation. This assumes that any buffer that
         has an entry in its allocations that starts with "lx" is free and that any other node's HBM
         transfers are accurately returned by `mem_usage_by_node`."""
-        result, emus = self.compile_and_collect_mem_usage(model, args)
+        result, mem_usages = self.compile_and_collect_mem_usage(model, args)
         hbm_transfers = sum(
             usage["size"]
-            for emu in emus
-            for usage in emu.values()
+            for mem_usage in mem_usages
+            for usage in mem_usage.values()
             if usage["location"] == "HBM"
         )
         return (result, hbm_transfers)
@@ -178,17 +179,16 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
     ):
         """Test that estimates the total amount of HBM transfers with LX planning turned off and
         turned on, and then compares them."""
-        with self.set_lx_planning(False):
+        with ts_inductor_config.patch(lx_planning=False):
             result_without_lx, hbm_without_lx = self.measure_hbm_transfers(model, args)
 
-        with self.set_lx_planning(True):
+        with ts_inductor_config.patch(lx_planning=True):
             result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
 
         self.assertLess(hbm_with_lx, hbm_without_lx)
 
-        if result_without_lx is not None and result_with_lx is not None:
-            delta = torch.abs(result_without_lx - result_with_lx).max().item()
-            self.assertLess(delta, 1e-5)
+        delta = torch.abs(result_without_lx - result_with_lx).max().item()
+        self.assertLess(delta, 1e-5)
 
 
 if __name__ == "__main__":
