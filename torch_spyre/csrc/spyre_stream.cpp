@@ -49,8 +49,8 @@ struct StreamPool {
   std::unordered_map<c10::DeviceIndex, size_t> next_low_priority_idx;
   std::unordered_map<c10::DeviceIndex, size_t> next_high_priority_idx;
 
-  // Mapping from c10::StreamId to flex::StreamHandle
-  std::unordered_map<c10::StreamId, flex::StreamHandle> stream_handle_map;
+  // Mapping from c10::StreamId to flex::RuntimeStream*
+  std::unordered_map<c10::StreamId, flex::RuntimeStream*> stream_handle_map;
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
@@ -108,7 +108,7 @@ bool SpyreStream::query() const {
   DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
             device().index());
 
-  flex::StreamHandle handle = getRuntimeHandle();
+  flex::RuntimeStream* handle = getRuntimeHandle();
   return handle->query();
 }
 
@@ -118,7 +118,7 @@ void SpyreStream::synchronize() const {
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             device().index());
 
-  flex::StreamHandle handle = getRuntimeHandle();
+  flex::RuntimeStream* handle = getRuntimeHandle();
   handle->synchronize();
 }
 
@@ -131,7 +131,7 @@ void SpyreStream::copy_async(const at::Tensor& src,
   // TODO(tmhoangt): place-holder to be implemented in the next PR
 }
 
-flex::StreamHandle SpyreStream::getRuntimeHandle() const {
+flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
 
@@ -243,7 +243,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   // Create corresponding flex stream handle (if not exists)
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
-    flex::StreamHandle flex_handle =
+    flex::RuntimeStream* flex_handle =
         runtime->createStream(device.index(), runtime->toPriority(priority));
     pool.stream_handle_map[stream_id] = flex_handle;
   }
@@ -258,7 +258,7 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
     }
     const auto device_index = dev.index();
 
-    std::vector<flex::StreamHandle> handles_to_sync;
+    std::vector<flex::RuntimeStream*> handles_to_sync;
     {
       auto& pool = getStreamPool();
       std::lock_guard<std::mutex> lock(pool.mutex);

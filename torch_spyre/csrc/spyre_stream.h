@@ -45,7 +45,7 @@ class SpyreStream {
   c10::Stream unwrap() const;
 
  private:
-  flex::StreamHandle getRuntimeHandle() const;
+  flex::RuntimeStream* getRuntimeHandle() const;
   void copy_async_impl(void* cpu_ptr,
                        flex::DeviceMemoryAllocationPtr& device_allocation,
                        int device_id, const DataConversionInfo& dci,
