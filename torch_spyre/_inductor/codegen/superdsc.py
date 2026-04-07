@@ -257,7 +257,6 @@ def _create_sdsc_tensors(
     use_op_dims = not _is_matmul(op_spec.op)
 
     missing_dim = None
-    backGap: dict[Symbol, int] = {}
     overwrite_infos: dict = (
         dict(op_spec.op_info.get("overwrite_infos", {})) if op_spec.op_info else {}
     )
@@ -284,6 +283,7 @@ def _create_sdsc_tensors(
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
+        backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
         use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
@@ -318,6 +318,22 @@ def _create_sdsc_tensors(
                     use_adjusted_size = False
                     break
 
+            dev_dim_size = arg.device_size[-dim_idx - 2]
+            it_dim_size = iteration_space[dim]
+            if dim == stick_dim:
+                stick_size = arg.device_dtype.elems_per_stick()
+                dev_dim_size *= stick_size
+                it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+
+            if dev_dim_size > it_dim_size and "overwrite_infos" not in op_spec.op_info:
+                # TODO: overwrite and view offsets cannot be used together until the
+                # overwrite operator is refactored to use coordinate expression offsets
+                dim_coord = arg.device_coordinates[-dim_idx - 2]
+                dim_offset = int(dim_coord.as_coeff_Add()[0])
+                offsets[dim] = dim_offset * dim_device_stride
+                backGap[dim] = dev_dim_size - it_dim_size
+                strides[dim] = strides[dim] / dev_dim_size * it_dim_size
+
             max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
@@ -338,7 +354,7 @@ def _create_sdsc_tensors(
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
                 start_address=addr,
-                backGap=backGap if not arg.is_input else {},
+                backGap=backGap,
             )
         )
 
