@@ -15,9 +15,14 @@
 # Helper methods to handle views
 
 from dataclasses import dataclass, astuple
+import logging
 import math
 import sympy
 from typing import Optional, Sequence, Dict, Tuple
+
+from .logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("views")
 
 
 def compute_coordinates(
@@ -265,6 +270,12 @@ def align_tensors(
     # core division for each variable
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "align_tensors input: %s",
+            {str(k): (v, s) for k, (v, s) in iteration_space.items()},
+        )
+
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
     splits: dict[sympy.Symbol, sympy.Expr] = {var: set() for var in var_ranges.keys()}
@@ -290,6 +301,12 @@ def align_tensors(
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "align_tensors splits: %s",
+            {str(k): v for k, v in splits.items()},
+        )
+
     # create new vars, var ranges, and core division for each variable
     # with one var per segment (split[i], split[i+1])
     new_var_ranges = {}
@@ -311,6 +328,15 @@ def align_tensors(
             for v in reversed(remap[var]):
                 new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
                 div //= new_op_it_space_splits[v]
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "align_tensors var %s (div=%d, split=%s) -> segments %s, splits %s",
+                    var,
+                    op_it_space_splits.get(var, 1),
+                    split,
+                    {str(v): new_var_ranges[v] for v in remap[var]},
+                    {str(v): new_op_it_space_splits[v] for v in remap[var]},
+                )
         else:
             # no splits keep existing var, range, and core division
             # may happen with a single stick since the stick size is omitted
@@ -318,6 +344,14 @@ def align_tensors(
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "align_tensors var %s (div=%d, split=%s) -> unchanged, split=%d",
+                    var,
+                    op_it_space_splits.get(var, 1),
+                    split,
+                    new_op_it_space_splits[var],
+                )
 
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
@@ -407,5 +441,11 @@ def align_tensors(
     new_iteration_space = {
         k: (v, new_op_it_space_splits[k]) for k, v in new_var_ranges.items()
     }
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "align_tensors output: %s",
+            {str(k): (v, s) for k, (v, s) in new_iteration_space.items()},
+        )
 
     return new_iteration_space, new_tensors

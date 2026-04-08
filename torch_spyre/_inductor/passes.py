@@ -138,7 +138,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        passes = [propagate_spyre_tensor_layouts, core_division_planning]
+        passes = [propagate_spyre_tensor_layouts]
         if config.lx_planning:
             passes.append(scratchpad_planning)
         return passes
@@ -149,9 +149,17 @@ class CustomPostFusionPasses(CustomNodePassBase):
     This inductor extension point enables Spyre-specific passes to run over
     the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
 
+    core_division_planning must run here (not pre-fusion) because inductor's
+    fusion pass renames the iteration-space symbols in MemoryDep.ranges between
+    the two phases.  Storing op_it_space_splits before that rename causes a
+    symbol mismatch at codegen time, silently dropping all work-division splits.
+
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
 
     def get_passes(self):
-        return [spyre_fuse_nodes]
+        # core_division_planning must precede spyre_fuse_nodes because the
+        # latter wraps SchedulerNodes into FusedSchedulerNodes, making them
+        # invisible to core_division's isinstance(n, SchedulerNode) check.
+        return [core_division_planning, spyre_fuse_nodes]
