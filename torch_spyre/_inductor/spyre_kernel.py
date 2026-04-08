@@ -367,15 +367,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             k: (v, core_division.get(k, 1)) for k, v in it_space.items()
         }
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "create_op_spec %s: it_space=%s, core_division=%s, it_space_extended=%s",
-                op,
-                {str(k): v for k, v in it_space.items()},
-                {str(k): v for k, v in core_division.items()},
-                {str(k): (v, s) for k, (v, s) in it_space_extended.items()},
-            )
-
         return OpSpec(
             op,
             is_reduction,
