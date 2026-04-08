@@ -620,31 +620,13 @@ def pad_decomp(
             f"Spyre (pad={pad})"
         )
 
-    # Left-padding on any dimension requires updating the output start address,
-    # which the SFP overwrite op does not support.
+    # Left-padding requires shifting the output start address by the left amount,
+    # which is not yet supported. Tracked in:
+    # https://github.com/torch-spyre/torch-spyre/issues/1480
     if any(pad[2 * i] > 0 for i in range(n_dims_padded)):
         raise Unsupported(
             f"constant_pad_nd: left-padding is not supported on Spyre (pad={pad})"
         )
-
-    # When the input's last dimension is smaller than one stick (64 fp16 elements),
-    # the data is repeated within each stick (inner_repeats = 64 // last_dim).
-    # The DSC requires the gap (right-pad on last dim) to be a multiple of
-    # inner_repeats; otherwise the hardware aborts with "Gap must be a multiple
-    # of inner repeats in expanded layout".
-    if n_dims_padded >= 1:
-        last_dim_size = input.size(-1)
-        right_pad_last = pad[1]
-        _FP16_ELEMS_PER_STICK = 64
-        if last_dim_size < _FP16_ELEMS_PER_STICK and right_pad_last > 0:
-            inner_repeats = _FP16_ELEMS_PER_STICK // last_dim_size
-            if right_pad_last % inner_repeats != 0:
-                raise Unsupported(
-                    f"constant_pad_nd: right-pad on last dimension ({right_pad_last}) "
-                    f"must be a multiple of inner repeats ({inner_repeats}) when "
-                    f"last dimension size ({last_dim_size}) is smaller than a stick "
-                    f"(pad={pad})"
-                )
 
     # Build the padded output shape and collect which dimensions need padding.
     scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
