@@ -1,6 +1,6 @@
 test_suite_config:
   files:
-    - path: ${PYTORCH}/test/test_modules.py
+    - path: ${TORCH_ROOT}/test/test_modules.py
       unlisted_test_mode: skip
       tests:
         - names:
@@ -15,7 +15,43 @@ test_suite_config:
                 - name: torch.nn.Linear
                   description: Linear causes OOM on this test
 
-    - path: ${PYTORCH}/test/test_view_ops.py
+    - path: ${TORCH_ROOT}/test/test_binary_ufuncs.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestBinaryUfuncs::test_scalar_support
+            - TestBinaryUfuncs::test_contig_vs_transposed
+          mode: xfail
+          tags:
+            - model_1
+            - model_2
+          edits:
+            ops:
+              include:
+                - name: add
+                  description: inject add — binary_ufuncs_with_references excludes it if ref is None
+              exclude:
+                - name: gcd
+                  description: gcd causes buffer alignment errors for this test
+            dtypes:
+              include:
+                - name: float32
+              exclude:
+                - name: bfloat16
+                  description: bfloat16 unsupported on Spyre for this test
+
+        # Single test — name as a list with one entry (or plain string, both accepted)
+        - names:
+            - TestBinaryUfuncs::test_add
+          mode: mandatory_success
+          tags:
+            - tag_for_add
+
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_regex.py
+      unlisted_test_mode: skip
+      tests: []
+
+    - path: ${TORCH_ROOT}/test/test_view_ops.py
       unlisted_test_mode: mandatory_success
       tests:
         - names: # Tests that pass with no special config needed
@@ -40,6 +76,8 @@ test_suite_config:
                 - name: int8
                 - name: uint8
         - names: # Tests that pass for float16 but fail for int64
+            - TestViewOps::test_view_dtype_upsize_errors # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
+            - TestViewOps::test_view_tensor_split   # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
             - TestOldViewOps::test_transposes_errors   # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
           mode: mandatory_success
           edits:
@@ -49,7 +87,8 @@ test_suite_config:
         - names: # Tests that fail 
             - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: Could not run 'aten::index.Tensor_out' https://github.com/torch-spyre/torch-spyre/issues/1219
             - TestViewOps::test_advanced_indexing_assignment   # NotImplementedError aten::_index_put_impl_ https://github.com/torch-spyre/torch-spyre/issues/692
-            - TestViewOps::test_flatten_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_conj_view_with_shared_memory   # RuntimeError: Spyre backend does not support dtype ComplexFloat https://github.com/torch-spyre/torch-spyre/issues/678
+            - TestViewOps::test_flatten_view   # torch._inductor.exc.InductorError: CalledProcessError 'dxp_standalone' (not implemented yet) https://github.com/torch-spyre/torch-spyre/issues/903
             - TestViewOps::test_unfold_view   # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
             - TestViewOps::test_T_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             - TestViewOps::test_as_strided_inplace_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 

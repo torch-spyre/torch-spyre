@@ -125,15 +125,25 @@ See [Compiler Architecture](../compiler/architecture.md) for details.
 Link to a specific section heading by its anchor:
 
 ```markdown
-See [Memory Hierarchy](../overview/dataflow_architecture.md#memory-hierarchy).
+See [Memory Hierarchy](../architecture/dataflow_architecture.md#memory-hierarchy).
 ```
+
+The rendered version of this page is available at
+[Dataflow Architecture on Read the Docs](https://torch-spyre.readthedocs.io/en/latest/architecture/dataflow_architecture.html).
 
 ### Figures
 
-Place image files in `docs/source/_static/images/` and embed them
-using the MyST `figure` directive:
+Place image files in `docs/source/_static/images/` and reference them
+with a standard Markdown image link:
 
-```text
+```markdown
+![Description of the diagram](../_static/images/my-diagram.png)
+```
+
+For richer formatting (captions, sizing, alignment), use the MyST
+`figure` directive:
+
+```
 :::{figure} ../_static/images/my-diagram.png
 :alt: Description of the diagram
 :width: 80%
@@ -147,7 +157,7 @@ Caption text with attribution. *Source: ...*
 
 Fenced code blocks with a language identifier are syntax-highlighted:
 
-```text
+```python
 import torch
 model = torch.compile(model, backend="spyre")
 ```

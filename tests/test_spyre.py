@@ -304,6 +304,35 @@ class TestSpyre(TestCase):
         dev = torch._C._get_accelerator()
         assert str(dev) == "spyre"
 
+    def test_memory_allocated(self):
+        torch.spyre.memory.reset_peak_memory_stats()
+        torch.spyre.memory.reset_accumulated_memory_stats()
+
+        prev_allocated = torch.spyre.memory.memory_allocated()
+        prev_max_allocated = torch.spyre.memory.max_memory_allocated()
+
+        self.assertEqual(
+            prev_allocated, prev_max_allocated
+        )  # Due to reset_peak_memory_stats
+        x = torch.rand((64, 64), dtype=torch.float16)
+        mem_size = x.numel() * x.element_size()  # 8192 bytes
+        self.assertEqual(x.device.type, "cpu")
+        self.assertEqual(torch.spyre.memory.memory_allocated(), prev_allocated)
+
+        x = x.to("spyre")
+        self.assertEqual(x.device.type, "spyre")
+        self.assertEqual(
+            torch.spyre.memory.memory_allocated(), prev_allocated + mem_size
+        )
+
+        del x
+        self.assertEqual(torch.spyre.memory.memory_allocated(), prev_allocated)
+
+        # Test max
+        self.assertEqual(
+            torch.spyre.memory.max_memory_allocated(), prev_max_allocated + mem_size
+        )
+
 
 if __name__ == "__main__":
     run_tests()

@@ -25,8 +25,8 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.relu` | Y | Y | Spyre | |
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |
 | `torch.nn.functional.softplus` | Y | Y | Spyre | Custom op + lowering |
-| `torch.nn.functional.dropout` | | Y | Spyre | |
-| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (math path) |
+| `torch.nn.functional.dropout` | Y | Y | Spyre | |
+| `torch.nn.functional.scaled_dot_product_attention` | | Y | Spyre | Custom decomposition (math path); compiled only |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
@@ -64,7 +64,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.reshape` / `torch.view` | | Y | Spyre | |
 | `torch.transpose` | | Y | Spyre | |
 | `torch.t` | Y | Y | Spyre | View op (via codegen) |
-| `torch.permute` | | Y | Spyre | |
+| `torch.permute` | Y | Y | Spyre | |
 | `torch.clone` | | Y | Spyre | Compiled only (with `.contiguous()`) |
 | `torch.contiguous` | | Y | Spyre | Compiled only |
 | `torch.squeeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
