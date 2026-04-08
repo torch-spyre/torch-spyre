@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  schedule:
+    - cron: 0 2 * * *
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    name: Run Spyre unit tests - complete version
+    # runs-on: official-aiu-x86-64-arc-runner-set-v1
+    # runs-on: official-aiu-x86-64-arc-runner-set-v2
+    runs-on: official-aiu-x86-64-arc-runner-set-v3
+    # increase timeout to 12 hours
+    timeout-minutes: 720
+    # env: {}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: get some info
+        run: |
+          echo 'gather info start'
+          pwd
+          ls -la
+          whoami
+          id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+          echo 'gather info end'
+      - name: Install the torch-spyre package and dependencies
+        run: |
+          echo 'installing with dependencies, this could take a while...'
+          pip install uv
+          # avoid the extra step required by --no-build-isolation
+          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
+      - name: Run unit tests
+        run: |
+          echo 'Run unit tests start'
+          pytest tests/ --cpu-compile -vvv -s || EXIT_CODE=$?
+          EXIT_CODE=${EXIT_CODE:-0}
+          echo "pytest EXIT_CODE: ${EXIT_CODE}"
+          if [[ "$EXIT_CODE" == '0' ]] ; then
+            echo 'pytest success'
+          else
+            echo 'pytest failed'
+          fi
+          echo 'Run unit tests end'
+          exit "$EXIT_CODE"
