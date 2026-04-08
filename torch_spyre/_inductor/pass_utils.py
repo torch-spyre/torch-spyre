@@ -59,11 +59,9 @@ def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.E
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
         # The iteration space of a Pointwise is that of its output
-        dep = next(iter(n.read_writes.writes))
-        return dep.ranges.copy()
+        return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
         # The iteration space of a Reduction is that of its input
-        dep = next(iter(n.read_writes.reads))
-        return dep.ranges.copy()
+        return next(iter(n.read_writes.reads)).ranges.copy()
     else:
         raise Unsupported("Unexpected node type")
