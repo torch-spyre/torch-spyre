@@ -1,0 +1,116 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_view_ops.py
+      unlisted_test_mode: mandatory_success
+      tests:
+        - names: # Tests that pass with no special config needed
+            - TestViewOps::test_as_strided_gradients
+            - TestViewOps::test_contiguous_self
+            - TestViewOps::test_unbind
+            - TestOldViewOps::test_atleast_gradient
+            - TestOldViewOps::test_contiguous
+            - TestOldViewOps::test_resize_as_preserves_strides
+          mode: mandatory_success
+        - names: # Tests that pass with extra dtypes allowed
+            - TestViewOps::test_conj_self
+          mode: mandatory_success
+          edits:
+            dtypes:
+              include:
+                - name: bfloat16
+                - name: int16
+                - name: int32
+                - name: float32
+                - name: float64
+                - name: int8
+                - name: uint8
+        - names: # Tests that pass for float16 but fail for int64
+            - TestOldViewOps::test_transposes_errors   # NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: int64
+        - names: # Tests that fail 
+            - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: Could not run 'aten::index.Tensor_out' https://github.com/torch-spyre/torch-spyre/issues/1219
+            - TestViewOps::test_advanced_indexing_assignment   # NotImplementedError aten::_index_put_impl_ https://github.com/torch-spyre/torch-spyre/issues/692
+            - TestViewOps::test_flatten_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_unfold_view   # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
+            - TestViewOps::test_T_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_as_strided_inplace_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_as_strided_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_basic_indexing_ellipses_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_basic_indexing_newaxis_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_basic_indexing_slice_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_contiguous_nonview   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_diagonal_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_expand_as_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_expand_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_flatten_nonview   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_movedim_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_narrow_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_permute_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_reshape_as_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_reshape_nonview   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_reshape_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
+            - TestViewOps::test_select_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_squeeze_inplace_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_squeeze_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_t_inplace_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_t_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_transpose_inplace_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_transpose_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_unbind_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_unsqueeze_inplace_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_unsqueeze_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_view_as_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_view_copy_out  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_view_copy_output_contiguous  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_view_copy   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestViewOps::test_view_tensor_dsplit  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 (float16), NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            - TestViewOps::test_view_tensor_hsplit   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 (float16), NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            - TestViewOps::test_view_tensor_vsplit  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 (float16), NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            - TestViewOps::test_view_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestOldViewOps::test_T  # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226
+            - TestOldViewOps::test_big_transpose  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestOldViewOps::test_broadcast_to  # AssertionError: Tensor-likes are not close https://github.com/torch-spyre/torch-spyre/issues/1227 (float16),  NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            - TestOldViewOps::test_expand  # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
+            - TestOldViewOps::test_flatten   # AssertionError: The length of the sequences mismatch: 1 != 0 https://github.com/torch-spyre/torch-spyre/issues/729
+            - TestOldViewOps::test_memory_format_resize_   # NotImplementedError aten::resize_ https://github.com/torch-spyre/torch-spyre/issues/730 
+            - TestOldViewOps::test_memory_format_resize_as   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestOldViewOps::test_python_types   # RuntimeError: Spyre backend does not support dtype Double https://github.com/torch-spyre/torch-spyre/issues/1228
+            - TestOldViewOps::test_ravel   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
+            - TestOldViewOps::test_reshape_view_semantics   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 (float16), NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            - TestOldViewOps::test_resize_all_dtypes_and_devices   # NotImplementedError aten::resize_ https://github.com/torch-spyre/torch-spyre/issues/730
+            - TestOldViewOps::test_resize_as_all_dtypes_and_devices   # NotImplementedError aten::resize_ https://github.com/torch-spyre/torch-spyre/issues/730 
+            - TestOldViewOps::test_transposes   # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226 (float16),  NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            - TestOldViewOps::test_view_all_dtypes_and_devices   # RuntimeError: Spyre backend does not support dtype Double https://github.com/torch-spyre/torch-spyre/issues/1228
+          mode: xfail
+        - names: # Tests that are not supported OR crash pytest with seg faults
+            - TestViewOps::test_conj_imag_view  # Complex not supported https://github.com/torch-spyre/torch-spyre/issues/697
+            - TestViewOps::test_real_imag_view  # Complex not supported https://github.com/torch-spyre/torch-spyre/issues/694 
+            - TestViewOps::test_set_real_imag  # Complex not supported https://github.com/torch-spyre/torch-spyre/issues/700
+            - TestViewOps::test_view_as_real  # Complex not supported https://github.com/torch-spyre/torch-spyre/issues/652
+            - TestOldViewOps::test_atleast   # Signal Received: 11 (Segmentation fault) https://github.com/torch-spyre/torch-spyre/issues/728
+            - TestOldViewOps::test_empty_reshape   # Segmentation fault https://github.com/torch-spyre/torch-spyre/issues/1229
+            - TestOldViewOps::test_transpose_vs_numpy   # Signal Received: 11 (Segmentation fault) https://github.com/torch-spyre/torch-spyre/issues/727
+            - TestOldViewOps::test_view_empty   # Segmentation fault https://github.com/torch-spyre/torch-spyre/issues/1229
+            - TestOldViewOps::test_view    # Segmentation fault https://github.com/torch-spyre/torch-spyre/issues/1231
+          mode: skip
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: int64
+    supported_ops:
+      - name: add
+        dtypes:
+          - name: float16
+            precision:
+              atol: 1e-3
+              rtol: 1e-3
+          - name: int64
+      - name: mul
+      - name: sub
+      - name: gcd
+        force_xfail: true
