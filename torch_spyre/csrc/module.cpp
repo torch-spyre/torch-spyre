@@ -409,9 +409,17 @@ PYBIND11_MODULE(_C, m) {
                " id=" + std::to_string(stream.id()) + ">";
       });
   m.def("set_device", [](int idx) {
+    int count = spyre::device_count();
+    TORCH_CHECK(idx >= 0 && idx < count, "Device index ", idx,
+                " out of range [0, ", count, ")");
     c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
         ->setDevice(c10::Device(c10::DeviceType::PrivateUse1,
                                 static_cast<c10::DeviceIndex>(idx)));
+  });
+  m.def("current_device", []() {
+    return c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->getDevice()
+        .index();
   });
   m.def("device_count", &spyre::device_count);
 }
