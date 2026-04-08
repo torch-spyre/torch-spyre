@@ -612,6 +612,7 @@ def pad_decomp(
     # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
     n_dims_padded = len(pad) // 2
 
+<<<<<<< HEAD
     # Negative pad values (cropping) require reading from a non-zero storage
     # offset or a sub-stick position, neither of which the SFP supports.
     if any(p < 0 for p in pad):
@@ -623,22 +624,36 @@ def pad_decomp(
     # Left-padding requires shifting the output start address by the left amount,
     # which is not yet supported. Tracked in:
     # https://github.com/torch-spyre/torch-spyre/issues/1480
+=======
+    # Left-padding on any dimension requires updating the output start address,
+    # which the SFP overwrite op does not support.
+>>>>>>> 50b1430 (TEMP: cherry-picked commit (will replace with upstream later))
     if any(pad[2 * i] > 0 for i in range(n_dims_padded)):
         raise Unsupported(
             f"constant_pad_nd: left-padding is not supported on Spyre (pad={pad})"
         )
 
+<<<<<<< HEAD
     # Build the padded output shape and collect which dimensions need padding.
     scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
     output_size = list(input.size())
     dims: list[int] = []
     offsets: list[int] = []
+=======
+    # Apply padding one dimension at a time, from outermost to innermost.
+    # Each step fills an intermediate tensor with the pad value and overwrites
+    # it with the current tensor.  Processing outermost-first ensures that each
+    # overwrite call sees matching sizes on all non-overwrite dimensions.
+    scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
+    current = input
+>>>>>>> 50b1430 (TEMP: cherry-picked commit (will replace with upstream later))
     for i in range(n_dims_padded - 1, -1, -1):
         left = pad[2 * i]
         right = pad[2 * i + 1]
         if left + right == 0:
             continue
         dim = input.dim() - 1 - i
+<<<<<<< HEAD
         output_size[dim] += left + right
         dims.append(dim)
         offsets.append(left)
@@ -650,6 +665,16 @@ def pad_decomp(
     return torch.ops.spyre.overwrite(
         input=input, output=output, dims=dims, offsets=offsets
     )
+=======
+        intermediate_size = list(current.size())
+        intermediate_size[dim] += left + right
+        intermediate = scalar.expand(intermediate_size).clone()
+        current = torch.ops.spyre.overwrite(
+            input=current, output=intermediate, dim=dim, offset=left
+        )
+
+    return current
+>>>>>>> 50b1430 (TEMP: cherry-picked commit (will replace with upstream later))
 
 
 ###############################################################################################
