@@ -19,6 +19,7 @@ import unittest
 import psutil
 import warnings
 from contextlib import contextmanager
+import pytest
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -332,6 +333,27 @@ class TestSpyre(TestCase):
         self.assertEqual(
             torch.spyre.memory.max_memory_allocated(), prev_max_allocated + mem_size
         )
+
+    def test_spyre_device_count_and_set_device(self):
+        count = torch.spyre.device_count()
+
+        assert isinstance(count, int)
+        assert count > 0
+
+        orig = torch.spyre.current_device()
+
+        try:
+            for i in range(min(2, count)):
+                torch.spyre.set_device(i)
+                assert torch.spyre.current_device() == i
+
+            with pytest.raises(Exception):
+                torch.spyre.set_device(count)
+
+            with pytest.raises(Exception):
+                torch.spyre.set_device(-1)
+        finally:
+            torch.spyre.set_device(orig)
 
 
 if __name__ == "__main__":

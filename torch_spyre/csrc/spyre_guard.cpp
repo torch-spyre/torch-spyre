@@ -19,6 +19,7 @@
 #include <ATen/core/op_registration/adaption.h>
 
 #include "module.h"
+#include "spyre_device_enum.h"
 #include "spyre_stream.h"
 
 namespace spyre {
@@ -46,8 +47,7 @@ void SpyreGuardImpl::setDevice(c10::Device d) const {
 void SpyreGuardImpl::uncheckedSetDevice(c10::Device) const noexcept {}
 
 c10::DeviceIndex SpyreGuardImpl::deviceCount() const noexcept {
-  //  FIXME (tmhoangt) - return actual device count
-  return 1;
+  return c10::DeviceIndex(getVisibleDeviceCount());
 }
 
 c10::Stream SpyreGuardImpl::getStream(c10::Device device) const {

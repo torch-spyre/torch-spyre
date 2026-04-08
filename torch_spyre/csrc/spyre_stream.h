@@ -19,8 +19,6 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
-#include <flex/stream/stream_handle.hpp>
-
 #include "module.h"
 
 namespace spyre {
@@ -47,7 +45,7 @@ class SpyreStream {
   c10::Stream unwrap() const;
 
  private:
-  flex::StreamHandle get_flex_handle() const;
+  flex::RuntimeStream* getRuntimeHandle() const;
   void copy_async_impl(void* cpu_ptr,
                        flex::DeviceMemoryAllocationPtr& device_allocation,
                        int device_id, const DataConversionInfo& dci,

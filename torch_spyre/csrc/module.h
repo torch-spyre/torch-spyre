@@ -20,7 +20,7 @@
 #include <torch/csrc/utils/pybind.h>
 #include <util/sen_host_ops.h>
 
-#include <flex/stream/stream_runtime.hpp>
+#include <flex/runtime_stream/runtime_entry.hpp>
 #include <memory>
 
 using DataConversionStrideInfo = data_conversion_stride_info;
@@ -28,7 +28,7 @@ using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
-using Runtime = flex::StreamRuntime;
+using Runtime = flex::RuntimeEntry;
 
 class GlobalRuntime {
  public:

@@ -29,6 +29,7 @@ class _SpyreImpl:
     def __init__(self):
         self._initialized = False
         self._in_bad_fork = False
+        self._pending_device_idx = None
 
         # When spawning a supprocess from inductor, ensure that IS_INDUCTOR_SPAWNED_SUBPROCESS=1
         # This will avoid additional initialization when processes are spawned from torch inductor (This happens in Triton pathway)
@@ -58,6 +59,10 @@ class _SpyreImpl:
             # Load the C++ Module
             # put any light, once-per-process setup here
             self._C = importlib.import_module("torch_spyre._C")
+            # Apply pending device index before runtime init
+            pending = self._pending_device_idx
+            if pending is not None:
+                self._C.set_device(pending)
             # this will create the allocator
             self._C.start_runtime()
             self._initialized = True
@@ -112,16 +117,20 @@ class _SpyreImpl:
         return self._initialized and not self._is_in_bad_fork()
 
     def device_count(self) -> int:
-        # TODO(tmhoangt) - invoke the right API to return
-        return 1
+        from . import _hooks
+
+        return _hooks.device_count()
 
     def current_device(self) -> int:
         return getattr(self._C, "current_device", lambda: 0)()
 
     def set_device(self, idx: int) -> None:
-        fn = getattr(self._C, "set_device", None)
-        if fn:
-            fn(int(idx))
+        self._pending_device_idx = int(idx)
+        # If runtime is already initialized, also set it on the C++ side.
+        if self._initialized:
+            fn = getattr(self._C, "set_device", None)
+            if fn:
+                fn(int(idx))
 
     def _mark_after_fork(self):
         self._initialized = True
