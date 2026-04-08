@@ -442,6 +442,29 @@ class SpyreKernel(Kernel[CSEVariable]):
             for input in value.arguments:
                 if isinstance(input, TensorAccess):
                     args.append(self.create_tensor_arg(True, input.name, input))
+                elif isinstance(input, PointwiseOp):
+                    # Handle nested PointwiseOp here: This argument is an output of another preceding op in the same loop body
+
+                    # Create and allocate an intermediate buffer to store the preceding op's output
+                    tmp_buf = torch._inductor.ir.ComputedBuffer(
+                        layout=input.arguments[-1].layout,
+                        name=None,
+                        data=None,
+                    )
+                    tmp_buf_name = V.graph.register_buffer(tmp_buf, set_name=True)
+                    V.graph.wrapper_code.codegen_allocation(tmp_buf)
+
+                    # Recursively call `store` to execute the preceding op and store its output into the intermediate buffer
+                    self.store(tmp_buf_name, index, input, mode)
+
+                    # Use the intermediate buffer as an input argument to the current op
+                    args.append(
+                        self.create_tensor_arg(
+                            True,
+                            tmp_buf_name,
+                            TensorAccess(tmp_buf_name, index, layout),
+                        )
+                    )
                 else:
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
