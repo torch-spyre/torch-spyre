@@ -138,10 +138,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        passes = [propagate_spyre_tensor_layouts]
-        if config.lx_planning:
-            passes.append(scratchpad_planning)
-        return passes
+        return [propagate_spyre_tensor_layouts]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
@@ -159,7 +156,12 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        # core_division_planning must precede spyre_fuse_nodes because the
-        # latter wraps SchedulerNodes into FusedSchedulerNodes, making them
-        # invisible to core_division's isinstance(n, SchedulerNode) check.
-        return [core_division_planning, spyre_fuse_nodes]
+        # core_division_planning and scratchpad_planning must precede
+        # spyre_fuse_nodes because the latter wraps SchedulerNodes into
+        # FusedSchedulerNodes, making them invisible to those passes'
+        # isinstance(n, SchedulerNode) checks.
+        passes = [core_division_planning]
+        if config.lx_planning:
+            passes.append(scratchpad_planning)
+        passes.append(spyre_fuse_nodes)
+        return passes
