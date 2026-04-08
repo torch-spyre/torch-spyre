@@ -32,6 +32,7 @@ from torch_spyre._inductor.constants import (
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
+import os
 
 from .compute_ops import generate_sdsc
 
@@ -50,6 +51,8 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     offset: int
+    isStartAddrSymbolic_: str = os.environ.get("SPYRE_SYMBOLIC_ADDR", "0")
+    symbolic_name: str | None = None
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -69,6 +72,8 @@ class SDSCArgs:
             f"  start_address={self.start_address}\n"
             f"  backGap={self.backGap}\n"
             f"  offset={self.offset}\n"
+            f"  isStartAddrSymbolic_={self.isStartAddrSymbolic_}\n"
+            f"  symbolic_name={self.symbolic_name}\n"
             f")"
         )
 
@@ -305,7 +310,7 @@ def _create_sdsc_tensors(
             ):
                 backGap[dim] = gap
             offsets[dim] = 0
-            max_dim_sizes[dim] = -1
+            max_dim_sizes[dim] = iteration_space.get(dim, -1) #-1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         label = _get_layout_label(
@@ -339,7 +344,7 @@ def _create_sdsc_tensors(
             dim_idx = len(sdsc_arg.scales)
             sdsc_arg.scales[missing_dim] = 1
             sdsc_arg.offsets[missing_dim] = 0
-            sdsc_arg.max_dim_sizes[missing_dim] = -1
+            sdsc_arg.max_dim_sizes[missing_dim] = iteration_space.get(dim, -1) #-1
             sdsc_arg.strides[missing_dim] = _calculate_device_stride(
                 dim_idx, src_arg.device_size
             )
@@ -462,7 +467,6 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> tuple[Any, list[int]]:
     sdsc_spec = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-
     arg_map = [ts.arg_index for ts in op_spec.args]
     dt_sdsc = generate_sdsc(sdsc_spec)
     return dt_sdsc, arg_map

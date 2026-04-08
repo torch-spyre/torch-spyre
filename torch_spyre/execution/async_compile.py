@@ -18,6 +18,8 @@ from typing import Any
 import os
 import subprocess
 import sympy
+import os
+import shutil
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
@@ -100,9 +102,40 @@ class SpyreAsyncCompile:
                 file.write("\t}\n")
                 file.write("}\n")
 
+            # subprocess.run(
+            #     ["dxp_standalone", "--bundle", "-d", kernel_output_dir], check=True
+            # )
+
+            # Ensure the directory exists before calling dxp_standalone
+            os.makedirs(kernel_output_dir, exist_ok=True)
+
+            # Create symlink from sdsc_0.json to sdsc.json (required by dxp_standalone)
+            sdsc_source = os.path.join(kernel_output_dir, "sdsc_0.json")
+            sdsc_link = os.path.join(kernel_output_dir, "sdsc.json")
+            if os.path.exists(sdsc_source) and not os.path.exists(sdsc_link):
+                os.symlink("sdsc_0.json", sdsc_link)
+            
+            # Copy sdsc_0.json to sdsc.json (required by dxp_standalone)
+            sdsc_source = os.path.join(kernel_output_dir, "sdsc_0.json")
+            sdsc_target = os.path.join(kernel_output_dir, "sdsc.json")
+            if os.path.exists(sdsc_source) and not os.path.exists(sdsc_target):
+                shutil.copy2(sdsc_source, sdsc_target)
+
             subprocess.run(
-                ["dxp_standalone", "--bundle", "-d", kernel_output_dir], check=True
+                ["dxp_standalone", "-d", kernel_output_dir, "-b", "spyre"], check=True
             )
+
+            # After dxp_standalone runs, before convert_artifacts
+            execute_dir = os.path.join(kernel_output_dir, "execute", os.path.basename(kernel_output_dir))
+            os.makedirs(execute_dir, exist_ok=True)
+
+            # Copy or symlink required files
+            for file in ["pagi.json", "segment_size.json", "sdsc.json"]:
+                src = os.path.join(kernel_output_dir, file)
+                dst = os.path.join(execute_dir, file)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    os.symlink(src, dst)
+                    
             convert_artifacts(kernel_output_dir)
 
             return SpyreSDSCKernelRunner(kernel_name, [kernel_output_dir], arg_mappings)

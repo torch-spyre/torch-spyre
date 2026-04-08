@@ -17,6 +17,7 @@ from torch_spyre._C import encode_constant, DataFormats
 from sympy import Symbol
 
 
+
 def core_idx_to_slice_offset(
     arg,
     wk_slice: dict,
@@ -204,6 +205,9 @@ def gen_coord_info_value(
         }
     )
 
+    
+    schedule_tree_nodes.append(node)
+    prev_node_name = node_name  # Update for next iteration
 
 def generate_sdsc(sdsc_spec):
     out_idx = len(sdsc_spec.args) - 1
@@ -214,6 +218,96 @@ def generate_sdsc(sdsc_spec):
         }
         for c in range(sdsc_spec.num_cores)
     }
+
+    # BUILD scheduleTree BEFORE the return dictionary
+    schedule_tree_nodes = []
+    prev_node_name = ""
+
+    for i, tensor in enumerate(sdsc_spec.args):
+        node_name = f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}"
+        
+        node = {
+            "nodeType_": "allocate",
+            "name_": node_name,
+            "prev_": prev_node_name,  # FIXED: uses actual node name
+            "ldsIdx_": i,
+            "component_": "hbm" if not tensor.allocation else "lx",
+            "layoutDimOrder_": [
+                str(dim)
+                for dim in sdsc_spec.layouts[tensor.layout]["dim_order"]
+            ],
+            "maxDimSizes_": [
+                tensor.max_dim_sizes[dim]
+                for dim in sdsc_spec.layouts[tensor.layout]["dim_order"]
+            ],
+            "startAddressCoreCorelet_": {
+                "dim_prop_func": [
+                    {"Map": {}},
+                    {"Const": {}},
+                    {"Const": {}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": sdsc_spec.num_cores, "label_": "core"},
+                    {"factor_": 1, "label_": "corelet"},
+                    {"factor_": 1, "label_": "time"},
+                ],
+                "data_": {
+                    f"[{c}, 0, 0]": (
+                    #     f"$Tensor{i} + "
+                    #     f"{core_idx_to_slice_offset(
+                    #         tensor,
+                    #         core_id_to_wk_slice[str(c)],
+                    #         sdsc_spec.work_slices,
+                    #         offset=tensor.offset,
+                    #     ) * num_bytes(tensor.data_format)}"
+                    # )
+                    # if tensor.isStartAddrSymbolic_
+                    #else str(
+                        tensor.start_address
+                        + core_idx_to_slice_offset(
+                            tensor,
+                            core_id_to_wk_slice[str(c)],
+                            sdsc_spec.work_slices,
+                            offset=tensor.offset,
+                        )
+                        * num_bytes(tensor.data_format)
+                    )
+                    for c in range(sdsc_spec.num_cores)
+                },
+            },
+            "isStartAddrSymbolic_": int(tensor.isStartAddrSymbolic_),  # FIXED: int not str
+            "coordinates_": {
+                "coordInfo": {
+                    str(dim): gen_coord_info_value(
+                        size=sdsc_spec.iteration_space[dim]
+                        // sdsc_spec.work_slices[dim]
+                        if (tensor.scales[dim] == 1)
+                        else 1,
+                        nsplits=sdsc_spec.work_slices[dim]
+                        if (tensor.scales[dim] == 1)
+                        else 1,
+                        elems_per_stick=tensor.data_format.elems_per_stick(),
+                        is_stick_dim=(
+                            sdsc_spec.layouts[tensor.layout]["stick_dim_order"].has(dim)
+                        ),
+                        is_stick_reduction=(tensor.scales[dim] == -2),
+                    )
+                    for dim in sdsc_spec.layouts[tensor.layout]["dim_order"]
+                },
+                "coreIdToWkSlice_": {},
+            },
+        }
+        
+        # Add backGapCore_ if exists
+        if tensor.backGap:
+            node["backGapCore_"] = {
+                str(dim): {"-1": str(gap)}
+                for dim, gap in tensor.backGap.items()
+            }
+        
+        schedule_tree_nodes.append(node)
+        prev_node_name = node_name  # Update for next iteration
+     
     return {
         sdsc_spec.opfunc: {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -272,111 +366,157 @@ def generate_sdsc(sdsc_spec):
                                 },
                             }
                         },
+                        # "primaryDsInfo_": {
+                        #     label: {
+                        #         "layoutDimOrder_": [
+                        #             str(dim) for dim in layout_info["dim_order"]
+                        #         ],
+                        #         "stickDimOrder_": [str(layout_info["stick_dim_order"])],
+                        #         "stickSize_": [layout_info["stick_size"]],
+                        #     }
+                        #     for label, layout_info in sdsc_spec.layouts.items()
+                        # },
                         "primaryDsInfo_": {
-                            label: {
-                                "layoutDimOrder_": [
-                                    str(dim) for dim in layout_info["dim_order"]
-                                ],
-                                "stickDimOrder_": [str(layout_info["stick_dim_order"])],
-                                "stickSize_": [layout_info["stick_size"]],
-                            }
-                            for label, layout_info in sdsc_spec.layouts.items()
+                            **{
+                                label: {
+                                    "layoutDimOrder_": [
+                                        str(dim) for dim in layout_info["dim_order"]
+                                    ],
+                                    "stickDimOrder_": [str(layout_info["stick_dim_order"])],
+                                    "stickSize_": [layout_info["stick_size"]],
+                                }
+                                for label, layout_info in sdsc_spec.layouts.items()
+                            },
+                            # Add OUTPUT layout (same structure as INPUT for element-wise ops)
+                            **({
+                                "OUTPUT": {
+                                    "layoutDimOrder_": [
+                                        str(dim) for dim in sdsc_spec.layouts["INPUT"]["dim_order"]
+                                    ],
+                                    "stickDimOrder_": [str(sdsc_spec.layouts["INPUT"]["stick_dim_order"])],
+                                    "stickSize_": [sdsc_spec.layouts["INPUT"]["stick_size"]],
+                                }
+                            } if "INPUT" in sdsc_spec.layouts else {})
                         },
-                        "scheduleTree_": [
-                            {
-                                "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
-                                "prev_": "",
-                                "ldsIdx_": i,
-                                "component_": "hbm" if not tensor.allocation else "lx",
-                                "layoutDimOrder_": [
-                                    str(dim)
-                                    for dim in sdsc_spec.layouts[tensor.layout][
-                                        "dim_order"
-                                    ]
-                                ],
-                                "maxDimSizes_": [
-                                    tensor.max_dim_sizes[dim]
-                                    for dim in sdsc_spec.layouts[tensor.layout][
-                                        "dim_order"
-                                    ]
-                                ],
-                                "startAddressCoreCorelet_": {
-                                    "dim_prop_func": [
-                                        {"Map": {}},
-                                        {"Const": {}},
-                                        {"Const": {}},
-                                    ],
-                                    "dim_prop_attr": [
-                                        {
-                                            "factor_": sdsc_spec.num_cores,
-                                            "label_": "core",
-                                        },
-                                        {"factor_": 1, "label_": "corelet"},
-                                        {"factor_": 1, "label_": "time"},
-                                    ],
-                                    "data_": {
-                                        f"[{c}, 0, 0]": str(
-                                            tensor.start_address
-                                            + core_idx_to_slice_offset(
-                                                tensor,
-                                                core_id_to_wk_slice[str(c)],
-                                                sdsc_spec.work_slices,
-                                                offset=tensor.offset,
-                                            )
-                                            * num_bytes(tensor.data_format)
-                                        )
-                                        if not tensor.allocation
-                                        else tensor.allocation["lx"]
-                                        for c in range(sdsc_spec.num_cores)
-                                    },
-                                },
-                                **(
-                                    {
-                                        "backGapCore_": {
-                                            str(dim): {
-                                                "-1": str(gap)  # HBM is -1
-                                            }
-                                            for dim, gap in tensor.backGap.items()
-                                        }
-                                    }
-                                    if tensor.backGap
-                                    else {}
-                                ),
-                                "coordinates_": {
-                                    "coordInfo": {
-                                        str(dim): gen_coord_info_value(
-                                            size=sdsc_spec.iteration_space[dim]
-                                            // sdsc_spec.work_slices[dim]
-                                            if (tensor.scales[dim] == 1)
-                                            else 1,
-                                            nsplits=sdsc_spec.work_slices[dim]
-                                            if (tensor.scales[dim] == 1)
-                                            else 1,
-                                            elems_per_stick=tensor.data_format.elems_per_stick(),
-                                            is_stick_dim=(
-                                                sdsc_spec.layouts[tensor.layout][
-                                                    "stick_dim_order"
-                                                ].has(dim)
-                                            ),
-                                            is_stick_reduction=(
-                                                tensor.scales[dim] == -2
-                                            ),
-                                        )
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
-                                    },
-                                    "coreIdToWkSlice_": {},
-                                },
-                            }
-                            for i, tensor in enumerate(sdsc_spec.args)
-                        ],
+                        # "scheduleTree_": [
+                        #     {
+                        #         "nodeType_": "allocate",
+                        #         "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
+                        #         "prev_": prev_node_name,
+                        #         "ldsIdx_": i,
+                        #         "component_": "hbm" if not tensor.allocation else "lx",
+                        #         "layoutDimOrder_": [
+                        #             str(dim)
+                        #             for dim in sdsc_spec.layouts[tensor.layout][
+                        #                 "dim_order"
+                        #             ]
+                        #         ],
+                        #         "maxDimSizes_": [
+                        #             tensor.max_dim_sizes[dim]
+                        #             for dim in sdsc_spec.layouts[tensor.layout][
+                        #                 "dim_order"
+                        #             ]
+                        #         ],
+                        #         "startAddressCoreCorelet_": {
+                        #             "dim_prop_func": [
+                        #                 {"Map": {}},
+                        #                 {"Const": {}},
+                        #                 {"Const": {}},
+                        #             ],
+                        #             "dim_prop_attr": [
+                        #                 {
+                        #                     "factor_": sdsc_spec.num_cores,
+                        #                     "label_": "core",
+                        #                 },
+                        #                 {"factor_": 1, "label_": "corelet"},
+                        #                 {"factor_": 1, "label_": "time"},
+                        #             ],
+                        #             # "data_": {
+                        #             #     f"[{c}, 0, 0]": str(
+                        #             #         tensor.start_address
+                        #             #         + core_idx_to_slice_offset(
+                        #             #             tensor,
+                        #             #             core_id_to_wk_slice[str(c)],
+                        #             #             sdsc_spec.work_slices,
+                        #             #             offset=tensor.offset,
+                        #             #         )
+                        #             #         * num_bytes(tensor.data_format)
+                        #             #     )
+                        #             #     if not tensor.allocation
+                        #             #     else tensor.allocation["lx"]
+                        #             #     for c in range(sdsc_spec.num_cores)
+                        #             # },
+                        #             "data_": {
+                        #                 f"[{c}, 0, 0]": (
+                        #                     # Use symbolic reference instead of concrete address
+                        #                     f"$Tensor{i} + "
+                        #                     f"{core_idx_to_slice_offset(
+                        #                         tensor,
+                        #                         core_id_to_wk_slice[str(c)],
+                        #                         sdsc_spec.work_slices,
+                        #                         offset=tensor.offset,
+                        #                     ) * num_bytes(tensor.data_format)}"
+                        #                 )
+                        #                 if tensor.isStartAddrSymbolic_
+                        #                 else str(
+                        #                     tensor.start_address
+                        #                     + core_idx_to_slice_offset(...)
+                        #                     * num_bytes(tensor.data_format)
+                        #                 )
+                        #                 for c in range(sdsc_spec.num_cores)
+                        #             },
+                        #         },
+
+                        #         "isStartAddrSymbolic_": str(tensor.isStartAddrSymbolic_),
+
+                        #         **(
+                        #             {
+                        #                 "backGapCore_": {
+                        #                     str(dim): {
+                        #                         "-1": str(gap)  # HBM is -1
+                        #                     }
+                        #                     for dim, gap in tensor.backGap.items()
+                        #                 }
+                        #             }
+                        #             if tensor.backGap
+                        #             else {}
+                        #         ),
+                        #         "coordinates_": {
+                        #             "coordInfo": {
+                        #                 str(dim): gen_coord_info_value(
+                        #                     size=sdsc_spec.iteration_space[dim]
+                        #                     // sdsc_spec.work_slices[dim]
+                        #                     if (tensor.scales[dim] == 1)
+                        #                     else 1,
+                        #                     nsplits=sdsc_spec.work_slices[dim]
+                        #                     if (tensor.scales[dim] == 1)
+                        #                     else 1,
+                        #                     elems_per_stick=tensor.data_format.elems_per_stick(),
+                        #                     is_stick_dim=(
+                        #                         sdsc_spec.layouts[tensor.layout][
+                        #                             "stick_dim_order"
+                        #                         ].has(dim)
+                        #                     ),
+                        #                     is_stick_reduction=(
+                        #                         tensor.scales[dim] == -2
+                        #                     ),
+                        #                 )
+                        #                 for dim in sdsc_spec.layouts[tensor.layout][
+                        #                     "dim_order"
+                        #                 ]
+                        #             },
+                        #             "coreIdToWkSlice_": {},
+                        #         },
+                        #     }
+                        #     for i, tensor in enumerate(sdsc_spec.args)
+                        # ],
+                        "scheduleTree_": schedule_tree_nodes,
                         "labeledDs_": [
                             {
                                 "ldsIdx_": i,
                                 "dsName_": f"Tensor{i}",
-                                "dsType_": tensor.layout,
+                                # "dsType_": tensor.layout,
+                                "dsType_": "OUTPUT" if i == len(sdsc_spec.args) - 1 else tensor.layout,
                                 "scale_": [
                                     tensor.scales[dim]
                                     for dim in sdsc_spec.layouts[tensor.layout][
