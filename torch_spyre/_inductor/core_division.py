@@ -194,15 +194,6 @@ def must_split_vars(
     result: dict[Symbol, int] = {}
     for td in tensor_deps:
         total_sticks = math.prod(td.layout.device_layout.device_size[:-1])
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "must_split_vars: tensor device_size=%s total_sticks=%d "
-                "device_coords=%s it_space_adjusted=%s",
-                td.layout.device_layout.device_size,
-                total_sticks,
-                [str(c) for c in td.device_coords],
-                {str(k): v for k, v in it_space_adjusted.items()},
-            )
         if total_sticks <= MAX_SPAN_STICKS:
             continue
 
@@ -255,10 +246,6 @@ def must_split_vars(
                 result[var] = max(result.get(var, 1), min_split)
             break
 
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "must_split_vars result: %s", {str(k): v for k, v in result.items()}
-        )
     return result
 
 
