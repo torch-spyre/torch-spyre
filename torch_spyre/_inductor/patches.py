@@ -72,6 +72,7 @@ def enable_spyre_context(
     import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.choices import SpyreHeuristics
     from torch_spyre._inductor.passes import (
+        CustomPreGradPasses,
         CustomPrePasses,
         CustomPostPasses,
         CustomPreFusionPasses,
@@ -82,6 +83,7 @@ def enable_spyre_context(
     new_config = {
         "split_reductions": False,
         "benchmark_harness": False,
+        "pre_grad_custom_pass": CustomPreGradPasses(),
         "post_grad_custom_pre_pass": CustomPrePasses(),
         "post_grad_custom_post_pass": CustomPostPasses(),
         "_pre_fusion_custom_pass": CustomPreFusionPasses(),
