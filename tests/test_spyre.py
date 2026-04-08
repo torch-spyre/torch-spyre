@@ -338,12 +338,7 @@ class TestSpyre(TestCase):
         count = torch.spyre.device_count()
 
         assert isinstance(count, int)
-        assert count >= 0
-
-        if count == 0:
-            with pytest.raises(Exception):
-                torch.spyre.set_device(0)
-            return
+        assert count > 0
 
         orig = torch.spyre.current_device()
 
