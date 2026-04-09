@@ -359,7 +359,29 @@ def run_test(
 
     ref_out_cpu = to_device(ref_out, torch.device("cpu"))
 
-    # Check if the operation explicitly specifies CPU device
+    # Check if the operation specifies CPU device
+    FACTORY_METHODS = {
+        "torch.tensor",
+        "torch.from_numpy",
+        "torch.from_dlpack",
+        "torch.arange",
+        "torch.range",
+        "torch.linspace",
+        "torch.logspace",
+        "torch.zeros",
+        "torch.ones",
+        "torch.full",
+        "torch.eye",
+        "torch.rand",
+        "torch,randn",
+        "torch.randint",
+        "torch.randperm",
+        "torch.normal",
+        "torch.empty",
+        "torch.empty_stride",
+        "torch.sparse_coo_tensor",
+        "torch.complex",
+    }
     is_cpu_operation = False
     if op_name == "torch.to":
         # Check if device argument for torch.to is "cpu"
@@ -370,8 +392,12 @@ def run_test(
         ):
             is_cpu_operation = True
     else:
+        device_str = str(test_sample.kwargs.get("device", ""))
+        # default device for Pytorch factory method is "cpu"
+        if device_str == "" and op_name in FACTORY_METHODS:
+            is_cpu_operation = True
         # Check if device kwarg is "cpu"
-        if str(test_sample.kwargs.get("device", "")) == "cpu":
+        elif device_str == "cpu":
             is_cpu_operation = True
 
     # Check if the output tensor is on expected device
