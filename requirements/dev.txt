@@ -35,8 +35,6 @@ huggingface-hub==0.36.2
     # via
     #   tokenizers
     #   transformers
-hypothesis==6.151.9
-    # via torch-spyre
 identify==2.6.16
     # via pre-commit
 idna==3.11
@@ -106,8 +104,6 @@ setuptools==79.0.1
     # via
     #   torch
     #   torch-spyre
-sortedcontainers==2.4.0
-    # via hypothesis
 sympy==1.14.0
     # via torch
 tokenizers==0.22.2

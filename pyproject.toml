@@ -3,8 +3,7 @@ requires = [
     # any change here should be reflected in the build dependencies below
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",
-    "expecttest>=0.3.0",
-    "hypothesis",
+    "expecttest>=0.3.0", # imported by torch.testing._internal.common_utils
     "jinja2",
     "ninja",
     "numpy",
@@ -38,8 +37,7 @@ build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",
-    "expecttest>=0.3.0",
-    "hypothesis",
+    "expecttest>=0.3.0", # imported by torch.testing._internal.common_utils
     "jinja2",
     "ninja",
     "numpy",
