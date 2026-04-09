@@ -19,6 +19,7 @@ import torch
 from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
+    cached_xavier,
     make_param_dict,
     unique_randn_along_dim,
 )
@@ -196,6 +197,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2, 3, 99, 65), (2, 3, 65, 55)),
                 ]
             ),
+        },
+        ("test_large_matmul", "test_mm_relaxed"): {
+            "ops_dict": {"matmul": torch.matmul},
+            "param_sets": {
+                "2d_M2048_K2048_N65536": (
+                    cached_randn((2048, 2048)),
+                    cached_xavier((2048, 65536)),
+                ),
+                "3d_M3_K11_N2880": (
+                    cached_randn((3, 11, 2880)),
+                    cached_xavier((3, 2880, 2880)),
+                ),
+                "3d2d_M3_K11_N2880": (
+                    cached_randn((3, 11, 2880)),
+                    cached_xavier((2880, 2880)),
+                ),
+                "4d_B2_H2_M2048_K2048_N65536": (
+                    cached_randn((2, 2, 2048, 2048)),
+                    cached_xavier((2, 2, 2048, 65536)),
+                ),
+            },
         },
         ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"sum": torch.sum},
@@ -1667,7 +1689,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
-        if K >= (128 // b.element_size()):  # multiple sticks
+        if K > (128 // b.element_size()):  # multiple sticks
             compare(op, a, b, atol=0.1, rtol=0.1)
         else:  # single stick, no need to relax
             compare(op, a, b)

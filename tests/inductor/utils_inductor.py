@@ -30,6 +30,17 @@ def cached_randn(
 
 
 @functools.lru_cache(maxsize=None)
+def cached_xavier(
+    shape,
+    differentiation=None,
+    dtype=torch.float16,
+):
+    out = torch.empty(shape, dtype=dtype)
+    torch.nn.init.xavier_uniform_(out)
+    return out
+
+
+@functools.lru_cache(maxsize=None)
 def unique_randn_along_dim(
     shape,
     dim=-1,
