@@ -51,7 +51,7 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     offset: int
-    isStartAddrSymbolic_: str = os.environ.get("SPYRE_SYMBOLIC_ADDR", "0")
+    isStartAddrSymbolic_: bool = os.environ.get("SPYRE_SYMBOLIC_ADDR", "0") == "1"
     symbolic_name: str | None = None
 
     def __str__(self) -> str:

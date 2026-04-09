@@ -253,16 +253,16 @@ def generate_sdsc(sdsc_spec):
                 ],
                 "data_": {
                     f"[{c}, 0, 0]": (
-                    #     f"$Tensor{i} + "
-                    #     f"{core_idx_to_slice_offset(
-                    #         tensor,
-                    #         core_id_to_wk_slice[str(c)],
-                    #         sdsc_spec.work_slices,
-                    #         offset=tensor.offset,
-                    #     ) * num_bytes(tensor.data_format)}"
-                    # )
-                    # if tensor.isStartAddrSymbolic_
-                    #else str(
+                        f"$Tensor{i} + "
+                        f"{core_idx_to_slice_offset(
+                            tensor,
+                            core_id_to_wk_slice[str(c)],
+                            sdsc_spec.work_slices,
+                            offset=tensor.offset,
+                        ) * num_bytes(tensor.data_format)}"
+                    )
+                    if tensor.isStartAddrSymbolic_
+                    else str(
                         tensor.start_address
                         + core_idx_to_slice_offset(
                             tensor,
@@ -275,7 +275,7 @@ def generate_sdsc(sdsc_spec):
                     for c in range(sdsc_spec.num_cores)
                 },
             },
-            "isStartAddrSymbolic_": int(tensor.isStartAddrSymbolic_),  # FIXED: int not str
+            "isStartAddrSymbolic_": str(int(tensor.isStartAddrSymbolic_)),  # FIXED: int not str
             "coordinates_": {
                 "coordInfo": {
                     str(dim): gen_coord_info_value(
