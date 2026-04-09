@@ -204,7 +204,16 @@ def must_split_vars(
             assert len(vars_) == 1, (
                 f"Expected exactly 1 free symbol in device coord {coord!r}, got {vars_}."
             )
-            adjusted_size = it_space_adjusted[next(iter(vars_))]
+            var = next(iter(vars_))
+            if var not in it_space_adjusted:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "must_split_vars: coord %s has var %s not in it_space_adjusted — skipping tensor",
+                        coord,
+                        var,
+                    )
+                break  # variable not in adjusted space, can't split this tensor
+            adjusted_size = it_space_adjusted[var]
             if adjusted_size == 1:
                 continue
             min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
@@ -216,6 +225,17 @@ def must_split_vars(
                 ),
                 adjusted_size,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "must_split_vars: coord=%s var=%s adjusted_size=%d "
+                    "total_sticks=%d min_split_raw=%d min_split=%d",
+                    coord,
+                    var,
+                    adjusted_size,
+                    total_sticks,
+                    min_split_raw,
+                    min_split,
+                )
             if min_split == adjusted_size and adjusted_size < min_split_raw:
                 logger.warning(
                     f"Cannot fully satisfy span limit for {vars_} "
@@ -290,7 +310,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
-    priorities, min_splits = prioritize_dimensions(output_td, it_space)
+    priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
     splits = multi_dim_iteration_space_split(
         it_space,
         max_cores,
