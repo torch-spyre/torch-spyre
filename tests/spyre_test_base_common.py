@@ -15,8 +15,6 @@ Usage:
 """
 
 import os
-import unittest
-from functools import wraps
 from typing import Dict, Optional, Set
 
 import pytest  # type: ignore
@@ -393,13 +391,29 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             )
 
             if not enabled:
-
-                @wraps(test)
-                def _skip(self, _reason=reason or "Skipped for Spyre"):
-                    raise unittest.SkipTest(_reason)
-
-                setattr(cls, method_name, _skip)
+                # ------- Delete rather than replace with a skip stub -------
+                # Previously this replaced the method with a unittest.SkipTest
+                # stub, causing pytest to collect and report the variant as
+                # SKIPPED. This happens for dtype-filtered variants (e.g.
+                # "Unsupported dtype: complex128") which can produce dozens of
+                # SKIPPED lines per test.
+                #
+                # Deleting the method entirely removes it from the class so
+                # pytest never collects it
+                delattr(cls, method_name)
                 continue
+
+            # Following lines has been commented out to disable generating
+            # the skipped tests. If you want to generate, then please uncomment
+            # these lines below and comment out the above lines.
+
+            # if not enabled:
+            #     @wraps(test)
+            #     def _skip(self, _reason=reason or "Skipped for Spyre"):
+            #         raise unittest.SkipTest(_reason)
+
+            #     setattr(cls, method_name, _skip)
+            #     continue
 
             # apply pytest tags as marks
             if tags:

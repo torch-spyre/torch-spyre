@@ -30,10 +30,11 @@ c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
 flex::DeviceMemoryAllocatorPtr SpyreAllocator::getAllocator(
-    unsigned int dev_id) {
-  return GlobalRuntime::get()
-      ->GetDeviceHandle(dev_id)
-      ->GetDeviceMemoryAllocator();
+    unsigned int /*dev_id*/) {
+  // Each process has exactly one runtime with one device handle (index 0).
+  // The PyTorch device index (dev_id) is the logical index across processes,
+  // not an index into the runtime's device handle vector.
+  return GlobalRuntime::get()->GetDeviceHandle(0)->GetDeviceMemoryAllocator();
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
