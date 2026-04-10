@@ -24,6 +24,7 @@ from torch._inductor.custom_graph_pass import (
 )
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
@@ -48,6 +49,19 @@ def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
 
     if has_spyre_device:
         return pass_fn(graph)
+
+
+class CustomPreGradPasses:
+    """
+    This inductor extension point enables Spyre-specific passes to run on the
+    pre-grad FX graph.
+    """
+
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [insert_padding]
+
+    def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        for p in self.passes:
+            p(graph)
 
 
 class CustomPrePasses(CustomGraphPass):
