@@ -169,12 +169,11 @@ class SpyreOpFuncs:
         return PointwiseOp("neg", [a])
 
     @staticmethod
-    def overwrite(input, stride, offset, gap):
+    def overwrite(input, strides, offsets, gaps):
         op_info = {
-            "overwrite_info": {
-                "stride": stride,
-                "offset": offset,
-                "gap": gap,
+            "overwrite_infos": {
+                i: {"stride": s, "offset": o, "gap": g}
+                for i, (s, o, g) in enumerate(zip(strides, offsets, gaps))
             }
         }
         return PointwiseOp("overwrite", [input], op_info)
@@ -443,7 +442,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info.update(value.op_info)
             if value.op == "overwrite":
                 convert_overwrite(
-                    value.op_info["overwrite_info"], dst.layout.device_layout
+                    value.op_info["overwrite_infos"], dst.layout.device_layout
                 )
             self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
         elif isinstance(value, TensorAccess):
@@ -626,16 +625,17 @@ def simplify_op_spec(op_spec):
         arg.device_coordinates = t["coordinates"]
 
 
-def convert_overwrite(overwrite_info, stl):
-    stride = overwrite_info["stride"]
-    gap = overwrite_info["gap"]
-    offset = overwrite_info["offset"]
-    span = gap * stride
-    device_dim = None
-    max_stride = 0
-    for i, st in enumerate(stl.stride_map):
-        if st > max_stride and span >= st and stl.device_size[i] > 1:
-            max_stride = st
-            device_dim = i
-    overwrite_info["device_stride"] = math.prod(stl.device_size[device_dim + 1 :])
-    overwrite_info["device_offset"] = offset * stride // max_stride
+def convert_overwrite(overwrite_infos, stl):
+    for info in overwrite_infos.values():
+        stride = info["stride"]
+        gap = info["gap"]
+        offset = info["offset"]
+        span = gap * stride
+        device_dim = None
+        max_stride = 0
+        for i, st in enumerate(stl.stride_map):
+            if st > max_stride and span >= st and stl.device_size[i] > 1:
+                max_stride = st
+                device_dim = i
+        info["device_stride"] = math.prod(stl.device_size[device_dim + 1 :])
+        info["device_offset"] = offset * stride // max_stride

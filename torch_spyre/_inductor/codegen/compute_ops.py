@@ -21,8 +21,8 @@ def core_idx_to_slice_offset(
     arg,
     wk_slice: dict,
     work_slices: dict,
-    offset: int,
 ) -> int:
+    offset = sum(arg.offsets.values())
     for dim, stride in arg.strides.items():
         if str(dim) in wk_slice and arg.scales[dim] > 0:
             offset += wk_slice[str(dim)] * stride // work_slices[dim]
@@ -322,7 +322,6 @@ def generate_sdsc(sdsc_spec):
                                                 tensor,
                                                 core_id_to_wk_slice[str(c)],
                                                 sdsc_spec.work_slices,
-                                                offset=tensor.offset,
                                             )
                                             * num_bytes(tensor.data_format)
                                         )

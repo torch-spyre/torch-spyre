@@ -504,15 +504,18 @@ def clone(x, *, memory_format=None):
 
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)
-def lower_overwrite(input, output, dim, offset):
+def lower_overwrite(input, output, dims, offsets):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
+
+    strides = [int(output.get_layout().stride[d]) for d in dims]
+    gaps = [int(output.get_layout().size[d] - input.get_layout().size[d]) for d in dims]
 
     def inner_fn(index):
         return fn(
             input.make_loader()(index),
-            int(output.get_layout().stride[dim]),
-            offset,
-            int(output.get_layout().size[dim] - input.get_layout().size[dim]),
+            strides,
+            offsets,
+            gaps,
         )
 
     inp = Pointwise(
