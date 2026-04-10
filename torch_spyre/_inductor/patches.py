@@ -20,6 +20,8 @@ from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from typing import Callable, Optional
 
+from .constants import DEVICE_NAME
+
 
 @contextmanager
 def spyre_data_types():
