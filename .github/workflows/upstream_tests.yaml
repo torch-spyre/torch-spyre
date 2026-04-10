@@ -1,0 +1,109 @@
+name: upstream-pytorch-tests
+
+on:
+  # Run automatically on every merge to main
+  push:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  upstream-tests:
+    name: ${{ matrix.suite.name }}
+    runs-on: official-aiu-x86-64-arc-runner-set-v3
+    timeout-minutes: 720
+
+    # ---------------------------------------------------------------------------
+    # To add a new upstream test suite, append an entry here:
+    #   - name: <human-readable label shown in the GHA UI>
+    #     config: <filename inside tests/configs/>
+    # ---------------------------------------------------------------------------
+    strategy:
+      fail-fast: false   # run all suites even if one fails
+      matrix:
+        suite:
+          - name: View ops
+            config: test_suite_config.yaml
+          - name: Profiler
+            config: test_profiler_config.yaml
+
+    steps:
+      - name: Checkout torch-spyre repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      # ---------------------------------------------------------------------------
+      # PyTorch source caching
+      #
+      # Cloning pytorch/pytorch at release/2.10 with all submodules is expensive.
+      # We cache the entire checkout keyed on the latest commit SHA of release/2.10
+      # so the clone only happens when the branch actually updates upstream.
+      #
+      # Cache hit  --> restore from cache, skip checkout (saves several minutes)
+      # Cache miss --> shallow clone + submodules, then save to cache for next run
+      # ---------------------------------------------------------------------------
+      - name: Get latest commit SHA of pytorch release/2.10
+        id: pytorch-sha
+        run: |
+          SHA=$(git ls-remote https://github.com/pytorch/pytorch.git refs/heads/release/2.10 | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "PyTorch release/2.10 HEAD: $SHA"
+
+      - name: Restore PyTorch source from cache
+        id: pytorch-cache
+        uses: actions/cache@v4
+        with:
+          path: pytorch
+          key: pytorch-release-2.10-${{ steps.pytorch-sha.outputs.sha }}
+
+      - name: Checkout PyTorch source at release/2.10
+        if: steps.pytorch-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: pytorch/pytorch
+          ref: release/2.10
+          submodules: recursive
+          path: pytorch
+
+      - name: Set TORCH_ROOT
+        run: echo "TORCH_ROOT=$GITHUB_WORKSPACE/pytorch" >> "$GITHUB_ENV"
+
+      - name: Gather environment info
+        run: |
+          echo 'gather info start'
+          pwd
+          ls -la
+          whoami
+          id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          echo "TORCH_ROOT $TORCH_ROOT"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+          echo 'gather info end'
+
+      - name: Install torch-spyre package and dependencies
+        working-directory: torch-spyre
+        run: |
+          echo 'installing with dependencies, this could take a while...'
+          pip install uv
+          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
+          uv pip install pydantic
+
+      - name: Run ${{ matrix.suite.name }} upstream test suite
+        working-directory: torch-spyre/tests
+        run: |-
+          echo 'Running ${{ matrix.suite.name }} upstream tests...'
+          bash run_test.sh configs/${{ matrix.suite.config }} -v
+          echo '${{ matrix.suite.name }} upstream tests done'
