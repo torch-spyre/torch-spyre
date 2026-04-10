@@ -19,10 +19,17 @@ from torch_spyre._C import get_elem_in_stick
 logger = get_inductor_logger("padding")
 aten = torch.ops.aten
 
+"""
+Pass to add padding where useful for correctness or performance.  Must be a pre-grad pass 
+if we want to leverage decomposition for constant_pad_nn.  If this pass must come later then
+pad will need to be inserted in its decomposed form.
+"""
 
-def compute_padding(cur_size, dtype):
+
+def compute_padding(cur_size: int, dtype: torch.dtype) -> int:
     stick_size = get_elem_in_stick(dtype)
-    return (stick_size - (cur_size % stick_size)) % stick_size
+    pad = (stick_size - (cur_size % stick_size)) % stick_size
+    return pad
 
 
 def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) -> None:
@@ -49,9 +56,7 @@ def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) ->
 
 
 def insert_padding(graph: torch.fx.Graph) -> None:
-    """
-    Pass to insert padded where needed for correctness.
-    """
+
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target == torch.matmul:
             args = node.args
@@ -61,7 +66,7 @@ def insert_padding(graph: torch.fx.Graph) -> None:
             x_val = args[0].meta.get("example_value")
             if x_val is None or not isinstance(x_val, torch.Tensor):
                 continue
-            # Skip if reduction dim is 1 (special case in mm lowering, converted to mul)
+            # Skip if reduction dim size is 1 (special cased in in lowering, size 1 mm is converted to mul)
             if x_val.shape[-1] == 1:
                 continue
 
