@@ -69,8 +69,8 @@ def insert_padding(graph: torch.fx.Graph) -> None:
             if x_val.shape[-1] == 1:
                 continue
 
-            # Backend only requires padding arg_1 dim_0 here, because arg_0 dim_1 gets stick padding elsewhere.
-            # However we are padding at the pytorch level so we also need to pad arg_0 dim_1 or we generate
+            # Backend only requires padding arg_1 dim_-2 here, because arg_0 dim_-1 gets stick padding elsewhere.
+            # However we are padding at the pytorch level so we also need to pad arg_0 dim_-1 or we generate
             # invalid matmul dimension errors.
             pad_arg(graph, node, arg_i=0, dim=-1)
             pad_arg(graph, node, arg_i=1, dim=-2)
