@@ -18,7 +18,7 @@ from typing import NamedTuple
 import sympy
 from torch._inductor.ir import FixedLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
 from torch_spyre._inductor.errors import Unsupported
 
@@ -34,6 +34,18 @@ class SchedNodeArg(NamedTuple):
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in n.read_writes.reads:
+        if isinstance(arg, MemoryDep):
+            buf = V.graph.get_buffer(arg.name)
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+            res.append(SchedNodeArg(arg, layout))
+    return res
+
+
+def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
+    res: list[SchedNodeArg] = []
+    for arg in read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
             layout = buf.get_layout()

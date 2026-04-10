@@ -31,7 +31,7 @@ from .temp_passes import (
     relayout_linear_weights,
     replace_scalar_with_tensor,
 )
-from .stickify import propagate_spyre_tensor_layouts
+from .stickify import propagate_mutation_layouts
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
@@ -152,7 +152,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [propagate_spyre_tensor_layouts]
+        return [propagate_mutation_layouts]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):

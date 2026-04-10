@@ -15,9 +15,12 @@
 from contextlib import contextmanager
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from typing import Callable, Optional
+
+from .constants import DEVICE_NAME
 
 
 @contextmanager
@@ -107,6 +110,22 @@ def enable_spyre_context(
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
+    # Inject the layout propagation pass before the Scheduler is constructed,
+    # allowing the pass to modify the graph IR (buffers, inputs, constants).
+    old_update_scheduler = GraphLowering._update_scheduler
+
+    def _spyre_update_scheduler(self: GraphLowering) -> None:
+        from torch_spyre._inductor.stickify import propagate_spyre_tensor_layouts
+
+        if any(
+            op.get_device() is not None and op.get_device().type == DEVICE_NAME
+            for op in self.operations
+        ):
+            propagate_spyre_tensor_layouts(self.operations)
+        old_update_scheduler(self)
+
+    GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
+
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
@@ -120,3 +139,4 @@ def enable_spyre_context(
         finally:
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
+            GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
