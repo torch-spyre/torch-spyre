@@ -23,7 +23,13 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>  // std::getenv
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <flex/compiler_interface/dee_graph_converter.hpp>
 #include <flex/runtime/flex_factory.hpp>
 #include <memory>
@@ -119,9 +125,38 @@ void freeRuntime() {
   GlobalRuntime::reset();
 }
 void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
+  // Static initialization - happens once per process
+  static bool timing_enabled = []() {
+    const char* env = std::getenv("TORCH_SPYRE_TIMING");
+    return env && std::string(env) == "1";
+  }();
+  
+  static std::string timing_log_file = []() {
+    const char* env = std::getenv("TORCH_SPYRE_TIMING_LOG");
+    if (!env) return std::string("");
+    
+    std::string base_path(env);
+    // Add LOCAL_RANK suffix if in distributed setting (consistent with torch-spyre pattern)
+    const char* local_rank_env = std::getenv("LOCAL_RANK");
+    if (local_rank_env) {
+      base_path += "_rank_" + std::string(local_rank_env);
+    }
+    return base_path;
+  }();
+  
+  static std::atomic<uint64_t> invocation_counter{0};
+  uint64_t current_invocation = invocation_counter.fetch_add(1, std::memory_order_relaxed);
+  
+  using Clock = std::chrono::high_resolution_clock;
+  using Duration = std::chrono::duration<double, std::milli>;
+  
+  auto total_start = Clock::now();
+  
   // Get global runtime from eager
   auto gl = sendnn::GraphLoader(GlobalRuntime::get());
 
+  // Section 1: Deserialization
+  auto deser_start = Clock::now();
   // Load compiled kernel
   auto g2 = sendnn::Graph();
   sendnn::Deserialize(&g2, g2_path);
@@ -168,7 +203,10 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
       }
     }
   }
+  auto deser_end = Clock::now();
 
+  // Section 2: Preparation
+  auto prep_start = Clock::now();
   // Load/parse patched G2 graph
   auto status = gl.LoadGraph(g2, false);
   if (!status.IsOk()) throw std::runtime_error(status.Message());
@@ -208,7 +246,10 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                           args.back().storage().data_ptr().get_context())
                           ->owner);
   sen_outputs.push_back(tensor);
+  auto prep_end = Clock::now();
 
+  // Section 3: Compute
+  auto compute_start = Clock::now();
   // Execute device init
   if (args.size() == 6) {
     // Filling in segment 5 adds another input to the device init supernode
@@ -230,7 +271,47 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     status = gl.Compute(sen_outputs, sen_inputs, 1);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
   }
-
+  auto compute_end = Clock::now();
+  
+  auto total_end = Clock::now();
+  
+  // Output timing if enabled
+  if (timing_enabled) {
+    Duration deser_time = deser_end - deser_start;
+    Duration prep_time = prep_end - prep_start;
+    Duration compute_time = compute_end - compute_start;
+    Duration total_time = total_end - total_start;
+    
+    // Extract kernel directory name from path
+    std::filesystem::path p(g2_path);
+    std::string kernel_name = p.parent_path().filename().string();
+    
+    std::ostringstream timing_output;
+    timing_output << std::fixed << std::setprecision(2);
+    timing_output << "launchKernel #" << current_invocation
+                  << " [" << kernel_name << "] Timing Breakdown:\n"
+                  << "  Deserialization: " << deser_time.count() << " ms\n"
+                  << "  Preparation:     " << prep_time.count() << " ms\n"
+                  << "  Compute:         " << compute_time.count() << " ms\n"
+                  << "  Total:           " << total_time.count() << " ms\n";
+    
+    // Output to file or stderr based on TORCH_SPYRE_TIMING_LOG
+    if (!timing_log_file.empty()) {
+      std::ofstream log_file(timing_log_file, std::ios::app);
+      if (log_file.is_open()) {
+        log_file << timing_output.str();
+        log_file.close();
+      } else {
+        // Fallback to stderr if file can't be opened
+        std::cerr << "Warning: Could not open timing log file: "
+                  << timing_log_file << "\n";
+        std::cerr << timing_output.str();
+      }
+    } else {
+      // Default: output to stderr
+      std::cerr << timing_output.str();
+    }
+  }
   return;
 }
 
