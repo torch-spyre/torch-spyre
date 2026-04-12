@@ -32,10 +32,14 @@ from .temp_passes import (
     relayout_linear_weights,
     replace_scalar_with_tensor,
 )
+<<<<<<< HEAD
 from . import config
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
+=======
+from .stickify import propagate_mutation_layouts
+>>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 
@@ -169,13 +173,19 @@ class CustomPostFusionPasses(CustomNodePassBase):
         return [spyre_fuse_nodes]
 
 
+<<<<<<< HEAD
 class CustomPreSchedulingPasses(CustomGraphPass):
     """
     Spyre-specific passes that run on IR operations immediately before the
+=======
+def pre_scheduling_passes(operations: list[Operation]) -> None:
+    """Spyre-specific passes that run on IR operations immediately before the
+>>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
     Scheduler is constructed (via the _update_scheduler monkey-patch).
 
     Operations are in topological order (guaranteed by GraphLowering).
     """
+<<<<<<< HEAD
 
     def __call__(self, operations: list[Operation]) -> None:
         has_spyre_device = any(
@@ -197,3 +207,21 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(scratchpad_planning),
         ]
         return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
+=======
+    from .stickify import propagate_spyre_tensor_layouts
+    from .core_division import core_division_planning
+    from .scratchpad import scratchpad_planning
+    from . import config
+
+    has_spyre_device = any(
+        op.get_device() is not None and op.get_device().type == DEVICE_NAME
+        for op in operations
+    )
+    if not has_spyre_device:
+        return
+
+    propagate_spyre_tensor_layouts(operations)
+    core_division_planning(operations)
+    if config.lx_planning:
+        scratchpad_planning(operations)
+>>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
