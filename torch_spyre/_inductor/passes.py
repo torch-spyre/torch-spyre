@@ -22,6 +22,7 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .padding import insert_padding
@@ -32,11 +33,8 @@ from .temp_passes import (
     replace_scalar_with_tensor,
 )
 from .stickify import propagate_mutation_layouts
-from .core_division import core_division_planning
-from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
-from . import config
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -160,22 +158,33 @@ class CustomPostFusionPasses(CustomNodePassBase):
     This inductor extension point enables Spyre-specific passes to run over
     the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
 
-    core_division_planning must run here (not pre-fusion) because inductor's
-    fusion pass renames the iteration-space symbols in MemoryDep.ranges between
-    the two phases.  Storing op_it_space_splits before that rename causes a
-    symbol mismatch at codegen time, silently dropping all work-division splits.
-
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
 
     def get_passes(self):
-        # core_division_planning and scratchpad_planning must precede
-        # spyre_fuse_nodes because the latter wraps SchedulerNodes into
-        # FusedSchedulerNodes, making them invisible to those passes'
-        # isinstance(n, SchedulerNode) checks.
-        passes = [core_division_planning]
-        if config.lx_planning:
-            passes.append(scratchpad_planning)
-        passes.append(spyre_fuse_nodes)
-        return passes
+        return [spyre_fuse_nodes]
+
+
+def pre_scheduling_passes(operations: list[Operation]) -> None:
+    """Spyre-specific passes that run on IR operations immediately before the
+    Scheduler is constructed (via the _update_scheduler monkey-patch).
+
+    Operations are in topological order (guaranteed by GraphLowering).
+    """
+    from .stickify import propagate_spyre_tensor_layouts
+    from .core_division import core_division_planning
+    from .scratchpad import scratchpad_planning
+    from . import config
+
+    has_spyre_device = any(
+        op.get_device() is not None and op.get_device().type == DEVICE_NAME
+        for op in operations
+    )
+    if not has_spyre_device:
+        return
+
+    propagate_spyre_tensor_layouts(operations)
+    core_division_planning(operations)
+    if config.lx_planning:
+        scratchpad_planning(operations)
