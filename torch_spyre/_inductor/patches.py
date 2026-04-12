@@ -78,7 +78,10 @@ def enable_spyre_context(
         CustomPostPasses,
         CustomPreFusionPasses,
         CustomPostFusionPasses,
+        CustomPreSchedulingPasses,
     )
+
+    from torch_spyre._inductor import config as spyre_config
 
     # *) Inductor config tweaks (saved/restored)
     new_config = {
@@ -94,6 +97,11 @@ def enable_spyre_context(
         "unroll_reductions_threshold": 1,
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
+    }
+
+    # *) Spyre config tweaks (saved/restored)
+    new_spyre_config = {
+        "pre_scheduling_custom_pass": CustomPreSchedulingPasses(),
     }
 
     from torch._inductor.ir import Loops
@@ -113,9 +121,9 @@ def enable_spyre_context(
     old_update_scheduler = GraphLowering._update_scheduler
 
     def _spyre_update_scheduler(self: GraphLowering) -> None:
-        from torch_spyre._inductor.passes import pre_scheduling_passes
-
-        pre_scheduling_passes(self.operations)
+        pre_scheduling_pass = spyre_config.pre_scheduling_custom_pass
+        if pre_scheduling_pass is not None:
+            pre_scheduling_pass(self.operations)
         old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
@@ -127,6 +135,7 @@ def enable_spyre_context(
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),
+        spyre_config.patch(new_spyre_config),
     ):
         try:
             yield spyre_context_decompositions

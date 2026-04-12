@@ -166,25 +166,40 @@ class CustomPostFusionPasses(CustomNodePassBase):
         return [spyre_fuse_nodes]
 
 
-def pre_scheduling_passes(operations: list[Operation]) -> None:
-    """Spyre-specific passes that run on IR operations immediately before the
+class CustomPreSchedulingPasses(CustomGraphPass):
+    """
+    Spyre-specific passes that run on IR operations immediately before the
     Scheduler is constructed (via the _update_scheduler monkey-patch).
 
     Operations are in topological order (guaranteed by GraphLowering).
     """
-    from .stickify import propagate_spyre_tensor_layouts
-    from .core_division import core_division_planning
-    from .scratchpad import scratchpad_planning
-    from . import config
 
-    has_spyre_device = any(
-        op.get_device() is not None and op.get_device().type == DEVICE_NAME
-        for op in operations
-    )
-    if not has_spyre_device:
-        return
+    def __call__(self, operations: list[Operation]) -> None:
+        from .stickify import propagate_spyre_tensor_layouts
+        from .core_division import core_division_planning
+        from .scratchpad import scratchpad_planning
+        from . import config
 
-    propagate_spyre_tensor_layouts(operations)
-    core_division_planning(operations)
-    if config.lx_planning:
-        scratchpad_planning(operations)
+        has_spyre_device = any(
+            op.get_device() is not None and op.get_device().type == DEVICE_NAME
+            for op in operations
+        )
+        if not has_spyre_device:
+            return
+
+        propagate_spyre_tensor_layouts(operations)
+        core_division_planning(operations)
+        if config.lx_planning:
+            scratchpad_planning(operations)
+
+    def uuid(self) -> Optional[Any]:
+        from .stickify import propagate_spyre_tensor_layouts
+        from .core_division import core_division_planning
+        from .scratchpad import scratchpad_planning
+
+        files = [
+            inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(core_division_planning),
+            inspect.getfile(scratchpad_planning),
+        ]
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
