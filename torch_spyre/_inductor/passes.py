@@ -32,7 +32,10 @@ from .temp_passes import (
     relayout_linear_weights,
     replace_scalar_with_tensor,
 )
-from .stickify import propagate_mutation_layouts
+from . import config
+from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
+from .core_division import core_division_planning
+from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 
@@ -175,11 +178,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     """
 
     def __call__(self, operations: list[Operation]) -> None:
-        from .stickify import propagate_spyre_tensor_layouts
-        from .core_division import core_division_planning
-        from .scratchpad import scratchpad_planning
-        from . import config
-
         has_spyre_device = any(
             op.get_device() is not None and op.get_device().type == DEVICE_NAME
             for op in operations
@@ -193,10 +191,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             scratchpad_planning(operations)
 
     def uuid(self) -> Optional[Any]:
-        from .stickify import propagate_spyre_tensor_layouts
-        from .core_division import core_division_planning
-        from .scratchpad import scratchpad_planning
-
         files = [
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(core_division_planning),
