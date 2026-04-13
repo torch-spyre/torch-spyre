@@ -355,6 +355,37 @@ class TestSpyre(TestCase):
         finally:
             torch.spyre.set_device(orig)
 
+    def test_instantiate_device_type_tests_mro(self):
+        """Verify that instantiate_device_type_tests works with TestCase
+        base class and only_for=("privateuse1",).
+
+        Previously, inheriting from PrivateUse1TestBase caused an MRO
+        conflict when instantiate_device_type_tests tried to create a
+        dynamic subclass that also inherits PrivateUse1TestBase.
+        Using plain TestCase + only_for avoids the conflict.
+        """
+        from torch.testing._internal.common_device_type import (
+            instantiate_device_type_tests,
+        )
+
+        class _TestMROCheck(TestCase):
+            def test_device_is_spyre(self):
+                pass
+
+        ns = {"_TestMROCheck": _TestMROCheck}
+        # This must not raise TypeError about MRO
+        instantiate_device_type_tests(_TestMROCheck, ns, only_for=("privateuse1",))
+
+        # instantiate_device_type_tests should create a class named
+        # _TestMROCheckPRIVATEUSE1 in the namespace
+        assert "_TestMROCheckPRIVATEUSE1" in ns, (
+            f"Expected _TestMROCheckPRIVATEUSE1 in namespace, got {list(ns)}"
+        )
+
+        # The generated class should be instantiable (valid MRO)
+        cls = ns["_TestMROCheckPRIVATEUSE1"]
+        assert issubclass(cls, TestCase)
+
 
 if __name__ == "__main__":
     run_tests()
