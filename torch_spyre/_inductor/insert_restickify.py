@@ -59,6 +59,8 @@ def _create_restickify_node(
     env = {}
     for tbs in graph_lowering.name_to_users.values():
         for tb in tbs:
+            if not tb.data.origins:
+                continue
             tb_fx_node = list(tb.data.origins)[0]
             env[tb_fx_node] = tb
     graph_lowering.env.update(env)
@@ -101,7 +103,12 @@ def insert_restickify_on_node_inputs(
 ) -> None:
     """Create a restickify node for each incompatible input arg of op."""
     name_map = {}
-    op_index = operations.index(op)
+    try:
+        op_index = operations.index(op)
+    except ValueError:
+        raise AssertionError(
+            f"Consumer op {op.get_name()} not found in operations list"
+        ) from None
 
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
