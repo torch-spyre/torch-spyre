@@ -166,7 +166,6 @@ def restickify_stride_map(
 def schedule_restickify(
     op: Operation,
     arg: SchedNodeArg,
-    arg_i: int,
     target_stick_expr,
     ic: list,
     idc: list,
@@ -220,7 +219,7 @@ def schedule_restickify(
         arg.layout.device, arg.layout.dtype, arg.layout.size, arg.layout.stride, stl
     )
     restickify_plan.setdefault(op.get_name(), []).append(
-        {"arg_index": arg_i, "target_layout": target_layout}
+        {"arg_name": arg.dep.name, "target_layout": target_layout}
     )
     return target_layout
 
@@ -342,12 +341,10 @@ def pointwise_layout(
             assert stick_expr != 0, (
                 "Expected arg 0 to have non-zero stick indexing expression"
             )
-            for arg_i, (ic, idc, arg) in enumerate(
-                zip(in_coords[1:], in_device_coords[1:], args[1:]), start=1
-            ):
+            for ic, idc, arg in zip(in_coords[1:], in_device_coords[1:], args[1:]):
                 if idc[-1] != stick_expr:
                     schedule_restickify(
-                        consumer_op, arg, arg_i, stick_expr, ic, idc, restickify_plan
+                        consumer_op, arg, stick_expr, ic, idc, restickify_plan
                     )
 
         # If the indexing and device element size are identical
@@ -453,7 +450,6 @@ def reduction_layout(
             tl = schedule_restickify(
                 consumer_op,
                 x,
-                0,
                 reduction_coord,
                 x_coords,
                 x_dev_coords,
@@ -474,7 +470,6 @@ def reduction_layout(
             tl = schedule_restickify(
                 consumer_op,
                 y,
-                1,
                 generated_coord,
                 y_coords,
                 y_dev_coords,

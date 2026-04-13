@@ -48,9 +48,7 @@ def _create_restickify_node(
     graph_lowering.run_node(), and assigns the target layout.  Returns
     (old_buffer_name, new_computed_buffer).
     """
-    rw = op.get_read_writes()
-    mem_dep = list(rw.reads)[restick_arg_info["arg_index"]]
-    arg_name = mem_dep.name
+    arg_name = restick_arg_info["arg_name"]
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -65,9 +63,7 @@ def _create_restickify_node(
             env[tb_fx_node] = tb
     graph_lowering.env.update(env)
 
-    # Search by buffer name rather than arg_index: FX args include scalars and
-    # constants that don't appear in read_writes.reads, making index-based lookup
-    # unreliable.
+    # Search env by buffer name to find the FX node to pass to restickify.
     fx_arg_node = next(
         fx_node
         for fx_node, tb in graph_lowering.env.items()
