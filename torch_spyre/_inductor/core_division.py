@@ -148,9 +148,14 @@ def adjust_it_space_for_sticks(
 
     For each tensor, find the variable that indexes its stick dimension and
     convert its size in it_space from elements to sticks. This ensures core
-    division treats sticks as atomic units. Adjusts each variable at most once.
+    division treats sticks as atomic units.
+
+    When tensors of different dtypes share a stick variable (e.g. a float16
+    input and an int64 argmax output), the smallest elems_per_stick is used
+    so the adjustment is conservative.
     """
-    adjusted: dict[Symbol, int] = {}  # stick_var -> elems_per_stick used
+    # Pass 1: find the smallest elems_per_stick per stick variable.
+    min_elems: dict[Symbol, int] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -159,20 +164,17 @@ def adjust_it_space_for_sticks(
         if stick_var not in it_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
-        if stick_var in adjusted:
-            assert adjusted[stick_var] == elems_per_stick, (
-                f"Conflicting elems_per_stick for iteration variable {stick_var}: "
-                f"previously seen {adjusted[stick_var]}, now {elems_per_stick}. "
-                f"Mixed-dtype tensors sharing a stick variable are not supported."
-            )
-            continue
-        # FIXME: here we assume padding to a full stick. It may not always be the
-        #        case and we shouldn use a more robust way of computing the number
-        #        of sticks
+        if stick_var not in min_elems or elems_per_stick < min_elems[stick_var]:
+            min_elems[stick_var] = elems_per_stick
+
+    # Pass 2: adjust each variable once using the minimum.
+    for stick_var, elems_per_stick in min_elems.items():
+        # FIXME: here we assume padding to a full stick. It may not always be
+        #        the case and we should use a more robust way of computing the
+        #        number of sticks
         it_space[stick_var] = (
             it_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
-        adjusted[stick_var] = elems_per_stick
 
 
 def must_split_vars(
@@ -397,13 +399,6 @@ def core_division_planning(
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 # Mutation ops keep their MutationLayoutSHOULDREMOVE until after
                 # scheduler init; core division is not applicable to them.
-                continue
-            layout = op.get_layout()
-            if not layout.dtype.is_floating_point:
-                # Integer-output buffers are index outputs (e.g. argmax) that are
-                # computed as part of the corresponding value reduction (e.g. max).
-                # The scheduler eliminates dead index nodes before running core
-                # division; we skip them here to match that behaviour.
                 continue
             rw = op.get_read_writes()
             args = get_mem_deps_from_rw(rw)
