@@ -114,7 +114,6 @@ def restickify_device_size(
 
 def restickify_stride_map(
     old_stride_map: list,
-    old_device_size: list,
     idc: list,
     old_stick_expr,
     target_stick_expr,
@@ -203,7 +202,6 @@ def schedule_restickify(
     )
     stride_map = restickify_stride_map(
         old_stride_map,
-        list(dl.device_size),
         idc,
         old_stick_expr,
         target_stick_expr,

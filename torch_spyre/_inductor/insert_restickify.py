@@ -78,14 +78,14 @@ def _create_restickify_node(
         restick_fx_node = fx_graph.create_node(
             "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
         )
-    # Lower the FX node; run_node lowers and registers the output buffer in graph.buffers.
+    # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
     assert isinstance(restick_buff, ComputedBuffer), (
         f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
     )
-    # Synthetic node with no corresponding ATen op; set origins to the synthetic
-    # FX node so code that expects non-empty origins doesn't crash.
+    # origins is empty by default since spyre.restickify has no ATen decomposition;
+    # set it to the synthetic FX node so code that expects non-empty origins doesn't crash.
     restick_buff.origins = OrderedSet([restick_fx_node])
     graph_lowering.env[restick_fx_node] = restick_tb
 
@@ -107,7 +107,7 @@ def insert_restickify_on_node_inputs(
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
         name_map[old_name] = restick_buff.get_name()
 
-        # run_node() -> realize() already appended restick_buff to operations.
+        # lower_restickify calls pw.realize() which appends restick_buff to operations.
         # Move it to just before the consumer op to preserve topological order.
         operations.remove(restick_buff)
         operations.insert(op_index, restick_buff)
@@ -122,7 +122,8 @@ def insert_restickify_on_node_inputs(
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
 
-    # Reconstruct ComputedBuffer so internal caches see the patched inner_fn.
+    # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
+    # on get_default_sizes_body can be cleanly invalidated below.
     new_consumer_buffer = ComputedBuffer(
         name=op.get_name(),
         layout=op.layout,
@@ -137,7 +138,7 @@ def insert_restickify_on_node_inputs(
     # Replace op in the operations list with the reconstructed buffer.
     operations[op_index] = new_consumer_buffer
 
-    # Recompute internal metadata including read/write dependencies based on new inner_fn.
+    # Invalidate the sizes/body cache so it is recomputed on next access with the patched inner_fn.
     ComputedBuffer.get_default_sizes_body.clear_cache(new_consumer_buffer)
 
 
