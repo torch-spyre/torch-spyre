@@ -18,14 +18,19 @@ import functools
 from typing import Any, Callable, TypeVarTuple, Unpack, Optional
 
 import unittest
+from unittest.mock import patch
 import torch
 
-from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    SchedulerNode,
+    FusedSchedulerNode,
+)
 from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
 
 from torch_spyre._inductor.scratchpad import mem_usage_by_node
-from torch_spyre._inductor.passes import CustomNodePassBase, CustomPostFusionPasses
+from torch_spyre._inductor.passes import CustomPostFusionPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
@@ -34,24 +39,24 @@ from tests.inductor.utils_inductor import cached_randn
 Ts = TypeVarTuple("Ts")
 
 
-class CustomPostFusionPassesWithOurPasses(CustomNodePassBase):
-    test_instance = Optional["TestScratchpadUsage"]
-    base_pass_list: list[
-        Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]
-    ] = []
+class CustomPostFusionPassesWithOurPasses(CustomPostFusionPasses):
+    """torch_spyre._inductor.patches.enable_spyre_context sets
+    torch._inductor.config._post_fusion_custom_pass to
+    torch_spyre._inductor.passes.CustomPostFusionPasses(), so we have to monkey patch that class
+    to add the ability to add custom passes."""
+
+    test_instance: Optional["TestScratchpadUsage"] = None
 
     @classmethod
     def initialize(cls, test_instance: "TestScratchpadUsage"):
-        cls.base_pass_list = CustomPostFusionPasses().get_passes()
         cls.test_instance = test_instance
-        passes.CustomPostFusionPasses = CustomPostFusionPassesWithOurPasses
 
     def get_passes(self):
         assert self.test_instance is not None, (
             "CustomPostFusionPassesWithOurPasses.test_instance must be set to an instance of "
             "TestScratchpadUsage before get_passes is called"
         )
-        return self.test_instance.our_scheduler_post_passes + self.base_pass_list
+        return super().get_passes() + self.test_instance.our_scheduler_post_passes
 
 
 class TestScratchpadUsage(unittest.TestCase):
@@ -59,17 +64,20 @@ class TestScratchpadUsage(unittest.TestCase):
         Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]
     ] = []
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     def setUp(self):
         torch.manual_seed(0xAFFE)
         t_inductor_config.force_disable_caches = True
+        ts_inductor_config.sencores = 1
         torch.compiler.reset()
-        if not CustomPostFusionPassesWithOurPasses.base_pass_list:
-            # Monkey patch CustomPostFusionPasses to call our passes as well. We can't do it in
-            # the class definition or in setUpClass because we need access to the test instance.
-            CustomPostFusionPassesWithOurPasses.initialize(self)
+
+        CustomPostFusionPassesWithOurPasses.initialize(self)
+        self.patcher = patch.object(
+            passes, "CustomPostFusionPasses", CustomPostFusionPassesWithOurPasses
+        )
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
 
     def cached_randn_device(self, shape: Sequence[int], *args, **kwargs):
         result = cached_randn(shape, *args, **kwargs)
@@ -84,7 +92,12 @@ class TestScratchpadUsage(unittest.TestCase):
         using `f`."""
 
         def new_pass(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-            return [f(node) for node in nodes]
+            for node in nodes:
+                if isinstance(node, FusedSchedulerNode):
+                    new_pass(list(node.get_nodes()))
+                else:
+                    f(node)
+            return nodes
 
         self.our_scheduler_post_passes.append(new_pass)
         yield
@@ -103,11 +116,7 @@ class TestScratchpadUsage(unittest.TestCase):
                     buffer = V.graph.get_buffer(buffer_name)
                     layout = buffer.get_layout()
                     allocation = getattr(layout, "allocation", {})
-                    usage["location"] = (
-                        "LX"
-                        if any(key.startswith("lx") for key in allocation)
-                        else "HBM"
-                    )
+                    usage["location"] = "LX" if "lx" in allocation else "HBM"
 
                 mem_usages.append(mem_usage)
             return node
@@ -125,17 +134,22 @@ class TestScratchpadUsage(unittest.TestCase):
     ):
         """Run the current class's test procedure on the given model and arguments. Override this
         in each subclass."""
-        with ts_inductor_config.patch(lx_planning=True):
-            _, mem_usages = self.compile_and_collect_mem_usage(model, args)
+        cpu_result = model(*(t.to("cpu") for t in args))
 
-        print(mem_usages)
+        with ts_inductor_config.patch(lx_planning=True):
+            device_result, mem_usages = self.compile_and_collect_mem_usage(model, args)
 
         self.assertTrue(
             any(
                 usage["location"] == "LX"
                 for mem_usage in mem_usages
                 for usage in mem_usage.values()
-            )
+            ),
+            "Expected at least one buffer to be allocated in LX, but none were",
+        )
+
+        self.assertTrue(
+            torch.allclose(cpu_result, device_result, atol=1e-3), "Results do not match"
         )
 
     def common(
@@ -185,10 +199,15 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         with ts_inductor_config.patch(lx_planning=True):
             result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
 
-        self.assertLess(hbm_with_lx, hbm_without_lx)
-
-        delta = torch.abs(result_without_lx - result_with_lx).max().item()
-        self.assertLess(delta, 1e-5)
+        self.assertLess(
+            hbm_with_lx,
+            hbm_without_lx,
+            "Expected LX planning to reduce HBM transfers, but it did not",
+        )
+        self.assertTrue(
+            torch.allclose(result_without_lx, result_with_lx, atol=1e-5),
+            "Results do not match between LX planning on and off",
+        )
 
 
 if __name__ == "__main__":
