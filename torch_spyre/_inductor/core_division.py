@@ -304,6 +304,23 @@ def prioritize_dimensions(
     return priority, min_splits
 
 
+def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
+    """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
+
+    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
+    scheduler can identify them as in-place writes.  Their target buffer already
+    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
+    real_layout() gives us the correct device layout for core division.
+    """
+    layout = op.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    assert isinstance(layout, FixedTiledLayout), (
+        f"Expected FixedTiledLayout for {op.get_name()}, got {type(layout)}"
+    )
+    return layout
+
+
 def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
@@ -315,7 +332,7 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), op.get_layout())
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
 
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
@@ -355,7 +372,7 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), op.get_layout())
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
 
     # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
@@ -396,10 +413,6 @@ def core_division_planning(
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # Mutation ops keep their MutationLayoutSHOULDREMOVE until after
-                # scheduler init; core division is not applicable to them.
-                continue
             rw = op.get_read_writes()
             args = get_mem_deps_from_rw(rw)
             if isinstance(op.data, Pointwise):
