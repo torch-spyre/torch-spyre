@@ -305,7 +305,6 @@ def prioritize_dimensions(
     return priority, min_splits
 
 
-<<<<<<< HEAD
 def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
 
@@ -323,8 +322,6 @@ def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     return layout
 
 
-=======
->>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
 def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
@@ -336,11 +333,7 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
-<<<<<<< HEAD
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
-=======
-    output_td = TensorDep(next(iter(rw.writes)), op.get_layout())
->>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
 
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
@@ -380,11 +373,7 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
-<<<<<<< HEAD
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
-=======
-    output_td = TensorDep(next(iter(rw.writes)), op.get_layout())
->>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
 
     # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
@@ -425,20 +414,6 @@ def core_division_planning(
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
-<<<<<<< HEAD
-=======
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # Mutation ops keep their MutationLayoutSHOULDREMOVE until after
-                # scheduler init; core division is not applicable to them.
-                continue
-            layout = op.get_layout()
-            if not layout.dtype.is_floating_point:
-                # Integer-output buffers are index outputs (e.g. argmax) that are
-                # computed as part of the corresponding value reduction (e.g. max).
-                # The scheduler eliminates dead index nodes before running core
-                # division; we skip them here to match that behaviour.
-                continue
->>>>>>> 48db654 (move core_divsion and scratchpad passes before scheduler)
             rw = op.get_read_writes()
             args = get_mem_deps_from_rw(rw)
             if isinstance(op.data, Pointwise):
