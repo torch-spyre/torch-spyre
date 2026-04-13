@@ -151,11 +151,12 @@ def adjust_it_space_for_sticks(
     division treats sticks as atomic units.
 
     When tensors of different dtypes share a stick variable (e.g. a float16
-    input and an int64 argmax output), the smallest elems_per_stick is used
-    so the adjustment is conservative.
+    input and an int64 argmax output), the largest elems_per_stick is used
+    so the adjustment is conservative (fewer sticks → smaller adjusted size →
+    fewer cores assigned to the stick dimension).
     """
-    # Pass 1: find the smallest elems_per_stick per stick variable.
-    min_elems: dict[Symbol, int] = {}
+    # Pass 1: find the largest elems_per_stick per stick variable.
+    max_elems: dict[Symbol, int] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -164,11 +165,11 @@ def adjust_it_space_for_sticks(
         if stick_var not in it_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
-        if stick_var not in min_elems or elems_per_stick < min_elems[stick_var]:
-            min_elems[stick_var] = elems_per_stick
+        if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
+            max_elems[stick_var] = elems_per_stick
 
-    # Pass 2: adjust each variable once using the minimum.
-    for stick_var, elems_per_stick in min_elems.items():
+    # Pass 2: adjust each variable once using the maximum.
+    for stick_var, elems_per_stick in max_elems.items():
         # FIXME: here we assume padding to a full stick. It may not always be
         #        the case and we should use a more robust way of computing the
         #        number of sticks
