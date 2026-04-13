@@ -479,7 +479,7 @@ def spyre_softplus(
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    weight = weight.transpose(-1, -2).contiguous()
+    weight = weight.transpose(-1, -2)
     while weight.dim() < input.dim():
         weight = torch.unsqueeze(weight, 0)
     out = input @ weight

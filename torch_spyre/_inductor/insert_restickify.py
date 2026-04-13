@@ -157,6 +157,10 @@ def insert_restickify(operations: list[Operation]) -> None:
     if not restickify_plan:
         return
 
-    for op in list(operations):  # copy since insert_restickify_on_node_inputs mutates operations
+    for op in list(
+        operations
+    ):  # copy since insert_restickify_on_node_inputs mutates operations
         if isinstance(op, ComputedBuffer) and op.get_name() in restickify_plan:
-            insert_restickify_on_node_inputs(op, restickify_plan[op.get_name()], operations)
+            insert_restickify_on_node_inputs(
+                op, restickify_plan[op.get_name()], operations
+            )

@@ -29,7 +29,6 @@ from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    relayout_linear_weights,
     replace_scalar_with_tensor,
 )
 <<<<<<< HEAD
@@ -102,7 +101,6 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         replace_scalar_with_tensor,
-        relayout_linear_weights,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]

@@ -451,7 +451,13 @@ def reduction_layout(
                 if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
             )
             tl = schedule_restickify(
-                consumer_op, x, 0, reduction_coord, x_coords, x_dev_coords, restickify_plan
+                consumer_op,
+                x,
+                0,
+                reduction_coord,
+                x_coords,
+                x_dev_coords,
+                restickify_plan,
             )
             x_stick_expr = device_coordinates(tl, x.dep)[-1]
         if matching_dim(out_coords, y_stick_expr) is None:
@@ -466,7 +472,13 @@ def reduction_layout(
                 and matching_dim(x_coords, c) is None
             )
             tl = schedule_restickify(
-                consumer_op, y, 1, generated_coord, y_coords, y_dev_coords, restickify_plan
+                consumer_op,
+                y,
+                1,
+                generated_coord,
+                y_coords,
+                y_dev_coords,
+                restickify_plan,
             )
             y_stick_expr = device_coordinates(tl, y.dep)[-1]
         out_stick_dim = matching_dim(out_coords, y_stick_expr)
@@ -638,7 +650,9 @@ def propagate_mutation_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
             output = n.node.get_layout()
-            n.node.layout = pointwise_layout(n.node, n.node.data, output, output_dep, args, {})
+            n.node.layout = pointwise_layout(
+                n.node, n.node.data, output, output_dep, args, {}
+            )
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
