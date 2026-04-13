@@ -35,6 +35,7 @@ from .temp_passes import (
 <<<<<<< HEAD
 from . import config
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
+from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 =======
@@ -196,6 +197,7 @@ def pre_scheduling_passes(operations: list[Operation]) -> None:
             return
 
         propagate_spyre_tensor_layouts(operations)
+        insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:
             scratchpad_planning(operations)
@@ -203,6 +205,7 @@ def pre_scheduling_passes(operations: list[Operation]) -> None:
     def uuid(self) -> Optional[Any]:
         files = [
             inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),
             inspect.getfile(scratchpad_planning),
         ]
