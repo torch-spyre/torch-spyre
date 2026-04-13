@@ -329,6 +329,7 @@ def pointwise_layout(
         for idc in in_device_coords:
             if idc[-1] != 0:
                 stick_exprs.add(idc[-1])
+        stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
         if len(stick_exprs) > 1:
             # This is a legal PyTorch operation that requires inserting restickify operations.
@@ -376,7 +377,7 @@ def pointwise_layout(
                 maybe_stick_dim = None
                 out_stick_dim = -1
             else:
-                maybe_stick_dim = matching_dim(out_coords, next(iter(stick_exprs)))
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
 
             dim_order = [
@@ -637,7 +638,7 @@ def propagate_mutation_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
             output = n.node.get_layout()
-            n.node.layout = pointwise_layout(n.node.data, output, output_dep, args)
+            n.node.layout = pointwise_layout(n.node, n.node.data, output, output_dep, args, {})
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"

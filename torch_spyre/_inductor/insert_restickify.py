@@ -117,13 +117,10 @@ def insert_restickify_on_node_inputs(
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
 
-    logger.warning(f"[insert_restickify] name_map for {op.get_name()}: {name_map}")
-
     # Patch inner_fn once with the full name_map covering all restickified args.
     orig_inner = op.data.inner_fn
 
     def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
-        logger.warning(f"[insert_restickify] new_inner_fn called with name_map={_map}")
         with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
             return _orig_inner(*args)
 
@@ -157,14 +154,9 @@ def insert_restickify(operations: list[Operation]) -> None:
     in-place.  No scheduler state is touched.
     """
     restickify_plan = getattr(V.graph, "restickify_plan", {})
-    logger.warning(f"[insert_restickify] plan keys: {list(restickify_plan.keys())}")
-    logger.warning(f"[insert_restickify] operations before: {[getattr(o, 'name', type(o).__name__) for o in operations]}")
     if not restickify_plan:
         return
 
     for op in list(operations):  # copy since insert_restickify_on_node_inputs mutates operations
         if isinstance(op, ComputedBuffer) and op.get_name() in restickify_plan:
-            logger.warning(f"[insert_restickify] inserting restickify before {op.get_name()}, plan={restickify_plan[op.get_name()]}")
             insert_restickify_on_node_inputs(op, restickify_plan[op.get_name()], operations)
-
-    logger.warning(f"[insert_restickify] operations after: {[getattr(o, 'name', type(o).__name__) for o in operations]}")
