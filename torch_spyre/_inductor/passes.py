@@ -29,11 +29,11 @@ from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    relayout_linear_weights,
     replace_scalar_with_tensor,
 )
 from . import config
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
+from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
@@ -97,7 +97,6 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         replace_scalar_with_tensor,
-        relayout_linear_weights,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]
@@ -186,6 +185,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             return
 
         propagate_spyre_tensor_layouts(operations)
+        insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:
             scratchpad_planning(operations)
@@ -193,6 +193,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     def uuid(self) -> Optional[Any]:
         files = [
             inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),
             inspect.getfile(scratchpad_planning),
         ]

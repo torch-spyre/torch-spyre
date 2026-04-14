@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import logging
+from typing import Any
 
 
+import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
@@ -61,18 +63,179 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
+def restickify_device_size(
+    old_device_size: list,
+    idc: list,
+    old_stick_expr,
+    target_stick_expr,
+    host_size: list,
+    old_sd: int,
+    new_sd: int,
+    stick_size: int = 64,
+) -> list:
+    """Compute device_size for a restickify by swapping old_stick_expr with target_stick_expr.
+
+    Uses idc coordinate expressions to identify which device dims cover old_sd vs new_sd:
+    - Last device dim (stick): size is always stick_size
+    - Dims involving old_var (outer stick): size becomes host_size[new_sd] // stick_size
+    - Dims involving new_var (non-stick for new_sd): size becomes host_size[old_sd]
+    - coord==0 with no explicit outer stick: degenerate outer stick (host_size[old_sd] == stick_size);
+      absorbs the new outer stick when host_size[new_sd] > stick_size
+    - All other dims: unchanged
+    """
+    old_var = next(iter(old_stick_expr.free_symbols))
+    new_var = next(iter(target_stick_expr.free_symbols))
+    # True when old_sd has an explicit outer-stick dim (host_size[old_sd] > stick_size).
+    # False means old_sd fit in one stick: the degenerate outer stick has coord==0, size==1.
+    has_old_outer_stick = any(
+        old_var in idc[j].free_symbols for j in range(len(idc) - 1)
+    )
+    result = []
+    for j, coord in enumerate(idc):
+        if j == len(idc) - 1:
+            # Last device dim is always the stick, size is always stick_size.
+            result.append(stick_size)
+        elif old_var in coord.free_symbols:
+            result.append(host_size[new_sd] // stick_size)
+        elif new_var in coord.free_symbols:
+            result.append(host_size[old_sd])
+        elif (
+            coord == sympy.S.Zero
+            and not has_old_outer_stick
+            and host_size[new_sd] > stick_size
+        ):
+            # Degenerate outer stick (host_size[old_sd] == stick_size, so floor(old_var/64) == 0).
+            # This placeholder absorbs the new outer stick when new_sd requires tiling.
+            result.append(host_size[new_sd] // stick_size)
+        else:
+            result.append(old_device_size[j])
+    return result
+
+
+def restickify_stride_map(
+    old_stride_map: list,
+    idc: list,
+    old_stick_expr,
+    target_stick_expr,
+    host_size: list,
+    host_stride: list,
+    old_sd: int,
+    new_sd: int,
+    stick_size: int = 64,
+) -> list:
+    """Compute stride_map for a restickify by swapping old_stick_expr with target_stick_expr.
+
+    Uses idc coordinate expressions to identify which device dims cover old_sd vs new_sd,
+    then rescales their stride_map values by host_stride[new_sd] / host_stride[old_sd]
+    and vice versa. All other dims are unchanged.
+    """
+    old_var = next(iter(old_stick_expr.free_symbols))
+    new_var = next(iter(target_stick_expr.free_symbols))
+    # True when old_sd has an explicit outer-stick dim (host_size[old_sd] > stick_size).
+    # False means old_sd fit in one stick: the degenerate outer stick has coord==0, size==1.
+    has_old_outer_stick = any(
+        old_var in idc[j].free_symbols for j in range(len(idc) - 1)
+    )
+    result = []
+    for j, coord in enumerate(idc):
+        if j == len(idc) - 1:
+            # Last device dim is always the stick; stride_map is the host stride of new_sd.
+            result.append(host_stride[new_sd])
+        elif old_var in coord.free_symbols:
+            result.append(
+                old_stride_map[j] * host_stride[new_sd] // host_stride[old_sd]
+            )
+        elif new_var in coord.free_symbols:
+            result.append(
+                old_stride_map[j] * host_stride[old_sd] // host_stride[new_sd]
+            )
+        elif (
+            coord == sympy.S.Zero
+            and not has_old_outer_stick
+            and host_size[new_sd] > stick_size
+        ):
+            # Degenerate outer stick (host_size[old_sd] == stick_size, so floor(old_var/64) == 0).
+            # This placeholder absorbs the new outer stick when new_sd requires tiling.
+            result.append(host_stride[new_sd] * stick_size)
+        else:
+            result.append(old_stride_map[j])
+    return result
+
+
+def schedule_restickify(
+    op: Operation,
+    arg: SchedNodeArg,
+    target_stick_expr,
+    ic: list,
+    idc: list,
+    restickify_plan: dict,
+) -> FixedTiledLayout:
+    """Record a restickify needed for arg to match target_stick_expr.
+
+    Computes the target FixedTiledLayout by replacing the current stick
+    coordinate expression with target_stick_expr in the device layout, then
+    appends an entry to restickify_plan[op] for the insert_restickify pass to act on.
+    """
+    dl = arg.layout.device_layout
+    new_sd = matching_dim(ic, target_stick_expr)
+    assert new_sd is not None, (
+        f"Could not find a host dimension matching stick expr {target_stick_expr} in {ic}"
+    )
+    host_size = list(arg.layout.size)
+    host_stride = list(arg.layout.stride)
+    old_sd = dl.dim_map[-1]
+    old_stick_expr = idc[-1]
+    old_stride_map = list(dl.stride_map)
+
+    # dim_map is kept for legacy reasons but is not used to derive device_size or stride_map.
+    new_dim_map = [
+        new_sd if x == old_sd else old_sd if x == new_sd else x for x in dl.dim_map
+    ]
+    device_size = restickify_device_size(
+        list(dl.device_size),
+        idc,
+        old_stick_expr,
+        target_stick_expr,
+        host_size,
+        old_sd,
+        new_sd,
+    )
+    stride_map = restickify_stride_map(
+        old_stride_map,
+        idc,
+        old_stick_expr,
+        target_stick_expr,
+        host_size,
+        host_stride,
+        old_sd,
+        new_sd,
+    )
+
+    stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
+
+    target_layout = FixedTiledLayout(
+        arg.layout.device, arg.layout.dtype, arg.layout.size, arg.layout.stride, stl
+    )
+    restickify_plan.setdefault(op.get_name(), []).append(
+        {"arg_name": arg.dep.name, "target_layout": target_layout}
+    )
+    return target_layout
+
+
 def pointwise_layout(
-    data: Pointwise,
+    op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
+    restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> FixedTiledLayout:
+    data = op.data
     origin_node = next(iter(data.origins))
-    op = origin_node.target
+    aten_op = origin_node.target
 
     if len(args) == 1:
         x = args[0]
-        match op:
+        match aten_op:
             case aten.clone.default:
                 # Clone is generated by an explicit `contiguous()`; on spyre that means use the default row major tiling.
                 stl = SpyreTensorLayout(
@@ -137,7 +300,7 @@ def pointwise_layout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
 
-    elif op == spyreop.layernormnorm.default:
+    elif aten_op == spyreop.layernormnorm.default:
         # Output layout is determined by layout of first argument only
         x = args[0]
         x_stl = x.layout.device_layout
@@ -163,12 +326,22 @@ def pointwise_layout(
         for idc in in_device_coords:
             if idc[-1] != 0:
                 stick_exprs.add(idc[-1])
+        stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
         if len(stick_exprs) > 1:
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            raise Unsupported(
-                f"Spyre limitation: pointwise op with nonuniform stick indexing: {stick_exprs}"
+            # This is a legal PyTorch operation that requires inserting restickify operations.
+            logger.warning(
+                f"Injecting restickify to resolve pointwise op with nonuniform stick indexing: {stick_exprs}."
             )
+            # Arbitrary choice: let arg[0] define the stick variable and restickify all
+            # others that have a conflict.
+            stick_expr = in_device_coords[0][-1]
+            assert stick_expr != 0, (
+                "Expected arg 0 to have non-zero stick indexing expression"
+            )
+            for ic, idc, arg in zip(in_coords[1:], in_device_coords[1:], args[1:]):
+                if idc[-1] != stick_expr:
+                    schedule_restickify(op, arg, stick_expr, ic, idc, restickify_plan)
 
         # If the indexing and device element size are identical
         # across all inputs and the output we can just propagate the device layout.
@@ -197,7 +370,7 @@ def pointwise_layout(
                 maybe_stick_dim = None
                 out_stick_dim = -1
             else:
-                maybe_stick_dim = matching_dim(out_coords, next(iter(stick_exprs)))
+                maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
 
             dim_order = [
@@ -230,11 +403,13 @@ def pointwise_layout(
 
 
 def reduction_layout(
-    data: Reduction,
+    op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
+    restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> FixedTiledLayout:
+    data = op.data
     if (
         data.reduction_type == MATMUL_REDUCTION_OP
         or data.reduction_type == BATCH_MATMUL_OP
@@ -255,14 +430,48 @@ def reduction_layout(
                 f"{data.reduction_type}: failed to map stick_dims to host coords"
             )
 
-        if (
-            x_stick_dim != len(x.layout.size) - 1
-            or y_stick_dim != len(y.layout.size) - 1
-        ):
-            # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
-            raise Unsupported(
-                f"Spyre limitation: {data.reduction_type} requires restickify"
+        # Hardware stick constraints (DF16):
+        #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
+        #   Input2 (y): stick on generated_dim (the y coord that appears in output)
+        #   Output:     stick on generated_dim
+        if matching_dim(out_coords, x_stick_expr) is not None:
+            logger.warning(
+                f"Injecting restickify on {data.reduction_type} x input to move stick to reduction_dim"
             )
+            reduction_coord = next(
+                c
+                for c in x_coords
+                if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+            )
+            tl = schedule_restickify(
+                op,
+                x,
+                reduction_coord,
+                x_coords,
+                x_dev_coords,
+                restickify_plan,
+            )
+            x_stick_expr = device_coordinates(tl, x.dep)[-1]
+        if matching_dim(out_coords, y_stick_expr) is None:
+            logger.warning(
+                f"Injecting restickify on {data.reduction_type} y input to move stick to generated_dim"
+            )
+            generated_coord = next(
+                c
+                for c in y_coords
+                if len(c.free_symbols) > 0
+                and matching_dim(out_coords, c) is not None
+                and matching_dim(x_coords, c) is None
+            )
+            tl = schedule_restickify(
+                op,
+                y,
+                generated_coord,
+                y_coords,
+                y_dev_coords,
+                restickify_plan,
+            )
+            y_stick_expr = device_coordinates(tl, y.dep)[-1]
         out_stick_dim = matching_dim(out_coords, y_stick_expr)
         if out_stick_dim is None:
             raise Unsupported(
@@ -365,6 +574,7 @@ def propagate_spyre_tensor_layouts(
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
     # performed to convert each output FixedLayout to a FixedTiledLayout.
+    restickify_plan: dict[str, list[dict[str, Any]]] = {}
 
     it = iter(operations)
     for op in it:
@@ -385,9 +595,13 @@ def propagate_spyre_tensor_layouts(
             args = get_mem_deps_from_rw(rw)
             output = op.get_layout()
             if isinstance(op.data, Pointwise):
-                op.layout = pointwise_layout(op.data, output, output_dep, args)
+                op.layout = pointwise_layout(
+                    op, output, output_dep, args, restickify_plan
+                )
             elif isinstance(op.data, Reduction):
-                op.layout = reduction_layout(op.data, output, output_dep, args)
+                op.layout = reduction_layout(
+                    op, output, output_dep, args, restickify_plan
+                )
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
@@ -399,6 +613,8 @@ def propagate_spyre_tensor_layouts(
             logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")
+
+    V.graph.restickify_plan = restickify_plan
 
 
 def propagate_mutation_layouts(
@@ -425,7 +641,7 @@ def propagate_mutation_layouts(
             output_dep = next(iter(rw.writes))
             args = get_mem_deps(n)
             output = n.node.get_layout()
-            n.node.layout = pointwise_layout(n.node.data, output, output_dep, args)
+            n.node.layout = pointwise_layout(n.node, output, output_dep, args, {})
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"

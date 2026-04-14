@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise
+from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, StorageBox
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -544,3 +544,36 @@ def lower_overwrite(input, output, dims, offsets):
     V.graph.register_operation(buffer)
 
     return output
+
+
+@register_spyre_lowering(torch.ops.spyre.restickify)
+def lower_restickify(x):
+    # Restickify must operate on base tensors, so we need
+    # to unwrap any views.
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
+
+    # Force realization so base has a buffer name and make_loader() emits
+    # ops.load(name, ...) rather than inlining the producer's inner_fn.
+    # Without this, ComputedBuffer.make_loader() may inline when num_reads()==0,
+    # capturing a closure that later resolves to the restickify buffer itself
+    # (after pw.realize() assigns the name), creating a self-dependency cycle.
+    base.realize()
+
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=base.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw

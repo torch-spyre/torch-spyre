@@ -227,3 +227,10 @@ def _(
     offsets: Sequence[int],
 ) -> torch.Tensor:
     return output
+
+
+@torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
+def restickify(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
