@@ -19,21 +19,20 @@ import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
+    ExternKernel,
     FallbackKernel,
     FixedLayout,
     InputBuffer,
+    MutationLayoutSHOULDREMOVE,
     MultiOutput,
+    Operation,
     Pointwise,
     Reduction,
     StorageBox,
     TensorBox,
 )
-from torch._inductor.scheduler import (
-    BaseSchedulerNode,
-    SchedulerNode,
-    ExternKernelSchedulerNode,
-    NopKernelSchedulerNode,
-)
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import (
@@ -46,7 +45,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
-    get_mem_deps,
+    get_mem_deps_from_rw,
     host_coordinates,
     device_coordinates,
 )
@@ -62,11 +61,13 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
-    pw: Pointwise = n.node.data
-    output: FixedLayout = n.node.get_layout()
-    output_dep = next(iter(n.read_writes.writes))
-    origin_node = next(iter(pw.origins))
+def pointwise_layout(
+    data: Pointwise,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[SchedNodeArg],
+) -> FixedTiledLayout:
+    origin_node = next(iter(data.origins))
     op = origin_node.target
 
     if len(args) == 1:
@@ -228,13 +229,15 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         return result
 
 
-def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
-    red: Reduction = n.node.data
-    output: FixedLayout = n.node.get_layout()
-    output_dep = next(iter(n.read_writes.writes))
+def reduction_layout(
+    data: Reduction,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[SchedNodeArg],
+) -> FixedTiledLayout:
     if (
-        red.reduction_type == MATMUL_REDUCTION_OP
-        or red.reduction_type == BATCH_MATMUL_OP
+        data.reduction_type == MATMUL_REDUCTION_OP
+        or data.reduction_type == BATCH_MATMUL_OP
     ):
         x = args[0]
         y = args[1]
@@ -249,7 +252,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         y_stick_dim = matching_dim(y_coords, y_stick_expr)
         if x_stick_dim is None or y_stick_dim is None:
             raise Unsupported(
-                f"{red.reduction_type}: failed to map stick_dims to host coords"
+                f"{data.reduction_type}: failed to map stick_dims to host coords"
             )
 
         if (
@@ -258,12 +261,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         ):
             # TODO: This is a legal PyTorch operation that we cannot execute without inserting restickify operations.
             raise Unsupported(
-                f"Spyre limitation: {red.reduction_type} requires restickify"
+                f"Spyre limitation: {data.reduction_type} requires restickify"
             )
         out_stick_dim = matching_dim(out_coords, y_stick_expr)
         if out_stick_dim is None:
             raise Unsupported(
-                f"{red.reduction_type}: failed to map output stick_dim to host coords {out_coords} {y_stick_expr}"
+                f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {y_stick_expr}"
             )
 
         out_dims = len(output.size)
@@ -276,7 +279,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
-    elif red.reduction_type == "exx2":
+    elif data.reduction_type == "exx2":
         x = args[0]
         x_coords = host_coordinates(x.layout, x.dep)
         x_dev_coords = device_coordinates(x.layout, x.dep)
@@ -312,15 +315,15 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"{red.reduction_type} layout: in:{list(args[0].layout.size)} -> out:{list(result.size)}, "
+                f"{data.reduction_type} layout: in:{list(args[0].layout.size)} -> out:{list(result.size)}, "
                 f"device_size={list(result.device_layout.device_size)}"
             )
 
         return result
 
 
-def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
-    output: FixedLayout = n.node.get_layout()
+def generic_layout(op: Operation) -> FixedTiledLayout:
+    output: FixedLayout = op.get_layout()
     # Use the generic stick format
     stl = SpyreTensorLayout(output.size, output.dtype)
     return FixedTiledLayout(
@@ -329,8 +332,8 @@ def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
 
 
 def propagate_spyre_tensor_layouts(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
+    operations: list[Operation],
+) -> None:
     # Convert InputBuffers from FixedLayout to FixedTiledLayouts
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
@@ -359,39 +362,73 @@ def propagate_spyre_tensor_layouts(
                     ptl.device, ptl.dtype, ptl.size, ptl.stride, stl
                 )
 
-    # Nodes are in topological order (guarenteed by caller).
+    # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being
-    # performed by the node to convert its output FixedLayout to a FixedTiledLayout.
+    # performed to convert each output FixedLayout to a FixedTiledLayout.
 
-    it = iter(nodes)
-    for n in it:
-        if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
-            n.node.decide_layout()
-            if isinstance(n.node.data, Pointwise):
-                output_layout = pointwise_layout(n, get_mem_deps(n))
-                n.node.layout = output_layout
-            elif isinstance(n.node.data, Reduction):
-                output_layout = reduction_layout(n, get_mem_deps(n))
-                n.node.layout = output_layout
+    it = iter(operations)
+    for op in it:
+        if op.is_no_op():
+            op.layout = generic_layout(op)
+        elif isinstance(op, ComputedBuffer):
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                # Mutation ops (e.g. spyre.overwrite) must keep their
+                # MutationLayoutSHOULDREMOVE so the scheduler correctly
+                # treats them as in-place writes to the target buffer.
+                # Their FixedTiledLayout is assigned later in
+                # propagate_mutation_layouts, after the scheduler has
+                # set up mutation tracking.
+                continue
+            op.decide_layout()
+            rw = op.get_read_writes()
+            output_dep = next(iter(rw.writes))
+            args = get_mem_deps_from_rw(rw)
+            output = op.get_layout()
+            if isinstance(op.data, Pointwise):
+                op.layout = pointwise_layout(op.data, output, output_dep, args)
+            elif isinstance(op.data, Reduction):
+                op.layout = reduction_layout(op.data, output, output_dep, args)
             else:
-                logger.warning(f"Warning: unhandled node type {type(n.node)}")
-        elif isinstance(n, ExternKernelSchedulerNode):
-            if isinstance(n.node, FallbackKernel):
-                n = next(it, None)
-                if not (
-                    isinstance(n, ExternKernelSchedulerNode)
-                    and isinstance(n.node, MultiOutput)
-                ):
-                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
-
-                output_layout = generic_layout(n)
-                n.node.layout = output_layout
-            else:
-                logger.warning(f"unhandled node type {type(n.node)}")
-        elif isinstance(n, NopKernelSchedulerNode):
-            output_layout = generic_layout(n)
-            n.node.layout = output_layout
+                logger.warning(f"Warning: unhandled node type {type(op.data)}")
+        elif isinstance(op, FallbackKernel):
+            op = next(it, None)
+            if not isinstance(op, MultiOutput):
+                raise RuntimeError("FallbackKernel must be followed by MultiOutput")
+            op.layout = generic_layout(op)
+        elif isinstance(op, ExternKernel):
+            logger.warning(f"unhandled node type {type(op)}")
         else:
-            logger.warning(f"unhandled scheduler node type {type(n)}")
+            logger.warning(f"unhandled operation type {type(op)}")
+
+
+def propagate_mutation_layouts(
+    nodes: list,
+) -> list:
+    """
+    Second phase of layout propagation for mutation ops.
+
+    ComputedBuffers with MutationLayoutSHOULDREMOVE are skipped in
+    propagate_spyre_tensor_layouts because the scheduler needs to see the
+    mutation layout during its initialisation to set up mutation tracking.
+    This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
+    assign FixedTiledLayout to those remaining mutation ops.
+    """
+    from .pass_utils import get_mem_deps
+
+    for n in nodes:
+        if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
+            continue
+        if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        if isinstance(n.node.data, Pointwise):
+            rw = n.read_writes
+            output_dep = next(iter(rw.writes))
+            args = get_mem_deps(n)
+            output = n.node.get_layout()
+            n.node.layout = pointwise_layout(n.node.data, output, output_dep, args)
+        else:
+            logger.warning(
+                f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
+            )
 
     return nodes
