@@ -516,6 +516,10 @@ def spyre__sdpa_overrideable(
     max_seqlen_q = query.size(2)
     max_seqlen_kv = key.size(2)
 
+    query = query.clone(memory_format=torch.contiguous_format)
+    key = key.clone(memory_format=torch.contiguous_format)
+    value = value.clone(memory_format=torch.contiguous_format)
+
     scaling_factor = scale
     if scaling_factor is None:
         scaling_factor = 1.0 / math.sqrt(query.shape[-1])
@@ -528,7 +532,7 @@ def spyre__sdpa_overrideable(
     query = query * scaling_factor_q
     key = key * scaling_factor_k
 
-    key_t = key.transpose(-2, -1)
+    key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
 
     attn = torch.matmul(query, key_t)
 
