@@ -563,7 +563,7 @@ def spyre__sdpa_overrideable(
 
     # B, S, H, E
     # This is needed to maintain the API promise from SDPA (attn needs to have same size+stride as q)
-    out = out.transpose(1, 2)
+    out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
 
     # Returns (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
     return (
