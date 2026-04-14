@@ -57,7 +57,11 @@ def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) ->
 
 def insert_padding(graph: torch.fx.Graph) -> None:
     for node in list(graph.nodes):
-        if node.op == "call_function" and node.target == torch.matmul:
+        if node.op == "call_function" and node.target in [
+            torch.matmul,
+            torch.mm,
+            torch.bmm,
+        ]:
             args = node.args
             if not all(isinstance(arg, torch.fx.Node) for arg in args):
                 continue
