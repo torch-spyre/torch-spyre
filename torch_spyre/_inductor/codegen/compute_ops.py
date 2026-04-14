@@ -205,7 +205,7 @@ def gen_coord_info_value(
     )
 
 
-def generate_sdsc(idx, sdsc_spec):
+def generate_sdsc(idx, sdsc_spec, symbols: list[int], symbol_id_offset: int = 0):
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
         str(c): {
@@ -214,6 +214,18 @@ def generate_sdsc(idx, sdsc_spec):
         }
         for c in range(sdsc_spec.num_cores)
     }
+
+    # local_symbols maps offset value -> globally-unique negative symbol id.
+    # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
+    local_symbols: dict[int, int] = {}
+
+    def offset_as_symbol(s):
+        if s not in local_symbols:
+            if s not in symbols:
+                symbols.append(s)
+            local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
+        return local_symbols[s]
+
     return {
         f"{idx}_{sdsc_spec.opfunc}": {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
@@ -291,6 +303,7 @@ def generate_sdsc(idx, sdsc_spec):
                                 "component_": "lx"
                                 if "lx" in tensor.allocation
                                 else "hbm",
+                                "isStartAddrSymbolic_": 1,
                                 "layoutDimOrder_": [
                                     str(dim)
                                     for dim in sdsc_spec.layouts[tensor.layout][
@@ -319,13 +332,15 @@ def generate_sdsc(idx, sdsc_spec):
                                     ],
                                     "data_": {
                                         f"[{c}, 0, 0]": str(
-                                            tensor.start_address
-                                            + core_idx_to_slice_offset(
-                                                tensor,
-                                                core_id_to_wk_slice[str(c)],
-                                                sdsc_spec.work_slices,
+                                            offset_as_symbol(
+                                                tensor.start_address
+                                                + core_idx_to_slice_offset(
+                                                    tensor,
+                                                    core_id_to_wk_slice[str(c)],
+                                                    sdsc_spec.work_slices,
+                                                )
+                                                * num_bytes(tensor.data_format)
                                             )
-                                            * num_bytes(tensor.data_format)
                                         )
                                         if "lx" not in tensor.allocation
                                         else str(tensor.start_address)
@@ -421,4 +436,4 @@ def generate_sdsc(idx, sdsc_spec):
                 }
             ],
         }
-    }
+    }, list(local_symbols.keys())
