@@ -22,6 +22,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from . import config
+from .pass_utils import live_operations
 
 
 OPS_GOOD_FOR_LX_REUSE = {"input": {"sub", "div"}, "output": {"max", "sum"}}
@@ -222,6 +223,7 @@ def scratchpad_planning(
 
     alloc = ScratchPadAllocator()
 
+    live_ops = live_operations(operations)
     op_idx_to_dealloc_bufs = buf_end_of_life_analysis(operations)
 
     for idx, op in enumerate(operations):
@@ -231,5 +233,7 @@ def scratchpad_planning(
 
         if isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                continue
+            if op.get_operation_name() not in live_ops:
                 continue
             consider_for_scratchpad(op, alloc, idx, is_last_op)

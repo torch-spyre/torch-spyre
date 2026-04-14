@@ -16,7 +16,13 @@ from typing import NamedTuple
 
 
 import sympy
-from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    Operation,
+    Pointwise,
+    Reduction,
+)
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
@@ -89,6 +95,33 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         return next(iter(rw.reads)).ranges.copy()
     else:
         raise Unsupported("Unexpected node type")
+
+
+def live_operations(operations: list[Operation]) -> frozenset[str]:
+    """Return the set of operation names that are transitively needed by the
+    graph outputs.
+
+    The scheduler performs dead-code elimination after it is constructed, but
+    some passes run before the scheduler.  Computing only the live set here
+    avoids processing operations (e.g. the index output of argmax) that the
+    scheduler would later eliminate.
+
+    A buffer is live if it appears in V.graph.get_output_names() or if it is
+    read by a live operation.  We walk the operation list in reverse
+    (topological order) to propagate liveness backwards.
+    """
+    live_bufs: set[str] = set(V.graph.get_output_names())
+    live_ops: set[str] = set()
+
+    for op in reversed(operations):
+        rw = op.get_read_writes()
+        writes = {dep.name for dep in rw.writes}
+        if writes & live_bufs:
+            live_ops.add(op.get_operation_name())
+            for dep in rw.reads:
+                live_bufs.add(dep.name)
+
+    return frozenset(live_ops)
 
 
 def map_ir_splits_to_scheduler(
