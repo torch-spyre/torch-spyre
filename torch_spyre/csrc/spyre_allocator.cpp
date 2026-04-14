@@ -15,6 +15,8 @@
  */
 #include "spyre_allocator.h"
 
+#include <flex/runtime_stream/runtime_context.hpp>
+#include <memory>
 #include <utility>
 
 #include "logging.h"
@@ -25,16 +27,30 @@
 namespace spyre {
 
 SpyreAllocator::SpyreAllocator() = default;
+SpyreAllocator::~SpyreAllocator() {
+  alive_ = false;
+}
+bool SpyreAllocator::alive_ = true;
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
 c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
-flex::DeviceMemoryAllocatorPtr SpyreAllocator::getAllocator(
-    unsigned int /*dev_id*/) {
-  // Each process has exactly one runtime with one device handle (index 0).
-  // The PyTorch device index (dev_id) is the logical index across processes,
-  // not an index into the runtime's device handle vector.
-  return GlobalRuntime::get()->GetDeviceHandle(0)->GetDeviceMemoryAllocator();
+flex::FlexAllocator* SpyreAllocator::getFlexAllocator() {
+  // FlexAllocator is owned by RuntimeContext (one per device per process).
+  // RuntimeContext::getAllocator() returns shared_ptr<const FlexAllocator>;
+  // we const_cast because allocate()/deallocate() are non-const
+  // (internally mutex-protected and thread-safe).
+  // Returns nullptr on PF devices where FlexAllocator is not available
+  // (see flex#796 for the Scheduler integration needed to enable it).
+  auto runtime_ctx = flex::getFlexRuntimeContext();
+  TORCH_CHECK(runtime_ctx != nullptr,
+              "RuntimeContext is null. Ensure the Spyre runtime has been "
+              "started before allocating device memory.");
+  auto const_alloc = runtime_ctx->getAllocator();
+  if (!const_alloc) {
+    return nullptr;
+  }
+  return const_cast<flex::FlexAllocator*>(const_alloc.get());
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
@@ -128,21 +144,48 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
-  auto allocator = getAllocator(device_id);
-  flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-  // NOTE: last argument should be set to 0
+
+  auto* flex_alloc = getFlexAllocator();
+
+  if (flex_alloc) {
+    // VF path: allocate via FlexAllocator -> CompositeAddress
+    auto allocateViaFlex = [&]()
+        -> std::pair<flex::CompositeAddress, flex::DeviceMemoryAllocationPtr> {
+      try {
+        auto addr = flex_alloc->allocate(nbytes);
+        auto ptr = flex_alloc->makeInterimAllocationPtr(addr);
+        return {std::move(addr), std::move(ptr)};
+      }
+      catch (const std::exception& e) {
+        TORCH_CHECK(false, "Failed to allocate ", nbytes,
+                    " bytes on Spyre device: ", e.what());
+      }
+    };
+    auto [composite_addr, interim_ptr] = allocateViaFlex();
+    auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id, nbytes,
+                                   std::move(interim_ptr));
+    void* data_void = static_cast<void*>(ctx->interim_alloc_ptr.get());
+    recordAlloc(nbytes, data_void, device_id);
+    return at::DataPtr(data_void, static_cast<void*>(ctx), &ReportAndDelete,
+                       curr_device);
+  }
+
+  // PF fallback: allocate directly via legacy DeviceMemoryAllocator.
+  // FlexAllocator is not available on PF because its region-based allocation
+  // conflicts with the Scheduler's direct DeviceMemoryAllocator usage
+  // (see flex#796).
+  auto allocator =
+      GlobalRuntime::get()->GetDeviceHandle(0)->GetDeviceMemoryAllocator();
+  flex::DeviceMemoryAllocationPtr data;
   allocator->TryAllocate(&data, nbytes, 0);
   TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-  auto* ctx = new SharedOwnerCtx{std::move(data), device_id, nbytes};
-  void* ctx_void = static_cast<void*>(ctx);
-
-  void* data_void = static_cast<void*>(ctx->owner.get());
+  auto* ctx =
+      new SharedOwnerCtx(flex::CompositeAddress(std::vector<flex::Chunk>{}),
+                         device_id, nbytes, std::move(data));
+  void* data_void = static_cast<void*>(ctx->interim_alloc_ptr.get());
   recordAlloc(nbytes, data_void, device_id);
-
-  auto data_ptr_result =
-      at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
-
-  return data_ptr_result;
+  return at::DataPtr(data_void, static_cast<void*>(ctx), &ReportAndDelete,
+                     curr_device);
 }
 
 void SpyreAllocator::ReportAndDelete(void* ctx_void) {
@@ -150,10 +193,26 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
     return;
   }
   auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-  size_t nbytes = ctx->nbytes;
 
-  SpyreAllocator::instance().recordRelease(
-      nbytes, static_cast<void*>(ctx->owner.get()), ctx->device_id);
+  // Guard against static destruction order: if the SpyreAllocator singleton
+  // has already been destroyed (process shutdown), skip deallocation.
+  // The device memory will be reclaimed by the OS when the process exits.
+  if (alive_) {
+    size_t nbytes = ctx->nbytes;
+
+    auto* flex_alloc = getFlexAllocator();
+    if (flex_alloc) {
+      // VF path: deallocate via FlexAllocator using CompositeAddress.
+      flex_alloc->deallocate(ctx->owner);
+    }
+    // PF path: interim_alloc_ptr is an owning DeviceMemoryAllocationPtr
+    // whose destructor calls DeviceMemoryAllocator::Free().
+
+    SpyreAllocator::instance().recordRelease(
+        nbytes, static_cast<void*>(ctx->interim_alloc_ptr.get()),
+        ctx->device_id);
+  }
+
   delete ctx;
 }
 
@@ -171,8 +230,6 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   py::gil_scoped_acquire acquire;
   DEBUGINFO("entering allocator->copy_data method");
   // do nothing -- look into when this is called
-  // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
-  // reinterpret_cast<spyre_ptr_t>(src));
 }
 
 // Register our custom allocator

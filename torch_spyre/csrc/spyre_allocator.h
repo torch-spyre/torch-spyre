@@ -19,29 +19,58 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <flex/allocator/alloc_address.hpp>
+#include <flex/allocator/flex_allocator.hpp>
 #include <flex/device_types/device_memory_allocator.hpp>
+#include <memory>
+#include <utility>
 
 namespace spyre {
 
 struct SharedOwnerCtx {
-  flex::DeviceMemoryAllocationPtr owner;
+  // Canonical allocation address from FlexAllocator (the "owner" per RFC).
+  // On PF fallback path this is an empty CompositeAddress.
+  flex::CompositeAddress owner;
   signed char device_id;
   size_t nbytes;
+  // INTERIM: cached non-owning DeviceMemoryAllocationPtr for SetSpyreData().
+  // Constructed once via makeInterimAllocationPtr() and reused for all
+  // SetSpyreData() calls on this tensor.
+  // Remove when SetSpyreData accepts CompositeAddress directly.
+  // On PF fallback path this is an owning allocation (allocator_ != nullptr).
+  flex::DeviceMemoryAllocationPtr interim_alloc_ptr;
+
+  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id, size_t nbytes,
+                 flex::DeviceMemoryAllocationPtr interim)
+      : owner(std::move(addr)),
+        device_id(dev_id),
+        nbytes(nbytes),
+        interim_alloc_ptr(std::move(interim)) {}
 };
 
-// A custom allocator for our custom device, which returns a handle to the
-// allocated memory, not the actual pointer.
+// A custom allocator for our custom device, using FlexAllocator to manage
+// device memory. Returns a handle (not a dereferenceable pointer) to the
+// allocated memory via CompositeAddress stored in SharedOwnerCtx.
 struct SpyreAllocator final : public c10::DeviceAllocator {
  private:
   SpyreAllocator();
+  ~SpyreAllocator();
   static c10::CachingDeviceAllocator::DeviceStats stats_;
   static c10::CachingDeviceAllocator::StatTypes
       stat_types;  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
-
-  flex::DeviceMemoryAllocatorPtr getAllocator(unsigned int dev_id);
+  // Guard against use-after-destroy during static destruction.
+  // Set to false in destructor; checked by ReportAndDelete.
+  static bool alive_;
 
  public:
   static SpyreAllocator& instance();
+
+  // Returns a mutable FlexAllocator from RuntimeContext.
+  // Uses const_pointer_cast because RuntimeContext::getAllocator() returns
+  // shared_ptr<const FlexAllocator>, but allocate()/deallocate() are
+  // non-const (internally mutex-protected).
+  static flex::FlexAllocator* getFlexAllocator();
+
   bool initialized() override;
 
   void emptyCache(c10::MempoolId_t mempool_id) override;

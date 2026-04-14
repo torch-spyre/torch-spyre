@@ -100,12 +100,12 @@
   unsigned int input_index = 0;
   for (const auto& tensor : {{ arguments[0].name }}) {
     auto& input_sendnn_tensor = input_sendnn_tensor_vector.emplace_back(createInputTensor(gl, tensor.storage().data_ptr().get(), input_index, sn_index));
-    input_sendnn_tensor.SetSpyreData((static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context()))->owner);
+    input_sendnn_tensor.SetSpyreData((static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context()))->interim_alloc_ptr);
     input_index++;
   }
 
   auto output_sendnn_tensor = createOutputTensor(gl, {{ output_variable_name }}.storage().data_ptr().get(), 0, sn_index);
-  output_sendnn_tensor.SetSpyreData((static_cast<SharedOwnerCtx*>({{ output_variable_name }}.storage().data_ptr().get_context()))->owner);
+  output_sendnn_tensor.SetSpyreData((static_cast<SharedOwnerCtx*>({{ output_variable_name }}.storage().data_ptr().get_context()))->interim_alloc_ptr);
 
   auto copy_status = gl.Compute({output_sendnn_tensor}, input_sendnn_tensor_vector, sn_index);
 

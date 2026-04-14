@@ -541,8 +541,7 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
                                       tensor_idx, sn_idx);
   auto* ctx =
       static_cast<SharedOwnerCtx*>(dst.storage().data_ptr().get_context());
-  flex::DeviceMemoryAllocationPtr& dev_data = ctx->owner;
-  inp_tensor.SetSpyreData(dev_data);  // ctx->owner;
+  inp_tensor.SetSpyreData(ctx->interim_alloc_ptr);
 
   SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
 }
@@ -556,7 +555,7 @@ auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
                                        tensor_idx, sn_idx);
   auto* ctx =
       static_cast<SharedOwnerCtx*>(self.storage().data_ptr().get_context());
-  out_tensor.SetSpyreData(ctx->owner);
+  out_tensor.SetSpyreData(ctx->interim_alloc_ptr);
   SEN_THROW_NOK(gl->Copy({out_tensor}, sendnn::Inputs(), sn_idx));
 }
 

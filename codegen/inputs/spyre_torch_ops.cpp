@@ -24,6 +24,7 @@
 #include <c10/util/ArrayRef.h>
 #include <logging.h>
 #include <module.h>
+#include <spyre_allocator.h>
 #include <spyre_mem.h>
 #include <spyre_sendnn_utils.h>
 #include <spyre_storage_impl.h>
@@ -206,7 +207,7 @@ void matmul_input_assignment(
   }
   eager_inputs[eager_idx] = (static_cast<SharedOwnerCtx *>(
                                  tmp_tensor.storage().data_ptr().get_context()))
-                                ->owner;
+                                ->interim_alloc_ptr;
 }
 // TODO(filhan): Even though codegen generated version should work,
 // this manually implemented version handles more failure cases.
@@ -280,7 +281,7 @@ at::Tensor spyre__bmm_default(const at::Tensor &self, const at::Tensor &mat2) {
       createOutputTensor(gl, result.storage().data_ptr().get(), 0, 2);
   output_sendnn_tensor.SetSpyreData(
       static_cast<SharedOwnerCtx *>(result.storage().data_ptr().get_context())
-          ->owner);
+          ->interim_alloc_ptr);
 
   auto copy_status =
       gl.Compute({output_sendnn_tensor},
@@ -467,18 +468,18 @@ at::Tensor spyre__clone_default(
     input_sendnn_tensor.SetSpyreData(
         (static_cast<SharedOwnerCtx *>(
              tmp_0.storage().data_ptr().get_context()))
-            ->owner);
+            ->interim_alloc_ptr);
   } else {
     input_sendnn_tensor.SetSpyreData(
         (static_cast<SharedOwnerCtx *>(self.storage().data_ptr().get_context()))
-            ->owner);
+            ->interim_alloc_ptr);
   }
 
   auto output_sendnn_tensor =
       createOutputTensor(gl, result.storage().data_ptr().get());
   output_sendnn_tensor.SetSpyreData(
       (static_cast<SharedOwnerCtx *>(result.storage().data_ptr().get_context()))
-          ->owner);
+          ->interim_alloc_ptr);
 
   auto copy_status =
       gl.Compute({output_sendnn_tensor}, {input_sendnn_tensor}, 1);
