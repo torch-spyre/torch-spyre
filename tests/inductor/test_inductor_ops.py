@@ -149,9 +149,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((67, 256), (256, 128)),
-                    # Fails for now, pending deeptools reduce fixes
-                    # ((67, 67,), (67, 67)),
-                    # ((67, 255), (255, 128)),
+                    # Padding
+                    ((55, 2), (2, 99)),
+                    ((67, 67), (67, 67)),
+                    ((67, 255), (255, 128)),
                 ]
             ),
         },
@@ -162,6 +163,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((2, 256, 1), (2, 1, 128)),
+                    # Padding
+                    ((2, 55, 2), (2, 2, 99)),
+                    ((2, 99, 65), (2, 65, 55)),
                 ]
             ),
         },
