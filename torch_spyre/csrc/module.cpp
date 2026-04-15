@@ -187,49 +187,33 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     at::Tensor tmp_0;
     if (arg.dim() == 0) {
       tmp_0 = (at::ones({1}, arg.dtype()) * arg).to(arg.device());
-      auto tensor = createInputTensor(gl, tmp_0.storage().data_ptr().get(), i,
-                                      (args.size() >= 3) ? 2 : 1);
+      auto tensor =
+          createInputTensor(gl, tmp_0.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                               tmp_0.storage().data_ptr().get_context())
                               ->owner);
       sen_inputs.push_back(tensor);
     } else {
-      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i,
-                                      (args.size() >= 3) ? 2 : 1);
+      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(
           static_cast<SharedOwnerCtx *>(arg.storage().data_ptr().get_context())
               ->owner);
       sen_inputs.push_back(tensor);
     }
   }
-  auto tensor = createOutputTensor(gl, args.back().storage().data_ptr().get(),
-                                   0, (args.size() >= 3) ? 2 : 1);
+  auto tensor =
+      createOutputTensor(gl, args.back().storage().data_ptr().get(), 0, 1);
   tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                           args.back().storage().data_ptr().get_context())
                           ->owner);
   sen_outputs.push_back(tensor);
 
   // Execute device init
-  if (args.size() == 6) {
-    // Filling in segment 5 adds another input to the device init supernode
-    status =
-        gl.Predict(sendnn::Outputs(), {sen_inputs[1], sen_outputs.front()}, 1);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-    status = gl.Compute(sen_outputs, sen_inputs, 2);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-  } else if (args.size() >= 3) {
-    status = gl.Predict(sendnn::Outputs(), {sen_inputs[1]}, 1);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
+  status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
+  if (!status.IsOk()) throw std::runtime_error(status.Message());
 
-    status = gl.Compute(sen_outputs, sen_inputs, 2);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-  } else {
-    status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-    status = gl.Compute(sen_outputs, sen_inputs, 1);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
-  }
+  status = gl.Compute(sen_outputs, sen_inputs, 1);
+  if (!status.IsOk()) throw std::runtime_error(status.Message());
 
   return;
 }
