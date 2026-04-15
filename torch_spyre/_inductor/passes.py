@@ -58,7 +58,6 @@ def _format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  allocation={allocation}")
             if splits := getattr(op, "op_it_space_splits", None):
                 buf.write(f"\n  op_it_space_splits={splits}")
-                buf.write(f"\n  op_it_space_sizes={op.op_it_space_sizes}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()

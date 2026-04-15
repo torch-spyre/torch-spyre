@@ -39,7 +39,11 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import iteration_space, map_ir_splits_to_scheduler
+from .pass_utils import (
+    apply_splits_from_device_dim,
+    device_coordinates,
+    iteration_space,
+)
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -362,9 +366,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node  # ComputedBuffer
         core_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
-            core_division = map_ir_splits_to_scheduler(
-                ir_node.op_it_space_sizes,
+            output_dep = next(iter(self.current_node.read_writes.writes))
+            output_layout = ir_node.get_layout()
+            assert isinstance(output_layout, FixedTiledLayout)
+            sched_dev_coords = device_coordinates(output_layout, output_dep)
+            core_division = apply_splits_from_device_dim(
                 ir_node.op_it_space_splits,
+                sched_dev_coords,
                 it_space,
             )
 
