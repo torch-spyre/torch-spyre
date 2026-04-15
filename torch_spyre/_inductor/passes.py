@@ -84,6 +84,7 @@ class CustomPreGradPasses:
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [insert_padding]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        print("Hi from original pass!")
         for p in self.passes:
             p(graph)
 
