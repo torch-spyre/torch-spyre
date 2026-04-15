@@ -856,6 +856,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 3, 64), dtype=torch.float16),
                     (0, 0, 0, 2),
                 ),
+                "2d_last_dim_left_stick_aligned": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (64, 0),
+                ),
+                "2d_last_dim_left_two_sticks": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (128, 0),
+                ),
+                "2d_last_dim_left_and_right_stick_aligned": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (64, 64),
+                ),
+                "2d_dim0_left": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 0, 2, 0),
+                ),
+                "2d_dim0_left_only": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 0, 1, 0),
+                ),
+                "3d_dim0_left": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 0, 0, 0, 2, 0),
+                ),
+                "3d_dim1_left": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 0, 1, 0),
+                ),
+                "4d_dim0_left": (
+                    cached_randn((2, 3, 4, 64), dtype=torch.float16),
+                    (0, 0, 0, 0, 0, 0, 1, 0),
+                ),
             },
         },
         (
