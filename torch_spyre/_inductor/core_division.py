@@ -20,16 +20,13 @@ from sympy import Expr, Symbol
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
+    ExternKernel,
     FallbackKernel,
     MultiOutput,
+    MutationLayoutSHOULDREMOVE,
+    Operation,
     Pointwise,
     Reduction,
-)
-from torch._inductor.scheduler import (
-    BaseSchedulerNode,
-    ExternKernelSchedulerNode,
-    SchedulerNode,
-    NopKernelSchedulerNode,
 )
 
 from torch._inductor.dependencies import MemoryDep
@@ -37,7 +34,12 @@ from torch._inductor.dependencies import MemoryDep
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps, device_coordinates, iteration_space
+from .pass_utils import (
+    SchedNodeArg,
+    get_mem_deps_from_rw,
+    device_coordinates,
+    iteration_space_from_op,
+)
 from .logging_utils import get_inductor_logger
 from . import config
 import logging
@@ -146,9 +148,15 @@ def adjust_it_space_for_sticks(
 
     For each tensor, find the variable that indexes its stick dimension and
     convert its size in it_space from elements to sticks. This ensures core
-    division treats sticks as atomic units. Adjusts each variable at most once.
+    division treats sticks as atomic units.
+
+    When tensors of different dtypes share a stick variable (e.g. a float16
+    input and an int64 argmax output), the largest elems_per_stick is used
+    so the adjustment is conservative (fewer sticks → smaller adjusted size →
+    fewer cores assigned to the stick dimension).
     """
-    adjusted: dict[Symbol, int] = {}  # stick_var -> elems_per_stick used
+    # Pass 1: find the largest elems_per_stick per stick variable.
+    max_elems: dict[Symbol, int] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -157,20 +165,17 @@ def adjust_it_space_for_sticks(
         if stick_var not in it_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
-        if stick_var in adjusted:
-            assert adjusted[stick_var] == elems_per_stick, (
-                f"Conflicting elems_per_stick for iteration variable {stick_var}: "
-                f"previously seen {adjusted[stick_var]}, now {elems_per_stick}. "
-                f"Mixed-dtype tensors sharing a stick variable are not supported."
-            )
-            continue
-        # FIXME: here we assume padding to a full stick. It may not always be the
-        #        case and we shouldn use a more robust way of computing the number
-        #        of sticks
+        if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
+            max_elems[stick_var] = elems_per_stick
+
+    # Pass 2: adjust each variable once using the maximum.
+    for stick_var, elems_per_stick in max_elems.items():
+        # FIXME: here we assume padding to a full stick. It may not always be
+        #        the case and we should use a more robust way of computing the
+        #        number of sticks
         it_space[stick_var] = (
             it_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
-        adjusted[stick_var] = elems_per_stick
 
 
 def must_split_vars(
@@ -300,13 +305,35 @@ def prioritize_dimensions(
     return priority, min_splits
 
 
-def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
+def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
+    """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
+
+    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
+    scheduler can identify them as in-place writes.  Their target buffer already
+    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
+    real_layout() gives us the correct device layout for core division.
+    """
+    layout = op.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    assert isinstance(layout, FixedTiledLayout), (
+        f"Expected FixedTiledLayout for {op.get_name()}, got {type(layout)}"
+    )
+    return layout
+
+
+def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
 
-    it_space = iteration_space(n)
+    it_space = iteration_space_from_op(op)
+    # Save raw (element-unit) sizes before stick adjustment for use in
+    # map_ir_splits_to_scheduler at codegen time.
+    it_space_raw_sizes = [int(v) for v in it_space.values()]
+
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
+    rw = op.get_read_writes()
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
 
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
 
@@ -321,26 +348,32 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     cores_used = math.prod(splits.values())
 
     if cores_used > 1:
-        n.op_it_space_splits = splits
+        op.op_it_space_splits = list(splits.values())
+        op.op_it_space_sizes = it_space_raw_sizes
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"pointwise work_division {n.node.get_name()}: cores={cores_used}, "
+                f"pointwise work_division {op.get_name()}: cores={cores_used}, "
                 f"iteration_space={it_space}, priorities={priorities}, "
-                f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
+                f"min_splits={min_splits}, op_it_space_splits={op.op_it_space_splits}"
             )
 
 
-def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
+def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
 
-    red: Reduction = n.node.data
+    red: Reduction = op.data
     is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
-    it_space = iteration_space(n)
+    it_space = iteration_space_from_op(op)
+    # Save raw (element-unit) sizes before stick adjustment for use in
+    # map_ir_splits_to_scheduler at codegen time.
+    it_space_raw_sizes = [int(v) for v in it_space.values()]
+
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
+    rw = op.get_read_writes()
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
 
     # Adjust all stick dimension variables (inputs and output) to count sticks
     adjust_it_space_for_sticks(it_space, input_tds + [output_td])
@@ -357,50 +390,45 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
-        n.op_it_space_splits = splits
+        op.op_it_space_splits = list(splits.values())
+        op.op_it_space_sizes = it_space_raw_sizes
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"reduction work_division {n.node.get_name()}: cores={cores_used}, "
+                f"reduction work_division {op.get_name()}: cores={cores_used}, "
                 f"iteration_space={it_space}, priorities={priorities}, "
-                f"min_splits={min_splits}, op_it_space_splits={n.op_it_space_splits}"
+                f"min_splits={min_splits}, op_it_space_splits={op.op_it_space_splits}"
             )
 
 
 def core_division_planning(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
-    # Nodes are in topological order (guaranteed by caller).
+    operations: list[Operation],
+) -> None:
+    # Operations are in topological order (guaranteed by GraphLowering).
     max_cores = config.sencores
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
 
-    it = iter(nodes)
-    for n in it:
-        if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
-            if isinstance(n.node.data, Pointwise):
-                divide_pointwise_op(n, get_mem_deps(n), max_cores)
-            elif isinstance(n.node.data, Reduction):
-                divide_reduction_op(n, get_mem_deps(n), max_cores)
+    it = iter(operations)
+    for op in it:
+        if op.is_no_op():
+            pass
+        elif isinstance(op, ComputedBuffer):
+            rw = op.get_read_writes()
+            args = get_mem_deps_from_rw(rw)
+            if isinstance(op.data, Pointwise):
+                divide_pointwise_op(op, args, max_cores)
+            elif isinstance(op.data, Reduction):
+                divide_reduction_op(op, args, max_cores)
             else:
                 # Core division not supported on other IRNode types
                 pass
-        elif isinstance(n, ExternKernelSchedulerNode):
-            if isinstance(n.node, FallbackKernel):
-                n = next(it, None)
-                if not (
-                    isinstance(n, ExternKernelSchedulerNode)
-                    and isinstance(n.node, MultiOutput)
-                ):
-                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
-
-                # Core division not supported on fallback kernels
-                pass
-            else:
-                logger.warning(f"unhandled node type {type(n.node)}")
-        elif isinstance(n, NopKernelSchedulerNode):
-            pass
+        elif isinstance(op, FallbackKernel):
+            op = next(it, None)
+            if not isinstance(op, MultiOutput):
+                raise RuntimeError("FallbackKernel must be followed by MultiOutput")
+            # Core division not supported on fallback kernels
+        elif isinstance(op, ExternKernel):
+            logger.warning(f"unhandled node type {type(op)}")
         else:
-            logger.warning(f"unhandled scheduler node type {type(n)}")
-
-    return nodes
+            logger.warning(f"unhandled operation type {type(op)}")

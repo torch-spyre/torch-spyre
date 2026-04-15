@@ -42,6 +42,7 @@ _VALID_DTYPE_STRINGS = {
     "complex64",
     "complex128",
     "bool",
+    "half",
 }
 
 

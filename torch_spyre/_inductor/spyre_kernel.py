@@ -39,7 +39,7 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import iteration_space
+from .pass_utils import iteration_space, map_ir_splits_to_scheduler
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -357,11 +357,17 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]:
                 raise Unsupported(f"operation on {arg.device_dtype}")
 
-        core_division: dict[sympy.Symbol, int] = {}
-        if hasattr(self.current_node, "op_it_space_splits"):
-            core_division = self.current_node.op_it_space_splits  # type: ignore[union-attr]
-
         it_space = iteration_space(self.current_node)
+
+        ir_node = self.current_node.node  # ComputedBuffer
+        core_division: dict[sympy.Symbol, int] = {}
+        if hasattr(ir_node, "op_it_space_splits"):
+            core_division = map_ir_splits_to_scheduler(
+                ir_node.op_it_space_sizes,
+                ir_node.op_it_space_splits,
+                it_space,
+            )
+
         it_space_extended = {
             k: (v, core_division.get(k, 1)) for k, v in it_space.items()
         }

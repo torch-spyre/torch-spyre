@@ -479,7 +479,7 @@ def spyre_softplus(
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    weight = weight.transpose(-1, -2).contiguous()
+    weight = weight.transpose(-1, -2)
     while weight.dim() < input.dim():
         weight = torch.unsqueeze(weight, 0)
     out = input @ weight
@@ -625,13 +625,20 @@ def pad_decomp(
             f"Spyre (pad={pad})"
         )
 
-    # Left-padding requires shifting the output start address by the left amount,
-    # which is not yet supported. Tracked in:
-    # https://github.com/torch-spyre/torch-spyre/issues/1480
-    if any(pad[2 * i] > 0 for i in range(n_dims_padded)):
-        raise Unsupported(
-            f"constant_pad_nd: left-padding is not supported on Spyre (pad={pad})"
-        )
+    # Left-padding on the last (stick) dimension shifts the output start address
+    # by `left` elements. The hardware can only express this in whole sticks, so
+    # `left` must be a multiple of the stick size (64 fp16 elements).
+    # Sub-stick left-padding on the last dimension is tracked in:
+    # https://github.com/torch-spyre/torch-spyre/issues/1464
+    last_dim_left = pad[0]
+    if last_dim_left > 0:
+        elems_per_stick = 128 // input.element_size()
+        if last_dim_left % elems_per_stick != 0:
+            raise Unsupported(
+                f"constant_pad_nd: sub-stick left-padding on the last dimension is "
+                f"not supported on Spyre (pad={pad}, left={last_dim_left}, "
+                f"stick_size={elems_per_stick})"
+            )
 
     # Build the padded output shape and collect which dimensions need padding.
     scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)

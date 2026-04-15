@@ -15,6 +15,7 @@
 from contextlib import contextmanager
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from typing import Callable, Optional
@@ -77,6 +78,7 @@ def enable_spyre_context(
         CustomPostPasses,
         CustomPreFusionPasses,
         CustomPostFusionPasses,
+        CustomPreSchedulingPasses,
     )
 
     # *) Inductor config tweaks (saved/restored)
@@ -107,6 +109,18 @@ def enable_spyre_context(
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
+    # Inject the pre_scheduling_passes before the Scheduler is constructed,
+    # allowing the passes to modify the graph IR (buffers, inputs, constants).
+    old_update_scheduler = GraphLowering._update_scheduler
+
+    _pre_scheduling_pass = CustomPreSchedulingPasses()
+
+    def _spyre_update_scheduler(self: GraphLowering) -> None:
+        _pre_scheduling_pass(self.operations)
+        old_update_scheduler(self)
+
+    GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
+
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
@@ -120,3 +134,4 @@ def enable_spyre_context(
         finally:
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
+            GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
