@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple, TypeVar
 
 
 import sympy
@@ -115,6 +115,35 @@ def _sym_to_device_dim(
     return result
 
 
+_V = TypeVar("_V")
+
+
+def by_device_dim(
+    values: dict[sympy.Symbol, _V],
+    device_coords: list[sympy.Expr],
+    *,
+    skip: "Callable[[_V], bool] | None" = None,
+) -> dict[int, _V]:
+    """Convert a symbol→value dict to a device_dim→value dict.
+
+    Uses ``_sym_to_device_dim`` to map each symbol to the outermost device
+    dimension index it governs.  Entries for which ``skip(value)`` returns
+    ``True`` are omitted (e.g. unity splits); pass ``skip=None`` to keep all.
+
+    This encoding is stable across the pre-scheduling / codegen boundary
+    because the device layout does not change between the two phases.
+    """
+    sym_to_dim = _sym_to_device_dim(device_coords)
+    result: dict[int, _V] = {}
+    for sym, value in values.items():
+        if skip is not None and skip(value):
+            continue
+        dim = sym_to_dim.get(sym)
+        if dim is not None:
+            result[dim] = value
+    return result
+
+
 def splits_by_device_dim(
     splits: dict[sympy.Symbol, int],
     device_coords: list[sympy.Expr],
@@ -126,13 +155,32 @@ def splits_by_device_dim(
     (guaranteed because the device layout is fixed), the two dicts share the
     same integer keys and the mapping is unambiguous.
     """
-    sym_to_dim = _sym_to_device_dim(device_coords)
-    result: dict[int, int] = {}
-    for sym, split in splits.items():
-        if split > 1:
-            dim = sym_to_dim.get(sym)
-            if dim is not None:
-                result[dim] = split
+    return by_device_dim(splits, device_coords, skip=lambda v: v <= 1)
+
+
+def apply_by_device_dim(
+    dim_values: dict[int, _V],
+    device_coords: list[sympy.Expr],
+    sched_it_space: dict[sympy.Symbol, sympy.Expr],
+    default: _V,
+) -> dict[sympy.Symbol, _V]:
+    """Reconstruct a scheduler-symbol→value dict from a device_dim→value dict.
+
+    At codegen time the scheduler's iteration-space symbols are different from
+    the pre-scheduler symbols, but ``device_coordinates`` evaluated against the
+    scheduler write dep produces the same device-dim-to-symbol mapping.
+    ``dim_values`` was produced by ``by_device_dim`` at pre-scheduler time;
+    we invert ``_sym_to_device_dim`` on the scheduler side to recover the
+    correct symbol for each value.  Symbols not present in ``dim_values`` are
+    assigned ``default``.
+    """
+    sched_sym_to_dim = _sym_to_device_dim(device_coords)
+    dim_to_sched_sym = {d: sym for sym, d in sched_sym_to_dim.items()}
+    result: dict[sympy.Symbol, _V] = {sym: default for sym in sched_it_space}
+    for dim, value in dim_values.items():
+        sym = dim_to_sched_sym.get(dim)
+        if sym is not None and sym in result:
+            result[sym] = value
     return result
 
 
@@ -143,18 +191,6 @@ def apply_splits_from_device_dim(
 ) -> dict[sympy.Symbol, int]:
     """Reconstruct a scheduler-symbol→split dict from a device_dim→split dict.
 
-    At codegen time the scheduler's iteration-space symbols are different from
-    the pre-scheduler symbols, but ``device_coordinates`` evaluated against the
-    scheduler write dep produces the same device-dim-to-symbol mapping.
-    ``dim_splits`` was produced by ``splits_by_device_dim`` at pre-scheduler time;
-    we invert ``_sym_to_device_dim`` on the scheduler side to recover the
-    correct symbol for each split.
+    Convenience wrapper around ``apply_by_device_dim`` with a default of 1.
     """
-    sched_sym_to_dim = _sym_to_device_dim(device_coords)
-    dim_to_sched_sym = {d: sym for sym, d in sched_sym_to_dim.items()}
-    result: dict[sympy.Symbol, int] = {sym: 1 for sym in sched_it_space}
-    for dim, split in dim_splits.items():
-        sym = dim_to_sched_sym.get(dim)
-        if sym is not None and sym in result:
-            result[sym] = split
-    return result
+    return apply_by_device_dim(dim_splits, device_coords, sched_it_space, 1)
