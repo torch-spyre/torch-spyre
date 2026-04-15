@@ -64,6 +64,7 @@ DTYPE_STR_MAP: Dict[str, torch.dtype] = {
     "complex64": torch.complex64,
     "complex128": torch.complex128,
     "bool": torch.bool,
+    "half": torch.half,
 }
 
 DTYPE_NAMES_ORDERED = sorted(DTYPE_STR_MAP.keys(), key=len, reverse=True)
