@@ -1568,20 +1568,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     True,
                 ),
-                # TODO(aviros): Implement expand
-                # "gqa_prefill": (
-                #     cached_randn(
-                #         (2, 256, 32, 128), differentiation=1, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 256, 8, 128), differentiation=2, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 256, 8, 128), differentiation=3, dtype=torch.float16
-                #     ),
-                #     False,
-                #     True,
-                # ),
                 # TODO(aviros): Implement broadcast for batch dim in batch matmul
                 # "mha_decode": (
                 #     cached_randn(
