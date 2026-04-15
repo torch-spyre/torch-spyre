@@ -395,7 +395,7 @@ def pointwise_layout(
                 [f"in{i}:{list(arg.layout.size)}" for i, arg in enumerate(args)]
             )
             logger.debug(
-                f"{op.__name__} layout: {input_info} -> out:{list(result.size)}, "
+                f"{getattr(op, '__name__', repr(op))} layout: {input_info} -> out:{list(result.size)}, "
                 f"device_size={list(result.device_layout.device_size)}"
             )
 
