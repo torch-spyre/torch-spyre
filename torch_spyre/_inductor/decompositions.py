@@ -513,6 +513,7 @@ def spyre__sdpa_overrideable(
 ]:
     batch_size = query.size(0)
     num_heads = query.size(1)
+    num_kvheads = key.size(1)
     max_seqlen_q = query.size(2)
     max_seqlen_kv = key.size(2)
 
@@ -532,6 +533,10 @@ def spyre__sdpa_overrideable(
     query = query * scaling_factor_q
     key = key * scaling_factor_k
 
+    expansion = num_heads // num_kvheads
+    if expansion != 1:
+        key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
     key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
 
     attn = torch.matmul(query, key_t)
