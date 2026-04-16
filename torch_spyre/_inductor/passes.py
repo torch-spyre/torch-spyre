@@ -39,6 +39,7 @@ from . import config
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
 from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
+from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
@@ -57,7 +58,14 @@ def _format_operations(operations: list[Operation]) -> str:
             if allocation := getattr(op.layout, "allocation", None):
                 buf.write(f"\n  allocation={allocation}")
             if splits := getattr(op, "op_it_space_splits", None):
-                buf.write(f"\n  op_it_space_splits={splits}")
+                rw = op.get_read_writes()
+                write_index = next(iter(rw.writes)).index
+                read_index = next((d.index for d in rw.reads), write_index)
+                it_space = iteration_space_from_op(op)
+                readable_splits = apply_splits_from_index_coeff(
+                    splits, write_index, read_index, it_space
+                )
+                buf.write(f"\n  op_it_space_splits={readable_splits}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
