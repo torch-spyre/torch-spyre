@@ -452,34 +452,71 @@ def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     return layout
 
 
+def collect_tensor_deps(
+    op: ComputedBuffer, args: list[SchedNodeArg]
+) -> tuple[list[TensorDep], TensorDep]:
+    """Build TensorDep lists for inputs and the output of op."""
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]
+    rw = op.get_read_writes()
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
+    return input_tds, output_td
+
+
+def apply_splits(
+    op: ComputedBuffer,
+    splits: dict,
+    output_td: TensorDep,
+    it_space: dict,
+    it_space_adjusted: dict,
+    priorities: list,
+    min_splits: dict,
+    kind: str,
+) -> None:
+    """Commit splits to op and emit a debug log entry.
+
+    Does nothing when the product of splits is 1 (no parallelism).
+    kind is a short label used in the log message (e.g. "pointwise" or "reduction").
+    """
+    cores_used = math.prod(splits.values())
+    if cores_used <= 1:
+        return
+
+    rw = op.get_read_writes()
+    write_index = output_td.dep.index
+    first_read = next(iter(rw.reads), None)
+    read_index = first_read.index if first_read is not None else write_index
+    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"{kind} work_division {op.get_name()}: cores={cores_used}, "
+            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"priorities={priorities}, min_splits={min_splits}, "
+            f"op_it_space_splits={op.op_it_space_splits}"
+        )
+
+
 def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
 
     it_space = iteration_space_from_op(op)
-
-    input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
+    input_tds, output_td = collect_tensor_deps(op, args)
 
     splits, it_space_adjusted, priorities, min_splits = plan_splits(
         input_tds + [output_td], output_td, it_space, max_cores
     )
 
-    cores_used = math.prod(splits.values())
-    if cores_used > 1:
-        write_index = output_td.dep.index
-        first_read = next(iter(rw.reads), None)
-        read_index = first_read.index if first_read is not None else write_index
-        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"pointwise work_division {op.get_name()}: cores={cores_used}, "
-                f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-                f"priorities={priorities}, min_splits={min_splits}, "
-                f"op_it_space_splits={op.op_it_space_splits}"
-            )
+    apply_splits(
+        op,
+        splits,
+        output_td,
+        it_space,
+        it_space_adjusted,
+        priorities,
+        min_splits,
+        kind="pointwise",
+    )
 
 
 def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
@@ -490,10 +527,7 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
     it_space = iteration_space_from_op(op)
-
-    input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
+    input_tds, output_td = collect_tensor_deps(op, args)
 
     # FIXME: For non-matmul reduction, excluding reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
@@ -506,20 +540,16 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
         exclude_reduction=not is_matmul,
     )
 
-    cores_used = math.prod(splits.values())
-    if cores_used > 1:
-        write_index = output_td.dep.index
-        first_read = next(iter(rw.reads), None)
-        read_index = first_read.index if first_read is not None else write_index
-        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"reduction work_division {op.get_name()}: cores={cores_used}, "
-                f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-                f"priorities={priorities}, min_splits={min_splits}, "
-                f"op_it_space_splits={op.op_it_space_splits}"
-            )
+    apply_splits(
+        op,
+        splits,
+        output_td,
+        it_space,
+        it_space_adjusted,
+        priorities,
+        min_splits,
+        kind="reduction",
+    )
 
 
 def core_division_planning(
