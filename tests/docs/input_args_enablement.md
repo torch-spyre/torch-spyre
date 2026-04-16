@@ -1,6 +1,12 @@
 # Customization of Input Arguments for Tests -- Tensors, Keyword Arguments
 
-- Authors: Anubhav Jana, Ashok Pon Kumar Sree Prakash (IBM Research, India)
+**Authors:**
+
+- Anubhav Jana (IBM Research, India)
+- Kazuaki Ishizaki (IBM Research, Tokyo, Japan)
+- Tuan Hoang Trong (IBM Research, Yorktown Heights, US)
+- Umamaheswari Devi (IBM Research, India)
+- Ashok Pon Kumar Sree Prakash (IBM Research, India)
 
 This document describes the `edits.inputs` field, which will let us specify exact input arguments for any test in the config. It is part of the `edits` block inside a test entry.
 
