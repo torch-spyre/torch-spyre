@@ -31,7 +31,10 @@ of shape `[M, N]` has iteration space `{c0: M, c1: N}`.
 Stick variables — iteration variables whose range maps to the innermost (stick)
 device dimension of some tensor — are converted from element counts to stick
 counts before planning. This ensures core splits always land on stick
-boundaries, since each core must receive a whole number of sticks.
+boundaries, since each core must receive a whole number of sticks. When
+multiple tensors of different dtypes share a stick variable, the conversion
+uses the largest `elems_per_stick` across those tensors (conservative: fewer
+sticks → smaller adjusted size → fewer cores assigned to that dimension).
 
 ## Hardware Memory Span Constraint
 
@@ -59,11 +62,15 @@ For each operation, `plan_splits` drives the planning in three steps:
 
 **Step 1 — Span-required splits (`must_split_vars`).**
 Process tensors one at a time. For each tensor whose per-core span exceeds
-256 MB, search for the smallest-product combination of slice counts across the
-contributing iteration variables (Cartesian product of valid divisors, outer
-device dimensions first) that brings the span within the hardware limit.
-Previously committed splits are carried forward, narrowing the search for
-subsequent tensors.
+256 MB, iterate over device dimensions outer to inner and search for the best
+split combination (Cartesian product of valid divisors for the variables
+contributing to that dimension) that satisfies the hardware limit. The search
+applies a two-tier selection: among combinations whose total core count does
+not exceed `max_cores`, prefer the one with the **largest span that still fits
+within the limit** (i.e. fewest cores used); if no combination brings the span
+within the limit, fall back to the one with the **smallest span** (most
+progress). Previously committed splits are carried forward as lower bounds,
+narrowing the search for subsequent tensors.
 
 **Step 2 — Priority ordering (`prioritize_dimensions`).**
 Among the remaining dimensions (those not already committed by step 1), rank
@@ -76,7 +83,8 @@ known backend limitation.
 **Step 3 — Core assignment (`multi_dim_iteration_space_split`).**
 Assign cores in two passes:
 
-1. Apply the span-required splits from step 1, consuming cores first.
+1. Apply the span-required splits from step 1. These variables are excluded
+   from the priority list — the two sets are disjoint.
 2. Distribute remaining cores to the priority-ordered dimensions from step 2,
    greedily assigning the largest valid divisor of each dimension's size that
    fits within the remaining core budget.
@@ -123,7 +131,8 @@ values range from 1 (no parallelization) to 32 (maximum supported cores).
 **Current limitations:**
 
 - Dimensions must divide evenly by the slice count (no uneven splits)
-- Only pointwise and reduction operations are supported
+- Only `Pointwise` and `Reduction` IR nodes are dispatched for work division;
+  `ExternKernel` and `FallbackKernel` nodes are skipped
 - Non-matmul reductions cannot split along the reduction dimension
 
 **Potential future enhancements:**
