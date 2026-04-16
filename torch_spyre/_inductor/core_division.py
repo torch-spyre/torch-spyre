@@ -39,6 +39,7 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
+    splits_by_index_coeff,
 )
 from .logging_utils import get_inductor_logger
 from . import config
@@ -327,9 +328,6 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
         return
 
     it_space = iteration_space_from_op(op)
-    # Save raw (element-unit) sizes before stick adjustment for use in
-    # map_ir_splits_to_scheduler at codegen time.
-    it_space_raw_sizes = [int(v) for v in it_space.values()]
 
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
@@ -348,8 +346,10 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     cores_used = math.prod(splits.values())
 
     if cores_used > 1:
-        op.op_it_space_splits = list(splits.values())
-        op.op_it_space_sizes = it_space_raw_sizes
+        write_index = output_td.dep.index
+        first_read = next(iter(rw.reads), None)
+        read_index = first_read.index if first_read is not None else write_index
+        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -367,9 +367,6 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
     it_space = iteration_space_from_op(op)
-    # Save raw (element-unit) sizes before stick adjustment for use in
-    # map_ir_splits_to_scheduler at codegen time.
-    it_space_raw_sizes = [int(v) for v in it_space.values()]
 
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
@@ -390,8 +387,10 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
-        op.op_it_space_splits = list(splits.values())
-        op.op_it_space_sizes = it_space_raw_sizes
+        write_index = output_td.dep.index
+        first_read = next(iter(rw.reads), None)
+        read_index = first_read.index if first_read is not None else write_index
+        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple, TypeVar
 
 
 import sympy
@@ -96,55 +96,89 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         raise Unsupported("Unexpected node type")
 
 
-def map_ir_splits_to_scheduler(
-    ir_sizes: list[int],
-    ir_splits: list[int],
+_V = TypeVar("_V")
+
+# Type alias for the two-namespace split storage: (output_splits, reduction_splits).
+# output_splits is keyed by the symbol's coefficient in the write dep's index.
+# reduction_splits is keyed by the symbol's coefficient in the first read dep's index.
+# The two dicts use different reference indices so their keys never collide.
+ItSpaceSplits = tuple[dict[sympy.Expr, int], dict[sympy.Expr, int]]
+
+
+def _coeff_splits_from_index(
+    splits: dict[sympy.Symbol, _V],
+    index: sympy.Expr,
+    *,
+    skip: "Callable[[_V], bool] | None" = None,
+) -> dict[sympy.Expr, _V]:
+    """Return a coeff→value dict for symbols with a non-zero coefficient in index.
+
+    The coefficient of a symbol in a flat tensor index expression is stable
+    across the pre-scheduling / codegen boundary (same layout strides on both
+    sides), so it serves as a symbol-identity key that survives the scheduler's
+    renaming.  Symbols absent from index (coeff=0) are not included.
+
+    Entries for which ``skip(value)`` returns True are omitted.
+    """
+    result: dict[sympy.Expr, _V] = {}
+    for sym, value in splits.items():
+        if skip is not None and skip(value):
+            continue
+        coeff = index.coeff(sym)
+        if coeff != 0:
+            result[coeff] = value
+    return result
+
+
+def splits_by_index_coeff(
+    splits: dict[sympy.Symbol, int],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> ItSpaceSplits:
+    """Encode a symbol→split dict as a pair of coeff-keyed dicts.
+
+    Output dims (those present in write_index) are encoded using their
+    coefficient in write_index.  Reduction dims (absent from write_index) are
+    encoded using their coefficient in read_index.  The two dicts form separate
+    namespaces so their keys never collide, even when output and reduction dims
+    happen to share the same stride value in different tensors.
+
+    Only non-unity splits are stored; 1 is the default on the apply side.
+    """
+    skip = lambda v: v <= 1  # noqa: E731
+    output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
+    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    reduction_only = {
+        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+    }
+    reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
+    return output_splits, reduction_splits
+
+
+def apply_splits_from_index_coeff(
+    coeff_splits: ItSpaceSplits,
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
     sched_it_space: dict[sympy.Symbol, sympy.Expr],
 ) -> dict[sympy.Symbol, int]:
-    """Map positional IR-level core-division splits to scheduler-level symbol keys.
+    """Reconstruct a scheduler-symbol→split dict from an ItSpaceSplits pair.
 
-    At pre-scheduler time, core_division stores splits as a list[int] parallel to
-    the IR-level iteration-space dimensions (in natural/declaration order).  At
-    codegen time the Scheduler has renamed and possibly reordered or merged those
-    dimensions via ``simplify_and_reorder``.
-
-    The scheduler sorts dimensions by decreasing stride.  For contiguous row-major
-    tensors this equals natural order, but broadcast operands (stride=0) can cause
-    the scheduler to reorder non-broadcast dims ahead of others.
-
-    Strategy: sort BOTH the IR (size, split) pairs AND the scheduler (size, symbol)
-    pairs by decreasing size using a stable sort.  After sorting, IR and scheduler
-    dims align positionally:
-
-    - Distinct sizes: sort uniquely resolves the mapping and handles reordering.
-    - Duplicate sizes: Python's stable sort preserves relative order among equal
-      elements, which matches the scheduler's tie-breaking by original position.
-    - Fewer scheduler dims (merging occurred): after sort-aligning, greedily consume
-      consecutive IR dims whose sizes multiply to each scheduler dim's size.
+    Output dims (non-zero coeff in write_index) are looked up in
+    coeff_splits[0]; reduction dims (zero coeff in write_index) are looked up
+    in coeff_splits[1] via their coefficient in read_index.  Symbols not found
+    in either dict default to 1.
     """
-    sorted_ir = sorted(zip(ir_sizes, ir_splits), key=lambda p: p[0], reverse=True)
-    sorted_sched = sorted(sched_it_space.items(), key=lambda p: int(p[1]), reverse=True)
-
-    if len(sorted_ir) == len(sorted_sched):
-        return {sym: split for (sym, _), (_, split) in zip(sorted_sched, sorted_ir)}
-
-    # Dimension merging occurred.  After size-sorting, the scheduler's merged dims
-    # correspond to consecutive runs of IR dims with matching size-products.
-    result: dict[sympy.Symbol, int] = {}
-    ir_idx = 0
-    for sym, sched_size in sorted_sched:
-        sched_size = int(sched_size)
-        product_size = 1
-        product_split = 1
-        while ir_idx < len(sorted_ir) and product_size < sched_size:
-            product_size *= sorted_ir[ir_idx][0]
-            product_split *= sorted_ir[ir_idx][1]
-            ir_idx += 1
-        assert product_size == sched_size, (
-            f"Cannot map IR dims to scheduler dims: "
-            f"ir_sizes={ir_sizes}, sched_sizes={[int(v) for v in sched_it_space.values()]}"
-        )
-        result[sym] = product_split
-
-    assert ir_idx == len(sorted_ir), "Not all IR dimensions consumed"
+    output_coeff_splits, reduction_coeff_splits = coeff_splits
+    result: dict[sympy.Symbol, int] = {sym: 1 for sym in sched_it_space}
+    for sym, size in sched_it_space.items():
+        if size <= 1:
+            continue
+        wc = write_index.coeff(sym)
+        if wc != 0:
+            if wc in output_coeff_splits:
+                result[sym] = output_coeff_splits[wc]
+        else:
+            rc = read_index.coeff(sym)
+            if rc != 0 and rc in reduction_coeff_splits:
+                result[sym] = reduction_coeff_splits[rc]
     return result
