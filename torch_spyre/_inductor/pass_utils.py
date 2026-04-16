@@ -96,101 +96,125 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         raise Unsupported("Unexpected node type")
 
 
-def _sym_to_device_dim(
-    device_coords: list[sympy.Expr],
-) -> dict[sympy.Symbol, int]:
-    """Return a mapping from each iteration-space symbol to its outermost device
-    dimension index.
-
-    ``device_coords[d]`` is the expression for device dimension ``d`` in terms of
-    the iteration-space symbols.  For each symbol ``s`` we find the smallest ``d``
-    such that ``s`` appears in ``device_coords[d]``.  This mapping is stable across
-    the pre-scheduling / codegen boundary because the device layout does not change.
-    """
-    result: dict[sympy.Symbol, int] = {}
-    for d, coord in enumerate(device_coords):
-        for sym in coord.free_symbols:
-            if sym not in result:
-                result[sym] = d
-    return result
-
-
 _V = TypeVar("_V")
 
+# Type alias for the two-namespace split storage: (output_splits, reduction_splits).
+# output_splits is keyed by the symbol's coefficient in the write dep's index.
+# reduction_splits is keyed by the symbol's coefficient in the first read dep's index.
+# The two dicts use different reference indices so their keys never collide.
+ItSpaceSplits = tuple[dict[sympy.Expr, int], dict[sympy.Expr, int]]
 
-def by_device_dim(
-    values: dict[sympy.Symbol, _V],
-    device_coords: list[sympy.Expr],
+
+def _coeff_splits_from_index(
+    splits: dict[sympy.Symbol, _V],
+    index: sympy.Expr,
     *,
     skip: "Callable[[_V], bool] | None" = None,
-) -> dict[int, _V]:
-    """Convert a symbol→value dict to a device_dim→value dict.
+) -> dict[sympy.Expr, _V]:
+    """Return a coeff→value dict for symbols with a non-zero coefficient in index.
 
-    Uses ``_sym_to_device_dim`` to map each symbol to the outermost device
-    dimension index it governs.  Entries for which ``skip(value)`` returns
-    ``True`` are omitted (e.g. unity splits); pass ``skip=None`` to keep all.
+    The coefficient of a symbol in a flat tensor index expression is stable
+    across the pre-scheduling / codegen boundary (same layout strides on both
+    sides), so it serves as a symbol-identity key that survives the scheduler's
+    renaming.  Symbols absent from index (coeff=0) are not included.
 
-    This encoding is stable across the pre-scheduling / codegen boundary
-    because the device layout does not change between the two phases.
+    Entries for which ``skip(value)`` returns True are omitted.
     """
-    sym_to_dim = _sym_to_device_dim(device_coords)
-    result: dict[int, _V] = {}
-    for sym, value in values.items():
+    result: dict[sympy.Expr, _V] = {}
+    for sym, value in splits.items():
         if skip is not None and skip(value):
             continue
-        dim = sym_to_dim.get(sym)
-        if dim is not None:
-            result[dim] = value
+        coeff = index.coeff(sym)
+        if coeff != 0:
+            result[coeff] = value
     return result
 
 
-def splits_by_device_dim(
-    splits: dict[sympy.Symbol, int],
-    device_coords: list[sympy.Expr],
-) -> dict[int, int]:
-    """Convert a symbol→split dict to a device_dim→split dict.
-
-    Only non-unity splits are stored; the caller uses 1 as the default.
-    When a scheduler symbol maps to the same device dimension as an IR symbol
-    (guaranteed because the device layout is fixed), the two dicts share the
-    same integer keys and the mapping is unambiguous.
-    """
-    return by_device_dim(splits, device_coords, skip=lambda v: v <= 1)
-
-
-def apply_by_device_dim(
-    dim_values: dict[int, _V],
-    device_coords: list[sympy.Expr],
+def _apply_coeff_splits(
+    coeff_values: dict[sympy.Expr, _V],
+    index: sympy.Expr,
     sched_it_space: dict[sympy.Symbol, sympy.Expr],
     default: _V,
+    *,
+    only_in_index: bool,
 ) -> dict[sympy.Symbol, _V]:
-    """Reconstruct a scheduler-symbol→value dict from a device_dim→value dict.
+    """Reconstruct a symbol→value dict from a coeff→value dict.
 
-    At codegen time the scheduler's iteration-space symbols are different from
-    the pre-scheduler symbols, but ``device_coordinates`` evaluated against the
-    scheduler write dep produces the same device-dim-to-symbol mapping.
-    ``dim_values`` was produced by ``by_device_dim`` at pre-scheduler time;
-    we invert ``_sym_to_device_dim`` on the scheduler side to recover the
-    correct symbol for each value.  Symbols not present in ``dim_values`` are
-    assigned ``default``.
+    For each scheduler symbol whose coefficient in index is non-zero and
+    appears in coeff_values, the stored value is applied.  All other symbols
+    receive default.
+
+    ``only_in_index``: when True, only symbols that appear in index (coeff!=0)
+    are eligible — used for output dims (write dep) so that reduction dims,
+    which are absent from the write dep, fall through to be handled separately.
+    When False, symbols absent from index are also eligible — not currently used
+    but keeps the helper general.
+
+    Symbols with size <= 1 are always skipped: a size-1 dim shares its stride
+    with the adjacent real dim, making its coefficient non-unique.
     """
-    sched_sym_to_dim = _sym_to_device_dim(device_coords)
-    dim_to_sched_sym = {d: sym for sym, d in sched_sym_to_dim.items()}
     result: dict[sympy.Symbol, _V] = {sym: default for sym in sched_it_space}
-    for dim, value in dim_values.items():
-        sym = dim_to_sched_sym.get(dim)
-        if sym is not None and sym in result:
-            result[sym] = value
+    for sym, size in sched_it_space.items():
+        if size <= 1:
+            continue
+        coeff = index.coeff(sym)
+        if coeff == 0:
+            if only_in_index:
+                continue
+        elif coeff in coeff_values:
+            result[sym] = coeff_values[coeff]
     return result
 
 
-def apply_splits_from_device_dim(
-    dim_splits: dict[int, int],
-    device_coords: list[sympy.Expr],
+def splits_by_index_coeff(
+    splits: dict[sympy.Symbol, int],
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
+) -> ItSpaceSplits:
+    """Encode a symbol→split dict as a pair of coeff-keyed dicts.
+
+    Output dims (those present in write_index) are encoded using their
+    coefficient in write_index.  Reduction dims (absent from write_index) are
+    encoded using their coefficient in read_index.  The two dicts form separate
+    namespaces so their keys never collide, even when output and reduction dims
+    happen to share the same stride value in different tensors.
+
+    Only non-unity splits are stored; 1 is the default on the apply side.
+    """
+    skip = lambda v: v <= 1  # noqa: E731
+    output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
+    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
+    reduction_only = {
+        sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
+    }
+    reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
+    return output_splits, reduction_splits
+
+
+def apply_splits_from_index_coeff(
+    coeff_splits: ItSpaceSplits,
+    write_index: sympy.Expr,
+    read_index: sympy.Expr,
     sched_it_space: dict[sympy.Symbol, sympy.Expr],
 ) -> dict[sympy.Symbol, int]:
-    """Reconstruct a scheduler-symbol→split dict from a device_dim→split dict.
+    """Reconstruct a scheduler-symbol→split dict from an ItSpaceSplits pair.
 
-    Convenience wrapper around ``apply_by_device_dim`` with a default of 1.
+    Output dims (non-zero coeff in write_index) are looked up in
+    coeff_splits[0]; reduction dims (zero coeff in write_index) are looked up
+    in coeff_splits[1] via their coefficient in read_index.  Symbols not found
+    in either dict default to 1.
     """
-    return apply_by_device_dim(dim_splits, device_coords, sched_it_space, 1)
+    output_coeff_splits, reduction_coeff_splits = coeff_splits
+    result: dict[sympy.Symbol, int] = {sym: 1 for sym in sched_it_space}
+    for sym, size in sched_it_space.items():
+        if size <= 1:
+            continue
+        wc = write_index.coeff(sym)
+        if wc != 0:
+            if wc in output_coeff_splits:
+                result[sym] = output_coeff_splits[wc]
+        else:
+            rc = read_index.coeff(sym)
+            if rc != 0 and rc in reduction_coeff_splits:
+                result[sym] = reduction_coeff_splits[rc]
+    return result

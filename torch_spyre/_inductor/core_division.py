@@ -39,7 +39,7 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
-    splits_by_device_dim,
+    splits_by_index_coeff,
 )
 from .logging_utils import get_inductor_logger
 from . import config
@@ -346,7 +346,10 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     cores_used = math.prod(splits.values())
 
     if cores_used > 1:
-        op.op_it_space_splits = splits_by_device_dim(splits, output_td.device_coords)
+        first_read_index = next(iter(rw.reads)).index
+        op.op_it_space_splits = splits_by_index_coeff(
+            splits, output_td.dep.index, first_read_index
+        )
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -384,7 +387,10 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
-        op.op_it_space_splits = splits_by_device_dim(splits, output_td.device_coords)
+        first_read_index = next(iter(rw.reads)).index
+        op.op_it_space_splits = splits_by_index_coeff(
+            splits, output_td.dep.index, first_read_index
+        )
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
