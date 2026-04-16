@@ -139,6 +139,15 @@ def test_4arg_at_x_y_bt(tensors_multiarg):
     _compare(lambda a, b, x, y: a.t() + x + y + b.t(), A, B, X, Y)
 
 
+def test_4arg_a_bt_c_d_square():
+    s = 128
+    A = torch.randn((s, s), dtype=torch.float16)
+    B = torch.randn((s, s), dtype=torch.float16)
+    C = torch.randn((s, s), dtype=torch.float16)
+    D = torch.randn((s, s), dtype=torch.float16)
+    _compare(lambda a, b, c, d: a + b.t() + c + d, A, B, C, D)
+
+
 # 3D tests
 SIZES_3D = [(2, 256, 128), (4, 128, 64)]
 
