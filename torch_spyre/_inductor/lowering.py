@@ -478,6 +478,40 @@ def lower_clamp(x, min=None, max=None):
     return pw
 
 
+@register_spyre_lowering(torch.ops.aten.sqrt.default)
+def lower_sqrt(x):
+    """Lower sqrt operation to Spyre FP32 format."""
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper("sqrt")(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.aten.rsqrt.default)
+def lower_rsqrt(x):
+    """Lower rsqrt (reciprocal square root) operation to Spyre FP32 format."""
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper("rsqrt")(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
     from torch._inductor.ir import FlexibleLayout, get_stride_order
