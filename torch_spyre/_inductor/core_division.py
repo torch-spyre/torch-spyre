@@ -221,6 +221,26 @@ def get_per_core_span(
     return itemsize
 
 
+def warn_if_per_core_overflow(
+    tensor_deps: list[TensorDep],
+    it_space_orig: dict[Symbol, Expr],
+    splits: dict[Symbol, int],
+    op_name: str,
+) -> None:
+    """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
+    for td in tensor_deps:
+        per_core_span = get_per_core_span(td, splits, it_space_orig)
+        if per_core_span > MAX_SPAN_BYTES:
+            dl = td.layout.device_layout
+            logger.critical(
+                f"{op_name}: per-core tensor span "
+                f"{per_core_span / (1024 * 1024):.2f} MB "
+                f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
+                f"device_size={list(dl.device_size)}, splits={splits}) "
+                f"exceeds hardware limit of {MAX_SPAN_BYTES / (1024 * 1024):.2f} MB"
+            )
+
+
 def must_split_vars(
     tensor_deps: list[TensorDep],
     it_space_orig: dict[Symbol, Expr],
@@ -497,32 +517,29 @@ def apply_splits(
 
 
 def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
-    if max_cores == 1:
-        return
-
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
 
-    splits, it_space_adjusted, priorities, min_splits = plan_splits(
-        input_tds + [output_td], output_td, it_space, max_cores
-    )
+    splits: dict[Symbol, int] = {}
+    if max_cores > 1:
+        splits, it_space_adjusted, priorities, min_splits = plan_splits(
+            input_tds + [output_td], output_td, it_space, max_cores
+        )
+        apply_splits(
+            op,
+            splits,
+            output_td,
+            it_space,
+            it_space_adjusted,
+            priorities,
+            min_splits,
+            kind="pointwise",
+        )
 
-    apply_splits(
-        op,
-        splits,
-        output_td,
-        it_space,
-        it_space_adjusted,
-        priorities,
-        min_splits,
-        kind="pointwise",
-    )
+    warn_if_per_core_overflow(input_tds + [output_td], it_space, splits, op.get_name())
 
 
 def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
-    if max_cores == 1:
-        return
-
     red: Reduction = op.data
     is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
@@ -532,24 +549,27 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     # FIXME: For non-matmul reduction, excluding reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
     #        https://github.com/torch-spyre/torch-spyre/issues/1304
-    splits, it_space_adjusted, priorities, min_splits = plan_splits(
-        input_tds + [output_td],
-        output_td,
-        it_space,
-        max_cores,
-        exclude_reduction=not is_matmul,
-    )
+    splits: dict[Symbol, int] = {}
+    if max_cores > 1:
+        splits, it_space_adjusted, priorities, min_splits = plan_splits(
+            input_tds + [output_td],
+            output_td,
+            it_space,
+            max_cores,
+            exclude_reduction=not is_matmul,
+        )
+        apply_splits(
+            op,
+            splits,
+            output_td,
+            it_space,
+            it_space_adjusted,
+            priorities,
+            min_splits,
+            kind="reduction",
+        )
 
-    apply_splits(
-        op,
-        splits,
-        output_td,
-        it_space,
-        it_space_adjusted,
-        priorities,
-        min_splits,
-        kind="reduction",
-    )
+    warn_if_per_core_overflow(input_tds + [output_td], it_space, splits, op.get_name())
 
 
 def core_division_planning(
