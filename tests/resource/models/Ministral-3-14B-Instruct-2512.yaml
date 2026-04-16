@@ -553,6 +553,26 @@ cases:
       - constant
     kwmap:
       dim: -1
+  - name: torch.mul.5
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 32, 14, 128]
+          stride: [57344, 1792, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 14, 128]
+          stride: [1792, 1792, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:63 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
+    marks: bf16operation
   - name: torch.add.2
     op: torch.add
     inputs:
@@ -573,7 +593,7 @@ cases:
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:63 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
     marks: bf16operation
-  - name: torch.mul.5
+  - name: torch.mul.6
     op: torch.mul
     inputs:
       - tensor:
@@ -642,6 +662,26 @@ cases:
       - constant
     kwmap:
       dim: -1
+  - name: torch.mul.7
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 14, 128]
+          stride: [14336, 1792, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 14, 128]
+          stride: [1792, 1792, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:64 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
+      * sin)'
+    marks: bf16operation
   - name: torch.add.3
     op: torch.add
     inputs:
@@ -720,7 +760,7 @@ cases:
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:106 in _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1
       + torch.floor(positions_ids / max_position_embeddings))'
     marks: fp32operation
-  - name: torch.mul.6
+  - name: torch.mul.8
     op: torch.mul
     inputs:
       - value: 0.1
@@ -751,7 +791,7 @@ cases:
     marks:
       - fp32operation
       - constant
-  - name: torch.mul.7
+  - name: torch.mul.9
     op: torch.mul
     inputs:
       - tensor:
@@ -1027,7 +1067,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
     marks: bf16operation
-  - name: torch.mul.8
+  - name: torch.mul.10
     op: torch.mul
     inputs:
       - tensor:
@@ -1251,7 +1291,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:336 in forward, code: cos = emb.cos() * self.attention_scaling'
     marks: fp32operation
-  - name: torch.mul.9
+  - name: torch.mul.11
     op: torch.mul
     inputs:
       - tensor:
@@ -1353,7 +1393,7 @@ cases:
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:208 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
     marks: fp32operation
-  - name: torch.mul.10
+  - name: torch.mul.12
     op: torch.mul
     inputs:
       - tensor:
@@ -1373,7 +1413,7 @@ cases:
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:208 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
     marks: fp32operation
-  - name: torch.mul.11
+  - name: torch.mul.13
     op: torch.mul
     inputs:
       - tensor:
@@ -1519,7 +1559,7 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.mul.12
+  - name: torch.mul.14
     op: torch.mul
     inputs:
       - tensor:
@@ -1588,6 +1628,26 @@ cases:
       - constant
     kwmap:
       dim: -1
+  - name: torch.mul.15
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 1, 128]
+          stride: [128, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:63 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
+    marks: bf16operation
   - name: torch.add.7
     op: torch.add
     inputs:
@@ -1608,7 +1668,7 @@ cases:
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:63 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
     marks: bf16operation
-  - name: torch.mul.13
+  - name: torch.mul.16
     op: torch.mul
     inputs:
       - tensor:
@@ -1677,6 +1737,26 @@ cases:
       - constant
     kwmap:
       dim: -1
+  - name: torch.mul.17
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 128]
+          stride: [1024, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 1, 128]
+          stride: [128, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:64 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
+      * sin)'
+    marks: bf16operation
   - name: torch.add.8
     op: torch.add
     inputs:
@@ -1755,7 +1835,7 @@ cases:
     description: 'site-packages/transformers/models/ministral3/modeling_ministral3.py:106 in _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1
       + torch.floor(positions_ids / max_position_embeddings))'
     marks: fp32operation
-  - name: torch.mul.14
+  - name: torch.mul.18
     op: torch.mul
     inputs:
       - value: 0.1
@@ -1786,7 +1866,7 @@ cases:
     marks:
       - fp32operation
       - constant
-  - name: torch.mul.15
+  - name: torch.mul.19
     op: torch.mul
     inputs:
       - tensor:
@@ -1833,6 +1913,37 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+    marks:
+      - bf16operation
+      - constant
+  - name: torch.index_copy_.3
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 2048, 128]
+          stride: [2097152, 262144, 128, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [1]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 2048
+      - tensor:
+          shape: [1, 8, 1, 128]
+          stride: [1024, 128, 1024, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/cache_utils.py:341 in update, code: self.values.index_copy_(2, cache_position, value_states)'
     marks:
       - bf16operation
       - constant
@@ -2001,7 +2112,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
     marks: bf16operation
-  - name: torch.mul.16
+  - name: torch.mul.20
     op: torch.mul
     inputs:
       - tensor:
@@ -2055,6 +2166,29 @@ cases:
           device: cuda:0
           init: rand
       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:466 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
+      :])'
+    marks:
+      - bf16operation
+      - constant
+  - name: torch.nn.functional.linear.12
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 5120]
+          stride: [5120, 5120, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [131072, 5120]
+          stride: [5120, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: null
     description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:466 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
       :])'
     marks:

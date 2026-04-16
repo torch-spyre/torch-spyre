@@ -590,6 +590,25 @@ cases:
     marks: constant
     kwmap:
       dim: -1
+  - name: torch.mul.5_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 16, 1064, 64]
+          stride: [1089536, 68096, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1064, 64]
+          stride: [68096, 64, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/pixtral/modeling_pixtral.py:164 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
   - name: torch.add.3_spyre
     op: torch.add
     inputs:
@@ -741,7 +760,7 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
-  - name: torch.mul.5_spyre
+  - name: torch.mul.6_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -849,7 +868,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:54 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
-  - name: torch.mul.6_spyre
+  - name: torch.mul.7_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -868,7 +887,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:54 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
-  - name: torch.mul.7_spyre
+  - name: torch.mul.8_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -934,7 +953,23 @@ cases:
     description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:77 in forward, code: (image_size[0] // self.patch_size, image_size[1]
       // self.patch_size) for image_size in image_sizes'
     marks: constant
-  - name: torch.mul.8
+  - name: torch.floordiv.2_spyre
+    op: torch.floordiv
+    inputs:
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 1
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: 14
+    description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:77 in forward, code: (image_size[0] // self.patch_size, image_size[1]
+      // self.patch_size) for image_size in image_sizes'
+    marks: constant
+  - name: torch.mul.9
     op: torch.mul
     inputs:
       - tensor:
@@ -1023,7 +1058,7 @@ cases:
       device=image_features.device) // downsample_ratio).prod(dim=-1).tolist()'
     kwmap:
       device: cuda:0
-  - name: torch.floordiv.2_spyre
+  - name: torch.floordiv.3_spyre
     op: torch.floordiv
     inputs:
       - tensor:
@@ -1362,7 +1397,7 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:326 in forward, code: cos = emb.cos() * self.attention_scaling'
-  - name: torch.mul.9_spyre
+  - name: torch.mul.10_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -1459,7 +1494,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:198 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
-  - name: torch.mul.10_spyre
+  - name: torch.mul.11_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -1478,7 +1513,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:198 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
-  - name: torch.mul.11_spyre
+  - name: torch.mul.12_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -1609,7 +1644,7 @@ cases:
       - value: 1
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:77 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
     marks: constant
-  - name: torch.mul.12_spyre
+  - name: torch.mul.13_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -1672,6 +1707,25 @@ cases:
     marks: constant
     kwmap:
       dim: -1
+  - name: torch.mul.14_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 32, 855, 128]
+          stride: [3502080, 109440, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 855, 128]
+          stride: [109440, 109440, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/mistral/modeling_mistral.py:79 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
   - name: torch.add.7_spyre
     op: torch.add
     inputs:
@@ -1691,7 +1745,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:79 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
-  - name: torch.mul.13_spyre
+  - name: torch.mul.15_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -1754,6 +1808,25 @@ cases:
     marks: constant
     kwmap:
       dim: -1
+  - name: torch.mul.16_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 855, 128]
+          stride: [875520, 109440, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 855, 128]
+          stride: [109440, 109440, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/mistral/modeling_mistral.py:80 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
+      * sin)'
   - name: torch.add.8_spyre
     op: torch.add
     inputs:
@@ -2007,7 +2080,7 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
-  - name: torch.mul.14_spyre
+  - name: torch.mul.17_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2213,7 +2286,7 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:326 in forward, code: cos = emb.cos() * self.attention_scaling'
-  - name: torch.mul.15_spyre
+  - name: torch.mul.18_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2304,7 +2377,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:198 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
-  - name: torch.mul.16_spyre
+  - name: torch.mul.19_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2323,7 +2396,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:198 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
-  - name: torch.mul.17_spyre
+  - name: torch.mul.20_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2454,7 +2527,7 @@ cases:
       - value: 1
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:77 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
     marks: constant
-  - name: torch.mul.18_spyre
+  - name: torch.mul.21_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2517,6 +2590,25 @@ cases:
     marks: constant
     kwmap:
       dim: -1
+  - name: torch.mul.22_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          stride: [4096, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 1, 128]
+          stride: [128, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/mistral/modeling_mistral.py:79 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
+      * sin)'
   - name: torch.add.11_spyre
     op: torch.add
     inputs:
@@ -2536,7 +2628,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:79 in apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q)
       * sin)'
-  - name: torch.mul.19_spyre
+  - name: torch.mul.23_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2599,6 +2691,25 @@ cases:
     marks: constant
     kwmap:
       dim: -1
+  - name: torch.mul.24_spyre
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 128]
+          stride: [1024, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 1, 128]
+          stride: [128, 128, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/mistral/modeling_mistral.py:80 in apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k)
+      * sin)'
   - name: torch.add.12_spyre
     op: torch.add
     inputs:
@@ -2646,6 +2757,35 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+    marks: constant
+  - name: torch.index_copy_.3_spyre
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 2048, 128]
+          stride: [2097152, 262144, 128, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [1]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 2048
+      - tensor:
+          shape: [1, 8, 1, 128]
+          stride: [1024, 128, 1024, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/cache_utils.py:341 in update, code: self.values.index_copy_(2, cache_position, value_states)'
     marks: constant
   - name: torch.nn.functional.scaled_dot_product_attention.3_spyre
     op: torch.nn.functional.scaled_dot_product_attention
@@ -2797,7 +2937,7 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/activations.py:103 in forward, code: return nn.functional.silu(input)'
-  - name: torch.mul.20_spyre
+  - name: torch.mul.25_spyre
     op: torch.mul
     inputs:
       - tensor:
@@ -2848,6 +2988,27 @@ cases:
           device: cuda:0
           init: rand
       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:466 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
+      :])'
+    marks: constant
+  - name: torch.nn.functional.linear.17_spyre
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 5120]
+          stride: [5120, 5120, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [131072, 5120]
+          stride: [5120, 1]
+          storage_offset: 0
+          dtype: torch.float16
+          device: cuda:0
+          init: rand
+      - value: null
     description: 'site-packages/transformers/models/mistral3/modeling_mistral3.py:466 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
       :])'
     marks: constant

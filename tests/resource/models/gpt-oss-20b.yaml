@@ -509,6 +509,26 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos - second_half
       * sin'
     marks: bf16operation
+  - name: torch.mul.5
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 64, 11, 32]
+          stride: [45056, 64, 4096, 1]
+          storage_offset: 32
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 11, 32]
+          stride: [352, 11, 1, 11]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos - second_half
+      * sin'
+    marks: bf16operation
   - name: torch.sub.1
     op: torch.sub
     inputs:
@@ -611,13 +631,33 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.mul.5
+  - name: torch.mul.6
     op: torch.mul
     inputs:
       - tensor:
           shape: [1, 8, 11, 32]
           stride: [5632, 64, 512, 1]
           storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 11, 32]
+          stride: [352, 11, 1, 11]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos - second_half
+      * sin'
+    marks: bf16operation
+  - name: torch.mul.7
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 11, 32]
+          stride: [5632, 64, 512, 1]
+          storage_offset: 32
           dtype: torch.bfloat16
           device: cuda:0
           init: rand
@@ -733,6 +773,37 @@ cases:
     marks:
       - bf16operation
       - constant
+  - name: torch.index_copy_.2
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 128, 64]
+          stride: [65536, 8192, 64, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [11]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 128
+      - tensor:
+          shape: [1, 8, 11, 64]
+          stride: [5632, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/cache_utils.py:452 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+    marks:
+      - bf16operation
+      - constant
   - name: torch.getitem.5
     op: torch.getitem
     inputs:
@@ -822,7 +893,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
       key_states.transpose(2, 3)) * scaling'
     marks: bf16operation
-  - name: torch.mul.6
+  - name: torch.mul.8
     op: torch.mul
     inputs:
       - tensor:
@@ -1313,6 +1384,21 @@ cases:
     marks:
       - bf16operation
       - constant
+  - name: torch.reshape.7
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [11, 4]
+          stride: [4, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: (-1,)
+    description: 'site-packages/transformers/integrations/moe.py:117 in batched_mm_experts_forward, code: expert_ids = top_k_index.reshape(-1)  # (S,)'
+    marks: constant
   - name: torch.lt.1
     op: torch.lt
     inputs:
@@ -1560,7 +1646,7 @@ cases:
     kwmap:
       min: -7.0
       max: 7.0
-  - name: torch.mul.7
+  - name: torch.mul.9
     op: torch.mul
     inputs:
       - tensor:
@@ -1587,7 +1673,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate * self.alpha)'
     marks: bf16operation
-  - name: torch.mul.8
+  - name: torch.mul.10
     op: torch.mul
     inputs:
       - tensor:
@@ -1690,7 +1776,7 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.mul.9
+  - name: torch.mul.11
     op: torch.mul
     inputs:
       - tensor:
@@ -1755,7 +1841,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: 1
-  - name: torch.reshape.7
+  - name: torch.reshape.8
     op: torch.reshape
     inputs:
       - tensor:
@@ -1780,7 +1866,7 @@ cases:
     kwmap:
       dtype: torch.float16
       device: cuda:0
-  - name: torch.index_copy_.2
+  - name: torch.index_copy_.3
     op: torch.index_copy_
     inputs:
       - tensor:
@@ -1808,6 +1894,37 @@ cases:
           device: cuda:0
           init: rand
     description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+    marks:
+      - bf16operation
+      - constant
+  - name: torch.index_copy_.4
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 2048, 64]
+          stride: [1048576, 131072, 64, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [11]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 2048
+      - tensor:
+          shape: [1, 8, 11, 64]
+          stride: [5632, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/cache_utils.py:341 in update, code: self.values.index_copy_(2, cache_position, value_states)'
     marks:
       - bf16operation
       - constant
@@ -1847,7 +1964,7 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.reshape.8
+  - name: torch.reshape.9
     op: torch.reshape
     inputs:
       - tensor:
@@ -1900,7 +2017,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
       key_states.transpose(2, 3)) * scaling'
     marks: bf16operation
-  - name: torch.mul.10
+  - name: torch.mul.12
     op: torch.mul
     inputs:
       - tensor:
@@ -2217,7 +2334,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:208 in forward, code: cos = emb.cos() * self.attention_scaling'
     marks: fp32operation
-  - name: torch.mul.11
+  - name: torch.mul.13
     op: torch.mul
     inputs:
       - tensor:
@@ -2305,7 +2422,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
     marks: fp32operation
-  - name: torch.mul.12
+  - name: torch.mul.14
     op: torch.mul
     inputs:
       - tensor:
@@ -2325,7 +2442,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
       + self.variance_epsilon)'
     marks: fp32operation
-  - name: torch.mul.13
+  - name: torch.mul.15
     op: torch.mul
     inputs:
       - tensor:
@@ -2520,13 +2637,33 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.mul.14
+  - name: torch.mul.16
     op: torch.mul
     inputs:
       - tensor:
           shape: [1, 64, 1, 32]
           stride: [4096, 64, 4096, 1]
           storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 1, 32]
+          stride: [32, 32, 32, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos - second_half
+      * sin'
+    marks: bf16operation
+  - name: torch.mul.17
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 64, 1, 32]
+          stride: [4096, 64, 4096, 1]
+          storage_offset: 32
           dtype: torch.bfloat16
           device: cuda:0
           init: rand
@@ -2642,13 +2779,33 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.mul.15
+  - name: torch.mul.18
     op: torch.mul
     inputs:
       - tensor:
           shape: [1, 8, 1, 32]
           stride: [512, 64, 512, 1]
           storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [1, 1, 1, 32]
+          stride: [32, 32, 32, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos - second_half
+      * sin'
+    marks: bf16operation
+  - name: torch.mul.19
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 32]
+          stride: [512, 64, 512, 1]
+          storage_offset: 32
           dtype: torch.bfloat16
           device: cuda:0
           init: rand
@@ -2724,7 +2881,7 @@ cases:
       - constant
     kwmap:
       dim: -1
-  - name: torch.index_copy_.3
+  - name: torch.index_copy_.5
     op: torch.index_copy_
     inputs:
       - tensor:
@@ -2755,6 +2912,37 @@ cases:
     marks:
       - bf16operation
       - constant
+  - name: torch.index_copy_.6
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 128, 64]
+          stride: [65536, 8192, 64, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [1]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 128
+      - tensor:
+          shape: [1, 8, 1, 64]
+          stride: [512, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/cache_utils.py:452 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+    marks:
+      - bf16operation
+      - constant
   - name: torch.matmul.7
     op: torch.matmul
     inputs:
@@ -2775,7 +2963,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
       key_states.transpose(2, 3)) * scaling'
     marks: bf16operation
-  - name: torch.mul.16
+  - name: torch.mul.20
     op: torch.mul
     inputs:
       - tensor:
@@ -2987,7 +3175,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:272 in eager_attention_forward, code: attn_output = attn_output.transpose(1,
       2).contiguous()'
     marks: bf16operation
-  - name: torch.reshape.9
+  - name: torch.reshape.10
     op: torch.reshape
     inputs:
       - tensor:
@@ -3059,7 +3247,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:384 in forward, code: hidden_states = residual + hidden_states'
     marks: bf16operation
-  - name: torch.reshape.10
+  - name: torch.reshape.11
     op: torch.reshape
     inputs:
       - tensor:
@@ -3190,7 +3378,7 @@ cases:
     description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1,
       num_top_k).reshape(-1)  # (S,)'
     marks: constant
-  - name: torch.reshape.11
+  - name: torch.reshape.12
     op: torch.reshape
     inputs:
       - tensor:
@@ -3206,7 +3394,7 @@ cases:
     description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1,
       num_top_k).reshape(-1)  # (S,)'
     marks: constant
-  - name: torch.reshape.12
+  - name: torch.reshape.13
     op: torch.reshape
     inputs:
       - tensor:
@@ -3222,6 +3410,21 @@ cases:
     marks:
       - bf16operation
       - constant
+  - name: torch.reshape.14
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 4]
+          stride: [4, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 1000
+      - value: (-1,)
+    description: 'site-packages/transformers/integrations/moe.py:117 in batched_mm_experts_forward, code: expert_ids = top_k_index.reshape(-1)  # (S,)'
+    marks: constant
   - name: torch.lt.2
     op: torch.lt
     inputs:
@@ -3469,7 +3672,7 @@ cases:
     kwmap:
       min: -7.0
       max: 7.0
-  - name: torch.mul.17
+  - name: torch.mul.21
     op: torch.mul
     inputs:
       - tensor:
@@ -3496,7 +3699,7 @@ cases:
           init: rand
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate * self.alpha)'
     marks: bf16operation
-  - name: torch.mul.18
+  - name: torch.mul.22
     op: torch.mul
     inputs:
       - tensor:
@@ -3599,7 +3802,7 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.mul.19
+  - name: torch.mul.23
     op: torch.mul
     inputs:
       - tensor:
@@ -3664,7 +3867,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: 1
-  - name: torch.reshape.13
+  - name: torch.reshape.15
     op: torch.reshape
     inputs:
       - tensor:
@@ -3680,7 +3883,7 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: torch.index_copy_.4
+  - name: torch.index_copy_.7
     op: torch.index_copy_
     inputs:
       - tensor:
@@ -3711,6 +3914,37 @@ cases:
     marks:
       - bf16operation
       - constant
+  - name: torch.index_copy_.8
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 2048, 64]
+          stride: [1048576, 131072, 64, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [1]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda:0
+          init: randint
+          init_args:
+            high: 2048
+      - tensor:
+          shape: [1, 8, 1, 64]
+          stride: [512, 64, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+    description: 'site-packages/transformers/cache_utils.py:341 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+    marks:
+      - bf16operation
+      - constant
   - name: torch.matmul.9
     op: torch.matmul
     inputs:
@@ -3731,7 +3965,7 @@ cases:
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
       key_states.transpose(2, 3)) * scaling'
     marks: bf16operation
-  - name: torch.mul.20
+  - name: torch.mul.24
     op: torch.mul
     inputs:
       - tensor:
@@ -3902,6 +4136,29 @@ cases:
           device: cuda:0
           init: rand
       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:675 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
+      :])'
+    marks:
+      - bf16operation
+      - constant
+  - name: torch.nn.functional.linear.10
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 2880]
+          stride: [2880, 2880, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - tensor:
+          shape: [201088, 2880]
+          stride: [2880, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda:0
+          init: rand
+      - value: null
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:675 in forward, code: logits = self.lm_head(hidden_states[:, slice_indices,
       :])'
     marks:
