@@ -7,6 +7,22 @@ from utils_inductor import (
     cached_randn,
 )
 
+from torch._dynamo.testing import (
+    InductorAndRecordGraphs,
+    normalize_gm,
+)
+import torch._inductor.config as config
+
+def run_inject_test_pass(target_fn, pass_fn, pass_class, args):
+    config.force_disable_caches = True
+    torch.compiler.reset()
+    backend = InductorAndRecordGraphs()
+
+    pass_class.passes.append(pass_fn)
+    cmp = torch.compile(target_fn, backend=backend)
+    cmp(*args)
+    pass_class.passes.pop()
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)
 
@@ -25,20 +41,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_matmul_padding(self, x: torch.Tensor, y: torch.Tensor):
 
-        from torch._dynamo.testing import (
-            InductorAndRecordGraphs,
-            normalize_gm,
-        )
-
-        import torch._inductor.config as config
-        config.force_disable_caches = True
-        torch.compiler.reset()
-        backend = InductorAndRecordGraphs()
-
         def test(x, y):
             return torch.matmul(x, y)
 
-        def fn(graph: torch.fx.Graph) -> None:
+        def test_pass(graph: torch.fx.Graph) -> None:
             print("Hi from Custom pass")
 
             for node in list(graph.nodes):
@@ -67,35 +73,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         "Expected 1st dimension of arg1 to have been padded"
                     )
 
-        # this doesn't seem to work
-        # with torch._inductor.config.patch(pre_grad_custom_pass=fn):
-        #     cmp = torch.compile(test, backend=backend)
-        #     cmp(x, y)
-
         from torch_spyre._inductor.passes import CustomPreGradPasses
 
-        # a bit ugly, convert into context manager
-        CustomPreGradPasses.passes.append(fn)
-        # core logic that should always exist
-        cmp = torch.compile(test, backend=backend)
-        cmp(x, y)
-        # convert into context manager
-        CustomPreGradPasses.passes.pop()
-
-        inductor_graph_str = normalize_gm(
-            backend.inductor_graphs[0].print_readable(print_output=False)
-        )
-
-        # examine the full output if needed
-        # print(inductor_graph_str)
-
-        # one loose option is to check for properties here
-        # !!! HARDCODED - CHANGE THIS !!!
-        # but this doesn't work with the way we have parameterized this function
-        assert "[10, 64]" in inductor_graph_str, (
-            "Expected 2nd dimension of arg0 to have been padded"
-        )
-
-        assert "[64, 20]" in inductor_graph_str, (
-            "Expected 1st dimension of arg1 to have been padded"
-        )
+        run_inject_test_pass(test,
+                             test_pass,
+                             CustomPreGradPasses,
+                             [x, y])
