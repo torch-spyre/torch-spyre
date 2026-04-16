@@ -16,7 +16,12 @@ from typing import NamedTuple
 
 
 import sympy
-from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    Pointwise,
+    Reduction,
+)
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
