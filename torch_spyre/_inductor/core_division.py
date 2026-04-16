@@ -346,10 +346,10 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     cores_used = math.prod(splits.values())
 
     if cores_used > 1:
-        first_read_index = next(iter(rw.reads)).index
-        op.op_it_space_splits = splits_by_index_coeff(
-            splits, output_td.dep.index, first_read_index
-        )
+        write_index = output_td.dep.index
+        first_read = next(iter(rw.reads), None)
+        read_index = first_read.index if first_read is not None else write_index
+        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -387,10 +387,10 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 
     cores_used = math.prod(splits.values())
     if cores_used > 1:
-        first_read_index = next(iter(rw.reads)).index
-        op.op_it_space_splits = splits_by_index_coeff(
-            splits, output_td.dep.index, first_read_index
-        )
+        write_index = output_td.dep.index
+        first_read = next(iter(rw.reads), None)
+        read_index = first_read.index if first_read is not None else write_index
+        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

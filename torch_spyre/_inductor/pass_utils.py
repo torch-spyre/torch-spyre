@@ -130,42 +130,6 @@ def _coeff_splits_from_index(
     return result
 
 
-def _apply_coeff_splits(
-    coeff_values: dict[sympy.Expr, _V],
-    index: sympy.Expr,
-    sched_it_space: dict[sympy.Symbol, sympy.Expr],
-    default: _V,
-    *,
-    only_in_index: bool,
-) -> dict[sympy.Symbol, _V]:
-    """Reconstruct a symbol→value dict from a coeff→value dict.
-
-    For each scheduler symbol whose coefficient in index is non-zero and
-    appears in coeff_values, the stored value is applied.  All other symbols
-    receive default.
-
-    ``only_in_index``: when True, only symbols that appear in index (coeff!=0)
-    are eligible — used for output dims (write dep) so that reduction dims,
-    which are absent from the write dep, fall through to be handled separately.
-    When False, symbols absent from index are also eligible — not currently used
-    but keeps the helper general.
-
-    Symbols with size <= 1 are always skipped: a size-1 dim shares its stride
-    with the adjacent real dim, making its coefficient non-unique.
-    """
-    result: dict[sympy.Symbol, _V] = {sym: default for sym in sched_it_space}
-    for sym, size in sched_it_space.items():
-        if size <= 1:
-            continue
-        coeff = index.coeff(sym)
-        if coeff == 0:
-            if only_in_index:
-                continue
-        elif coeff in coeff_values:
-            result[sym] = coeff_values[coeff]
-    return result
-
-
 def splits_by_index_coeff(
     splits: dict[sympy.Symbol, int],
     write_index: sympy.Expr,
