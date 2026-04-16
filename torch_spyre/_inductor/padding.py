@@ -56,12 +56,11 @@ def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) ->
 
 
 def insert_padding(graph: torch.fx.Graph) -> None:
+    # This pass runs pre-grad, so we have to detect both call_function and call_method variants
+    # If we ever move it to run post-grad, we need to change this to use aten.bmm.default, etc.
+    matmul_ops = {torch.matmul, torch.mm, torch.bmm, "matmul", "mm", "bmm"}
     for node in list(graph.nodes):
-        if node.op == "call_function" and node.target in [
-            torch.matmul,
-            torch.mm,
-            torch.bmm,
-        ]:
+        if node.op in ("call_function", "call_method") and node.target in matmul_ops:
             args = node.args
             if not all(isinstance(arg, torch.fx.Node) for arg in args):
                 continue
