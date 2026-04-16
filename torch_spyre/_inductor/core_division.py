@@ -15,7 +15,8 @@
 
 import dataclasses
 import math
-from sympy import Expr, Symbol
+import itertools
+from sympy import Expr, Symbol, divisors
 
 import torch
 from torch._inductor.ir import (
@@ -49,7 +50,6 @@ logger = get_inductor_logger("core_division")
 
 # Maximum memory access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
-MAX_SPAN_STICKS = MAX_SPAN_BYTES // 128
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -144,8 +144,11 @@ def multi_dim_iteration_space_split(
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
-) -> None:
-    """Adjust iteration space sizes to count sticks rather than elements.
+) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
+    """
+    Return a copy of it_space with stick variables converted from elements to
+    sticks, plus a dict mapping each stick variable to its max element per stick
+    value.
 
     For each tensor, find the variable that indexes its stick dimension and
     convert its size in it_space from elements to sticks. This ensures core
@@ -155,15 +158,18 @@ def adjust_it_space_for_sticks(
     input and an int64 argmax output), the largest elems_per_stick is used
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
     fewer cores assigned to the stick dimension).
+
+    The original it_space is not mutated.
     """
     # Pass 1: find the largest elems_per_stick per stick variable.
+    adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
             continue
         stick_var = next(iter(stick_expr.free_symbols))
-        if stick_var not in it_space:
+        if stick_var not in adjusted_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
@@ -174,124 +180,196 @@ def adjust_it_space_for_sticks(
         # FIXME: here we assume padding to a full stick. It may not always be
         #        the case and we should use a more robust way of computing the
         #        number of sticks
-        it_space[stick_var] = (
-            it_space[stick_var] + elems_per_stick - 1
+        adjusted_space[stick_var] = (
+            adjusted_space[stick_var] + elems_per_stick - 1
         ) // elems_per_stick
+
+    return adjusted_space, max_elems
+
+
+def get_per_core_span(
+    td: TensorDep,
+    splits: dict[Symbol, int],
+    it_space_orig: dict[Symbol, Expr],
+) -> int:
+    """Compute per-core memory span in bytes for a tensor under the given splits.
+
+    coordinate expressions from compute_coordinates() in views.py are sums of
+    independent single-variable terms, so max of the full expression equals the
+    sum of per-variable maxima obtained by zeroing out all other variables.
+    min is always 0 since all variables start at 0. If this invariant in
+    compute_coordinates() ever changes, this logic must be revisited.
+
+    it_space_orig must be the original element-valued ranges, not the
+    stick-adjusted copy, because device coordinate expressions are written in
+    terms of element indices.
+    """
+    device_size = td.layout.device_layout.device_size
+    itemsize = td.layout.dtype.itemsize
+    for d, coord in enumerate(td.device_coords[:-1]):
+        if not coord.free_symbols:
+            continue
+        per_core_max = 0
+        for v in coord.free_symbols:
+            term = coord.subs({u: 0 for u in coord.free_symbols - {v}})
+            R = it_space_orig[v] // splits.get(v, 1)
+            per_core_max += int(term.subs(v, R - 1))
+        per_core_size = per_core_max + 1
+        if per_core_size > 1:
+            stride_elems = math.prod(device_size[d + 1 :])
+            return per_core_size * stride_elems * itemsize
+    return itemsize
 
 
 def must_split_vars(
-    tensor_deps: list[TensorDep] | None,
+    tensor_deps: list[TensorDep],
+    it_space_orig: dict[Symbol, Expr],
     it_space_adjusted: dict[Symbol, Expr],
+    stick_vars: dict[Symbol, int],
+    max_cores: int,
 ) -> dict[Symbol, int]:
-    """Return the minimum splits required per iteration variable to keep each
-    tensor's memory span within MAX_SPAN_STICKS.
+    """Return the minimum splits per iteration variable to keep each tensor's
+    memory span within MAX_SPAN_BYTES.
 
-    For each violating tensor, finds the outermost non-size-1 device dimension
-    (row-major layout means outer dims have larger strides and splitting them
-    reduces contiguous span). The minimum split is rounded up to the nearest
-    divisor of the stick-adjusted iteration space size so each core gets an
-    equal integer-sized slice.
+    Processes tensors one at a time, carrying accumulated_splits forward so
+    splits committed for one tensor reduce the search space for subsequent ones.
+    For each violating tensor, iterates device dimensions outer to inner and
+    searches for the joint split combination (Cartesian product over contributing
+    variables) that brings the span closest to (but not exceeding) MAX_SPAN_BYTES.
+    If no combo satisfies the limit, picks the one that minimizes the span.
+    Gives up on a dimension when the committed splits still leave it evaluating
+    to > 1, meaning inner dimensions cannot reduce the span further.
 
-    Returns a dict mapping Symbol -> minimum split count, guaranteed to evenly
-    divide the corresponding entry in it_space_adjusted.
+    Args:
+        tensor_deps: List of tensor dependencies to check
+        it_space_orig: Original iteration space (element-valued)
+        it_space_adjusted: Adjusted iteration space (stick-valued for stick vars)
+        stick_vars: Mapping of stick variables to elements per stick
+        max_cores: Maximum number of cores available
+
+    Returns a dict mapping Symbol -> number of slices.
     """
-    if tensor_deps is None:
-        return {}
-    result: dict[Symbol, int] = {}
+    accumulated_splits: dict[Symbol, int] = {}
+
     for td in tensor_deps:
-        total_sticks = math.prod(td.layout.device_layout.device_size[:-1])
-        if total_sticks <= MAX_SPAN_STICKS:
+        if get_per_core_span(td, accumulated_splits, it_space_orig) <= MAX_SPAN_BYTES:
             continue
 
         for coord in td.device_coords[:-1]:
-            vars_ = coord.free_symbols
-            if not vars_:
-                continue  # skipping empty set (is it safe to assume no constant value > 1)?
-            assert len(vars_) == 1, (
-                f"Expected exactly 1 free symbol in device coord {coord!r}, got {vars_}."
-            )
-            var = next(iter(vars_))
-            if var not in it_space_adjusted:
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "must_split_vars: coord %s has var %s not in it_space_adjusted — skipping tensor",
-                        coord,
-                        var,
-                    )
-                break  # variable not in adjusted space, can't split this tensor
-            adjusted_size = it_space_adjusted[var]
-            if adjusted_size == 1:
+            vars = [v for v in coord.free_symbols if it_space_orig.get(v, 1) > 1]
+            if not vars:
                 continue
-            min_split_raw = math.ceil(total_sticks / MAX_SPAN_STICKS)
-            min_split = next(
-                (
-                    d
-                    for d in range(min_split_raw, adjusted_size + 1)
-                    if adjusted_size % d == 0
-                ),
-                adjusted_size,
-            )
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "must_split_vars: coord=%s var=%s adjusted_size=%d "
-                    "total_sticks=%d min_split_raw=%d min_split=%d",
-                    coord,
-                    var,
-                    adjusted_size,
-                    total_sticks,
-                    min_split_raw,
-                    min_split,
-                )
-            if min_split == adjusted_size and adjusted_size < min_split_raw:
-                logger.warning(
-                    f"Cannot fully satisfy span limit for {vars_} "
-                    f"(adjusted_size={adjusted_size}, need {min_split_raw} splits): "
-                    f"using full split of {adjusted_size}."
-                )
-            for var in vars_:
-                result[var] = max(result.get(var, 1), min_split)
-            break
 
-    return result
+            def valid_splits(v: Symbol) -> list[int]:
+                current_min = accumulated_splits.get(v, 1)
+                if v in stick_vars:
+                    stick_count = int(it_space_adjusted[v])
+                    return [s for s in divisors(stick_count) if s >= current_min]
+                return [s for s in divisors(int(it_space_orig[v])) if s >= current_min]
+
+            var_divisors = [valid_splits(v) for v in vars]
+
+            for v, candidates in zip(vars, var_divisors):
+                if not candidates:
+                    raise Unsupported(
+                        f"No valid split for variable {v} "
+                        f"(orig_size={int(it_space_orig[v])}, "
+                        f"min_required={accumulated_splits.get(v, 1)}) "
+                        f"for tensor {td.dep.name}."
+                    )
+
+            # NOTE: Exhaustive search of all combinations. It's probably ok
+            #       assuming the search space is small. Can revisit if this
+            #       becomes a bottleneck.
+            #
+            # Two-tier selection by span value:
+            #   - Within-limit combos: prefer largest span (= fewest cores used)
+            #   - Above-limit combos: prefer smallest span (= most progress)
+            best_within: tuple[int, tuple] | None = None  # (span, combo)
+            best_above: tuple[int, tuple] | None = None  # (span, combo)
+
+            for combo in itertools.product(*var_divisors):
+                trial = dict(accumulated_splits)
+                for v, s in zip(vars, combo):
+                    trial[v] = s
+
+                if math.prod(trial.values()) > max_cores:
+                    continue
+
+                span = get_per_core_span(td, trial, it_space_orig)
+
+                if span <= MAX_SPAN_BYTES:
+                    if best_within is None or span > best_within[0]:
+                        best_within = (span, combo)
+                else:
+                    if best_above is None or span < best_above[0]:
+                        best_above = (span, combo)
+
+            # Prefer within-limit; fall back to best partial progress
+            best = best_within or best_above
+
+            if best is None:
+                logger.warning(
+                    f"No valid split combo found for tensor {td.dep.name} "
+                    f"coord={coord} under accumulated_splits={accumulated_splits}. "
+                    f"Skipping."
+                )
+                break
+
+            best_span, best_combo = best
+            for v, s in zip(vars, best_combo):
+                accumulated_splits[v] = s
+
+            if best_span <= MAX_SPAN_BYTES:
+                break
+
+            # Still above the limit. If this coord still evaluates to > 1 under
+            # the committed splits, inner dimensions cannot reduce the span further.
+            per_core_coord_size = (
+                max(
+                    int(
+                        coord.subs(
+                            {
+                                v: it_space_orig[v] // accumulated_splits.get(v, 1) - 1
+                                for v in coord.free_symbols
+                            }
+                        )
+                    ),
+                    0,
+                )
+                + 1
+            )
+            if per_core_coord_size > 1:
+                logger.warning(
+                    f"Cannot satisfy span limit for tensor {td.dep.name}: "
+                    f"coord={coord} still evaluates to {per_core_coord_size} after splits. "
+                    f"Inner dimensions cannot reduce span further. "
+                    f"Best span={best_span}, limit={MAX_SPAN_BYTES}."
+                )
+                break
+
+    return accumulated_splits
 
 
 def prioritize_dimensions(
     output: TensorDep,
-    it_space: dict[Symbol, Expr],
-    inputs: list[TensorDep] | None = None,
+    it_space_adjusted: dict[Symbol, Expr],
     exclude_reduction: bool = False,
-) -> tuple[list[Symbol], dict[Symbol, int]]:
-    """
-    Return iteration variables in priority order for core division, along with
-    minimum split requirements.
+) -> list[Symbol]:
+    """Return iteration variables in priority order for core division.
+
+    Variables already committed as min_splits should be filtered out of
+    it_space_adjusted before calling this function.
 
     Priority tiers:
-      1. Must-split vars: outermost dims of tensors that violate MAX_SPAN_BYTES.
-         Splitting these is required to bring memory span within hardware limits.
-      2. Remaining output dims (present in output coords), by decreasing size.
-      3. Reduction dims (absent from output coords), by decreasing size.
-
-    Returns:
-        tuple of (priority list, min_splits dict)
+      1. Output dims (present in output device coords), by decreasing size.
+      2. Reduction dims (absent from output coords), by decreasing size.
     """
-    # Collect free symbols from all output device coords except the stick dim.
-    # The stick dim is always the innermost device dimension and shares its host
-    # dimension with an outer coord, so its free symbol is already captured here.
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
-    all_deps = (inputs + [output]) if inputs is not None else [output]
-    # NOTE: it is possible that a reduction var is selected as must split
-    min_splits = must_split_vars(all_deps, it_space)
-
-    priority = []
     remaining_output = []
     reduction_dims: list[tuple[Symbol, Expr]] = []
-    for s, e in it_space.items():
-        if s in min_splits:
-            assert not exclude_reduction or s in coord_vars, (
-                f"Excluding reduction dimensions but {s} must be split"
-            )
-            continue
+    for s, e in it_space_adjusted.items():
         if s in coord_vars:
             remaining_output.append((s, e))
         else:
@@ -299,11 +377,62 @@ def prioritize_dimensions(
 
     remaining_output.sort(key=lambda t: t[1], reverse=True)
     reduction_dims.sort(key=lambda t: t[1], reverse=True)
-    priority += [t[0] for t in remaining_output]
+
+    priority = [t[0] for t in remaining_output]
     if not exclude_reduction:
         priority += [t[0] for t in reduction_dims]
 
-    return priority, min_splits
+    return priority
+
+
+def plan_splits(
+    all_tds: list[TensorDep],
+    output_td: TensorDep,
+    it_space: dict[Symbol, Expr],
+    max_cores: int,
+    exclude_reduction: bool = False,
+) -> tuple[dict[Symbol, int], dict[Symbol, Expr], list[Symbol], dict[Symbol, int]]:
+    """Compute core splits for an op's iteration space.
+
+    Returns (splits, it_space_adjusted, priorities, min_splits).
+
+    When exclude_reduction is True, asserts that no reduction variable appears
+    in min_splits — callers are responsible for only passing exclude_reduction=True
+    when the backend supports it.
+    """
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+
+    # 1. Determine the minimum splits required to keep each tensor's memory
+    #    span within the hardware limit.
+    min_splits = must_split_vars(
+        all_tds, it_space, it_space_adjusted, stick_vars, max_cores
+    )
+
+    if exclude_reduction:
+        coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+        reduction_vars_to_split = set(min_splits) - coord_vars
+        if reduction_vars_to_split:
+            raise Unsupported(
+                f"Cannot satisfy hardware memory span limit "
+                f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting reduction"
+                f"dimensions {reduction_vars_to_split}, but the backend does not "
+                f"support splitting reduction dimensions for this operation type."
+            )
+
+    # 2. Among the remaining dimensions, decide the priority order for
+    #    distributing leftover cores.
+    it_space_remaining = {
+        s: e for s, e in it_space_adjusted.items() if s not in min_splits
+    }
+    priorities = prioritize_dimensions(
+        output_td, it_space_remaining, exclude_reduction=exclude_reduction
+    )
+
+    # 3. Assign cores: satisfy min_splits first, then fill by priority.
+    splits = multi_dim_iteration_space_split(
+        it_space_adjusted, max_cores, priorities, min_splits
+    )
+    return splits, it_space_adjusted, priorities, min_splits
 
 
 def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
@@ -323,40 +452,71 @@ def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     return layout
 
 
+def collect_tensor_deps(
+    op: ComputedBuffer, args: list[SchedNodeArg]
+) -> tuple[list[TensorDep], TensorDep]:
+    """Build TensorDep lists for inputs and the output of op."""
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]
+    rw = op.get_read_writes()
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
+    return input_tds, output_td
+
+
+def apply_splits(
+    op: ComputedBuffer,
+    splits: dict,
+    output_td: TensorDep,
+    it_space: dict,
+    it_space_adjusted: dict,
+    priorities: list,
+    min_splits: dict,
+    kind: str,
+) -> None:
+    """Commit splits to op and emit a debug log entry.
+
+    Does nothing when the product of splits is 1 (no parallelism).
+    kind is a short label used in the log message (e.g. "pointwise" or "reduction").
+    """
+    cores_used = math.prod(splits.values())
+    if cores_used <= 1:
+        return
+
+    rw = op.get_read_writes()
+    write_index = output_td.dep.index
+    first_read = next(iter(rw.reads), None)
+    read_index = first_read.index if first_read is not None else write_index
+    op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"{kind} work_division {op.get_name()}: cores={cores_used}, "
+            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"priorities={priorities}, min_splits={min_splits}, "
+            f"op_it_space_splits={op.op_it_space_splits}"
+        )
+
+
 def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
 
     it_space = iteration_space_from_op(op)
+    input_tds, output_td = collect_tensor_deps(op, args)
 
-    input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
-
-    adjust_it_space_for_sticks(it_space, input_tds + [output_td])
-
-    priorities, min_splits = prioritize_dimensions(output_td, it_space, input_tds)
-    splits = multi_dim_iteration_space_split(
-        it_space,
-        max_cores,
-        priorities,
-        min_splits,
+    splits, it_space_adjusted, priorities, min_splits = plan_splits(
+        input_tds + [output_td], output_td, it_space, max_cores
     )
 
-    cores_used = math.prod(splits.values())
-
-    if cores_used > 1:
-        write_index = output_td.dep.index
-        first_read = next(iter(rw.reads), None)
-        read_index = first_read.index if first_read is not None else write_index
-        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"pointwise work_division {op.get_name()}: cores={cores_used}, "
-                f"iteration_space={it_space}, priorities={priorities}, "
-                f"min_splits={min_splits}, op_it_space_splits={op.op_it_space_splits}"
-            )
+    apply_splits(
+        op,
+        splits,
+        output_td,
+        it_space,
+        it_space_adjusted,
+        priorities,
+        min_splits,
+        kind="pointwise",
+    )
 
 
 def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
@@ -367,37 +527,29 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
     it_space = iteration_space_from_op(op)
+    input_tds, output_td = collect_tensor_deps(op, args)
 
-    input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
-
-    # Adjust all stick dimension variables (inputs and output) to count sticks
-    adjust_it_space_for_sticks(it_space, input_tds + [output_td])
-
-    # FIXME: For non-matmul reduction, excluting reduction dimensions from work
+    # FIXME: For non-matmul reduction, excluding reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
     #        https://github.com/torch-spyre/torch-spyre/issues/1304
-    priorities, min_splits = prioritize_dimensions(
-        output_td, it_space, input_tds, exclude_reduction=not is_matmul
-    )
-    splits = multi_dim_iteration_space_split(
-        it_space, max_cores, priorities, min_splits
+    splits, it_space_adjusted, priorities, min_splits = plan_splits(
+        input_tds + [output_td],
+        output_td,
+        it_space,
+        max_cores,
+        exclude_reduction=not is_matmul,
     )
 
-    cores_used = math.prod(splits.values())
-    if cores_used > 1:
-        write_index = output_td.dep.index
-        first_read = next(iter(rw.reads), None)
-        read_index = first_read.index if first_read is not None else write_index
-        op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                f"reduction work_division {op.get_name()}: cores={cores_used}, "
-                f"iteration_space={it_space}, priorities={priorities}, "
-                f"min_splits={min_splits}, op_it_space_splits={op.op_it_space_splits}"
-            )
+    apply_splits(
+        op,
+        splits,
+        output_td,
+        it_space,
+        it_space_adjusted,
+        priorities,
+        min_splits,
+        kind="reduction",
+    )
 
 
 def core_division_planning(
