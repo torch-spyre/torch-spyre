@@ -64,13 +64,14 @@ struct DMAParameters {
 
 /* Generates the dimension mapping between `strides` and `stride_map`.
  *
+ * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
  * @param stride_map: mapping of strides of the CPU tensor to sizes of dev
  *                    tensor
  * @return index in `strides` that the `stride_map` value corresponds to.
  */
-auto get_dim_map(c10::IntArrayRef strides, c10::IntArrayRef stride_map)
-    -> std::vector<int> {
+auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                 c10::IntArrayRef stride_map) -> std::vector<int> {
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
   const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
@@ -79,6 +80,9 @@ auto get_dim_map(c10::IntArrayRef strides, c10::IntArrayRef stride_map)
   std::vector<int> dim_map(device_rank, -1);
 
   for (int i = 0; i < host_rank; i++) {
+    // Size 1 dimensions are ignored.
+    if (sizes[i] == 1) continue;
+
     const int64_t hst = strides[i];
 
     // Expanded dimensions are ignored.
@@ -100,6 +104,7 @@ auto get_dim_map(c10::IntArrayRef strides, c10::IntArrayRef stride_map)
 
 /* Generates the tile mapping between `strides` and `stride_map`.
  *
+ * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
  * @param device_sizes: dimesion sizes of dev tensor
  * @param stride_map: mapping of strides of the CPU tensor to sizes of dev
@@ -107,10 +112,10 @@ auto get_dim_map(c10::IntArrayRef strides, c10::IntArrayRef stride_map)
  * @return ordered indices (from back-to-front) in `stride_map` that the
  *         `strides` value corresponds to
  */
-auto get_tile_map(c10::IntArrayRef strides, c10::IntArrayRef device_sizes,
-                  c10::IntArrayRef stride_map)
+auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
+                  c10::IntArrayRef device_sizes, c10::IntArrayRef stride_map)
     -> std::vector<std::vector<int>> {
-  const std::vector<int> dim_map = get_dim_map(strides, stride_map);
+  const std::vector<int> dim_map = get_dim_map(sizes, strides, stride_map);
 
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
@@ -195,7 +200,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                              bool host2device)
     -> std::vector<DataConversionStrideInfo> {
   const std::vector<std::vector<int>> tile_map =
-      get_tile_map(strides, stl.device_size, stl.stride_map);
+      get_tile_map(sizes, strides, stl.device_size, stl.stride_map);
 
   const int host_rank = strides.size();
   const int device_rank = stl.stride_map.size();
@@ -287,7 +292,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         // When the current elements is not evenly divisible by the tile stride
         // then this tile and the next tile have a remainder.
         //
-        // In thse cases we get both tile and compute the dci sizes and
+        // In thse cases we get both tile and compute the dcsi sizes and
         // remainders for this tile and the next tile using the information from
         // both tiles. We then update the remainders and offsets so they can be
         // used to populate subsequent DataConversionStrideInfo.
@@ -319,7 +324,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
           remainder[tile_index] = 1;
 
           TORCH_CHECK(host_offset == 0,
-                      "The same host dimension cannot be tiled more than once");
+                      "The same dimension cannot be padded across tiles more than once");
 
           host_offset = remaining_elements * host_strides[tile_index];
           device_offset = remaining_elements * device_strides[tile_index];
