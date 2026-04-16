@@ -171,6 +171,52 @@ class TestSpyreTensorLayout(TestCase):
             cpu_result, compiled_result, rtol=0.001, atol=0.00001
         )
 
+    def test_spyre_tensor_layout_guard(self):
+        """
+        Verify that torch.compile recompiles when SpyreTensorLayout changes
+        between calls. Two tensors with same shape but different layout must
+        produce separate compiled graphs — regression test for issue #1297.
+        """
+        x = torch.rand([512, 256], dtype=torch.float16)
+        stl_default = SpyreTensorLayout([512, 256], torch.float16)
+        stl_custom = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0])
+        _ = x.to("spyre")  # required for lazy device initialization
+
+        tensor_default = x.to(device_layout=stl_default)
+        tensor_custom = x.to(device_layout=stl_custom)
+
+        def simple_add(a):
+            return a + a
+
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        compiled = torch.compile(simple_add)
+
+        # call 1 — default layout → compiles new graph
+        compiled(tensor_default)
+        count_after_default = torch._dynamo.utils.counters["stats"]["calls_captured"]
+
+        # call 2 — different layout → guard fails → recompile expected
+        compiled(tensor_custom)
+        count_after_custom = torch._dynamo.utils.counters["stats"]["calls_captured"]
+
+        self.assertEqual(
+            count_after_custom,
+            count_after_default + 1,
+            "Expected recompilation when SpyreTensorLayout changes between calls",
+        )
+
+        # call 3 — same custom layout again → cache hit → no recompile expected
+        compiled(tensor_custom)
+        count_after_custom_second = torch._dynamo.utils.counters["stats"][
+            "calls_captured"
+        ]
+        self.assertEqual(
+            count_after_custom_second,
+            count_after_custom,
+            "Expected cache hit when SpyreTensorLayout is the same as previous call",
+        )
+
 
 if __name__ == "__main__":
     run_tests()
