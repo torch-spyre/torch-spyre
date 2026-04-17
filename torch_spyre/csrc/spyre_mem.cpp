@@ -121,7 +121,8 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                   c10::IntArrayRef device_sizes, c10::IntArrayRef stride_map)
     -> std::vector<std::vector<int>> {
-  const std::vector<int> dim_map = get_dim_map(sizes, strides, device_sizes, stride_map);
+  const std::vector<int> dim_map =
+      get_dim_map(sizes, strides, device_sizes, stride_map);
 
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
@@ -256,14 +257,16 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       // Size 1 dimensions are ignored.
       if (tile_size == 1) continue;
 
-      TORCH_CHECK(host_size % elements_before == 0,
-                  "Invalid device sizes and stride map for host sizes and strides");
+      TORCH_CHECK(
+          host_size % elements_before == 0,
+          "Invalid device sizes and stride map for host sizes and strides");
 
       const int64_t current_elements = host_size / elements_before;
       const int64_t remaining_elements = current_elements / tile_stride;
 
-      TORCH_CHECK(remaining_elements > 0,
-                  "Invalid device sizes and stride map for host sizes and strides");
+      TORCH_CHECK(
+          remaining_elements > 0,
+          "Invalid device sizes and stride map for host sizes and strides");
 
       if (current_elements % tile_stride == 0) {
         // When the current elements is evenly divisible by the tile stride then
@@ -298,8 +301,9 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
         elements_before *= tiled_elements;
 
-        TORCH_CHECK(host_offset == 0,
-                    "The same dimension cannot be padded across tiles more than once");
+        TORCH_CHECK(
+            host_offset == 0,
+            "The same dimension cannot be padded across tiles more than once");
 
         host_offset = remaining_elements * host_strides[tile_index];
         device_offset = remaining_elements * device_strides[tile_index];
@@ -336,7 +340,8 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     for (auto j = 0; j < num_infos; j++) {
       DataConversionStrideInfo info = stride_infos[j];
       for (auto k = 0; k < device_rank; k++) {
-        info.size_[k] = remainders[i][k] == 0 ? info.size_[k] : remainders[i][k];
+        info.size_[k] =
+            remainders[i][k] == 0 ? info.size_[k] : remainders[i][k];
       }
       info.offset_src_ += offset_src;
       info.offset_dst_ += offset_dst;
@@ -460,7 +465,8 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   sendnn::SubGraph exec_graph;
   {  // add above subgraph as part of SenFusedDeviceCompute node
     flex::FlexGraphBuilder gb;
-    auto dci = generate_dci(dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+    auto dci = generate_dci(dev_tensor, stl, cpu_tensor->storage_offset(),
+                            host2device);
     if (host2device) {
       auto inp_node = gb.PrimaryInput("Input", cpu_ti);
       auto dci_node = gb.SenHostCompute("Host2Sen-HostPrep", {dci_ti},
