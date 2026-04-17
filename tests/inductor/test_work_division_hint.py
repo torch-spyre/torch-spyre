@@ -167,6 +167,49 @@ class TestWorkDivisionHint(InductorTestCase):
             f"Expected no 'user-hint' logs without a hint, got: {logs}",
         )
 
+    @config.patch({"sencores": 8, "ignore_work_division_hints": True})
+    def test_ignore_hints_flag_suppresses_hint(self):
+        """Setting ignore_work_division_hints=True makes the planner ignore hints."""
+
+        def fn(x, y):
+            with work_division_hint([2, 1, 4]):
+                return x @ y
+
+        x = torch.randn(128, 256, dtype=torch.float16).to("spyre")
+        y = torch.randn(256, 64, dtype=torch.float16).to("spyre")
+
+        cfn = torch.compile(fn, dynamic=False)
+        _, source_codes = run_and_get_code(cfn, x, y)
+
+        logs = self._get_log_messages()
+        hint_logs = [m for m in logs if "user-hint" in m]
+        self.assertEqual(
+            len(hint_logs),
+            0,
+            f"Expected no 'user-hint' logs when ignore_work_division_hints=True, got: {logs}",
+        )
+
+    @config.patch({"sencores": 8, "ignore_work_division_hints": False})
+    def test_ignore_hints_false_applies_hint(self):
+        """Setting ignore_work_division_hints=False (default) still applies hints."""
+
+        def fn(x, y):
+            with work_division_hint([2, 1, 4]):
+                return x @ y
+
+        x = torch.randn(128, 256, dtype=torch.float16).to("spyre")
+        y = torch.randn(256, 64, dtype=torch.float16).to("spyre")
+
+        cfn = torch.compile(fn, dynamic=False)
+        _, source_codes = run_and_get_code(cfn, x, y)
+
+        logs = self._get_log_messages()
+        hint_logs = [m for m in logs if "user-hint" in m]
+        self.assertTrue(
+            len(hint_logs) > 0,
+            f"Expected 'user-hint' logs when ignore_work_division_hints=False, got: {logs}",
+        )
+
     @config.patch({"sencores": 8})
     def test_hint_only_applies_inside_context(self):
         """Ops outside the context manager use the heuristic."""

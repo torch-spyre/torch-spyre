@@ -613,24 +613,25 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
 
-    user_hint = _get_work_division_hint(op)
-    if user_hint is not None:
-        user_splits = _apply_user_hint(op, user_hint, it_space, max_cores)
-        if user_splits is not None:
-            apply_splits(
-                op,
-                user_splits,
-                output_td,
-                it_space,
-                it_space,
-                list(it_space.keys()),
-                {},
-                kind="pointwise(user-hint)",
-            )
-            warn_if_per_core_overflow(
-                input_tds + [output_td], it_space, user_splits, op.get_name()
-            )
-            return
+    if not config.ignore_work_division_hints:
+        user_hint = _get_work_division_hint(op)
+        if user_hint is not None:
+            user_splits = _apply_user_hint(op, user_hint, it_space, max_cores)
+            if user_splits is not None:
+                apply_splits(
+                    op,
+                    user_splits,
+                    output_td,
+                    it_space,
+                    it_space,
+                    list(it_space.keys()),
+                    {},
+                    kind="pointwise(user-hint)",
+                )
+                warn_if_per_core_overflow(
+                    input_tds + [output_td], it_space, user_splits, op.get_name()
+                )
+                return
 
     splits: dict[Symbol, int] = {}
     if max_cores > 1:
@@ -663,24 +664,25 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
 
-    user_hint = _get_work_division_hint(op)
-    if user_hint is not None:
-        user_splits = _apply_user_hint(op, user_hint, it_space, max_cores)
-        if user_splits is not None:
-            apply_splits(
-                op,
-                user_splits,
-                output_td,
-                it_space,
-                it_space,
-                list(it_space.keys()),
-                {},
-                kind="reduction(user-hint)",
-            )
-            warn_if_per_core_overflow(
-                input_tds + [output_td], it_space, user_splits, op.get_name()
-            )
-            return
+    if not config.ignore_work_division_hints:
+        user_hint = _get_work_division_hint(op)
+        if user_hint is not None:
+            user_splits = _apply_user_hint(op, user_hint, it_space, max_cores)
+            if user_splits is not None:
+                apply_splits(
+                    op,
+                    user_splits,
+                    output_td,
+                    it_space,
+                    it_space,
+                    list(it_space.keys()),
+                    {},
+                    kind="reduction(user-hint)",
+                )
+                warn_if_per_core_overflow(
+                    input_tds + [output_td], it_space, user_splits, op.get_name()
+                )
+                return
 
     # FIXME: For non-matmul reduction, excluding reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
