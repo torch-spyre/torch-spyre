@@ -59,4 +59,3 @@ if delta_sqrt < tolerance and delta_rsqrt < tolerance:
     print("\n✓ All tests passed!")
 else:
     print(f"\n✗ Tests failed! Deltas exceed tolerance ({tolerance})")
-

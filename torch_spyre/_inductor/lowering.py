@@ -484,9 +484,7 @@ def lower_sqrt(x):
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
-        inner_fn=lambda index: lowering.ops_wrapper("sqrt")(
-            x.make_loader()(index)
-        ),
+        inner_fn=lambda index: lowering.ops_wrapper("sqrt")(x.make_loader()(index)),
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
@@ -501,9 +499,7 @@ def lower_rsqrt(x):
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
-        inner_fn=lambda index: lowering.ops_wrapper("rsqrt")(
-            x.make_loader()(index)
-        ),
+        inner_fn=lambda index: lowering.ops_wrapper("rsqrt")(x.make_loader()(index)),
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
