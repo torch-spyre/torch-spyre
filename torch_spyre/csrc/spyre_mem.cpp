@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <flex/runtime_graph/graph/graph_builder/flex_graph_builder.hpp>
+#include <map>
 #include <memory>
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/interface/graph_loader.hpp>
@@ -66,6 +67,7 @@ struct DMAParameters {
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
+ * @param device_sizes: dimesion sizes of dev tensor
  * @param stride_map: mapping of strides of the CPU tensor to sizes of dev
  *                    tensor
  * @return index in `strides` that the `stride_map` value corresponds to.
