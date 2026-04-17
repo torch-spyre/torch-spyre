@@ -80,6 +80,43 @@ class TestCoordinates(TestCase):
         )
         self.assertEqual(cx, [p0, 0, p1])
 
+        # split(x, dim=0, sections=3)[1]: offset = 5760 * 3 = 17280
+        cx = compute_coordinates(
+            [9, 15, 384],
+            [5760, 384, 1],
+            {p0: 3, p1: 15, p2: 384},
+            5760 * p0 + 384 * p1 + p2 + 17280,
+        )
+        self.assertEqual(cx, [p0 + 3, p1, p2])
+
+        # split(x, dim=1, sections=3)[1]: offset = 384 * 5 = 1920
+        cx = compute_coordinates(
+            [9, 15, 384],
+            [5760, 384, 1],
+            {p0: 9, p1: 5, p2: 384},
+            5760 * p0 + 384 * p1 + p2 + 1920,
+        )
+        self.assertEqual(cx, [p0, p1 + 5, p2])
+
+        # split(x, dim=2, sections=3)[1]: offset = 1 * 128 = 128
+        cx = compute_coordinates(
+            [9, 15, 384],
+            [5760, 384, 1],
+            {p0: 9, p1: 15, p2: 128},
+            5760 * p0 + 384 * p1 + p2 + 128,
+        )
+        self.assertEqual(cx, [p0, p1, p2 + 128])
+
+        # offset spanning dimentions
+        cx = compute_coordinates(
+            [10, 20, 30],
+            [600, 30, 1],
+            {p0: 10, p1: 20, p2: 30},
+            600 * p0 + 30 * p1 + p2 + 1855,
+        )
+        # offset 1855 = 3*600 + 1*30 + 25*1
+        self.assertEqual(cx, [p0 + 3, p1 + 1, p2 + 25])
+
     def test_compute_device_coordinates(self):
         # B, S, E -> B, E/H, S, H
         cx = compute_coordinates(
@@ -98,6 +135,52 @@ class TestCoordinates(TestCase):
             4096 * p0 + p1,
         )
         self.assertEqual(cx, [p0 % 256, p1 // 64, p0 // 256, p1 % 64])
+
+        # split(x, dim=0, sections=3)[1]: offset = 5760 * 3 = 17280
+        cx = compute_coordinates(
+            [15, 6, 9, 64],
+            [384, 64, 5760, 1],
+            {p0: 3, p1: 15, p2: 384},
+            5760 * p0 + 384 * p1 + p2 + 17280,
+        )
+        self.assertEqual(cx, [p1, p2 // 64, p0 + 3, p2 % 64])
+
+        # split(x, dim=1, sections=3)[1]: offset = 384 * 5 = 1920
+        cx = compute_coordinates(
+            [15, 6, 9, 64],
+            [384, 64, 5760, 1],
+            {p0: 9, p1: 5, p2: 384},
+            5760 * p0 + 384 * p1 + p2 + 1920,
+        )
+        self.assertEqual(cx, [p1 + 5, p2 // 64, p0, p2 % 64])
+
+        # split(x, dim=2, sections=3)[1]: offset = 1 * 128 = 128
+        cx = compute_coordinates(
+            [15, 6, 9, 64],
+            [384, 64, 5760, 1],
+            {p0: 9, p1: 15, p2: 128},
+            5760 * p0 + 384 * p1 + p2 + 128,
+        )
+        self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
+
+        # non-contiguous strides wit offset
+        cx = compute_coordinates(
+            [256, 64, 2, 64],
+            [4096, 64, 1048576, 1],
+            {p0: 2, p1: 32, p2: 256, p3: 128},
+            1048576 * p0 + 128 * p1 + 4096 * p2 + p3 + 200,
+        )
+        # offset 200 = 0*1048576 + 0*4096 + 3*64 + 8*1
+        self.assertEqual(cx, [p2, 2 * p1 + p3 // 64 + 3, p0, p3 % 64 + 8])
+
+        # spliting the stick dimention
+        cx = compute_coordinates(
+            [15, 6, 9, 64],
+            [384, 64, 5760, 1],
+            {p0: 9, p1: 15, p2: 128},
+            5760 * p0 + 384 * p1 + p2 + 128,
+        )
+        self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
 
 
 if __name__ == "__main__":

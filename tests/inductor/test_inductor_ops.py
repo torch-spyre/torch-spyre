@@ -1620,6 +1620,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # ),
             }
         },
+        ("test_split", "test_split_cpu"): {
+            "ops_dict": {
+                "split3": lambda dim, index, x: (
+                    torch.split(x, x.size()[dim] // 3, dim=dim)[index].clone(),
+                ),
+            },
+            "param_sets": {
+                "1d0s0": (0, 0, cached_randn((384,), dtype=torch.float16)),
+                "1d0s1": (0, 1, cached_randn((384,), dtype=torch.float16)),
+                "1d0s2": (0, 2, cached_randn((384,), dtype=torch.float16)),
+                "2d0s0": (0, 0, cached_randn((9, 384), dtype=torch.float16)),
+                "2d0s1": (0, 1, cached_randn((9, 384), dtype=torch.float16)),
+                "2d0s2": (0, 2, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s0": (1, 0, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s1": (1, 1, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s2": (1, 2, cached_randn((9, 384), dtype=torch.float16)),
+                "3d0s0": (0, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d0s1": (0, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d0s2": (0, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s0": (1, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s1": (1, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s2": (1, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s0": (2, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s1": (2, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s2": (2, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -2189,6 +2216,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return result.item()
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
+
+    def test_split_cpu(self, op, dim, index, x):
+        def fn(x):
+            return op(dim, index, x)
+
+        compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
 
 
 if __name__ == "__main__":
