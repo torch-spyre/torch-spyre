@@ -147,6 +147,19 @@ def model(x, y):
     return out
 ```
 
+Different operations can receive different hints by using separate context
+blocks:
+
+```python
+@torch.compile(options={"epilogue_fusion": False})
+def linear_with_bias(x, w, b):
+    with work_division_hint([4, 2, 1]):
+        mm_out = x @ w.T        # matmul: M=4, N=2, K=1
+    with work_division_hint([4, 2]):
+        out = mm_out + b         # bias add: M=4, N=2
+    return out
+```
+
 The hint is a list of split factors in **iteration-space order**: output
 dimensions first (matching the output tensor shape), then reduction
 dimensions appended.
@@ -175,8 +188,25 @@ but still applied:
 
 The context manager wraps `torch.fx.traceback.annotate`, which attaches the
 hint to the FX graph node metadata (`node.meta["custom"]`) during
-`torch.compile` tracing. The core division pass reads the hint from the IR
-node's origin metadata and applies it in place of the heuristic.
+`torch.compile` tracing.
+
+Between tracing and core division planning, multiple graph transformation
+passes (AOT Autograd decomposition, re-tracing) may create replacement nodes
+that lose the original metadata. The compiler recovers hints through a
+two-stage propagation pipeline:
+
+1. **Pre-pass collection** — At `CustomPrePasses` time (post-grad, before
+   further transformations), all hinted nodes still carry their annotations.
+   The compiler snapshots these hints keyed by node name.
+
+2. **Post-pass recovery** — At `CustomPostPasses` time (post-grad, after
+   transformations), replacement nodes (e.g. `mm_default`, `add_tensor`)
+   have lost their custom metadata. The compiler recovers hints by matching
+   each replacement node back to its pre-pass predecessor via name-based
+   matching (stripping ATen overload suffixes).
+
+The core division pass then reads the recovered hint from each IR node's
+origin metadata and applies it in place of the heuristic.
 
 ### Decomposed Operations
 
