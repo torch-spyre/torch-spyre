@@ -178,6 +178,26 @@ hint to the FX graph node metadata (`node.meta["custom"]`) during
 `torch.compile` tracing. The core division pass reads the hint from the IR
 node's origin metadata and applies it in place of the heuristic.
 
+### Decomposed Operations
+
+The hint attaches to every FX graph node created inside the context manager.
+When a high-level operation decomposes into multiple lower-level ops (for
+example, `F.linear(x, w, b)` becomes `mm` + `add`), all decomposed ops
+receive the same hint.
+
+If the hint's length does not match an op's iteration-space dimensionality,
+the compiler logs a warning and falls back to the automatic planner for that
+op. In practice this means the hint naturally targets the op it was designed
+for, while mismatched ops are left to the heuristic.
+
+To avoid ambiguity, keep the context manager scope as narrow as possible:
+
+```python
+a = F.linear(x, w, b)          # heuristic for both mm and add
+with work_division_hint([2, 1, 2]):
+    c = x @ y                   # only this matmul gets the hint
+```
+
 ### Caveats
 
 - Different hint values for the same compiled function may hit Dynamo's graph
