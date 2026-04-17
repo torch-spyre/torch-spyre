@@ -71,7 +71,8 @@ struct DMAParameters {
  * @return index in `strides` that the `stride_map` value corresponds to.
  */
 auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
-                 c10::IntArrayRef stride_map) -> std::vector<int> {
+                 c10::IntArrayRef device_sizes, c10::IntArrayRef stride_map)
+    -> std::vector<int> {
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
   const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
@@ -89,6 +90,9 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     if (hst == 0) continue;
 
     for (int j = 0; j < device_rank; j++) {
+      // Size 1 dimensions are ignored.
+      if (device_sizes[j] == 1) continue;
+
       const int64_t dst = stride_map[j];
       if (hst > max_stride_le[j] && hst <= dst) {
         max_stride_le[j] = hst;
@@ -97,7 +101,9 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     }
   }
 
-  dim_map[stick_dim_index] = dim_map[device_rank - 1];
+  if (dim_map[stick_dim_index] != -1) {
+    dim_map[stick_dim_index] = dim_map[device_rank - 1];
+  }
 
   return dim_map;
 }
@@ -115,11 +121,10 @@ auto get_dim_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
                   c10::IntArrayRef device_sizes, c10::IntArrayRef stride_map)
     -> std::vector<std::vector<int>> {
-  const std::vector<int> dim_map = get_dim_map(sizes, strides, stride_map);
+  const std::vector<int> dim_map = get_dim_map(sizes, strides, device_sizes, stride_map);
 
   const int host_rank = strides.size();
   const int device_rank = stride_map.size();
-  const int stick_dim_index = device_rank > 2 ? device_rank - 3 : 0;
 
   // Get the mapping of the indices of each dim in the dim map, ordered based
   // on increasing stride map value.
@@ -135,37 +140,20 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   //   tile_pairs[0]: [(320, 2)]
   //   tile_pairs[1]: [(80, 0)]
   //   tile_pairs[2]: [(1, 3), (64, 1)]
-  std::vector<std::vector<std::pair<int64_t, int>>> tile_pairs(host_rank);
+  std::vector<std::map<int64_t, int>> tile_pairs(host_rank);
 
   const int stick_dim = dim_map[device_rank - 1];
-
   if (stick_dim != -1) {
-    tile_pairs[stick_dim].push_back({-1, device_rank - 1});
-    tile_pairs[stick_dim].push_back({-1, stick_dim_index});
+    tile_pairs[stick_dim].insert({-1, device_rank - 1});
   }
 
   for (int i = device_rank - 2; i > -1; i--) {
-    if (i == stick_dim_index) continue;
-
-    const int64_t tile_stride = stride_map[i];
-
-    // Size 1 dimensions are ignored.
-    if (tile_stride == -1) continue;
-
-    // Expanded dimensions are ignored.
-    if (tile_stride == 0) continue;
-
     const int dim = dim_map[i];
-    const int64_t host_stride = strides[dim];
 
-    auto it = tile_pairs[dim].begin();
-    for (; it != tile_pairs[dim].end(); it++) {
-      const int64_t stride = it->first;
-      if (stride > tile_stride || (stride == tile_stride && device_sizes[i] != 1)) {
-        break;
-      }
-    }
-    tile_pairs[dim].insert(it, {tile_stride, i});
+    // Dimensions that do not appear in the dim map are ignored.
+    if (dim == -1) continue;
+
+    tile_pairs[dim].insert({stride_map[i], i});
   }
 
   // Reduce the tile pairs down to just the indices since the strides are no
@@ -177,8 +165,8 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   std::vector<std::vector<int>> tile_map(host_rank);
   for (int i = 0; i < host_rank; i++) {
     tile_map[i].reserve(tile_pairs[i].size());
-    for (const auto& pair : tile_pairs[i]) {
-      tile_map[i].push_back(pair.second);
+    for (const auto& [stride, index] : tile_pairs[i]) {
+      tile_map[i].push_back(index);
     }
   }
 
@@ -209,19 +197,21 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   std::vector<int64_t> host_strides(device_rank, 1);
   // The device strides are always contiguous strides for device sizes.
   std::vector<int64_t> device_strides(device_rank, 1);
+  // The sizes for the fist DataConversionStrideInfo match the device sizes
+  // except for dimensions with a remainder.
+  std::vector<int64_t> dcsi_sizes(device_rank, 1);
 
   int64_t prev_size = 1;
   for (int i = device_rank - 1; i > -1; i--) {
+    if (stl.stride_map[i] == 0) {
+      dcsi_sizes[i] = stl.device_size[i];
+    }
     device_strides[i] = prev_size;
     prev_size *= stl.device_size[i];
     // Size 1 dimensions are ignored.
     if (stl.stride_map[i] == -1) continue;
     host_strides[i] = stl.stride_map[i];
   }
-
-  // The sizes for the fist DataConversionStrideInfo match the device sizes
-  // except for dimensions with a remainder.
-  std::vector<int64_t> dcsi_sizes(device_rank, 1);
 
   // The sizes for the subsequent DataConversionStrideInfo (remainders) match
   // the first DataConversionStrideInfo sizes except for dimensions with a
@@ -234,15 +224,10 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
   // Iterate over host dimensions from back-to-front.
   for (int i = host_rank - 1; i > -1; i--) {
-    // Dimensions that do not appear in the tile map get folded into other
-    // dimensions.
+    // Dimensions that do not appear in the tile map are ignored.
     if (tile_map[i].size() == 0) continue;
 
     const int64_t host_stride = strides[i];
-
-    // Expanded dimensions are ignored.
-    if (host_stride == 0) continue;
-
     int64_t host_size = sizes[i];
 
     // Fold leading host dimensions that do not appear in the tile map.
@@ -277,15 +262,14 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       const int64_t current_elements = host_size / elements_before;
       const int64_t remaining_elements = current_elements / tile_stride;
 
+      TORCH_CHECK(remaining_elements > 0,
+                  "Invalid device sizes and stride map for host sizes and strides");
+
       if (current_elements % tile_stride == 0) {
         // When the current elements is evenly divisible by the tile stride then
         // this tile has no remainder.
 
-        if (remaining_elements < tile_size) {
-          dcsi_sizes[tile_index] = remaining_elements;
-        } else {
-          dcsi_sizes[tile_index] = tile_size;
-        }
+        dcsi_sizes[tile_index] = std::min(remaining_elements, tile_size);
 
         elements_before *= dcsi_sizes[tile_index];
       } else {
@@ -300,47 +284,31 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         TORCH_CHECK(j != 0, "Invalid tiling for dimension");
         j--;
 
-        int next_index = tile_map[i][j];
-
-        // Size 1 dimensions are ignored.
-        while (stl.device_size[next_index] == 1) {
-          TORCH_CHECK(j != 0, "Invalid tiling for dimension");
-          j--;
-
-          next_index = tile_map[i][j];
-        }
-
+        const int next_index = tile_map[i][j];
         const int64_t next_size = stl.device_size[next_index];
         const int64_t next_stride = host_strides[next_index] / host_stride;
 
+        const int64_t tiled_elements = current_elements / next_stride;
+
+        dcsi_sizes[tile_index] = remaining_elements;
+        remainder[tile_index] = 1;
+
         dcsi_sizes[next_index] = next_size;
-        remainder[next_index] = (current_elements % tile_stride) / next_stride;
+        remainder[next_index] = tiled_elements % next_size;
 
-        if (remaining_elements < 1) {
-          dcsi_sizes[tile_index] = 1;
-          remainder[tile_index] = 0;
-        } else {
-          dcsi_sizes[tile_index] = remaining_elements;
-          remainder[tile_index] = 1;
+        elements_before *= tiled_elements;
 
-          TORCH_CHECK(host_offset == 0,
-                      "The same dimension cannot be padded across tiles more than once");
+        TORCH_CHECK(host_offset == 0,
+                    "The same dimension cannot be padded across tiles more than once");
 
-          host_offset = remaining_elements * host_strides[tile_index];
-          device_offset = remaining_elements * device_strides[tile_index];
-        }
+        host_offset = remaining_elements * host_strides[tile_index];
+        device_offset = remaining_elements * device_strides[tile_index];
 
-        elements_before *= dcsi_sizes[tile_index] * dcsi_sizes[next_index] + remainder[next_index];
+        remainders.push_back(remainder);
+        host_offsets.push_back(host_offset);
+        device_offsets.push_back(device_offset);
       }
     }
-
-    // If the offset is 0 then none of the tiles have remainders and an
-    // additional DataConversionStrideInfo is not needed for this dimension.
-    if (host_offset == 0) continue;
-
-    remainders.push_back(remainder);
-    host_offsets.push_back(host_offset);
-    device_offsets.push_back(device_offset);
   }
 
   // Create the first DataConversionStrideInfo.
