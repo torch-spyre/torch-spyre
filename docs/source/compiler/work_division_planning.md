@@ -129,6 +129,62 @@ Work division is controlled by the `SENCORES` environment variable, which
 specifies the maximum number of cores available for parallelization. Valid
 values range from 1 (no parallelization) to 32 (maximum supported cores).
 
+## User-Specified Work Division Hints
+
+For debugging and experimentation, users can override the automatic split
+decisions on a per-operation basis using the `work_division_hint` context
+manager.
+
+### Usage
+
+```python
+from torch_spyre._inductor.work_division_hint import work_division_hint
+
+@torch.compile
+def model(x, y):
+    with work_division_hint([2, 1, 2]):
+        out = x @ y  # M split by 2, N unsplit, K split by 2
+    return out
+```
+
+The hint is a list of split factors in **iteration-space order**: output
+dimensions first (matching the output tensor shape), then reduction
+dimensions appended.
+
+| Operation | Iteration space | Hint format |
+|---|---|---|
+| 2D matmul `x:(M,K) @ y:(K,N)` | M, N, K | `[M_split, N_split, K_split]` |
+| 3D batched matmul `x:(B,M,K) @ y:(K,N)` | B, M, N, K | `[B_split, M_split, N_split, K_split]` |
+| 2D pointwise `x:(A,B) + y:(A,B)` | A, B | `[A_split, B_split]` |
+
+Operations outside the context manager are unaffected and use the normal
+planning algorithm.
+
+### Validation
+
+The compiler validates the hint at planning time. Structurally invalid hints
+(wrong number of dimensions, non-positive values) are rejected with a warning,
+and the operation falls back to automatic planning. Soft violations are warned
+but still applied:
+
+- Split factor does not evenly divide the dimension size
+- Total core count (product of all splits) exceeds `SENCORES`
+- Per-core memory span exceeds the 256 MB hardware limit
+
+### Mechanism
+
+The context manager wraps `torch.fx.traceback.annotate`, which attaches the
+hint to the FX graph node metadata (`node.meta["custom"]`) during
+`torch.compile` tracing. The core division pass reads the hint from the IR
+node's origin metadata and applies it in place of the heuristic.
+
+### Caveats
+
+- Different hint values for the same compiled function may hit Dynamo's graph
+  cache. Call `torch._dynamo.reset()` between experiments.
+- Hints are specified in raw element-space dimensions, not stick-adjusted
+  counts.
+
 ## Limitations and Future Work
 
 **Current limitations:**
