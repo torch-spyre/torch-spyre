@@ -20,9 +20,11 @@ logger = get_inductor_logger("padding")
 aten = torch.ops.aten
 
 """
-Pass to add padding where useful for correctness or performance.  Must be a pre-grad pass 
-if we want to leverage decomposition for constant_pad_nn.  If this pass must come later then
-pad will need to be inserted in its decomposed form.
+Pass to add padding where useful for correctness or performance.  Runs as the first pass
+in CustomPostPasses on the post-grad FX graph, so it matches ATen default overloads
+(aten.mm.default, aten.bmm.default).  Decompositions run before post-grad passes, so this
+pass inserts the decomposed form directly: spyre.full + aten.expand + aten.clone +
+spyre.overwrite (mirroring pad_decomp in decompositions.py).
 """
 
 
@@ -34,38 +36,56 @@ def compute_padding(cur_size: int, dtype: torch.dtype) -> int:
 
 def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) -> None:
     arg = node.args[arg_i]
-    example_value = arg.meta["example_value"]
-    shape = example_value.shape
+    val = arg.meta["val"]
+    shape = val.shape
     ndim = len(shape)
     dim = dim if dim >= 0 else ndim + dim  # convert neg to pos indices
 
-    pad = compute_padding(shape[dim], example_value.dtype)
+    pad = compute_padding(shape[dim], val.dtype)
     if pad > 0:
-        # We are paddding dimension 'dim'.  F.pad takes padding inner to outer (until no more)
-        # so put in zeros until dim is reached
-        pad_list = [0, 0] * (ndim - 1 - dim) + [0, pad]
+        output_shape = list(shape)
+        output_shape[dim] += pad
+        device = val.device
+        dtype = val.dtype
+        # Replicate the pad_decomp transformation from decompositions.py directly
+        # as FX nodes, since decompositions run before post-grad passes.
+        # Insert all new nodes immediately after the arg node.
         with graph.inserting_after(arg):
-            padded = graph.call_function(
-                aten.constant_pad_nd.default,
-                args=(arg, pad_list, 0.0),
+            scalar = graph.call_function(
+                torch.ops.spyre.full.default,
+                args=([1], 0.0, device, dtype),
             )
-            new_shape = list(shape)
-            new_shape[dim] += pad
-            padded.meta["example_value"] = example_value.new_empty(new_shape)
+            scalar.meta["val"] = torch.empty([1], dtype=dtype, device=device)
+        with graph.inserting_after(scalar):
+            expanded = graph.call_function(
+                aten.expand.default,
+                args=(scalar, output_shape),
+            )
+            expanded.meta["val"] = torch.empty(output_shape, dtype=dtype, device=device)
+        with graph.inserting_after(expanded):
+            output = graph.call_function(
+                aten.clone.default,
+                args=(expanded,),
+            )
+            output.meta["val"] = torch.empty(output_shape, dtype=dtype, device=device)
+        with graph.inserting_after(output):
+            padded = graph.call_function(
+                torch.ops.spyre.overwrite.default,
+                args=(arg, output, [dim], [0]),
+            )
+            padded.meta["val"] = torch.empty(output_shape, dtype=dtype, device=device)
         node.replace_input_with(arg, padded)
 
 
 def insert_padding(graph: torch.fx.Graph) -> None:
-    # This pass runs pre-grad, so we have to detect both call_function and call_method variants
-    # If we ever move it to run post-grad, we need to change this to use aten.bmm.default, etc.
-    matmul_ops = {torch.matmul, torch.mm, torch.bmm, "matmul", "mm", "bmm"}
+    matmul_ops = {aten.mm.default, aten.bmm.default}
     for node in list(graph.nodes):
-        if node.op in ("call_function", "call_method") and node.target in matmul_ops:
+        if node.op == "call_function" and node.target in matmul_ops:
             args = node.args
             if not all(isinstance(arg, torch.fx.Node) for arg in args):
                 continue
 
-            x_val = args[0].meta.get("example_value")
+            x_val = args[0].meta.get("val")
             if x_val is None or not isinstance(x_val, torch.Tensor):
                 continue
             # Skip if reduction dim size is 1 (special cased in in lowering, size 1 mm is converted to mul)

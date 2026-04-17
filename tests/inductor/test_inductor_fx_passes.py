@@ -21,6 +21,40 @@ from utils_inductor import (
     cached_randn,
 )
 
+from torch_spyre._inductor.padding import insert_padding
+
+
+def _make_mm_graph(x_shape, w_shape, dtype=torch.float16):
+    """Build a minimal post-grad FX graph containing a single aten.mm.default node."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(x_shape, dtype=dtype, device="spyre")
+    w = graph.placeholder("w")
+    w.meta["val"] = torch.empty(w_shape, dtype=dtype, device="spyre")
+    mm = graph.call_function(torch.ops.aten.mm.default, args=(x, w))
+    mm.meta["val"] = torch.empty((x_shape[0], w_shape[1]), dtype=dtype, device="spyre")
+    graph.output(mm)
+    return graph
+
+
+def _make_bmm_graph(x_shape, w_shape, dtype=torch.float16):
+    """Build a minimal post-grad FX graph containing a single aten.bmm.default node."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(x_shape, dtype=dtype, device="spyre")
+    w = graph.placeholder("w")
+    w.meta["val"] = torch.empty(w_shape, dtype=dtype, device="spyre")
+    bmm = graph.call_function(torch.ops.aten.bmm.default, args=(x, w))
+    bmm.meta["val"] = torch.empty(
+        (x_shape[0], x_shape[1], w_shape[2]), dtype=dtype, device="spyre"
+    )
+    graph.output(bmm)
+    return graph
+
+
+def _overwrite_nodes(graph):
+    return [n for n in graph.nodes if n.target == torch.ops.spyre.overwrite.default]
+
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)
@@ -164,6 +198,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert "aten.mm.default" not in inductor_graph_str, (
             "aten.mm.default should be replaced by bmm after unflatten pass"
         )
+
+
+class TestInsertPadding(unittest.TestCase):
+    """Unit tests for the insert_padding post-grad FX pass."""
+
+    def test_mm_unaligned_reduction_dim_gets_padded(self):
+        # 200 is not a multiple of 64 (fp16 stick size), so both args need padding
+        graph = _make_mm_graph(x_shape=(67, 200), w_shape=(200, 128))
+        insert_padding(graph)
+        overwrites = _overwrite_nodes(graph)
+        self.assertEqual(len(overwrites), 2, "expected padding on both mm args")
+
+    def test_mm_aligned_reduction_dim_no_padding(self):
+        # 256 is a multiple of 64 — no padding needed on the reduction dim
+        graph = _make_mm_graph(x_shape=(67, 256), w_shape=(256, 128))
+        insert_padding(graph)
+        overwrites = _overwrite_nodes(graph)
+        self.assertEqual(
+            len(overwrites), 0, "expected no padding for aligned reduction dim"
+        )
+
+    def test_bmm_unaligned_reduction_dim_gets_padded(self):
+        # 200 is not a multiple of 64
+        graph = _make_bmm_graph(x_shape=(2, 67, 200), w_shape=(2, 200, 128))
+        insert_padding(graph)
+        overwrites = _overwrite_nodes(graph)
+        self.assertEqual(len(overwrites), 2, "expected padding on both bmm args")
+
+    def test_mm_reduction_dim_1_skipped(self):
+        # reduction dim == 1 is special-cased: lowering converts size-1 mm to mul
+        graph = _make_mm_graph(x_shape=(67, 1), w_shape=(1, 128))
+        insert_padding(graph)
+        overwrites = _overwrite_nodes(graph)
+        self.assertEqual(
+            len(overwrites), 0, "size-1 reduction dim should not be padded"
+        )
+
+    def test_mm_padded_arg_has_correct_shape(self):
+        # x is (67, 200): pad 200 → 256 along dim -1; w is (200, 128): pad 200 → 256 along dim -2
+        graph = _make_mm_graph(x_shape=(67, 200), w_shape=(200, 128))
+        insert_padding(graph)
+        overwrites = _overwrite_nodes(graph)
+        shapes = sorted([tuple(n.meta["val"].shape) for n in overwrites])
+        self.assertIn((67, 256), shapes)
+        self.assertIn((256, 128), shapes)
 
 
 if __name__ == "__main__":
