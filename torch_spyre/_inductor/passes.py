@@ -89,7 +89,7 @@ class CustomPreGradPasses:
     pre-grad FX graph.
     """
 
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = [insert_padding]
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in self.passes:
@@ -127,6 +127,7 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        insert_padding,
         replace_scalar_with_tensor,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
