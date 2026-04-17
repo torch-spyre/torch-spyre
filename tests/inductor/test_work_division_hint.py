@@ -233,6 +233,36 @@ class TestWorkDivisionHint(InductorTestCase):
         for msg in hint_logs:
             self.assertIn("reduction(user-hint)", msg)
 
+    @config.patch({"sencores": 8})
+    def test_multiple_hint_blocks(self):
+        """Different hint blocks for mm and bias-add both propagate."""
+
+        def fn(x, w, b):
+            with work_division_hint([4, 2, 1]):
+                mm_out = x @ w.T
+            with work_division_hint([4, 2]):
+                out = mm_out + b
+            return out
+
+        x = torch.randn(512, 128, dtype=torch.float16).to("spyre")
+        w = torch.randn(256, 128, dtype=torch.float16).to("spyre")
+        b = torch.randn(256, dtype=torch.float16).to("spyre")
+
+        cfn = torch.compile(fn, options={"epilogue_fusion": False}, dynamic=False)
+        _, source_codes = run_and_get_code(cfn, x, w, b)
+
+        logs = self._get_log_messages()
+        reduction_hints = [m for m in logs if "reduction(user-hint)" in m]
+        pointwise_hints = [m for m in logs if "pointwise(user-hint)" in m]
+        self.assertTrue(
+            len(reduction_hints) > 0,
+            f"Expected reduction(user-hint) for mm, got: {logs}",
+        )
+        self.assertTrue(
+            len(pointwise_hints) > 0,
+            f"Expected pointwise(user-hint) for add, got: {logs}",
+        )
+
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests
