@@ -181,7 +181,7 @@ auto get_tile_map(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  *
  * @param sizes: dimension sizes of the CPU tensor
  * @param strides: dimension strides of the CPU tensor
- * @param storage_offset: stoage offset of the CPU tensor
+ * @param storage_offset: storage offset of the CPU tensor
  * @param stl: SpyreTensorLayout of dev tensor
  * @param host2device: direction of data conversion
  * @return description of data conversion
@@ -242,9 +242,6 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     }
 
     int64_t elements_before = 1;
-    std::vector<int64_t> remainder(device_rank, 0);
-    int64_t host_offset = 0;
-    int64_t device_offset = 0;
 
     // Iterate over the device dimension that come from the host dimension from
     // back-to-front.
@@ -281,7 +278,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         // When the current elements is not evenly divisible by the tile stride
         // then this tile and the next tile have a remainder.
         //
-        // In thse cases we get both tile and compute the dcsi sizes and
+        // In these cases we get both tile and compute the dcsi sizes and
         // remainders for this tile and the next tile using the information from
         // both tiles. We then update the remainders and offsets so they can be
         // used to populate subsequent DataConversionStrideInfo.
@@ -296,23 +293,18 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
         const int64_t tiled_elements = current_elements / next_stride;
 
         dcsi_sizes[tile_index] = remaining_elements;
-        remainder[tile_index] = 1;
-
         dcsi_sizes[next_index] = next_size;
-        remainder[next_index] = tiled_elements % next_size;
 
         elements_before *= tiled_elements;
 
-        TORCH_CHECK(
-            host_offset == 0,
-            "The same dimension cannot be padded across tiles more than once");
-
-        host_offset = remaining_elements * host_strides[tile_index];
-        device_offset = remaining_elements * device_strides[tile_index];
+        std::vector<int64_t> remainder(device_rank, 0);
+        remainder[tile_index] = 1;
+        remainder[next_index] = tiled_elements % next_size;
 
         remainders.push_back(remainder);
-        host_offsets.push_back(host_offset);
-        device_offsets.push_back(device_offset);
+        host_offsets.push_back(remaining_elements * host_strides[tile_index]);
+        device_offsets.push_back(remaining_elements *
+                                 device_strides[tile_index]);
       }
     }
   }
