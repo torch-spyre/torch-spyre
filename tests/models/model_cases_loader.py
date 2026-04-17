@@ -51,6 +51,7 @@ def case_key(case: Dict[str, Any], defaults: Dict[str, Any]) -> tuple:
     dtype = case.get("dtype", defaults.get("dtype", "float16"))
     seed = case.get("seed", defaults.get("seed", None))
     attrs = freeze(case.get("attrs", {}))
+    kwmap = freeze(case.get("kwmap", {}))
 
     inputs_sig: List[tuple[Any, ...]] = []
     for inp in case.get("inputs", []):
@@ -90,7 +91,7 @@ def case_key(case: Dict[str, Any], defaults: Dict[str, Any]) -> tuple:
         else:
             raise ValueError(f"Unknown input entry: {inp}")
 
-    return (op, dtype, seed, attrs, tuple(inputs_sig))
+    return (op, dtype, seed, attrs, kwmap, tuple(inputs_sig))
 
 
 def load_all_cases(pytest_root: Path) -> List[LoadedCase]:

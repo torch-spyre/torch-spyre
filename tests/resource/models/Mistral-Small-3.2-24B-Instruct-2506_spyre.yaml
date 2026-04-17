@@ -429,7 +429,7 @@ cases:
       seq_len), fill_value=d_min, dtype=dtype, device=device)'
     marks: constant
     kwmap:
-      fill_value: -3.3895313892515354e+38
+      fill_value: -65504.0
       dtype: torch.float16
       device: cuda:0
   - name: torch.tensor.1_spyre

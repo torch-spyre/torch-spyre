@@ -740,7 +740,7 @@ cases:
     description: 'site-packages/transformers/cache_utils.py:290 in lazy_initialization, code: self.keys = torch.zeros('
     marks: constant
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
       device: cuda:0
   - name: torch.index_copy_.1
     op: torch.index_copy_
@@ -1057,7 +1057,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: -1
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.getitem.7
     op: torch.getitem
     inputs:
@@ -1309,7 +1309,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: 1
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.arange.1
     op: torch.arange
     inputs:
@@ -1864,7 +1864,7 @@ cases:
     description: 'site-packages/transformers/cache_utils.py:290 in lazy_initialization, code: self.keys = torch.zeros('
     marks: constant
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
       device: cuda:0
   - name: torch.index_copy_.3
     op: torch.index_copy_
@@ -2124,7 +2124,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: -1
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.getitem.16
     op: torch.getitem
     inputs:
@@ -3092,7 +3092,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: -1
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.getitem.22
     op: torch.getitem
     inputs:
@@ -3344,7 +3344,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: 1
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.unsqueeze.7
     op: torch.unsqueeze
     inputs:
@@ -4072,7 +4072,7 @@ cases:
     marks: bf16operation
     kwmap:
       dim: -1
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.getitem.30
     op: torch.getitem
     inputs:

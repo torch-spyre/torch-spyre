@@ -46,7 +46,7 @@ cases:
     description: 'site-packages/transformers/models/pixtral/modeling_pixtral.py:497 in forward, code: patch_embeds = self.patch_conv(pixel_values.to(dtype=target_dtype))'
     marks: bf16operation
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.conv2d.1
     op: torch.conv2d
     inputs:
@@ -453,7 +453,7 @@ cases:
     description: 'site-packages/transformers/models/pixtral/modeling_pixtral.py:133 in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks: fp32operation
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.full.1
     op: torch.full
     inputs:
@@ -463,7 +463,7 @@ cases:
     marks: constant
     kwmap:
       fill_value: -3.3895313892515354e+38
-      dtype: torch.float16
+      dtype: torch.bfloat16
       device: cuda:0
   - name: torch.tensor.1
     op: torch.tensor
@@ -1539,7 +1539,7 @@ cases:
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:329 in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks: fp32operation
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch._C._log_api_usage_once.1
     op: torch._C._log_api_usage_once
     inputs:
@@ -1998,7 +1998,7 @@ cases:
     description: 'site-packages/transformers/cache_utils.py:290 in lazy_initialization, code: self.keys = torch.zeros('
     marks: constant
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
       device: cuda:0
   - name: torch.index_copy_.1
     op: torch.index_copy_
@@ -2508,7 +2508,7 @@ cases:
     description: 'site-packages/transformers/models/mistral/modeling_mistral.py:329 in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
     marks: fp32operation
     kwmap:
-      dtype: torch.float16
+      dtype: torch.bfloat16
   - name: torch.pow.4
     op: torch.pow
     inputs:
