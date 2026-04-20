@@ -125,9 +125,10 @@ Batch dimensions appear as output dimensions and receive the highest priority
 
 ## Configuration
 
-Work division is controlled by the `SENCORES` environment variable, which
-specifies the maximum number of cores available for parallelization. Valid
-values range from 1 (no parallelization) to 32 (maximum supported cores).
+| Variable | Default | Purpose |
+|---|---|---|
+| `SENCORES` | 32 | Maximum number of cores for parallelization (1–32) |
+| `SPYRE_INDUCTOR_IGNORE_HINTS` | 0 | Set to `1` to ignore all `work_division_hint` annotations and use the automatic planner |
 
 ## User-Specified Work Division Hints
 
@@ -240,6 +241,13 @@ a = F.linear(x, w, b)          # heuristic for both mm and add
 with work_division_hint([2, 1, 2]):
     c = x @ y                   # only this matmul gets the hint
 ```
+
+### Disabling Hints
+
+To bypass all hints without modifying user code, set
+`SPYRE_INDUCTOR_IGNORE_HINTS=1`. All operations fall back to the automatic
+planner. This is useful for A/B comparisons between hinted and automatic
+splits.
 
 ### Caveats
 
