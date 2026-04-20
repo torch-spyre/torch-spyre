@@ -572,6 +572,13 @@ def _apply_user_hint(
     Returns None (with a warning) if the hint is structurally invalid.
     Warns but still returns splits for soft violations (non-divisible, exceeds
     max_cores).
+
+    The hint list is zipped positionally with it_space keys.  This relies on
+    it_space preserving insertion order (guaranteed by Python 3.7+ dicts).
+    For Reduction ops the order is output dims then reduction dims, established
+    by extract_read_writes(pointwise_size, reduction_size) in upstream Inductor
+    which creates index variables d0..dN sequentially.  For Pointwise ops the
+    order matches the output tensor shape.
     """
     symbols = list(it_space.keys())
     op_name = op.get_name()
