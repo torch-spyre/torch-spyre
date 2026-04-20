@@ -183,14 +183,13 @@ def schedule_restickify(
     )
     host_size = list(arg.layout.size)
     host_stride = list(arg.layout.stride)
-    old_sd = dl.dim_map[-1]
+    old_sd = matching_dim(ic, idc[-1])
+    assert old_sd is not None, (
+        f"Could not find a host dimension matching current stick expr {idc[-1]} in {ic}"
+    )
     old_stick_expr = idc[-1]
     old_stride_map = list(dl.stride_map)
 
-    # dim_map is kept for legacy reasons but is not used to derive device_size or stride_map.
-    new_dim_map = [
-        new_sd if x == old_sd else old_sd if x == new_sd else x for x in dl.dim_map
-    ]
     device_size = restickify_device_size(
         list(dl.device_size),
         idc,
@@ -211,7 +210,7 @@ def schedule_restickify(
         new_sd,
     )
 
-    stl = SpyreTensorLayout(device_size, new_dim_map, stride_map, dl.device_dtype)
+    stl = SpyreTensorLayout(device_size, stride_map, dl.device_dtype)
 
     target_layout = FixedTiledLayout(
         arg.layout.device, arg.layout.dtype, arg.layout.size, arg.layout.stride, stl
@@ -266,15 +265,13 @@ def pointwise_layout(
                     # We can simply propagate the device_layout.
                     stl = SpyreTensorLayout(
                         x_stl.device_size,
-                        x_stl.dim_map,
                         x_stl.stride_map,
                         get_device_dtype(output.dtype),
                     )
                 else:
-                    # TODO: Once we eliminate the dim_map from the STL,
-                    #       we should be able to preserve the input stride_map
+                    # TODO: We should be able to preserve the input stride_map
                     #       unless the operation is changing elems_per_stick.
-                    #       Until then, use the default layout for a mostly row major dimension
+                    #       For now, use the default layout for a mostly row major dimension
                     #       ordering, adjusted to put the stick dimension last and move all
                     #       non-stick size one dimensions to the right to avoid tiling them.
                     in_device_coords = device_coordinates(x.layout, x.dep)
@@ -308,9 +305,7 @@ def pointwise_layout(
             raise Unsupported(
                 f"views not supported for spyre.layernormnorm({x.layout.size})=>{output.size}) "
             )
-        stl = SpyreTensorLayout(
-            x_stl.device_size, x_stl.dim_map, x_stl.stride_map, x_stl.device_dtype
-        )
+        stl = SpyreTensorLayout(x_stl.device_size, x_stl.stride_map, x_stl.device_dtype)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
@@ -359,7 +354,6 @@ def pointwise_layout(
             template_stl = args[0].layout.device_layout
             stl = SpyreTensorLayout(
                 template_stl.device_size,
-                template_stl.dim_map,
                 template_stl.stride_map,
                 get_device_dtype(output.dtype),
             )
@@ -498,8 +492,8 @@ def reduction_layout(
             # TODO: Insert a restickify to enable the operation to be performed
             raise Unsupported(f"exx2: illegal device layout {x.layout}")
 
-        dim_map = list(range(len(output.size))) + [-1]
-        stl = SpyreTensorLayout(output.size, output.stride, output.dtype, dim_map)
+        dim_order = list(range(len(output.size))) + [-1]
+        stl = SpyreTensorLayout(output.size, output.stride, output.dtype, dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )

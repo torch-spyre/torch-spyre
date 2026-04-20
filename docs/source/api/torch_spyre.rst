@@ -246,8 +246,7 @@ manipulation of device tensor layouts. See
       # From explicit device layout parameters
       layout = SpyreTensorLayout(
           device_size=[4, 2, 64],
-          dim_map=[0, 1, 1],
-          stride_map=[1, 1, 1],
+          stride_map=[128, 64, 1],
           device_dtype=DataFormats.SEN169_FP16,
       )
 
@@ -256,16 +255,11 @@ manipulation of device tensor layouts. See
 
       Shape on device, including tiling dimensions and padding.
 
-   .. attribute:: dim_map
-      :type: list[int]
-
-      Mapping from each device dimension back to the corresponding
-      PyTorch (host) dimension.
-
    .. attribute:: stride_map
       :type: list[int]
 
-      Stride mapping for device dimensions.
+      Host stride for each device dimension. A value of -1 indicates a
+      synthetic or padded dimension with no corresponding host stride.
 
    .. attribute:: device_dtype
       :type: DataFormats
@@ -275,11 +269,6 @@ manipulation of device tensor layouts. See
    .. method:: elems_per_stick() -> int
 
       Returns the number of elements per stick for this layout's dtype.
-
-   .. method:: host_stick_dim() -> int
-
-      Returns the host dimension index that corresponds to the stick
-      (innermost) dimension on device.
 
 .. class:: torch_spyre._C.DataFormats
 
