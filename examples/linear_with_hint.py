@@ -21,15 +21,19 @@
 # planning independently.
 
 import torch
-
 from torch_spyre._inductor.work_division_hint import work_division_hint
 
+torch.manual_seed(0xAFFE)
 DEVICE = "spyre"
 
-M, N, K = 512, 256, 128
+M, N, K = 2048, 2048, 65536
 
 x = torch.randn([M, K], dtype=torch.float16).to(DEVICE)
-w = torch.randn([N, K], dtype=torch.float16).to(DEVICE)
+
+w = torch.randn([N, K], dtype=torch.float16)
+torch.nn.init.xavier_uniform_(w)
+w = w.to(DEVICE)
+
 b = torch.randn([N], dtype=torch.float16).to(DEVICE)
 
 
