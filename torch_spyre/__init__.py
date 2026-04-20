@@ -226,6 +226,13 @@ def _autoload():
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()
+    # Patch safetensors to recognize spyre device
+    try:
+        from torch_spyre.safetensors_patch import patch_safetensors
+        patch_safetensors()
+    except Exception as e:
+        import warnings
+        warnings.warn(f"Failed to patch safetensors: {e}")
 
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config
