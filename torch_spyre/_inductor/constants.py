@@ -16,6 +16,22 @@ BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
+# Type casting operators from deeptools
+DL16TOFP32_OP = "dl16tofp32"
+FP32TODL16_OP = "fp32todl16"
+DL16TOBF16_OP = "dl16tobf16"
+FP8TODL16_OP = "fp8todl16"
+
+# FP32TOBF16_OP = "fp32tobf16"
+# BF16TOFP32_OP = "bf16tofp32"
+# FP32TOFP8_OP = "fp32tofp8"
+# FP8TOFP32_OP = "fp8tofp32"
+# BF16TODL16_OP = "bf16todl16"
+# INT32TOINT16_OP = "int32toint16"
+# INT16TOINT32_OP = "int16toint32"
+# INT32TOINT8_OP = "int32toint8"
+# INT8TOINT32_OP = "int8toint32"
+
 DEVICE_NAME = "spyre"
 
 
@@ -52,6 +68,7 @@ SPYRE_FP32_OPS = [
     "topkvalue",
     "topkindex",
     "floor",
+    "to_dtype",
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}
