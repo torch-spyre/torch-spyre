@@ -191,13 +191,13 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
           createInputTensor(gl, tmp_0.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                               tmp_0.storage().data_ptr().get_context())
-                              ->interim_alloc_ptr);
+                              ->owner);
       sen_inputs.push_back(tensor);
     } else {
       auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(
           static_cast<SharedOwnerCtx *>(arg.storage().data_ptr().get_context())
-              ->interim_alloc_ptr);
+              ->owner);
       sen_inputs.push_back(tensor);
     }
   }
@@ -205,7 +205,7 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
       createOutputTensor(gl, args.back().storage().data_ptr().get(), 0, 1);
   tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                           args.back().storage().data_ptr().get_context())
-                          ->interim_alloc_ptr);
+                          ->owner);
   sen_outputs.push_back(tensor);
 
   // Execute device init

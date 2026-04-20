@@ -28,24 +28,17 @@
 namespace spyre {
 
 struct SharedOwnerCtx {
-  // Canonical allocation address from FlexAllocator (the "owner" per RFC).
-  // On PF fallback path this is an empty CompositeAddress.
-  flex::CompositeAddress owner;
+  flex::DeviceMemoryAllocationPtr owner;
+  flex::CompositeAddress composite_addr;
   signed char device_id;
   size_t nbytes;
-  // INTERIM: cached non-owning DeviceMemoryAllocationPtr for SetSpyreData().
-  // Constructed once via makeInterimAllocationPtr() and reused for all
-  // SetSpyreData() calls on this tensor.
-  // Remove when SetSpyreData accepts CompositeAddress directly.
-  // On PF fallback path this is an owning allocation (allocator_ != nullptr).
-  flex::DeviceMemoryAllocationPtr interim_alloc_ptr;
 
-  SharedOwnerCtx(flex::CompositeAddress addr, signed char dev_id, size_t nbytes,
-                 flex::DeviceMemoryAllocationPtr interim)
-      : owner(std::move(addr)),
+  SharedOwnerCtx(flex::DeviceMemoryAllocationPtr own,
+                 flex::CompositeAddress addr, signed char dev_id, size_t nb)
+      : owner(std::move(own)),
+        composite_addr(std::move(addr)),
         device_id(dev_id),
-        nbytes(nbytes),
-        interim_alloc_ptr(std::move(interim)) {}
+        nbytes(nb) {}
 };
 
 // A custom allocator for our custom device, using FlexAllocator to manage
@@ -65,11 +58,7 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
  public:
   static SpyreAllocator& instance();
 
-  // Returns a mutable FlexAllocator from RuntimeContext.
-  // Uses const_pointer_cast because RuntimeContext::getAllocator() returns
-  // shared_ptr<const FlexAllocator>, but allocate()/deallocate() are
-  // non-const (internally mutex-protected).
-  static flex::FlexAllocator* getFlexAllocator();
+  static std::shared_ptr<flex::FlexAllocator> getFlexAllocator();
 
   bool initialized() override;
 

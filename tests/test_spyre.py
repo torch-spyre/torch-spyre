@@ -293,6 +293,26 @@ class TestSpyre(TestCase):
                 x = torch.empty(64, dtype=dtype)
                 x.to("spyre")
 
+    def test_device_to_device_copy(self):
+        # Test device-to-device copy using copy_() method
+        x = torch.ones(3, dtype=torch.float16, device="spyre")
+        y = torch.empty(3, dtype=torch.float16, device="spyre")
+        y.copy_(x)
+
+        # Check that values are the same by comparing on CPU
+        self.assertTrue(torch.all(x.cpu() == y.cpu()))
+        self.assertTrue(torch.all(y.cpu() == 1.0))
+
+        # Test with different values
+        z = torch.tensor([1.5, 2.5, 3.5], dtype=torch.float16, device="spyre")
+        y.copy_(z)
+
+        # Check that values are the same by comparing on CPU
+        self.assertTrue(torch.all(y.cpu() == z.cpu()))
+        self.assertTrue(
+            torch.all(y.cpu() == torch.tensor([1.5, 2.5, 3.5], dtype=torch.float16))
+        )
+
     def test_detach(self):
         # exercises the shallow copy code path
         for dtype in [torch.float16, torch.float32, torch.bool, torch.int8]:

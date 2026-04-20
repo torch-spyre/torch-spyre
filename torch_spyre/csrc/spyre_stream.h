@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <flex/allocator/alloc_address.hpp>
+
 #include "module.h"
 
 namespace spyre {
@@ -39,17 +41,16 @@ class SpyreStream {
   bool query() const;        // Check if work completed
   void synchronize() const;  // Block until work done
 
-  void copy_async(const at::Tensor& src, const at::Tensor& dst) const;
+  void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
 
   // Conversions
   c10::Stream unwrap() const;
 
  private:
   flex::RuntimeStream* getRuntimeHandle() const;
-  void copy_async_impl(void* cpu_ptr,
-                       flex::DeviceMemoryAllocationPtr& device_allocation,
-                       int device_id, const DataConversionInfo& dci,
-                       bool host2device) const;
+  void copyAsyncImpl(void* cpu_ptr,
+                     const flex::CompositeAddress* device_address,
+                     const DataConversionInfo& dci, bool host2device) const;
 };
 
 /**
