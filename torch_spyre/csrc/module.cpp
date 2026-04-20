@@ -50,7 +50,7 @@
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 1;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 2;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -270,7 +270,6 @@ PYBIND11_MODULE(_C, m) {
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def("__str__",
@@ -278,7 +277,6 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
-      .def("host_stick_dim", &spyre::SpyreTensorLayout::host_stick_dim)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
@@ -286,9 +284,8 @@ PYBIND11_MODULE(_C, m) {
                     std::vector<int32_t>>(),
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
            py::arg("dim_order"))
-      .def(py::init<std::vector<int64_t>, std::vector<int32_t>,
-                    std::vector<int64_t>, DataFormats>(),
-           py::arg("device_size"), py::arg("dim_map"), py::arg("stride_map"),
+      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats>(),
+           py::arg("device_size"), py::arg("stride_map"),
            py::arg("device_dtype"))
       .def(py::pickle(
           [](const spyre::SpyreTensorLayout &p) {  // __getstate__
@@ -298,26 +295,34 @@ PYBIND11_MODULE(_C, m) {
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
-                                  p.device_size, p.dim_map, p.stride_map,
-                                  p.device_dtype);
+                                  p.device_size, p.stride_map, p.device_dtype);
           },
           [](py::tuple t) {  // __setstate__
-            if (t.size() != 5) {
-              throw py::value_error(
-                  "Invalid SpyreTensorLayout pickle: wrong tuple size");
-            }
-
             int32_t version = t[0].cast<int32_t>();
-            if (version != spyre::kSpyreTensorLayoutPickleVersion) {
+            if (version == 1) {
+              // Version 1 had: (version, device_size, dim_map, stride_map,
+              // device_dtype) — discard dim_map
+              if (t.size() != 5) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v1: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
+                                              t[3].cast<std::vector<int64_t>>(),
+                                              t[4].cast<DataFormats>());
+            } else if (version == 2) {
+              // Version 2: (version, device_size, stride_map, device_dtype)
+              if (t.size() != 4) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v2: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
+                                              t[2].cast<std::vector<int64_t>>(),
+                                              t[3].cast<DataFormats>());
+            } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
                   std::to_string(version));
             }
-
-            return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
-                                            t[2].cast<std::vector<int32_t>>(),
-                                            t[3].cast<std::vector<int64_t>>(),
-                                            t[4].cast<DataFormats>());
           }));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);

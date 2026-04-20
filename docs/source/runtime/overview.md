@@ -78,7 +78,7 @@ represent tiled device layouts, Torch-Spyre defines `SpyreTensorImpl`
 that captures:
 
 - `device_size` — shape on device, with extra tiling dimensions and padded values
-- `dim_map` — mapping from device dimensions back to PyTorch dimensions
+- `stride_map` — host stride for each device dimension (-1 for synthetic/padded dimensions)
 - `device_dtype` — on-device data format (e.g. `SEN169_FP16`)
 
 Tensor handles returned to Python **do not contain raw physical

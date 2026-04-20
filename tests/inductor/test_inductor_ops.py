@@ -1218,7 +1218,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {
                 # exp(unsqueeze(x)) triggers internal compile in eager mode that
-                # fails with "Host dimension not found in dim_map" errors
+                # fails with host dimension lookup errors
                 "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
             },
             "param_sets": {

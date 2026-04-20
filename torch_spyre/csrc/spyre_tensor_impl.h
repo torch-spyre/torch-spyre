@@ -41,15 +41,6 @@ class SpyreTensorLayout {
   std::vector<int64_t> device_size;
 
   /**
-   * Record the mapping from host size to device_size.
-   * It has len(device_size) entires whose values are indices in the host size
-   * vector. Stick dimensions will appear twice; non-stick dimensions will
-   * appear once.
-   */
-  [[deprecated("Use stride_map instead.")]]
-  std::vector<int32_t> dim_map;
-
-  /**
    * Record the mapping from device dimensions to host strides.
    * It has len(device_size) entries whose values are offsets in the host tensor
    * memory.
@@ -83,17 +74,15 @@ class SpyreTensorLayout {
   }
 
   /**
-   * Construct a SpyreTensorLayout with the specified device_size
-   * and dim_map. This constructor is intended for use only by the compiler
+   * Construct a SpyreTensorLayout with the specified device_size and
+   * stride_map. This constructor is intended for use only by the compiler
    * or the expert programmer. It enables complete control over the
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
    */
   SpyreTensorLayout(std::vector<int64_t> device_size,
-                    std::vector<int32_t> dim_map,
                     std::vector<int64_t> stride_map, DataFormats device_dtype)
       : device_size(device_size),
-        dim_map(dim_map),
         stride_map(stride_map),
         device_dtype(device_dtype) {}
 
@@ -104,19 +93,12 @@ class SpyreTensorLayout {
 
   std::string toString() const;
 
-  /**
-   * Return the host_dim that is the stick dimension; sparse tensors return
-   * nullopt.
-   */
-  std::optional<int32_t> host_stick_dim();
-
   int64_t elems_per_stick() {
     return spyre::elems_per_stick(this->device_dtype);
   }
 
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
-           this->dim_map == other.dim_map &&
            this->stride_map == other.stride_map &&
            this->device_dtype == other.device_dtype;
   }

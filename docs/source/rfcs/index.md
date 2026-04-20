@@ -25,7 +25,7 @@ and submit a pull request.
 
 ### RFC 0047 — Tensors with Device-Specific Layouts
 
-Defines the Spyre tiled tensor layout model: `device_size`, `dim_map`, and the
+Defines the Spyre tiled tensor layout model: `device_size`, `stride_map`, and the
 stick abstraction. Motivates why PyTorch's single-stride-per-dimension layout
 cannot represent tiled tensors, and specifies the `SpyreTensorLayout` data
 structure that maps between PyTorch coordinates and Spyre device memory.
