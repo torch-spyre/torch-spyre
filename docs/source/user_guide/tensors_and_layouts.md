@@ -284,7 +284,7 @@ print(stl)
 You should see something like:
 
 ```
-SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
 The 3-D tensor has a 4-D `device_size`.
@@ -311,7 +311,7 @@ print(y.device_tensor_layout())
 You should see exactly the same output as before:
 
 ```
-SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
 A second constructor of `SpyreTensorLayout` enables finer-grained control.

@@ -159,7 +159,7 @@ PyTorch `size+stride` cannot represent tiled tensors.
   IEEE_FP32, etc.)
 
 Example: `(5, 100, 150)` float16 →
-`SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map=[15000, 64, 150, 1], device_dtype=SEN169_FP16)`
+`SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map=[150, 64, 15000, 1], device_dtype=SEN169_FP16)`
 where 64 = elements per 128-byte stick for fp16.
 
 ### KernelSpec
