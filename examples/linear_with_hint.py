@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Demonstrates work_division_hint to keep mm output and bias-add splits
-# compatible: both ops split M by 4 and N by 2 (total 8 cores).
+# Demonstrates work_division_hint to keep mm and bias-add splits aligned:
+# the matmul splits M by 4 and N by 2, and the add uses the same M/N split.
 #
-# F.linear(x, w, b) decomposes into mm + add. The hint [4, 2, 1] targets
-# the mm (M, N, K order). The bias add is a pointwise op over the mm output
-# shape (M, N), so using the same [4, 2] hint keeps splits aligned.
+# epilogue_fusion is not needed here.  Even if Inductor fuses mm + add into
+# addmm, Spyre's addmm decomposition (decompositions.py) breaks it back into
+# separate mm and add ComputedBuffers that each go through core division
+# planning independently.
 
 import torch
 
@@ -34,14 +35,10 @@ b = torch.randn([N], dtype=torch.float16).to(DEVICE)
 
 @torch.compile
 def linear_with_bias(x, w, b):
-    # mm hint: [M_split, N_split, K_split] = [4, 2, 1]  -> 8 cores on M x N
-    # add hint: [M_split, N_split]         = [4, 2]     -> same 8-core split
-    # Both hints are attached to every node in the block; the mm node matches
-    # length 3 and the add node matches length 2, so each gets the right hint.
     with work_division_hint([4, 2, 1]):
-        mm_out = x @ w.T
+        mm_out = x @ w.T  # matmul iteration space: [M, N, K]
     with work_division_hint([4, 2]):
-        out = mm_out + b
+        out = mm_out + b  # pointwise iteration space: [M, N]
     return out
 
 
