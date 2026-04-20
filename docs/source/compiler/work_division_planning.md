@@ -186,39 +186,52 @@ but still applied:
 
 ### Mechanism
 
-The context manager wraps `torch.fx.traceback.annotate`, which attaches the
-hint to the FX graph node metadata (`node.meta["custom"]`) during
-`torch.compile` tracing.
+The context manager wraps `torch.fx.traceback.annotate`, which stores the
+hint in the FX graph node metadata under `node.meta["custom"]` during
+`torch.compile` tracing. Users do not need to interact with this metadata
+directly.
 
-Between tracing and core division planning, multiple graph transformation
-passes (AOT Autograd decomposition, re-tracing) may create replacement nodes
-that lose the original metadata. The compiler recovers hints through a
-two-stage propagation pipeline:
+#### Propagation through decompositions
 
-1. **Pre-pass collection** — At `CustomPrePasses` time (post-grad, before
-   further transformations), all hinted nodes still carry their annotations.
-   The compiler snapshots these hints keyed by node name.
+When a high-level operation decomposes into multiple lower-level ops (for
+example, `F.linear(x, w, b)` becomes `mm` + `add`), PyTorch's
+`preserve_node_meta` mechanism ensures that the `custom` metadata (including
+the hint) is copied to all decomposed FX nodes automatically. Dynamo
+activates `preserve_node_meta` whenever it encounters `annotate`, so users
+do not need to enable it manually.
 
-2. **Post-pass recovery** — At `CustomPostPasses` time (post-grad, after
-   transformations), replacement nodes (e.g. `mm_default`, `add_tensor`)
-   have lost their custom metadata. The compiler recovers hints by matching
-   each replacement node back to its pre-pass predecessor via name-based
-   matching (stripping ATen overload suffixes).
+If the hint's length does not match a decomposed op's iteration-space
+dimensionality, the compiler logs a warning and falls back to the automatic
+planner for that op. In practice this means the hint naturally targets the
+op it was designed for, while mismatched ops are left to the heuristic.
+
+#### Recovery across re-tracing passes
+
+Between tracing and core division planning, several graph transformation
+passes (AOT Autograd re-tracing, post-grad passes) may create replacement
+nodes that lose the original `custom` metadata despite `preserve_node_meta`.
+The compiler recovers hints through a multi-stage propagation pipeline:
+
+1. **Pre-grad collection** (`collect_work_division_hints`) — At
+   `CustomPreGradPasses` time, before AOT Autograd, the compiler snapshots
+   all hinted nodes keyed by graph ID and node name.
+
+2. **Post-grad early recovery** (`propagate_work_division_hints`) — At
+   `CustomPrePasses` time, the compiler traces each node's `from_node`
+   provenance chain back to the pre-grad graph and restores hints from the
+   snapshot. The compiler then takes a second snapshot
+   (`collect_pre_pass_hints`) for the next stage.
+
+3. **Post-grad late recovery** (`propagate_post_pass_hints`) — At
+   `CustomPostPasses` time, replacement nodes (e.g. `mm_default`,
+   `add_tensor`) may have lost both `custom` metadata and `from_node`
+   provenance. The compiler recovers hints by stripping ATen overload
+   suffixes from node names and matching against the second snapshot.
 
 The core division pass then reads the recovered hint from each IR node's
 origin metadata and applies it in place of the heuristic.
 
-### Decomposed Operations
-
-The hint attaches to every FX graph node created inside the context manager.
-When a high-level operation decomposes into multiple lower-level ops (for
-example, `F.linear(x, w, b)` becomes `mm` + `add`), all decomposed ops
-receive the same hint.
-
-If the hint's length does not match an op's iteration-space dimensionality,
-the compiler logs a warning and falls back to the automatic planner for that
-op. In practice this means the hint naturally targets the op it was designed
-for, while mismatched ops are left to the heuristic.
+#### Scope and decomposed operations
 
 To avoid ambiguity, keep the context manager scope as narrow as possible:
 
