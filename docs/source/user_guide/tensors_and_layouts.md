@@ -328,7 +328,7 @@ stl = SpyreTensorLayout((5, 100, 150), torch.float16, [1,0,2])
 yields a tensor with the tiling inverted:
 
 ```
-SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[150, 64, 15000, 1], device_dtype=DataFormats.SEN169_FP16)
+SpyreTensorLayout(device_size=[5, 3, 100, 64], stride_map =[15000, 64, 150, 1], device_dtype=DataFormats.SEN169_FP16)
 ```
 
 ## Layout Compatibility
