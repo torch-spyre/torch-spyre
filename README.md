@@ -46,6 +46,8 @@ Controlling logging:
 
 * `TORCH_SPYRE_DEBUG=1` to enable debug logging
 * `TORCH_SPYRE_DOWNCAST_WARN=0` to disable downcast warning (accept: 0/1, true/false, on/off)
+* `SPYRE_INDUCTOR_LOG=1` to enable Spyre Inductor logging
+* `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` to set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR)
 * `DT_DEEPRT_VERBOSE=-1` to reduce Spyre stack logging
 * `DTLOG_LEVEL=error` to reduce Spyre stack logging
 
