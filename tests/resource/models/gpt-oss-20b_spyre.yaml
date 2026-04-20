@@ -902,7 +902,11 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: unique_randn_along_dim
+          init_args:
+            dim: -1
+            min_val: -100.0
+            max_val: 100.0
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
       - combined_logits.max(dim=-1, keepdim=True).values'
     kwmap:
@@ -1911,7 +1915,11 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: unique_randn_along_dim
+          init_args:
+            dim: -1
+            min_val: -100.0
+            max_val: 100.0
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
       - combined_logits.max(dim=-1, keepdim=True).values'
     kwmap:
@@ -2774,7 +2782,11 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: unique_randn_along_dim
+          init_args:
+            dim: -1
+            min_val: -100.0
+            max_val: 100.0
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
       - combined_logits.max(dim=-1, keepdim=True).values'
     kwmap:
@@ -3704,7 +3716,11 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: unique_randn_along_dim
+          init_args:
+            dim: -1
+            min_val: -100.0
+            max_val: 100.0
     description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
       - combined_logits.max(dim=-1, keepdim=True).values'
     kwmap:

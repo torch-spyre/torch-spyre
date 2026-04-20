@@ -84,6 +84,26 @@ def make_tensor_from_conf(
     init = tconf.get("init", "rand")
     init_args = dict(tconf.get("init_args", {}))
 
+    # Handle unique_randn_along_dim initialization
+    if init == "unique_randn_along_dim":
+        from tests.inductor.utils_inductor import unique_randn_along_dim  # type: ignore[attr-defined]
+
+        dim = init_args.get("dim", None)
+        min_val = float(init_args.get("min_val", -100.0))
+        max_val = float(init_args.get("max_val", 100.0))
+        warn_precision = init_args.get("warn_precision", True)
+
+        t = unique_randn_along_dim(
+            tuple(shape),
+            dim=dim,
+            min_val=min_val,
+            max_val=max_val,
+            dtype=dtype,
+            seed=seed,
+            warn_precision=warn_precision,
+        )
+        return t
+
     with torch.random.fork_rng(devices=[]):
         assert init == "rand" or init == "randint", f"Unknown init: {init}"
         if seed is not None:
