@@ -179,6 +179,22 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
   status = gl.ParseGraph();
   if (!status.IsOk()) throw std::runtime_error(status.Message());
 
+  // Determine supernode indices dynamically.
+  // Graph may have: [DeviceInit, PrepareModel, Compute] or [DeviceInit, Compute]
+  int prepare_model_idx = -1;
+  int compute_sn_idx = -1;
+  for (size_t i = 0; i < g2.compute_ops_.size(); ++i) {
+    auto &sn = g2.compute_ops_[i];
+    if (sn->Name() == "PrepareModel") {
+      prepare_model_idx = static_cast<int>(i);
+    } else if (sn->Name() != "DeviceInit") {
+      compute_sn_idx = static_cast<int>(i);
+    }
+  }
+  TORCH_CHECK(compute_sn_idx >= 0,
+              "launchKernel: no compute supernode found in G2 graph");
+  uint64_t sn_idx = static_cast<uint64_t>(compute_sn_idx);
+
   // Create sendnn tensors
   std::vector<sendnn::ConstTensor> sen_inputs;
   std::vector<sendnn::Tensor> sen_outputs;
@@ -187,32 +203,46 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     at::Tensor tmp_0;
     if (arg.dim() == 0) {
       tmp_0 = (at::ones({1}, arg.dtype()) * arg).to(arg.device());
-      auto tensor =
-          createInputTensor(gl, tmp_0.storage().data_ptr().get(), i, 1);
+      auto tensor = createInputTensor(gl, tmp_0.storage().data_ptr().get(), i,
+                                      sn_idx);
       tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                               tmp_0.storage().data_ptr().get_context())
                               ->owner);
       sen_inputs.push_back(tensor);
     } else {
-      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i, 1);
+      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i,
+                                      sn_idx);
       tensor.SetSpyreData(
           static_cast<SharedOwnerCtx *>(arg.storage().data_ptr().get_context())
               ->owner);
       sen_inputs.push_back(tensor);
     }
   }
-  auto tensor =
-      createOutputTensor(gl, args.back().storage().data_ptr().get(), 0, 1);
+  auto tensor = createOutputTensor(gl, args.back().storage().data_ptr().get(),
+                                   0, sn_idx);
   tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
                           args.back().storage().data_ptr().get_context())
                           ->owner);
   sen_outputs.push_back(tensor);
 
-  // Execute device init
-  status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
-  if (!status.IsOk()) throw std::runtime_error(status.Message());
+  // Execute device init + compute
+  if (prepare_model_idx >= 0) {
+    uint64_t pm_idx = static_cast<uint64_t>(prepare_model_idx);
+    if (args.size() == 6) {
+      status = gl.Predict(sendnn::Outputs(),
+                          {sen_inputs[1], sen_outputs.front()}, pm_idx);
+    } else if (args.size() >= 3) {
+      status = gl.Predict(sendnn::Outputs(), {sen_inputs[1]}, pm_idx);
+    } else {
+      status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), pm_idx);
+    }
+    if (!status.IsOk()) throw std::runtime_error(status.Message());
+  } else {
+    status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
+    if (!status.IsOk()) throw std::runtime_error(status.Message());
+  }
 
-  status = gl.Compute(sen_outputs, sen_inputs, 1);
+  status = gl.Compute(sen_outputs, sen_inputs, sn_idx);
   if (!status.IsOk()) throw std::runtime_error(status.Message());
 
   return;
