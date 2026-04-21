@@ -1,21 +1,10 @@
 """
 Shared class and methods for all OOT PyTorch test overrides.
 
-Usage:
-    export PYTORCH_TESTING_DEVICE_ONLY_FOR="privateuse1"
-
-    # Clone pytorch
-    $DTI_PROJECT_ROOT/torch-spyre-docs/scripts/checkout-pytorch-src.sh
-
-    export TORCH_TEST_DEVICES="$DTI_PROJECT_ROOT/torch-spyre/tests/spyre_test_base_common.py"
-    export PYTORCH_TEST_CONFIG="$DTI_PROJECT_ROOT/torch-spyre/tests/test_suite_config.yaml"
-
-    cd $DTI_PROJECT_ROOT/pytorch/test/
-    python3 -m pytest test_binary_ufuncs.py -v
 """
 
 import os
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import pytest  # type: ignore
 import torch
@@ -47,9 +36,11 @@ from spyre_upstream_patcher import (
     _OOTOpListPatcher,
     _OOTModuleListPatcher,
     _OOTModuleDtypePatcher,
+    _OOTPrecisionOverridePatcher,
 )
 from spyre_test_config_models import (
     OOTTestConfig,
+    Precision,
     SupportedOpConfig,
     SupportedModuleConfig,
     TestEntry,
@@ -163,6 +154,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         str, "SupportedModuleConfig"
     ] = {}  # {module_name -> config}
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
+    GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
 
     @classmethod
     def setUpClass(cls):
@@ -202,6 +194,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             cls.SUPPORTED_MODULES_CONFIG = module_configs
 
         cls.GLOBAL_SUPPORTED_DTYPES = config.global_config.resolved_supported_dtypes()
+        cls.GLOBAL_DTYPE_PRECISION = (
+            config.global_config.resolved_supported_dtypes_precision()
+        )
 
         file_entry: FileEntry = resolve_current_file(config, path)
 
@@ -302,11 +297,24 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # print tags to stderr
         entry = cls.TEST_ENTRIES.get(name)
         tags = entry.tags if entry is not None else []
-        if tags:
+        # Collect op-level tags from all OpsNamedItem entries in this TestEntry
+        # and union them with test-level tags so pytest -m works for both levels.
+        op_tags: List[str] = []
+        if entry is not None:
+            seen_op_tags: set = set()
+            for ops_item in entry.edits.ops.include:
+                for t in ops_item.tags:
+                    if t not in seen_op_tags:
+                        seen_op_tags.add(t)
+                        op_tags.append(t)
+
+        # Union: test-level tags + op-level tags (deduplicated)
+        all_tags = tags + [t for t in op_tags if t not in set(tags)]
+        if all_tags:
             os.write(
                 2,
                 f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
-                f"tags: [{', '.join(tags)}]\n".encode(),
+                f"tags: [{', '.join(all_tags)}]\n".encode(),
             )
 
         # op list filtering
@@ -379,6 +387,16 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 _OOTDtypePatcher(test, extra_dtypes).patch()
                 _OOTOpDtypeExpander(test, extra_dtypes).patch()
 
+        _OOTPrecisionOverridePatcher(
+            test,
+            global_dtype_precision=cls.GLOBAL_DTYPE_PRECISION,
+            include_dtype_precision=(
+                entry.edits.dtypes.resolved_include_precision()
+                if entry is not None
+                else {}
+            ),
+        ).patch()
+
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
@@ -416,11 +434,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             #     continue
 
             # apply pytest tags as marks
-            if tags:
+            if all_tags:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
                     marked_fn = existing_fn
-                    for tag in tags:
+                    for tag in all_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
 

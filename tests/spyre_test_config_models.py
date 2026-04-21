@@ -54,6 +54,13 @@ _VALID_UNLISTED_MODES = {"skip", "xfail", "xfail_strict", "mandatory_success"}
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+class Precision(BaseModel):
+    """Precision sub-model for tolerance overrides."""
+
+    atol: Optional[float] = None
+    rtol: Optional[float] = None
+
+
 class NamedItem(BaseModel):
     """A named item in an include/exclude list."""
 
@@ -61,11 +68,12 @@ class NamedItem(BaseModel):
     description: Optional[str] = None
 
 
-class Precision(BaseModel):
-    """Precision sub-model for tolerance overrides"""
+class DtypeNamedItem(BaseModel):
+    """A dtype item with optional precision override."""
 
-    atol: Optional[float] = None
-    rtol: Optional[float] = None
+    name: str
+    description: Optional[str] = None
+    precision: Optional[Precision] = None
 
 
 class OpsEdits(BaseModel):
@@ -97,7 +105,7 @@ class ModulesEdits(BaseModel):
 class DtypesEdits(BaseModel):
     """Per-test dtype overrides."""
 
-    include: List[NamedItem] = []  # inject dtypes into @ops.allowed_dtypes
+    include: List[DtypeNamedItem] = []  # inject dtypes into @ops.allowed_dtypes
     exclude: List[NamedItem] = []  # remove dtype variants for this test
 
     @field_validator("include", "exclude", mode="before")
@@ -123,6 +131,14 @@ class DtypesEdits(BaseModel):
 
     def resolved_exclude(self) -> Set[torch.dtype]:
         return {parse_dtype(item.name) for item in self.exclude}
+
+    def resolved_include_precision(self) -> Dict[torch.dtype, Precision]:
+        """Return {dtype -> Precision} for included dtypes that have precision overrides."""
+        return {
+            parse_dtype(item.name): item.precision
+            for item in self.include
+            if item.precision is not None
+        }
 
 
 class TestEdits(BaseModel):
@@ -268,7 +284,7 @@ class SupportedModuleConfig(BaseModel):
 class GlobalConfig(BaseModel):
     """Model for global configs: supported_dtypes, supported_ops"""
 
-    supported_dtypes: List[NamedItem] = []
+    supported_dtypes: List[DtypeNamedItem] = []
     supported_ops: Optional[List[SupportedOpConfig]] = None
     supported_modules: Optional[List[SupportedModuleConfig]] = None
 
@@ -312,6 +328,16 @@ class GlobalConfig(BaseModel):
         if not self.supported_dtypes:
             return None
         return {parse_dtype(item.name) for item in self.supported_dtypes}
+
+    def resolved_supported_dtypes_precision(
+        self,
+    ) -> Dict[torch.dtype, Precision]:
+        """Return {dtype -> Precision} for dtypes that have precision overrides."""
+        return {
+            parse_dtype(item.name): item.precision
+            for item in self.supported_dtypes
+            if item.precision is not None
+        }
 
     def resolved_supported_ops(self) -> Optional[Set[str]]:
         if self.supported_ops is None:

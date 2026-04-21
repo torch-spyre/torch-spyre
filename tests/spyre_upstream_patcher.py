@@ -390,3 +390,73 @@ class _OOTModuleDtypePatcher:
             and self._modules_instance.allowed_dtypes is not None
         ):
             self._modules_instance.allowed_dtypes |= self._extra_dtypes
+
+
+class _OOTPrecisionOverridePatcher:
+    """Injects dtype-level precision overrides into fn.precision_overrides and
+    fn.tolerance_overrides before super().instantiate_test() runs.
+
+    Uses two upstream mechanisms that instantiate_test reads automatically:
+      - fn.precision_overrides: {dtype -> atol}          (@precisionOverride)
+      - fn.tolerance_overrides: {dtype -> tol(atol,rtol)} (@toleranceOverride)
+
+    When only atol is specified, precision_overrides is used.
+    When rtol is specified (with or without atol), tolerance_overrides is used
+    since it is the only upstream mechanism that carries rtol.
+
+    """
+
+    def __init__(
+        self,
+        test: object,
+        global_dtype_precision: dict,  # {torch.dtype -> Precision}
+        include_dtype_precision: dict,  # {torch.dtype -> Precision}
+    ) -> None:
+        self._underlying_fn = test.__func__ if hasattr(test, "__func__") else test
+        self._global_dtype_precision = global_dtype_precision
+        self._include_dtype_precision = include_dtype_precision
+
+    def patch(self) -> None:
+        if not self._global_dtype_precision and not self._include_dtype_precision:
+            return
+
+        # Merge: global first (lower priority), include overrides
+        merged: dict = {}
+        for dtype, prec in self._global_dtype_precision.items():
+            if prec is not None:
+                merged[dtype] = prec
+        for dtype, prec in self._include_dtype_precision.items():
+            if prec is not None:
+                merged[dtype] = prec
+
+        if not merged:
+            return
+
+        try:
+            from torch.testing._internal.common_device_type import tol as _tol
+
+            has_tol = True
+        except ImportError:
+            has_tol = False
+
+        for dtype, prec in merged.items():
+            atol = prec.atol
+            rtol = prec.rtol
+
+            if rtol is not None and has_tol:
+                # rtol specified - use tolerance_overrides (carries both atol+rtol)
+                # tolerance_overrides takes precedence over precision_overrides
+                # in upstream instantiate_test.
+                if not hasattr(self._underlying_fn, "tolerance_overrides"):
+                    self._underlying_fn.tolerance_overrides = {}
+                self._underlying_fn.tolerance_overrides[dtype] = _tol(
+                    atol=atol if atol is not None else 0.0,
+                    rtol=rtol,
+                )
+            elif atol is not None:
+                # atol only - use precision_overrides (simpler, matches @precisionOverride)
+                if not hasattr(self._underlying_fn, "precision_overrides"):
+                    self._underlying_fn.precision_overrides = {}
+                # setdefault for global, direct assign for include (already merged above
+                # so just assign - include already won priority during merge)
+                self._underlying_fn.precision_overrides[dtype] = atol
