@@ -6,3 +6,10 @@ self-hosted-runner:
     - official-aiu-x86-64-arc-runner-set-v1
     - official-aiu-x86-64-arc-runner-set-v2
     - official-aiu-x86-64-arc-runner-set-v3
+    - official-aiu-x86-64-arc-runner-set-v4
+    # add separate categories
+    - runner_v4
+    - x86_64
+    - amd64
+    - spyre_card_pf
+    - spyre_backend_image

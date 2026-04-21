@@ -26,42 +26,114 @@ jobs:
     name: Run Spyre unit tests
     # runs-on: official-aiu-x86-64-arc-runner-set-v1
     # runs-on: official-aiu-x86-64-arc-runner-set-v2
-    runs-on: official-aiu-x86-64-arc-runner-set-v3
+    # runs-on: official-aiu-x86-64-arc-runner-set-v3
+    # runs-on: official-aiu-x86-64-arc-runner-set-v4
+    runs-on:
+    # only run on x86_64 machines with a physical spyre card and using the spyre backend image
+      - x86_64
+      - spyre_card_pf
+      - spyre_backend_image
     # increase timeout to 12 hours
     timeout-minutes: 720
     # env: {}
     steps:
-      - name: Checkout repository
+      - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: get some info
+      - name: info
         run: |
-          echo 'gather info start'
+          MY_DELIM="=================================================================="
+          # echo "$MY_DELIM"
+          # echo 'sleeping so the user can exec in...'
+          # tail -f /dev/null
+
+          echo "$MY_DELIM"
           pwd
           ls -la
           whoami
           id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
-      - name: Install the torch-spyre package and dependencies
-        run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          # avoid the extra step required by --no-build-isolation
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-      - name: Run unit tests
-        run: |
-          echo 'Run unit tests start'
-          pytest tests/ -vvv -s || EXIT_CODE=$?
-          EXIT_CODE=${EXIT_CODE:-0}
-          echo "pytest EXIT_CODE: ${EXIT_CODE}"
-          if [[ "$EXIT_CODE" == '0' ]] ; then
-            echo 'pytest success'
-          else
-            echo 'pytest failed'
-          fi
-          echo 'Run unit tests end'
+          groups || true
+          env | sort
+          ls -al /etc/profile.d/ibm-aiu-setup.sh
+          env | sort | grep AIU_
+
+          echo "$MY_DELIM"
+          echo 'install uv...'
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          source "$HOME/.bashrc" || exit 1
+
+          echo "$MY_DELIM"
+          echo 'build torch-spyre'
+          cd
+          cd ./torch-spyre/torch-spyre/ || exit 1
+          uv sync --verbose --all-extras --active --inexact --reinstall-package torch-spyre || exit 1
+          source .venv/bin/activate || exit 1
+
+          echo "$MY_DELIM"
+          echo 'build torch_sendnn'
+          cd
+          cd torch_sendnn/ || exit 1
+          # python3 -m pip install build
+          # uv pip install build
+          python3 -m build --wheel . || exit 1
+          uv pip uninstall torch-sendnn
+          uv pip install --upgrade dist/torch_sendnn-*.whl --no-deps
+
+          echo "$MY_DELIM"
+          echo 'create the validation script'
+          cd
+          cat <<'EOF' > validation.py
+          #!/usr/bin/env python3
+
+          import torch
+
+
+          def main():
+              # check if the sendnn backends are available
+              # You should see the following:
+              # ['cudagraphs', 'inductor', 'openxla', 'sendnn', 'sendnn_compile_only', 'sendnn_mock', 'tvm']
+              backends = torch.compiler.list_backends()
+              print("torch.compiler.list_backends()", backends)
+              expected_backends = ["sendnn", "sendnn_compile_only", "sendnn_mock"]
+              assert all(
+                  b in backends for b in expected_backends
+              ), f"actual backends: {backends} expected_backends: {expected_backends}"
+              # check if a spyre card is available
+              print("torch.accelerator.is_available()", torch.accelerator.is_available())
+              # check the type of accelerator (should be spyre if it's present)
+              print(
+                  "torch.accelerator.current_accelerator()",
+                  torch.accelerator.current_accelerator(),
+              )
+              # if there's no spyre card (and no GPU)
+              print(
+                  "torch.accelerator.current_accelerator() is None",
+                  torch.accelerator.current_accelerator() is None,
+              )
+              # try creating some tensors
+              print("torch.empty((10,))", torch.empty((10,)))
+              print('torch.empty((10,), device="spyre")', torch.empty((10,), device="spyre"))
+              print('torch.zeros((10,), device="spyre")', torch.zeros((10,), device="spyre"))
+              print('torch.ones((10,), device="spyre")', torch.ones((10,), device="spyre"))
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          echo "$MY_DELIM"
+          echo 'run the validation script'
+          python3 validation.py || exit 1
+
+          echo "$MY_DELIM"
+          echo 'run the tests'
+          cd
+          cd ./torch-spyre/torch-spyre/ || exit 1
+          EXIT_CODE=0
+          pytest || EXIT_CODE=$?
+          echo "EXIT_CODE $EXIT_CODE"
+
+          echo "$MY_DELIM"
+          echo 'sleeping...'
+          tail -f /dev/null
+
           exit "$EXIT_CODE"
