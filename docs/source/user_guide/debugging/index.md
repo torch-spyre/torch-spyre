@@ -1,4 +1,14 @@
-# Debugging Guide
+# Debugging
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+
+inductor_artifacts
+```
+
+**Scope:** correctness — *why is the result wrong?* For performance
+questions (*why is it slow?*) see [Profiling](../profiling/index.md).
 
 This guide describes a systematic approach to debugging incorrect or
 unexpected behaviour in Torch-Spyre. The workflow applies whether you
