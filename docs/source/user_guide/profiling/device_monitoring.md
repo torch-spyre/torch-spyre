@@ -55,4 +55,3 @@ above.
   that affect `aiu-smi`
 - [Performance analysis methodology](performance_analysis_methodology.md) —
   pairing `aiu-smi` samples with trace-viewer timelines
-
