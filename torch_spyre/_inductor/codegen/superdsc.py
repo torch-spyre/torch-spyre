@@ -29,7 +29,6 @@ from torch_spyre._inductor.constants import (
     MATMUL_LAYOUT_LABELS,
     TOPK_OPS,
 )
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
@@ -433,25 +432,7 @@ def _create_sdsc_tensors(
     return sdsc_args, layouts, missing_dim
 
 
-def _get_op_func(
-    op: str, is_reduction: bool, output_scales: dict, op_spec: OpSpec
-) -> str:
-    if op == "to_dtype":
-        if op_spec and len(op_spec.args) >= 2:
-            src_dtype = op_spec.args[0].device_dtype
-            dst_dtype = op_spec.args[-1].device_dtype
-
-            if src_dtype == dst_dtype:
-                return IDENTITY_OP
-
-            cast_op = DtypeOpTable.get_operator(src_dtype, dst_dtype)
-
-            if cast_op is not None:
-                return cast_op
-
-        # TODO Fallback to CPU or identity op if op_spec is invalid or return error
-        return IDENTITY_OP
-
+def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     if op == "overwrite":
         return IDENTITY_OP
     if (
@@ -656,7 +637,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         )
 
     return SDSCSpec(
-        opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales, op_spec),
+        opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
         execution_unit="pt" if is_matmul else "sfp",
         data_format=op_spec.args[
             0

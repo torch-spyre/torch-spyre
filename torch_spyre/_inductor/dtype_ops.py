@@ -21,13 +21,16 @@ mapping PyTorch dtype pairs to Spyre hardware operators.
 
 from typing import Optional
 
-from torch_spyre._C import DataFormats
+import torch
+
 from torch_spyre._inductor.constants import (
+    IDENTITY_OP,
     # Deeptools type cast ops
     DL16TOFP32_OP,
     FP32TODL16_OP,
-    DL16TOBF16_OP,
-    FP8TODL16_OP,
+    # bf16 is identical to DL16 as per PR #1605
+    # DL16TOBF16_OP,
+    # FP8TODL16_OP,
     # TBD Deeptools type cast ops
     # FP32TOBF16_OP,
     # BF16TOFP32_OP,
@@ -42,36 +45,46 @@ from torch_spyre._inductor.constants import (
 
 
 class DtypeOpTable:
-    """Dtype conversion operator table.
+    _IDENTITY_CONVERSIONS = [
+        (torch.float16, torch.bool),
+        (torch.bool, torch.float16),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+    ]
 
-    Maps (source_dtype, destination_dtype) pairs to Spyre hardware operator names.
-    Provides methods to check support and retrieve stick sizes for conversions.
-    """
+    _FP16_TO_FP32_CONVERSIONS = [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+    ]
 
-    # Phase 0: Currently implemented conversions
+    _FP32_TO_FP16_CONVERSIONS = [
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
+    ]
+
     _CONVERSIONS = {
-        # Deeptools dtype cast ops
-        (DataFormats.IEEE_FP32, DataFormats.SEN169_FP16): FP32TODL16_OP,
-        (DataFormats.SEN169_FP16, DataFormats.IEEE_FP32): DL16TOFP32_OP,
-        (DataFormats.SEN169_FP16, DataFormats.BFLOAT16): DL16TOBF16_OP,
-        (DataFormats.SEN143_FP8, DataFormats.SEN169_FP16): FP8TODL16_OP,
-        (DataFormats.SEN152_FP8, DataFormats.SEN169_FP16): FP8TODL16_OP,
+        **{pair: IDENTITY_OP for pair in _IDENTITY_CONVERSIONS},
+        **{pair: FP32TODL16_OP for pair in _FP16_TO_FP32_CONVERSIONS},
+        **{pair: DL16TOFP32_OP for pair in _FP32_TO_FP16_CONVERSIONS},
         # TBD Deeptools dtype cast ops
-        # (DataFormats.IEEE_FP32, DataFormats.BFLOAT16): FP32TOBF16_OP,
-        # (DataFormats.BFLOAT16, DataFormats.IEEE_FP32): BF16TOFP32_OP,
-        # (DataFormats.IEEE_FP32, DataFormats.SEN143_FP8): FP32TOFP8_OP,
-        # (DataFormats.IEEE_FP32, DataFormats.SEN152_FP8): FP32TOFP8_OP,
-        # (DataFormats.SEN143_FP8, DataFormats.IEEE_FP32): FP8TOFP32_OP,
-        # (DataFormats.SEN152_FP8, DataFormats.IEEE_FP32): FP8TOFP32_OP,
-        # (DataFormats.BFLOAT16, DataFormats.SEN169_FP16): BF16TODL16_OP,
-        # (DataFormats.IEEE_INT32, DataFormats.SENINT16): INT32TOINT16_OP,
-        # (DataFormats.SENINT16, DataFormats.IEEE_INT32): INT16TOINT32_OP,
-        # (DataFormats.IEEE_INT32, DataFormats.SENINT8): INT32TOINT8_OP,
-        # (DataFormats.SENINT8, DataFormats.IEEE_INT32): INT8TOINT32_OP,
+        # (torch.bfloat16, torch.float32): FP32TOBF16_OP,
+        # (torch.float32, torch.bfloat16): BF16TOFP32_OP,
+        # FP8 conversions (when supported)
+        # (torch.float8_e4m3fn, torch.float32): FP32TOFP8_OP,
+        # (torch.float8_e5m2, torch.float32): FP32TOFP8_OP,
+        # (torch.float32, torch.float8_e4m3fn): FP8TOFP32_OP,
+        # (torch.float32, torch.float8_e5m2): FP8TOFP32_OP,
+        # (torch.float16, torch.float8_e4m3fn): FP8TODL16_OP,
+        # (torch.float16, torch.float8_e5m2): FP8TODL16_OP,
+        # Integer conversions (when supported)
+        # (torch.int16, torch.int32): INT32TOINT16_OP,
+        # (torch.int32, torch.int16): INT16TOINT32_OP,
+        # (torch.int8, torch.int32): INT32TOINT8_OP,
+        # (torch.int32, torch.int8): INT8TOINT32_OP,
     }
 
     @classmethod
     def get_operator(
-        cls, src_dtype: DataFormats, dst_dtype: DataFormats
+        cls, src_dtype: torch.dtype, dst_dtype: torch.dtype
     ) -> Optional[str]:
         return cls._CONVERSIONS.get((src_dtype, dst_dtype))
