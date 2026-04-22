@@ -1658,6 +1658,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
             },
         },
+        ("test_rope_fms", "test_rope_cpu"): {
+            "param_sets": {
+                "fp16": (
+                    cached_randn((2, 256, 4096), dtype=torch.float16),
+                    cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -2246,6 +2254,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return op(dim, index, x[:, :, start:end])
 
         compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
+
+    def test_rope_cpu(self, q, freqs):
+        def fn(q, freqs):
+            q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
+            mul_out = freqs[:, :, None, :, :, :] * q_.unsqueeze(-3)
+            sum_out = mul_out.sum(4, keepdim=True)
+            q_out = sum_out.flatten(3)
+            return q_out
+
+        compare_with_cpu(fn, q, freqs, cpu_compile=False)
 
 
 if __name__ == "__main__":
