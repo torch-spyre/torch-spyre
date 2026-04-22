@@ -136,7 +136,7 @@ class Term:
     """
     A term num*(var%mod)//den + offset in a coordinate expression.
     Includes the size of the dimension the expression is intended for.
-    Zero is represented as Term(None, None, None, None, dim_size, 0).
+    Constant including zero is represented as Term(None, None, None, None, dim_size, offset).
     """
 
     num: sympy.Expr | None  # numerator
@@ -174,9 +174,7 @@ def normalize_coordinates(
         vars = expr.free_symbols
         offset = expr.xreplace({var: sympy.S.Zero for var in vars})
         if len(vars) == 0:
-            # TODO: Support size-1 dimensions with non-zero offset
-            assert offset == 0
-            terms.append(Term(None, None, None, None, dim_size))
+            terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         dim_terms = []  # terms for current dimension
         for var in vars:
@@ -249,10 +247,10 @@ def normalize_coordinates(
             fused_term.dim_size *= term.dim_size
             fused_term.offset += term.offset
         else:
-            if fused_term.dim_size > 1:
+            if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
             fused_term = term
-    if fused_term.dim_size > 1:
+    if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
     # add term for stick dimension
     fused_terms.append(terms[-1])
@@ -262,7 +260,7 @@ def normalize_coordinates(
 
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
-    tensors: Sequence[Dict[str, Sequence[sympy.Expr]]],
+    tensors: list[Dict[str, list[sympy.Expr]]],
 ) -> tuple[
     (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
 ]:
@@ -282,6 +280,35 @@ def align_tensors(
     all_terms = []  # terms for each tensor
     stick_dim = []  # stick var for each tensor
     stick_size = []  # stick size for each tensor
+
+    n = 0  # next symbol number
+
+    # TODO: Current support of size-1 dimensions are limited. We will generalize this
+    # in follow-up PRs. See #1548
+    is_pointwise_op = len(set([len(tensor["size"]) for tensor in tensors])) == 1
+    if is_pointwise_op:
+        rank = len(tensors[0]["size"])
+        vars = var_ranges.keys()
+        for i in range(rank):
+            coords = [tensor["coordinates"][i] for tensor in tensors]
+            if all(c == 0 for c in coords):
+                continue
+            if not any(c == 0 for c in coords):
+                continue
+            if not any(c.is_number and c > 0 for c in coords):
+                continue
+
+            new_var = sympy.symbols(f"z{n}")
+            n += 1
+            var_ranges[new_var] = 1
+            splits[new_var] = set()
+
+            for tensor in tensors:
+                coord = tensor["coordinates"][i]
+                if coord == 0:
+                    tensor["coordinates"][i] = new_var
+                else:
+                    tensor["coordinates"][i] = new_var + coord
 
     for tensor in tensors:
         terms = normalize_coordinates(var_ranges, tensor["size"], tensor["coordinates"])
@@ -304,7 +331,6 @@ def align_tensors(
     # with one var per segment (split[i], split[i+1])
     new_var_ranges = {}
     new_op_it_space_splits = {}
-    n = 0  # next symbol number
     remap = {}  # map old var to new vars in splits order
     for var, split in splits.items():
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
@@ -351,7 +377,11 @@ def align_tensors(
                 and den not in splits[var]
                 else splits[var].index(den)
             )  # replace split[var].index(stick_size) with 0 for stick dim
-            for i in reversed(range(low, splits[var].index(mod))):
+            high = splits[var].index(mod)
+            if low == high:
+                size.append(dim_size)
+                coordinates.append(var + offset)
+            for i in reversed(range(low, high)):
                 if i == splits[var].index(mod) - 1:
                     # upper bound of iteration range is dim_size * den
                     size.append(dim_size * den // splits[var][i])

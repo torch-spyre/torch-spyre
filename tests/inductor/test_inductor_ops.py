@@ -1647,6 +1647,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
             },
         },
+        ("test_slice", "test_slice_cpu"): {
+            "ops_dict": {
+                "slice3": lambda dim, index, x: x.exp(),
+            },
+            "param_sets": {
+                # TODO: Add more tests by generalizing size-1 dim support. See #1548
+                "3d1s0": (1, 0, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s1": (1, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -2220,6 +2231,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_split_cpu(self, op, dim, index, x):
         def fn(x):
             return op(dim, index, x)
+
+        compare_with_cpu(fn, x, run_eager=False)
+
+    def test_slice_cpu(self, op, dim, index, x):
+        def fn(x):
+            start = index * (x.size()[0] // 3)
+            end = (index + 1) * (x.size()[0] // 3)
+            if dim == 0:
+                return op(dim, index, x[start:end])
+            elif dim == 1:
+                return op(dim, index, x[:, start:end])
+            elif dim == 2:
+                return op(dim, index, x[:, :, start:end])
 
         compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
 
