@@ -107,7 +107,7 @@ class TestCoordinates(TestCase):
         )
         self.assertEqual(cx, [p0, p1, p2 + 128])
 
-        # offset spanning dimentions
+        # offset spanning dimensions
         cx = compute_coordinates(
             [10, 20, 30],
             [600, 30, 1],
@@ -163,7 +163,7 @@ class TestCoordinates(TestCase):
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
 
-        # non-contiguous strides wit offset
+        # non-contiguous strides with offset
         cx = compute_coordinates(
             [256, 64, 2, 64],
             [4096, 64, 1048576, 1],
@@ -173,7 +173,7 @@ class TestCoordinates(TestCase):
         # offset 200 = 0*1048576 + 0*4096 + 3*64 + 8*1
         self.assertEqual(cx, [p2, 2 * p1 + p3 // 64 + 3, p0, p3 % 64 + 8])
 
-        # spliting the stick dimention
+        # splitting the stick dimension
         cx = compute_coordinates(
             [15, 6, 9, 64],
             [384, 64, 5760, 1],
