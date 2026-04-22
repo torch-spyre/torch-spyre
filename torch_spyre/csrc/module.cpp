@@ -326,7 +326,6 @@ PYBIND11_MODULE(_C, m) {
           }));
 
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
-  m.def("to_with_layout", &spyre::to_with_layout);
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -364,6 +363,14 @@ PYBIND11_MODULE(_C, m) {
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // Memory copy functions
+  m.def("copy_host_to_device", &spyre::copy_host_to_device,
+        "Copy tensor from host to device using DMA", py::arg("self"),
+        py::arg("dst"));
+  m.def("copy_device_to_host", &spyre::copy_device_to_host,
+        "Copy tensor from device to host using DMA", py::arg("self"),
+        py::arg("dst"));
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
