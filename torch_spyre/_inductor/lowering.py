@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, StorageBox
+from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -512,22 +512,21 @@ def lower_spyre_from_d2d(src, dst):
 def lower_overwrite(input, output, dims, offsets):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
 
-    strides = [int(output.get_layout().stride[d]) for d in dims]
-    gaps = [int(output.get_layout().size[d] - input.get_layout().size[d]) for d in dims]
-
     def inner_fn(index):
-        return fn(
-            input.make_loader()(index),
-            strides,
-            offsets,
-            gaps,
-        )
+        return fn(input.make_loader()(index))
 
-    inp = Pointwise(
+    def output_indexer(index):
+        out_index = [*index]
+        for dim, offset in zip(dims, offsets):
+            out_index[dim] += offset
+        return out_index
+
+    inp = Scatter(
         device=input.get_device(),
         dtype=input.get_dtype(),
         inner_fn=inner_fn,
         ranges=input.get_size(),
+        output_indexer=output_indexer,
     )
 
     output.realize()
