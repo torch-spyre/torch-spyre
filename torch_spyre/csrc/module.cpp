@@ -86,14 +86,11 @@ void _startRuntime() {
   } else if (const char *lr = std::getenv("LOCAL_RANK")) {
     logical_device_id = std::atoi(lr);
   }
-  ensureSpyreDevicesEnv();
 
-  const auto &devices = getVisibleDevices();
-  if (logical_device_id >= 0 &&
-      logical_device_id < static_cast<int>(devices.size())) {
-    DEBUGINFO("logical_device_id =", logical_device_id,
-              "-> PCI bus ID =", devices[logical_device_id].pci_bus_id);
-  }
+  const int num_devices = getVisibleDeviceCount();
+  TORCH_CHECK(logical_device_id < num_devices,
+              "Device index out of bounds. logical_device_id=",
+              logical_device_id, ", number of visible devices=", num_devices);
 
   std::shared_ptr<Runtime> runtime;
   auto s = flex::initializeRuntime(&runtime, logical_device_id);
@@ -101,10 +98,7 @@ void _startRuntime() {
   if (runtime) {
     GlobalRuntime::set(runtime);
     DEBUGINFO(s);
-    std::string env_key = "AIU_WORLD_RANK_" + std::to_string(logical_device_id);
-    const char *pci = std::getenv(env_key.c_str());
-    DEBUGINFO("runtime started, device PCI bus ID:",
-              pci ? pci : "(default/senlib)");
+    DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
   } else {
     DEBUGINFO("runtime FAILED TO START.");
     throw std::runtime_error("Failed to initialize Spyre runtime. ");

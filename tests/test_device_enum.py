@@ -17,43 +17,9 @@
 import os
 import subprocess
 import sys
-from pathlib import Path
 from typing import Optional
 
 import pytest
-
-
-# Spyre PCI vendor/device IDs (must match spyre_device_enum.cpp)
-SPYRE_VENDOR_ID = 0x1014  # IBM
-SPYRE_DEVICE_ID = 0x06A7  # Spyre Accelerator
-
-
-def discover_spyre_pci_bus_ids() -> list[str]:
-    """
-    Discover Spyre PCI bus IDs by scanning /sys/bus/pci/devices/.
-
-    Returns list of PCI bus IDs (e.g., ['0000:29:00.0', '0000:3c:00.0'])
-    """
-    sysfs_path = Path("/sys/bus/pci/devices")
-    if not sysfs_path.exists():
-        return []
-
-    bus_ids = []
-    for device_dir in sysfs_path.iterdir():
-        try:
-            vendor_file = device_dir / "vendor"
-            device_file = device_dir / "device"
-
-            if vendor_file.exists() and device_file.exists():
-                vendor = int(vendor_file.read_text().strip(), 16)
-                device = int(device_file.read_text().strip(), 16)
-
-                if vendor == SPYRE_VENDOR_ID and device == SPYRE_DEVICE_ID:
-                    bus_ids.append(device_dir.name)
-        except (OSError, ValueError):
-            continue
-
-    return bus_ids
 
 
 def get_device_count_in_subprocess(env_vars: Optional[dict] = None) -> int:
@@ -71,7 +37,7 @@ print(torch.spyre.device_count())
     if env_vars is not None:
         env.update(env_vars)
         # Remove env vars that might interfere if not specified
-        for key in ["SPYRE_VISIBLE_DEVICES", "PCIDEVICE_IBM_COM_AIU_PF"]:
+        for key in ["SPYRE_DEVICES", "AIU_WORLD_SIZE"]:
             if key not in env_vars:
                 env.pop(key, None)
 
@@ -95,59 +61,74 @@ print(torch.spyre.device_count())
 class TestDeviceEnumEnvVars:
     """Test environment variable handling for device enumeration."""
 
-    def test_default_pci_scan(self):
-        """Test default PCI bus scan - verifies hardware is detected."""
+    def test_no_env_vars(self):
+        """Test No env vars → returns total devices."""
         count = get_device_count_in_subprocess({})
-        assert count > 0, "No Spyre devices found via PCI scan"
+        assert count > 0
+
+    def test_aiu_world_size_smaller_equal_total(self):
+        """Test AIU_WORLD_SIZE → returns AIU_WORLD_SIZE."""
+        count = get_device_count_in_subprocess({"AIU_WORLD_SIZE": "1"})
+        assert count == 1
+
+    def test_aiu_world_size_larger_total(self):
+        """Test AIU_WORLD_SIZE larger than total devices → returns total devices."""
+        total = get_device_count_in_subprocess({})
+        aiu_world_size = total + 1
+        count = get_device_count_in_subprocess({"AIU_WORLD_SIZE": str(aiu_world_size)})
+        assert count == total
 
     def test_spyre_visible_devices_single(self):
-        """Test SPYRE_VISIBLE_DEVICES with single index."""
-        count = get_device_count_in_subprocess({"SPYRE_VISIBLE_DEVICES": "0"})
+        """Test SPYRE_DEVICES with single index."""
+        count = get_device_count_in_subprocess({"SPYRE_DEVICES": "0"})
         assert count == 1
 
-    def test_spyre_visible_devices_multiple(self):
-        """Test SPYRE_VISIBLE_DEVICES with multiple indices."""
-        # Check total count first
+    @pytest.mark.parametrize(
+        "devices_str,expected_count,min_devices,description",
+        [
+            ("0,1", 2, 2, "basic multiple devices"),
+            ("0,1,1", 2, 2, "duplicates should be deduplicated"),
+            ("1,0", 2, 2, "out-of-order indices"),
+            ("0, {total_plus_one}", 1, 2, "out-of-range index should be filtered out"),
+        ],
+    )
+    def test_spyre_visible_devices_multiple(
+        self, devices_str, expected_count, min_devices, description
+    ):
+        """Test SPYRE_DEVICES with various scenarios."""
+        # Check if we have enough devices for this test
         total = get_device_count_in_subprocess({})
-        if total < 2:
-            pytest.skip("Need at least 2 devices")
+        if total < min_devices:
+            pytest.skip(f"Need at least {min_devices} devices for: {description}")
 
-        count = get_device_count_in_subprocess({"SPYRE_VISIBLE_DEVICES": "0,1"})
-        assert count == 2
-
-    def test_k8s_pci_device_env(self):
-        """Test PCIDEVICE_IBM_COM_AIU_PF (K8s device plugin)."""
-        bus_ids = discover_spyre_pci_bus_ids()
-        if not bus_ids:
-            pytest.skip("No Spyre devices found via sysfs scan")
-
-        # Test with single PCI bus ID
-        count = get_device_count_in_subprocess({"PCIDEVICE_IBM_COM_AIU_PF": bus_ids[0]})
-        assert count == 1
-
-    def test_env_var_priority(self):
-        """SPYRE_VISIBLE_DEVICES takes priority over PCIDEVICE_IBM_COM_AIU_PF."""
-        count = get_device_count_in_subprocess(
-            {
-                "SPYRE_VISIBLE_DEVICES": "0",
-                "PCIDEVICE_IBM_COM_AIU_PF": "invalid_bus_id",
-            }
+        resolved_devices_str = devices_str.format(total_plus_one=total + 1)
+        count = get_device_count_in_subprocess({"SPYRE_DEVICES": resolved_devices_str})
+        assert count == expected_count, (
+            f"SPYRE_DEVICES='{resolved_devices_str}' ({description}) "
+            f"should return {expected_count}, got {count}"
         )
-        assert count == 1, "SPYRE_VISIBLE_DEVICES should take priority"
 
-    def test_k8s_invalid_pci_bus_id_filtered(self):
-        """Invalid PCI bus IDs are filtered out, count equals valid IDs only."""
-        bus_ids = discover_spyre_pci_bus_ids()
-        if not bus_ids:
-            pytest.skip("No Spyre devices found via sysfs scan")
+    @pytest.mark.parametrize(
+        "aiu_world_size,spyre_devices,expected_count,min_devices,description",
+        [
+            ("2", "0", 1, 2, "AIU_WORLD_SIZE=2, SPYRE_DEVICES=0"),
+            ("2", "0,1", 2, 2, "AIU_WORLD_SIZE=2, SPYRE_DEVICES=0,1"),
+        ],
+    )
+    def test_aiu_world_size_with_spyre_devices(
+        self, aiu_world_size, spyre_devices, expected_count, min_devices, description
+    ):
+        """Test AIU_WORLD_SIZE with SPYRE_DEVICES combinations."""
+        total = get_device_count_in_subprocess({})
+        if total < min_devices:
+            pytest.skip(f"Need at least {min_devices} devices for: {description}")
 
-        # Use first valid PCI bus ID + append an invalid one
-        valid_id = bus_ids[0]
-        env_val = f"{valid_id},0000:ff:ff.ff"
-        count = get_device_count_in_subprocess({"PCIDEVICE_IBM_COM_AIU_PF": env_val})
-
-        # Count should be 1 (invalid ID filtered out)
-        assert count == 1, f"Expected 1 (invalid ID filtered), got {count}"
+        count = get_device_count_in_subprocess(
+            {"AIU_WORLD_SIZE": aiu_world_size, "SPYRE_DEVICES": spyre_devices}
+        )
+        assert count == expected_count, (
+            f"{description} should return {expected_count}, got {count}"
+        )
 
 
 if __name__ == "__main__":
