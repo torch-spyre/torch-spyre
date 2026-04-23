@@ -16,6 +16,24 @@ import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
 import torch_spyre._C as _C
 import warnings
+import functools
+
+
+# Decorator to keep track of compiled variant
+def compile_once(op, **compile_kwargs):
+    def decorator(fn):
+        compiled = None
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            nonlocal compiled
+            if compiled is None:
+                compiled = torch.compile(op, **compile_kwargs)
+            return fn(*args, compiled=compiled, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def maybe_wrap_dim(dim: int, ndims: int) -> int:
@@ -25,17 +43,17 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
 
 
 @torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
-def spyre__mm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
-    compiled_mm = torch.compile(torch.mm, dynamic=False)
-    return compiled_mm(self, mat2)
+@compile_once(torch.mm, dynamic=False)
+def spyre__mm(self: torch.Tensor, mat2: torch.Tensor, compiled) -> torch.Tensor:
+    return compiled(self, mat2)
 
 
 @torch.library.register_kernel("aten::mm.out", ["spyre"])  # type:ignore
+@compile_once(torch.mm, dynamic=False)
 def spyre__mm_out(
-    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor
+    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor, compiled
 ) -> torch.Tensor:
-    compiled_mm = torch.compile(torch.mm, dynamic=False)
-    return compiled_mm(self, mat2, out=out)
+    return compiled(self, mat2, out=out)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -72,17 +90,21 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
 
 
 @torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
-def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+@compile_once(torch.ops.aten.silu.out, dynamic=False)
+def spyre__silu_out(
+    self: torch.Tensor, out: torch.Tensor = None, compiled=None
+) -> torch.Tensor:
     # Out variant
-    compiled_silu = torch.compile(torch.ops.aten.silu.out, dynamic=False)
-    return compiled_silu(self, out=out)
+    return compiled(self, out=out)
 
 
 @torch.library.register_kernel("aten::mish.out", ["spyre"])  # type:ignore
-def spyre__mish_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+@compile_once(torch.ops.aten.mish.out, dynamic=False)
+def spyre__mish_out(
+    self: torch.Tensor, out: torch.Tensor = None, compiled=None
+) -> torch.Tensor:
     # Out variant
-    compiled_mish = torch.compile(torch.ops.aten.mish.out, dynamic=False)
-    return compiled_mish(self, out=out)
+    return compiled(self, out=out)
 
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
