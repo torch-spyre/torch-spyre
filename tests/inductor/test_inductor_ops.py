@@ -297,7 +297,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim_neg1": (-1, cached_randn((3, 7, 9))),
                 "3d_dim_neg12": ((-1, -2), cached_randn((3, 7, 9))),
                 # 0D / scalar tensor:
-                # "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)), # TODO
+                "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
         },
         ("test_max_sub_broadcast", "test_max_sub_broadcast"): {
