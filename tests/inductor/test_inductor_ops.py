@@ -297,7 +297,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim_neg1": (-1, cached_randn((3, 7, 9))),
                 "3d_dim_neg12": ((-1, -2), cached_randn((3, 7, 9))),
                 # 0D / scalar tensor:
-                # "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)), # TODO
+                "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
         },
         ("test_max_sub_broadcast", "test_max_sub_broadcast"): {
@@ -933,6 +933,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_empty_like",
+            "test_empty_like_cpu",
+        ): {
+            "param_sets": {
+                "1d_fp16": (cached_randn((64,), dtype=torch.float16),),
+                "2d_fp16": (cached_randn((4, 8), dtype=torch.float16),),
+                "2d_fp32": (cached_randn((4, 8), dtype=torch.float32),),
+                "3d_fp16": (cached_randn((2, 4, 8), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_empty_like_dtype_override",
+            "test_empty_like_dtype_override_cpu",
+        ): {
+            "param_sets": {
+                "fp16_to_fp32": (cached_randn((4, 8), dtype=torch.float16),),
+                "fp32_to_fp16": (cached_randn((4, 8), dtype=torch.float32),),
+            },
+        },
+        (
+            "test_empty_like_memory_format",
+            "test_empty_like_memory_format_cpu",
+        ): {
+            "param_sets": {
+                "transposed_2d": (cached_randn((4, 8), dtype=torch.float16),),
+            },
+        },
+        (
             "test_new_ones",
             "test_new_ones_cpu",
         ): {
@@ -1218,7 +1246,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {
                 # exp(unsqueeze(x)) triggers internal compile in eager mode that
-                # fails with "Host dimension not found in dim_map" errors
+                # fails with host dimension lookup errors
                 "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
             },
             "param_sets": {
@@ -1647,6 +1675,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
             },
         },
+        ("test_slice", "test_slice_cpu"): {
+            "ops_dict": {
+                "slice3": lambda dim, index, x: x.exp(),
+            },
+            "param_sets": {
+                # TODO: Add more tests by generalizing size-1 dim support. See #1548
+                "3d1s0": (1, 0, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s1": (1, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
+            },
+        },
+        ("test_rope_fms", "test_rope_cpu"): {
+            "param_sets": {
+                "fp16": (
+                    cached_randn((2, 256, 4096), dtype=torch.float16),
+                    cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1913,6 +1960,41 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.arange(*args, dtype=torch.float16, device=device)
 
         compare_with_cpu(fn, needs_device=True)
+
+    def test_empty_like_cpu(self, x):
+        def fn(x):
+            y = torch.empty_like(x)
+            y.fill_(1.0)
+            return y
+
+        compare_with_cpu(fn, x)
+
+    @unittest.skip("dtype override may not be supported on Spyre")
+    def test_empty_like_dtype_override_cpu(self, x):
+        """Test empty_like with dtype override (fp16->fp32 or fp32->fp16)."""
+        # Determine target dtype (opposite of input)
+        target_dtype = torch.float32 if x.dtype == torch.float16 else torch.float16
+
+        def fn(x):
+            y = torch.empty_like(x, dtype=target_dtype)
+            y.fill_(1.0)
+            return y
+
+        compare_with_cpu(fn, x)
+
+    def test_empty_like_memory_format_cpu(self, x):
+        """Test empty_like with memory_format on non-contiguous (transposed) input."""
+
+        def fn(x):
+            # Create non-contiguous input via transpose
+            x_t = x.t()
+            # empty_like with contiguous_format should create contiguous output
+            y = torch.empty_like(x_t, memory_format=torch.contiguous_format)
+            y.fill_(1.0)
+            return y
+
+        # Note: .contiguous() causes issues with eager mode per existing patterns
+        compare_with_cpu(fn, x, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_new_ones_cpu(self, x, y):
@@ -2221,7 +2303,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return op(dim, index, x)
 
+        compare_with_cpu(fn, x, run_eager=False)
+
+    def test_slice_cpu(self, op, dim, index, x):
+        def fn(x):
+            start = index * (x.size()[0] // 3)
+            end = (index + 1) * (x.size()[0] // 3)
+            if dim == 0:
+                return op(dim, index, x[start:end])
+            elif dim == 1:
+                return op(dim, index, x[:, start:end])
+            elif dim == 2:
+                return op(dim, index, x[:, :, start:end])
+
         compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
+
+    def test_rope_cpu(self, q, freqs):
+        def fn(q, freqs):
+            q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
+            mul_out = freqs[:, :, None, :, :, :] * q_.unsqueeze(-3)
+            sum_out = mul_out.sum(4, keepdim=True)
+            q_out = sum_out.flatten(3)
+            return q_out
+
+        compare_with_cpu(fn, q, freqs, cpu_compile=False)
 
 
 if __name__ == "__main__":

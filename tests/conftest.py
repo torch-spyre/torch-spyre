@@ -144,13 +144,13 @@ def pytest_addoption(parser):
         "--list-models",
         action="store_true",
         default=False,
-        help="List models found in tests/_inductor/models/*.yaml and exit.",
+        help="List models found in tests/resource/models/*.yaml and exit.",
     )
     parser.addoption(
         "--list-cases",
         action="store_true",
         default=False,
-        help="List cases found in tests/_inductor/models/*.yaml and exit. Use --model to filter.",
+        help="List cases found in tests/resource/models/*.yaml and exit. Use --model to filter.",
     )
     parser.addoption(
         "--compile-backend",
@@ -193,7 +193,7 @@ def pytest_addoption(parser):
 
 
 def _models_dir(rootpath: Path) -> Path:
-    return rootpath / "tests" / "_inductor" / "models"
+    return rootpath / "tests" / "resource" / "models"
 
 
 def load_yaml_or_fail(path: Path) -> dict:
@@ -281,7 +281,7 @@ def compile_backend(pytestconfig):
 def pytest_configure(config):
     shared_config._PYTEST_CONFIG = config
     # auto-register model_<name> markers based on YAML files
-    mdir = config.rootpath / "tests" / "_inductor" / "models"
+    mdir = config.rootpath / "tests" / "resource" / "models"
     for p in mdir.glob("*.yaml"):
         spec = load_yaml_or_fail(p)
         model = spec.get("model", p.stem)
@@ -325,7 +325,8 @@ def pytest_collection_modifyitems(config, items):
 
     for item in items:
         # item.nodeid includes the file path, e.g. "tests/models/test_model_ops.py::test_model_ops[...]"
-        if "tests/models/test_model_ops.py::" in item.nodeid:
+        # if "tests/models/test_model_ops.py::" in item.nodeid:
+        if "tests/models/test_model_ops" in item.nodeid:
             keep.append(item)
         else:
             deselect.append(item)

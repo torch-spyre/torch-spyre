@@ -103,7 +103,7 @@ Inductor lowering or stickification pass.
 **sdsc.json**
 This is the final specification fed to the DeepTools back-end compiler.
 It encodes the op name, input/output tensor layouts (`device_size`,
-`dim_map`, `device_dtype`), work division, and scratchpad allocations.
+`stride_map`, `device_dtype`), work division, and scratchpad allocations.
 Bugs that appear only in the final output often trace back here.
 
 ### Example: debugging an incorrect `clone` result
@@ -117,7 +117,7 @@ correct:
 
 ```
 [TORCH_SPYRE_DEBUG] copy_to_device: shape=[65] dtype=float16
-  device_layout: SpyreTensorLayout(device_size=[2, 64], dim_map=[0, 0], ...)
+  device_layout: SpyreTensorLayout(device_size=[2, 64], stride_map=[64, 1], ...)
   transfer OK
 ```
 

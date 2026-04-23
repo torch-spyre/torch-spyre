@@ -1,0 +1,4107 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/models/test_model_ops_v2.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestSpyreModelOps::test_model_ops_db
+          mode: mandatory_success
+          tags:
+            - gpt-oss-20b
+            - constant
+          edits:
+            ops:
+              include:
+                - name: torch.nn.functional.embedding
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:471 in forward, code: inputs_embeds = self.embed_tokens(input_ids)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11]
+                          stride: [11, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [201088, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 199999
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:201 in forward, code: inv_freq_expanded = self.inv_freq[None,
+                    :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (None, slice(None, None, None), None)
+
+                - name: torch.float
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:201 in forward, code: inv_freq_expanded = self.inv_freq[None,
+                    :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:201 in forward, code: inv_freq_expanded = self.inv_freq[None,
+                    :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: -1
+                      - value: 1
+
+                - name: torch.to
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:201 in forward, code: inv_freq_expanded = self.inv_freq[None,
+                    :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: cuda:0
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:202 in forward, code: position_ids_expanded = position_ids[:,
+                    None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11]
+                          stride: [11, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+
+                - name: torch.float
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:202 in forward, code: position_ids_expanded = position_ids[:,
+                    None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 11]
+                          stride: [11, 11, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+
+                - name: torch.float
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:206 in forward, code: freqs = (inv_freq_expanded.float() @
+                    position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 11]
+                          stride: [11, 11, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:206 in forward, code: freqs = (inv_freq_expanded.float() @
+                    position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11]
+                          stride: [11, 11, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:206 in forward, code: freqs = (inv_freq_expanded.float() @
+                    position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 11]
+                          stride: [352, 11, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.cos
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:208 in forward, code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 32]
+                          stride: [352, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:208 in forward, code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 32]
+                          stride: [352, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.3465735902799727
+
+                - name: torch.sin
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:209 in forward, code: sin = emb.sin() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 32]
+                          stride: [352, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.pow
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:60 in forward, code: variance = hidden_states.pow(2).mean(-1,
+                    keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+
+                - name: torch.mean
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:60 in forward, code: variance = hidden_states.pow(2).mean(-1,
+                    keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                    kwargs:
+                      keepdim: true
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+                    + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 1]
+                          stride: [11, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+
+                - name: torch.rsqrt
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+                    + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 1]
+                          stride: [11, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+                    + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 11, 1]
+                          stride: [11, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:62 in forward, code: return (self.weight * hidden_states).to(input_dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [2880]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:317 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:317 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 4096]
+                          stride: [45056, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 11, -1, 64)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:317 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 64, 64]
+                          stride: [45056, 4096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:318 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [512, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [512]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:318 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 512]
+                          stride: [5632, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 11, -1, 64)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:318 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 8, 64]
+                          stride: [5632, 512, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:238 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 32]
+                          stride: [352, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.chunk
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 64]
+                          stride: [45056, 64, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                    kwargs:
+                      dim: -1
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 11, 32]
+                            stride: [45056, 64, 4096, 1]
+                            storage_offset: 32
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                      - value: 0
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 32]
+                          stride: [45056, 64, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11, 32]
+                          stride: [352, 11, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 32]
+                          stride: [45056, 64, 4096, 1]
+                          storage_offset: 32
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11, 32]
+                          stride: [352, 11, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.sub
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 32]
+                          stride: [22528, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 11, 32]
+                          stride: [22528, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:233 in _apply_rotary_emb, code: second_ = second_half * cos
+                    + first_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 32]
+                          stride: [22528, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 11, 32]
+                          stride: [22528, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:234 in _apply_rotary_emb, code: return torch.cat((first_,
+                    second_), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 11, 32]
+                            stride: [22528, 32, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 64, 11, 32]
+                            stride: [22528, 32, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.chunk
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 11, 64]
+                          stride: [5632, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                    kwargs:
+                      dim: -1
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 11, 32]
+                            stride: [5632, 64, 512, 1]
+                            storage_offset: 32
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                      - value: 0
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 11, 32]
+                          stride: [5632, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11, 32]
+                          stride: [352, 11, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 11, 32]
+                          stride: [5632, 64, 512, 1]
+                          storage_offset: 32
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11, 32]
+                          stride: [352, 11, 1, 11]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.sub
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 11, 32]
+                          stride: [2816, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 11, 32]
+                          stride: [2816, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:233 in _apply_rotary_emb, code: second_ = second_half * cos
+                    + first_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 11, 32]
+                          stride: [2816, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 11, 32]
+                          stride: [2816, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:234 in _apply_rotary_emb, code: return torch.cat((first_,
+                    second_), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 11, 32]
+                            stride: [2816, 32, 256, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 11, 32]
+                            stride: [2816, 32, 256, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.zeros
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:290 in lazy_initialization, code: self.keys = torch.zeros('
+                  sample_inputs_func:
+                    args:
+                      - value: (1, 8, 128, 64)
+                    kwargs:
+                      dtype: torch.float16
+                      device: cuda:0
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:451 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 128, 64]
+                          stride: [65536, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [11]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 128
+                      - tensor:
+                          shape: [1, 8, 11, 64]
+                          stride: [5632, 704, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:452 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 128, 64]
+                          stride: [65536, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [11]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 128
+                      - tensor:
+                          shape: [1, 8, 11, 64]
+                          stride: [5632, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:222 in repeat_kv, code: hidden_states = hidden_states[:, :,
+                    None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 128, 64]
+                          stride: [65536, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:222 in repeat_kv, code: hidden_states = hidden_states[:, :,
+                    None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128, 64]
+                          stride: [65536, 8192, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 8
+                      - value: 8
+                      - value: 128
+                      - value: 64
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:223 in repeat_kv, code: return hidden_states.reshape(batch,
+                    num_key_value_heads * n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 8, 128, 64]
+                          stride: [65536, 8192, 0, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 64, 128, 64)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 128, 64]
+                          stride: [524288, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - value: 3
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 64]
+                          stride: [45056, 704, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 64, 128]
+                          stride: [524288, 8192, 1, 64]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 128]
+                          stride: [90112, 1408, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 0.125
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:259 in eager_attention_forward, code: attn_weights = attn_weights
+                    + attention_mask'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 128]
+                          stride: [90112, 1408, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11, 128]
+                          stride: [1408, 1408, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:261 in eager_attention_forward, code: sinks = module.sinks.reshape(1,
+                    -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [64]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, -1, 1, 1)
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:261 in eager_attention_forward, code: sinks = module.sinks.reshape(1,
+                    -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 1]
+                          stride: [64, 1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: -1
+                      - value: 11
+                      - value: -1
+
+                - name: torch.cat
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:262 in eager_attention_forward, code: combined_logits = torch.cat([attn_weights,
+                    sinks], dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 11, 128]
+                            stride: [90112, 1408, 128, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 64, 11, 1]
+                            stride: [64, 1, 0, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.max
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 129]
+                          stride: [90816, 1419, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 11, 1]
+                            stride: [704, 11, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cuda:0
+                            init: randint
+                            init_args:
+                              high: 1000
+                      - value: 0
+
+                - name: torch.sub
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 129]
+                          stride: [90816, 1419, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 11, 1]
+                          stride: [704, 11, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.softmax
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:268 in eager_attention_forward, code: probs = F.softmax(combined_logits,
+                    dim=-1, dtype=combined_logits.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 129]
+                          stride: [90816, 1419, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:269 in eager_attention_forward, code: scores = probs[...,
+                    :-1]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 129]
+                          stride: [90816, 1419, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, -1, None))
+
+                - name: torch.nn.functional.dropout
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:270 in eager_attention_forward, code: attn_weights = nn.functional.dropout(scores,
+                    p=dropout, training=module.training).to(value_states.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 128]
+                          stride: [90816, 1419, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:271 in eager_attention_forward, code: attn_output = torch.matmul(attn_weights,
+                    value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 128]
+                          stride: [90112, 1408, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 128, 64]
+                          stride: [524288, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:272 in eager_attention_forward, code: attn_output = attn_output.transpose(1,
+                    2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 64]
+                          stride: [45056, 704, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.Tensor.contiguous
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:272 in eager_attention_forward, code: attn_output = attn_output.transpose(1,
+                    2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 64, 64]
+                          stride: [45056, 64, 704, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:345 in forward, code: attn_output = attn_output.reshape(*input_shape,
+                    -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 64, 64]
+                          stride: [45056, 4096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 11, -1)
+
+                - name: torch.Tensor.contiguous
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:345 in forward, code: attn_output = attn_output.reshape(*input_shape,
+                    -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 4096]
+                          stride: [45056, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:346 in forward, code: attn_output = self.o_proj(attn_output)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 4096]
+                          stride: [45056, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [2880, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [2880]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:384 in forward, code: hidden_states = residual + hidden_states'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:142 in forward, code: hidden_states = hidden_states.reshape(-1,
+                    hidden_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (-1, 2880)
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:127 in forward, code: router_logits = F.linear(hidden_states,
+                    self.weight, self.bias)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [32, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [32]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.topk
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:128 in forward, code: router_top_value, router_indices = torch.topk(router_logits,
+                    self.top_k, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 32]
+                          stride: [32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 4
+                    kwargs:
+                      dim: -1
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:128 in forward, code: router_top_value, router_indices = torch.topk(router_logits,
+                    self.top_k, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [11, 4]
+                            stride: [4, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cuda:0
+                            init: randint
+                            init_args:
+                              high: 1000
+                      - value: 0
+
+                - name: torch.nn.functional.softmax
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:129 in forward, code: router_scores = torch.nn.functional.softmax(router_top_value,
+                    dim=1, dtype=router_top_value.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 4]
+                          stride: [4, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: 1
+                      dtype: torch.float16
+
+                - name: torch.arange
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - value: 11
+                    kwargs:
+                      device: cuda:0
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 1
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: -1
+                      - value: 4
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 4]
+                          stride: [1, 0]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: (-1,)
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:116 in batched_mm_experts_forward, code: sample_weights = top_k_weights.reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 4]
+                          stride: [4, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (-1,)
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:117 in batched_mm_experts_forward, code: expert_ids = top_k_index.reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 4]
+                          stride: [4, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: (-1,)
+
+                - name: torch.lt
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:121 in batched_mm_experts_forward, code: valid_mask = expert_ids < self.num_experts'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 32
+
+                - name: torch.clamp
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:122 in batched_mm_experts_forward, code: expert_ids_clamped = expert_ids.clamp(0,
+                    self.num_experts - 1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 0
+                      - value: 31
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:125 in batched_mm_experts_forward, code: selected_hidden_states = hidden_states[token_idx]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 11
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:128 in batched_mm_experts_forward, code: selected_gate_up = self.gate_up_proj[expert_ids_clamped]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 2880, 5760]
+                          stride: [16588800, 5760, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/integrations/moe.py:129 in batched_mm_experts_forward, code: selected_down = self.down_proj[expert_ids_clamped]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 2880, 2880]
+                          stride: [8294400, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/integrations/moe.py:130 in batched_mm_experts_forward, code: selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_clamped]
+                    if self.has_bias else None'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/integrations/moe.py:131 in batched_mm_experts_forward, code: selected_down_bias = self.down_proj_bias[expert_ids_clamped]
+                    if self.has_bias else None'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.unsqueeze
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.bmm
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44, 2880, 5760]
+                          stride: [16588800, 5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.squeeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 1, 5760]
+                          stride: [5760, 5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.add
+                  description: 'site-packages/transformers/integrations/moe.py:97 in _batched_linear, code: out = out + bias'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:83 in _apply_gate, code: gate, up = gate_up[..., ::2], gate_up[...,
+                    1::2]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, None, 2))
+
+                - name: torch.clamp
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:84 in _apply_gate, code: gate = gate.clamp(min=None, max=self.limit)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [5760, 2]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      min: null
+                      max: 7.0
+
+                - name: torch.clamp
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:85 in _apply_gate, code: up = up.clamp(min=-self.limit, max=self.limit)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [5760, 2]
+                          storage_offset: 1
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      min: -7.0
+                      max: 7.0
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate *
+                    self.alpha)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.702
+
+                - name: torch.sigmoid
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate *
+                    self.alpha)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate *
+                    self.alpha)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:87 in _apply_gate, code: gated_output = (up + 1) * glu'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.bmm
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44, 2880, 2880]
+                          stride: [8294400, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.squeeze
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.add
+                  description: 'site-packages/transformers/integrations/moe.py:97 in _batched_linear, code: out = out + bias'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:149 in batched_mm_experts_forward, code: out_per_sample = out_per_sample
+                    * sample_weights.unsqueeze(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/integrations/moe.py:149 in batched_mm_experts_forward, code: out_per_sample = out_per_sample
+                    * sample_weights.unsqueeze(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [44, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:150 in batched_mm_experts_forward, code: out_per_sample = out_per_sample
+                    * valid_mask.unsqueeze(-1).to(out_per_sample.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                          init: zeros
+                      - value: -1
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:154 in batched_mm_experts_forward, code: final_hidden_states = out_per_sample.view(num_tokens,
+                    num_top_k, hidden_dim).sum(dim=1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [44, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 11
+                      - value: 4
+                      - value: 2880
+
+                - name: torch.sum
+                  description: 'site-packages/transformers/integrations/moe.py:154 in batched_mm_experts_forward, code: final_hidden_states = out_per_sample.view(num_tokens,
+                    num_top_k, hidden_dim).sum(dim=1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 4, 2880]
+                          stride: [11520, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: 1
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:145 in forward, code: hidden_states = hidden_states.reshape(batch_size,
+                    sequence_length, hidden_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [11, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 11, 2880)
+
+                - name: torch.zeros
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:290 in lazy_initialization, code: self.keys = torch.zeros('
+                  sample_inputs_func:
+                    args:
+                      - value: (1, 8, 2048, 64)
+                    kwargs:
+                      dtype: torch.float16
+                      device: cuda:0
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 64]
+                          stride: [1048576, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [11]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 11, 64]
+                          stride: [5632, 704, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:341 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 64]
+                          stride: [1048576, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [11]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 11, 64]
+                          stride: [5632, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:222 in repeat_kv, code: hidden_states = hidden_states[:, :,
+                    None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 64]
+                          stride: [1048576, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:222 in repeat_kv, code: hidden_states = hidden_states[:, :,
+                    None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 2048, 64]
+                          stride: [1048576, 131072, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 8
+                      - value: 8
+                      - value: 2048
+                      - value: 64
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:223 in repeat_kv, code: return hidden_states.reshape(batch,
+                    num_key_value_heads * n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 8, 2048, 64]
+                          stride: [1048576, 131072, 0, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 64, 2048, 64)
+
+                - name: torch.transpose
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 2048, 64]
+                          stride: [8388608, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - value: 3
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 64]
+                          stride: [45056, 704, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 64, 2048]
+                          stride: [8388608, 131072, 1, 64]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2048]
+                          stride: [1441792, 22528, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 0.125
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:259 in eager_attention_forward, code: attn_weights = attn_weights
+                    + attention_mask'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2048]
+                          stride: [1441792, 22528, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 11, 2048]
+                          stride: [22528, 22528, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:262 in eager_attention_forward, code: combined_logits = torch.cat([attn_weights,
+                    sinks], dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 11, 2048]
+                            stride: [1441792, 22528, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 64, 11, 1]
+                            stride: [64, 1, 0, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.max
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2049]
+                          stride: [1442496, 22539, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
+
+                - name: torch.sub
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2049]
+                          stride: [1442496, 22539, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 11, 1]
+                          stride: [704, 11, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.softmax
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:268 in eager_attention_forward, code: probs = F.softmax(combined_logits,
+                    dim=-1, dtype=combined_logits.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2049]
+                          stride: [1442496, 22539, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:269 in eager_attention_forward, code: scores = probs[...,
+                    :-1]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2049]
+                          stride: [1442496, 22539, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, -1, None))
+
+                - name: torch.nn.functional.dropout
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:270 in eager_attention_forward, code: attn_weights = nn.functional.dropout(scores,
+                    p=dropout, training=module.training).to(value_states.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2048]
+                          stride: [1442496, 22539, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
+
+                - name: torch.matmul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:271 in eager_attention_forward, code: attn_output = torch.matmul(attn_weights,
+                    value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 11, 2048]
+                          stride: [1441792, 22528, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 2048, 64]
+                          stride: [8388608, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:675 in forward, code: logits = self.lm_head(hidden_states[:,
+                    slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 11, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:675 in forward, code: logits = self.lm_head(hidden_states[:,
+                    slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [31680, 2880, 1]
+                          storage_offset: 28800
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [201088, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                # ── Decode pass (sequence length = 1) ────────────────────────
+
+                - name: torch.nn.functional.embedding
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:471 in forward, code: inputs_embeds = self.embed_tokens(input_ids)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [201088, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 199999
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:202 in forward, code: position_ids_expanded = position_ids[:,
+                    None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+
+                - name: torch.float
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:202 in forward, code: position_ids_expanded = position_ids[:,
+                    None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+
+                - name: torch.float
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:206 in forward, code: freqs = (inv_freq_expanded.float() @
+                    position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:206 in forward, code: freqs = (inv_freq_expanded.float() @
+                    position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:206 in forward, code: freqs = (inv_freq_expanded.float() @
+                    position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.cos
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:208 in forward, code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:208 in forward, code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32]
+                          stride: [32, 32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.3465735902799727
+
+                - name: torch.sin
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:209 in forward, code: sin = emb.sin() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32]
+                          stride: [32, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.pow
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:60 in forward, code: variance = hidden_states.pow(2).mean(-1,
+                    keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+
+                - name: torch.mean
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:60 in forward, code: variance = hidden_states.pow(2).mean(-1,
+                    keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                    kwargs:
+                      keepdim: true
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+                    + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+
+                - name: torch.rsqrt
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+                    + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:61 in forward, code: hidden_states = hidden_states * torch.rsqrt(variance
+                    + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:62 in forward, code: return (self.weight * hidden_states).to(input_dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [2880]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:317 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.Tensor.view
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:317 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 64)
+
+                - name: torch.transpose
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:317 in forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 64, 64]
+                          stride: [4096, 4096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:318 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [512, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [512]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.Tensor.view
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:318 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 512]
+                          stride: [512, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 64)
+
+                - name: torch.transpose
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:318 in forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1,
+                    2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 8, 64]
+                          stride: [512, 512, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:238 in apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32]
+                          stride: [32, 32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.chunk
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 64]
+                          stride: [4096, 64, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                    kwargs:
+                      dim: -1
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 1, 32]
+                            stride: [4096, 64, 4096, 1]
+                            storage_offset: 32
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                      - value: 0
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 32]
+                          stride: [4096, 64, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 32]
+                          stride: [32, 32, 32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 32]
+                          stride: [4096, 64, 4096, 1]
+                          storage_offset: 32
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 32]
+                          stride: [32, 32, 32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.sub
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 32]
+                          stride: [2048, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 1, 32]
+                          stride: [2048, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:233 in _apply_rotary_emb, code: second_ = second_half * cos
+                    + first_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 32]
+                          stride: [2048, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 1, 32]
+                          stride: [2048, 32, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:234 in _apply_rotary_emb, code: return torch.cat((first_,
+                    second_), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 1, 32]
+                            stride: [2048, 32, 32, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 64, 1, 32]
+                            stride: [2048, 32, 32, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.chunk
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [512, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                    kwargs:
+                      dim: -1
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:231 in _apply_rotary_emb, code: first_half, second_half =
+                    torch.chunk(x, 2, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 1, 32]
+                            stride: [512, 64, 512, 1]
+                            storage_offset: 32
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                      - value: 0
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 32]
+                          stride: [512, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 32]
+                          stride: [32, 32, 32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 32]
+                          stride: [512, 64, 512, 1]
+                          storage_offset: 32
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 32]
+                          stride: [32, 32, 32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.sub
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:232 in _apply_rotary_emb, code: first_ = first_half * cos
+                    - second_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 32]
+                          stride: [256, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 1, 32]
+                          stride: [256, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:233 in _apply_rotary_emb, code: second_ = second_half * cos
+                    + first_half * sin'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 32]
+                          stride: [256, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 1, 32]
+                          stride: [256, 32, 256, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:234 in _apply_rotary_emb, code: return torch.cat((first_,
+                    second_), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 1, 32]
+                            stride: [256, 32, 32, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 1, 32]
+                            stride: [256, 32, 32, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:451 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 128, 64]
+                          stride: [65536, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 128
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [512, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.index_copy_
+                  description: 'site-packages/transformers/cache_utils.py:452 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 128, 64]
+                          stride: [65536, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 128
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [512, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 64]
+                          stride: [4096, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 64, 128]
+                          stride: [524288, 8192, 1, 64]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 128]
+                          stride: [8192, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 0.125
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:259 in eager_attention_forward, code: attn_weights = attn_weights
+                    + attention_mask'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 128]
+                          stride: [8192, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:262 in eager_attention_forward, code: combined_logits = torch.cat([attn_weights,
+                    sinks], dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 1, 128]
+                            stride: [8192, 128, 128, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 64, 1, 1]
+                            stride: [64, 1, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.max
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 129]
+                          stride: [8256, 129, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 1, 1]
+                            stride: [64, 1, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cuda:0
+                            init: randint
+                            init_args:
+                              high: 1000
+                      - value: 0
+
+                - name: torch.sub
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 129]
+                          stride: [8256, 129, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 1, 1]
+                          stride: [64, 1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.softmax
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:268 in eager_attention_forward, code: probs = F.softmax(combined_logits,
+                    dim=-1, dtype=combined_logits.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 129]
+                          stride: [8256, 129, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:269 in eager_attention_forward, code: scores = probs[...,
+                    :-1]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 129]
+                          stride: [8256, 129, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, -1, None))
+
+                - name: torch.nn.functional.dropout
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:270 in eager_attention_forward, code: attn_weights = nn.functional.dropout(scores,
+                    p=dropout, training=module.training).to(value_states.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 128]
+                          stride: [8256, 129, 129, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
+
+                - name: torch.matmul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:271 in eager_attention_forward, code: attn_output = torch.matmul(attn_weights,
+                    value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 128]
+                          stride: [8192, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 128, 64]
+                          stride: [524288, 8192, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:272 in eager_attention_forward, code: attn_output = attn_output.transpose(1,
+                    2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 64]
+                          stride: [4096, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.Tensor.contiguous
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:272 in eager_attention_forward, code: attn_output = attn_output.transpose(1,
+                    2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 64, 64]
+                          stride: [4096, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:345 in forward, code: attn_output = attn_output.reshape(*input_shape,
+                    -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 64, 64]
+                          stride: [4096, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1)
+
+                - name: torch.Tensor.contiguous
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:345 in forward, code: attn_output = attn_output.reshape(*input_shape,
+                    -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:346 in forward, code: attn_output = self.o_proj(attn_output)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [2880, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [2880]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:384 in forward, code: hidden_states = residual + hidden_states'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:142 in forward, code: hidden_states = hidden_states.reshape(-1,
+                    hidden_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (-1, 2880)
+
+                - name: torch.nn.functional.linear
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:127 in forward, code: router_logits = F.linear(hidden_states,
+                    self.weight, self.bias)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [32, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [32]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.topk
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:128 in forward, code: router_top_value, router_indices = torch.topk(router_logits,
+                    self.top_k, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32]
+                          stride: [32, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 4
+                    kwargs:
+                      dim: -1
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:128 in forward, code: router_top_value, router_indices = torch.topk(router_logits,
+                    self.top_k, dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 4]
+                            stride: [4, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cuda:0
+                            init: randint
+                            init_args:
+                              high: 1000
+                      - value: 0
+
+                - name: torch.nn.functional.softmax
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:129 in forward, code: router_scores = torch.nn.functional.softmax(router_top_value,
+                    dim=1, dtype=router_top_value.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4]
+                          stride: [4, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: 1
+                      dtype: torch.float16
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 1
+
+                - name: torch.Tensor.expand
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: -1
+                      - value: 4
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:115 in batched_mm_experts_forward, code: token_idx = torch.arange(num_tokens,
+                    device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4]
+                          stride: [1, 0]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: (-1,)
+
+                - name: torch.reshape
+                  description: 'site-packages/transformers/integrations/moe.py:116 in batched_mm_experts_forward, code: sample_weights = top_k_weights.reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4]
+                          stride: [4, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (-1,)
+
+                - name: torch.reshape
+                  description: 'site-packages/transformers/integrations/moe.py:117 in batched_mm_experts_forward, code: expert_ids = top_k_index.reshape(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4]
+                          stride: [4, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: (-1,)
+
+                - name: torch.lt
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:121 in batched_mm_experts_forward, code: valid_mask = expert_ids < self.num_experts'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 32
+
+                - name: torch.clamp
+                  description: 'site-packages/transformers/integrations/moe.py:122 in batched_mm_experts_forward, code: expert_ids_clamped = expert_ids.clamp(0,
+                    self.num_experts - 1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 0
+                      - value: 31
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:125 in batched_mm_experts_forward, code: selected_hidden_states = hidden_states[token_idx]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4]
+                          stride: [0]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/integrations/moe.py:128 in batched_mm_experts_forward, code: selected_gate_up = self.gate_up_proj[expert_ids_clamped]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 2880, 5760]
+                          stride: [16588800, 5760, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:129 in batched_mm_experts_forward, code: selected_down = self.down_proj[expert_ids_clamped]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 2880, 2880]
+                          stride: [8294400, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/integrations/moe.py:130 in batched_mm_experts_forward, code: selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_clamped]
+                    if self.has_bias else None'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/integrations/moe.py:131 in batched_mm_experts_forward, code: selected_down_bias = self.down_proj_bias[expert_ids_clamped]
+                    if self.has_bias else None'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [32, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 32
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.bmm
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4, 2880, 5760]
+                          stride: [16588800, 5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.squeeze
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 1, 5760]
+                          stride: [5760, 5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:97 in _batched_linear, code: out = out + bias'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:83 in _apply_gate, code: gate, up = gate_up[..., ::2], gate_up[...,
+                    1::2]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 5760]
+                          stride: [5760, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, None, 2))
+
+                - name: torch.clamp
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:84 in _apply_gate, code: gate = gate.clamp(min=None, max=self.limit)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [5760, 2]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      min: null
+                      max: 7.0
+
+                - name: torch.clamp
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:85 in _apply_gate, code: up = up.clamp(min=-self.limit, max=self.limit)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [5760, 2]
+                          storage_offset: 1
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      min: -7.0
+                      max: 7.0
+
+                - name: torch.mul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate *
+                    self.alpha)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.702
+
+                - name: torch.sigmoid
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate *
+                    self.alpha)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:86 in _apply_gate, code: glu = gate * torch.sigmoid(gate *
+                    self.alpha)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:87 in _apply_gate, code: gated_output = (up + 1) * glu'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.bmm
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4, 2880, 2880]
+                          stride: [8294400, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.squeeze
+                  description: 'site-packages/transformers/integrations/moe.py:91 in _batched_linear, code: out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.add
+                  description: 'site-packages/transformers/integrations/moe.py:97 in _batched_linear, code: out = out + bias'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.unsqueeze
+                  description: 'site-packages/transformers/integrations/moe.py:149 in batched_mm_experts_forward, code: out_per_sample = out_per_sample
+                    * sample_weights.unsqueeze(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:149 in batched_mm_experts_forward, code: out_per_sample = out_per_sample
+                    * sample_weights.unsqueeze(-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.unsqueeze
+                  description: 'site-packages/transformers/integrations/moe.py:150 in batched_mm_experts_forward, code: out_per_sample = out_per_sample
+                    * valid_mask.unsqueeze(-1).to(out_per_sample.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                          init: zeros
+                      - value: -1
+
+                - name: torch.Tensor.view
+                  description: 'site-packages/transformers/integrations/moe.py:154 in batched_mm_experts_forward, code: final_hidden_states = out_per_sample.view(num_tokens,
+                    num_top_k, hidden_dim).sum(dim=1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 4
+                      - value: 2880
+
+                - name: torch.sum
+                  tags: [constant]
+                  description: 'site-packages/transformers/integrations/moe.py:154 in batched_mm_experts_forward, code: final_hidden_states = out_per_sample.view(num_tokens,
+                    num_top_k, hidden_dim).sum(dim=1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4, 2880]
+                          stride: [11520, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: 1
+
+                - name: torch.reshape
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:145 in forward, code: hidden_states = hidden_states.reshape(batch_size,
+                    sequence_length, hidden_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, 2880)
+
+                - name: torch.index_copy_
+                  description: 'site-packages/transformers/cache_utils.py:340 in update, code: self.keys.index_copy_(2, cache_position, key_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 64]
+                          stride: [1048576, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [512, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'site-packages/transformers/cache_utils.py:341 in update, code: self.values.index_copy_(2, cache_position, value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 64]
+                          stride: [1048576, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [512, 64, 512, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.matmul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 64]
+                          stride: [4096, 64, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 64, 2048]
+                          stride: [8388608, 131072, 1, 64]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:257 in eager_attention_forward, code: attn_weights = torch.matmul(query,
+                    key_states.transpose(2, 3)) * scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2048]
+                          stride: [131072, 2048, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 0.125
+
+                - name: torch.add
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:259 in eager_attention_forward, code: attn_weights = attn_weights
+                    + attention_mask'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2048]
+                          stride: [131072, 2048, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 2048]
+                          stride: [2048, 2048, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:262 in eager_attention_forward, code: combined_logits = torch.cat([attn_weights,
+                    sinks], dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 64, 1, 2048]
+                            stride: [131072, 2048, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 64, 1, 1]
+                            stride: [64, 1, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.max
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2049]
+                          stride: [131136, 2049, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
+
+                - name: torch.sub
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:267 in eager_attention_forward, code: combined_logits = combined_logits
+                    - combined_logits.max(dim=-1, keepdim=True).values'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2049]
+                          stride: [131136, 2049, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 1, 1]
+                          stride: [64, 1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.softmax
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:268 in eager_attention_forward, code: probs = F.softmax(combined_logits,
+                    dim=-1, dtype=combined_logits.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2049]
+                          stride: [131136, 2049, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:269 in eager_attention_forward, code: scores = probs[...,
+                    :-1]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2049]
+                          stride: [131136, 2049, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, -1, None))
+
+                - name: torch.nn.functional.dropout
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:270 in eager_attention_forward, code: attn_weights = nn.functional.dropout(scores,
+                    p=dropout, training=module.training).to(value_states.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2048]
+                          stride: [131136, 2049, 2049, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
+
+                - name: torch.matmul
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:271 in eager_attention_forward, code: attn_output = torch.matmul(attn_weights,
+                    value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1, 2048]
+                          stride: [131072, 2048, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 64, 2048, 64]
+                          stride: [8388608, 131072, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:675 in forward, code: logits = self.lm_head(hidden_states[:,
+                    slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'site-packages/transformers/models/gpt_oss/modeling_gpt_oss.py:675 in forward, code: logits = self.lm_head(hidden_states[:,
+                    slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 2880]
+                          stride: [2880, 2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [201088, 2880]
+                          stride: [2880, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+  global:
+    supported_dtypes:
+      - name: float16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+    input_config:
+      seed: 123

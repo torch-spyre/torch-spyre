@@ -105,6 +105,7 @@ class TestBuildingBlocks(unittest.TestCase):
             gate_proj_weight,
             up_proj_weight,
             down_proj_weight,
+            cpu_compile=True,
         )
 
     def test_rms_norm(self):
@@ -150,4 +151,4 @@ class TestBuildingBlocks(unittest.TestCase):
         compare_with_pytorch(rms_norm, pytorch_fn, *args)
 
         # Compare with cpu implementation
-        compare_with_cpu(rms_norm, *args)
+        compare_with_cpu(rms_norm, *args, cpu_compile=True)

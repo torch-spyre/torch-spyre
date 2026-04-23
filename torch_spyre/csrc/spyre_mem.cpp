@@ -23,6 +23,7 @@
 #include <c10/core/MemoryFormat.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
+#include <pybind11/pybind11.h>
 #include <torch/library.h>
 #include <util/sen_data_convert.h>
 
@@ -46,6 +47,8 @@
 #include "spyre_storage_impl.h"
 #include "spyre_tensor_impl.h"
 #include "types_mapping.h"
+
+namespace py = pybind11;
 
 namespace spyre {
 
@@ -528,7 +531,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   return gl;
 }
 
-auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
+void copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
   std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, true);
   if (!gl) {
     DEBUGINFO("GraphLoader is null!");
@@ -547,7 +550,7 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
   SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
 }
 
-auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
+void copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
   std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, false);
   // execute
   constexpr int sn_idx = 0;
@@ -695,72 +698,6 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
   return at::cpu::set_(result, storage, storage_offset, size, stride);
 }
 
-/**
- * This method handles copy between devices. When copying to Spyre, this method
- * marks the tensor to compute on Spyre, but continue to use CPU tensor for now
- * such that when we run an op on the tensor on the Spyre, it will have the
- * proper handle to the Spyre allocation
- */
-at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
-                           bool non_blocking) {
-  DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
-  at::Storage source_storage;
-  at::Storage dest_storage;
-
-  // TODO(tmhoangt): add type conversion node
-  TORCH_CHECK(
-      self.scalar_type() == dst.scalar_type(),
-      "Spyre backend does not support type conversion yet during copy.");
-
-  if (self.is_cpu() && dst.is_privateuseone()) {
-    if (self.dim() == 0) {
-      at::Tensor tmp_tensor = self.reshape({1});
-      copy_host_to_device(tmp_tensor, dst);
-    } else {
-      copy_host_to_device(self, dst);
-    }
-    return dst;
-
-  } else if (self.is_privateuseone() && dst.is_cpu()) {
-    copy_device_to_host(self, dst);
-    return dst;
-
-  } else if (self.is_privateuseone() && dst.is_privateuseone()) {
-    // Copy from Spyre to Spyre
-    TORCH_CHECK(false, "Error: In-device copy not implemented.");
-    // FIXME: This will need to be addressed for proper spyre to spyre copy
-    // source_storage =
-    //     (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->storage();
-    // dest_storage =
-    //     (static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl()))->storage();
-    // DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
-    //           source_storage.device(), "to", dest_storage.device());
-    // std::memcpy(dest_storage.data_ptr().get(),
-    // source_storage.data_ptr().get(),
-    //             source_storage.nbytes());
-    // DEBUGINFO("Finished Copying ");
-    return dst;
-  } else {
-    // For all other cases fallback to the upstream implementation
-    return at::_copy_from(self, dst, non_blocking);
-  }
-}
-
-at::Tensor to_with_layout(const at::Tensor& self,
-                          SpyreTensorLayout device_layout) {
-  DEBUGINFO(
-      "Tensor info on CPU (Size:", self.sizes(), ", Stride: ", self.strides(),
-      ", dtype: ", c10::typeMetaToScalarType(self.dtype()),
-      ") and to be mapped onto device ",
-      c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice(),
-      " with layout ", device_layout.toString());
-  auto dst = spyre_empty_with_layout(self.sizes(), self.strides(),
-                                     c10::typeMetaToScalarType(self.dtype()),
-                                     device_layout);
-  return spyre_copy_from(self, dst, false);
-}
-
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,
     std::optional<c10::ScalarType> dtype_opt,
@@ -813,7 +750,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
-  m.impl("_copy_from", TORCH_FN(spyre_copy_from));
 }
 
 }  // namespace spyre
