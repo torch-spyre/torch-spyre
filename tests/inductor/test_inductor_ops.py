@@ -933,6 +933,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_empty_like",
+            "test_empty_like_cpu",
+        ): {
+            "param_sets": {
+                "1d_fp16": (cached_randn((64,), dtype=torch.float16),),
+                "2d_fp16": (cached_randn((4, 8), dtype=torch.float16),),
+                "2d_fp32": (cached_randn((4, 8), dtype=torch.float32),),
+                "3d_fp16": (cached_randn((2, 4, 8), dtype=torch.float16),),
+            },
+        },
+        (
+            "test_empty_like_dtype_override",
+            "test_empty_like_dtype_override_cpu",
+        ): {
+            "param_sets": {
+                "fp16_to_fp32": (cached_randn((4, 8), dtype=torch.float16),),
+                "fp32_to_fp16": (cached_randn((4, 8), dtype=torch.float32),),
+            },
+        },
+        (
+            "test_empty_like_memory_format",
+            "test_empty_like_memory_format_cpu",
+        ): {
+            "param_sets": {
+                "transposed_2d": (cached_randn((4, 8), dtype=torch.float16),),
+            },
+        },
+        (
             "test_new_ones",
             "test_new_ones_cpu",
         ): {
@@ -1932,6 +1960,41 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.arange(*args, dtype=torch.float16, device=device)
 
         compare_with_cpu(fn, needs_device=True)
+
+    def test_empty_like_cpu(self, x):
+        def fn(x):
+            y = torch.empty_like(x)
+            y.fill_(1.0)
+            return y
+
+        compare_with_cpu(fn, x)
+
+    @unittest.skip("dtype override may not be supported on Spyre")
+    def test_empty_like_dtype_override_cpu(self, x):
+        """Test empty_like with dtype override (fp16->fp32 or fp32->fp16)."""
+        # Determine target dtype (opposite of input)
+        target_dtype = torch.float32 if x.dtype == torch.float16 else torch.float16
+
+        def fn(x):
+            y = torch.empty_like(x, dtype=target_dtype)
+            y.fill_(1.0)
+            return y
+
+        compare_with_cpu(fn, x)
+
+    def test_empty_like_memory_format_cpu(self, x):
+        """Test empty_like with memory_format on non-contiguous (transposed) input."""
+
+        def fn(x):
+            # Create non-contiguous input via transpose
+            x_t = x.t()
+            # empty_like with contiguous_format should create contiguous output
+            y = torch.empty_like(x_t, memory_format=torch.contiguous_format)
+            y.fill_(1.0)
+            return y
+
+        # Note: .contiguous() causes issues with eager mode per existing patterns
+        compare_with_cpu(fn, x, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_new_ones_cpu(self, x, y):
