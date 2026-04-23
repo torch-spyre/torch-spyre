@@ -19,12 +19,15 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
+#include "flex/runtime_stream/runtime_operation.hpp"
 #include "logging.h"
 #include "module.h"
+#include "spyre_allocator.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
@@ -126,9 +129,48 @@ c10::Stream SpyreStream::unwrap() const {
   return stream_;
 }
 
-void SpyreStream::copy_async(const at::Tensor& src,
-                             const at::Tensor& dst) const {
-  // TODO(tmhoangt): place-holder to be implemented in the next PR
+void SpyreStream::copyAsync(const at::Tensor& src,
+                            const at::Tensor& dst) const {
+  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
+  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+
+  // TODO(tmhoangt): add type conversion node
+  // Type checking - no type conversion support yet
+  TORCH_CHECK(
+      src.scalar_type() == dst.scalar_type(),
+      "Spyre backend does not support type conversion yet during copy.");
+
+  // Determine copy direction
+  bool host2device = src.is_cpu() && dst.is_privateuseone();
+  bool device2host = src.is_privateuseone() && dst.is_cpu();
+
+  const at::Tensor* dev_tensor = host2device ? &dst : &src;
+  const at::Tensor* cpu_tensor = host2device ? &src : &dst;
+
+  if (host2device || device2host) {
+    // Host-to-device or device-to-host copy
+    void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
+
+    // Get SpyreTensorLayout using the public API
+    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
+
+    // Extract device allocation from Spyre tensor storage
+    auto* spyre_impl =
+        static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
+    auto& storage = spyre_impl->storage();
+    auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
+
+    // Generate data conversion info
+    // So we always pass &src, not cpu_tensor
+    DataConversionInfo dci = generate_dci(
+        dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+
+    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, dci, host2device);
+
+  } else {
+    TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
+                " dst on ", dst.device());
+  }
 }
 
 flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
@@ -142,10 +184,24 @@ flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
   return it->second;
 }
 
-void SpyreStream::copy_async_impl(
-    void* cpu_ptr, flex::DeviceMemoryAllocationPtr& device_allocation,
-    int device_id, const DataConversionInfo& dci, bool host2device) const {
-  // TODO(tmhoangt): place-holder to be implemented in the next PR
+void SpyreStream::copyAsyncImpl(void* cpu_ptr,
+                                const flex::CompositeAddress* device_address,
+                                const DataConversionInfo& dci,
+                                bool host2device) const {
+  // Wrap dci in shared_ptr for flex API
+  auto dci_ptr = std::make_shared<data_conversion_info>(dci);
+
+  // Get the flex runtime stream handle
+  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+
+  // Create and launch operation
+  if (host2device) {
+    flex::RuntimeOperationH2D op(cpu_ptr, device_address, dci_ptr);
+    flex_stream->launchOperation(op);
+  } else {
+    flex::RuntimeOperationD2H op(device_address, cpu_ptr, dci_ptr);
+    flex_stream->launchOperation(op);
+  }
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {

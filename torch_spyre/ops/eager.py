@@ -143,11 +143,10 @@ def spyre__copy_from(self, dst, non_blocking=False):
     if self.numel() == 0:
         return dst
 
-    if self.device.type == "cpu" and dst.device.type == "spyre":
-        _C.copy_host_to_device(self, dst)
-        return dst
-    elif self.device.type == "spyre" and dst.device.type == "cpu":
-        _C.copy_device_to_host(self, dst)
+    if (self.device.type == "cpu" and dst.device.type == "spyre") or (
+        self.device.type == "spyre" and dst.device.type == "cpu"
+    ):
+        _C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
         torch.ops.spyre.copy_from_d2d(self, dst)

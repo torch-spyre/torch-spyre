@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include "module.h"
+
 namespace spyre {
 
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
@@ -27,8 +29,8 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                                std::optional<c10::Device> device_opt,
                                std::optional<bool> pin_memory_opt);
 
-void copy_host_to_device(const at::Tensor& self, const at::Tensor& dst);
-void copy_device_to_host(const at::Tensor& self, const at::Tensor& dst);
+at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
+                           bool non_blocking);
 
 class SpyreTensorLayout;
 at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
@@ -49,4 +51,6 @@ at::Tensor py_empty_with_layout(
     std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
     std::optional<c10::MemoryFormat> memory_format_opt);
 
+auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
+                  int64_t cpu_offset, bool host2device) -> DataConversionInfo;
 }  // namespace spyre

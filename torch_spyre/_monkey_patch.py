@@ -20,7 +20,7 @@ from torch_spyre._C import (
     get_spyre_tensor_layout,
     empty_with_layout,
     spyre_empty_with_layout,
-    copy_host_to_device,
+    copy_tensor,
 )
 
 from torch._dynamo.guards import GuardBuilder
@@ -106,7 +106,7 @@ def _patch_tensor_for_spyre():
             )
 
             if self.device.type == "cpu":
-                copy_host_to_device(self, dst)
+                copy_tensor(self, dst, non_blocking=False)
                 return dst
             else:  # device to device copy
                 # If device_layout is the same as self and copy is not True, return self

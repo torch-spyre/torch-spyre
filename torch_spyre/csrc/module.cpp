@@ -364,13 +364,10 @@ PYBIND11_MODULE(_C, m) {
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
-  // Memory copy functions
-  m.def("copy_host_to_device", &spyre::copy_host_to_device,
-        "Copy tensor from host to device using DMA", py::arg("self"),
-        py::arg("dst"));
-  m.def("copy_device_to_host", &spyre::copy_device_to_host,
-        "Copy tensor from device to host using DMA", py::arg("self"),
-        py::arg("dst"));
+  // Memory copy function
+  m.def("copy_tensor", &spyre::spyre_copy_from,
+        "Copy tensor between host and device using DMA", py::arg("self"),
+        py::arg("dst"), py::arg("non_blocking") = false);
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
