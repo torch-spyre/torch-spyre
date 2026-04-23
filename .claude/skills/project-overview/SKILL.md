@@ -153,13 +153,13 @@ PyTorch `size+stride` cannot represent tiled tensors.
 
 - **`device_size: list[int]`** — padded, higher-dimensional on-device shape
   (always row-major)
-- **`dim_map: list[int]`** — maps each device dim to a host dim (-1 = synthetic
-  stick dim)
+- **`stride_map: list[int]`** — host stride for each device dim (-1 = synthetic
+  or padded dimension with no host correspondence)
 - **`device_dtype: DataFormats`** — on-device data format (SEN169_FP16,
   IEEE_FP32, etc.)
 
 Example: `(5, 100, 150)` float16 →
-`SpyreTensorLayout(device_size=[100, 3, 5, 64], dim_map=[1, 2, 0, 2], device_dtype=SEN169_FP16)`
+`SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map=[150, 64, 15000, 1], device_dtype=SEN169_FP16)`
 where 64 = elements per 128-byte stick for fp16.
 
 ### KernelSpec

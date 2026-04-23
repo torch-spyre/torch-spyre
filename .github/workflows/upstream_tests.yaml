@@ -4,6 +4,7 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -43,35 +44,64 @@ jobs:
           path: torch-spyre
 
       # ---------------------------------------------------------------------------
+      # Derive the PyTorch release branch from pyproject.toml so there is a
+      # single source of truth — no hardcoded version in this workflow.
+      #
+      # pyproject.toml declares:  torch~=2.10.0
+      # This step extracts "2.10.0", strips the patch -> "2.10", and builds
+      # the branch name "release/2.10".
+      # ---------------------------------------------------------------------------
+      - name: Derive PyTorch release branch from pyproject.toml
+        id: pytorch-branch
+        working-directory: torch-spyre
+        run: |
+          # Extract the version constraint, e.g. "2.10.0" from "torch~=2.10.0"
+          VERSION=$(python3 - <<'PYEOF'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          requires = data.get('build-system', {}).get('requires', [])
+          torch_dep = next(x for x in requires if x.startswith('torch'))
+          version = torch_dep.removeprefix('torch~=')   # e.g. "2.10.0"
+          print('.'.join(version.split('.')[:2]))        # --> "2.10"
+          PYEOF
+          )
+          BRANCH="release/${VERSION}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Derived PyTorch branch: $BRANCH"
+      # ---------------------------------------------------------------------------
       # PyTorch source caching
       #
-      # Cloning pytorch/pytorch at release/2.10 with all submodules is expensive.
-      # We cache the entire checkout keyed on the latest commit SHA of release/2.10
+      # Cloning pytorch/pytorch with all submodules is expensive.
+      # We cache the entire checkout keyed on the latest commit SHA of the branch
       # so the clone only happens when the branch actually updates upstream.
       #
       # Cache hit  --> restore from cache, skip checkout (saves several minutes)
-      # Cache miss --> shallow clone + submodules, then save to cache for next run
+      # Cache miss --> full clone + submodules, then save to cache for next run
       # ---------------------------------------------------------------------------
-      - name: Get latest commit SHA of pytorch release/2.10
+      - name: Get latest commit SHA of PyTorch branch
         id: pytorch-sha
         run: |
-          SHA=$(git ls-remote https://github.com/pytorch/pytorch.git refs/heads/release/2.10 | cut -f1)
+          BRANCH="${{ steps.pytorch-branch.outputs.branch }}"
+          SHA=$(git ls-remote https://github.com/pytorch/pytorch.git "refs/heads/${BRANCH}" | cut -f1)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "PyTorch release/2.10 HEAD: $SHA"
+          echo "PyTorch ${BRANCH} HEAD: $SHA"
 
       - name: Restore PyTorch source from cache
         id: pytorch-cache
         uses: actions/cache@v4
         with:
           path: pytorch
-          key: pytorch-release-2.10-${{ steps.pytorch-sha.outputs.sha }}
+          key: pytorch-${{ steps.pytorch-branch.outputs.branch }}-${{ steps.pytorch-sha.outputs.sha }}
 
-      - name: Checkout PyTorch source at release/2.10
+      - name: Checkout PyTorch source
         if: steps.pytorch-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: pytorch/pytorch
-          ref: release/2.10
+          ref: ${{ steps.pytorch-branch.outputs.branch }}
           submodules: recursive
           path: pytorch
 
@@ -103,7 +133,7 @@ jobs:
 
       - name: Run ${{ matrix.suite.name }} upstream test suite
         working-directory: torch-spyre/tests
-        run: |-
+        run: |
           echo 'Running ${{ matrix.suite.name }} upstream tests...'
           bash run_test.sh configs/${{ matrix.suite.config }} -v
           echo '${{ matrix.suite.name }} upstream tests done'

@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise
+from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -503,26 +503,30 @@ def clone(x, *, memory_format=None):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
+def lower_spyre_from_d2d(src, dst):
+    lowering.mutate_to(dst, src)
+
+
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
 
-    strides = [int(output.get_layout().stride[d]) for d in dims]
-    gaps = [int(output.get_layout().size[d] - input.get_layout().size[d]) for d in dims]
-
     def inner_fn(index):
-        return fn(
-            input.make_loader()(index),
-            strides,
-            offsets,
-            gaps,
-        )
+        return fn(input.make_loader()(index))
 
-    inp = Pointwise(
+    def output_indexer(index):
+        out_index = [*index]
+        for dim, offset in zip(dims, offsets):
+            out_index[dim] += offset
+        return out_index
+
+    inp = Scatter(
         device=input.get_device(),
         dtype=input.get_dtype(),
         inner_fn=inner_fn,
         ranges=input.get_size(),
+        output_indexer=output_indexer,
     )
 
     output.realize()
@@ -544,3 +548,42 @@ def lower_overwrite(input, output, dims, offsets):
     V.graph.register_operation(buffer)
 
     return output
+
+
+@register_spyre_lowering(torch.ops.spyre.restickify)
+def lower_restickify(x):
+    # Restickify must operate on base tensors, so we need
+    # to unwrap any views.
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
+
+    # Force realization so base has a buffer name and make_loader() emits
+    # ops.load(name, ...) rather than inlining the producer's inner_fn.
+    # Without this, ComputedBuffer.make_loader() may inline when num_reads()==0,
+    # capturing a closure that later resolves to the restickify buffer itself
+    # (after pw.realize() assigns the name), creating a self-dependency cycle.
+    base.realize()
+
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=base.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.aten.slice.Tensor, type_promotion_kind=None)
+def lower_slice(x, dim=0, start=None, end=None, step=1):
+    result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
+    return clone(result, memory_format=torch.contiguous_format)

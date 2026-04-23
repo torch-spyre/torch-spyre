@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import inspect
+import io
+import logging
 from typing import Optional, Any, Callable, List
 from abc import abstractmethod
 
@@ -22,21 +24,51 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
+
+from .logging_utils import get_inductor_logger
 
 from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    relayout_linear_weights,
     replace_scalar_with_tensor,
 )
-from .stickify import propagate_spyre_tensor_layouts
+from . import config
+from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
+from .insert_restickify import insert_restickify
 from .core_division import core_division_planning
+from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
-from . import config
+from .deadcode_elimination import deadcode_elimination
+
+
+logger = get_inductor_logger("passes")
+
+
+def _format_operations(operations: list[Operation]) -> str:
+    buf = io.StringIO()
+    for op in operations:
+        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
+        if isinstance(op, ComputedBuffer):
+            buf.write(f"\n  layout={op.layout}")
+            if allocation := getattr(op.layout, "allocation", None):
+                buf.write(f"\n  allocation={allocation}")
+            if splits := getattr(op, "op_it_space_splits", None):
+                rw = op.get_read_writes()
+                write_index = next(iter(rw.writes)).index
+                read_index = next((d.index for d in rw.reads), write_index)
+                it_space = iteration_space_from_op(op)
+                readable_splits = apply_splits_from_index_coeff(
+                    splits, write_index, read_index, it_space
+                )
+                buf.write(f"\n  op_it_space_splits={readable_splits}")
+            buf.write(f"\n  {op.data}")
+        buf.write("\n\n")
+    return buf.getvalue()
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -57,7 +89,7 @@ class CustomPreGradPasses:
     pre-grad FX graph.
     """
 
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = [insert_padding]
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in self.passes:
@@ -95,8 +127,8 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        insert_padding,
         replace_scalar_with_tensor,
-        relayout_linear_weights,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]
@@ -152,7 +184,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [propagate_spyre_tensor_layouts]
+        return [propagate_mutation_layouts]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
@@ -160,22 +192,49 @@ class CustomPostFusionPasses(CustomNodePassBase):
     This inductor extension point enables Spyre-specific passes to run over
     the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
 
-    core_division_planning must run here (not pre-fusion) because inductor's
-    fusion pass renames the iteration-space symbols in MemoryDep.ranges between
-    the two phases.  Storing op_it_space_splits before that rename causes a
-    symbol mismatch at codegen time, silently dropping all work-division splits.
-
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
 
     def get_passes(self):
-        # core_division_planning and scratchpad_planning must precede
-        # spyre_fuse_nodes because the latter wraps SchedulerNodes into
-        # FusedSchedulerNodes, making them invisible to those passes'
-        # isinstance(n, SchedulerNode) checks.
-        passes = [core_division_planning]
+        return [spyre_fuse_nodes]
+
+
+class CustomPreSchedulingPasses(CustomGraphPass):
+    """
+    Spyre-specific passes that run on IR operations immediately before the
+    Scheduler is constructed (via the _update_scheduler monkey-patch).
+
+    Operations are in topological order (guaranteed by GraphLowering).
+    """
+
+    def __call__(self, operations: list[Operation]) -> None:
+        has_spyre_device = any(
+            op.get_device() is not None and op.get_device().type == DEVICE_NAME
+            for op in operations
+        )
+        if not has_spyre_device:
+            return
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
+
+        deadcode_elimination(operations)
+        propagate_spyre_tensor_layouts(operations)
+        insert_restickify(operations)
+        core_division_planning(operations)
         if config.lx_planning:
-            passes.append(scratchpad_planning)
-        passes.append(spyre_fuse_nodes)
-        return passes
+            scratchpad_planning(operations)
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
+
+    def uuid(self) -> Optional[Any]:
+        files = [
+            inspect.getfile(deadcode_elimination),
+            inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(insert_restickify),
+            inspect.getfile(core_division_planning),
+            inspect.getfile(scratchpad_planning),
+        ]
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))

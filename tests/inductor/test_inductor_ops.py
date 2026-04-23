@@ -19,6 +19,7 @@ import torch
 from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
+    cached_xavier,
     make_param_dict,
     unique_randn_along_dim,
 )
@@ -149,9 +150,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((67, 256), (256, 128)),
-                    # Fails for now, pending deeptools reduce fixes
-                    # ((67, 67,), (67, 67)),
-                    # ((67, 255), (255, 128)),
+                    # Padding
+                    ((55, 2), (2, 99)),
+                    ((67, 67), (67, 67)),
+                    ((67, 255), (255, 128)),
                 ]
             ),
         },
@@ -162,6 +164,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((3, 1, 256), (3, 256, 128)),
                     ((3, 17, 256), (3, 256, 128)),
                     ((2, 256, 1), (2, 1, 128)),
+                    # Padding
+                    ((2, 55, 2), (2, 2, 99)),
+                    ((2, 99, 65), (2, 65, 55)),
                 ]
             ),
         },
@@ -192,6 +197,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2, 3, 99, 65), (2, 3, 65, 55)),
                 ]
             ),
+        },
+        ("test_large_matmul", "test_mm_relaxed"): {
+            "ops_dict": {"matmul": torch.matmul},
+            "param_sets": {
+                "2d_M2048_K2048_N65536": (
+                    cached_randn((2048, 2048)),
+                    cached_xavier((2048, 65536)),
+                ),
+                "3d_M3_K11_N2880": (
+                    cached_randn((3, 11, 2880)),
+                    cached_xavier((3, 2880, 2880)),
+                ),
+                "3d2d_M3_K11_N2880": (
+                    cached_randn((3, 11, 2880)),
+                    cached_xavier((2880, 2880)),
+                ),
+                "4d_B2_H2_M2048_K2048_N65536": (
+                    cached_randn((2, 2, 2048, 2048)),
+                    cached_xavier((2, 2, 2048, 65536)),
+                ),
+            },
         },
         ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"sum": torch.sum},
@@ -824,6 +850,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
                     cached_randn((2, 4, 8, 128), dtype=torch.float16),
                 ),
+                "4d_dim3_fp32": (
+                    3,
+                    cached_randn((2, 4, 3, 64), dtype=torch.float32),
+                    cached_randn((2, 4, 3, 32), dtype=torch.float32),
+                ),
             },
         },
         (
@@ -846,6 +877,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim1_right": (
                     cached_randn((2, 3, 64), dtype=torch.float16),
                     (0, 0, 0, 2),
+                ),
+                "2d_last_dim_left_stick_aligned": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (64, 0),
+                ),
+                "2d_last_dim_left_two_sticks": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (128, 0),
+                ),
+                "2d_last_dim_left_and_right_stick_aligned": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (64, 64),
+                ),
+                "2d_dim0_left": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 0, 2, 0),
+                ),
+                "2d_dim0_left_only": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 0, 1, 0),
+                ),
+                "3d_dim0_left": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 0, 0, 0, 2, 0),
+                ),
+                "3d_dim1_left": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 0, 1, 0),
+                ),
+                "4d_dim0_left": (
+                    cached_randn((2, 3, 4, 64), dtype=torch.float16),
+                    (0, 0, 0, 0, 0, 0, 1, 0),
                 ),
             },
         },
@@ -1183,7 +1246,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {
                 # exp(unsqueeze(x)) triggers internal compile in eager mode that
-                # fails with "Host dimension not found in dim_map" errors
+                # fails with host dimension lookup errors
                 "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
             },
             "param_sets": {
@@ -1527,20 +1590,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     False,
                 ),
-                # TODO(aviros): Implement expand
-                # "gqa_prefill": (
-                #     cached_randn(
-                #         (2, 256, 32, 128), differentiation=1, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 256, 8, 128), differentiation=2, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 256, 8, 128), differentiation=3, dtype=torch.float16
-                #     ),
-                #     False,
-                #     True,
-                # ),
+                "gqa_prefill": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    False,
+                    True,
+                ),
+                "gqa_prefill_causal": (
+                    cached_randn(
+                        (2, 256, 32, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 8, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (2, 256, 8, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    None,
+                    True,
+                    True,
+                ),
                 # TODO(aviros): Implement broadcast for batch dim in batch matmul
                 # "mha_decode": (
                 #     cached_randn(
@@ -1570,6 +1647,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 #     True,
                 # ),
             }
+        },
+        ("test_split", "test_split_cpu"): {
+            "ops_dict": {
+                "split3": lambda dim, index, x: (
+                    torch.split(x, x.size()[dim] // 3, dim=dim)[index].clone(),
+                ),
+            },
+            "param_sets": {
+                "1d0s0": (0, 0, cached_randn((384,), dtype=torch.float16)),
+                "1d0s1": (0, 1, cached_randn((384,), dtype=torch.float16)),
+                "1d0s2": (0, 2, cached_randn((384,), dtype=torch.float16)),
+                "2d0s0": (0, 0, cached_randn((9, 384), dtype=torch.float16)),
+                "2d0s1": (0, 1, cached_randn((9, 384), dtype=torch.float16)),
+                "2d0s2": (0, 2, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s0": (1, 0, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s1": (1, 1, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s2": (1, 2, cached_randn((9, 384), dtype=torch.float16)),
+                "3d0s0": (0, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d0s1": (0, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d0s2": (0, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s0": (1, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s1": (1, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s2": (1, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s0": (2, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s1": (2, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s2": (2, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+            },
+        },
+        ("test_slice", "test_slice_cpu"): {
+            "ops_dict": {
+                "slice3": lambda dim, index, x: x.exp(),
+            },
+            "param_sets": {
+                # TODO: Add more tests by generalizing size-1 dim support. See #1548
+                "3d1s0": (1, 0, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s1": (1, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
+            },
+        },
+        ("test_rope_fms", "test_rope_cpu"): {
+            "param_sets": {
+                "fp16": (
+                    cached_randn((2, 256, 4096), dtype=torch.float16),
+                    cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+            },
         },
     }
 
@@ -1640,7 +1763,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
-        if K >= (128 // b.element_size()):  # multiple sticks
+        if K > (128 // b.element_size()):  # multiple sticks
             compare(op, a, b, atol=0.1, rtol=0.1)
         else:  # single stick, no need to relax
             compare(op, a, b)
@@ -2175,6 +2298,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return result.item()
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
+
+    def test_split_cpu(self, op, dim, index, x):
+        def fn(x):
+            return op(dim, index, x)
+
+        compare_with_cpu(fn, x, run_eager=False)
+
+    def test_slice_cpu(self, op, dim, index, x):
+        def fn(x):
+            start = index * (x.size()[0] // 3)
+            end = (index + 1) * (x.size()[0] // 3)
+            if dim == 0:
+                return op(dim, index, x[start:end])
+            elif dim == 1:
+                return op(dim, index, x[:, start:end])
+            elif dim == 2:
+                return op(dim, index, x[:, :, start:end])
+
+        compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
+
+    def test_rope_cpu(self, q, freqs):
+        def fn(q, freqs):
+            q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
+            mul_out = freqs[:, :, None, :, :, :] * q_.unsqueeze(-3)
+            sum_out = mul_out.sum(4, keepdim=True)
+            q_out = sum_out.flatten(3)
+            return q_out
+
+        compare_with_cpu(fn, q, freqs, cpu_compile=False)
 
 
 if __name__ == "__main__":

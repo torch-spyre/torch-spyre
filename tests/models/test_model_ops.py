@@ -28,10 +28,10 @@ from torch.testing._internal.opinfo.core import (
     OpInfo,
 )
 from torch.testing._internal.common_device_type import (
-    PrivateUse1TestBase,
     ops,
     instantiate_device_type_tests,
 )
+from torch.testing._internal.common_utils import TestCase
 from op_registry import OP_REGISTRY, OpAdapter
 
 
@@ -110,7 +110,7 @@ _init_model_ops_db()
 seen_case_keys = set()
 
 
-class TestSpyreModelOps(PrivateUse1TestBase):
+class TestSpyreModelOps(TestCase):
     @ops(model_ops_db)
     def test_model_ops_db(
         self,
@@ -221,4 +221,4 @@ class TestSpyreModelOps(PrivateUse1TestBase):
 
 # Instantiate device type tests for the TestSpyreModelOps class
 # This is required for @ops decorator to work properly
-instantiate_device_type_tests(TestSpyreModelOps, globals())
+instantiate_device_type_tests(TestSpyreModelOps, globals(), only_for=("privateuse1",))

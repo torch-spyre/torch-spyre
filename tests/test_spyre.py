@@ -355,6 +355,57 @@ class TestSpyre(TestCase):
         finally:
             torch.spyre.set_device(orig)
 
+    def test_instantiate_device_type_tests_mro(self):
+        """Verify that instantiate_device_type_tests works with TestCase
+        base class and only_for=("privateuse1",).
+
+        Previously, inheriting from PrivateUse1TestBase caused an MRO
+        conflict when instantiate_device_type_tests tried to create a
+        dynamic subclass that also inherits PrivateUse1TestBase.
+        Using plain TestCase + only_for avoids the conflict.
+        """
+        from torch.testing._internal.common_device_type import (
+            instantiate_device_type_tests,
+        )
+
+        class _TestMROCheck(TestCase):
+            def test_device_is_spyre(self):
+                pass
+
+        ns = {"_TestMROCheck": _TestMROCheck}
+        # This must not raise TypeError about MRO
+        instantiate_device_type_tests(_TestMROCheck, ns, only_for=("privateuse1",))
+
+        # instantiate_device_type_tests should create a class named
+        # _TestMROCheckPRIVATEUSE1 in the namespace
+        assert "_TestMROCheckPRIVATEUSE1" in ns, (
+            f"Expected _TestMROCheckPRIVATEUSE1 in namespace, got {list(ns)}"
+        )
+
+        # The generated class should be instantiable (valid MRO)
+        cls = ns["_TestMROCheckPRIVATEUSE1"]
+        assert issubclass(cls, TestCase)
+
+    def test_device_to_device(self):
+        """Test simple device-to-device copy using tensor.copy_() method."""
+        src = torch.randn(3, dtype=torch.float16, device="spyre")
+        dst = torch.empty(3, dtype=torch.float16, device="spyre")
+
+        dst.copy_(src)
+
+        # Verify the copy worked
+        assert torch.allclose(src.cpu(), dst.cpu())
+        assert src.data_ptr() != dst.data_ptr()
+
+    def test_device_to_device_with_view(self):
+        """Test more complex device-to-device copy using tensor.copy_() method."""
+        a = torch.randn(512, 512).to("spyre")
+        b = torch.zeros((512, 512), device="spyre")
+        c = b.view((64, 8, 512))
+        b.copy_(a)
+        assert torch.allclose(a.cpu(), b.cpu())
+        assert torch.allclose(a.cpu().view(64, 8, 512), c.cpu())
+
 
 if __name__ == "__main__":
     run_tests()

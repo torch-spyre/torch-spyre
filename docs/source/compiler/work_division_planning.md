@@ -1,144 +1,149 @@
 # Work Division Planning
 
-This document describes the multi-dimensional parallelization planning in Torch-Spyre, which determines how computational work is distributed across multiple cores for parallel execution.
+This document describes the multi-dimensional parallelization planning in
+Torch-Spyre, which determines how computational work is distributed across
+multiple cores for parallel execution.
 
 ## Motivation
 
-Spyre provide multiple processing cores that can execute operations in parallel. To maximize performance, the compiler must decide how to divide tensor operations across these cores. The challenges are to:
+Spyre provides multiple processing cores that can execute operations in
+parallel. To maximize performance, the compiler must decide how to divide
+tensor operations across these cores. The challenges are to:
 
 1. Maximize parallelism by using as many cores as possible
 2. Ensure balanced workloads across all cores
-3. Maintain correctness by respecting operation semantics
+3. Respect hardware memory constraints per core
+4. Maintain correctness by respecting operation semantics
 
-As a start, the current work division planning phase analyzes each operation in the computation graph and determines an optimal parallelization strategy based on the operation type, tensor dimensions, and available hardware resources. In the future we wish to combine it with LX scratchpad optimization and consider optimal work divisions beyond a single operation.
+The work division planning phase analyzes each operation in the computation
+graph and determines a parallelization strategy based on the operation type,
+tensor dimensions, device layouts, and available hardware resources. In the
+future we wish to combine it with LX scratchpad optimization and consider
+optimal work divisions beyond a single operation.
 
-## Core Splitting Principles
+## Iteration Space
 
-### Multi-Dimensional Splitting
+Each operation has an _iteration space_: the set of loop variables and their
+ranges that together enumerate all output elements (for pointwise ops) or all
+input elements (for reductions). For example, a 2D pointwise op over an output
+of shape `[M, N]` has iteration space `{c0: M, c1: N}`.
 
-Many operations have multiple dimensions that can be parallelized independently. For example, a matrix multiplication can be split along both the row and column dimensions of the output matrix. The challenge is to distribute a fixed number of cores across multiple dimensions optimally.
+Stick variables — iteration variables whose range maps to the innermost (stick)
+device dimension of some tensor — are converted from element counts to stick
+counts before planning. This ensures core splits always land on stick
+boundaries, since each core must receive a whole number of sticks. When
+multiple tensors of different dtypes share a stick variable, the conversion
+uses the largest `elems_per_stick` across those tensors (conservative: fewer
+sticks → smaller adjusted size → fewer cores assigned to that dimension).
 
-Currently, the planner uses a priority-based greedy algorithm:
+## Hardware Memory Span Constraint
 
-1. Assign priorities to dimensions based on operation semantics and performance characteristics
-2. Sort dimensions by priority (higher priority first) and size (larger first)
-3. Allocate cores to the highest priority dimension first
-4. Continue allocating remaining cores to subsequent dimensions
-5. Stop when all cores are allocated or no more even divisions are possible
+Each Spyre core has a 256 MB limit on the memory span it can access. The
+_per-core span_ for a tensor is the contiguous range of device memory (in
+sticks) that a single core must read or write, given a particular split
+assignment. It is determined by the outermost device dimension that a core
+touches: `per_core_size * stride`, where `per_core_size` is the number of
+positions along that dimension each core covers.
 
-The product of all dimension splits equals the total number of cores used. For example, with 8 cores and three dimensions, the splits might be [4, 2, 1], meaning 4 splits on the first dimension, 2 on the second, and 1 (no split) on the third.
+If splitting is not applied, a large tensor may violate this limit. The
+planner detects violations and computes the minimum number of slices required
+on the responsible iteration variables to bring each tensor's span within the
+limit.
+
+For stick variables, valid slice counts are restricted to divisors of the
+stick count, so each core always receives a whole number of sticks. If the
+same iteration variable is a stick variable for one tensor and a span variable
+for another, and no valid slice count satisfies both constraints simultaneously,
+the compiler raises an error at compile time.
+
+## Planning Algorithm
+
+For each operation, `plan_splits` drives the planning in three steps:
+
+**Step 1 — Span-required splits (`must_split_vars`).**
+Process tensors one at a time. For each tensor whose per-core span exceeds
+256 MB, iterate over device dimensions outer to inner and search for the best
+split combination (Cartesian product of valid divisors for the variables
+contributing to that dimension) that satisfies the hardware limit. The search
+applies a two-tier selection: among combinations whose total core count does
+not exceed `max_cores`, prefer the one with the **largest span that still fits
+within the limit** (i.e. fewest cores used); if no combination brings the span
+within the limit, fall back to the one with the **smallest span** (most
+progress). Previously committed splits are carried forward as lower bounds,
+narrowing the search for subsequent tensors.
+
+**Step 2 — Priority ordering (`prioritize_dimensions`).**
+Among the remaining dimensions (those not already committed by step 1), rank
+variables for core assignment. Output dimensions (those present in the output's
+device coordinates) are ranked first by decreasing stick-adjusted size.
+Reduction dimensions follow, also by decreasing size. For non-matmul
+reductions, reduction dimensions are excluded from candidates entirely due to a
+known backend limitation.
+
+**Step 3 — Core assignment (`multi_dim_iteration_space_split`).**
+Assign cores in two passes:
+
+1. Apply the span-required splits from step 1. These variables are excluded
+   from the priority list — the two sets are disjoint.
+2. Distribute remaining cores to the priority-ordered dimensions from step 2,
+   greedily assigning the largest valid divisor of each dimension's size that
+   fits within the remaining core budget.
+
+The result is stored as `op_it_space_splits` on the scheduler node — a dict
+mapping each iteration variable to its slice count.
 
 ## Operation-Specific Strategies
 
 ### Pointwise Operations
 
-Pointwise operations perform element-wise computations where each output element depends only on corresponding input elements at the same position. Examples include addition, multiplication, and activation functions.
+The iteration space is that of the output tensor. All output dimensions are
+candidates for splitting. There is no reduction dimension. Span-required
+splits are computed jointly over all input and output tensors.
 
-**Parallelization Strategy:**
-- Split along the innermost dimension (stick dimension) in the device layout
-- Only applicable when all tensors have identical shapes (no broadcasting)
-- Each core processes a contiguous slice of the tensor
+### Reduction Operations (non-matmul)
 
-### Reduction Operations
-
-TODO
+Reduction dimensions are excluded from work division candidates due to a known
+backend limitation. Only output dimensions are split. Span-required splits are
+asserted to not involve reduction variables; if they do, the compiler raises an
+error.
 
 ### Matrix Multiplication
 
-Matrix multiplication computes C = A × B where A is M×K, B is K×N, and C is M×N. The output can be parallelized along the M, N, and K dimensions.
-
-**Parallelization Strategy:**
-- Prioritize the M dimension (rows) highest
-- Then prioritize the N dimension (columns)
-- The K dimension (reduction dimension) has the lowest priority and is only split when M and N cannot utilize all cores
-- When K is split, each core computes a partial result that is accumulated by the backend
-
-**Example:** With 8 cores and M=128, K=64, N=64, the planner chooses `op_dim_splits = [4, 1, 2]` — 4 row tiles and 2 column tiles. Each core computes a 32×32 block of the output while iterating over all 64 K-elements. If M and N were smaller, K might be split to utilize more cores.
-
-:::{figure} ../_static/images/work-division-matmul.svg
-:alt: Work division for matmul with 8 cores
-:width: 580px
-:align: center
-
-Matmul work division with `op_dim_splits = [4, 1, 2]`. Matrix A (M×K) is split into 4 row tiles (M_split=4, one color per tile). Matrix B (K×N) is split into 2 column tiles (N_split=2). Each of the 8 cores computes one colored block of C, reading the full K dimension of A and B. K and N are both 64, so their axes are drawn at the same scale — B is square.
-:::
+The iteration space covers the M (rows), K (reduction), and N (columns)
+dimensions. All three are candidates. The priority order after span-required
+splits is: output dimensions (M and N) by decreasing size, then K last. K is
+only split when M and N cannot utilize all available cores.
 
 ### Batched Matrix Multiplication
 
-Batched matrix multiplication extends matrix multiplication with additional batch dimensions, computing multiple independent matrix multiplications in parallel.
-
-**Parallelization Strategy:**
-- Prioritize batch dimensions highest (perfect parallelism)
-- Then prioritize the N dimension (columns)
-- Then consider the M dimension (rows)
-- The K dimension (reduction dimension) has the lowest priority and is only split when other dimensions cannot utilize all cores
-- When K is split, each core computes a partial result that is accumulated by the backend
-
-**Example:** With 8 cores, batch size 4, and output size 64×128 per batch, the planner might choose splits [4, 1, 1, 2] (B=4, M=1, K=1, N=2), splitting all 4 batches and dividing columns into 2 parts. If batch and output dimensions were smaller, K might be split to utilize more cores.
-
-## Core Division Representation
-
-The planning phase annotates each operation with an `op_dim_splits` list — a single list of split counts, one per **operation dimension**, in the same order as the dimension labels used during code generation.
-
-The operation dimension ordering is:
-
-| Op | Dimension labels | `op_dim_splits` |
-|---|---|---|
-| matmul | `["mb", "in", "out"]` | `[M_split, K_split, N_split]` |
-| 3D bmm | `["x", "mb", "in", "out"]` | `[B_split, M_split, K_split, N_split]` |
-| 4D bmm | `["x", "y", "mb", "in", "out"]` | `[B1_split, B2_split, M_split, K_split, N_split]` |
-| pointwise 2D | `["mb", "out"]` | `[1, cores]` |
-| pointwise 3D | `["mb", "x", "out"]` | `[1, 1, cores]` |
-| pointwise 4D | `["mb", "x", "y", "out"]` | `[1, 1, 1, cores]` |
-
-The reduction dimension (K / `"in"`) has the lowest priority and is typically 1 (not split) unless other dimensions cannot utilize all available cores. The product of all splits equals the total number of cores used.
-
-For example, a matrix multiplication with 8 cores and M_split=4, K_split=1, N_split=2 would have:
-- `op_dim_splits = [4, 1, 2]`  — matching `["mb", "in", "out"]`
-
-If M and N were small (e.g., 4×4) but K was large (e.g., 1024), the planner might choose:
-- `op_dim_splits = [4, 2, 4]` — splitting M=4, K=2, N=4 to use all 32 cores
-
-This representation is operation-centric: it describes how the logical computation is divided, independent of how any particular tensor is laid out in device memory. The code generation phase uses `op_dim_splits` directly without any mapping through device dimensions.
-
-## Planning Pipeline
-
-The work division planner processes operations in topological order, ensuring that dependencies are handled before dependent operations. For each operation:
-
-1. Determine if the operation type supports parallelization
-2. Extract tensor dimensions and device layouts
-3. Identify parallelizable dimensions based on operation semantics
-4. Apply the appropriate splitting strategy
-5. Annotate the operation with the core division specification
-
-The maximum number of cores is configured via an environment variable and validated to be within hardware limits. Operations that don't support parallelization or have dimensions that don't divide evenly default to single-core execution.
-
-## Limitations and Considerations
-
-**Current Limitations:**
-- Broadcasting in pointwise operations prevents parallelization
-- Only specific operation types are supported (pointwise, matrix multiplication)
-- Dimensions must divide evenly by the core count
-- No dynamic adjustment based on runtime conditions
-
-**Design Considerations:**
-- Static planning enables compile-time optimization and code generation
-- Even division simplifies implementation for now
-- Operation-specific parallelization strategies
+Same as matrix multiplication, with additional batch dimensions prepended.
+Batch dimensions appear as output dimensions and receive the highest priority
+(largest size first), followed by N, M, and finally K.
 
 ## Configuration
 
-Work division is controlled by the SENCORES environment variable, which specifies the maximum number of cores available for parallelization. Valid values range from 1 (no parallelization) to 32 (maximum supported cores). The planner will use up to this many cores for each operation, subject to the constraints described above.
+Work division is controlled by the `SENCORES` environment variable, which
+specifies the maximum number of cores available for parallelization. Valid
+values range from 1 (no parallelization) to 32 (maximum supported cores).
 
-## Future Extensions
+## Limitations and Future Work
 
-Potential enhancements to work division planning include:
+**Current limitations:**
 
-- Support for uneven splits with padding or dynamic load balancing
-- Parallelization of additional operation types (convolution, pooling, etc.)
+- Dimensions must divide evenly by the slice count (no uneven splits)
+- Only `Pointwise` and `Reduction` IR nodes are dispatched for work division;
+  `ExternKernel` and `FallbackKernel` nodes are skipped
+- Non-matmul reductions cannot split along the reduction dimension
+
+**Potential future enhancements:**
+
+- Retrieving correct padding instead of simplifying assumption
 - Cross-operation optimization considering data reuse and memory hierarchy
+- Integration with LX scratchpad memory planning
 
 ## See Also
 
-- [Work Division Code Generation](work_division_codegen.md) - How division plans are translated to executable code
-- [Tensor Layouts](../user_guide/tensors_and_layouts.md) - Understanding device layouts and dimensions
+- [Work Division Code Generation](work_division_codegen.md) — how division
+  plans are translated to executable code
+- [Tensor Layouts](../user_guide/tensors_and_layouts.md) — device layouts and
+  the stick memory model

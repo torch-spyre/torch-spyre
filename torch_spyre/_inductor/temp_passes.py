@@ -14,7 +14,6 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-from typing import cast
 import torch
 from torch._inductor.pattern_matcher import (
     Arg,
@@ -25,28 +24,6 @@ from torch._inductor.pattern_matcher import (
 )
 
 aten = torch.ops.aten
-
-
-def relayout_linear_weights(graph: torch.fx.Graph) -> None:
-    """
-    Transpose and realize nn.Linear weights so that they are compatible
-    with the backend compiler as it is today. In the future, this pass
-    should be eliminated for performance reasons when possible.
-    """
-
-    for node in graph.nodes:
-        if node.op == "call_function" and node.target == aten.mm.default:
-            input_t, kernel_t = node.args
-            input_t = cast(torch.fx.Node, input_t)
-            kernel_t = cast(torch.fx.Node, kernel_t)
-            if not kernel_t.meta["val"].is_contiguous():
-                with graph.inserting_before(node):
-                    contiguous_node = graph.call_function(
-                        aten.clone.default,
-                        args=(kernel_t,),
-                        kwargs={"memory_format": torch.contiguous_format},
-                    )
-                    node.update_arg(1, contiguous_node)
 
 
 _RESHAPE_OPS = (

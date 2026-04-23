@@ -87,15 +87,6 @@ std::vector<int32_t> generic_stick_dim_order(int32_t num_dims) {
   return dim_order;
 }
 
-std::optional<int32_t> SpyreTensorLayout::host_stick_dim() {
-  int32_t stick_dim = this->dim_map.back();
-  if (stick_dim == -1) {
-    return std::nullopt;
-  } else {
-    return stick_dim;
-  }
-}
-
 static std::vector<int64_t> compute_host_stride(
     const std::vector<int64_t>& host_size) {
   int n = host_size.size();
@@ -155,11 +146,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   if (host_size.size() == 0) {
     // Degenerate case of 0-dimension tensor (ie, a scalar)
     this->device_size.resize(2);
-    this->dim_map.resize(2);
     this->device_size[0] = 1;
     this->device_size[1] = this->elems_per_stick();
-    this->dim_map[0] = -1;
-    this->dim_map[1] = -1;
     this->stride_map.resize(2);
     this->stride_map[0] = -1;
     this->stride_map[1] = -1;
@@ -167,14 +155,14 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   }
 
   // Computing tiling
-  this->dim_map = spyre::get_generic_stick_layout(dim_order);
-  this->device_size.resize(this->dim_map.size());
+  auto dim_map = spyre::get_generic_stick_layout(dim_order);
+  this->device_size.resize(dim_map.size());
   bool sparse = dim_order.back() == -1;
   auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
-  auto stick_dim = this->dim_map.back();
-  this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();
-  for (int i = 0; i < this->dim_map.size() - 1; i++) {
-    auto dim = this->dim_map[i];
+  auto stick_dim = dim_map.back();
+  this->device_size[dim_map.size() - 1] = this->elems_per_stick();
+  for (int i = 0; i < dim_map.size() - 1; i++) {
+    auto dim = dim_map[i];
     if (dim == stick_dim) {
       if (sparse) {
         this->device_size[i] = 1;
@@ -186,8 +174,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] = host_size[dim];
     }
   }
-  this->stride_map = dim_map_to_stride_map(this->dim_map, host_size,
-                                           host_strides, this->device_size);
+  this->stride_map = dim_map_to_stride_map(dim_map, host_size, host_strides,
+                                           this->device_size);
 }
 
 std::string SpyreTensorLayout::toString() const {
@@ -197,13 +185,6 @@ std::string SpyreTensorLayout::toString() const {
   for (size_t i = 0; i < this->device_size.size(); i++) {
     ss << this->device_size[i];
     if (i < this->device_size.size() - 1) {
-      ss << ", ";
-    }
-  }
-  ss << "], dim_map =[";
-  for (size_t i = 0; i < this->dim_map.size(); i++) {
-    ss << this->dim_map[i];
-    if (i < this->dim_map.size() - 1) {
       ss << ", ";
     }
   }

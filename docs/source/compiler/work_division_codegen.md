@@ -1,5 +1,9 @@
 # Work Division Code Generation
 
+::::{warning}
+This document is stale and may not reflect the current implementation.
+::::
+
 This document describes how work division plans are translated into executable code structures in Torch-Spyre. The code generation phase takes the core division from the planning phase and generates the necessary data structures for runtime execution on the hardware accelerator.
 
 ## Overview

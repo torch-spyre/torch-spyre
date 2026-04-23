@@ -14,6 +14,7 @@
 
 import functools
 import torch
+import os
 
 DEVICE = torch.device("spyre")
 
@@ -27,6 +28,17 @@ def cached_randn(
 ):
     out = torch.randn(shape, dtype=dtype) * scale
     return out if not abs else torch.abs(out)
+
+
+@functools.lru_cache(maxsize=None)
+def cached_xavier(
+    shape,
+    differentiation=None,
+    dtype=torch.float16,
+):
+    out = torch.empty(shape, dtype=dtype)
+    torch.nn.init.xavier_uniform_(out)
+    return out
 
 
 @functools.lru_cache(maxsize=None)
@@ -450,10 +462,16 @@ def compare_with_cpu(
     atol=0.1,
     rtol=0.1,
     needs_device=False,
-    cpu_compile=True,
+    cpu_compile=None,
     target=None,
     run_eager=True,
 ):
+    # if this flag is explicitly passed in by the test, use it
+    if cpu_compile is None:
+        # the bool function parses all non-empty strings to true
+        # if this env var is set at all, it gets marked as true
+        cpu_compile = bool(os.getenv("TEST_COMPARE_CPU_COMPILE"))
+
     """Compare Spyre execution (compiled and optionally eager) against CPU execution."""
     cpu_result = fn(*args)
 

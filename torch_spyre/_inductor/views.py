@@ -42,18 +42,8 @@ def compute_coordinates(
                 next_stride[i] = stride[j]
     # compute coordinate expressions
     coordinates = [sympy.S.Zero] * n
-    vars = index.free_symbols
-    for var in vars:
-        if var_ranges[var] <= 1:
-            continue  # ignore var with trivial range
-        # isolate current var
-        term = index.subs({v: 0 for v in vars - {var}})
-        # compute index({var=1}) and index({var=var_ranges[var]})
-        # TODO: handle non-zero offset in index
-        # https://github.com/torch-spyre/torch-spyre/issues/1333
-        assert term.subs(var, 0) == 0, f"Non-zero offset in index expression {index}"
-        step = term.subs(var, 1)
-        limit = term.subs(var, var_ranges[var])
+
+    def add_term(var, step, limit):
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
@@ -80,6 +70,23 @@ def compute_coordinates(
             )
         else:
             coordinates[primary_dim] += var * step // primary_stride
+
+    vars = index.free_symbols
+    offset = index.xreplace({v: 0 for v in vars})
+    if offset > 0:
+        index = index - offset
+        add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
+
+    for var in vars:
+        if var_ranges[var] <= 1:
+            continue  # ignore var with trivial range
+        # isolate current var
+        term = index.xreplace({v: 0 for v in vars - {var}})
+        # compute index({var=1}) and index({var=var_ranges[var]})
+        step = term.xreplace({var: 1})
+        limit = term.xreplace({var: var_ranges[var]})
+        add_term(var=var, step=step, limit=limit)
+
     return coordinates
 
 
@@ -127,9 +134,9 @@ def matching_dim(coords: list[sympy.Expr], expr: sympy.Expr) -> Optional[int]:
 @dataclass(order=True)
 class Term:
     """
-    A term num*(var%mod)//den in a coordinate expression.
+    A term num*(var%mod)//den + offset in a coordinate expression.
     Includes the size of the dimension the expression is intended for.
-    Zero is represented as Term(None, None, None, None, dim_size).
+    Constant including zero is represented as Term(None, None, None, None, dim_size, offset).
     """
 
     num: sympy.Expr | None  # numerator
@@ -137,6 +144,7 @@ class Term:
     var: sympy.Expr | None  # variable
     mod: sympy.Expr | None  # modulo
     dim_size: sympy.Expr
+    offset: sympy.Expr = sympy.S.Zero  # offset
 
 
 def normalize_coordinates(
@@ -149,7 +157,6 @@ def normalize_coordinates(
 
     If mod is absent from term assume term does not overflow dim_size.
     Assume num or den is 1.
-    Assume no offset: coordinate(0, .., 0) = 0.
 
     Break each expression into list of terms.
     If expr has no mod, use var_range instead.
@@ -165,18 +172,14 @@ def normalize_coordinates(
         # sympy uses floor to encode integer divisions, remove
         expr = coordinate.replace(sympy.floor, lambda x: x)
         vars = expr.free_symbols
-        # TODO: handle non-zero offset in coordinate expression
-        # https://github.com/torch-spyre/torch-spyre/issues/1333
-        assert expr.subs({var: sympy.S.Zero for var in vars}) == 0, (
-            f"Non-zero offset in coordinate expression {expr}"
-        )
+        offset = expr.xreplace({var: sympy.S.Zero for var in vars})
         if len(vars) == 0:
-            terms.append(Term(None, None, None, None, dim_size))
+            terms.append(Term(None, None, None, None, dim_size, offset))
             continue
         dim_terms = []  # terms for current dimension
         for var in vars:
             # extract term for each var
-            term = expr.subs({v: 0 for v in vars - {var}})
+            term = expr.xreplace({v: 0 for v in vars - {var}}) - offset
             # pattern match expression tree, there is small number of possibilities
             if term.is_symbol:
                 dim_terms.append(
@@ -202,6 +205,10 @@ def normalize_coordinates(
 
         # sort dim_terms in increasing num order
         dim_terms.sort()
+
+        for dim_term in dim_terms[::-1]:
+            dim_term.offset = offset // dim_term.num
+            offset %= dim_term.num
 
         # split dims with n>1 terms
         split_dim_terms = []
@@ -238,11 +245,12 @@ def normalize_coordinates(
             fused_term.num = term.num
             fused_term.den = term.den
             fused_term.dim_size *= term.dim_size
+            fused_term.offset += term.offset
         else:
-            if fused_term.dim_size > 1:
+            if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
             fused_term = term
-    if fused_term.dim_size > 1:
+    if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
     # add term for stick dimension
     fused_terms.append(terms[-1])
@@ -252,7 +260,7 @@ def normalize_coordinates(
 
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
-    tensors: Sequence[Dict[str, Sequence[sympy.Expr]]],
+    tensors: list[Dict[str, list[sympy.Expr]]],
 ) -> tuple[
     (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
 ]:
@@ -273,12 +281,41 @@ def align_tensors(
     stick_dim = []  # stick var for each tensor
     stick_size = []  # stick size for each tensor
 
+    n = 0  # next symbol number
+
+    # TODO: Current support of size-1 dimensions are limited. We will generalize this
+    # in follow-up PRs. See #1548
+    is_pointwise_op = len(set([len(tensor["size"]) for tensor in tensors])) == 1
+    if is_pointwise_op:
+        rank = len(tensors[0]["size"])
+        vars = var_ranges.keys()
+        for i in range(rank):
+            coords = [tensor["coordinates"][i] for tensor in tensors]
+            if all(c == 0 for c in coords):
+                continue
+            if not any(c == 0 for c in coords):
+                continue
+            if not any(c.is_number and c > 0 for c in coords):
+                continue
+
+            new_var = sympy.symbols(f"z{n}")
+            n += 1
+            var_ranges[new_var] = 1
+            splits[new_var] = set()
+
+            for tensor in tensors:
+                coord = tensor["coordinates"][i]
+                if coord == 0:
+                    tensor["coordinates"][i] = new_var
+                else:
+                    tensor["coordinates"][i] = new_var + coord
+
     for tensor in tensors:
         terms = normalize_coordinates(var_ranges, tensor["size"], tensor["coordinates"])
         stick_dim.append(terms[-1].var)
         stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
-        for num, den, var, mod, dim_size in [astuple(term) for term in terms]:
+        for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
                 if den != stick_size[-1] or var != stick_dim[-1]:
                     # add den to splits unless stick dim and stick size
@@ -294,7 +331,6 @@ def align_tensors(
     # with one var per segment (split[i], split[i+1])
     new_var_ranges = {}
     new_op_it_space_splits = {}
-    n = 0  # next symbol number
     remap = {}  # map old var to new vars in splits order
     for var, split in splits.items():
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
@@ -324,7 +360,9 @@ def align_tensors(
     for j, terms in enumerate(all_terms):
         size = []
         coordinates = []
-        for num, den, var, mod, dim_size in [astuple(term) for term in terms[:-1]]:
+        for num, den, var, mod, dim_size, offset in [
+            astuple(term) for term in terms[:-1]
+        ]:
             # for each term except last one (stick dim)
             if var is None:
                 # dimension is not iterated over, keep as is
@@ -339,26 +377,34 @@ def align_tensors(
                 and den not in splits[var]
                 else splits[var].index(den)
             )  # replace split[var].index(stick_size) with 0 for stick dim
-            for i in reversed(range(low, splits[var].index(mod))):
+            high = splits[var].index(mod)
+            if low == high:
+                size.append(dim_size)
+                coordinates.append(var + offset)
+            for i in reversed(range(low, high)):
                 if i == splits[var].index(mod) - 1:
                     # upper bound of iteration range is dim_size * den
                     size.append(dim_size * den // splits[var][i])
                 else:
                     # upper bound of iteration range is split
                     size.append(splits[var][i + 1] // splits[var][i])
-                coordinates.append(remap[var][i])
+                coordinates.append(remap[var][i] + offset // splits[var][i])
+                offset %= splits[var][i]
             if var == stick_dim[j] and den == stick_size[j] and den not in splits[var]:
                 # outer stick dim
                 size[-1] //= den
-                coordinates[-1] //= den
+                (offset, term) = coordinates[-1].as_coeff_Add()
+                coordinates[-1] = term // den + offset
             if num > 1:
                 # iteration skips over elements in dim, realize gap as new dimension
                 size.append(num)
                 coordinates.append(sympy.S.Zero)
         # add stick dim
-        num, den, var, mod, dim_size = astuple(terms[-1])
+        num, den, var, mod, dim_size, offset = astuple(terms[-1])
         size.append(dim_size)
-        coordinates.append(var % dim_size if var is not None else sympy.S.Zero)
+        coordinates.append(
+            (var % dim_size if var is not None else sympy.S.Zero) + offset
+        )
         new_tensors.append({"size": size, "coordinates": coordinates})
 
     # decide desired rank for all tensors

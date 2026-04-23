@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import math
 
 from torch._inductor.ir import (
     ComputedBuffer,
-)
-from torch._inductor.scheduler import (
-    BaseSchedulerNode,
-    SchedulerNode,
+    MutationLayoutSHOULDREMOVE,
+    Operation,
 )
 from torch._inductor.virtualized import V
 from . import config
@@ -158,18 +157,19 @@ class ScratchPadAllocator:
     # TODO add dealloc and defrag mechanism to allocator later
 
 
-def mem_usage_by_node(n: SchedulerNode):
-    """Get a summary of memory usage of the input node"""
+def mem_usage_by_op(op: ComputedBuffer):
+    """Get a summary of memory usage of the input operation."""
+    rw = op.get_read_writes()
     mem_usage = {}
-    for r_or_w, buf_memDeps in enumerate([n.read_writes.reads, n.read_writes.writes]):
-        for buf_memDep in buf_memDeps:
-            buf = V.graph.get_buffer(buf_memDep.name)
+    for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+        for dep in deps:
+            buf = V.graph.get_buffer(dep.name)
             dev_layout = buf.layout.device_layout  # this is device layout
             dev_size = (
                 math.prod(dev_layout.device_size[:-1]) * 128
             )  # num_sticks * bytes_per_stick
-            mem_usage[buf_memDep.name] = {
-                "is_input": r_or_w == 0,
+            mem_usage[dep.name] = {
+                "is_input": is_input,
                 "size": dev_size,
             }
 
@@ -177,29 +177,30 @@ def mem_usage_by_node(n: SchedulerNode):
 
 
 def consider_for_scratchpad(
-    n: SchedulerNode,
+    op: ComputedBuffer,
     alloc: ScratchPadAllocator,
     idx: int,
-    is_last_node: bool,
+    is_last_op: bool,
 ):
-    # 1. summarize both inputs and output sizes used by this node.
-    mem_usage = mem_usage_by_node(n)
+    # 1. summarize both inputs and output sizes used by this operation.
+    mem_usage = mem_usage_by_op(op)
 
     # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
     # which will be used in generate_sdsc() later.
-    org_op_name = n.node.origin_node.name
-    alloc.try_allocate(mem_usage, idx, org_op_name, is_last_node)
+    org_op_name = op.origin_node.name
+    alloc.try_allocate(mem_usage, idx, org_op_name, is_last_op)
 
 
-def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
+def buf_end_of_life_analysis(operations: list[Operation]):
     """
     First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
     Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
     """
     last_used: dict = {}
-    for idx, n in enumerate(nodes):
-        for buf in n.used_buffer_names():  # just buf names
-            last_used[buf] = idx
+    for idx, op in enumerate(operations):
+        rw = op.get_read_writes()
+        for dep in itertools.chain(rw.reads, rw.writes):
+            last_used[dep.name] = idx
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -213,22 +214,22 @@ def buf_end_of_life_analysis(nodes: list[BaseSchedulerNode]):
 
 
 def scratchpad_planning(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
-    # Nodes are in topological order (guarenteed by caller).
-    # Work division has already been done.
-    # Stickification has already been done (therefore all ComputedBeffers have FixedTiledLayouts)
+    operations: list[Operation],
+) -> None:
+    # Operations are in topological order (guaranteed by GraphLowering).
+    # Core division has already been done.
+    # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts)
 
     alloc = ScratchPadAllocator()
 
-    node_idx_to_dealloc_bufs = buf_end_of_life_analysis(nodes)
+    op_idx_to_dealloc_bufs = buf_end_of_life_analysis(operations)
 
-    for idx, n in enumerate(nodes):
+    for idx, op in enumerate(operations):
         # release unneeded LX allocations before actual planning
-        alloc.deallocate(node_idx_to_dealloc_bufs.get(idx, []))
-        is_last_node = idx == len(nodes) - 1
+        alloc.deallocate(op_idx_to_dealloc_bufs.get(idx, []))
+        is_last_op = idx == len(operations) - 1
 
-        if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
-            consider_for_scratchpad(n, alloc, idx, is_last_node)
-    # print(alloc.lx_usage_hist)
-    return nodes
+        if isinstance(op, ComputedBuffer):
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                continue
+            consider_for_scratchpad(op, alloc, idx, is_last_op)
