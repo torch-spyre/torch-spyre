@@ -4,6 +4,7 @@ Shared class and methods for all OOT PyTorch test overrides.
 """
 
 import os
+import regex as re
 from typing import Dict, List, Optional, Set
 
 import pytest  # type: ignore
@@ -441,6 +442,16 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                     for tag in all_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
+
+            # apply the full method name as its own pytest marker
+            existing_fn = cls.__dict__.get(method_name)
+            if existing_fn is not None:
+                safe_marker = re.sub(r"[^a-zA-Z0-9_]", "_", method_name)
+                setattr(
+                    cls,
+                    method_name,
+                    pytest.mark.__getattr__(safe_marker)(existing_fn),
+                )
 
             # apply xfail if needed
             if is_xfail:
