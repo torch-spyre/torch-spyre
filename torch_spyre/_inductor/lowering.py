@@ -257,7 +257,7 @@ def lower_mm(x, y):
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"mm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}, "
+            f"mm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}, "
             f"x_layout={x.get_layout()}, y_layout={y.get_layout()}, out_layout={result_buf.get_layout()}"
         )
 
@@ -328,7 +328,7 @@ def lower_bmm(x, y):
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"bmm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}"
+            f"bmm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}"
         )
 
     return result

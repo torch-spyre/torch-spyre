@@ -39,6 +39,8 @@ from .constants import (
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
+    concretize_expr,
+    concretize_index,
     apply_splits_from_index_coeff,
     iteration_space,
 )
@@ -86,6 +88,46 @@ class ReductionOp(RValue):
 @dataclass
 class UnimplementedOp(RValue):
     op: str
+
+
+def _serialize_value(v):
+    """Serialize a value for code generation, handling symbolic expressions.
+
+    Produces valid Python source text that can appear in the generated kernel
+    wrapper code.  All sympy expressions—including symbolic ones with free
+    symbols—are concretized to Python ``int`` / ``float`` so the generated
+    code never depends on sympy names (``Mul``, ``Float``, ``Pow``, etc.)
+    being in scope.
+
+    This is needed because ``op_info`` dicts may contain symbolic scalars
+    (e.g. ``1.0 / s97``) that came from Inductor's symbolic analysis.
+
+    TODO(issue#220): once SDSC generation produces symbolic JSON
+    (``symbolDefinitions_``), this function should emit symbolic references
+    rather than concretizing.
+    """
+    if isinstance(v, sympy.Integer):
+        return repr(int(v))
+    elif isinstance(v, sympy.Basic):
+        # Concretize: first try direct float conversion for concrete numerics,
+        # then fall back to substituting size_hints for symbolic expressions.
+        if hasattr(v, "free_symbols") and v.free_symbols:
+            # Substitute each symbol individually (size_hint handles simple
+            # Symbol lookups reliably), then evaluate.  This works for float
+            # expressions like 1.0/s97 where size_hint on the whole expression
+            # might not handle the float division correctly.
+            subs = {s: V.graph.sizevars.size_hint(s) for s in v.free_symbols}
+            concrete = float(v.subs(subs))
+            return repr(concrete)
+        try:
+            return repr(float(v))
+        except (TypeError, ValueError):
+            return repr(V.graph.sizevars.size_hint(v))
+    elif isinstance(v, dict):
+        items = ", ".join(f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items())
+        return "{" + items + "}"
+    else:
+        return repr(v)
 
 
 class SpyreOpFuncs:
@@ -319,11 +361,17 @@ class SpyreKernel(Kernel[CSEVariable]):
     def create_tensor_arg(
         self, is_input: bool, name: str, tensor: TensorAccess
     ) -> TensorArg:
+        it_space = iteration_space(self.current_node)
+        # With dynamic=True the host index may contain symbolic strides
+        # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
+        # can correctly isolate each loop variable's contribution.
+
+        index = concretize_index(tensor.index, set(it_space.keys()))
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
-            iteration_space(self.current_node),
-            tensor.index,
+            it_space,
+            index,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -401,7 +449,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"kernel_load: {name}, shape={[int(s) for s in layout.size]}, "
+                f"kernel_load: {name}, shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
@@ -429,7 +477,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
             logger.debug(
-                f"kernel_store: {name} (type: {value_type}), shape={[int(s) for s in layout.size]}, "
+                f"kernel_store: {name} (type: {value_type}), shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
@@ -492,7 +540,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"kernel_store_reduction: {name} (op: {value.op}), shape={[int(s) for s in layout.size]}, "
+                f"kernel_store_reduction: {name} (op: {value.op}), shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
@@ -573,7 +621,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                             )
                             + "},"
                         )
-                        buf.writeline(f"op_info={op_spec.op_info!r},")
+                        buf.writeline(f"op_info={_serialize_value(op_spec.op_info)},")
                         buf.writeline("args=[")
                         with buf.indent():
                             for arg in op_spec.args:
