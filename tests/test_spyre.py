@@ -274,21 +274,33 @@ class TestSpyre(TestCase):
 
     def test_allocation_and_copy_dtypes(self):
         # allocation and device to host cases
-        for dtype in [torch.float16, torch.float32, torch.bool, torch.int8]:
+        for dtype in [
+            torch.float16,
+            torch.float32,
+            torch.bool,
+            torch.int8,
+            torch.bfloat16,
+        ]:
             x = torch.empty(64, dtype=dtype, device="spyre")
             x.cpu()
 
-        for dtype in [torch.bfloat16, torch.float64]:
+        for dtype in [torch.float64]:
             with self.assertRaises(RuntimeError):
                 x = torch.empty(64, dtype=dtype, device="spyre")
                 x.cpu()
 
         # allocation and host to device cases
-        for dtype in [torch.float16, torch.float32, torch.bool, torch.int8]:
+        for dtype in [
+            torch.float16,
+            torch.float32,
+            torch.bool,
+            torch.int8,
+            torch.bfloat16,
+        ]:
             x = torch.empty(64, dtype=dtype)
             x.to("spyre")
 
-        for dtype in [torch.bfloat16, torch.float64]:
+        for dtype in [torch.float64]:
             with self.assertRaises(RuntimeError):
                 x = torch.empty(64, dtype=dtype)
                 x.to("spyre")
