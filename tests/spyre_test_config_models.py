@@ -783,9 +783,15 @@ class SupportedModuleConfig(BaseModel):
 
     name: str
     force_xfail: bool = False
+    dtypes: List[SupportedOpDtypeConfig] = []
 
     def get_name(self) -> str:
         return self.name
+
+    def resolved_dtypes(self) -> Optional[Set[torch.dtype]]:
+        if not self.dtypes:
+            return None
+        return {d.resolved_dtype() for d in self.dtypes}
 
 
 class InputConfig(BaseModel):
@@ -799,7 +805,7 @@ class GlobalConfig(BaseModel):
 
     supported_dtypes: List[DtypeNamedItem] = []
     supported_ops: Optional[List[SupportedOpConfig]] = None
-    supported_modules: Optional[List[ModulesNamedItem]] = None
+    supported_modules: Optional[List[SupportedModuleConfig]] = None
     input_config: InputConfig = InputConfig()
 
     @field_validator("supported_dtypes", mode="before")

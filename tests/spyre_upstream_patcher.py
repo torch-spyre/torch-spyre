@@ -334,10 +334,13 @@ class _OOTModuleListPatcher:
         if self._included_modules:
             existing_names = {m.name for m in self._modules_instance.module_info_list}
             for name in self._included_modules:
-                if name not in existing_names:
-                    mod_info = module_db_by_name.get(name)
-                    if mod_info is not None:
-                        self._modules_instance.module_info_list.append(mod_info)
+                # YAML may use "torch.nn.X" but module_db keys use "nn.X"
+                short_name = name.removeprefix("torch.")
+                mod_info = module_db_by_name.get(short_name) or module_db_by_name.get(
+                    name
+                )
+                if mod_info is not None and mod_info.name not in existing_names:
+                    self._modules_instance.module_info_list.append(mod_info)
 
         # filter to global.supported_modules
         # included_modules will exist even if not in supported_modules
@@ -345,7 +348,10 @@ class _OOTModuleListPatcher:
             filtered = [
                 m
                 for m in self._modules_instance.module_info_list
-                if m.name in self._supported_modules or m.name in self._included_modules
+                if m.name in self._supported_modules
+                or m.name in self._included_modules
+                or f"torch.{m.name}" in self._supported_modules
+                or f"torch.{m.name}" in self._included_modules
             ]
             if filtered:
                 self._modules_instance.module_info_list[:] = filtered
@@ -356,6 +362,7 @@ class _OOTModuleListPatcher:
                 m
                 for m in self._modules_instance.module_info_list
                 if m.name not in self._excluded_modules
+                and f"torch.{m.name}" not in self._excluded_modules  # ← add
             ]
             if filtered:
                 self._modules_instance.module_info_list[:] = filtered
@@ -460,3 +467,145 @@ class _OOTPrecisionOverridePatcher:
                 # setdefault for global, direct assign for include (already merged above
                 # so just assign - include already won priority during merge)
                 self._underlying_fn.precision_overrides[dtype] = atol
+
+
+class _OOTOpMarkerPatcher:
+    """Patches @ops._parametrize_test to attach pytest markers directly on
+    each test_wrapper as it is yielded, before super().instantiate_test()
+    installs it as a class method.
+
+    """
+
+    def __init__(self, test: object) -> None:
+        from torch.testing._internal.common_device_type import ops as _ops_cls
+
+        underlying_fn = test.__func__ if hasattr(test, "__func__") else test
+        p = getattr(underlying_fn, "parametrize_fn", None)
+        self._ops_instance = (
+            p.__self__
+            if p is not None
+            and hasattr(p, "__self__")
+            and isinstance(p.__self__, _ops_cls)
+            else None
+        )
+        self._underlying_fn = underlying_fn
+
+    def patch(self) -> None:
+        if self._ops_instance is None:
+            return
+
+        import pytest
+        import regex as re
+
+        original_parametrize_fn = self._underlying_fn.parametrize_fn
+
+        def patched_parametrize_fn(test, generic_cls, device_cls):
+            for (
+                test_wrapper,
+                test_name,
+                param_kwargs,
+                decorator_fn,
+            ) in original_parametrize_fn(test, generic_cls, device_cls):
+                op = param_kwargs.get("op")
+                dtype = param_kwargs.get("dtype")
+
+                if op is not None:
+                    op_safe = re.sub(r"[^a-zA-Z0-9_]", "_", op.name).strip("_")
+                    op_safe = re.sub(r"__\d+$", "", op_safe).strip("_")
+                    if op_safe:
+                        test_wrapper = pytest.mark.__getattr__(f"op__{op_safe}")(
+                            test_wrapper
+                        )
+
+                if dtype is not None:
+                    dtype_safe = re.sub(
+                        r"[^a-zA-Z0-9_]", "_", str(dtype).replace("torch.", "")
+                    ).strip("_")
+                    dtype_safe = re.sub(r"__\d+$", "", dtype_safe).strip("_")
+                    if dtype_safe:
+                        test_wrapper = pytest.mark.__getattr__(f"dtype__{dtype_safe}")(
+                            test_wrapper
+                        )
+
+                yield test_wrapper, test_name, param_kwargs, decorator_fn
+
+        # Replacing on the function object itself because this is what the upstream reads.
+        self._underlying_fn.parametrize_fn = patched_parametrize_fn
+
+
+class _OOTModuleMarkerPatcher:
+    """Patches @modules.parametrize_fn to attach pytest markers directly on
+    each test_wrapper as it is yielded, before super().instantiate_test()
+    installs it as a class method.
+
+    Follows _OOTOpMarkerPatcher exactly but targets the @modules decorator.
+    Attaches module name and dtype as pytest markers so tests can be filtered
+    with -m "nn_Linear" or -m "float16".
+    """
+
+    def __init__(self, test: object) -> None:
+        from torch.testing._internal.common_modules import modules as _modules_cls
+
+        self._test = test  # store original test object
+        underlying_fn = test.__func__ if hasattr(test, "__func__") else test
+        p = getattr(underlying_fn, "parametrize_fn", None)
+        self._modules_instance = (
+            p.__self__
+            if p is not None
+            and hasattr(p, "__self__")
+            and isinstance(p.__self__, _modules_cls)
+            else None
+        )
+        self._underlying_fn = underlying_fn
+
+    def patch(self) -> None:
+        if self._modules_instance is None:
+            return
+
+        import pytest
+        import regex as re
+
+        original_parametrize_fn = self._underlying_fn.parametrize_fn
+
+        def patched_parametrize_fn(test, generic_cls, device_cls):
+            for (
+                test_wrapper,
+                test_name,
+                param_kwargs,
+                decorator_fn,
+            ) in original_parametrize_fn(test, generic_cls, device_cls):
+                module_info = param_kwargs.get("module_info")
+                dtype = param_kwargs.get("dtype")
+
+                if module_info is not None:
+                    module_safe = re.sub(r"[^a-zA-Z0-9_]", "_", module_info.name).strip(
+                        "_"
+                    )
+                    module_safe = re.sub(r"__\d+$", "", module_safe).strip("_")
+                    if module_safe:
+                        mark = pytest.mark.__getattr__(f"module__{module_safe}")
+                        # Set directly on pytestmark list so @wraps copies it
+                        if not hasattr(test_wrapper, "pytestmark"):
+                            test_wrapper.pytestmark = []
+                        test_wrapper.pytestmark = list(test_wrapper.pytestmark) + [mark]
+
+                if dtype is not None:
+                    dtype_safe = re.sub(
+                        r"[^a-zA-Z0-9_]", "_", str(dtype).replace("torch.", "")
+                    ).strip("_")
+                    dtype_safe = re.sub(r"__\d+$", "", dtype_safe).strip("_")
+                    if dtype_safe:
+                        mark = pytest.mark.__getattr__(f"dtype__{dtype_safe}")
+                        if not hasattr(test_wrapper, "pytestmark"):
+                            test_wrapper.pytestmark = []
+                        test_wrapper.pytestmark = list(test_wrapper.pytestmark) + [mark]
+
+                yield test_wrapper, test_name, param_kwargs, decorator_fn
+
+        self._underlying_fn.parametrize_fn = patched_parametrize_fn
+        # Also set directly on the test object in case getattr(test, ...)
+        # resolves differently from getattr(test.__func__, ...)
+        try:
+            self._test.parametrize_fn = patched_parametrize_fn  # type: ignore[attr-defined]
+        except AttributeError:
+            pass

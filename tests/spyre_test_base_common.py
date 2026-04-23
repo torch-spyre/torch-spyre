@@ -4,8 +4,9 @@ Shared class and methods for all OOT PyTorch test overrides.
 """
 
 import os
-import regex as re
 from typing import Dict, List, Optional, Set
+import warnings
+
 
 import pytest  # type: ignore
 import torch
@@ -32,11 +33,13 @@ from spyre_test_parsing import (
 
 from spyre_upstream_patcher import (
     _OOTDtypePatcher,
+    _OOTModuleMarkerPatcher,
     _OOTOnlyOnPatcher,
     _OOTOpDtypeExpander,
     _OOTOpListPatcher,
     _OOTModuleListPatcher,
     _OOTModuleDtypePatcher,
+    _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
 )
 from spyre_test_config_models import (
@@ -46,6 +49,8 @@ from spyre_test_config_models import (
     SupportedModuleConfig,
     TestEntry,
 )
+
+warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 
 
 # Resolve the actual backend name registered for privateuse1.
@@ -294,7 +299,6 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     def instantiate_test(cls, name, test, *, generic_cls=None):
         _OOTOnlyOnPatcher(test, _SPYRE_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
-
         # print tags to stderr
         entry = cls.TEST_ENTRIES.get(name)
         tags = entry.tags if entry is not None else []
@@ -373,7 +377,10 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 and isinstance(p.__self__, _modules_cls)
             ):
                 for mod_info in p.__self__.module_info_list:
-                    mod_cfg = cls.SUPPORTED_MODULES_CONFIG.get(mod_info.name)
+                    mod_cfg = cls.SUPPORTED_MODULES_CONFIG.get(
+                        mod_info.name
+                    ) or cls.SUPPORTED_MODULES_CONFIG.get(f"torch.{mod_info.name}")
+
                     if mod_cfg is not None:
                         resolved = mod_cfg.resolved_dtypes()
                         if resolved is not None:
@@ -397,6 +404,12 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 else {}
             ),
         ).patch()
+
+        # Dynamically adds pytest marker to each of ops and dtype passed to @ops
+        _OOTOpMarkerPatcher(test).patch()
+
+        # Dynamically adds pytest marker to each of modules and dtype passed to @modules
+        _OOTModuleMarkerPatcher(test).patch()
 
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
@@ -442,16 +455,6 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                     for tag in all_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
-
-            # apply the full method name as its own pytest marker
-            existing_fn = cls.__dict__.get(method_name)
-            if existing_fn is not None:
-                safe_marker = re.sub(r"[^a-zA-Z0-9_]", "_", method_name)
-                setattr(
-                    cls,
-                    method_name,
-                    pytest.mark.__getattr__(safe_marker)(existing_fn),
-                )
 
             # apply xfail if needed
             if is_xfail:
