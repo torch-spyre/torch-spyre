@@ -305,7 +305,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # 0D / scalar tensor
                 "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
-            "expect_fail": ["scalar_tensor"],
         },
         ("test_amax_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {"amax": torch.amax},
@@ -330,7 +329,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim_neg1": (-1, cached_randn((3, 7, 9))),
                 "3d_dim_neg12": ((-1, -2), cached_randn((3, 7, 9))),
                 # 0D / scalar tensor:
-                "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
+                # "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
         },
         ("test_max_sub_broadcast", "test_max_sub_broadcast"): {

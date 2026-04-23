@@ -653,6 +653,11 @@ class TestSpyre(TestCase):
             ),
         )
 
+    def test_scalar_tensor(self):
+        """Test to ensure we have scalar tensor on Spyre"""
+        scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
+        assert scalar.dim() == 0
+
 
 if __name__ == "__main__":
     run_tests()
