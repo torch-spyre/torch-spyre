@@ -1786,6 +1786,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        torch._inductor.config.fx_graph_cache = False
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):

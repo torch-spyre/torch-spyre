@@ -14,6 +14,7 @@
 
 from typing import Optional, Sequence
 import torch
+from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
@@ -266,6 +267,35 @@ def overwrite_cpu(
     for i, dim in enumerate(dims):
         sliced_t = torch.ops.aten.slice(sliced_t, dim, offsets[i], offsets[i] + 1)
     sliced_t = input
+
+
+@torch.library.custom_op("spyre::overwrite_f", mutates_args=(), device_types="spyre")
+def overwrite_f(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dims: Sequence[int],
+    offsets: Sequence[int],
+) -> torch.Tensor:
+    if "overwrite" not in eager_paths:
+        eager_paths["overwrite"] = torch.compile(torch.ops.spyre.overwrite)
+    result = output.clone()
+    eager_paths["overwrite"](input, result, dims, offsets)
+    return result
+
+
+@overwrite_f.register_fake
+def _(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dims: Sequence[int],
+    offsets: Sequence[int],
+) -> torch.Tensor:
+    return output.clone()
+
+
+inplaceable_ops[torch.ops.spyre.overwrite_f.default] = InplaceableOp(
+    torch.ops.spyre.overwrite.default, 1
+)
 
 
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
