@@ -255,6 +255,19 @@ def _(
     return None
 
 
+@torch.library.register_kernel("spyre::overwrite", ["cpu"])
+def overwrite_cpu(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dims: Sequence[int],
+    offsets: Sequence[int],
+) -> None:
+    sliced_t = output
+    for i, dim in enumerate(dims):
+        sliced_t = torch.ops.aten.slice(sliced_t, dim, offsets[i], offsets[i] + 1)
+    sliced_t = input
+
+
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
 def restickify(  # type: ignore[empty-body]
     x: torch.Tensor,
