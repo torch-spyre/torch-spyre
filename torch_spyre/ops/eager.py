@@ -89,6 +89,7 @@ register_torch_compile_kernel(
         aten.cat,
         aten.div,
         aten.exp,
+        aten.floor,
         aten.log,
         aten.mean,
         aten.mul,
