@@ -1212,6 +1212,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(128, dtype=torch.float16),  # float tensor
                     cached_randn((128,)) > 0,  # bool tensor
                 ),
+                "2d_transposed_src": (
+                    torch.zeros(128, 256, dtype=torch.float16),
+                    cached_randn((256, 128)).t(),
+                ),
+            },
+        },
+        (
+            "test_inplace_copy_noncontiguous",
+            "test_inplace_copy_noncontiguous_cpu",
+        ): {
+            "param_sets": {
+                "transposed_dst": (
+                    torch.zeros(256, 128, dtype=torch.float16),
+                    cached_randn((128, 256)),
+                ),
+                "transposed_src_and_dst": (
+                    torch.zeros(256, 128, dtype=torch.float16),
+                    cached_randn((256, 128)).t(),
+                ),
             },
         },
         (
@@ -2012,6 +2031,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return result
 
         # Eager mode hangs/crashes when executing inplace operations on Spyre tensors
+        compare_with_cpu(fn, dst, src, run_eager=False)
+
+    def test_inplace_copy_noncontiguous_cpu(self, dst, src):
+        def fn(dst, src):
+            dst_t = dst.t()
+            dst_t.copy_(src)
+            return dst_t.contiguous()
+
         compare_with_cpu(fn, dst, src, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
