@@ -28,14 +28,6 @@
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
-#include <sendnn/graph.hpp>
-#include <sendnn/graph/graph_builder.hpp>
-#include <sendnn/graph/graph_deserializer.hpp>
-#include <sendnn/graph/graph_utils.hpp>
-#include <sendnn/interface/graph_loader.hpp>
-#include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/sentensor_info.hpp>
-#include <sendnn/util/status.hpp>
 #include <string>
 #include <vector>
 
@@ -45,8 +37,8 @@
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
-#include "spyre_sendnn_utils.h"
 #include "spyre_stream.h"
+#include "spyre_tensor_impl.h"
 #include "spyre_views.h"
 #include "types_mapping.h"
 
@@ -124,105 +116,6 @@ void launchKernel(const std::string& g2_path,
   auto& arts = getOrLoadArtifacts(g2_path, stream);
 
   stream.executeProgramAsync(arts, args);
-}
-
-void launchKernel_old(std::string g2_path, std::vector<at::Tensor> args) {
-  // Get global runtime from eager
-  auto gl = sendnn::GraphLoader(GlobalRuntime::get());
-
-  // Load compiled kernel
-  auto g2 = sendnn::Graph();
-  sendnn::Deserialize(&g2, g2_path);
-
-  for (auto& super_node : g2.compute_ops_) {
-    if (super_node->Name() != "DeviceInit" &&
-        super_node->Name() != "PrepareModel") {
-      auto* sn_attrs = dynamic_cast<sendnn::attributes::SenSuperNodeV2*>(
-          super_node->Attrs());
-      auto& exec_graph = sn_attrs->execution_graph_;
-      for (auto& node : exec_graph.compute_ops_) {
-        auto* dev_attrs = dynamic_cast<sendnn::attributes::SenFusedDeviceNode*>(
-            node->Attrs());
-        auto& sub_graph = dev_attrs->sub_graph_;
-        auto compute_node = sub_graph.compute_ops_.front();
-        auto edge_count = 0;
-
-        for (auto& arg : args) {
-          if (&args.back() != &arg) {
-            auto tensor = sendnn::Tensor(getTensorInfo(arg));
-            exec_graph.AddInput(
-                new sendnn::Node(sendnn::opcodes::PrimaryInput, {tensor}));
-            sub_graph.AddInput(
-                new sendnn::Node(sendnn::opcodes::PrimaryInput, {tensor}));
-            exec_graph.NewEdge(edge_count, node, 0,
-                               exec_graph.input_ops_[edge_count]);
-            sub_graph.NewEdge(edge_count, compute_node, 0,
-                              sub_graph.input_ops_[edge_count]);
-            edge_count++;
-          } else {
-            auto tensor = sendnn::Tensor(getTensorInfo(arg));
-            exec_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
-            sub_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
-
-            auto* exec_edge =
-                exec_graph.NewEdge(0, exec_graph.output_ops_.front(), 0, node);
-            exec_edge->tensor_ = tensor;
-            auto* sub_edge = sub_graph.NewEdge(0, sub_graph.output_ops_.front(),
-                                               0, compute_node);
-            sub_edge->tensor_ = tensor;
-          }
-        }
-      }
-    }
-  }
-
-  // Load/parse patched G2 graph
-  auto status = gl.LoadGraph(g2, false);
-  if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-  status = gl.CompileGraph();
-  if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-  status = gl.ParseGraph();
-  if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-  // Create sendnn tensors
-  std::vector<sendnn::ConstTensor> sen_inputs;
-  std::vector<sendnn::Tensor> sen_outputs;
-  for (size_t i = 0; i < args.size() - 1; ++i) {
-    auto arg = args[i];
-    at::Tensor tmp_0;
-    if (arg.dim() == 0) {
-      tmp_0 = (at::ones({1}, arg.dtype()) * arg).to(arg.device());
-      auto tensor =
-          createInputTensor(gl, tmp_0.storage().data_ptr().get(), i, 1);
-      tensor.SetSpyreData(
-          static_cast<SharedOwnerCtx*>(tmp_0.storage().data_ptr().get_context())
-              ->owner);
-      sen_inputs.push_back(tensor);
-    } else {
-      auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i, 1);
-      tensor.SetSpyreData(
-          static_cast<SharedOwnerCtx*>(arg.storage().data_ptr().get_context())
-              ->owner);
-      sen_inputs.push_back(tensor);
-    }
-  }
-  auto tensor =
-      createOutputTensor(gl, args.back().storage().data_ptr().get(), 0, 1);
-  tensor.SetSpyreData(static_cast<SharedOwnerCtx*>(
-                          args.back().storage().data_ptr().get_context())
-                          ->owner);
-  sen_outputs.push_back(tensor);
-
-  // Execute device init
-  status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
-  if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-  status = gl.Compute(sen_outputs, sen_inputs, 1);
-  if (!status.IsOk()) throw std::runtime_error(status.Message());
-
-  return;
 }
 
 uint32_t encodeConstant(float torch_const, DataFormats df) {
