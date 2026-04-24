@@ -18,6 +18,8 @@ from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
+eager_paths = {}
+
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
@@ -214,10 +216,9 @@ def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
 ) -> None:
-    _compiled_copy_from_d2d = torch.compile(
-        torch.ops.spyre.copy_from_d2d, dynamic=False
-    )
-    return _compiled_copy_from_d2d(src, dst)
+    if "copy_from_d2d" not in eager_paths:
+        eager_paths["copy_from_d2d"] = torch.compile(torch.ops.spyre.copy_from_d2d)
+    return eager_paths["copy_from_d2d"](src, dst)
 
 
 @copy_from_d2d.register_fake
@@ -230,14 +231,18 @@ def _(
 
 # Copy input into output starting at offsets along dimensions dims and
 # return the updated output.
-@torch.library.custom_op("spyre::overwrite", mutates_args=(), device_types="spyre")
+@torch.library.custom_op(
+    "spyre::overwrite", mutates_args=("output",), device_types="spyre"
+)
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
     dims: Sequence[int],
     offsets: Sequence[int],
-) -> torch.Tensor:
-    pass
+) -> None:
+    if "overwrite" not in eager_paths:
+        eager_paths["overwrite"] = torch.compile(torch.ops.spyre.overwrite)
+    return eager_paths["overwrite"](input, output, dims, offsets)
 
 
 @overwrite.register_fake
@@ -246,8 +251,8 @@ def _(
     output: torch.Tensor,
     dims: Sequence[int],
     offsets: Sequence[int],
-) -> torch.Tensor:
-    return output
+) -> None:
+    return None
 
 
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
