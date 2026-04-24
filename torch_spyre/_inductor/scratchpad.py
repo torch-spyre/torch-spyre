@@ -32,6 +32,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "sum",
     "clone",
     # "exp",
+    # "mul",
 ]
 
 logger = get_inductor_logger("LX_PLANNING")
@@ -419,16 +420,18 @@ def scratchpad_planning(
 
     idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
-    num_ops_before = len(operations)
-    try_insert_clone_op_for_inputs(
-        operations,
-        alloc.get_available_total(),
-        buf_users,
-        core_div_mismatch,
-    )
+    if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+        num_ops_before = len(operations)
+        try_insert_clone_op_for_inputs(
+            operations,
+            alloc.get_available_total(),
+            buf_users,
+            core_div_mismatch,
+        )
 
-    if len(operations) > num_ops_before:  # refresh LUTs
-        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
+        # refresh LUTs -- insertion may not happen, e.g. input tensor is used only once
+        if len(operations) > num_ops_before:
+            idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
     for idx, op in enumerate(operations):
         # release unneeded LX allocations before actual planning
