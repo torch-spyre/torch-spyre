@@ -342,15 +342,22 @@ class _OOTModuleListPatcher:
                 if mod_info is not None and mod_info.name not in existing_names:
                     self._modules_instance.module_info_list.append(mod_info)
 
-        # filter to global.supported_modules
-        # included_modules will exist even if not in supported_modules
-        if self._supported_modules is not None:
+        # filter to global.supported_modules OR included_modules
+        # If we have included_modules but no supported_modules, filter to ONLY included_modules
+        # This allows per-test module selection via edits.modules.include
+        if self._supported_modules is not None or self._included_modules:
             filtered = [
                 m
                 for m in self._modules_instance.module_info_list
-                if m.name in self._supported_modules
+                if (
+                    self._supported_modules is not None
+                    and m.name in self._supported_modules
+                )
                 or m.name in self._included_modules
-                or f"torch.{m.name}" in self._supported_modules
+                or (
+                    self._supported_modules is not None
+                    and f"torch.{m.name}" in self._supported_modules
+                )
                 or f"torch.{m.name}" in self._included_modules
             ]
             if filtered:

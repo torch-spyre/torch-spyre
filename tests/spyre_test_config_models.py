@@ -532,11 +532,65 @@ class NamedItem(BaseModel):
 
 
 class ModulesNamedItem(BaseModel):
-    """A named item in an include list in a module"""
+    """A named item in an include list in a module.
+
+    Supports two input specifications:
+    - constructor_inputs: Args/kwargs for module.__init__()
+    - forward_inputs: Args/kwargs for module.forward() (defaults to sample_inputs_func for backward compat)
+    """
 
     name: str
+    module_path: Optional[str] = None  # Full import path (e.g., "torch.nn.Linear")
     description: Optional[str] = None
-    sample_inputs_func: InputsEdits = InputsEdits()
+    tags: List[str] = []  # Optional per-module tags
+    sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
+    constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
+    forward_inputs: Optional[InputsEdits] = None  # New: explicit forward inputs
+
+    def build_module_input(
+        self,
+        *,
+        seed: Optional[int],
+        test_device: Optional[torch.device],
+        FunctionInput,
+        ModuleInput,
+    ) -> Any:
+        """Build a ModuleInput from the config inputs.
+
+        Follows PyTorch's upstream module_inputs_func signature:
+        module_inputs_func(module_info, device, dtype, requires_grad, training, **kwargs) -> list[ModuleInput]
+
+        Returns a ModuleInput with:
+        - constructor_input: FunctionInput with args/kwargs for module.__init__()
+        - forward_input: FunctionInput with args/kwargs for module.forward()
+
+        FunctionInput and ModuleInput are passed in as arguments to avoid importing
+        torch.testing internals into this models file.
+        """
+        # Build constructor inputs
+        constructor_spec = self.constructor_inputs or InputsEdits()
+        constructor_args = constructor_spec.build_cpu_args(
+            seed=seed,
+            op_name=self.name,
+            test_device=test_device,
+        )
+        constructor_kwargs = constructor_spec.resolved_kwargs(test_device=test_device)
+        constructor_input = FunctionInput(*constructor_args, **constructor_kwargs)
+
+        # Build forward inputs (prefer forward_inputs, fallback to sample_inputs_func for backward compat)
+        forward_spec = self.forward_inputs or self.sample_inputs_func
+        forward_args = forward_spec.build_cpu_args(
+            seed=(None if seed is None else seed + 10000),  # Different seed for forward
+            op_name=self.name,
+            test_device=test_device,
+        )
+        forward_kwargs = forward_spec.resolved_kwargs(test_device=test_device)
+        forward_input = FunctionInput(*forward_args, **forward_kwargs)
+
+        return ModuleInput(
+            constructor_input=constructor_input,
+            forward_input=forward_input,
+        )
 
 
 class OpsNamedItem(BaseModel):
@@ -802,11 +856,16 @@ class SupportedOpConfig(BaseModel):
 
 
 class SupportedModuleConfig(BaseModel):
-    """Model for storing supported modules config: name, force_xfail."""
+    """Model for storing supported modules config: name, force_xfail, dtypes.
+
+    Supports inline input specification via constructor_inputs and forward_inputs.
+    """
 
     name: str
     force_xfail: bool = False
     dtypes: List[SupportedOpDtypeConfig] = []
+    constructor_inputs: Optional[InputsEdits] = None  # Inline constructor inputs
+    forward_inputs: Optional[InputsEdits] = None  # Inline forward inputs
 
     def get_name(self) -> str:
         return self.name
@@ -815,6 +874,12 @@ class SupportedModuleConfig(BaseModel):
         if not self.dtypes:
             return None
         return {d.resolved_dtype() for d in self.dtypes}
+
+    def has_inline_inputs(self) -> bool:
+        """Check if this config has inline input specifications."""
+        return (
+            self.constructor_inputs is not None and self.constructor_inputs.has_inputs()
+        ) or (self.forward_inputs is not None and self.forward_inputs.has_inputs())
 
 
 class InputConfig(BaseModel):

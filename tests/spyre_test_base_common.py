@@ -4,6 +4,7 @@ Shared class and methods for all OOT PyTorch test overrides.
 """
 
 import os
+import sys
 import json
 from typing import Dict, List, Optional, Set
 import warnings
@@ -199,6 +200,8 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         module_configs = config.global_config.resolved_supported_modules_config()
         if module_configs:
             cls.SUPPORTED_MODULES_CONFIG = module_configs
+            # Register module input generators for modules with inline inputs
+            cls._register_module_input_generators(module_configs)
 
         cls.GLOBAL_SUPPORTED_DTYPES = config.global_config.resolved_supported_dtypes()
         cls.GLOBAL_DTYPE_PRECISION = (
@@ -211,6 +214,222 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
         cls._yaml_loaded = True
+
+    @classmethod
+    def _register_custom_modules_from_edits(cls, modules_named_items: List) -> None:
+        """Register custom modules from edits.modules.include into module_db.
+
+        This allows tests to use modules that aren't in PyTorch's upstream module_db
+        by dynamically registering them before the _OOTModuleListPatcher runs.
+        """
+
+        try:
+            from torch.testing._internal.common_modules import module_db, ModuleInfo
+        except ImportError:
+            print(
+                "[DEBUG _register_custom_modules_from_edits] Failed to import module_db/ModuleInfo"
+            )
+            return
+
+        # Get existing module names to avoid duplicates
+        existing_names = {m.name for m in module_db}
+        for i, module_item in enumerate(modules_named_items):
+            module_name = module_item.name
+            # Skip if already registered
+            if module_name in existing_names:
+                continue
+
+            # Try to import the module class
+            module_path = getattr(module_item, "module_path", None)
+            if not module_path:
+                print(
+                    "[DEBUG _register_custom_modules_from_edits]   No module_path found, skipping"
+                )
+                continue
+
+            try:
+                # Import the module class
+                parts = module_path.rsplit(".", 1)
+                if len(parts) != 2:
+                    print(
+                        f"[DEBUG _register_custom_modules_from_edits]   Invalid module_path format: {module_path}"
+                    )
+                    continue
+                module_pkg, class_name = parts
+                print(
+                    f"[DEBUG _register_custom_modules_from_edits]   Importing: {module_pkg}.{class_name}"
+                )
+                pkg = __import__(module_pkg, fromlist=[class_name])
+                module_cls = getattr(pkg, class_name)
+                print(
+                    f"[DEBUG _register_custom_modules_from_edits]   Successfully imported: {module_cls}"
+                )
+            except (ImportError, AttributeError) as e:
+                print(
+                    f"[DEBUG _register_custom_modules_from_edits]   Failed to import {module_path}: {e}"
+                )
+                continue
+
+            # Create a module input generator from the sample_inputs_func
+            def create_module_inputs_func(item):
+                def module_inputs_func(
+                    module_info, device, dtype, requires_grad, training, **kwargs
+                ):
+                    """Generated from YAML edits.modules.include"""
+                    try:
+                        from torch.testing._internal.common_modules import ModuleInput
+                        from torch.testing._internal.common_utils import FunctionInput
+                    except ImportError:
+                        return []
+
+                    # Use the build_module_input method if available
+                    if hasattr(item, "build_module_input"):
+                        test_device = (
+                            torch.device(device) if isinstance(device, str) else device
+                        )
+                        seed = kwargs.get("seed")
+                        return [
+                            item.build_module_input(
+                                seed=seed,
+                                test_device=test_device,
+                                FunctionInput=FunctionInput,
+                                ModuleInput=ModuleInput,
+                            )
+                        ]
+
+                    # Fallback: empty inputs
+                    return [
+                        ModuleInput(
+                            constructor_input=FunctionInput(),
+                            forward_input=FunctionInput(),
+                        )
+                    ]
+
+                return module_inputs_func
+
+            # Create ModuleInfo and add to module_db
+            try:
+                print(
+                    "[DEBUG _register_custom_modules_from_edits]   Creating ModuleInfo..."
+                )
+                module_info = ModuleInfo(
+                    module_cls,
+                    module_inputs_func=create_module_inputs_func(module_item),
+                    skips=(),
+                    decorators=None,
+                    dtypes=(torch.float32, torch.float16),
+                )
+                module_db.append(module_info)
+                existing_names.add(module_name)
+                print(
+                    f"[DEBUG _register_custom_modules_from_edits]   ✓ Successfully registered: {module_name}"
+                )
+            except Exception as e:
+                print(
+                    f"[DEBUG _register_custom_modules_from_edits]   ✗ Failed to register {module_name}: {e}"
+                )
+                import traceback
+
+                traceback.print_exc()
+                continue
+
+        print(
+            f"\n[DEBUG _register_custom_modules_from_edits] Final module_db size: {len(module_db)}"
+        )
+        print(
+            f"[DEBUG _register_custom_modules_from_edits] Newly registered: {len(module_db) - len(existing_names)}"
+        )
+
+    @classmethod
+    def _register_module_input_generators(
+        cls, module_configs: Dict[str, SupportedModuleConfig]
+    ) -> None:
+        """Register module input generators for modules with inline input specs.
+
+        This creates generator functions that follow PyTorch's upstream signature:
+        module_inputs_func(module_info, device, dtype, requires_grad, training, **kwargs) -> list[ModuleInput]
+        """
+        try:
+            from torch.testing._internal.common_modules import module_db
+        except ImportError:
+            return  # module_db not available
+
+        for module_name, module_config in module_configs.items():
+            if not module_config.has_inline_inputs():
+                continue
+
+            # Find the module in module_db
+            matching_modules = [m for m in module_db if m.name == module_name]
+            if not matching_modules:
+                continue
+
+            module_info = matching_modules[0]
+
+            # Create a generator function that uses the inline input specs
+            def create_generator(config: SupportedModuleConfig):
+                def module_inputs_func(
+                    module_info, device, dtype, requires_grad, training, **kwargs
+                ):
+                    """Generated module input function from YAML config."""
+                    try:
+                        from torch.testing._internal.common_modules import ModuleInput
+                        from torch.testing._internal.common_utils import FunctionInput
+                    except ImportError:
+                        return []
+
+                    # Get seed from global config
+                    seed = kwargs.get("seed")
+                    test_device = (
+                        torch.device(device) if isinstance(device, str) else device
+                    )
+
+                    # Build constructor inputs
+                    constructor_spec = config.constructor_inputs
+                    if constructor_spec and constructor_spec.has_inputs():
+                        constructor_args = constructor_spec.build_cpu_args(
+                            seed=seed,
+                            op_name=module_info.name,
+                            test_device=test_device,
+                        )
+                        constructor_kwargs = constructor_spec.resolved_kwargs(
+                            test_device=test_device
+                        )
+                    else:
+                        constructor_args = []
+                        constructor_kwargs = {}
+
+                    constructor_input = FunctionInput(
+                        *constructor_args, **constructor_kwargs
+                    )
+
+                    # Build forward inputs
+                    forward_spec = config.forward_inputs
+                    if forward_spec and forward_spec.has_inputs():
+                        forward_args = forward_spec.build_cpu_args(
+                            seed=(None if seed is None else seed + 10000),
+                            op_name=module_info.name,
+                            test_device=test_device,
+                        )
+                        forward_kwargs = forward_spec.resolved_kwargs(
+                            test_device=test_device
+                        )
+                    else:
+                        forward_args = []
+                        forward_kwargs = {}
+
+                    forward_input = FunctionInput(*forward_args, **forward_kwargs)
+
+                    return [
+                        ModuleInput(
+                            constructor_input=constructor_input,
+                            forward_input=forward_input,
+                        )
+                    ]
+
+                return module_inputs_func
+
+            # Replace the module's input generator
+            module_info.module_inputs_func = create_generator(module_config)
 
     @classmethod
     def _should_run(
@@ -298,10 +517,22 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     # ------------------------------------------------------------------
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
+        # Write to file to verify this method is called
+        sys.stderr.write(f"\n[DEBUG instantiate_test ENTRY] Called for test: {name}\n")
+        sys.stderr.flush()
+
         _OOTOnlyOnPatcher(test, _SPYRE_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
+
+        sys.stderr.write("[DEBUG instantiate_test] After _load_test_suite_config()\n")
+        sys.stderr.flush()
+
         # print tags to stderr
         entry = cls.TEST_ENTRIES.get(name)
+        sys.stderr.write(
+            f"[DEBUG instantiate_test] entry for '{name}': {entry is not None}\n"
+        )
+        sys.stderr.flush()
         tags = entry.tags if entry is not None else []
         # Collect op-level tags from all OpsNamedItem entries in this TestEntry
         # and union them with test-level tags so pytest -m works for both levels.
@@ -323,19 +554,31 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 f"tags: [{', '.join(all_tags)}]\n".encode(),
             )
 
+        sys.stderr.write(
+            f"\n[DEBUG instantiate_test] Starting module filtering for test: {name}\n"
+        )
+        sys.stderr.write(f"[DEBUG instantiate_test] entry = {entry}\n")
+        sys.stderr.flush()
+
         # op list filtering
         supported_ops = cls._get_supported_ops()
         if supported_ops is not None:
             _OOTOpListPatcher(test, supported_ops).patch()
 
-        # @modules filtering
+        # @modules filtering - but first register any custom modules from edits.modules.include
         supported_modules = cls._get_supported_modules()
+
         included_modules = (
             entry.edits.modules.included_module_names() if entry is not None else set()
         )
         excluded_modules = (
             entry.edits.modules.excluded_module_names() if entry is not None else set()
         )
+
+        # Register custom modules from edits.modules.include BEFORE filtering
+        if entry is not None and entry.edits.modules.include:
+            cls._register_custom_modules_from_edits(entry.edits.modules.include)
+
         if supported_modules is not None or included_modules or excluded_modules:
             _OOTModuleListPatcher(
                 test,
