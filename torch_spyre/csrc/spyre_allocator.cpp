@@ -15,6 +15,7 @@
  */
 #include "spyre_allocator.h"
 
+#include <memory>
 #include <utility>
 
 #include "logging.h"
@@ -29,12 +30,13 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
 c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
-flex::DeviceMemoryAllocatorPtr SpyreAllocator::getAllocator(
-    unsigned int /*dev_id*/) {
-  // Each process has exactly one runtime with one device handle (index 0).
-  // The PyTorch device index (dev_id) is the logical index across processes,
-  // not an index into the runtime's device handle vector.
-  return GlobalRuntime::get()->GetDeviceHandle(0)->GetDeviceMemoryAllocator();
+std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
+  // FlexAllocator is owned by RuntimeContext (one per device per process).
+  // RuntimeContext::getAllocator() returns shared_ptr<const FlexAllocator>;
+  // we const_cast to shared_ptr<FlexAllocator> because allocate()/deallocate()
+  // are non-const (internally mutex-protected and thread-safe).
+  auto const_alloc = flex::getFlexRuntimeContext()->getAllocator();
+  return std::const_pointer_cast<flex::FlexAllocator>(const_alloc);
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
@@ -128,12 +130,22 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
-  auto allocator = getAllocator(device_id);
-  flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-  // NOTE: last argument should be set to 0
-  allocator->TryAllocate(&data, nbytes, 0);
+  // Get shared_ptr to keep FlexAllocator alive during operations
+  auto flex_alloc = getFlexAllocator();
+
+  // Allocate first-class raw storage via CompositeAddress.
+  flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
+
+  // Bridge to the legacy DeviceMemoryAllocationPtr view for existing PF-mode
+  // users that still expect a pointer-like object referring to the same
+  // storage.
+  flex::DeviceMemoryAllocationPtr data =
+      flex_alloc->makeInterimAllocationPtr(composite_addr);
   TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-  auto* ctx = new SharedOwnerCtx{std::move(data), device_id, nbytes};
+
+  // Create context with both owner and CompositeAddress
+  auto* ctx = new SharedOwnerCtx(std::move(data), std::move(composite_addr),
+                                 device_id, nbytes);
   void* ctx_void = static_cast<void*>(ctx);
 
   void* data_void = static_cast<void*>(ctx->owner.get());

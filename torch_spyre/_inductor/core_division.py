@@ -37,6 +37,7 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
+    concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
@@ -132,8 +133,9 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-
-        best_split = core_split(iteration_space[v], n_cores_remaining)
+        # TODO(issue#1372): with symbolic core division, concretize_expr
+        #                   for core_split will not be needed.
+        best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
@@ -212,7 +214,12 @@ def get_per_core_span(
         per_core_max = 0
         for v in coord.free_symbols:
             term = coord.subs({u: 0 for u in coord.free_symbols - {v}})
-            R = it_space_orig[v] // splits.get(v, 1)
+            # Concretize the iteration-space size so R (and therefore the
+            # ``int(term.subs(...))`` cast below) is a Python int.  Per-core
+            # span is a hardware-bound quantity that must be compared against
+            # MAX_SPAN_BYTES, so concretization here is the right boundary.
+            # TODO(issue#1372): Symbolic core division will keep this symbolic.
+            R = concretize_expr(it_space_orig[v]) // splits.get(v, 1)
             per_core_max += int(term.subs(v, R - 1))
         per_core_size = per_core_max + 1
         if per_core_size > 1:
@@ -276,16 +283,29 @@ def must_split_vars(
             continue
 
         for coord in td.device_coords[:-1]:
-            vars = [v for v in coord.free_symbols if it_space_orig.get(v, 1) > 1]
+            # Concretize for the ``> 1`` comparison: with symbolic ranges,
+            # ``s0 > 1`` returns a sympy Relational whose truth value is
+            # undefined.  Span filtering here is a structural decision that
+            # needs a concrete answer.
+            # TODO(issue#1372): Symbolic core division will keep this symbolic.
+            vars = [
+                v
+                for v in coord.free_symbols
+                if concretize_expr(it_space_orig.get(v, 1)) > 1
+            ]
             if not vars:
                 continue
 
             def valid_splits(v: Symbol) -> list[int]:
                 current_min = accumulated_splits.get(v, 1)
                 if v in stick_vars:
-                    stick_count = int(it_space_adjusted[v])
+                    stick_count = concretize_expr(it_space_adjusted[v])
                     return [s for s in divisors(stick_count) if s >= current_min]
-                return [s for s in divisors(int(it_space_orig[v])) if s >= current_min]
+                return [
+                    s
+                    for s in divisors(concretize_expr(it_space_orig[v]))
+                    if s >= current_min
+                ]
 
             var_divisors = [valid_splits(v) for v in vars]
 
@@ -293,7 +313,7 @@ def must_split_vars(
                 if not candidates:
                     raise Unsupported(
                         f"No valid split for variable {v} "
-                        f"(orig_size={int(it_space_orig[v])}, "
+                        f"(orig_size={concretize_expr(it_space_orig[v])}, "
                         f"min_required={accumulated_splits.get(v, 1)}) "
                         f"for tensor {td.dep.name}."
                     )
@@ -345,12 +365,17 @@ def must_split_vars(
 
             # Still above the limit. If this coord still evaluates to > 1 under
             # the committed splits, inner dimensions cannot reduce the span further.
+            # Concretize it_space_orig[v] so the ``int(coord.subs(...))`` cast
+            # below succeeds with symbolic ranges.
+            # TODO(issue#1372): Symbolic core division will keep this symbolic.
             per_core_coord_size = (
                 max(
                     int(
                         coord.subs(
                             {
-                                v: it_space_orig[v] // accumulated_splits.get(v, 1) - 1
+                                v: concretize_expr(it_space_orig[v])
+                                // accumulated_splits.get(v, 1)
+                                - 1
                                 for v in coord.free_symbols
                             }
                         )
@@ -395,8 +420,13 @@ def prioritize_dimensions(
         else:
             reduction_dims.append((s, e))
 
-    remaining_output.sort(key=lambda t: t[1], reverse=True)
-    reduction_dims.sort(key=lambda t: t[1], reverse=True)
+    # Concretize sort keys: comparing two sympy Symbols returns a Relational
+    # whose truth value is undefined and would raise inside Python's sort.
+    # The priority order is a structural decision (largest dim first) that
+    # needs a concrete numeric ordering.
+    # TODO(issue#1372): Symbolic core division will keep this symbolic.
+    remaining_output.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
+    reduction_dims.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
 
     priority = [t[0] for t in remaining_output]
     if not exclude_reduction:

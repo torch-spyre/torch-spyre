@@ -19,14 +19,26 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <flex/allocator/alloc_address.hpp>
+#include <flex/allocator/flex_allocator.hpp>
 #include <flex/device_types/device_memory_allocator.hpp>
+#include <memory>
+#include <utility>
 
 namespace spyre {
 
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
+  flex::CompositeAddress composite_addr;
   signed char device_id;
   size_t nbytes;
+
+  SharedOwnerCtx(flex::DeviceMemoryAllocationPtr own,
+                 flex::CompositeAddress addr, signed char dev_id, size_t nb)
+      : owner(std::move(own)),
+        composite_addr(std::move(addr)),
+        device_id(dev_id),
+        nbytes(nb) {}
 };
 
 // A custom allocator for our custom device, which returns a handle to the
@@ -38,7 +50,7 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   static c10::CachingDeviceAllocator::StatTypes
       stat_types;  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
-  flex::DeviceMemoryAllocatorPtr getAllocator(unsigned int dev_id);
+  static std::shared_ptr<flex::FlexAllocator> getFlexAllocator();
 
  public:
   static SpyreAllocator& instance();
