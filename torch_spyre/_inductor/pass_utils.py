@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, NamedTuple, TypeVar
+from typing import Callable, NamedTuple, TypeVar, Union
 
 
 import sympy
+from sympy import Expr
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -48,6 +49,46 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
+def concretize_expr(expr: Union[Expr, int]) -> int:
+    """Concretize a sympy expression to a Python int.
+
+    Used at boundaries where concrete values are required (e.g. C++
+    constructors that only accept ``int``, comparison operators inside
+    algorithms such as core-division and coordinate computation).
+
+    Key invariant: only structural parameters (sizes, strides, split
+    counts) are concretized.  Symbolic loop variables inside coordinate
+    output expressions are never touched, so the generated coordinate
+    expressions remain symbolic and will carry through to the SDSC when
+    symbolic SDSC generation is implemented.
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        return V.graph.sizevars.size_hint(expr)
+    return int(expr)
+
+
+def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
+    """Replace non-loop symbolic variables in an index expression with concrete values.
+
+    With ``dynamic=True``, the host index may contain symbolic strides. When
+    ``normalize_coordinates`` isolates each loop variable's contribution
+    by substituting 0 for all other free symbols, the size symbol ``s1``
+    is also zeroed.  This function replaces size symbols with their concrete
+    hints so that coordinate expressions are structurally identical to static-shape
+    compilation while loop variable symbols are preserved.
+    """
+    size_syms = index.free_symbols - loop_vars
+    if not size_syms:
+        return index
+    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    result = index.subs(subs)
+    return result
+
+
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
@@ -61,15 +102,26 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
+    # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
+    # comparisons.  var_ranges and index stay symbolic so the *output*
+    # coordinate expressions remain symbolic.
+    # TODO(issue#1373): remove concretization once compute_coordinates handles
+    #              symbolic comparisons natively.
+    concrete_size = [concretize_expr(s) for s in layout.size]
+    concrete_stride = [concretize_expr(s) for s in layout.stride]
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
+    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
 def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    # device_size and stride_map come from the C++ SpyreTensorLayout and are
+    # already concrete, so no concretization is needed here.
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
     return compute_coordinates(
         layout.device_layout.device_size,
         layout.device_layout.stride_map,
         dep.ranges,
-        dep.index,
+        index,
     )
 
 
@@ -171,7 +223,12 @@ def apply_splits_from_index_coeff(
     output_coeff_splits, reduction_coeff_splits = coeff_splits
     result: dict[sympy.Symbol, int] = {sym: 1 for sym in sched_it_space}
     for sym, size in sched_it_space.items():
-        if size <= 1:
+        # Skip iteration vars with trivial range.  For symbolic ranges we
+        # cannot statically determine triviality (and a symbolic size
+        # carries no compile-time guarantee that it is 1), so we assume
+        # they are non-trivial — consistent with views.compute_coordinates.
+        # TODO(issue#1373): replace with a sympy-aware predicate.
+        if isinstance(size, (int, sympy.Integer)) and int(size) <= 1:
             continue
         wc = write_index.coeff(sym)
         if wc != 0:

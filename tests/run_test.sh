@@ -16,6 +16,13 @@
 # (e.g. only_for=DEVICE_LIST_SUPPORT_PROFILING_TEST) are re-injected into
 # the wrapper without `only_for`, so the spyre/privateuse1 device is included.
 
+# YAML tag --> JUnit XML <properties>
+# ------------------------------------
+# Tags defined under yaml tags in the YAML are
+# injected as <properties> elements directly into the JUnit XML after pytest
+# finishes writing it.  This post-processing approach is used because pytest
+# does not emit marker <properties> for unittest.TestCase items even with
+# junit_family=xunit2 -- which seems to be a pytest limitation.
 
 set -euo pipefail
 
@@ -327,7 +334,6 @@ def analyze(path):
                     has_device, _ = class_methods_info(node)
                     all_classes[node.name] = has_device
                     break
-
     # Classify instantiate_device_type_tests() calls:
     #   without only_for  -> fully open, framework already controls all devices
     #   with    only_for  -> restricted; spyre/privateuse1 likely excluded
@@ -355,13 +361,12 @@ def analyze(path):
             arg = node.args[0]
             if isinstance(arg, ast.Name):
                 parametrized_instantiated.add(arg.id)
-
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already
     # covers all devices including spyre.
     device_type_restricted -= device_type_open
-
+    
     # "Fully handled" = open device_type + parametrized
     # (restricted is NOT fully handled for spyre)
     fully_handled = device_type_open | parametrized_instantiated
@@ -484,7 +489,6 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
     [[ -n "$restricted_str" ]] && read -r -a RESTRICTED_CLASSES <<< "$restricted_str"
     local -a UNCONTROLLED_CLASSES=()
     [[ -n "$uncontrolled_str" ]] && read -r -a UNCONTROLLED_CLASSES <<< "$uncontrolled_str"
-
     # Warn about plain classes -- they are safe only when YAML skips them.
     if [[ ${#PLAIN_CLASSES[@]} -gt 0 ]]; then
         echo "[spyre_run] NOTE: the following classes have no 'device' arg in their"
@@ -500,7 +504,6 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
     original_stem="$(basename "$test_file" .py)"
     module_name="$original_stem"
     wrapper_path="${original_dir}/${original_stem}__oot_wrapper.py"
-
     # Report uncontrolled classes (never instantiated upstream at all)
     if [[ ${#UNCONTROLLED_CLASSES[@]} -gt 0 ]]; then
         echo "[spyre_run] Injecting instantiate_device_type_tests for uncontrolled classes in: $(basename "$test_file")"
@@ -508,7 +511,6 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
             echo "[spyre_run]   -> $cls"
         done
     fi
-
     # Report restricted classes (instantiated upstream with only_for, excluding spyre)
     if [[ ${#RESTRICTED_CLASSES[@]} -gt 0 ]]; then
         echo "[spyre_run] Re-injecting instantiate_device_type_tests (dropping only_for) for restricted classes in: $(basename "$test_file")"
@@ -521,7 +523,6 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
     conftest_path="${original_dir}/__oot_conftest_${original_stem}.py"
 
     echo "[spyre_run] Generating wrapper: $(basename "$wrapper_path")"
-
     # Build the per-class injection block first (pure bash, no heredoc nesting issue).
     # All classes use _pre_import_classes which is populated before the star-import.
     local injection_block=""
@@ -535,7 +536,6 @@ _instantiate(_cls_${cls}, globals())
 _restore_staticmethods(_cls_${cls}, globals())
 "
     done
-
     # Separate quoted lists for restricted vs uncontrolled classes --
     # each is retrieved differently from the private module.
     local quoted_restricted_list=""
@@ -546,7 +546,6 @@ _restore_staticmethods(_cls_${cls}, globals())
     for cls in "${UNCONTROLLED_CLASSES[@]}"; do
         quoted_uncontrolled_list+="'${cls}', "
     done
-
     # Write the wrapper using a heredoc — no quoting issues with embedded text.
     # WRAPPER_EOF is unquoted so shell variables ($module_name, $test_file,
     # $quoted_class_list, $injection_block) expand; all other Python lines
@@ -561,7 +560,7 @@ _restore_staticmethods(_cls_${cls}, globals())
 #     privateuse1/spyre. Re-injected here WITHOUT only_for so TorchTestBase
 #     can generate the spyre variant and control it via the YAML config.
 # Classes with no 'device' arg are safe when YAML mode is 'skip'.
-
+ 
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
@@ -574,7 +573,6 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 for _p in reversed(_os.environ.get('PYTHONPATH', '').split(_os.pathsep)):
     if _p and _p not in _sys.path:
         _sys.path.insert(0, _p)
-
 # ---------------------------------------------------------------------------
 # Pre-import: capture original class objects BEFORE the star-import runs the
 # upstream instantiate_device_type_tests() calls that delete them from scope.
@@ -602,6 +600,7 @@ for _p in reversed(_os.environ.get('PYTHONPATH', '').split(_os.pathsep)):
 #   Nothing deletes them, so they are still present on _pre_mod after
 #   exec_module() completes.  A plain getattr suffices.
 # ---------------------------------------------------------------------------
+
 import importlib.util as _ilu
 
 _pre_import_classes = {}
@@ -610,7 +609,7 @@ _restricted_names = set([${quoted_restricted_list}])
 def _do_pre_import():
     """Capture original class objects before the star-import deletes them."""
     import torch.testing._internal.common_device_type as _cdtype
-
+    
     real_fn = _cdtype.instantiate_device_type_tests
 
     def _capturing_instantiate(cls, *args, **kwargs):
@@ -629,7 +628,6 @@ def _do_pre_import():
                 if name.startswith('test')
             }
         return real_fn(cls, *args, **kwargs)
-
     # Patch at source so every from-import of instantiate_device_type_tests
     # picks up the shim during exec_module.
     _cdtype.instantiate_device_type_tests = _capturing_instantiate
@@ -642,7 +640,6 @@ def _do_pre_import():
         _private_spec.loader.exec_module(_pre_mod)
     finally:
         _cdtype.instantiate_device_type_tests = real_fn
-
     # Restricted classes captured via shim; uncontrolled still on _pre_mod.
     for _name in [${quoted_uncontrolled_list}]:
         if hasattr(_pre_mod, _name):
@@ -772,8 +769,90 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
-# 12. Run pytest for each file (original or wrapper)
+# 12. Run pytest for each file - original / wrapper depending on TestClass
+#
+# After pytest writes the JUnit XML, a Python post-processor injects YAML
+# tags as <properties> elements directly into the XML.
+#
+# Two regex fixes make matching robust:
+#   1. (?<![a-z])name="..."  avoids matching 'name' inside 'classname="..."'
+#   2. yaml_class in classname  handles dotted XML classnames like
+#      "test.test_binary_ufuncs.TestBinaryUfuncsPRIVATEUSE1"
 # ---------------------------------------------------------------------------
+
+_XML_INJECT_PY='
+import sys, re
+from pathlib import Path
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+
+xml_path, yaml_path = sys.argv[1], sys.argv[2]
+
+data = yaml.safe_load(open(yaml_path)) or {}
+tag_map = {}
+for fe in data.get("test_suite_config", {}).get("files", []):
+    for te in fe.get("tests", []):
+        tags = sorted(set(te.get("tags", []) or []))
+        if not tags:
+            continue
+        for name in te.get("names", []):
+            name = name.strip()
+            if name:
+                tag_map.setdefault(name, set()).update(tags)
+
+def match_tags(classname, testname):
+    matched = set()
+    for yaml_name, tags in tag_map.items():
+        if "::" in yaml_name:
+            yaml_class, yaml_method = yaml_name.split("::", 1)
+        else:
+            yaml_class, yaml_method = "", yaml_name
+        if ((yaml_class and yaml_method
+                and yaml_class in classname
+                and testname.startswith(yaml_method))
+                or (yaml_method and not yaml_class
+                    and testname.startswith(yaml_method))):
+            matched.update(tags)
+    return sorted(matched)
+
+def build_props(tags):
+    return "<properties>" + "".join(
+        f"<property name=\"tag\" value=\"{t}\"/>" for t in tags
+    ) + "</properties>"
+
+def inject_full(m):
+    attrs, content = m.group(1), m.group(2)
+    if "<properties>" in content:
+        return m.group(0)
+    cn = re.search(r"classname=\"([^\"]*)\"", attrs)
+    tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
+    if not cn or not tn:
+        return m.group(0)
+    tags = match_tags(cn.group(1), tn.group(1))
+    if not tags:
+        return m.group(0)
+    return f"<testcase{attrs}>{build_props(tags)}{content}</testcase>"
+
+def inject_self_closing(m):
+    attrs = m.group(1)
+    cn = re.search(r"classname=\"([^\"]*)\"", attrs)
+    tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
+    if not cn or not tn:
+        return m.group(0)
+    tags = match_tags(cn.group(1), tn.group(1))
+    if not tags:
+        return m.group(0)
+    return f"<testcase{attrs}>{build_props(tags)}</testcase>"
+
+xml = Path(xml_path).read_text()
+xml = re.sub(r"<testcase([^>]*)>(.*?)</testcase>", inject_full,        xml, flags=re.DOTALL)
+xml = re.sub(r"<testcase([^>]*?)/>",               inject_self_closing, xml)
+Path(xml_path).write_text(xml)
+print(f"[spyre_run] Tags injected into XML: {xml_path}", flush=True)
+'
+
 OVERALL_EXIT=0
 
 for i in "${!RUN_FILES[@]}"; do
@@ -796,6 +875,23 @@ for i in "${!RUN_FILES[@]}"; do
     )
 
     _exit=$?
+
+    # Post-process XML to inject YAML tags as <properties>.
+    _XML_PATH=""
+    _prev_arg=""
+    for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
+        case "$_arg" in
+            --junit-xml=*) _XML_PATH="${_arg#--junit-xml=}" ;;
+            --junit-xml)   : ;;
+            *)  [[ "$_prev_arg" == "--junit-xml" ]] && _XML_PATH="$_arg" ;;
+        esac
+        _prev_arg="$_arg"
+    done
+
+    if [[ -n "$_XML_PATH" && -f "$_XML_PATH" ]]; then
+        python3 -c "$_XML_INJECT_PY" "$_XML_PATH" "$YAML_CONFIG" || true
+    fi
+
     if [[ $_exit -ne 0 ]]; then
         echo "[spyre_run] WARNING: pytest exited with code $_exit for $original_file" >&2
         OVERALL_EXIT=$_exit

@@ -14,6 +14,26 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
+import torch_spyre._C as _C
+import warnings
+import functools
+
+
+# Decorator to keep track of compiled variant
+def compile_once(op, **compile_kwargs):
+    def decorator(fn):
+        compiled = None
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            nonlocal compiled
+            if compiled is None:
+                compiled = torch.compile(op, **compile_kwargs)
+            return fn(*args, compiled=compiled, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def maybe_wrap_dim(dim: int, ndims: int) -> int:
@@ -23,17 +43,17 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
 
 
 @torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
-def spyre__mm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
-    compiled_mm = torch.compile(torch.mm, dynamic=False)
-    return compiled_mm(self, mat2)
+@compile_once(torch.mm, dynamic=False)
+def spyre__mm(self: torch.Tensor, mat2: torch.Tensor, compiled) -> torch.Tensor:
+    return compiled(self, mat2)
 
 
 @torch.library.register_kernel("aten::mm.out", ["spyre"])  # type:ignore
+@compile_once(torch.mm, dynamic=False)
 def spyre__mm_out(
-    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor
+    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor, compiled
 ) -> torch.Tensor:
-    compiled_mm = torch.compile(torch.mm, dynamic=False)
-    return compiled_mm(self, mat2, out=out)
+    return compiled(self, mat2, out=out)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -70,17 +90,21 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
 
 
 @torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
-def spyre__silu_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+@compile_once(torch.ops.aten.silu.out, dynamic=False)
+def spyre__silu_out(
+    self: torch.Tensor, out: torch.Tensor = None, compiled=None
+) -> torch.Tensor:
     # Out variant
-    compiled_silu = torch.compile(torch.ops.aten.silu.out, dynamic=False)
-    return compiled_silu(self, out=out)
+    return compiled(self, out=out)
 
 
 @torch.library.register_kernel("aten::mish.out", ["spyre"])  # type:ignore
-def spyre__mish_out(self: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+@compile_once(torch.ops.aten.mish.out, dynamic=False)
+def spyre__mish_out(
+    self: torch.Tensor, out: torch.Tensor = None, compiled=None
+) -> torch.Tensor:
     # Out variant
-    compiled_mish = torch.compile(torch.ops.aten.mish.out, dynamic=False)
-    return compiled_mish(self, out=out)
+    return compiled(self, out=out)
 
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
@@ -100,6 +124,41 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
 @torch.library.register_kernel("aten::_local_scalar_dense", "spyre")
 def spyre__local_scalar_dense(self):
     return self.cpu().item()
+
+
+@torch.library.register_kernel("aten::_copy_from", ["spyre"])
+def spyre__copy_from(self, dst, non_blocking=False):
+    # Check if views of same data
+    if (
+        self.data_ptr() == dst.data_ptr()
+        and self.storage_offset() == dst.storage_offset()
+        and self.strides().equals(dst.strides())
+        and self.sizes().equals(dst.sizes())
+        and self.scalar_type() == dst.scalar_type()
+        and self.is_conj() == dst.is_conj()
+        and self.is_neg() == dst.is_neg()
+    ):
+        return dst
+
+    if self.numel() == 0:
+        return dst
+
+    if (self.device.type == "cpu" and dst.device.type == "spyre") or (
+        self.device.type == "spyre" and dst.device.type == "cpu"
+    ):
+        _C.copy_tensor(self, dst, non_blocking)
+        return dst
+    elif self.device.type == "spyre" and self.device == dst.device:
+        torch.ops.spyre.copy_from_d2d(self, dst)
+        return dst
+    else:
+        if non_blocking:
+            warnings.warn(
+                f"non_blocking is set to {non_blocking}", UserWarning, stacklevel=2
+            )
+
+        torch.ops.aten._copy_from.default(self, dst, non_blocking)
+        return dst
 
 
 # INSERT_CODEGEN_HERE

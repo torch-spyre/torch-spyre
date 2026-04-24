@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, StorageBox
+from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -257,7 +257,7 @@ def lower_mm(x, y):
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"mm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}, "
+            f"mm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}, "
             f"x_layout={x.get_layout()}, y_layout={y.get_layout()}, out_layout={result_buf.get_layout()}"
         )
 
@@ -328,7 +328,7 @@ def lower_bmm(x, y):
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"bmm: x{[int(s) for s in x_size]} @ y{[int(s) for s in y_size]} -> {[int(s) for s in result_buf.get_size()]}"
+            f"bmm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}"
         )
 
     return result
@@ -503,26 +503,30 @@ def clone(x, *, memory_format=None):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
+def lower_spyre_from_d2d(src, dst):
+    lowering.mutate_to(dst, src)
+
+
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
 
-    strides = [int(output.get_layout().stride[d]) for d in dims]
-    gaps = [int(output.get_layout().size[d] - input.get_layout().size[d]) for d in dims]
-
     def inner_fn(index):
-        return fn(
-            input.make_loader()(index),
-            strides,
-            offsets,
-            gaps,
-        )
+        return fn(input.make_loader()(index))
 
-    inp = Pointwise(
+    def output_indexer(index):
+        out_index = [*index]
+        for dim, offset in zip(dims, offsets):
+            out_index[dim] += offset
+        return out_index
+
+    inp = Scatter(
         device=input.get_device(),
         dtype=input.get_dtype(),
         inner_fn=inner_fn,
         ranges=input.get_size(),
+        output_indexer=output_indexer,
     )
 
     output.realize()

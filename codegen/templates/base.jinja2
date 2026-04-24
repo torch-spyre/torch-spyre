@@ -14,7 +14,8 @@
   limitations under the License.
 #}
 @torch.library.register_kernel("aten::{{ template_data.reg_name | replace('"', '')}}", ["spyre"])
-def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length > 0 %} -> {{ signature_out }}{% endif %}:
+@compile_once({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
+def spyre__{{ template_data.op_name }}({{ signature_in }}, compiled=None){% if returns|length > 0 %} -> {{ signature_out }}{% endif %}:
     {% if scalar_arg_names|length > 0 %}
     # Convert scalar arguments to tensors on Spyre device
     {% for scalar_name in scalar_arg_names %}
@@ -24,10 +25,8 @@ def spyre__{{ template_data.op_name }}({{ signature_in }}){% if returns|length >
     {% endif %}
     {% if "out" in overload_name %}
     # Out variant
-    compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
-    return compiled_{{ operator_name }}({{ arg_names }}, out=out)
+    return compiled({{ arg_names }}, out=out)
     {% else %}
     # Standard variant
-    compiled_{{ operator_name }} = torch.compile({{ template_data.torch_prefix }}.{{ template_data.torch_func_name }}, dynamic=False)
-    return compiled_{{ operator_name }}({{ arg_names }})
+    return compiled({{ arg_names }})
     {% endif %}

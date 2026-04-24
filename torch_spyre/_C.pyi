@@ -19,6 +19,7 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "convert_artifacts",
     "empty_with_layout",
+    "copy_tensor",
     "encode_constant",
     "free_runtime",
     "get_device_dtype",
@@ -239,6 +240,17 @@ def as_strided_with_layout(
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
 def convert_artifacts(arg0: str) -> None: ...
+def copy_tensor(
+    self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
+) -> None:
+    """
+    Copy tensor
+
+    Args:
+        self or dst: one of that must be on spyre device
+    """
+    ...
+
 def empty_with_layout(
     arg0: tuple[int, ...],
     arg1: SpyreTensorLayout,
