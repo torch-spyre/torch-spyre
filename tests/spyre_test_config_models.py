@@ -261,7 +261,85 @@ class InputTensorSpec(BaseModel):
         return _resolve_dtype_str(self.dtype)
 
     def build(self, *, seed: Optional[int]) -> torch.Tensor:
-        """Build and return a CPU tensor according to this spec."""
+        """Build and return a CPU tensor according to this spec.
+
+        Uses PyTorch's upstream make_tensor utility for consistency with
+        upstream test patterns.
+        """
+        try:
+            from torch.testing._internal.common_utils import make_tensor
+        except ImportError:
+            # Fallback to direct torch functions if make_tensor not available
+            return self._build_fallback(seed=seed)
+
+        shape = list(self.shape)
+        dtype = self.resolved_dtype()
+        init = self.init
+        ia = self.init_args
+
+        # Special cases that don't use make_tensor
+        if init == "file":
+            return self._load_from_file()
+        elif init == "arange":
+            return torch.arange(shape[0], dtype=dtype)
+        elif init == "eye":
+            return torch.eye(shape[0], dtype=dtype)
+        elif init == "full":
+            return torch.full(shape, ia.fill_value, dtype=dtype)
+        elif init == "zeros":
+            return torch.zeros(shape, dtype=dtype)
+        elif init == "ones":
+            return torch.ones(shape, dtype=dtype)
+
+        # Use make_tensor for random tensors (rand, randn, randint)
+        # make_tensor signature: make_tensor(*shape, dtype, device, low, high, requires_grad, noncontiguous, exclude_zero, memory_format)
+        with torch.random.fork_rng(devices=[]):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+
+            if init == "rand":
+                # rand uses uniform [0, 1), map to make_tensor with low=0, high=1
+                t = make_tensor(*shape, dtype=dtype, device="cpu", low=0.0, high=1.0)
+            elif init == "randn":
+                # randn uses normal distribution, make_tensor defaults to this
+                t = make_tensor(*shape, dtype=dtype, device="cpu")
+            elif init == "randint":
+                # randint needs explicit low/high
+                t = make_tensor(
+                    *shape, dtype=dtype, device="cpu", low=ia.low, high=ia.high
+                )
+            else:
+                raise ValueError(f"Unknown init strategy: {init!r}")
+
+        # Handle custom stride/storage_offset
+        if self.stride is not None or self.storage_offset != 0:
+            stride = self.stride if self.stride is not None else list(t.stride())
+            offset = self.storage_offset
+            needed = offset + (
+                sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
+            )
+            backing = torch.empty(needed, dtype=dtype)
+            t = torch.as_strided(backing, shape, stride, offset)
+            with torch.no_grad():
+                if init == "rand":
+                    t.copy_(
+                        make_tensor(
+                            *shape, dtype=dtype, device="cpu", low=0.0, high=1.0
+                        )
+                    )
+                elif init == "randn":
+                    t.copy_(make_tensor(*shape, dtype=dtype, device="cpu"))
+                elif init == "randint":
+                    t.copy_(
+                        make_tensor(
+                            *shape, dtype=dtype, device="cpu", low=ia.low, high=ia.high
+                        )
+                    )
+
+        return t
+
+    def _build_fallback(self, *, seed: Optional[int]) -> torch.Tensor:
+        """Fallback tensor builder when make_tensor is not available."""
         shape = list(self.shape)
         dtype = self.resolved_dtype()
         init = self.init
