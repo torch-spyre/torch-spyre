@@ -465,17 +465,44 @@ def compare_with_cpu(
     cpu_compile=None,
     target=None,
     run_eager=True,
+    run_compile=True,
 ):
+    """Compare Spyre execution against CPU for one or both Spyre execution paths.
+
+    ``run_compile`` and ``run_eager`` select ``torch.compile`` vs eager on ``DEVICE``
+    (spyre). At least one must be ``True``:
+
+    - **Both** (default): ``run_compile=True``, ``run_eager=True`` — run compiled
+      Spyre, then eager Spyre (same order as before).
+    - **Compiled only**: ``run_compile=True``, ``run_eager=False``.
+    - **Eager only**: ``run_compile=False``, ``run_eager=True``.
+    - **Neither**: raises ``ValueError``.
+
+    When ``cpu_compile`` is True, each selected Spyre path is also compared to CPU
+    using the same compile flag (compiled vs compiled, or eager vs eager).
+
+    Args:
+        run_compile: Run the compiled path on Spyre.
+        run_eager: Run the eager (non-compiled) path on Spyre.
+    """
     # if this flag is explicitly passed in by the test, use it
     if cpu_compile is None:
         # the bool function parses all non-empty strings to true
         # if this env var is set at all, it gets marked as true
         cpu_compile = bool(os.getenv("TEST_COMPARE_CPU_COMPILE"))
 
-    """Compare Spyre execution (compiled and optionally eager) against CPU execution."""
     cpu_result = fn(*args)
 
-    for compiled in [True, False] if run_eager else [True]:
+    # Order: compiled first, then eager (matches prior [True, False] when both on).
+    modes = tuple(
+        compiled
+        for compiled, enabled in ((True, run_compile), (False, run_eager))
+        if enabled
+    )
+    if not modes:
+        raise ValueError("At least one of run_compile or run_eager must be True")
+
+    for compiled in modes:
         mode = "compiled" if compiled else "eager"
         spyre_result = (
             target
