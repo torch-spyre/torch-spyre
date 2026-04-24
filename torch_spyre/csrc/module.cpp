@@ -24,7 +24,9 @@
 #include <util/sendefs.h>
 
 #include <cstdlib>  // std::getenv
+#include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
+#include <iostream>
 #include <memory>
 #include <sendnn/graph.hpp>
 #include <sendnn/graph/graph_builder.hpp>
@@ -41,11 +43,14 @@
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
 #include "spyre_guard.h"
+#include "spyre_kernel.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_stream.h"
 #include "spyre_views.h"
 #include "types_mapping.h"
+
+namespace fs = std::filesystem;
 
 namespace spyre {
 
@@ -63,10 +68,10 @@ void set_downcast_warn_enabled(bool enabled) {
 
 // Optional: initialize from env at module init
 static void init_from_env() {
-  if (const char *v = std::getenv(SPYRE_DOWNCAST_ENV)) {
+  if (const char* v = std::getenv(SPYRE_DOWNCAST_ENV)) {
     // Accept 0/1, true/false, on/off
     std::string s(v);
-    for (auto &c : s) c = std::tolower(c);
+    for (auto& c : s) c = std::tolower(c);
     bool enable = !(s == "0" || s == "false" || s == "off");
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
   }
@@ -82,7 +87,7 @@ void _startRuntime() {
   int tls_idx = static_cast<int>(SpyreGuardImpl::tls_idx);
   if (tls_idx != 0) {
     logical_device_id = tls_idx;
-  } else if (const char *lr = std::getenv("LOCAL_RANK")) {
+  } else if (const char* lr = std::getenv("LOCAL_RANK")) {
     logical_device_id = std::atoi(lr);
   }
 
@@ -111,7 +116,17 @@ void startRuntime() {
 void freeRuntime() {
   GlobalRuntime::reset();
 }
-void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
+
+void launchKernel(const std::string& g2_path,
+                  const std::vector<at::Tensor>& args) {
+  auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+  auto& arts = getOrLoadArtifacts(g2_path, stream);
+
+  stream.executeProgramAsync(arts, args);
+}
+
+void launchKernel_old(std::string g2_path, std::vector<at::Tensor> args) {
   // Get global runtime from eager
   auto gl = sendnn::GraphLoader(GlobalRuntime::get());
 
@@ -119,21 +134,20 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
   auto g2 = sendnn::Graph();
   sendnn::Deserialize(&g2, g2_path);
 
-  for (auto &super_node : g2.compute_ops_) {
+  for (auto& super_node : g2.compute_ops_) {
     if (super_node->Name() != "DeviceInit" &&
         super_node->Name() != "PrepareModel") {
-      auto *sn_attrs = dynamic_cast<sendnn::attributes::SenSuperNodeV2 *>(
+      auto* sn_attrs = dynamic_cast<sendnn::attributes::SenSuperNodeV2*>(
           super_node->Attrs());
-      auto &exec_graph = sn_attrs->execution_graph_;
-      for (auto &node : exec_graph.compute_ops_) {
-        auto *dev_attrs =
-            dynamic_cast<sendnn::attributes::SenFusedDeviceNode *>(
-                node->Attrs());
-        auto &sub_graph = dev_attrs->sub_graph_;
+      auto& exec_graph = sn_attrs->execution_graph_;
+      for (auto& node : exec_graph.compute_ops_) {
+        auto* dev_attrs = dynamic_cast<sendnn::attributes::SenFusedDeviceNode*>(
+            node->Attrs());
+        auto& sub_graph = dev_attrs->sub_graph_;
         auto compute_node = sub_graph.compute_ops_.front();
         auto edge_count = 0;
 
-        for (auto &arg : args) {
+        for (auto& arg : args) {
           if (&args.back() != &arg) {
             auto tensor = sendnn::Tensor(getTensorInfo(arg));
             exec_graph.AddInput(
@@ -150,10 +164,10 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
             exec_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
             sub_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
 
-            auto *exec_edge =
+            auto* exec_edge =
                 exec_graph.NewEdge(0, exec_graph.output_ops_.front(), 0, node);
             exec_edge->tensor_ = tensor;
-            auto *sub_edge = sub_graph.NewEdge(0, sub_graph.output_ops_.front(),
+            auto* sub_edge = sub_graph.NewEdge(0, sub_graph.output_ops_.front(),
                                                0, compute_node);
             sub_edge->tensor_ = tensor;
           }
@@ -182,21 +196,21 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
       tmp_0 = (at::ones({1}, arg.dtype()) * arg).to(arg.device());
       auto tensor =
           createInputTensor(gl, tmp_0.storage().data_ptr().get(), i, 1);
-      tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
-                              tmp_0.storage().data_ptr().get_context())
-                              ->owner);
+      tensor.SetSpyreData(
+          static_cast<SharedOwnerCtx*>(tmp_0.storage().data_ptr().get_context())
+              ->owner);
       sen_inputs.push_back(tensor);
     } else {
       auto tensor = createInputTensor(gl, arg.storage().data_ptr().get(), i, 1);
       tensor.SetSpyreData(
-          static_cast<SharedOwnerCtx *>(arg.storage().data_ptr().get_context())
+          static_cast<SharedOwnerCtx*>(arg.storage().data_ptr().get_context())
               ->owner);
       sen_inputs.push_back(tensor);
     }
   }
   auto tensor =
       createOutputTensor(gl, args.back().storage().data_ptr().get(), 0, 1);
-  tensor.SetSpyreData(static_cast<SharedOwnerCtx *>(
+  tensor.SetSpyreData(static_cast<SharedOwnerCtx*>(
                           args.back().storage().data_ptr().get_context())
                           ->owner);
   sen_outputs.push_back(tensor);
@@ -266,9 +280,9 @@ PYBIND11_MODULE(_C, m) {
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
       .def("__str__",
-           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+           [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("__repr__",
-           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+           [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
@@ -281,7 +295,7 @@ PYBIND11_MODULE(_C, m) {
            py::arg("device_size"), py::arg("stride_map"),
            py::arg("device_dtype"))
       .def(py::pickle(
-          [](const spyre::SpyreTensorLayout &p) {  // __getstate__
+          [](const spyre::SpyreTensorLayout& p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
             // If the pickle format changes, then update
             // kSpyreTensorLayoutPickleVersion but keep the tuple as the
@@ -346,7 +360,7 @@ PYBIND11_MODULE(_C, m) {
       .value("BFLOAT16", DataFormats::BFLOAT16)
       .value("SEN18F_FP24", DataFormats::SEN18F_FP24)
       .def("elems_per_stick",
-           [](const DataFormats &df) { return spyre::elems_per_stick(df); });
+           [](const DataFormats& df) { return spyre::elems_per_stick(df); });
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
@@ -389,7 +403,7 @@ PYBIND11_MODULE(_C, m) {
            "Get the device associated with this stream")
       .def("id", &spyre::SpyreStream::id, "Get the stream ID")
       .def("priority", &spyre::SpyreStream::priority, "Get the stream priority")
-      .def("__repr__", [](const spyre::SpyreStream &stream) {
+      .def("__repr__", [](const spyre::SpyreStream& stream) {
         return "<torch_spyre.Stream device=" +
                std::to_string(stream.device().index()) +
                " id=" + std::to_string(stream.id()) + ">";
