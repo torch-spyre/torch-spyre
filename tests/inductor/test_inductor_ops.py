@@ -1075,6 +1075,66 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_bitwise_not",
+            "test_fallback_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "bitwise_not": torch.bitwise_not,
+            },
+            "param_sets": {
+                "bool_1d": (cached_randn((256), dtype=torch.float16) > 0,),
+                "bool_2d": (cached_randn((128, 256), dtype=torch.float16) > 0,),
+                "bool_3d": (cached_randn((8, 32, 128), dtype=torch.float16) > 0,),
+                "bool_4d": (cached_randn((2, 8, 32, 64), dtype=torch.float16) > 0,),
+                "int_1d": (torch.randint(-128, 127, (256,), dtype=torch.int8),),
+                "int_2d": (torch.randint(-128, 127, (128, 256), dtype=torch.int8),),
+                "int_3d": (torch.randint(-128, 127, (8, 32, 128), dtype=torch.int8),),
+                "int_4d": (torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),),
+            },
+        },
+        (
+            "test_bitwise_and",
+            "test_fallback_binary_op_cpu",
+        ): {
+            "ops_dict": {
+                "bitwise_and": torch.bitwise_and,
+            },
+            "param_sets": {
+                "bool_1d": (
+                    cached_randn((256), dtype=torch.float16) > 0,
+                    cached_randn((256), dtype=torch.float16) > 0,
+                ),
+                "bool_2d": (
+                    cached_randn((128, 256), dtype=torch.float16) > 0,
+                    cached_randn((128, 256), dtype=torch.float16) > 0,
+                ),
+                "bool_3d": (
+                    cached_randn((8, 32, 128), dtype=torch.float16) > 0,
+                    cached_randn((8, 32, 128), dtype=torch.float16) > 0,
+                ),
+                "bool_4d": (
+                    cached_randn((2, 8, 32, 64), dtype=torch.float16) > 0,
+                    cached_randn((2, 8, 32, 64), dtype=torch.float16) > 0,
+                ),
+                "int_1d": (
+                    torch.randint(-128, 127, (256,), dtype=torch.int8),
+                    torch.randint(-128, 127, (256,), dtype=torch.int8),
+                ),
+                "int_2d": (
+                    torch.randint(-128, 127, (128, 256), dtype=torch.int8),
+                    torch.randint(-128, 127, (128, 256), dtype=torch.int8),
+                ),
+                "int_3d": (
+                    torch.randint(-128, 127, (8, 32, 128), dtype=torch.int8),
+                    torch.randint(-128, 127, (8, 32, 128), dtype=torch.int8),
+                ),
+                "int_4d": (
+                    torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
+                    torch.randint(-128, 127, (2, 8, 32, 64), dtype=torch.int8),
+                ),
+            },
+        },
+        (
             "test_logical_not",
             "test_fallback_unary_op_cpu",
         ): {
@@ -1768,6 +1828,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare_with_cpu(op, a, b)
         else:
             compare(op, a, b)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_fallback_binary_op_cpu(self, op, x, y):
+        compare_with_cpu(op, x, y, run_eager=False)
 
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):

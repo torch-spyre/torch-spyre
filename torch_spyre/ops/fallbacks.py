@@ -272,3 +272,13 @@ def spyre__tril(input, diagonal=0, **kwargs):
 @register_fallback([aten.triu.default, aten.triu.out])
 def spyre__triu(input, diagonal=0, **kwargs):
     return torch.triu(input, diagonal, **kwargs)
+
+
+@register_fallback([aten.bitwise_xor.Tensor, aten.bitwise_xor.Tensor_out])
+def spyre__bitwise_xor(input1, input2, **kwargs):
+    return torch.bitwise_xor(input1, input2, **kwargs)
+
+
+@register_fallback([aten.bitwise_or.Tensor, aten.bitwise_or.Tensor_out])
+def spyre__bitwise_or(input1, input2, **kwargs):
+    return torch.bitwise_or(input1, input2, **kwargs)
