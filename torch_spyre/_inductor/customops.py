@@ -16,10 +16,9 @@ from typing import Optional, Sequence
 import torch
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.fallbacks import warn_fallback
+from torch_spyre.codegen_ops import compile_once
 
 from .errors import Unsupported
-
-eager_paths = {}
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
@@ -213,13 +212,13 @@ def _ones_scalar_fake(
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
+@compile_once("spyre.copy_from_d2d")
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
+    compiled,
 ) -> None:
-    if "copy_from_d2d" not in eager_paths:
-        eager_paths["copy_from_d2d"] = torch.compile(torch.ops.spyre.copy_from_d2d)
-    return eager_paths["copy_from_d2d"](src, dst)
+    return compiled(src, dst)
 
 
 @copy_from_d2d.register_fake
@@ -235,15 +234,15 @@ def _(
 @torch.library.custom_op(
     "spyre::overwrite", mutates_args=("output",), device_types="spyre"
 )
+@compile_once("spyre.overwrite")
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
     dims: Sequence[int],
     offsets: Sequence[int],
+    compiled,
 ) -> None:
-    if "overwrite" not in eager_paths:
-        eager_paths["overwrite"] = torch.compile(torch.ops.spyre.overwrite)
-    return eager_paths["overwrite"](input, output, dims, offsets)
+    return compiled(input, output, dims, offsets)
 
 
 @overwrite.register_fake
@@ -265,8 +264,8 @@ def overwrite_cpu(
 ) -> None:
     sliced_t = output
     for i, dim in enumerate(dims):
-        sliced_t = torch.ops.aten.slice(sliced_t, dim, offsets[i], offsets[i] + 1)
-    sliced_t = input
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+    sliced_t.copy_(input)
 
 
 @torch.library.custom_op("spyre::overwrite_f", mutates_args=(), device_types="spyre")
@@ -276,10 +275,8 @@ def overwrite_f(
     dims: Sequence[int],
     offsets: Sequence[int],
 ) -> torch.Tensor:
-    if "overwrite" not in eager_paths:
-        eager_paths["overwrite"] = torch.compile(torch.ops.spyre.overwrite)
     result = output.clone()
-    eager_paths["overwrite"](input, result, dims, offsets)
+    torch.ops.spyre.overwrite(input, result, dims, offsets)
     return result
 
 
