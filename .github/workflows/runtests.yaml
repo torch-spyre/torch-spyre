@@ -37,6 +37,7 @@ jobs:
         run: |
           MY_DELIM="=================================================================="
 
+
           # The CI env var is very important.
           # GitHub actions automatically sets CI=true
           # which causes the pytest inductor tests to fail with AssetionError
@@ -44,7 +45,7 @@ jobs:
           # Here we set it to an empty string (or we could also unset it)
           export CI=
 
-          CLONED_TORCH_SPYRE_DIR=$(pwd)
+          CLONED_TORCH_SPYRE_DIR="$(pwd)"
           CLONED_TORCH_SENDNN_DIR="${HOME}/torch_sendnn"
 
           echo "$MY_DELIM"
@@ -68,7 +69,9 @@ jobs:
           env | sort
           echo "$MY_DELIM"
           env | sort | grep AIU
+          date
           echo 'gather info end'
+          echo "$MY_DELIM"
 
           echo "$MY_DELIM"
           echo 'building torch-spyre...'
@@ -90,7 +93,7 @@ jobs:
           cd
           cd "$CLONED_TORCH_SPYRE_DIR" || exit 1
           EXIT_CODE=0
-          pytest tests/ -vvv -s || EXIT_CODE=$?
+          pytest -vvv -s || EXIT_CODE=$?
           echo "pytest EXIT_CODE: ${EXIT_CODE}"
           if [[ "$EXIT_CODE" == '0' ]] ; then
             echo 'pytest success'
