@@ -855,6 +855,98 @@ print(f"[spyre_run] Tags injected into XML: {xml_path}", flush=True)
 
 OVERALL_EXIT=0
 
+# ---------------------------------------------------------------------------
+# Extract the caller-supplied --junit-xml destination BEFORE the
+# per-file loop so we can:
+#   1. Route each per-file pytest run to a shard XML (e.g. report__shard_0.xml)
+#      instead of the shared final path, preventing later runs from overwriting
+#      the XML and the already-injected <properties> tags of earlier runs.
+#   2. Merge all shards into the original --junit-xml path after all runs finish.
+# ---------------------------------------------------------------------------
+_FINAL_XML_PATH=""
+_prev_arg=""
+for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
+    case "$_arg" in
+        --junit-xml=*) _FINAL_XML_PATH="${_arg#--junit-xml=}" ;;
+        --junit-xml)   : ;;
+        *)  [[ "$_prev_arg" == "--junit-xml" ]] && _FINAL_XML_PATH="$_arg" ;;
+    esac
+    _prev_arg="$_arg"
+done
+
+# Build a copy of EXTRA_PYTEST_ARGS with --junit-xml stripped out.
+# Each per-file run injects its own shard path instead.
+_EXTRA_NO_XML=()
+_skip_next=0
+for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
+    if [[ $_skip_next -eq 1 ]]; then
+        _skip_next=0
+        continue
+    fi
+    case "$_arg" in
+        --junit-xml=*) ;;                  # drop combined form
+        --junit-xml)   _skip_next=1 ;;     # drop flag; value dropped next iteration
+        *)             _EXTRA_NO_XML+=("$_arg") ;;
+    esac
+done
+
+# Accumulate shard paths for the final merge step.
+_XML_SHARDS=()
+
+# ---------------------------------------------------------------------------
+# XML shard merger: combines N JUnit XML files (each produced by a separate
+# pytest run) into one, summing suite-level counters and concatenating all
+# <testcase> elements (which already carry their injected <properties> tags).
+# ---------------------------------------------------------------------------
+_XML_MERGE_PY='
+import sys, re
+from pathlib import Path
+
+out_path    = sys.argv[1]
+shard_paths = sys.argv[2:]
+
+all_cases   = []
+total_tests = 0
+total_err   = 0
+total_fail  = 0
+total_skip  = 0
+total_time  = 0.0
+
+def _attr(xml, name, default="0"):
+    m = re.search(rf"{name}=\"([^\"]*)\"", xml)
+    return m.group(1) if m else default
+
+for sp in shard_paths:
+    txt = Path(sp).read_text()
+    suite_m = re.search(r"<testsuite([^>]*)>", txt)
+    if suite_m:
+        attrs = suite_m.group(1)
+        total_tests += int(_attr(attrs, "tests"))
+        total_err   += int(_attr(attrs, "errors"))
+        total_fail  += int(_attr(attrs, "failures"))
+        total_skip  += int(_attr(attrs, "skipped"))
+        try:
+            total_time += float(_attr(attrs, "time", "0"))
+        except ValueError:
+            pass
+    # Collect full and self-closing <testcase> blocks.
+    blocks  = re.findall(r"<testcase[^>]*>.*?</testcase>", txt, re.DOTALL)
+    blocks += re.findall(r"<testcase[^>]*/>",              txt)
+    all_cases.extend(blocks)
+
+merged = (
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+    "<testsuites>"
+    f"<testsuite name=\"pytest\" tests=\"{total_tests}\" "
+    f"errors=\"{total_err}\" failures=\"{total_fail}\" "
+    f"skipped=\"{total_skip}\" time=\"{total_time:.3f}\">"
+    + "\n".join(all_cases)
+    + "</testsuite></testsuites>"
+)
+Path(out_path).write_text(merged)
+print(f"[spyre_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
+'
+
 for i in "${!RUN_FILES[@]}"; do
     run_file="${RUN_FILES[$i]}"
     original_file="${TEST_FILES[$i]}"
@@ -869,27 +961,30 @@ for i in "${!RUN_FILES[@]}"; do
     fi
     echo "========================================================================"
 
+    # Derive a shard XML path for this file's pytest run.
+    _SHARD_XML=""
+    if [[ -n "$_FINAL_XML_PATH" ]]; then
+        _SHARD_XML="${_FINAL_XML_PATH%.xml}__shard_${i}.xml"
+        _XML_SHARDS+=("$_SHARD_XML")
+    fi
+
+    # Build per-file args: base args (--junit-xml stripped) + shard path.
+    if [[ -n "$_SHARD_XML" ]]; then
+        _FILE_PYTEST_ARGS=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" "--junit-xml=${_SHARD_XML}")
+    else
+        _FILE_PYTEST_ARGS=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}")
+    fi
+
     (
         cd "$run_dir"
-        python3 -m pytest "$run_basename" "${EXTRA_PYTEST_ARGS[@]}" || true
+        python3 -m pytest "$run_basename" "${_FILE_PYTEST_ARGS[@]}" || true
     )
 
     _exit=$?
 
     # Post-process XML to inject YAML tags as <properties>.
-    _XML_PATH=""
-    _prev_arg=""
-    for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
-        case "$_arg" in
-            --junit-xml=*) _XML_PATH="${_arg#--junit-xml=}" ;;
-            --junit-xml)   : ;;
-            *)  [[ "$_prev_arg" == "--junit-xml" ]] && _XML_PATH="$_arg" ;;
-        esac
-        _prev_arg="$_arg"
-    done
-
-    if [[ -n "$_XML_PATH" && -f "$_XML_PATH" ]]; then
-        python3 -c "$_XML_INJECT_PY" "$_XML_PATH" "$YAML_CONFIG" || true
+    if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" ]]; then
+        python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
     fi
 
     if [[ $_exit -ne 0 ]]; then
@@ -897,6 +992,30 @@ for i in "${!RUN_FILES[@]}"; do
         OVERALL_EXIT=$_exit
     fi
 done
+
+# ---------------------------------------------------------------------------
+# Merge all XML shards into the final output path requested by the caller.
+# ---------------------------------------------------------------------------
+if [[ -n "$_FINAL_XML_PATH" && ${#_XML_SHARDS[@]} -gt 0 ]]; then
+    _existing_shards=()
+    for _s in "${_XML_SHARDS[@]}"; do
+        [[ -f "$_s" ]] && _existing_shards+=("$_s")
+    done
+
+    if [[ ${#_existing_shards[@]} -eq 1 ]]; then
+        # Single file run: just rename the shard, no merge needed.
+        mv "${_existing_shards[0]}" "$_FINAL_XML_PATH"
+        echo "[spyre_run] Single XML shard moved to: $_FINAL_XML_PATH"
+    elif [[ ${#_existing_shards[@]} -gt 1 ]]; then
+        python3 -c "$_XML_MERGE_PY" "$_FINAL_XML_PATH" "${_existing_shards[@]}" || true
+        # Clean up shards after successful merge.
+        for _s in "${_existing_shards[@]}"; do
+            rm -f "$_s"
+        done
+    else
+        echo "[spyre_run] WARNING: No XML shards found to merge." >&2
+    fi
+fi
 
 echo ""
 echo "[spyre_run] Done. Overall exit code: $OVERALL_EXIT"
