@@ -28,7 +28,7 @@ planned toolkit is in
 |---|---|---|
 | Compiler pipeline logs | Available | [Environment variables](environment_variables.md) |
 | CPU-side timing with `torch.profiler` | Available | [PyTorch Profiler](pytorch_profiler.md) |
-| Device telemetry (power, temperature, bandwidth) | Available | [Device monitoring](device_monitoring.md) |
+| Device telemetry (power, temperature, bandwidth) | Available (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
 | Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Preview (requires [`kineto-spyre`][kineto-spyre] wheel) | [PyTorch Profiler](pytorch_profiler.md) |
 | Trace post-processing (aiu-trace-analyzer) | Available, known gaps | [Trace analysis](trace_analysis.md) |
 | `torch.spyre.memory_allocated()` / `max_memory_allocated()` | Planned | [RFC 0601][rfc-0601] |
@@ -68,6 +68,9 @@ planned toolkit is in
 - [Compiler Architecture](../../compiler/architecture.md) — pipeline
   overview
 - [RFC 0601][rfc-0601] — full profiling toolkit design
+- [Contributing to the Profiler](../../contributing/profiling.md) —
+  branch / commit conventions, build flag, test layout, and review
+  process for the profiling squad
 
 :::{admonition} Work in Progress
 :class: warning
@@ -80,3 +83,4 @@ design and may change.
 [rfc-0601]: https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md
 [kineto-spyre]: https://github.com/IBM/kineto-spyre
 [ata]: https://github.com/IBM/aiu-trace-analyzer
+[issue-1335]: https://github.com/torch-spyre/torch-spyre/issues/1335
