@@ -129,7 +129,6 @@ jobs:
           echo 'installing with dependencies, this could take a while...'
           pip install uv
           uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-          uv pip install pydantic
 
       - name: Run ${{ matrix.suite.name }} upstream test suite
         working-directory: torch-spyre/tests

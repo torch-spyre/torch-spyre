@@ -657,11 +657,15 @@ def propagate_mutation_layouts(
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
         if isinstance(n.node.data, Pointwise):
-            rw = n.read_writes
-            output_dep = next(iter(rw.writes))
-            args = get_mem_deps(n)
-            output = n.node.get_layout()
-            n.node.layout = pointwise_layout(n.node, output, output_dep, args, {})
+            real = n.node.layout.real_layout()
+            if isinstance(real, FixedTiledLayout):
+                n.node.layout = real
+            else:
+                rw = n.read_writes
+                output_dep = next(iter(rw.writes))
+                args = get_mem_deps(n)
+                output = n.node.get_layout()
+                n.node.layout = pointwise_layout(n.node, output, output_dep, args, {})
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
