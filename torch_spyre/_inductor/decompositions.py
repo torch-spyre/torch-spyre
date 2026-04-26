@@ -584,6 +584,52 @@ def spyre__sdpa_overrideable(
     )
 
 
+## TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
+## See: https://github.com/torch-spyre/torch-spyre/issues/1172
+## This will be enabled after solving this.
+# @register_spyre_decomposition([torch.ops.aten.max.default])
+# def spyre_max_default_decomp(input):
+#    """
+#    Decompose torch.max(input) with conditional CPU fallback for int64.
+#
+#    For int64 tensors, use custom op spyre::max_default_int64_fallback which has
+#    a CPU fallback registered in fallbacks.py.
+#    For other dtypes (float16, float32, etc.), use amax.
+#    """
+#    if input.dtype == torch.int64:
+#        # Use custom op with CPU fallback to avoid recursive decomposition
+#        # Returns a scalar (0D) tensor
+#        return torch.ops.spyre.max_default_int64_fallback(input)
+#    else:
+#        # Use amax for supported dtypes (can run on Spyre)
+#        # Returns a scalar (0D) tensor
+#        return torch.ops.aten.amax(input)
+
+
+@register_spyre_decomposition([torch.ops.aten.max.dim])
+def spyre_max_dim_decomp(input, dim, keepdim=False):
+    """
+    Decompose torch.max(input, dim) with conditional CPU fallback for int64.
+
+    For int64 tensors, use custom op spyre::max_dim_int64_fallback which has
+    a CPU fallback registered in fallbacks.py.
+    For other dtypes (float16, float32, etc.), decompose into amax and argmax operations.
+
+    Returns a named tuple (values, indices) as expected by torch.max.
+
+    # TODO (imaihal): Decomposed into torch.topk with k=1 to obtain both values and indices,
+    #  or implement argmax in the backend compiler to get indices
+    """
+    if input.dtype == torch.int64:
+        # Use custom op with CPU fallback to avoid recursive decomposition
+        return torch.ops.spyre.max_dim_int64_fallback(input, dim, keepdim)
+    else:
+        # Use amax and argmax for supported dtypes (can run on Spyre)
+        values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmax(input, dim=dim, keepdim=keepdim)
+        return torch.return_types.max((values, indices))
+
+
 @register_spyre_decomposition([torch.ops.aten.cat.default])
 def decompose_cat(
     tensors: list[torch.Tensor],
