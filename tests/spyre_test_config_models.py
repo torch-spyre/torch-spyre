@@ -620,7 +620,6 @@ class ModulesNamedItem(BaseModel):
     name: str
     module_path: Optional[str] = None  # Full import path (e.g., "torch.nn.Linear")
     description: Optional[str] = None
-    tags: List[str] = []  # Optional per-module tags
     sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
     constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
     forward_inputs: Optional[InputsEdits] = None  # New: explicit forward inputs
