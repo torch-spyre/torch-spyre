@@ -8,7 +8,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - "*TestModule*::test_forward"
+            - '*TestModule*::test_forward'
           mode: mandatory_success
           tags:
             - granite_3_3_8b_instruct
@@ -17,7 +17,7 @@ test_suite_config:
             modules:
               include:
                 - name: GraniteRotaryEmbedding
-                  module_path: 'transformers.models.granite.modeling_granite.GraniteRotaryEmbedding'
+                  module_path: transformers.models.granite.modeling_granite.GraniteRotaryEmbedding
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteRotaryEmbedding'
                   constructor_inputs:
                     args:
@@ -42,7 +42,7 @@ test_suite_config:
                             high: 10000
 
                 - name: GraniteDecoderLayer
-                  module_path: 'transformers.models.granite.modeling_granite.GraniteDecoderLayer'
+                  module_path: transformers.models.granite.modeling_granite.GraniteDecoderLayer
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteDecoderLayer'
                   tags: [complex]
                   constructor_inputs:
@@ -79,7 +79,7 @@ test_suite_config:
                             init: zeros
 
                 - name: GraniteRMSNorm
-                  module_path: 'transformers.models.granite.modeling_granite.GraniteRMSNorm'
+                  module_path: transformers.models.granite.modeling_granite.GraniteRMSNorm
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteRMSNorm'
                   constructor_inputs:
                     args:
@@ -96,7 +96,7 @@ test_suite_config:
                     kwargs: {}
 
                 - name: GraniteAttention
-                  module_path: 'transformers.models.granite.modeling_granite.GraniteAttention'
+                  module_path: transformers.models.granite.modeling_granite.GraniteAttention
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteAttention'
                   tags: [complex]
                   constructor_inputs:
@@ -133,7 +133,7 @@ test_suite_config:
                             init: zeros
 
                 - name: GraniteMLP
-                  module_path: 'transformers.models.granite.modeling_granite.GraniteMLP'
+                  module_path: transformers.models.granite.modeling_granite.GraniteMLP
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteMLP'
                   constructor_inputs:
                     args:
@@ -150,7 +150,7 @@ test_suite_config:
                     kwargs: {}
 
                 - name: SiLUActivation
-                  module_path: 'transformers.activations.SiLUActivation'
+                  module_path: transformers.activations.SiLUActivation
                   description: 'Module: transformers.activations.SiLUActivation'
                   constructor_inputs:
                     args: []

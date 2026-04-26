@@ -709,7 +709,7 @@ def generate_unified_yaml_config(
     yaml_str += "      unlisted_test_mode: skip\n"
     yaml_str += "      tests:\n"
     yaml_str += "        - names:\n"
-    yaml_str += '            - "*TestModule*::test_forward"\n'
+    yaml_str += "            - '*TestModule*::test_forward'\n"
     yaml_str += "          mode: mandatory_success\n"
     yaml_str += "          tags:\n"
     yaml_str += f"            - {model_name}\n"
@@ -721,7 +721,7 @@ def generate_unified_yaml_config(
     # Add all modules with their constructor_inputs and forward_inputs
     for entry in all_module_entries:
         yaml_str += f"                - name: {entry['name']}\n"
-        yaml_str += f"                  module_path: '{entry['module_path']}'\n"
+        yaml_str += f"                  module_path: {entry['module_path']}\n"
         yaml_str += f"                  description: 'Module: {entry['module_path']}'\n"
 
         # Add tags based on complexity
