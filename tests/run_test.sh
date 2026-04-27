@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # run_test.sh -- Single-entry-point test runner for torch-spyre OOT tests.
 #
-# Usage:
-#   bash run_test.sh /path/to/test_suite_config.yaml [extra pytest args...]
+# Usage (single config):
+#   bash run_test.sh /path/to/yaml/config [extra pytest args...]
+#
+# Usage (multiple configs -- merged at runtime, temp file cleaned up on exit):
+#   bash run_test.sh config_a.yaml config_b.yaml [config_c.yaml ...] [extra pytest args...]
+#   bash run_test.sh config_a.yaml config_b.yaml -- [extra pytest args...]
+#
+# When more than one YAML file is supplied the configs are merged in order via
+# spyre_test_utilities.py
+#   - `files` entries with the same path are combined (tests deduplicated).
+#   - `global` list keys form a superset; identical items are deduplicated.
+#   - Conflicting scalar globals raise an error.
+# The merged temp file is removed by the EXIT trap at the end of the run.
 #
 # For each test file, any TestCase subclass that is NOT already passed to
 # instantiate_device_type_tests() is automatically wrapped: a temporary
@@ -32,16 +43,86 @@ if [[ $# -lt 1 ]]; then
     exit 1
 fi
 
-YAML_CONFIG="$(realpath "$1")"
-shift
-EXTRA_PYTEST_ARGS=("$@")
+# ---------------------------------------------------------------------------
+# Multi-config support
+#
+# Collect all leading *.yaml / *.yml arguments that resolve to real files as
+# YAML configs.  The first non-YAML argument (or anything after "--") is the
+# start of extra pytest args.  A single YAML argument is the original
+# backward-compatible path and behaves exactly as before.
+# ---------------------------------------------------------------------------
+YAML_CONFIGS=()
+EXTRA_PYTEST_ARGS=()
+_parsing_yamls=1
 
-if [[ ! -f "$YAML_CONFIG" ]]; then
-    echo "ERROR: YAML config not found: $YAML_CONFIG" >&2
+for _arg in "$@"; do
+    if [[ "$_arg" == "--" ]]; then
+        _parsing_yamls=0
+        continue
+    fi
+    if [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
+        YAML_CONFIGS+=("$(realpath "$_arg")")
+    else
+        _parsing_yamls=0
+        EXTRA_PYTEST_ARGS+=("$_arg")
+    fi
+done
+
+if [[ ${#YAML_CONFIGS[@]} -eq 0 ]]; then
+    echo "ERROR: No YAML config file(s) found in the arguments." >&2
+    echo "Usage: $0 <path/to/test_suite_config.yaml> [extra pytest args...]" >&2
     exit 1
 fi
 
-echo "[spyre_run] Using YAML config: $YAML_CONFIG"
+# MERGED_CONFIG_IS_TEMP=1 means we created the file and must delete it on EXIT.
+MERGED_CONFIG_IS_TEMP=0
+
+if [[ ${#YAML_CONFIGS[@]} -eq 1 ]]; then
+    # -----------------------------------------------------------------------
+    # Single-config path
+    # -----------------------------------------------------------------------
+    YAML_CONFIG="${YAML_CONFIGS[0]}"
+
+    if [[ ! -f "$YAML_CONFIG" ]]; then
+        echo "ERROR: YAML config not found: $YAML_CONFIG" >&2
+        exit 1
+    fi
+
+    echo "[spyre_run] Using YAML config: $YAML_CONFIG"
+else
+    # -----------------------------------------------------------------------
+    # Multi-config path -- merge via spyre_test_utilities.py
+    # -----------------------------------------------------------------------
+    echo "[spyre_run] Merging ${#YAML_CONFIGS[@]} YAML config(s):"
+    for _c in "${YAML_CONFIGS[@]}"; do
+        echo "[spyre_run]   $_c"
+    done
+
+    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _UTILITIES_PY=""
+    if [[ -f "${_script_dir}/spyre_test_utilities.py" ]]; then
+        _UTILITIES_PY="${_script_dir}/spyre_test_utilities.py"
+    else
+        _first_config_dir="$(dirname "${YAML_CONFIGS[0]}")"
+        if [[ -f "${_first_config_dir}/spyre_test_utilities.py" ]]; then
+            _UTILITIES_PY="${_first_config_dir}/spyre_test_utilities.py"
+        fi
+    fi
+
+    if [[ -z "$_UTILITIES_PY" ]]; then
+        echo "ERROR: spyre_test_utilities.py not found beside run_test.sh or beside the first config." >&2
+        echo "       Place spyre_test_utilities.py in the same directory as run_test.sh." >&2
+        exit 1
+    fi
+
+    YAML_CONFIG=$(python3 "$_UTILITIES_PY" "${YAML_CONFIGS[@]}") || {
+        echo "ERROR: Failed to merge YAML configs." >&2
+        exit 1
+    }
+    MERGED_CONFIG_IS_TEMP=1
+    echo "[spyre_run] Merged config written to: $YAML_CONFIG"
+fi
+
 YAML_DIR="$(dirname "$YAML_CONFIG")"
 
 # ---------------------------------------------------------------------------
@@ -439,6 +520,11 @@ _cleanup_wrappers() {
         [[ -f "$wf" ]] && rm -f "$wf" && \
             echo "[spyre_run] Cleaned up wrapper: $wf"
     done
+    # Remove merged config temp file (only if we created it)
+    if [[ $MERGED_CONFIG_IS_TEMP -eq 1 && -n "${YAML_CONFIG:-}" && -f "$YAML_CONFIG" ]]; then
+        rm -f "$YAML_CONFIG"
+        echo "[spyre_run] Removed merged temp config: $YAML_CONFIG"
+    fi
 }
 trap _cleanup_wrappers EXIT
 
@@ -973,6 +1059,60 @@ for i in "${!RUN_FILES[@]}"; do
         _FILE_PYTEST_ARGS=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" "--junit-xml=${_SHARD_XML}")
     else
         _FILE_PYTEST_ARGS=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}")
+    fi
+
+    # ---------------------------------------------------------------------------
+    # -m marker pre-flight
+    #
+    # When a -m MARKEXPR is present, probe whether this specific file has any
+    # tests that match it before running.  The probe uses --collect-only which
+    # is fast as no test execution happens and runs from the file's own directory
+    # so conftest.py files are discovered correctly.
+    #
+    # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
+    # from _FILE_PYTEST_ARGS so the file's tests all run normally. 
+    # the marker filter applies to files that USE that marker
+    # family; files that don't use it are unaffected.
+    #
+    # ---------------------------------------------------------------------------
+    _HAS_M=0
+    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+        [[ "$_a" == "-m" ]] && { _HAS_M=1; break; }
+    done
+
+    if [[ $_HAS_M -eq 1 ]]; then
+        # Extract just the -m args for the probe (no --junit-xml, no -v, etc.)
+        _PROBE_ARGS=()
+        _take_next=0
+        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+            if [[ $_take_next -eq 1 ]]; then
+                _PROBE_ARGS+=("$_a")
+                _take_next=0
+                continue
+            fi
+            if [[ "$_a" == "-m" ]]; then
+                _PROBE_ARGS+=("$_a")
+                _take_next=1
+            fi
+        done
+
+        _probe_exit=0
+        (cd "$run_dir" && python3 -m pytest "$run_basename" \
+            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null)
+        _probe_exit=$?
+
+        if [[ $_probe_exit -eq 5 ]]; then
+            # 0 tests match this marker in this file — strip -m from args.
+            echo "[spyre_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
+            _ARGS_NO_M=()
+            _skip_m=0
+            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
+                if [[ $_skip_m -eq 1 ]]; then _skip_m=0; continue; fi
+                if [[ "$_a" == "-m" ]]; then _skip_m=1; continue; fi
+                _ARGS_NO_M+=("$_a")
+            done
+            _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
+        fi
     fi
 
     (

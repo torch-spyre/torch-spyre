@@ -581,9 +581,3 @@ def lower_restickify(x):
 
     pw.realize()
     return pw
-
-
-@register_spyre_lowering(torch.ops.aten.slice.Tensor, type_promotion_kind=None)
-def lower_slice(x, dim=0, start=None, end=None, step=1):
-    result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
-    return clone(result, memory_format=torch.contiguous_format)

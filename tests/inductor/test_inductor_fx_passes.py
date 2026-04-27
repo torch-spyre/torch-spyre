@@ -53,7 +53,7 @@ def _make_bmm_graph(x_shape, w_shape, dtype=torch.float16):
 
 
 def _overwrite_nodes(graph):
-    return [n for n in graph.nodes if n.target == torch.ops.spyre.overwrite.default]
+    return [n for n in graph.nodes if n.target == torch.ops.spyre.overwrite_f.default]
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
