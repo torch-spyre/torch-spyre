@@ -15,22 +15,18 @@
 from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
-from typing import Any, Callable, TypeVarTuple, Unpack, Optional
+from typing import Any, Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
 from unittest.mock import patch
 import torch
 
-from torch._inductor.scheduler import (
-    BaseSchedulerNode,
-    SchedulerNode,
-    FusedSchedulerNode,
-)
 from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
+from torch._inductor.ir import Operation
 
-from torch_spyre._inductor.scratchpad import mem_usage_by_node
-from torch_spyre._inductor.passes import CustomPostFusionPasses
+from torch_spyre._inductor.scratchpad import mem_usage_by_op
+from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
@@ -39,7 +35,7 @@ from tests.inductor.utils_inductor import cached_randn
 Ts = TypeVarTuple("Ts")
 
 
-class CustomPostFusionPassesWithOurPasses(CustomPostFusionPasses):
+class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
     """torch_spyre._inductor.patches.enable_spyre_context sets
     torch._inductor.config._post_fusion_custom_pass to
     torch_spyre._inductor.passes.CustomPostFusionPasses(), so we have to monkey patch that class
@@ -51,77 +47,88 @@ class CustomPostFusionPassesWithOurPasses(CustomPostFusionPasses):
     def initialize(cls, test_instance: "TestScratchpadUsage"):
         cls.test_instance = test_instance
 
-    def get_passes(self):
+    @override
+    def __call__(self, operations: list[Operation]) -> None:
         assert self.test_instance is not None, (
-            "CustomPostFusionPassesWithOurPasses.test_instance must be set to an instance of "
+            "CustomPreSchedulingPassesWithOurPasses.test_instance must be set to an instance of "
             "TestScratchpadUsage before get_passes is called"
         )
-        return super().get_passes() + self.test_instance.our_scheduler_post_passes
+        super().__call__(operations)
+        for f in self.test_instance.our_pre_scheduling_passes:
+            f(operations)
 
 
 class TestScratchpadUsage(unittest.TestCase):
-    our_scheduler_post_passes: list[
-        Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]
-    ] = []
+    our_pre_scheduling_passes: list[Callable[[list[Operation]], None]] = []
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
-        t_inductor_config.force_disable_caches = True
-        ts_inductor_config.sencores = 1
+        self.patchers = []
+
+        self.patchers.append(t_inductor_config.patch("force_disable_caches", True))
+        self.patchers.append(ts_inductor_config.patch("sencores", 1))
+
+        CustomPreSchedulingPassesWithOurPasses.initialize(self)
+        self.patchers.append(
+            patch.object(
+                passes,
+                "CustomPreSchedulingPasses",
+                CustomPreSchedulingPassesWithOurPasses,
+            )
+        )
+
+        for p in self.patchers:
+            p.__enter__()
+
         torch.compiler.reset()
 
-        CustomPostFusionPassesWithOurPasses.initialize(self)
-        self.patcher = patch.object(
-            passes, "CustomPostFusionPasses", CustomPostFusionPassesWithOurPasses
-        )
-        self.patcher.start()
-
     def tearDown(self):
-        self.patcher.stop()
+        for p in self.patchers:
+            p.__exit__(None, None, None)
+
+        torch.compiler.reset()
 
     def cached_randn_device(self, shape: Sequence[int], *args, **kwargs):
         result = cached_randn(shape, *args, **kwargs)
         return result.to("spyre")
 
     @contextmanager
-    def post_fusion_mapping_pass(
+    def pre_scheduling_iterating_pass(
         self,
-        f: Callable[[BaseSchedulerNode], BaseSchedulerNode],
+        f: Callable[[Operation], None],
     ):
         """Context manager to add a post fusion custom pass that processes each node independently
         using `f`."""
 
-        def new_pass(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+        def new_pass(nodes: list[Operation]) -> None:
             for node in nodes:
-                if isinstance(node, FusedSchedulerNode):
-                    new_pass(list(node.get_nodes()))
-                else:
-                    f(node)
-            return nodes
+                f(node)
+                # if isinstance(node, FusedSchedulerNode):
+                #    new_pass(list(node.get_nodes()))
+                # else:
+                #    f(node)
 
-        self.our_scheduler_post_passes.append(new_pass)
+        self.our_pre_scheduling_passes.append(new_pass)
         yield
-        self.our_scheduler_post_passes.remove(new_pass)
+        self.our_pre_scheduling_passes.remove(new_pass)
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
     ) -> tuple[torch.Tensor, list[dict[str, dict[str, Any]]]]:
         mem_usages = []
 
-        def visitor(node: BaseSchedulerNode) -> BaseSchedulerNode:
+        def visitor(node: Operation) -> None:
             nonlocal mem_usages
-            if isinstance(node, SchedulerNode):
-                mem_usage = mem_usage_by_node(node)
-                for buffer_name, usage in mem_usage.items():
-                    buffer = V.graph.get_buffer(buffer_name)
-                    layout = buffer.get_layout()
-                    allocation = getattr(layout, "allocation", {})
-                    usage["location"] = "LX" if "lx" in allocation else "HBM"
+            mem_usage = mem_usage_by_op(node)
+            for buffer_name, usage in mem_usage.items():
+                buffer = V.graph.get_buffer(buffer_name)
+                layout = buffer.get_layout()
+                allocation = getattr(layout, "allocation", {})
+                usage["location"] = "LX" if "lx" in allocation else "HBM"
 
-                mem_usages.append(mem_usage)
-            return node
+            mem_usages.append(mem_usage)
 
-        with self.post_fusion_mapping_pass(visitor):
+        with self.pre_scheduling_iterating_pass(visitor):
             compiled_kernel = torch.compile(f, fullgraph=True)
             result = compiled_kernel(*args).to("cpu")
 
@@ -131,6 +138,7 @@ class TestScratchpadUsage(unittest.TestCase):
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
+        **kwargs,
     ):
         """Run the current class's test procedure on the given model and arguments. Override this
         in each subclass."""
@@ -148,26 +156,28 @@ class TestScratchpadUsage(unittest.TestCase):
             "Expected at least one buffer to be allocated in LX, but none were",
         )
 
+        atol = kwargs.get("atol", 1e-4)
         self.assertTrue(
-            torch.allclose(cpu_result, device_result, atol=1e-3), "Results do not match"
+            torch.allclose(cpu_result, device_result, atol=atol), "Results do not match"
         )
 
     def common(
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
+        **kwargs,
     ):
         """This method runs some sanity checks common to all subclasses and then calls
         `run_test`."""
         for t in args:
             self.assertIsInstance(t, torch.Tensor)
             self.assertEqual(t.device.type, "spyre")
-        return self.run_test(model, args)
+        return self.run_test(model, args, **kwargs)
 
     def test_softmax(self):
         f = functools.partial(torch.softmax, dim=0)
         x = self.cached_randn_device((512, 1024))
-        self.common(f, (x,))
+        self.common(f, (x,), atol=1e-3)
 
 
 class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
@@ -186,10 +196,12 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         )
         return (result, hbm_transfers)
 
+    @override
     def run_test(
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
+        **kwargs,
     ):
         """Test that estimates the total amount of HBM transfers with LX planning turned off and
         turned on, and then compares them."""
