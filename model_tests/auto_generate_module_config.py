@@ -1031,12 +1031,6 @@ def generate_unified_yaml_config(
     yaml_str += "          atol: 0.001\n"
     yaml_str += "          rtol: 0.001\n"
 
-    # Set supported_modules to empty list to filter out ALL built-in PyTorch modules.
-    # The _OOTModuleListPatcher logic (line 348) keeps modules if they're in
-    # supported_modules OR included_modules. With supported_modules=[], only
-    # modules from edits.modules.include will be tested.
-    yaml_str += "\n    supported_modules: []\n"
-
     return yaml_str
 
 

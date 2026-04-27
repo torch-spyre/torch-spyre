@@ -338,5 +338,3 @@ test_suite_config:
         precision:
           atol: 0.001
           rtol: 0.001
-
-    supported_modules: []
