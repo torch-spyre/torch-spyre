@@ -179,7 +179,17 @@ def register_fallback(ops, device="cpu"):
             return out
 
         # Otherwise, return result moved to the target Spyre device
-        return fallback_result.to(spyre_device)
+        # Handle both single tensor and tuple/list of tensors
+        def _move_to_spyre(result):
+            if isinstance(result, (tuple, list)):
+                # Handle tuple/list of tensors (e.g., torch.max returns (values, indices))
+                moved = [_move_to_spyre(item) for item in result]
+                # Preserve the original type (tuple or list)
+                return type(result)(moved)
+
+            return result.to(spyre_device)
+
+        return _move_to_spyre(fallback_result)
 
     def _decorator(fn):
         for op in ops:
@@ -282,3 +292,27 @@ def spyre__bitwise_xor(input1, input2, **kwargs):
 @register_fallback([aten.bitwise_or.Tensor, aten.bitwise_or.Tensor_out])
 def spyre__bitwise_or(input1, input2, **kwargs):
     return torch.bitwise_or(input1, input2, **kwargs)
+
+
+@register_fallback([aten.argmax.default])
+def spyre__argmax(*args, **kwargs):
+    return torch.argmax(*args, **kwargs)
+
+
+@register_fallback(["spyre::max_dim_int64_fallback"])
+def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
+    """
+    CPU fallback for torch.max(input, dim) when input is int64.
+    """
+    return torch.max(input, dim=dim, keepdim=keepdim, **kwargs)
+
+
+@register_fallback(["spyre::max_default_int64_fallback"])
+def spyre__max_default_int64_fallback(input, **kwargs):
+    """
+    CPU fallback for torch.max(input) when input is int64.
+
+    Returns a scalar (0D) tensor containing the maximum value.
+    This avoids recursive decomposition by directly calling torch.max on CPU.
+    """
+    return torch.max(input, **kwargs)

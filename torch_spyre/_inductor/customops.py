@@ -300,3 +300,62 @@ def restickify(  # type: ignore[empty-body]
     x: torch.Tensor,
 ) -> torch.Tensor:
     pass
+
+
+@torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
+def max_dim_int64_fallback(
+    input: torch.Tensor, dim: int, keepdim: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    CPU fallback for torch.max(input, dim) when input is int64.
+    This custom op will be registered with a CPU fallback in fallbacks.py.
+    Returns a tuple (values, indices) as expected by torch.max.
+    """
+    # This should never be called directly; the fallback in fallbacks.py handles it
+    raise RuntimeError(
+        "spyre::max_dim_int64_fallback should be handled by CPU fallback registration"
+    )
+
+
+@max_dim_int64_fallback.register_fake
+def _(input: torch.Tensor, dim: int, keepdim: bool = False):
+    """
+    Fake implementation for shape inference.
+    Returns the expected output shapes for torch.max(input, dim, keepdim).
+    """
+    # Compute output shape based on dim and keepdim
+    if keepdim:
+        output_shape = list(input.size())
+        output_shape[dim] = 1
+    else:
+        output_shape = list(input.size())
+        output_shape.pop(dim)
+
+    # Return tuple of (values, indices) with the computed shape
+    values = input.new_empty(output_shape)
+    indices = torch.empty(output_shape, dtype=torch.int64, device=input.device)
+    return (values, indices)
+
+
+## TODO (imaihal): This needs scalar tensor support from Spyre to CPU. issues #1172
+#
+# @torch.library.custom_op("spyre::max_default_int64_fallback", mutates_args=())
+# def max_default_int64_fallback(input: torch.Tensor) -> torch.Tensor:
+#    """
+#    CPU fallback for torch.max(input) when input is int64.
+#    This custom op will be registered with a CPU fallback in fallbacks.py.
+#    Returns a 1D tensor with shape [1] containing the maximum value.
+#    """
+#    # This should never be called directly; the fallback in fallbacks.py handles it
+#    raise RuntimeError(
+#        "spyre::max_default_int64_fallback should be handled by CPU fallback registration"
+#    )
+#
+#
+# @max_default_int64_fallback.register_fake
+# def _(input: torch.Tensor):
+#    """
+#    Fake implementation for shape inference.
+#    Returns a scalar (0D) tensor matching the input dtype.
+#    """
+#    return input.new_empty([])
