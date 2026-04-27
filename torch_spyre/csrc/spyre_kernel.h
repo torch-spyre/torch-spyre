@@ -44,21 +44,6 @@ struct KernelArtifacts {
 
 std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k);
 
-struct PagiJsonConfig {
-  std::string dsName;
-  bool isMarker;
-  uint64_t defaultAddr;
-
-  std::vector<uint64_t> addrMap;
-  std::vector<std::string> addrMapTag;
-  std::vector<std::string> inputSym;
-  std::vector<std::string> addrIdxSym;
-
-  std::unordered_map<std::string, std::string> variableDefs;
-};
-
-PagiJsonConfig readPagiJson(const std::string& path);
-
 /**
  * @brief Read hex-encoded init.txt file (production-tested approach)
  *

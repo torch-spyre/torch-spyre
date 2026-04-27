@@ -47,30 +47,6 @@ std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k) {
   return os;
 }
 
-PagiJsonConfig readPagiJson(const std::string& path) {
-  std::ifstream file(path);
-  if (!file.is_open()) {
-    throw std::runtime_error("Failed to open JSON file");
-  }
-
-  json j;
-  file >> j;
-
-  PagiJsonConfig cfg;
-  cfg.dsName = j.at("dsName_").get<std::string>();
-  cfg.isMarker = j.at("isMarker_").get<bool>();
-  cfg.defaultAddr = std::stoull(j.at("defaultAddr_").get<std::string>());
-
-  cfg.addrMap = j.at("addrMap_").get<std::vector<uint64_t>>();
-  cfg.addrMapTag = j.at("addrMapTag_").get<std::vector<std::string>>();
-  cfg.inputSym = j.at("inputSym_").get<std::vector<std::string>>();
-  cfg.addrIdxSym = j.at("addrIdxSym_").get<std::vector<std::string>>();
-
-  cfg.variableDefs =
-      j.at("variableDefs_").get<std::unordered_map<std::string, std::string>>();
-  return cfg;
-}
-
 std::vector<uint8_t> readHexEncodedFile(const std::string& filepath) {
   // Slurp entire file into memory in one I/O call
   std::ifstream inpFile(filepath, std::ios::in | std::ios::binary);
