@@ -72,37 +72,61 @@ PagiJsonConfig readPagiJson(const std::string& path) {
 }
 
 std::vector<uint8_t> readHexEncodedFile(const std::string& filepath) {
-  std::ifstream inpFile(filepath);
+  // Slurp entire file into memory in one I/O call
+  std::ifstream inpFile(filepath, std::ios::in | std::ios::binary);
   if (!inpFile.is_open()) {
     throw std::runtime_error("Failed to open file: " + filepath);
   }
+  std::vector<char> buf;
+  inpFile.seekg(0, std::ios::end);
+  buf.resize(static_cast<size_t>(inpFile.tellg()));
+  inpFile.seekg(0, std::ios::beg);
+  inpFile.read(buf.data(), static_cast<std::streamsize>(buf.size()));
 
-  auto c2u = [](int8_t c) -> int {
-    return (c >= 'A') ? (c >= 'a') ? (c - 'a' + 10) : (c - 'A' + 10)
-                      : (c - '0');
+  auto c2u = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
   };
 
   std::vector<uint8_t> binary_data;
-  std::string line;
+  binary_data.reserve(buf.size() / 257 * 128);
 
-  while (std::getline(inpFile, line)) {
-    // Skip empty lines and comments
-    if (line.empty() || line[0] == '#') {
+  const char* p = buf.data();
+  const char* end = p + buf.size();
+
+  while (p < end) {
+    // Skip newlines
+    if (*p == '\n' || *p == '\r') {
+      p++;
       continue;
     }
-    if (line.length() != 256) {
+    // Skip comment lines
+    if (*p == '#') {
+      while (p < end && *p != '\n') p++;
+      continue;
+    }
+
+    // We're at the start of a hex line — it must be exactly 256 chars
+    const char* line_start = p;
+    const char* line_end = p;
+    while (line_end < end && *line_end != '\n' && *line_end != '\r') {
+      line_end++;
+    }
+    if (line_end - line_start != 256) {
       throw std::runtime_error(
           "In readHexEncodedFile, line is not 256 chars in " + filepath);
     }
 
-    // Read hex in reverse order (right-to-left), matching senlib's
-    // parse_flit(). The hardware expects this byte ordering — reading
-    // left-to-right (big-endian) produces an invalid program image causing QGI
-    // errors (prep_zero_flit_cnt).
-    for (auto rit = line.rbegin(); rit != line.rend();) {
+    auto rit = std::make_reverse_iterator(line_end);
+    auto rend = std::make_reverse_iterator(line_start);
+    while (rit != rend) {
       uint8_t byte = static_cast<uint8_t>(c2u(*rit++) + (c2u(*rit++) << 4));
       binary_data.push_back(byte);
     }
+
+    p = line_end;
   }
 
   if (binary_data.empty()) {
@@ -140,14 +164,12 @@ std::unordered_map<std::string, std::unique_ptr<std::mutex>> g_key_mtxs;
 
 KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
                                     const SpyreStream& stream) {
-  // Fast path: check cache under lock
   {
     std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
     auto it = g_artifact_cache.find(g2_path);
     if (it != g_artifact_cache.end()) {
       return it->second;
     }
-    // Ensure per-key mutex exists (also under lock)
     auto& key_mtx = g_key_mtxs[g2_path];
     if (!key_mtx) {
       key_mtx = std::make_unique<std::mutex>();
@@ -171,10 +193,8 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
     }
   }
 
-  // Slow path: load artifacts — only one thread per key reaches here
   KernelArtifacts arts;
 
-  // Detect Format B: check for bundle.mlir
   fs::path g2_dir = fs::path(g2_path).parent_path();
   std::string bundle_path = (g2_dir / "bundle.mlir").string();
   // Store bundle.mlir path for future JIT compilation
@@ -184,7 +204,7 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
 
   // Read init.bin (hex-encoded program binary)
   std::string init_path = get_init_path(g2_path) + "/init.txt";
-  arts.init_bin = readHexEncodedFile(init_path);  // Helper to decode hex
+  arts.init_bin = readHexEncodedFile(init_path);
 
   arts.program_size = arts.init_bin.size();
   auto& allocator = SpyreAllocator::instance();
@@ -197,7 +217,6 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
   TORCH_CHECK(std::filesystem::exists(arts.sdsc_json_path),
               "SuperDSC not found: ", arts.sdsc_json_path);
 
-  // Cache and return
   std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
   auto [it, inserted] = g_artifact_cache.emplace(g2_path, std::move(arts));
   if (inserted) {
