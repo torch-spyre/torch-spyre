@@ -599,7 +599,7 @@ def decompose_cat(
         output = tensors[0].new_empty(output_size)
         offset = 0
         for input in tensors:
-            output = torch.ops.spyre.overwrite(
+            output = torch.ops.spyre.overwrite_f(
                 input=input, output=output, dims=[dim], offsets=[offset]
             )
             offset += input.size(dim)
@@ -659,9 +659,10 @@ def pad_decomp(
         return input
 
     output = scalar.expand(output_size).clone()
-    return torch.ops.spyre.overwrite(
+    output = torch.ops.spyre.overwrite_f(
         input=input, output=output, dims=dims, offsets=offsets
     )
+    return output
 
 
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
