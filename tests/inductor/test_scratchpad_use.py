@@ -30,7 +30,6 @@ from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
-from tests.inductor.utils_inductor import cached_randn
 
 Ts = TypeVarTuple("Ts")
 
@@ -88,9 +87,9 @@ class TestScratchpadUsage(unittest.TestCase):
 
         torch.compiler.reset()
 
-    def cached_randn_device(self, shape: Sequence[int], *args, **kwargs):
-        result = cached_randn(shape, *args, **kwargs)
-        return result.to("spyre")
+    def rand_device(self, shape: Sequence[int]):
+        result = torch.rand(shape, dtype=torch.float16, device="spyre")
+        return result
 
     @contextmanager
     def pre_scheduling_iterating_pass(
@@ -176,8 +175,8 @@ class TestScratchpadUsage(unittest.TestCase):
 
     def test_softmax(self):
         f = functools.partial(torch.softmax, dim=0)
-        x = self.cached_randn_device((512, 1024))
-        self.common(f, (x,), atol=1e-3)
+        x = self.rand_device((512, 1024))
+        self.common(f, (x,))
 
 
 class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
