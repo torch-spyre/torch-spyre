@@ -712,7 +712,7 @@ def generate_unified_yaml_config(
     yaml_str += "            - '*TestModule*::test_forward'\n"
     yaml_str += "          mode: mandatory_success\n"
     yaml_str += "          tags:\n"
-    yaml_str += f"            - {model_name}\n"
+    yaml_str += f"            - model__{model_name}\n"
     yaml_str += "          seed: 123\n"
     yaml_str += "          edits:\n"
     yaml_str += "            modules:\n"
@@ -873,7 +873,7 @@ def generate_unified_yaml_config(
     yaml_str += "            - '*TestModuleCustom*::test_stride'\n"
     yaml_str += "          mode: mandatory_success\n"
     yaml_str += "          tags:\n"
-    yaml_str += f"            - {model_name}\n"
+    yaml_str += f"            - model__{model_name}\n"
     yaml_str += "            - custom_tests\n"
     yaml_str += "          seed: 123\n"
     yaml_str += "          edits:\n"
@@ -1147,7 +1147,7 @@ def main():
         output_path = args.output
     else:
         # Use tests/configs directory for unified format
-        output_path = f"../tests/configs/{model_name_normalized}_spyre.yaml"
+        output_path = f"./tests/configs/{model_name_normalized}_spyre.yaml"
 
     # Write unified YAML file
     output_file = Path(output_path)

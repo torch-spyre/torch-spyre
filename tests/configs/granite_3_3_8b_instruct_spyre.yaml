@@ -11,7 +11,7 @@ test_suite_config:
             - '*TestModule*::test_forward'
           mode: mandatory_success
           tags:
-            - granite_3_3_8b_instruct
+            - model__granite_3_3_8b_instruct
           seed: 123
           edits:
             modules:
@@ -175,7 +175,7 @@ test_suite_config:
             - '*TestModuleCustom*::test_stride'
           mode: mandatory_success
           tags:
-            - granite_3_3_8b_instruct
+            - model__granite_3_3_8b_instruct
             - custom_tests
           seed: 123
           edits:
