@@ -165,6 +165,169 @@ test_suite_config:
                           init: randn
                     kwargs: {}
 
+    # Custom tests for eager/compile, layout, and stride validation
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_modules_custom.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - '*TestModuleCustom*::test_eager_vs_compile'
+            - '*TestModuleCustom*::test_layout'
+            - '*TestModuleCustom*::test_stride'
+          mode: mandatory_success
+          tags:
+            - granite_3_3_8b_instruct
+            - custom_tests
+          seed: 123
+          edits:
+            modules:
+              include:
+               - name: GraniteRotaryEmbedding
+                 module_path: transformers.models.granite.modeling_granite.GraniteRotaryEmbedding
+                 description: 'Module: transformers.models.granite.modeling_granite.GraniteRotaryEmbedding'
+                 constructor_inputs:
+                   args:
+                     - value: <config:transformers.models.granite.configuration_granite.GraniteConfig>
+                   kwargs: {}
+                 forward_inputs:
+                   args:
+                     - tensor:
+                         shape: [1, 128, 4096]
+                         storage_offset: 0
+                         dtype: torch.float16
+                         device: spyre
+                         init: randn
+                   kwargs:
+                     position_ids:
+                       tensor:
+                         shape: [1, 128]
+                         dtype: torch.int64
+                         device: spyre
+                         init: randint
+                         init_args:
+                           high: 10000
+
+               - name: GraniteDecoderLayer
+                 module_path: transformers.models.granite.modeling_granite.GraniteDecoderLayer
+                 description: 'Module: transformers.models.granite.modeling_granite.GraniteDecoderLayer'
+                 constructor_inputs:
+                   args:
+                     - value: <config:transformers.models.granite.configuration_granite.GraniteConfig>
+                   kwargs:
+                     layer_idx: 0
+                 forward_inputs:
+                   args:
+                     - tensor:
+                         shape: [1, 128, 4096]
+                         storage_offset: 0
+                         dtype: torch.float16
+                         device: spyre
+                         init: randn
+                   kwargs:
+                     position_ids:
+                       tensor:
+                         shape: [1, 128]
+                         dtype: torch.int64
+                         device: spyre
+                         init: randint
+                         init_args:
+                           high: 10000
+                     position_embeddings:
+                       tensor_list:
+                         - shape: [1, 128, 128]
+                           dtype: torch.float16
+                           device: spyre
+                           init: zeros
+                         - shape: [1, 128, 128]
+                           dtype: torch.float16
+                           device: spyre
+                           init: zeros
+
+               - name: GraniteRMSNorm
+                 module_path: transformers.models.granite.modeling_granite.GraniteRMSNorm
+                 description: 'Module: transformers.models.granite.modeling_granite.GraniteRMSNorm'
+                 constructor_inputs:
+                   args:
+                     - value: 4096
+                   kwargs: {}
+                 forward_inputs:
+                   args:
+                     - tensor:
+                         shape: [1, 128, 4096]
+                         storage_offset: 0
+                         dtype: torch.float16
+                         device: spyre
+                         init: randn
+                   kwargs: {}
+
+               - name: GraniteAttention
+                 module_path: transformers.models.granite.modeling_granite.GraniteAttention
+                 description: 'Module: transformers.models.granite.modeling_granite.GraniteAttention'
+                 constructor_inputs:
+                   args:
+                     - value: <config:transformers.models.granite.configuration_granite.GraniteConfig>
+                   kwargs:
+                     layer_idx: 0
+                 forward_inputs:
+                   args: []
+                   kwargs:
+                     hidden_states:
+                       tensor:
+                         shape: [1, 128, 4096]
+                         dtype: torch.float16
+                         device: spyre
+                         init: randn
+                     position_ids:
+                       tensor:
+                         shape: [1, 128]
+                         dtype: torch.int64
+                         device: spyre
+                         init: randint
+                         init_args:
+                           high: 10000
+                     position_embeddings:
+                       tensor_list:
+                         - shape: [1, 128, 128]
+                           dtype: torch.float16
+                           device: spyre
+                           init: zeros
+                         - shape: [1, 128, 128]
+                           dtype: torch.float16
+                           device: spyre
+                           init: zeros
+
+               - name: GraniteMLP
+                 module_path: transformers.models.granite.modeling_granite.GraniteMLP
+                 description: 'Module: transformers.models.granite.modeling_granite.GraniteMLP'
+                 constructor_inputs:
+                   args:
+                     - value: <config:transformers.models.granite.configuration_granite.GraniteConfig>
+                   kwargs: {}
+                 forward_inputs:
+                   args:
+                     - tensor:
+                         shape: [1, 128, 4096]
+                         storage_offset: 0
+                         dtype: torch.float16
+                         device: spyre
+                         init: randn
+                   kwargs: {}
+
+               - name: SiLUActivation
+                 module_path: transformers.activations.SiLUActivation
+                 description: 'Module: transformers.activations.SiLUActivation'
+                 constructor_inputs:
+                   args: []
+                   kwargs: {}
+                 forward_inputs:
+                   args:
+                     - tensor:
+                         shape: [1, 128, 12800]
+                         storage_offset: 0
+                         dtype: torch.float16
+                         device: spyre
+                         init: randn
+                   kwargs: {}
+
   global:
     supported_dtypes:
       - name: float16

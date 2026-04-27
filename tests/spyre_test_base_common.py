@@ -51,7 +51,7 @@ from spyre_test_config_models import (
     SupportedModuleConfig,
     TestEntry,
 )
-from spyre_test_utilities import (
+from spyre_test_common_methods_invocations import (
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )

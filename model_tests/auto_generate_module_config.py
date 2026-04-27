@@ -862,6 +862,129 @@ def generate_unified_yaml_config(
 
         yaml_str += "\n"
 
+    # Add custom tests section for eager/compile, layout, and stride validation
+    yaml_str += "    # Custom tests for eager/compile, layout, and stride validation\n"
+    yaml_str += "    - path: ${TORCH_DEVICE_ROOT}/tests/test_modules_custom.py\n"
+    yaml_str += "      unlisted_test_mode: skip\n"
+    yaml_str += "      tests:\n"
+    yaml_str += "        - names:\n"
+    yaml_str += "            - '*TestModuleCustom*::test_eager_vs_compile'\n"
+    yaml_str += "            - '*TestModuleCustom*::test_layout'\n"
+    yaml_str += "            - '*TestModuleCustom*::test_stride'\n"
+    yaml_str += "          mode: mandatory_success\n"
+    yaml_str += "          tags:\n"
+    yaml_str += f"            - {model_name}\n"
+    yaml_str += "            - custom_tests\n"
+    yaml_str += "          seed: 123\n"
+    yaml_str += "          edits:\n"
+    yaml_str += "            modules:\n"
+    yaml_str += "              include:\n"
+    
+    # Add all modules again for custom tests (without complexity tags)
+    for entry in all_module_entries:
+        yaml_str += f"               - name: {entry['name']}\n"
+        yaml_str += f"                 module_path: {entry['module_path']}\n"
+        yaml_str += f"                 description: 'Module: {entry['module_path']}'\n"
+        
+        # Constructor inputs
+        yaml_str += "                 constructor_inputs:\n"
+        if entry["constructor_inputs"]["args"]:
+            yaml_str += "                   args:\n"
+            for arg in entry["constructor_inputs"]["args"]:
+                if "tensor" in arg:
+                    yaml_str += "                     - tensor:\n"
+                    tensor = arg["tensor"]
+                    yaml_str += f"                         shape: {tensor['shape']}\n"
+                    if tensor.get("stride"):
+                        yaml_str += f"                         stride: {tensor['stride']}\n"
+                    yaml_str += f"                         storage_offset: {tensor['storage_offset']}\n"
+                    yaml_str += f"                         dtype: {tensor['dtype']}\n"
+                    yaml_str += f"                         device: {tensor['device']}\n"
+                    yaml_str += f"                         init: {tensor['init']}\n"
+                    if tensor.get("init_args"):
+                        yaml_str += "                         init_args:\n"
+                        for k, v in tensor["init_args"].items():
+                            yaml_str += f"                           {k}: {v}\n"
+                elif "tensor_list" in arg:
+                    yaml_str += "                     - tensor_list:\n"
+                    for tensor in arg["tensor_list"]:
+                        yaml_str += f"                         - shape: {tensor['shape']}\n"
+                        yaml_str += f"                           dtype: {tensor['dtype']}\n"
+                        yaml_str += f"                           device: {tensor['device']}\n"
+                        yaml_str += f"                           init: {tensor['init']}\n"
+                elif "value" in arg:
+                    yaml_str += f"                     - value: {arg['value']}\n"
+        else:
+            yaml_str += "                   args: []\n"
+        
+        if entry["constructor_inputs"]["kwargs"]:
+            yaml_str += "                   kwargs:\n"
+            for key, value in entry["constructor_inputs"]["kwargs"].items():
+                yaml_str += f"                     {key}: {value}\n"
+        else:
+            yaml_str += "                   kwargs: {}\n"
+        
+        # Forward inputs
+        yaml_str += "                 forward_inputs:\n"
+        if entry["forward_inputs"]["args"]:
+            yaml_str += "                   args:\n"
+            for arg in entry["forward_inputs"]["args"]:
+                if "tensor" in arg:
+                    yaml_str += "                     - tensor:\n"
+                    tensor = arg["tensor"]
+                    yaml_str += f"                         shape: {tensor['shape']}\n"
+                    if tensor.get("stride"):
+                        yaml_str += f"                         stride: {tensor['stride']}\n"
+                    yaml_str += f"                         storage_offset: {tensor['storage_offset']}\n"
+                    yaml_str += f"                         dtype: {tensor['dtype']}\n"
+                    yaml_str += f"                         device: {tensor['device']}\n"
+                    yaml_str += f"                         init: {tensor['init']}\n"
+                    if tensor.get("init_args"):
+                        yaml_str += "                         init_args:\n"
+                        for k, v in tensor["init_args"].items():
+                            yaml_str += f"                           {k}: {v}\n"
+                elif "tensor_list" in arg:
+                    yaml_str += "                     - tensor_list:\n"
+                    for tensor in arg["tensor_list"]:
+                        yaml_str += f"                         - shape: {tensor['shape']}\n"
+                        yaml_str += f"                           dtype: {tensor['dtype']}\n"
+                        yaml_str += f"                           device: {tensor['device']}\n"
+                        yaml_str += f"                           init: {tensor['init']}\n"
+                elif "value" in arg:
+                    yaml_str += f"                     - value: {arg['value']}\n"
+        else:
+            yaml_str += "                   args: []\n"
+        
+        if entry["forward_inputs"]["kwargs"]:
+            yaml_str += "                   kwargs:\n"
+            for key, value in entry["forward_inputs"]["kwargs"].items():
+                if isinstance(value, dict) and "tensor" in value:
+                    yaml_str += f"                     {key}:\n"
+                    yaml_str += "                       tensor:\n"
+                    tensor = value["tensor"]
+                    yaml_str += f"                         shape: {tensor['shape']}\n"
+                    yaml_str += f"                         dtype: {tensor['dtype']}\n"
+                    yaml_str += f"                         device: {tensor['device']}\n"
+                    yaml_str += f"                         init: {tensor['init']}\n"
+                    if tensor.get("init_args"):
+                        yaml_str += "                         init_args:\n"
+                        for k, v in tensor["init_args"].items():
+                            yaml_str += f"                           {k}: {v}\n"
+                elif isinstance(value, dict) and "tensor_list" in value:
+                    yaml_str += f"                     {key}:\n"
+                    yaml_str += "                       tensor_list:\n"
+                    for tensor in value["tensor_list"]:
+                        yaml_str += f"                         - shape: {tensor['shape']}\n"
+                        yaml_str += f"                           dtype: {tensor['dtype']}\n"
+                        yaml_str += f"                           device: {tensor['device']}\n"
+                        yaml_str += f"                           init: {tensor['init']}\n"
+                else:
+                    yaml_str += f"                     {key}: {value}\n"
+        else:
+            yaml_str += "                   kwargs: {}\n"
+        
+        yaml_str += "\n"
+
     # Global configuration
     yaml_str += "  global:\n"
     yaml_str += "    supported_dtypes:\n"
