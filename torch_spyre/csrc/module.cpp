@@ -109,15 +109,6 @@ void freeRuntime() {
   GlobalRuntime::reset();
 }
 
-void launchKernel(const std::string& g2_path,
-                  const std::vector<at::Tensor>& args) {
-  auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
-
-  auto& arts = getOrLoadArtifacts(g2_path, stream);
-
-  stream.executeProgramAsync(arts, args);
-}
-
 uint32_t encodeConstant(float torch_const, DataFormats df) {
   uint32_t sen_const;
 

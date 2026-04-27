@@ -206,4 +206,13 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
   return it->second;
 }
 
+void launchKernel(const std::string& g2_path,
+                  const std::vector<at::Tensor>& args) {
+  auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+  auto& arts = getOrLoadArtifacts(g2_path, stream);
+
+  stream.executeProgramAsync(arts, args);
+}
+
 }  // namespace spyre

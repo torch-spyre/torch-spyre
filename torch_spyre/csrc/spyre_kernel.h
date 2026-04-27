@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <ATen/core/Tensor.h>
 #include <c10/core/Allocator.h>
 
 #include <cstdint>
@@ -72,5 +73,7 @@ std::string get_pagi_path(const std::string& g2_path);
 
 KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
                                     const SpyreStream& stream);
+void launchKernel(const std::string& g2_path,
+                  const std::vector<at::Tensor>& args);
 
 }  // namespace spyre
