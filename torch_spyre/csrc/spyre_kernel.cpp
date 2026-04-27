@@ -75,6 +75,11 @@ std::vector<uint8_t> readHexEncodedFile(const std::string& filepath) {
     throw std::runtime_error("Failed to open file: " + filepath);
   }
 
+  auto c2u = [](int8_t c) -> int {
+    return (c >= 'A') ? (c >= 'a') ? (c - 'a' + 10) : (c - 'A' + 10)
+                      : (c - '0');
+  };
+
   std::vector<uint8_t> binary_data;
   std::string line;
 
@@ -83,24 +88,18 @@ std::vector<uint8_t> readHexEncodedFile(const std::string& filepath) {
     if (line.empty() || line[0] == '#') {
       continue;
     }
+    if (line.length() != 256) {
+      throw std::runtime_error(
+          "In readHexEncodedFile, line is not 256 chars in " + filepath);
+    }
 
-    for (size_t pos = 0; pos + 8 <= line.length(); pos += 8) {
-      std::string hex_chunk = line.substr(pos, 8);
-
-      std::istringstream strm(hex_chunk);
-      uint32_t value;
-      strm >> std::hex >> value;
-
-      if (strm.fail()) {
-        throw std::runtime_error("Invalid hex at position " +
-                                 std::to_string(pos) + " in " + filepath);
-      }
-
-      // Convert uint32_t to bytes (big-endian as in init.txt)
-      binary_data.push_back((value >> 24) & 0xFF);
-      binary_data.push_back((value >> 16) & 0xFF);
-      binary_data.push_back((value >> 8) & 0xFF);
-      binary_data.push_back(value & 0xFF);
+    // Read hex in reverse order (right-to-left), matching senlib's
+    // parse_flit(). The hardware expects this byte ordering — reading
+    // left-to-right (big-endian) produces an invalid program image causing QGI
+    // errors (prep_zero_flit_cnt).
+    for (auto rit = line.rbegin(); rit != line.rend();) {
+      uint8_t byte = static_cast<uint8_t>(c2u(*rit++) + (c2u(*rit++) << 4));
+      binary_data.push_back(byte);
     }
   }
 
@@ -146,7 +145,8 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
   KernelArtifacts arts;
 
   // Detect Format B: check for bundle.mlir
-  std::string bundle_path = g2_path + "/bundle.mlir";
+  fs::path g2_dir = fs::path(g2_path).parent_path();
+  std::string bundle_path = (g2_dir / "bundle.mlir").string();
   // Store bundle.mlir path for future JIT compilation
   arts.bundle_mlir_path = bundle_path;
   TORCH_CHECK(std::filesystem::exists(bundle_path),
@@ -156,20 +156,20 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
   std::string init_path = get_init_path(g2_path) + "/init.txt";
   arts.init_bin = readHexEncodedFile(init_path);  // Helper to decode hex
 
-  size_t program_size = arts.init_bin.size();
+  arts.program_size = arts.init_bin.size();
   auto& allocator = SpyreAllocator::instance();
-  arts.device_alloc = std::move(allocator.allocate(program_size));
+  arts.device_alloc = std::move(allocator.allocate(arts.program_size));
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
   stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
   stream.synchronize();
 
-  arts.sdsc_json_path = g2_path + "/sdsc_0.json";
+  arts.sdsc_json_path = (g2_dir / "sdsc_0.json").string();
   TORCH_CHECK(std::filesystem::exists(arts.sdsc_json_path),
               "SuperDSC not found: ", arts.sdsc_json_path);
 
   // Cache and return
   g_artifact_cache[g2_path] = std::move(arts);
-  std::cout << arts << std::endl;
+  std::cout << g_artifact_cache[g2_path] << std::endl;
   return g_artifact_cache[g2_path];
 }
 
