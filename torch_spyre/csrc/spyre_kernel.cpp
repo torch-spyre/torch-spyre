@@ -21,6 +21,8 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -133,15 +135,43 @@ std::string get_pagi_path(const std::string& g2_path) {
 
 // Cache: g2_path -> artifacts (loaded once)
 std::unordered_map<std::string, KernelArtifacts> g_artifact_cache;
+std::mutex g_artifact_cache_mtx;  // protects g_artifact_cache and g_key_mtxs
+std::unordered_map<std::string, std::unique_ptr<std::mutex>> g_key_mtxs;
 
 KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
                                     const SpyreStream& stream) {
-  // Check cache first
-  auto it = g_artifact_cache.find(g2_path);
-  if (it != g_artifact_cache.end()) {
-    return it->second;
+  // Fast path: check cache under lock
+  {
+    std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+    auto it = g_artifact_cache.find(g2_path);
+    if (it != g_artifact_cache.end()) {
+      return it->second;
+    }
+    // Ensure per-key mutex exists (also under lock)
+    auto& key_mtx = g_key_mtxs[g2_path];
+    if (!key_mtx) {
+      key_mtx = std::make_unique<std::mutex>();
+    }
   }
 
+  // Per-key lock: only one thread loads a given key
+  std::mutex* key_mtx = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+    key_mtx = g_key_mtxs[g2_path].get();
+  }
+  std::lock_guard<std::mutex> key_lock(*key_mtx);
+
+  // Double-check after acquiring per-key lock
+  {
+    std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+    auto it = g_artifact_cache.find(g2_path);
+    if (it != g_artifact_cache.end()) {
+      return it->second;
+    }
+  }
+
+  // Slow path: load artifacts — only one thread per key reaches here
   KernelArtifacts arts;
 
   // Detect Format B: check for bundle.mlir
@@ -168,9 +198,12 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
               "SuperDSC not found: ", arts.sdsc_json_path);
 
   // Cache and return
-  g_artifact_cache[g2_path] = std::move(arts);
-  std::cout << g_artifact_cache[g2_path] << std::endl;
-  return g_artifact_cache[g2_path];
+  std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+  auto [it, inserted] = g_artifact_cache.emplace(g2_path, std::move(arts));
+  if (inserted) {
+    DEBUGINFO(it->second);
+  }
+  return it->second;
 }
 
 }  // namespace spyre
