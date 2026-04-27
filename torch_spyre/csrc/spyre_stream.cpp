@@ -219,7 +219,6 @@ void SpyreStream::executeProgramAsync(const KernelArtifacts& arts,
   for (size_t i = 0; i < args.size(); ++i) {
     auto* ctx = static_cast<SharedOwnerCtx*>(
         args[i].storage().data_ptr().get_context());
-    // tensor_allocs.push_back(ctx->owner); //until we DeviceMemoryAllocationPtr
     tensor_allocs.push_back(&ctx->composite_addr);
   }
 
