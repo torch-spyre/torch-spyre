@@ -196,10 +196,12 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
   // Create and launch operation
   if (host2device) {
-    auto op = flex::RuntimeOperationH2D::create(cpu_ptr, *device_address, dci_ptr);
+    auto op =
+        flex::RuntimeOperationH2D::create(cpu_ptr, *device_address, dci_ptr);
     flex_stream->launchOperation(*op);
   } else {
-    auto op = flex::RuntimeOperationD2H::create(*device_address, cpu_ptr, dci_ptr);
+    auto op =
+        flex::RuntimeOperationD2H::create(*device_address, cpu_ptr, dci_ptr);
     flex_stream->launchOperation(*op);
   }
 }
