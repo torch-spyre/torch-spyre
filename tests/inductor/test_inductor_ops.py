@@ -343,10 +343,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        # TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
+        # Spyre represents scalars as 1D tensors [1], while CPU uses 0D tensors.
+        # This inconsistency causes shape mismatches when moving tensors from Spyre to CPU.
+        # See: https://github.com/torch-spyre/torch-spyre/issues/1172
+        # ("test_max_default", "test_reduce_cpu"): {
+        #        "ops_dict": {
+        #            "max": torch.max,
+        #        },
+        #        "param_sets": {
+        #            "1d_float16": (unique_randn_along_dim((64,), dtype=torch.float16),),
+        #            "2d_float16": (unique_randn_along_dim((8, 64), dtype=torch.float16),),
+        #            "3d_float16": (
+        #                unique_randn_along_dim((2, 4, 64), dtype=torch.float16),
+        #            ),
+        #            "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
+        #            "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
+        #        },
+        #    },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu_no_eager"): {
             "ops_dict": {
-                "sum": torch.max,
+                "max": torch.max,
             },
             "param_sets": {
                 "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
@@ -354,7 +372,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     unique_randn_along_dim((67, 256), dim=1),
                 ),  #  sparse tensor output
-                # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
+                "3d_dim_0": (
+                    0,
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                ),  # layout needs repermutation
                 "3d_dim_1": (1, unique_randn_along_dim((67, 71, 256), dim=1)),
                 "3d_dim_2": (
                     2,
@@ -367,11 +388,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     unique_randn_along_dim((6, 17, 7, 64), dim=3),
                 ),  # sparse tensor output
+                "4d_dim_gpt0": (
+                    -1,
+                    unique_randn_along_dim((1, 64, 1, 129), dim=-1),
+                ),  # gpt_oss
+                "4d_dim_gpt1": (
+                    -1,
+                    unique_randn_along_dim((1, 64, 11, 129), dim=-1),
+                ),  # gpt_oss
+                "2d_dim_0_int64": (
+                    0,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
+                "2d_dim_1_int64": (
+                    1,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu_no_eager"): {
             "ops_dict": {
-                "sum": torch.max,
+                "max": torch.max,
             },
             "param_sets": {
                 "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
@@ -389,6 +430,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_1": (1, unique_randn_along_dim((6, 7, 12, 256), dim=1)),
                 "4d_dim_2": (2, unique_randn_along_dim((6, 7, 12, 256), dim=2)),
                 "4d_dim_3": (3, unique_randn_along_dim((6, 7, 12, 256), dim=3)),
+                "2d_dim_0_int64": (
+                    0,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
+                "2d_dim_1_int64": (
+                    1,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
             },
         },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -1886,13 +1939,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
         compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
 
+    # @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    # @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    # def test_reduce_cpu(self, op, x):
+    #    compare_with_cpu(lambda x: op(x), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch
-        if op == torch.max:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
-            )
-        elif op == torch.amax:
+        if op == torch.amax or op == torch.max:
             # aten::amax.out is not registered for the Spyre backend
             compare_with_cpu(
                 lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
@@ -1900,29 +1956,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim0_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
-        if op == torch.max:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
-            )
-        else:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
-            )
+        compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim1_cpu(self, op, dim: int, x):
-        # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch
-        if op == torch.max:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=True)[0], x, run_eager=False
-            )
-        elif op == torch.amax:
+        if op == torch.amax or op == torch.max:
             # aten::amax.out is not registered for the Spyre backend
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim1_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
         if op == torch.max:
@@ -1934,7 +1984,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
-            x_max = torch.max(x, dim=dim)[0]
+            x_max = torch.max(x, dim=dim).values
             z = x - torch.unsqueeze(x_max, dim=dim)
             return z
 

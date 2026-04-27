@@ -17,6 +17,8 @@ import torch_spyre.ops.fallbacks  # noqa: F401
 import torch_spyre._C as _C
 import warnings
 import functools
+import inspect
+import operator
 
 
 # Decorator to keep track of compiled variant
@@ -27,9 +29,20 @@ def compile_once(op, **compile_kwargs):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             nonlocal compiled
+            nonlocal op
             if compiled is None:
+                if isinstance(op, str):
+                    op = operator.attrgetter(op)(torch.ops)
                 compiled = torch.compile(op, **compile_kwargs)
             return fn(*args, compiled=compiled, **kwargs)
+
+        # We remove the `compiled` arg from the signature to have
+        # a clean signature.
+        old_signature = inspect.signature(fn)
+        params = dict(old_signature.parameters)
+        params.pop("compiled")
+        new_signature = old_signature.replace(parameters=params.values())
+        wrapper.__signature__ = new_signature
 
         return wrapper
 
