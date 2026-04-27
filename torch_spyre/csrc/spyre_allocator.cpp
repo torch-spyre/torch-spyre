@@ -84,7 +84,7 @@ void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id) {
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
   c10::reportMemoryUsageToProfiler(
-      &data,
+      data,
       nbytes,  // alloc_size
       stats_
           .allocated_bytes[static_cast<size_t>(
@@ -107,7 +107,7 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
   c10::reportMemoryUsageToProfiler(
-      &data,
+      data,
       -nbytes,  // alloc_size
       stats_
           .allocated_bytes[static_cast<size_t>(
