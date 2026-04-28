@@ -1071,7 +1071,7 @@ def main():
         "--output",
         type=str,
         default=None,
-        help="Output YAML file path (default: ../tests/configs/<model>_spyre.yaml)",
+        help="Output YAML file path (default: ./configs/<model>_spyre.yaml)",
     )
 
     args = parser.parse_args()
