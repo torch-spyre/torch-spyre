@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
 # run_test.sh -- Single-entry-point test runner for torch-spyre OOT tests.
 #
 # Usage (single config):
@@ -6,8 +7,9 @@
 #
 # Usage (multiple configs -- merged at runtime, temp file cleaned up on exit):
 #   bash run_test.sh config_a.yaml config_b.yaml [config_c.yaml ...] [extra pytest args...]
-#   bash run_test.sh config_a.yaml config_b.yaml -- [extra pytest args...]
-#
+#   bash run_test.sh configs/                            # all YAMLs in a directory
+#   bash run_test.sh configs/ extra.yaml -- [extra pytest args...]
+
 # When more than one YAML file is supplied the configs are merged in order via
 # spyre_test_utilities.py
 #   - `files` entries with the same path are combined (tests deduplicated).
@@ -39,17 +41,27 @@ set -euo pipefail
 
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <path/to/test_suite_config.yaml> [extra pytest args...]" >&2
+    echo "Usage: $0 <config.yaml | config_dir/> [config2.yaml ...] [extra pytest args...]" >&2
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Multi-config support
 #
-# Collect all leading *.yaml / *.yml arguments that resolve to real files as
-# YAML configs.  The first non-YAML argument (or anything after "--") is the
-# start of extra pytest args.  A single YAML argument is the original
-# backward-compatible path and behaves exactly as before.
+# Collect all leading positional arguments that are YAML files or directories
+# as YAML configs.  The first non-YAML / non-directory argument (or anything
+# after "--") is the start of extra pytest args.  A single YAML argument is
+# the original backward-compatible path and behaves exactly as before.
+#
+# Supported forms (mixable in any order before pytest args):
+#   run_test.sh config.yaml                    # single file (original)
+#   run_test.sh a.yaml b.yaml                  # explicit list
+#   run_test.sh configs/                       # all YAMLs in a directory
+#   run_test.sh configs/ extra.yaml            # directory + extra file
+#   run_test.sh a.yaml configs/ b.yaml -- -v   # mixed, "--" boundary
+#
+# Directory expansion: all *.yaml / *.yml files directly inside the directory
+# are collected in sorted order.
 # ---------------------------------------------------------------------------
 YAML_CONFIGS=()
 EXTRA_PYTEST_ARGS=()
@@ -60,7 +72,21 @@ for _arg in "$@"; do
         _parsing_yamls=0
         continue
     fi
-    if [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
+    if [[ $_parsing_yamls -eq 1 && -d "$_arg" ]]; then
+        _dir_yamls=()
+        while IFS= read -r -d '' _f; do
+            _dir_yamls+=("$(realpath "$_f")")
+        done < <(find "$(realpath "$_arg")" -maxdepth 1 \
+                     \( -name '*.yaml' -o -name '*.yml' \) \
+                     -type f -print0 | sort -z)
+        if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
+            echo "WARNING: No YAML files found in directory: $_arg" >&2
+        else
+            echo "[spyre_run] Expanded directory '$_arg' -> ${#_dir_yamls[@]} config(s):"
+            for _f in "${_dir_yamls[@]}"; do echo "[spyre_run]   $_f"; done
+            YAML_CONFIGS+=("${_dir_yamls[@]}")
+        fi
+    elif [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
         YAML_CONFIGS+=("$(realpath "$_arg")")
     else
         _parsing_yamls=0
@@ -867,7 +893,7 @@ echo ""
 # ---------------------------------------------------------------------------
 
 _XML_INJECT_PY='
-import sys, re
+import sys, re, json, os
 from pathlib import Path
 try:
     import yaml
@@ -876,8 +902,20 @@ except ImportError:
 
 xml_path, yaml_path = sys.argv[1], sys.argv[2]
 
+# Load sidecar written by TorchTestBase.instantiate_test.
+# Keys are bare method names matching the XML `name=` attribute exactly.
+# Values are already-merged lists of all tags (YAML tests tags + op__ + dtype__ + module__ markers).
+_sidecar: dict = {}
+_sidecar_path = yaml_path + ".markers.json"
+try:
+    with open(_sidecar_path) as _f:
+        _sidecar = json.load(_f)
+except Exception:
+    pass
+
+# Fallback YAML-only tag_map for tests not in sidecar
 data = yaml.safe_load(open(yaml_path)) or {}
-tag_map = {}
+tag_map: dict = {}
 for fe in data.get("test_suite_config", {}).get("files", []):
     for te in fe.get("tests", []):
         tags = sorted(set(te.get("tags", []) or []))
@@ -888,7 +926,11 @@ for fe in data.get("test_suite_config", {}).get("files", []):
             if name:
                 tag_map.setdefault(name, set()).update(tags)
 
-def match_tags(classname, testname):
+def _all_tags(classname, testname):
+    # Sidecar has the full merged tag list -- use it when available.
+    if testname in _sidecar:
+        return sorted(_sidecar[testname])
+    # Fallback: YAML tests `tags` only lookup.
     matched = set()
     for yaml_name, tags in tag_map.items():
         if "::" in yaml_name:
@@ -910,15 +952,23 @@ def build_props(tags):
 
 def inject_full(m):
     attrs, content = m.group(1), m.group(2)
-    if "<properties>" in content:
-        return m.group(0)
     cn = re.search(r"classname=\"([^\"]*)\"", attrs)
     tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
     if not cn or not tn:
         return m.group(0)
-    tags = match_tags(cn.group(1), tn.group(1))
+    tags = _all_tags(cn.group(1), tn.group(1))
     if not tags:
         return m.group(0)
+    if "<properties>" in content:
+        existing = set(re.findall(r"<property name=\"tag\" value=\"([^\"]*)\"/>", content))
+        new_props = "".join(
+            f"<property name=\"tag\" value=\"{t}\"/>"
+            for t in tags if t not in existing
+        )
+        if not new_props:
+            return m.group(0)
+        content = content.replace("</properties>", new_props + "</properties>", 1)
+        return f"<testcase{attrs}>{content}</testcase>"
     return f"<testcase{attrs}>{build_props(tags)}{content}</testcase>"
 
 def inject_self_closing(m):
@@ -927,7 +977,7 @@ def inject_self_closing(m):
     tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
     if not cn or not tn:
         return m.group(0)
-    tags = match_tags(cn.group(1), tn.group(1))
+    tags = _all_tags(cn.group(1), tn.group(1))
     if not tags:
         return m.group(0)
     return f"<testcase{attrs}>{build_props(tags)}</testcase>"
@@ -936,6 +986,12 @@ xml = Path(xml_path).read_text()
 xml = re.sub(r"<testcase([^>]*)>(.*?)</testcase>", inject_full,        xml, flags=re.DOTALL)
 xml = re.sub(r"<testcase([^>]*?)/>",               inject_self_closing, xml)
 Path(xml_path).write_text(xml)
+
+try:
+    os.remove(_sidecar_path)
+except OSError:
+    pass
+
 print(f"[spyre_run] Tags injected into XML: {xml_path}", flush=True)
 '
 
