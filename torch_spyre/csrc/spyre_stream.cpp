@@ -24,7 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "flex/runtime_stream/runtime_operation.hpp"
+#include "flex/flex.hpp"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
