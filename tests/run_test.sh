@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
 # run_test.sh -- Single-entry-point test runner for torch-spyre OOT tests.
 #
 # Usage (single config):
@@ -6,8 +7,9 @@
 #
 # Usage (multiple configs -- merged at runtime, temp file cleaned up on exit):
 #   bash run_test.sh config_a.yaml config_b.yaml [config_c.yaml ...] [extra pytest args...]
-#   bash run_test.sh config_a.yaml config_b.yaml -- [extra pytest args...]
-#
+#   bash run_test.sh configs/                            # all YAMLs in a directory
+#   bash run_test.sh configs/ extra.yaml -- [extra pytest args...]
+
 # When more than one YAML file is supplied the configs are merged in order via
 # spyre_test_utilities.py
 #   - `files` entries with the same path are combined (tests deduplicated).
@@ -39,17 +41,27 @@ set -euo pipefail
 
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <path/to/test_suite_config.yaml> [extra pytest args...]" >&2
+    echo "Usage: $0 <config.yaml | config_dir/> [config2.yaml ...] [extra pytest args...]" >&2
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Multi-config support
 #
-# Collect all leading *.yaml / *.yml arguments that resolve to real files as
-# YAML configs.  The first non-YAML argument (or anything after "--") is the
-# start of extra pytest args.  A single YAML argument is the original
-# backward-compatible path and behaves exactly as before.
+# Collect all leading positional arguments that are YAML files or directories
+# as YAML configs.  The first non-YAML / non-directory argument (or anything
+# after "--") is the start of extra pytest args.  A single YAML argument is
+# the original backward-compatible path and behaves exactly as before.
+#
+# Supported forms (mixable in any order before pytest args):
+#   run_test.sh config.yaml                    # single file (original)
+#   run_test.sh a.yaml b.yaml                  # explicit list
+#   run_test.sh configs/                       # all YAMLs in a directory
+#   run_test.sh configs/ extra.yaml            # directory + extra file
+#   run_test.sh a.yaml configs/ b.yaml -- -v   # mixed, "--" boundary
+#
+# Directory expansion: all *.yaml / *.yml files directly inside the directory
+# are collected in sorted order.
 # ---------------------------------------------------------------------------
 YAML_CONFIGS=()
 EXTRA_PYTEST_ARGS=()
@@ -60,7 +72,21 @@ for _arg in "$@"; do
         _parsing_yamls=0
         continue
     fi
-    if [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
+    if [[ $_parsing_yamls -eq 1 && -d "$_arg" ]]; then
+        _dir_yamls=()
+        while IFS= read -r -d '' _f; do
+            _dir_yamls+=("$(realpath "$_f")")
+        done < <(find "$(realpath "$_arg")" -maxdepth 1 \
+                     \( -name '*.yaml' -o -name '*.yml' \) \
+                     -type f -print0 | sort -z)
+        if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
+            echo "WARNING: No YAML files found in directory: $_arg" >&2
+        else
+            echo "[spyre_run] Expanded directory '$_arg' -> ${#_dir_yamls[@]} config(s):"
+            for _f in "${_dir_yamls[@]}"; do echo "[spyre_run]   $_f"; done
+            YAML_CONFIGS+=("${_dir_yamls[@]}")
+        fi
+    elif [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
         YAML_CONFIGS+=("$(realpath "$_arg")")
     else
         _parsing_yamls=0
