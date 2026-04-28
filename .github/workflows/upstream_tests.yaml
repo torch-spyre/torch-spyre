@@ -48,11 +48,11 @@ jobs:
           - name: NeuralNet test embedding
             config: test_nn_test_embedding.yaml
           - name: NeuralNet lazy modules
-            config: test_nn_test_lazy_modules.yaml          
+            config: test_nn_test_lazy_modules.yaml
           - name: NeuralNet pooling
-            config: test_nn_test_pooling.yaml  
+            config: test_nn_test_pooling.yaml
           - name: Reductions
-            config: test_reductions.yaml  
+            config: test_reductions.yaml
           - name: Shape ops
             config: test_shape_ops.yaml
           - name: Tensor creation ops
