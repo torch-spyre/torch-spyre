@@ -1829,9 +1829,59 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
-                "fp16": (
+                "prefill_bs1": (
+                    cached_randn((1, 256, 4096), dtype=torch.float16),
+                    cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+                "prefill": (
                     cached_randn((2, 256, 4096), dtype=torch.float16),
                     cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+                "decode_bs1": (
+                    cached_randn((1, 1, 4096), dtype=torch.float16),
+                    cached_randn((1, 1, 2, 2, 64), dtype=torch.float16),
+                ),
+                "decode": (
+                    cached_randn((2, 1, 4096), dtype=torch.float16),
+                    cached_randn((1, 1, 2, 2, 64), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_qkv_attn_paths_fms", "test_attn_qkv_paths"): {
+            "param_sets": {
+                "prefill_mha": (
+                    cached_randn(
+                        (1, 256, 32, 2, 1, 64), differentiation=1, dtype=torch.bfloat16
+                    ),
+                    cached_randn(
+                        (1, 256, 32, 2, 1, 64), differentiation=2, dtype=torch.bfloat16
+                    ),
+                    cached_randn((1, 256, 4096), dtype=torch.bfloat16),
+                ),
+                "prefill_gqa": (
+                    cached_randn((1, 256, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 256, 8, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 256, 1024), dtype=torch.bfloat16),
+                ),
+                "fms_decode_mha": (
+                    cached_randn((1, 64, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 4096), dtype=torch.bfloat16),
+                ),
+                "fms_decode_gqa": (
+                    cached_randn((1, 64, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 8, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 1024), dtype=torch.bfloat16),
+                ),
+                "decode_mha": (
+                    cached_randn((1, 1, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 4096), dtype=torch.bfloat16),
+                ),
+                "decode_gqa": (
+                    cached_randn((1, 1, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 8, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 1024), dtype=torch.bfloat16),
                 ),
             },
         },
@@ -2481,13 +2531,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
-            q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
+            B, S, E = q.shape
+            D = freqs.shape[-1] * 2
+            H = E // D
+            q_ = q.view(B, S, H, D).view(B, S, H, 2, D // 2)
             mul_out = freqs[:, :, None, :, :, :] * q_.unsqueeze(-3)
             sum_out = mul_out.sum(4, keepdim=True)
             q_out = sum_out.flatten(3)
             return q_out
 
         compare_with_cpu(fn, q, freqs, cpu_compile=False)
+
+    def test_attn_qkv_paths(self, q, k, v):
+        # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
+        def fn(q, k, v):
+            B, Sq, Hq = q.shape[0:3]
+            D = q.shape[-1] * 2
+            Sk, Hk = k.shape[1:3]
+            expansion = Hq // Hk
+            # (post-rope) B S Hq 2 1 D/2 --(view)-> B S Hq D --(transpose)-> B Hq S D -> identity (contiguous)
+            q_attn = q.view(B, Sq, Hq, D).transpose(1, 2).contiguous()
+            # (post-rope) B S Hk 2 1 D/2 --(view)-> B S Hk D --(transpose)-> B Hk S D --(unsqueeze)-> B Hk 1 S D --(expand)-> B Hk 4 S D --(flatten)-> B 4Hk S D --(transpose)-> B 4Hk D S -> restickify
+            k_attn = (
+                k.view(B, Sk, Hk, D)
+                .transpose(1, 2)
+                .unsqueeze(2)
+                .expand(-1, -1, expansion, -1, -1)
+                .flatten(1, 2)
+                .transpose(2, 3)
+                .contiguous()
+            )
+            # (post-v proj) B S Hv*D --(view)-> B S Hv D --(transpose)-> B Hv S D --(unsqueeze)-> B Hv 1 S D --(expand)-> B Hv 4 S D --(flatten)-> B 4Hk S D -> identity (contiguous)
+            v_attn = (
+                v.view(B, Sk, Hk, D)
+                .transpose(1, 2)
+                .unsqueeze(2)
+                .expand(-1, -1, expansion, -1, -1)
+                .flatten(1, 2)
+                .contiguous()
+            )
+            return q_attn, k_attn, v_attn
+
+        # TODO(aviros): Add support for missing eager ops and debug remaining issues to match eager results
+        compare_with_cpu(fn, q, k, v, cpu_compile=False, run_eager=False)
 
 
 if __name__ == "__main__":
