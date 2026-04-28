@@ -14,7 +14,6 @@
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
-MATMUL_REDUCTION_OP = "batchmatmul"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
 DEVICE_NAME = "spyre"
