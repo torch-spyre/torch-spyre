@@ -893,7 +893,7 @@ echo ""
 # ---------------------------------------------------------------------------
 
 _XML_INJECT_PY='
-import sys, re
+import sys, re, json, os
 from pathlib import Path
 try:
     import yaml
@@ -902,8 +902,20 @@ except ImportError:
 
 xml_path, yaml_path = sys.argv[1], sys.argv[2]
 
+# Load sidecar written by TorchTestBase.instantiate_test.
+# Keys are bare method names matching the XML `name=` attribute exactly.
+# Values are already-merged lists of all tags (YAML tests tags + op__ + dtype__ + module__ markers).
+_sidecar: dict = {}
+_sidecar_path = yaml_path + ".markers.json"
+try:
+    with open(_sidecar_path) as _f:
+        _sidecar = json.load(_f)
+except Exception:
+    pass
+
+# Fallback YAML-only tag_map for tests not in sidecar
 data = yaml.safe_load(open(yaml_path)) or {}
-tag_map = {}
+tag_map: dict = {}
 for fe in data.get("test_suite_config", {}).get("files", []):
     for te in fe.get("tests", []):
         tags = sorted(set(te.get("tags", []) or []))
@@ -914,7 +926,11 @@ for fe in data.get("test_suite_config", {}).get("files", []):
             if name:
                 tag_map.setdefault(name, set()).update(tags)
 
-def match_tags(classname, testname):
+def _all_tags(classname, testname):
+    # Sidecar has the full merged tag list -- use it when available.
+    if testname in _sidecar:
+        return sorted(_sidecar[testname])
+    # Fallback: YAML tests `tags` only lookup.
     matched = set()
     for yaml_name, tags in tag_map.items():
         if "::" in yaml_name:
@@ -936,15 +952,23 @@ def build_props(tags):
 
 def inject_full(m):
     attrs, content = m.group(1), m.group(2)
-    if "<properties>" in content:
-        return m.group(0)
     cn = re.search(r"classname=\"([^\"]*)\"", attrs)
     tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
     if not cn or not tn:
         return m.group(0)
-    tags = match_tags(cn.group(1), tn.group(1))
+    tags = _all_tags(cn.group(1), tn.group(1))
     if not tags:
         return m.group(0)
+    if "<properties>" in content:
+        existing = set(re.findall(r"<property name=\"tag\" value=\"([^\"]*)\"/>", content))
+        new_props = "".join(
+            f"<property name=\"tag\" value=\"{t}\"/>"
+            for t in tags if t not in existing
+        )
+        if not new_props:
+            return m.group(0)
+        content = content.replace("</properties>", new_props + "</properties>", 1)
+        return f"<testcase{attrs}>{content}</testcase>"
     return f"<testcase{attrs}>{build_props(tags)}{content}</testcase>"
 
 def inject_self_closing(m):
@@ -953,7 +977,7 @@ def inject_self_closing(m):
     tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
     if not cn or not tn:
         return m.group(0)
-    tags = match_tags(cn.group(1), tn.group(1))
+    tags = _all_tags(cn.group(1), tn.group(1))
     if not tags:
         return m.group(0)
     return f"<testcase{attrs}>{build_props(tags)}</testcase>"
@@ -962,6 +986,12 @@ xml = Path(xml_path).read_text()
 xml = re.sub(r"<testcase([^>]*)>(.*?)</testcase>", inject_full,        xml, flags=re.DOTALL)
 xml = re.sub(r"<testcase([^>]*?)/>",               inject_self_closing, xml)
 Path(xml_path).write_text(xml)
+
+try:
+    os.remove(_sidecar_path)
+except OSError:
+    pass
+
 print(f"[spyre_run] Tags injected into XML: {xml_path}", flush=True)
 '
 
