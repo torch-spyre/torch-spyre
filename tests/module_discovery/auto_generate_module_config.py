@@ -404,7 +404,7 @@ def generate_yaml_config(
 ) -> str:
     """Generate YAML configuration from captured module information."""
 
-    config = {"model_name": model_name, "modules": []}
+    config: Dict[str, Any] = {"model_name": model_name, "modules": []}
 
     for module_info in captured_modules:
         module_name = module_info["name"].lower()
@@ -713,7 +713,6 @@ def generate_unified_yaml_config(
     yaml_str += "          mode: mandatory_success\n"
     yaml_str += "          tags:\n"
     yaml_str += f"            - model__{model_name}\n"
-    yaml_str += "          seed: 123\n"
     yaml_str += "          edits:\n"
     yaml_str += "            modules:\n"
     yaml_str += "              include:\n"
@@ -875,7 +874,6 @@ def generate_unified_yaml_config(
     yaml_str += "          tags:\n"
     yaml_str += f"            - model__{model_name}\n"
     yaml_str += "            - custom_tests\n"
-    yaml_str += "          seed: 123\n"
     yaml_str += "          edits:\n"
     yaml_str += "            modules:\n"
     yaml_str += "              include:\n"
@@ -1030,6 +1028,9 @@ def generate_unified_yaml_config(
     yaml_str += "        precision:\n"
     yaml_str += "          atol: 0.001\n"
     yaml_str += "          rtol: 0.001\n"
+    yaml_str += "\n"
+    yaml_str += "    input_config:\n"
+    yaml_str += "      seed: 123\n"
 
     return yaml_str
 

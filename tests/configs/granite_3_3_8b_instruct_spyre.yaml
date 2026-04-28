@@ -12,7 +12,6 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - model__granite_3_3_8b_instruct
-          seed: 123
           edits:
             modules:
               include:
@@ -177,7 +176,6 @@ test_suite_config:
           tags:
             - model__granite_3_3_8b_instruct
             - custom_tests
-          seed: 123
           edits:
             modules:
               include:
@@ -338,3 +336,6 @@ test_suite_config:
         precision:
           atol: 0.001
           rtol: 0.001
+
+    input_config:
+      seed: 123
