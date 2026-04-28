@@ -217,7 +217,7 @@ def _unflatten_bmm_batch_dims(
     node.args = (lhs_orig, rhs_orig)
 
     # Update bmm output shape metadata
-    node.meta["val"] = node.meta["val"].new_empty(output_shape)
+    node.meta["val"] = output_view.meta["val"]
 
     # Replace all uses of the output view with the bmm itself
     output_view.replace_all_uses_with(node)
