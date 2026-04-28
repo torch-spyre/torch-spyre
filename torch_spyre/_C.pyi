@@ -17,7 +17,6 @@ __all__: list[str] = [
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
-    "convert_artifacts",
     "empty_with_layout",
     "copy_tensor",
     "encode_constant",
@@ -239,7 +238,6 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def convert_artifacts(arg0: str) -> None: ...
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:
