@@ -1,0 +1,14 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_shape_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestShapeOps::test_clamp_raises_arg_errors
+          mode: mandatory_success
+        - names:
+            - TestShapeOps::test_nonzero_non_diff
+          mode: mandatory_success
+        - names:
+            - TestShapeOps::test_unfold_errors
+          mode: mandatory_success

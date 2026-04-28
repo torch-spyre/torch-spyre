@@ -1,0 +1,130 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_tensor_creation_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestAsArray::test_unsupported_alias
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_byte_to_int
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_invalid_positional_args
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_not_a_buffer
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_requires_grad
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_same_type
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_with_count
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_with_count_and_offset
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestBufferProtocol::test_with_offset
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_cat_mem_overlap
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_cat_out_channels_last
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_concat_empty_list_error
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_empty_strided
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_empty_tensor_props
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_linlogspace_mem_overlap
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_meshgrid_empty
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_meshgrid_inconsistent_device
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_meshgrid_inconsistent_dtype
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_meshgrid_non_1d_tensor
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_meshgrid_unsupported_indexing
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_meshgrid_warns_if_no_indexing
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_simple_scalar_cast
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_strided_mismatched_stride_shape
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_tensor_from_non_writable_numpy
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops
+        - names:
+            - TestTensorCreation::test_zeros_bounds_checking
+          mode: mandatory_success
+          tags:
+            - tensor_creation_ops

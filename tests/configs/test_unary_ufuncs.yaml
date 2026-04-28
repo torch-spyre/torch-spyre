@@ -1,0 +1,22 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_unary_ufuncs.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output
+          mode: mandatory_success
+          tags:
+            - unary_ufuncs
+          edits:
+            dtypes:
+              exclude:
+                - name: bfloat16
+                - name: complex64
+                - name: complex128
+                - name: float64
+        - names:
+            - TestUnaryUfuncs::test_polygamma_neg
+          mode: mandatory_success
+          tags:
+            - unary_ufuncs

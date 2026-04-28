@@ -1,0 +1,44 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_indexing.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - NumpyTests::test_boolean_assignment_value_mismatch
+          mode: mandatory_success
+        - names:
+            - NumpyTests::test_everything_returns_views
+          mode: mandatory_success
+        - names:
+            - NumpyTests::test_index_no_floats
+          mode: mandatory_success
+        - names:
+            - NumpyTests::test_none_index
+          mode: mandatory_success
+        - names:
+            - NumpyTests::test_truncate_leading_1s
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_empty_slice
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_index_put_accumulate_empty
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_invalid_index
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_multiple_int
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_none
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_out_of_bound_index
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_setitem_expansion_error
+          mode: mandatory_success
+        - names:
+            - TestIndexing::test_single_int
+          mode: mandatory_success
