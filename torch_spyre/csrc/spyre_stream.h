@@ -52,7 +52,10 @@ class SpyreStream {
   c10::Stream unwrap() const;
 
  private:
+  mutable flex::RuntimeStream* flex_handle_ = nullptr;
+
   flex::RuntimeStream* getRuntimeHandle() const;
+  flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr,
                      const flex::CompositeAddress* device_address,
                      const DataConversionInfo* dci, bool host2device) const;

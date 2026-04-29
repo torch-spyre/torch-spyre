@@ -181,6 +181,14 @@ void SpyreStream::copyAsync(const at::Tensor& src,
 }
 
 flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
+  if (flex_handle_ != nullptr) {
+    return flex_handle_;
+  }
+  flex_handle_ = resolveRuntimeHandle();
+  return flex_handle_;
+}
+
+flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
 

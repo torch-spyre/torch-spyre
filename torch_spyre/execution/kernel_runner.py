@@ -35,5 +35,5 @@ class SpyreSDSCKernelRunner:
         self.code_dir = code_dir
 
     def run(self, *args, **kw_args):
-        logger.info(f"RUN: {self.kernel_name} {self.code_dir}")
+        logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
         launch_kernel(self.code_dir, args)
