@@ -52,13 +52,13 @@ std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k);
  */
 std::vector<uint8_t> readHexEncodedFile(const std::string& filepath);
 
-std::string get_init_path(const std::string& g2_path);
+std::string get_init_path(const std::string& code_dir);
 
-std::string get_pagi_path(const std::string& g2_path);
+std::string get_pagi_path(const std::string& code_dir);
 
-KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
+KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
                                     const SpyreStream& stream);
-void launchKernel(const std::string& g2_path,
+void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args);
 
 }  // namespace spyre

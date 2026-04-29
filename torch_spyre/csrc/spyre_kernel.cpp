@@ -112,9 +112,8 @@ std::vector<uint8_t> readHexEncodedFile(const std::string& filepath) {
   return binary_data;
 }
 
-std::string get_init_path(const std::string& g2_path) {
-  fs::path p(g2_path);
-  fs::path dir = p.parent_path();
+std::string get_init_path(const std::string& code_dir) {
+  fs::path dir(code_dir);
   std::string kernel_name = dir.filename().string();
 
   std::string program_dir =
@@ -123,9 +122,8 @@ std::string get_init_path(const std::string& g2_path) {
   return (dir / program_dir).string();
 }
 
-std::string get_pagi_path(const std::string& g2_path) {
-  fs::path p(g2_path);
-  fs::path dir = p.parent_path();
+std::string get_pagi_path(const std::string& code_dir) {
+  fs::path dir(code_dir);
   std::string kernel_name = dir.filename().string();
 
   std::string program_dir = "execute/" + kernel_name;
@@ -133,20 +131,20 @@ std::string get_pagi_path(const std::string& g2_path) {
   return (dir / program_dir).string();
 }
 
-// Cache: g2_path -> artifacts (loaded once)
+// Cache: code_dir -> artifacts (loaded once)
 std::unordered_map<std::string, KernelArtifacts> g_artifact_cache;
 std::mutex g_artifact_cache_mtx;  // protects g_artifact_cache and g_key_mtxs
 std::unordered_map<std::string, std::unique_ptr<std::mutex>> g_key_mtxs;
 
-KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
+KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
                                     const SpyreStream& stream) {
   {
     std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
-    auto it = g_artifact_cache.find(g2_path);
+    auto it = g_artifact_cache.find(code_dir);
     if (it != g_artifact_cache.end()) {
       return it->second;
     }
-    auto& key_mtx = g_key_mtxs[g2_path];
+    auto& key_mtx = g_key_mtxs[code_dir];
     if (!key_mtx) {
       key_mtx = std::make_unique<std::mutex>();
     }
@@ -156,14 +154,14 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
   std::mutex* key_mtx = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
-    key_mtx = g_key_mtxs[g2_path].get();
+    key_mtx = g_key_mtxs[code_dir].get();
   }
   std::lock_guard<std::mutex> key_lock(*key_mtx);
 
   // Double-check after acquiring per-key lock
   {
     std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
-    auto it = g_artifact_cache.find(g2_path);
+    auto it = g_artifact_cache.find(code_dir);
     if (it != g_artifact_cache.end()) {
       return it->second;
     }
@@ -171,15 +169,15 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
 
   KernelArtifacts arts;
 
-  fs::path g2_dir = fs::path(g2_path).parent_path();
-  std::string bundle_path = (g2_dir / "bundle.mlir").string();
+  fs::path dir(code_dir);
+  std::string bundle_path = (dir / "bundle.mlir").string();
   // Store bundle.mlir path for future JIT compilation
   arts.bundle_mlir_path = bundle_path;
   TORCH_CHECK(std::filesystem::exists(bundle_path),
               "Bundle not found: ", bundle_path);
 
   // Read init.bin (hex-encoded program binary)
-  std::string init_path = get_init_path(g2_path) + "/init.txt";
+  std::string init_path = get_init_path(code_dir) + "/init.txt";
   arts.init_bin = readHexEncodedFile(init_path);
 
   arts.program_size = arts.init_bin.size();
@@ -189,23 +187,23 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& g2_path,
   stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
   stream.synchronize();
 
-  arts.sdsc_json_path = (g2_dir / "sdsc_0.json").string();
+  arts.sdsc_json_path = (dir / "sdsc_0.json").string();
   TORCH_CHECK(std::filesystem::exists(arts.sdsc_json_path),
               "SuperDSC not found: ", arts.sdsc_json_path);
 
   std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
-  auto [it, inserted] = g_artifact_cache.emplace(g2_path, std::move(arts));
+  auto [it, inserted] = g_artifact_cache.emplace(code_dir, std::move(arts));
   if (inserted) {
     DEBUGINFO(it->second);
   }
   return it->second;
 }
 
-void launchKernel(const std::string& g2_path,
+void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args) {
   auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
 
-  auto& arts = getOrLoadArtifacts(g2_path, stream);
+  auto& arts = getOrLoadArtifacts(code_dir, stream);
 
   stream.executeProgramAsync(arts, args);
 }
