@@ -4,13 +4,11 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output # The test verifies that the unary functions torch.isposinf and torch.isneginf raise a RuntimeError when a non‑boolean tensor is supplied via the out= argument.
+            - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output 
           mode: mandatory_success
           edits:
             dtypes:
               exclude:
-                - name: bfloat16
-                  description: bfloat16 unsupported on Spyre for this test.
                 - name: complex64
                   description: complex64 unsupported on Spyre for this test. This test attempts complex type test as well.
                 - name: complex128
@@ -18,5 +16,5 @@ test_suite_config:
                 - name: float64
                   description: float64 unsupported on Spyre for this test.
         - names:
-            - TestUnaryUfuncs::test_polygamma_neg # The test verifies that calling torch.polygamma with a negative order raises a RuntimeError with the expected error message.
+            - TestUnaryUfuncs::test_polygamma_neg 
           mode: mandatory_success

@@ -229,7 +229,6 @@ test_suite_config:
             dtypes:
               include:
                 - name: float32
-                # - name: float64
         - names:
             - TestTorchDeviceType::test_storage_meta_errors
           mode: mandatory_success
@@ -255,4 +254,3 @@ test_suite_config:
             dtypes:
               include:
                 - name: float32
-                # - name: float64
