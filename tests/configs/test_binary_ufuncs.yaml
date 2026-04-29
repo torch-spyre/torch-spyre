@@ -25,7 +25,7 @@ test_suite_config:
                 - name: bfloat16
                   description: bfloat16 unsupported on Spyre for this test
         - names:
-            - TestBinaryUfuncs::generate_not_implemented_tests
+            - generate_not_implemented_tests
           mode: mandatory_success
           edits:
             dtypes:
