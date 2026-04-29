@@ -551,6 +551,14 @@ _cleanup_wrappers() {
         rm -f "$YAML_CONFIG"
         echo "[spyre_run] Removed merged temp config: $YAML_CONFIG"
     fi
+    # Remove marker sidecar JSON written by TorchTestBase.instantiate_test.
+    # Normally deleted by _XML_INJECT_PY after injection, but when --junit-xml
+    # is not supplied _XML_INJECT_PY never runs
+    local _sidecar="${YAML_CONFIG}.markers.json"
+    if [[ -f "$_sidecar" ]]; then
+        rm -f "$_sidecar"
+        echo "[spyre_run] Cleaned up marker sidecar: $_sidecar"
+    fi
 }
 trap _cleanup_wrappers EXIT
 
