@@ -4,6 +4,7 @@ Shared class and methods for all OOT PyTorch test overrides.
 """
 
 import os
+import json
 from typing import Dict, List, Optional, Set
 import warnings
 
@@ -415,6 +416,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
 
+        _tags_to_write: Dict[str, List[str]] = {}
         for method_name in new_methods:
             enabled, reason, is_xfail, is_strict = cls._should_run(
                 method_name=method_name,
@@ -447,14 +449,33 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             #     setattr(cls, method_name, _skip)
             #     continue
 
-            # apply pytest tags as marks
-            if all_tags:
+            # Collect dynamic markers (op__, dtype__, module__) that the
+            # patchers attached to this specific instantiated method, and
+            # union them with the YAML-declared tags so _XML_INJECT_PY
+            # only needs to handle one flat tag list per method.
+            _DYNAMIC_PREFIXES = ("op__", "dtype__", "module__")
+            existing_fn = cls.__dict__.get(method_name)
+            dynamic_tags: List[str] = []
+            if existing_fn is not None:
+                dynamic_tags = sorted(
+                    {
+                        m.name
+                        for m in getattr(existing_fn, "pytestmark", [])
+                        if any(m.name.startswith(p) for p in _DYNAMIC_PREFIXES)
+                    }
+                )
+
+            method_tags = all_tags + [t for t in dynamic_tags if t not in set(all_tags)]
+
+            # apply all tags (YAML + dynamic) as marks
+            if method_tags:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
                     marked_fn = existing_fn
-                    for tag in all_tags:
+                    for tag in method_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
+                _tags_to_write[method_name] = method_tags
 
             # apply xfail if needed
             if is_xfail:
@@ -465,6 +486,25 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                         method_name,
                         pytest.mark.xfail(strict=is_strict)(existing_fn),
                     )
+
+        # Flush {method_name: [tags]} to sidecar for _XML_INJECT_PY.
+        # so that XML reads global + op/dtype/module tags in one shot
+        if _tags_to_write:
+            _cfg = os.environ.get(ENV_TEST_CONFIG, "")
+            if _cfg:
+                _sidecar = _cfg + ".markers.json"
+                _existing_tags: dict = {}
+                try:
+                    with open(_sidecar) as _sf:
+                        _existing_tags = json.load(_sf)
+                except Exception:
+                    pass
+                _existing_tags.update(_tags_to_write)
+                try:
+                    with open(_sidecar, "w") as _sf:
+                        json.dump(_existing_tags, _sf)
+                except Exception:
+                    pass
 
 
 TEST_CLASS = TorchTestBase

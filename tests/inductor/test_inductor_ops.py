@@ -343,10 +343,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        # TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
+        # Spyre represents scalars as 1D tensors [1], while CPU uses 0D tensors.
+        # This inconsistency causes shape mismatches when moving tensors from Spyre to CPU.
+        # See: https://github.com/torch-spyre/torch-spyre/issues/1172
+        # ("test_max_default", "test_reduce_cpu"): {
+        #        "ops_dict": {
+        #            "max": torch.max,
+        #        },
+        #        "param_sets": {
+        #            "1d_float16": (unique_randn_along_dim((64,), dtype=torch.float16),),
+        #            "2d_float16": (unique_randn_along_dim((8, 64), dtype=torch.float16),),
+        #            "3d_float16": (
+        #                unique_randn_along_dim((2, 4, 64), dtype=torch.float16),
+        #            ),
+        #            "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
+        #            "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
+        #        },
+        #    },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu_no_eager"): {
             "ops_dict": {
-                "sum": torch.max,
+                "max": torch.max,
             },
             "param_sets": {
                 "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
@@ -354,7 +372,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     unique_randn_along_dim((67, 256), dim=1),
                 ),  #  sparse tensor output
-                # "3d_dim_0": (0, cached_randn((67, 71, 256))), # layout needs repermutation
+                "3d_dim_0": (
+                    0,
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                ),  # layout needs repermutation
                 "3d_dim_1": (1, unique_randn_along_dim((67, 71, 256), dim=1)),
                 "3d_dim_2": (
                     2,
@@ -367,11 +388,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     unique_randn_along_dim((6, 17, 7, 64), dim=3),
                 ),  # sparse tensor output
+                "4d_dim_gpt0": (
+                    -1,
+                    unique_randn_along_dim((1, 64, 1, 129), dim=-1),
+                ),  # gpt_oss
+                "4d_dim_gpt1": (
+                    -1,
+                    unique_randn_along_dim((1, 64, 11, 129), dim=-1),
+                ),  # gpt_oss
+                "2d_dim_0_int64": (
+                    0,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
+                "2d_dim_1_int64": (
+                    1,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
             },
         },
         ("test_max_keepdim1", "test_reduce_keepdim1_cpu_no_eager"): {
             "ops_dict": {
-                "sum": torch.max,
+                "max": torch.max,
             },
             "param_sets": {
                 "2d_dim_0": (0, unique_randn_along_dim((67, 256), dim=0)),
@@ -389,6 +430,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_1": (1, unique_randn_along_dim((6, 7, 12, 256), dim=1)),
                 "4d_dim_2": (2, unique_randn_along_dim((6, 7, 12, 256), dim=2)),
                 "4d_dim_3": (3, unique_randn_along_dim((6, 7, 12, 256), dim=3)),
+                "2d_dim_0_int64": (
+                    0,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
+                "2d_dim_1_int64": (
+                    1,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, min_val=0, max_val=100, dtype=torch.int64
+                    ),
+                ),
             },
         },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -1212,6 +1265,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(128, dtype=torch.float16),  # float tensor
                     cached_randn((128,)) > 0,  # bool tensor
                 ),
+                "2d_transposed_src": (
+                    torch.zeros(128, 256, dtype=torch.float16),
+                    cached_randn((256, 128)).t(),
+                ),
+            },
+        },
+        (
+            "test_inplace_copy_noncontiguous",
+            "test_inplace_copy_noncontiguous_cpu",
+        ): {
+            "param_sets": {
+                "transposed_dst": (
+                    torch.zeros(256, 128, dtype=torch.float16),
+                    cached_randn((128, 256)),
+                ),
+                "transposed_src_and_dst": (
+                    torch.zeros(256, 128, dtype=torch.float16),
+                    cached_randn((256, 128)).t(),
+                ),
             },
         },
         (
@@ -1757,9 +1829,59 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
-                "fp16": (
+                "prefill_bs1": (
+                    cached_randn((1, 256, 4096), dtype=torch.float16),
+                    cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+                "prefill": (
                     cached_randn((2, 256, 4096), dtype=torch.float16),
                     cached_randn((1, 256, 2, 2, 64), dtype=torch.float16),
+                ),
+                "decode_bs1": (
+                    cached_randn((1, 1, 4096), dtype=torch.float16),
+                    cached_randn((1, 1, 2, 2, 64), dtype=torch.float16),
+                ),
+                "decode": (
+                    cached_randn((2, 1, 4096), dtype=torch.float16),
+                    cached_randn((1, 1, 2, 2, 64), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_qkv_attn_paths_fms", "test_attn_qkv_paths"): {
+            "param_sets": {
+                "prefill_mha": (
+                    cached_randn(
+                        (1, 256, 32, 2, 1, 64), differentiation=1, dtype=torch.bfloat16
+                    ),
+                    cached_randn(
+                        (1, 256, 32, 2, 1, 64), differentiation=2, dtype=torch.bfloat16
+                    ),
+                    cached_randn((1, 256, 4096), dtype=torch.bfloat16),
+                ),
+                "prefill_gqa": (
+                    cached_randn((1, 256, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 256, 8, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 256, 1024), dtype=torch.bfloat16),
+                ),
+                "fms_decode_mha": (
+                    cached_randn((1, 64, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 4096), dtype=torch.bfloat16),
+                ),
+                "fms_decode_gqa": (
+                    cached_randn((1, 64, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 8, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 320, 1024), dtype=torch.bfloat16),
+                ),
+                "decode_mha": (
+                    cached_randn((1, 1, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 4096), dtype=torch.bfloat16),
+                ),
+                "decode_gqa": (
+                    cached_randn((1, 1, 32, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 8, 2, 1, 64), dtype=torch.bfloat16),
+                    cached_randn((1, 257, 1024), dtype=torch.bfloat16),
                 ),
             },
         },
@@ -1867,13 +1989,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
         compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
 
+    # @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    # @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    # def test_reduce_cpu(self, op, x):
+    #    compare_with_cpu(lambda x: op(x), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim0_cpu(self, op, dim: int, x):
         # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch
-        if op == torch.max:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
-            )
-        elif op == torch.amax:
+        if op == torch.amax or op == torch.max:
             # aten::amax.out is not registered for the Spyre backend
             compare_with_cpu(
                 lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
@@ -1881,29 +2006,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim0_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
-        if op == torch.max:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False)[0], x, run_eager=False
-            )
-        else:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False
-            )
+        compare_with_cpu(lambda x: op(x, dim=dim, keepdim=False), x, run_eager=False)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim1_cpu(self, op, dim: int, x):
-        # torch.max returns a tuple; torch.amax is not registered for Spyre eager dispatch
-        if op == torch.max:
-            compare_with_cpu(
-                lambda x: op(x, dim=dim, keepdim=True)[0], x, run_eager=False
-            )
-        elif op == torch.amax:
+        if op == torch.amax or op == torch.max:
             # aten::amax.out is not registered for the Spyre backend
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_keepdim1_cpu_no_eager(self, op, dim: int, x):
         # aten::max.dim and aten::amin are not registered for Spyre eager dispatch
         if op == torch.max:
@@ -1915,7 +2034,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
-            x_max = torch.max(x, dim=dim)[0]
+            x_max = torch.max(x, dim=dim).values
             z = x - torch.unsqueeze(x_max, dim=dim)
             return z
 
@@ -2012,6 +2131,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return result
 
         # Eager mode hangs/crashes when executing inplace operations on Spyre tensors
+        compare_with_cpu(fn, dst, src, run_eager=False)
+
+    def test_inplace_copy_noncontiguous_cpu(self, dst, src):
+        def fn(dst, src):
+            dst_t = dst.t()
+            dst_t.copy_(src)
+            return dst_t.contiguous()
+
         compare_with_cpu(fn, dst, src, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
@@ -2404,13 +2531,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
-            q_ = q.view(2, 256, 32, 128).view(2, 256, 32, 2, 64)
+            B, S, E = q.shape
+            D = freqs.shape[-1] * 2
+            H = E // D
+            q_ = q.view(B, S, H, D).view(B, S, H, 2, D // 2)
             mul_out = freqs[:, :, None, :, :, :] * q_.unsqueeze(-3)
             sum_out = mul_out.sum(4, keepdim=True)
             q_out = sum_out.flatten(3)
             return q_out
 
         compare_with_cpu(fn, q, freqs, cpu_compile=False)
+
+    def test_attn_qkv_paths(self, q, k, v):
+        # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
+        def fn(q, k, v):
+            B, Sq, Hq = q.shape[0:3]
+            D = q.shape[-1] * 2
+            Sk, Hk = k.shape[1:3]
+            expansion = Hq // Hk
+            # (post-rope) B S Hq 2 1 D/2 --(view)-> B S Hq D --(transpose)-> B Hq S D -> identity (contiguous)
+            q_attn = q.view(B, Sq, Hq, D).transpose(1, 2).contiguous()
+            # (post-rope) B S Hk 2 1 D/2 --(view)-> B S Hk D --(transpose)-> B Hk S D --(unsqueeze)-> B Hk 1 S D --(expand)-> B Hk 4 S D --(flatten)-> B 4Hk S D --(transpose)-> B 4Hk D S -> restickify
+            k_attn = (
+                k.view(B, Sk, Hk, D)
+                .transpose(1, 2)
+                .unsqueeze(2)
+                .expand(-1, -1, expansion, -1, -1)
+                .flatten(1, 2)
+                .transpose(2, 3)
+                .contiguous()
+            )
+            # (post-v proj) B S Hv*D --(view)-> B S Hv D --(transpose)-> B Hv S D --(unsqueeze)-> B Hv 1 S D --(expand)-> B Hv 4 S D --(flatten)-> B 4Hk S D -> identity (contiguous)
+            v_attn = (
+                v.view(B, Sk, Hk, D)
+                .transpose(1, 2)
+                .unsqueeze(2)
+                .expand(-1, -1, expansion, -1, -1)
+                .flatten(1, 2)
+                .contiguous()
+            )
+            return q_attn, k_attn, v_attn
+
+        # TODO(aviros): Add support for missing eager ops and debug remaining issues to match eager results
+        compare_with_cpu(fn, q, k, v, cpu_compile=False, run_eager=False)
 
 
 if __name__ == "__main__":
