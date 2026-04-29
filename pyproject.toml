@@ -103,6 +103,7 @@ override-dependencies = ['setuptools>=70.1.0,<80.0']
 [tool.uv.sources]
 torch = [
 #  { path = "../pytorch", editable = true },
+#  { url = "https://github.com/IBM/kineto-spyre/releases/download/torch-2.10.0.aiu.kineto.1.1.2/torch-2.10.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl" },
   { index = "pytorch-cpu" },
 ]
 torchvision = [
