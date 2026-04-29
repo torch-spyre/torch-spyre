@@ -15,8 +15,8 @@ test_suite_config:
                   description: complex64 unsupported on Spyre for this test. This test attempts complex type test as well.
                 - name: complex128
                   description: complex128 unsupported on Spyre for this test. This test attempts complex type test as well.
-                # - name: float64
-                #   description: float64 unsupported on Spyre for this test.
+                - name: float64
+                  description: float64 unsupported on Spyre for this test.
         - names:
             - TestUnaryUfuncs::test_polygamma_neg # The test verifies that calling torch.polygamma with a negative order raises a RuntimeError with the expected error message.
           mode: mandatory_success
