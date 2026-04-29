@@ -21,9 +21,6 @@ test_suite_config:
             dtypes:
               include:
                 - name: float32
-              exclude:
-                - name: bfloat16
-                  description: bfloat16 unsupported on Spyre for this test
         - names:
             - generate_not_implemented_tests
           mode: mandatory_success
