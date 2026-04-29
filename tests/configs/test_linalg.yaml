@@ -5,19 +5,9 @@ test_suite_config:
       tests:
         - names:
             - TestLinalg::test_einsum_error_cases
-          mode: mandatory_success
-        - names:
             - TestLinalg::test_lower_precision_accumulation_with_ref_path
-          mode: mandatory_success
-        - names:
             - TestLinalg::test_matrix_rank_removed_error
-          mode: mandatory_success
-        - names:
             - TestLinalg::test_permute_matmul
-          mode: mandatory_success
-        - names:
             - TestLinalg::test_solve_removed_error
-          mode: mandatory_success
-        - names:
             - TestLinalg::test_vector_norm_decom_unbacked_checks
           mode: mandatory_success

@@ -5,24 +5,8 @@ test_suite_config:
       tests:
         - names:
             - TestReductions::test_all_issue117215
-          mode: mandatory_success
-          tags:
-            - reductions
-        - names:
             - TestReductions::test_argminmax_axis_with_dim_one
-          mode: mandatory_success
-          tags:
-            - reductions
-        - names:
             - TestReductions::test_dim_multi_unsupported
-          mode: mandatory_success
-        - names:
             - TestReductions::test_scalar_tensor_as_dim_argument
-          mode: mandatory_success
-          tags:
-            - reductions
-        - names:
             - TestReductions::test_scalar_tensor_dim_compiled_mode
           mode: mandatory_success
-          tags:
-            - reductions

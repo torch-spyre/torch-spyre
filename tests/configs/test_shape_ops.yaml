@@ -5,10 +5,6 @@ test_suite_config:
       tests:
         - names:
             - TestShapeOps::test_clamp_raises_arg_errors
-          mode: mandatory_success
-        - names:
             - TestShapeOps::test_nonzero_non_diff
-          mode: mandatory_success
-        - names:
             - TestShapeOps::test_unfold_errors
           mode: mandatory_success
