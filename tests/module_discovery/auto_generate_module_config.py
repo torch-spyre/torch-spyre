@@ -861,7 +861,7 @@ def main():
 
     print(f"Loading model: {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModel.from_pretrained(args.model_path, torch_dtype=torch.float16).eval()
+    model = AutoModel.from_pretrained(args.model_path).eval()
 
     print("Analyzing model structure...")
     unique_modules = get_unique_modules(model)

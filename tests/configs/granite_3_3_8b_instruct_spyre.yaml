@@ -27,7 +27,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs:
@@ -54,7 +54,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs:
@@ -69,11 +69,11 @@ test_suite_config:
                       position_embeddings:
                         tensor_list:
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
 
@@ -89,7 +89,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs: {}
@@ -109,7 +109,7 @@ test_suite_config:
                       hidden_states:
                         tensor:
                           shape: [1, 128, 4096]
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                       position_ids:
@@ -123,11 +123,11 @@ test_suite_config:
                       position_embeddings:
                         tensor_list:
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
 
@@ -143,7 +143,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs: {}
@@ -159,7 +159,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 12800]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs: {}
@@ -191,7 +191,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs:
@@ -217,7 +217,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs:
@@ -232,11 +232,11 @@ test_suite_config:
                       position_embeddings:
                         tensor_list:
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
 
@@ -252,7 +252,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs: {}
@@ -271,7 +271,7 @@ test_suite_config:
                       hidden_states:
                         tensor:
                           shape: [1, 128, 4096]
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                       position_ids:
@@ -285,11 +285,11 @@ test_suite_config:
                       position_embeddings:
                         tensor_list:
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
                           - shape: [1, 128, 128]
-                            dtype: torch.float16
+                            dtype: torch.bfloat16
                             device: spyre
                             init: zeros
 
@@ -305,7 +305,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 4096]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs: {}
@@ -321,7 +321,7 @@ test_suite_config:
                       - tensor:
                           shape: [1, 128, 12800]
                           storage_offset: 0
-                          dtype: torch.float16
+                          dtype: torch.bfloat16
                           device: spyre
                           init: randn
                     kwargs: {}
