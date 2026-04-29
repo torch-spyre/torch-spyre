@@ -4,7 +4,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output 
+            - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output
           mode: mandatory_success
           edits:
             dtypes:
@@ -16,5 +16,5 @@ test_suite_config:
                 - name: float64
                   description: float64 unsupported on Spyre for this test.
         - names:
-            - TestUnaryUfuncs::test_polygamma_neg 
+            - TestUnaryUfuncs::test_polygamma_neg
           mode: mandatory_success
