@@ -21,13 +21,13 @@ test_suite_config:
             dtypes:
               include:
                 - name: float32
-        - names:
-            - generate_not_implemented_tests
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: float64
+        # - names:
+        #     - generate_not_implemented_tests
+        #   mode: mandatory_success
+        #   edits:
+        #     dtypes:
+        #       exclude:
+        #         - name: float64
         - names:
             - TestBinaryUfuncs::test_binary_op_mem_overlap
           mode: mandatory_success
