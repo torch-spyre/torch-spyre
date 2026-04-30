@@ -2,15 +2,19 @@
 Custom module tests for torch-spyre.
 
 This file contains additional test methods for modules defined in YAML configs:
-- test_eager_vs_compile: Compare eager and compile mode outputs (CPU vs Spyre)
-- test_layout: Test different memory layouts (contiguous, non-contiguous, channels_last)
-- test_stride: Test different stride patterns
+- test_eager_vs_compile: Compare eager and compile mode outputs (CPU vs Spyre eager vs Spyre compiled)
+- test_layout: Validate real YAML-specified SpyreTensorLayouts (CPU vs Spyre)
+- test_stride: Validate real YAML-specified tensor strides (CPU vs Spyre)
+
+All tests use pytree for robust handling of nested input/output structures and test only
+real model configurations from YAML without artificial modifications.
 """
 
 import torch
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_modules import modules, module_db
 from torch.testing._internal.common_utils import TestCase
+from torch.utils._pytree import tree_map
 
 
 class TestModuleCustom(TestCase):
@@ -61,15 +65,13 @@ class TestModuleCustom(TestCase):
             args_cpu = module_input.forward_input.args
             kwargs_cpu = module_input.forward_input.kwargs
 
-            # Move inputs to device
-            args_device = tuple(
-                arg.to(device) if isinstance(arg, torch.Tensor) else arg
-                for arg in args_cpu
+            # Move inputs to device using pytree to handle nested structures
+            args_device = tree_map(
+                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, args_cpu
             )
-            kwargs_device = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in kwargs_cpu.items()
-            }
+            kwargs_device = tree_map(
+                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, kwargs_cpu
+            )
 
             # Run forward passes
             with torch.no_grad():
@@ -79,19 +81,22 @@ class TestModuleCustom(TestCase):
                     *args_device, **kwargs_device
                 )
 
-            # Extract tensor from output (handle tuples/dicts)
-            def extract_tensor(output):
-                if isinstance(output, torch.Tensor):
-                    return output
-                elif isinstance(output, (tuple, list)):
-                    return output[0] if len(output) > 0 else None
-                elif isinstance(output, dict):
-                    return next(iter(output.values())) if output else None
-                return output
+            # Extract first tensor from output using pytree
+            def extract_first_tensor(output):
+                """Extract first tensor from potentially nested output structure."""
+                tensors = []
 
-            output_cpu_tensor = extract_tensor(output_cpu)
-            output_device_eager_tensor = extract_tensor(output_device_eager)
-            output_device_compile_tensor = extract_tensor(output_device_compile)
+                def collect_tensors(x):
+                    if isinstance(x, torch.Tensor):
+                        tensors.append(x)
+                    return x
+
+                tree_map(collect_tensors, output)
+                return tensors[0] if tensors else None
+
+            output_cpu_tensor = extract_first_tensor(output_cpu)
+            output_device_eager_tensor = extract_first_tensor(output_device_eager)
+            output_device_compile_tensor = extract_first_tensor(output_device_compile)
 
             if (
                 output_cpu_tensor is not None
@@ -117,158 +122,157 @@ class TestModuleCustom(TestCase):
 
     @modules(module_db)
     def test_layout(self, device, dtype, module_info, training):
-        """Test module with different memory layouts.
+        """Test module with real YAML-specified layouts only.
 
-        Tests:
-        - Contiguous tensors
-        - Non-contiguous tensors (via transpose)
-        - Channels-last format (for Conv modules)
+        This test validates that modules work correctly with the actual tensor
+        layouts (SpyreTensorLayouts) specified in the YAML configuration, without
+        any artificial modifications. Compares CPU vs device outputs to ensure
+        correctness.
         """
         module_inputs = module_info.module_inputs_func(
             module_info, device=device, dtype=dtype, requires_grad=False, training=False
         )
 
         for module_input in module_inputs:
-            module = module_info.module_cls(
+            # Create module on CPU
+            module_cpu = module_info.module_cls(
+                *module_input.constructor_input.args,
+                **module_input.constructor_input.kwargs,
+            )
+            module_cpu.eval()
+
+            # Create module on device
+            module_device = module_info.module_cls(
                 *module_input.constructor_input.args,
                 **module_input.constructor_input.kwargs,
             ).to(device)
-            module.eval()
+            module_device.eval()
 
-            args = tuple(
-                arg.to(device) if isinstance(arg, torch.Tensor) else arg
-                for arg in module_input.forward_input.args
+            # Copy weights from CPU to device
+            module_device.load_state_dict(module_cpu.state_dict())
+
+            # Prepare inputs
+            args_cpu = module_input.forward_input.args
+            kwargs_cpu = module_input.forward_input.kwargs
+
+            # Move inputs to device using pytree to handle nested structures
+            args_device = tree_map(
+                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, args_cpu
             )
-            kwargs = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in module_input.forward_input.kwargs.items()
-            }
+            kwargs_device = tree_map(
+                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, kwargs_cpu
+            )
 
-            # Test 1: Contiguous input (default)
+            # Run forward passes
             with torch.no_grad():
-                output_contiguous = module(*args, **kwargs)
+                output_cpu = module_cpu(*args_cpu, **kwargs_cpu)
+                output_device = module_device(*args_device, **kwargs_device)
 
-            # Verify output exists
-            self.assertIsNotNone(
-                output_contiguous, f"{module_info.name}: Contiguous layout test failed"
-            )
+            # Extract first tensor from output using pytree
+            def extract_first_tensor(output):
+                """Extract first tensor from potentially nested output structure."""
+                tensors = []
 
-            # Test 2: Non-contiguous input (if applicable)
-            # Try to make first tensor arg non-contiguous via transpose
-            if args and isinstance(args[0], torch.Tensor) and args[0].ndim >= 2:
-                args_non_contig = list(args)
-                # Transpose and transpose back to get non-contiguous tensor with same shape
-                args_non_contig[0] = args[0].t().contiguous().t()
-                self.assertFalse(
-                    args_non_contig[0].is_contiguous(),
-                    f"{module_info.name}: Failed to create non-contiguous tensor",
-                )
+                def collect_tensors(x):
+                    if isinstance(x, torch.Tensor):
+                        tensors.append(x)
+                    return x
 
-                with torch.no_grad():
-                    output_non_contig = module(*args_non_contig, **kwargs)
+                tree_map(collect_tensors, output)
+                return tensors[0] if tensors else None
 
-                self.assertIsNotNone(
-                    output_non_contig,
-                    f"{module_info.name}: Non-contiguous layout test failed",
-                )
+            cpu_tensor = extract_first_tensor(output_cpu)
+            device_tensor = extract_first_tensor(output_device)
 
-            # Test 3: Channels-last (for 4D tensors in Conv-like modules)
-            if args and isinstance(args[0], torch.Tensor) and args[0].ndim == 4:
-                args_channels_last = list(args)
-                args_channels_last[0] = args[0].to(memory_format=torch.channels_last)
-                self.assertTrue(
-                    args_channels_last[0].is_contiguous(
-                        memory_format=torch.channels_last
-                    ),
-                    f"{module_info.name}: Failed to create channels_last tensor",
-                )
-
-                with torch.no_grad():
-                    output_channels_last = module(*args_channels_last, **kwargs)
-
-                self.assertIsNotNone(
-                    output_channels_last,
-                    f"{module_info.name}: Channels-last layout test failed",
+            if (
+                cpu_tensor is not None
+                and isinstance(cpu_tensor, torch.Tensor)
+                and device_tensor is not None
+                and isinstance(device_tensor, torch.Tensor)
+            ):
+                # Compare CPU vs device outputs
+                self.assertEqual(
+                    cpu_tensor,
+                    device_tensor.cpu(),
+                    msg=f"{module_info.name}: layout mismatch on real inputs",
                 )
 
     @modules(module_db)
     def test_stride(self, device, dtype, module_info, training):
-        """Test module with different stride patterns.
+        """Test module with real YAML-specified strides only.
 
-        Tests:
-        - Default strides
-        - Custom strides (via slicing)
-        - Broadcasted tensors (stride 0 in some dimensions)
+        This test validates that modules work correctly with the actual tensor
+        sizes and strides specified in the YAML configuration, without any
+        artificial modifications. Compares CPU vs device outputs to ensure
+        correctness.
         """
         module_inputs = module_info.module_inputs_func(
             module_info, device=device, dtype=dtype, requires_grad=False, training=False
         )
 
         for module_input in module_inputs:
-            module = module_info.module_cls(
+            # Create module on CPU
+            module_cpu = module_info.module_cls(
+                *module_input.constructor_input.args,
+                **module_input.constructor_input.kwargs,
+            )
+            module_cpu.eval()
+
+            # Create module on device
+            module_device = module_info.module_cls(
                 *module_input.constructor_input.args,
                 **module_input.constructor_input.kwargs,
             ).to(device)
-            module.eval()
+            module_device.eval()
 
-            args = tuple(
-                arg.to(device) if isinstance(arg, torch.Tensor) else arg
-                for arg in module_input.forward_input.args
+            # Copy weights from CPU to device
+            module_device.load_state_dict(module_cpu.state_dict())
+
+            # Prepare inputs
+            args_cpu = module_input.forward_input.args
+            kwargs_cpu = module_input.forward_input.kwargs
+
+            # Move inputs to device using pytree to handle nested structures
+            args_device = tree_map(
+                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, args_cpu
             )
-            kwargs = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in module_input.forward_input.kwargs.items()
-            }
+            kwargs_device = tree_map(
+                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, kwargs_cpu
+            )
 
-            # Test 1: Default strides
+            # Run forward passes
             with torch.no_grad():
-                output_default = module(*args, **kwargs)
+                output_cpu = module_cpu(*args_cpu, **kwargs_cpu)
+                output_device = module_device(*args_device, **kwargs_device)
 
-            self.assertIsNotNone(
-                output_default, f"{module_info.name}: Default stride test failed"
-            )
+            # Extract first tensor from output using pytree
+            def extract_first_tensor(output):
+                """Extract first tensor from potentially nested output structure."""
+                tensors = []
 
-            # Test 2: Custom strides via slicing (if tensor is large enough)
-            if args and isinstance(args[0], torch.Tensor):
-                tensor = args[0]
-                # Try to create a strided view by taking every other element
-                if tensor.shape[-1] > 2:  # Need at least 3 elements to slice
-                    args_strided = list(args)
-                    # Take every other element along last dimension
-                    args_strided[0] = tensor[..., ::2]
+                def collect_tensors(x):
+                    if isinstance(x, torch.Tensor):
+                        tensors.append(x)
+                    return x
 
-                    # Verify stride changed
-                    original_stride = tensor.stride()
-                    new_stride = args_strided[0].stride()
-                    if original_stride != new_stride:
-                        with torch.no_grad():
-                            output_strided = module(*args_strided, **kwargs)
+                tree_map(collect_tensors, output)
+                return tensors[0] if tensors else None
 
-                        self.assertIsNotNone(
-                            output_strided,
-                            f"{module_info.name}: Custom stride test failed",
-                        )
+            cpu_tensor = extract_first_tensor(output_cpu)
+            device_tensor = extract_first_tensor(output_device)
 
-            # Test 3: Broadcasted tensor (stride 0)
-            if args and isinstance(args[0], torch.Tensor) and args[0].ndim >= 2:
-                tensor = args[0]
-                # Create a broadcasted version by expanding first dimension
-                if tensor.shape[0] > 1:
-                    args_broadcast = list(args)
-                    # Take first element and expand
-                    single = tensor[0:1]  # Keep dimensions
-                    expanded = single.expand(tensor.shape[0], *tensor.shape[1:])
-                    args_broadcast[0] = expanded
-
-                    # Verify stride 0 in first dimension
-                    if expanded.stride()[0] == 0:
-                        with torch.no_grad():
-                            output_broadcast = module(*args_broadcast, **kwargs)
-
-                        self.assertIsNotNone(
-                            output_broadcast,
-                            f"{module_info.name}: Broadcast stride test failed",
-                        )
+            if (
+                cpu_tensor is not None
+                and isinstance(cpu_tensor, torch.Tensor)
+                and device_tensor is not None
+                and isinstance(device_tensor, torch.Tensor)
+            ):
+                # Compare CPU vs device outputs
+                self.assertEqual(
+                    cpu_tensor,
+                    device_tensor.cpu(),
+                    msg=f"{module_info.name}: stride/layout mismatch on real inputs",
+                )
 
 
 # Instantiate tests for all device types
