@@ -1,0 +1,36 @@
+name: Build a pod and push to icr
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install OpenShift CLI
+        run: |
+          chmod +x scripts/preflight.sh
+          ./scripts/preflight.sh
+      
+      - name: Apply BuildConfig
+        env:
+          OC_SERVER: ${{ secrets.OC_SERVER }}
+          OC_TOKEN: ${{ secrets.OC_TOKEN }}
+          OC_NAMESPACE: ${{ secrets.OC_NAMESPACE }}
+        run: |
+          oc --server="$OC_SERVER" \
+             --token="$OC_TOKEN" \
+             --insecure-skip-tls-verify=true \
+             -n "$OC_NAMESPACE" \
+             apply -f buildconfig.yaml
+      
+      - name: Trigger BuildConfig
+        env:
+          OC_SERVER: ${{ secrets.OC_SERVER }}
+          OC_TOKEN: ${{ secrets.OC_TOKEN }}
+          OC_NAMESPACE: ${{ secrets.OC_NAMESPACE }}
+        run: oc start-build torch-spyre-build --wait --follow --server=$OC_SERVER --token=$OC_TOKEN --insecure-skip-tls-verify=true -n $OC_NAMESPACE
