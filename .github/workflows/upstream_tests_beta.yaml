@@ -1,6 +1,8 @@
 name: upstream-pytorch-tests
 
 on:
+  pull_request:
+    branches: [main]
   # Run automatically on every merge to main
   push:
     branches: [main]
@@ -152,5 +154,5 @@ jobs:
         working-directory: torch-spyre/tests
         run: |
           echo 'Running ${{ matrix.suite.name }} upstream tests...'
-          bash run_test.sh configs/${{ matrix.suite.config }} -v
+          bash run_test.sh configs/upstream_tests/${{ matrix.suite.config }} -v
           echo '${{ matrix.suite.name }} upstream tests done'
