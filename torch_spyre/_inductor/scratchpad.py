@@ -146,7 +146,8 @@ class ScratchPadAllocator:
                     inp_i_on_lx = inp_i in self.usage
                     inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
                     inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
-                    if inp_i_on_lx and inp_i_size_match and inp_i_lay_match:
+                    inp_i_eol = mem_usage[inp_i]["last_usage"]
+                    if inp_i_on_lx and inp_i_size_match and inp_i_lay_match and inp_i_eol:
                         found_matched_input = True
                         break  # see TODO
                 if found_matched_input:
@@ -188,12 +189,17 @@ class ScratchPadAllocator:
     # TODO add dealloc and defrag mechanism to allocator later
 
 
-def mem_usage_by_op(op: ComputedBuffer, core_div_mismatch: dict[str, bool] = {}):
+def mem_usage_by_op(
+    op: ComputedBuffer, core_div_mismatch: dict[str, bool] = {}, release_next: list = []
+):
     """
     Get a summary of memory usage of the given operation. Two types of info can be found
     1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
     2. Detailed info of individual buf, e.g. mem_usage[<buf_name>], which has
         "is_input", "size", "core_div_mismatch" fields
+    NOTE:
+    if a buf is not in core_div_mismatch => it has no users => graph output
+    if a buf is on release_next => it's the last time it'll be used => allow inplace
     """
     rw = op.get_read_writes()
     mem_usage: dict[str, Any] = {
@@ -211,7 +217,7 @@ def mem_usage_by_op(op: ComputedBuffer, core_div_mismatch: dict[str, bool] = {})
                 "is_input": is_input,
                 "size": dev_size,
                 "core_div_mismatch": core_div_mismatch.get(dep.name, False),
-                # if a buf is not in core_div_mismatch => it has no users => graph output
+                "last_usage": dep.name in release_next,
             }
 
             if is_input:
@@ -229,6 +235,7 @@ def consider_for_scratchpad(
     alloc: ScratchPadAllocator,
     idx: int,
     core_div_mismatch: dict[str, bool] = {},
+    release_next: list = [],
 ):
     """
     If core_div_mismatch is not provided, we will consider LX pinning without taking
@@ -238,7 +245,7 @@ def consider_for_scratchpad(
     """
     # 1. summarize both inputs and output sizes used by this node, also merge core_div
     #    info into the table.
-    mem_usage = mem_usage_by_op(op, core_div_mismatch)
+    mem_usage = mem_usage_by_op(op, core_div_mismatch, release_next)
 
     # 2. Try to allocate as many buffers on LX as we can. If successful, lx info (addr)
     #    will be added to buffer.FixedTiledLayout and used in generate_sdsc() later.
@@ -480,10 +487,12 @@ def scratchpad_planning(
 
     for idx, op in enumerate(operations):
         # release unneeded LX allocations before actual planning
-        alloc.deallocate(idx_to_dealloc_bufs.get(idx, []))
+        release_now = idx_to_dealloc_bufs.get(idx, [])
+        release_next = idx_to_dealloc_bufs.get(idx + 1, [])
+        alloc.deallocate(release_now)
 
         if isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
-            consider_for_scratchpad(op, alloc, idx, core_div_mismatch)
+            consider_for_scratchpad(op, alloc, idx, core_div_mismatch, release_next)
     # logger.info(alloc.lx_usage_hist)
