@@ -132,7 +132,7 @@ torch.compile(model)
 | `dsc.py` | `SuperDSCScheduling` — emits kernel definition code |
 | `wrapper.py` | `SpyrePythonWrapperCodegen` — host-side wrapper code |
 | `choices.py` | `SpyreHeuristics` — disables fusion/cooperative reductions |
-| `constants.py` | Op name constants (MATMUL_REDUCTION_OP, TRANSPOSE_OP, etc.) |
+| `constants.py` | Op name constants (BATCH_MATMUL_OP, TRANSPOSE_OP, etc.) |
 | `errors.py` | Spyre-specific error classes |
 | `temp_passes.py` | `relayout_linear_weights` — ensures weight contiguity for mm |
 | `runtime/__init__.py` | `KernelSpec`, `TensorArg`, `ConstantArg` dataclasses |
