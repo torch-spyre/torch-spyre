@@ -15,6 +15,7 @@
 import functools
 import torch
 import os
+import pytest
 
 DEVICE = torch.device("spyre")
 
@@ -420,6 +421,7 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
+            expect_fail = cases.get("expect_fail", [])
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -446,6 +448,10 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
+                        if test_case in expect_fail:
+                            namespace[test_name] = pytest.mark.xfail(
+                                reason=f"Expected fail for {test_case}", strict=True
+                            )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -467,6 +473,10 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
+                    if test_case in expect_fail:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Expected fail for {test_case}", strict=True
+                        )(namespace[test_name])
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
