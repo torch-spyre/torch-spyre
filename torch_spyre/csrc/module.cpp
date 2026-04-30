@@ -106,6 +106,7 @@ void startRuntime() {
 }
 
 void freeRuntime() {
+  clearArtifactCache();
   GlobalRuntime::reset();
 }
 

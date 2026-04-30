@@ -208,4 +208,10 @@ void launchKernel(const std::string& code_dir,
   stream.executeProgramAsync(arts, args);
 }
 
+void clearArtifactCache() {
+  std::unique_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
+  g_artifact_cache.clear();
+  g_key_mtxs.clear();
+}
+
 }  // namespace spyre

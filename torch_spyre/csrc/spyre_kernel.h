@@ -61,4 +61,6 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
 void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args);
 
+void clearArtifactCache();
+
 }  // namespace spyre
