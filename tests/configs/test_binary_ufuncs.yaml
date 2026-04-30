@@ -77,7 +77,8 @@ test_suite_config:
             dtypes:
               include:
                 - name: float64
-                  description: Since, this test runs on cpu, the float64 works. When the test is extended to Spyre, then this dtype might have to be modified as float64 is unsupported on Spyre.
+                  description: Since, this test runs on cpu, the float64 works. When the test is extended to Spyre, then this dtype might have to be modified
+                    as float64 is unsupported on Spyre.
         - names:
             - TestBinaryUfuncs::test_divide_by_zero_rounding # The test verifies that torch.divide correctly handles division by zero for various floating‑point dtypes, comparing its output to NumPy's np.divide for both scalar and tensor zero divisors and for different rounding modes. For Spyre, some code refactoring is required. At the moment, the test seems to default to cpu.
           mode: mandatory_success
@@ -91,7 +92,8 @@ test_suite_config:
                 - name: float32
                   description: Supported by both Spyre and CPU. Required floating point dtype for the test.
                 - name: float64
-                  description: Since, this test runs on cpu, the float64 works. When the test is extended to Spyre, then this dtype might have to be modified as float64 is unsupported on Spyre.
+                  description: Since, this test runs on cpu, the float64 works. When the test is extended to Spyre, then this dtype might have to be modified
+                    as float64 is unsupported on Spyre.
 
   global:
     supported_dtypes:
