@@ -25,10 +25,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: &id001
-                            - 1
-                            - 128
-                            - 4096
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -37,9 +34,7 @@ test_suite_config:
                     kwargs:
                       position_ids:
                         tensor:
-                          shape: &id002
-                            - 1
-                            - 128
+                          shape: [1, 128]
                           stride: null
                           storage_offset: 0
                           dtype: torch.int64
@@ -58,10 +53,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: &id003
-                            - 1
-                            - 128
-                            - 4096
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -70,9 +62,7 @@ test_suite_config:
                     kwargs:
                       position_ids:
                         tensor:
-                          shape: &id004
-                            - 1
-                            - 128
+                          shape: [1, 128]
                           stride: null
                           storage_offset: 0
                           dtype: torch.int64
@@ -82,10 +72,7 @@ test_suite_config:
                             high: 10000
                       position_embeddings:
                         tensor_list:
-                          - shape: &id005
-                              - 1
-                              - 128
-                              - 128
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -93,10 +80,7 @@ test_suite_config:
                             init: randint
                             init_args:
                               high: 10000
-                          - shape: &id006
-                              - 1
-                              - 128
-                              - 128
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -116,10 +100,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: &id007
-                            - 1
-                            - 128
-                            - 4096
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -139,10 +120,7 @@ test_suite_config:
                     kwargs:
                       hidden_states:
                         tensor:
-                          shape: &id008
-                            - 1
-                            - 128
-                            - 4096
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -150,9 +128,7 @@ test_suite_config:
                           init: randn
                       position_ids:
                         tensor:
-                          shape: &id009
-                            - 1
-                            - 128
+                          shape: [1, 128]
                           stride: null
                           storage_offset: 0
                           dtype: torch.int64
@@ -162,10 +138,7 @@ test_suite_config:
                             high: 10000
                       position_embeddings:
                         tensor_list:
-                          - shape: &id010
-                              - 1
-                              - 128
-                              - 128
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -173,10 +146,7 @@ test_suite_config:
                             init: randint
                             init_args:
                               high: 10000
-                          - shape: &id011
-                              - 1
-                              - 128
-                              - 128
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -196,10 +166,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: &id012
-                            - 1
-                            - 128
-                            - 4096
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -215,10 +182,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: &id013
-                            - 1
-                            - 128
-                            - 12800
+                          shape: [1, 128, 12800]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -249,7 +213,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: *id001
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -258,7 +222,7 @@ test_suite_config:
                     kwargs:
                       position_ids:
                         tensor:
-                          shape: *id002
+                          shape: [1, 128]
                           stride: null
                           storage_offset: 0
                           dtype: torch.int64
@@ -277,7 +241,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: *id003
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -286,7 +250,7 @@ test_suite_config:
                     kwargs:
                       position_ids:
                         tensor:
-                          shape: *id004
+                          shape: [1, 128]
                           stride: null
                           storage_offset: 0
                           dtype: torch.int64
@@ -296,7 +260,7 @@ test_suite_config:
                             high: 10000
                       position_embeddings:
                         tensor_list:
-                          - shape: *id005
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -304,7 +268,7 @@ test_suite_config:
                             init: randint
                             init_args:
                               high: 10000
-                          - shape: *id006
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -322,7 +286,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: *id007
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -342,7 +306,7 @@ test_suite_config:
                     kwargs:
                       hidden_states:
                         tensor:
-                          shape: *id008
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -350,7 +314,7 @@ test_suite_config:
                           init: randn
                       position_ids:
                         tensor:
-                          shape: *id009
+                          shape: [1, 128]
                           stride: null
                           storage_offset: 0
                           dtype: torch.int64
@@ -360,7 +324,7 @@ test_suite_config:
                             high: 10000
                       position_embeddings:
                         tensor_list:
-                          - shape: *id010
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -368,7 +332,7 @@ test_suite_config:
                             init: randint
                             init_args:
                               high: 10000
-                          - shape: *id011
+                          - shape: [1, 128, 128]
                             stride: null
                             storage_offset: 0
                             dtype: torch.bfloat16
@@ -386,7 +350,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: *id012
+                          shape: [1, 128, 4096]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16
@@ -402,7 +366,7 @@ test_suite_config:
                   forward_inputs:
                     args:
                       - tensor:
-                          shape: *id013
+                          shape: [1, 128, 12800]
                           stride: null
                           storage_offset: 0
                           dtype: torch.bfloat16

@@ -22,8 +22,25 @@ from torch.utils._pytree import tree_flatten
 
 
 class PrettyDumper(yaml.SafeDumper):
+    """Custom YAML dumper with consistent 2-space indentation."""
+
     def increase_indent(self, flow=False, indentless=False):
+        """Ensure consistent indentation (no indentless sequences)."""
         return super().increase_indent(flow, False)
+
+    def represent_data(self, data):
+        """Override to handle shape lists specially."""
+        # Check if this is a list that should be inline (shape values)
+        if isinstance(data, list) and len(data) > 0:
+            # Check if all elements are integers (shape lists are all ints)
+            if all(isinstance(x, int) for x in data):
+                # This is likely a shape list - use flow style
+                return self.represent_sequence(
+                    "tag:yaml.org,2002:seq", data, flow_style=True
+                )
+
+        # For everything else, use default representation
+        return super().represent_data(data)
 
 
 def _is_special_tensor(name: str) -> bool:
