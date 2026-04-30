@@ -71,11 +71,11 @@ test_suite_config:
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
 
                 - name: GraniteRMSNorm
                   module_path: transformers.models.granite.modeling_granite.GraniteRMSNorm
@@ -125,11 +125,11 @@ test_suite_config:
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
 
                 - name: GraniteMLP
                   module_path: transformers.models.granite.modeling_granite.GraniteMLP
@@ -234,11 +234,11 @@ test_suite_config:
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
 
                 - name: GraniteRMSNorm
                   module_path: transformers.models.granite.modeling_granite.GraniteRMSNorm
@@ -287,11 +287,11 @@ test_suite_config:
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
                           - shape: [1, 128, 128]
                             dtype: torch.bfloat16
                             device: spyre
-                            init: zeros
+                            init: randint
 
                 - name: GraniteMLP
                   module_path: transformers.models.granite.modeling_granite.GraniteMLP

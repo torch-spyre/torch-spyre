@@ -17,6 +17,74 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Set
 from transformers import AutoModel, AutoTokenizer
+from torch.utils._pytree import tree_flatten
+
+
+def _is_special_tensor(name: str) -> bool:
+    """Check if tensor name indicates it should not be random."""
+    return any(keyword in name.lower() for keyword in ["position", "mask", "ids"])
+
+
+def _extract_tensor_info(tensor: torch.Tensor, name: str) -> Dict[str, Any]:
+    """Extract information from a single tensor."""
+    return {
+        "type": "tensor",
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype).replace("torch.", ""),
+        "is_random": not _is_special_tensor(name),
+        "requires_grad": tensor.requires_grad,
+    }
+
+
+def _process_pytree_structure(value: Any, name: str) -> Dict[str, Any] | None:
+    """
+    Process a pytree structure (nested tensors/lists/tuples/dicts) and extract info.
+
+    Uses PyTorch's tree_flatten to handle arbitrary nesting uniformly.
+    """
+    # Check if this is a tensor or contains tensors
+    if isinstance(value, torch.Tensor):
+        # Single tensor - simple case
+        return {"name": name, **_extract_tensor_info(value, name)}
+
+    # Use tree_flatten to extract all tensor leaves regardless of nesting.
+    # We intentionally do not reconstruct the original structure since only
+    # tensor metadata is needed for config generation.
+    flat_values, _ = tree_flatten(value)
+
+    # Extract info from all tensors in the flattened structure
+    # Single source of truth: pytree handles all container types uniformly
+    tensor_infos = []
+    for item in flat_values:
+        if isinstance(item, torch.Tensor):
+            tensor_infos.append(_extract_tensor_info(item, name))
+
+    # Post-process: enrich dict tensors with their keys
+    if isinstance(value, dict) and tensor_infos:
+        dict_keys = [k for k, v in value.items() if isinstance(v, torch.Tensor)]
+        for i, key in enumerate(dict_keys):
+            if i < len(tensor_infos):
+                tensor_infos[i]["dict_key"] = key
+
+    # If we found tensors, return with structure info
+    if tensor_infos:
+        # Determine container type from the original value
+        if isinstance(value, tuple):
+            container_type = "tuple"
+        elif isinstance(value, list):
+            container_type = "list"
+        elif isinstance(value, dict):
+            container_type = "dict"
+        else:
+            container_type = "pytree"
+
+        return {
+            "name": name,
+            "type": container_type,
+            "items": tensor_infos,
+        }
+
+    return None
 
 
 class ModuleInfoCapture:
@@ -167,77 +235,17 @@ class ModuleInfoCapture:
                 "inputs": [],
             }
 
-            # Analyze positional arguments
+            # Analyze positional arguments using pytree
             for i, arg in enumerate(args):
-                if isinstance(arg, torch.Tensor):
-                    input_info = {
-                        "name": f"arg_{i}",
-                        "type": "tensor",
-                        "shape": list(arg.shape),
-                        "dtype": str(arg.dtype).replace("torch.", ""),
-                        "is_random": True,  # Default assumption
-                        "requires_grad": arg.requires_grad,
-                    }
+                input_info = _process_pytree_structure(arg, f"arg_{i}")
+                if input_info:
                     module_info["inputs"].append(input_info)
-                elif isinstance(arg, (tuple, list)):
-                    # Handle tuple/list of tensors (e.g., position_embeddings)
-                    for j, item in enumerate(arg):
-                        if isinstance(item, torch.Tensor):
-                            input_info = {
-                                "name": f"arg_{i}_item_{j}",
-                                "type": "tensor",
-                                "shape": list(item.shape),
-                                "dtype": str(item.dtype).replace("torch.", ""),
-                                "is_random": True,
-                                "requires_grad": item.requires_grad,
-                            }
-                            module_info["inputs"].append(input_info)
 
-            # Analyze keyword arguments
+            # Analyze keyword arguments using pytree
             for key, value in kwargs.items():
-                if isinstance(value, torch.Tensor):
-                    # Detect special non-random tensors
-                    is_random = True
-                    if (
-                        "position" in key.lower()
-                        or "mask" in key.lower()
-                        or "ids" in key.lower()
-                    ):
-                        is_random = False
-
-                    input_info = {
-                        "name": key,
-                        "type": "tensor",
-                        "shape": list(value.shape),
-                        "dtype": str(value.dtype).replace("torch.", ""),
-                        "is_random": is_random,
-                        "requires_grad": value.requires_grad,
-                    }
+                input_info = _process_pytree_structure(value, key)
+                if input_info:
                     module_info["inputs"].append(input_info)
-                elif isinstance(value, (tuple, list)):
-                    # Handle tuple/list (e.g., position_embeddings = (cos, sin))
-                    is_random = "position" not in key.lower()
-                    tuple_items = []
-                    for j, item in enumerate(value):
-                        if isinstance(item, torch.Tensor):
-                            tuple_items.append(
-                                {
-                                    "type": "tensor",
-                                    "shape": list(item.shape),
-                                    "dtype": str(item.dtype).replace("torch.", ""),
-                                    "is_random": is_random,
-                                    "requires_grad": item.requires_grad,
-                                }
-                            )
-
-                    # Add as a single tuple input
-                    if tuple_items:
-                        input_info = {
-                            "name": key,
-                            "type": "tuple",
-                            "items": tuple_items,
-                        }
-                        module_info["inputs"].append(input_info)
 
             # Store the captured information
             self.module_data[module_type] = module_info
@@ -362,58 +370,61 @@ def _convert_constructor_arg_to_sample_input(
         return {"value": None}
 
 
+def _tensor_info_to_spec(tensor_info: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """
+    Convert a single tensor info dict to sample_inputs tensor spec format.
+
+    This function can be used with tree_map to transform entire structures.
+    """
+    dtype = tensor_info["dtype"]
+    if not dtype.startswith("torch."):
+        dtype = f"torch.{dtype}"
+
+    # Determine init strategy based on tensor characteristics
+    is_random = tensor_info.get("is_random", True)
+    init = "randn" if is_random else "zeros"
+    init_args = {}
+
+    # Special handling for position/id tensors
+    if _is_special_tensor(name):
+        init = "randint"
+        init_args = {"high": 10000}
+
+    tensor_spec = {
+        "shape": tensor_info["shape"],
+        "stride": None,  # Let PyTorch compute default stride
+        "storage_offset": 0,
+        "dtype": dtype,
+        "device": "spyre",
+        "init": init,
+    }
+
+    if init_args:
+        tensor_spec["init_args"] = init_args
+
+    return tensor_spec
+
+
 def _convert_captured_input_to_sample_input(inp_spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert captured input spec to sample_inputs_func format."""
-    if inp_spec["type"] == "tensor":
-        # Map dtype string to torch.dtype format
-        dtype = inp_spec["dtype"]
-        if not dtype.startswith("torch."):
-            dtype = f"torch.{dtype}"
+    """
+    Convert captured input spec to sample_inputs_func format.
 
-        # Determine init strategy
-        init = "randn" if inp_spec.get("is_random", True) else "zeros"
-        if "position" in inp_spec["name"].lower() or "ids" in inp_spec["name"].lower():
-            init = "randint"
-            init_args = {"high": 10000}
-        else:
-            init_args = {}
+    Uses pytree utilities to handle single tensors and nested collections uniformly.
+    The key insight: pytree lets us treat single tensors and collections the same way.
+    """
+    inp_name = inp_spec["name"]
+    inp_type = inp_spec["type"]
 
-        tensor_spec = {
-            "tensor": {
-                "shape": inp_spec["shape"],
-                "stride": None,  # Let PyTorch compute default stride
-                "storage_offset": 0,
-                "dtype": dtype,
-                "device": "spyre",
-                "init": init,
-            }
-        }
+    if inp_type == "tensor":
+        # Single tensor - wrap in standard format
+        return {"tensor": _tensor_info_to_spec(inp_spec, inp_name)}
 
-        if init_args:
-            tensor_spec["tensor"]["init_args"] = init_args
-
-        return tensor_spec
-
-    elif inp_spec["type"] == "tuple":
-        # Handle tuples (e.g., position_embeddings)
-        tensor_list = []
-        for item in inp_spec.get("items", []):
-            dtype = item["dtype"]
-            if not dtype.startswith("torch."):
-                dtype = f"torch.{dtype}"
-
-            init = "randn" if item.get("is_random", True) else "zeros"
-
-            tensor_list.append(
-                {
-                    "shape": item["shape"],
-                    "stride": None,
-                    "storage_offset": 0,
-                    "dtype": dtype,
-                    "device": "spyre",
-                    "init": init,
-                }
-            )
+    elif inp_type in ("tuple", "list", "dict", "pytree"):
+        # Collection of tensors - pytree handles all container types uniformly
+        # Convert each tensor in the flattened structure
+        tensor_list = [
+            _tensor_info_to_spec(item, inp_name) for item in inp_spec.get("items", [])
+        ]
 
         return {"tensor_list": tensor_list}
 
@@ -457,19 +468,17 @@ def generate_unified_yaml_config(
         forward_args = []
         forward_kwargs = {}
 
-        # Add forward inputs
+        # Add forward inputs - pytree handles both single tensors and collections
         for inp_spec in module_info.get("inputs", []):
             inp_name = inp_spec["name"]
+            converted = _convert_captured_input_to_sample_input(inp_spec)
+
             # Positional args (arg_0, arg_1, etc.)
             if inp_name.startswith("arg_"):
-                forward_args.append(_convert_captured_input_to_sample_input(inp_spec))
+                forward_args.append(converted)
             else:
                 # Named parameters go to kwargs
-                converted = _convert_captured_input_to_sample_input(inp_spec)
-                if "tensor" in converted:
-                    forward_kwargs[inp_name] = converted
-                elif "tensor_list" in converted:
-                    forward_kwargs[inp_name] = converted
+                forward_kwargs[inp_name] = converted
 
         module_entry = {
             "name": module_info["name"],
