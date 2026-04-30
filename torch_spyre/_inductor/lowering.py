@@ -22,7 +22,7 @@ import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
 
-from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction
@@ -216,7 +216,6 @@ def lower_mm(x, y):
 
     # Handle 3D input with 2D weight (batched matmul)
     if x_ndim == 3 and y_ndim == 2:
-        reduction_type = BATCH_MATMUL_OP  # Use BATCH_MATMUL_OP for 3D×2D
         ranges = [x_size[0], x_size[1], y_size[1]]  # [B, M, N]
 
         def inner_fn(index, reduction_index):
@@ -224,7 +223,6 @@ def lower_mm(x, y):
             (r0,) = reduction_index
             return (x_loader([i0, i1, r0]), y_loader([r0, i2]))
     elif x_ndim == 2 and y_ndim == 2:
-        reduction_type = MATMUL_REDUCTION_OP  # Use MATMUL_REDUCTION_OP for 2D×2D
         ranges = [x_size[0], y_size[1]]
 
         def inner_fn(index, reduction_index):
@@ -242,7 +240,7 @@ def lower_mm(x, y):
         result = lowering.mul(x, y)
     else:
         result = Reduction.create(
-            reduction_type=reduction_type,
+            reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
             dst_dtype=x.get_dtype(),
