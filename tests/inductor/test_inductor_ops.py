@@ -23,7 +23,7 @@ from utils_inductor import (
     make_param_dict,
     unique_randn_along_dim,
 )
-from utils_inductor import compare, compare_with_cpu
+from utils_inductor import compare_with_cpu
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -244,7 +244,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "dim_0": (0, unique_randn_along_dim((3, 7), dim=0)),
                 "dim_1": (1, unique_randn_along_dim((3, 7), dim=1)),
-                #  Disabled because torch-sendnn fails
+                # Disabled: multi-dim reduction not supported
                 # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
@@ -1968,17 +1968,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
 
-        cpu_ops = {
-            torch.cos,  # CPU fallback
-            torch.exp,  # TODO: eager / sendnn results are radically differ from CPU. deeptools bug?
-            torch.sin,  # CPU fallback
-        }
-        if op in cpu_ops:
-            compare_with_cpu(op, x)
-        elif op == torch.neg:
-            compare_with_cpu(op, x)
-        else:
-            compare(op, x)
+        compare_with_cpu(op, x)
 
     def test_bool(self):
         dtype = torch.bool
@@ -2017,10 +2007,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             tiny_value_mask = torch.abs(b) < FP16_EPS
             b[tiny_value_mask] = FP16_EPS
 
-        if a.dtype == torch.float32:
-            compare_with_cpu(op, a, b)
-        else:
-            compare(op, a, b)
+        compare_with_cpu(op, a, b)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):
@@ -2030,9 +2017,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
         if K > (128 // b.element_size()):  # multiple sticks
-            compare(op, a, b, atol=0.1, rtol=0.1)
+            compare_with_cpu(op, a, b, atol=0.1, rtol=0.1)
         else:  # single stick, no need to relax
-            compare(op, a, b)
+            compare_with_cpu(op, a, b)
 
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
@@ -2050,7 +2037,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
-        compare(lambda x, y: torch.add(x[None, :], y), x, y)
+        compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
 
     # Example where base function is not parameterized
     def test_add_broadcast_cpu(self, x, y):
@@ -2109,7 +2096,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             z = x - torch.unsqueeze(x_max, dim=dim)
             return z
 
-        compare(fn, x)
+        compare_with_cpu(fn, x)
 
     def test_t_1d_cpu(self, x):
         compare_with_cpu(lambda x: x.t(), x)
