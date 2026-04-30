@@ -46,7 +46,7 @@ class SpyreStream {
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
   void executeProgramAsync(const KernelArtifacts& arts,
-                           const std::vector<at::Tensor>& args);
+                           const std::vector<at::Tensor>& args) const;
 
   // Conversions
   c10::Stream unwrap() const;

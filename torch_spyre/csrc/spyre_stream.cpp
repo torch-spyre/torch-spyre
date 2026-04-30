@@ -219,8 +219,8 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
   }
 }
 
-void SpyreStream::executeProgramAsync(const KernelArtifacts& arts,
-                                      const std::vector<at::Tensor>& args) {
+void SpyreStream::executeProgramAsync(
+    const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
   // NOTE: Maybe it's better/faster if we know the exact number of arguments
   // as it is tracked inside KerntlArtifacts
   std::vector<const flex::CompositeAddress*> tensor_allocs;
