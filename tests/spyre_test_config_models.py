@@ -471,6 +471,10 @@ InputArg = Union[InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy]
 
 def _parse_input_arg(raw: Any) -> InputArg:
     """Parse one element of edits.inputs.args into the correct InputArg variant."""
+    # Handle already-parsed InputArg objects (from YAML anchors/aliases)
+    if isinstance(raw, (InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy)):
+        return raw
+
     if not isinstance(raw, dict):
         raise ValueError(f"Each args element must be a dict, got {type(raw)}")
     keys = set(raw.keys())
