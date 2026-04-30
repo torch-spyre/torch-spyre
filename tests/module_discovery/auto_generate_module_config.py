@@ -905,6 +905,26 @@ def main():
     with torch.no_grad():
         model(**inputs)
 
+    with torch.no_grad():
+        decode_inputs = {
+            "input_ids": torch.cat(
+                [
+                    inputs["input_ids"],
+                    torch.zeros((inputs["input_ids"].shape[0], 1), dtype=torch.long),
+                ],
+                dim=1,
+            ),
+            "attention_mask": torch.cat(
+                [
+                    inputs["attention_mask"],
+                    torch.ones((inputs["input_ids"].shape[0], 1), dtype=torch.long),
+                ],
+                dim=1,
+            ),
+        }
+
+        _ = model(**decode_inputs)
+
     # Remove hooks
     for handle in handles:
         handle.remove()
