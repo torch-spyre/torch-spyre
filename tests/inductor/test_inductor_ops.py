@@ -506,6 +506,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((1088, 320),),
                     ((320, 320),),
+                    ((49159, 4096),),
                 ]
             ),
         },
@@ -516,8 +517,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((320, 320),),
                     ((49280, 4096),),
                     ((4096, 49280),),
+                    ((49159, 4096),),
                 ]
             ),
+            "expect_fail": ["49159x4096"],
         },
         ("test_transpose_2d", "test_transpose_2d_cpu"): {
             "param_sets": {
@@ -541,7 +544,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     cached_randn((128, 64, 128), abs=True),
                 ),
-            }
+                "large_dim_0_1_nopad": (
+                    0,
+                    1,
+                    cached_randn((769, 4096, 63), abs=True),
+                ),
+                "large_dim_0_2_nopad": (
+                    0,
+                    2,
+                    cached_randn((769, 4096, 63), abs=True),
+                ),
+                "large_dim_1_2_nopad": (
+                    1,
+                    2,
+                    cached_randn((769, 4096, 63), abs=True),
+                ),
+                "large_dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((769, 4096, 64), abs=True),
+                ),
+                "large_dim_0_2": (
+                    0,
+                    2,
+                    cached_randn((769, 4096, 64), abs=True),
+                ),
+                "large_dim_1_2": (
+                    1,
+                    2,
+                    cached_randn((769, 4096, 64), abs=True),
+                ),
+            },
         },
         ("test_transpose_2d_contiguous", "test_transpose_2d_contiguous_cpu"): {
             "param_sets": {
@@ -565,7 +598,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     cached_randn((128, 64, 128), abs=True),
                 ),
-            }
+                "large_dim_0_1_nopad": (
+                    0,
+                    1,
+                    cached_randn((769, 4096, 63), abs=True),
+                ),
+                "large_dim_0_2_nopad": (
+                    0,
+                    2,
+                    cached_randn((769, 4096, 63), abs=True),
+                ),
+                "large_dim_1_2_nopad": (
+                    1,
+                    2,
+                    cached_randn((769, 4096, 63), abs=True),
+                ),
+                "large_dim_0_1": (
+                    0,
+                    1,
+                    cached_randn((769, 4096, 64), abs=True),
+                ),
+                "large_dim_0_2": (
+                    0,
+                    2,
+                    cached_randn((769, 4096, 64), abs=True),
+                ),
+                "large_dim_1_2": (
+                    1,
+                    2,
+                    cached_randn((769, 4096, 64), abs=True),
+                ),
+            },
+            "expect_fail": [
+                "large_dim_0_1",
+                "large_dim_0_1_nopad",
+                "large_dim_0_2",
+                "large_dim_0_2_nopad",
+                "large_dim_1_2",
+                "large_dim_1_2_nopad",
+            ],
         },
         ("test_transpose_3d", "test_transpose_3d_cpu"): {
             "param_sets": {
