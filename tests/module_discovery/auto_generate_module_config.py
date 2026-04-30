@@ -14,10 +14,16 @@ Usage:
 
 import torch
 import argparse
+import yaml
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Set
 from transformers import AutoModel, AutoTokenizer
 from torch.utils._pytree import tree_flatten
+
+
+class PrettyDumper(yaml.SafeDumper):
+    def increase_indent(self, flow=False, indentless=False):
+        return super().increase_indent(flow, False)
 
 
 def _is_special_tensor(name: str) -> bool:
@@ -432,408 +438,148 @@ def _convert_captured_input_to_sample_input(inp_spec: Dict[str, Any]) -> Dict[st
         return {"value": None}
 
 
+def _build_module_entry_dict(
+    module_info: Dict[str, Any], include_complexity_tag: bool = False
+) -> Dict[str, Any]:
+    """
+    Build a module entry dictionary for YAML generation.
+
+    Args:
+        module_info: Captured module information
+        include_complexity_tag: Whether to include complexity tag for complex modules
+
+    Returns:
+        Dictionary representing a module entry for YAML
+    """
+    complexity = classify_module_complexity(module_info)
+
+    # Build constructor_inputs
+    constructor_args = []
+    constructor_kwargs = {}
+
+    for arg_spec in module_info.get("constructor_args", []):
+        constructor_args.append(_convert_constructor_arg_to_sample_input(arg_spec))
+
+    for key, kwarg_spec in module_info.get("constructor_kwargs", {}).items():
+        if kwarg_spec["type"] == "int":
+            constructor_kwargs[key] = kwarg_spec["value"]
+
+    # Build forward_inputs
+    forward_args = []
+    forward_kwargs = {}
+
+    for inp_spec in module_info.get("inputs", []):
+        inp_name = inp_spec["name"]
+        converted = _convert_captured_input_to_sample_input(inp_spec)
+
+        if inp_name.startswith("arg_"):
+            forward_args.append(converted)
+        else:
+            forward_kwargs[inp_name] = converted
+
+    # Build module entry
+    entry = {
+        "name": module_info["name"],
+        "module_path": module_info["module_path"],
+        "description": f"Module: {module_info['module_path']}",
+        "constructor_inputs": {
+            "args": constructor_args if constructor_args else [],
+            "kwargs": constructor_kwargs if constructor_kwargs else {},
+        },
+        "forward_inputs": {
+            "args": forward_args if forward_args else [],
+            "kwargs": forward_kwargs if forward_kwargs else {},
+        },
+    }
+
+    # Add complexity tag if requested and module is complex
+    if include_complexity_tag and complexity == "complex":
+        entry["tags"] = ["complex"]
+
+    return entry
+
+
 def generate_unified_yaml_config(
     captured_modules: List[Dict[str, Any]], model_name: str
 ) -> str:
-    """Generate unified YAML configuration in test_model_ops_v2.py format.
+    """Generate unified YAML configuration using yaml.dump().
 
     This creates a single YAML file with edits.modules.include that contains:
     - Module name and path
     - constructor_inputs: Args/kwargs for module.__init__()
     - forward_inputs: Args/kwargs for module.forward()
-    - Separated format for proper ModuleInput generation
     """
-    # Classify modules
-    simple_modules = []
-    complex_modules = []
-    all_module_entries = []
+    # Build module entries for upstream tests (with complexity tags)
+    upstream_modules = [
+        _build_module_entry_dict(m, include_complexity_tag=True)
+        for m in captured_modules
+    ]
 
-    for module_info in captured_modules:
-        complexity = classify_module_complexity(module_info)
+    # Build module entries for custom tests (without complexity tags)
+    custom_modules = [
+        _build_module_entry_dict(m, include_complexity_tag=False)
+        for m in captured_modules
+    ]
 
-        # Build constructor_inputs (separate from forward inputs)
-        constructor_args = []
-        constructor_kwargs = {}
-
-        # Add constructor args
-        for arg_spec in module_info.get("constructor_args", []):
-            constructor_args.append(_convert_constructor_arg_to_sample_input(arg_spec))
-
-        # Add constructor kwargs
-        for key, kwarg_spec in module_info.get("constructor_kwargs", {}).items():
-            if kwarg_spec["type"] == "int":
-                constructor_kwargs[key] = kwarg_spec["value"]
-
-        # Build forward_inputs (captured during forward pass)
-        forward_args = []
-        forward_kwargs = {}
-
-        # Add forward inputs - pytree handles both single tensors and collections
-        for inp_spec in module_info.get("inputs", []):
-            inp_name = inp_spec["name"]
-            converted = _convert_captured_input_to_sample_input(inp_spec)
-
-            # Positional args (arg_0, arg_1, etc.)
-            if inp_name.startswith("arg_"):
-                forward_args.append(converted)
-            else:
-                # Named parameters go to kwargs
-                forward_kwargs[inp_name] = converted
-
-        module_entry = {
-            "name": module_info["name"],
-            "module_path": module_info["module_path"],
-            "constructor_inputs": {
-                "args": constructor_args,
-                "kwargs": constructor_kwargs,
+    # Build the complete configuration dictionary
+    config = {
+        "test_suite_config": {
+            "files": [
+                {
+                    "path": "${TORCH_ROOT}/test/test_modules.py",
+                    "unlisted_test_mode": "skip",
+                    "tests": [
+                        {
+                            "names": ["*TestModule*::test_forward"],
+                            "mode": "mandatory_success",
+                            "tags": [f"model__{model_name}"],
+                            "edits": {"modules": {"include": upstream_modules}},
+                        }
+                    ],
+                },
+                {
+                    "path": "${TORCH_DEVICE_ROOT}/tests/test_modules_custom.py",
+                    "unlisted_test_mode": "skip",
+                    "tests": [
+                        {
+                            "names": [
+                                "*TestModuleCustom*::test_eager_vs_compile",
+                                "*TestModuleCustom*::test_layout",
+                                "*TestModuleCustom*::test_stride",
+                            ],
+                            "mode": "mandatory_success",
+                            "tags": [f"model__{model_name}", "custom_tests"],
+                            "edits": {"modules": {"include": custom_modules}},
+                        }
+                    ],
+                },
+            ],
+            "global": {
+                "supported_dtypes": [
+                    {"name": "float16", "precision": {"atol": 0.005, "rtol": 0.005}},
+                    {"name": "float32", "precision": {"atol": 0.001, "rtol": 0.001}},
+                ],
+                "input_config": {"seed": 123},
             },
-            "forward_inputs": {
-                "args": forward_args,
-                "kwargs": forward_kwargs,
-            },
-            "complexity": complexity,
         }
+    }
 
-        all_module_entries.append(module_entry)
+    # Generate YAML string with header comments and consistent 2-space indentation
+    header = f"""# Auto-generated unified test configuration for {model_name}
+# Generated by auto_generate_module_config.py
+# Format compatible with PyTorch's test_modules.py (using edits.modules.include)
 
-        if complexity == "simple":
-            simple_modules.append(module_info["name"])
-        else:
-            complex_modules.append(module_info["name"])
+"""
 
-    # Generate YAML
-    yaml_str = f"# Auto-generated unified test configuration for {model_name}\n"
-    yaml_str += "# Generated by auto_generate_module_config.py\n"
-    yaml_str += "# Format compatible with PyTorch's test_modules.py (using edits.modules.include)\n\n"
-    yaml_str += "test_suite_config:\n"
-    yaml_str += "  files:\n"
-    yaml_str += "    - path: ${TORCH_ROOT}/test/test_modules.py\n"
-    yaml_str += "      unlisted_test_mode: skip\n"
-    yaml_str += "      tests:\n"
-    yaml_str += "        - names:\n"
-    yaml_str += "            - '*TestModule*::test_forward'\n"
-    yaml_str += "          mode: mandatory_success\n"
-    yaml_str += "          tags:\n"
-    yaml_str += f"            - model__{model_name}\n"
-    yaml_str += "          edits:\n"
-    yaml_str += "            modules:\n"
-    yaml_str += "              include:\n"
-
-    # Add all modules with their constructor_inputs and forward_inputs
-    for entry in all_module_entries:
-        yaml_str += f"                - name: {entry['name']}\n"
-        yaml_str += f"                  module_path: {entry['module_path']}\n"
-        yaml_str += f"                  description: 'Module: {entry['module_path']}'\n"
-
-        # Add tags based on complexity
-        if entry["complexity"] == "complex":
-            yaml_str += "                  tags: [complex]\n"
-
-        # Constructor inputs
-        yaml_str += "                  constructor_inputs:\n"
-        if entry["constructor_inputs"]["args"]:
-            yaml_str += "                    args:\n"
-            for arg in entry["constructor_inputs"]["args"]:
-                if "tensor" in arg:
-                    yaml_str += "                      - tensor:\n"
-                    tensor = arg["tensor"]
-                    yaml_str += f"                          shape: {tensor['shape']}\n"
-                    if tensor.get("stride"):
-                        yaml_str += (
-                            f"                          stride: {tensor['stride']}\n"
-                        )
-                    yaml_str += f"                          storage_offset: {tensor['storage_offset']}\n"
-                    yaml_str += f"                          dtype: {tensor['dtype']}\n"
-                    yaml_str += (
-                        f"                          device: {tensor['device']}\n"
-                    )
-                    yaml_str += f"                          init: {tensor['init']}\n"
-                    if tensor.get("init_args"):
-                        yaml_str += "                          init_args:\n"
-                        for k, v in tensor["init_args"].items():
-                            yaml_str += f"                            {k}: {v}\n"
-                elif "tensor_list" in arg:
-                    yaml_str += "                      - tensor_list:\n"
-                    for tensor in arg["tensor_list"]:
-                        yaml_str += (
-                            f"                          - shape: {tensor['shape']}\n"
-                        )
-                        yaml_str += (
-                            f"                            dtype: {tensor['dtype']}\n"
-                        )
-                        yaml_str += (
-                            f"                            device: {tensor['device']}\n"
-                        )
-                        yaml_str += (
-                            f"                            init: {tensor['init']}\n"
-                        )
-                elif "value" in arg:
-                    yaml_str += f"                      - value: {arg['value']}\n"
-        else:
-            yaml_str += "                    args: []\n"
-
-        if entry["constructor_inputs"]["kwargs"]:
-            yaml_str += "                    kwargs:\n"
-            for key, value in entry["constructor_inputs"]["kwargs"].items():
-                yaml_str += f"                      {key}: {value}\n"
-        else:
-            yaml_str += "                    kwargs: {}\n"
-
-        # Forward inputs
-        yaml_str += "                  forward_inputs:\n"
-        if entry["forward_inputs"]["args"]:
-            yaml_str += "                    args:\n"
-            for arg in entry["forward_inputs"]["args"]:
-                if "tensor" in arg:
-                    yaml_str += "                      - tensor:\n"
-                    tensor = arg["tensor"]
-                    yaml_str += f"                          shape: {tensor['shape']}\n"
-                    if tensor.get("stride"):
-                        yaml_str += (
-                            f"                          stride: {tensor['stride']}\n"
-                        )
-                    yaml_str += f"                          storage_offset: {tensor['storage_offset']}\n"
-                    yaml_str += f"                          dtype: {tensor['dtype']}\n"
-                    yaml_str += (
-                        f"                          device: {tensor['device']}\n"
-                    )
-                    yaml_str += f"                          init: {tensor['init']}\n"
-                    if tensor.get("init_args"):
-                        yaml_str += "                          init_args:\n"
-                        for k, v in tensor["init_args"].items():
-                            yaml_str += f"                            {k}: {v}\n"
-                elif "tensor_list" in arg:
-                    yaml_str += "                      - tensor_list:\n"
-                    for tensor in arg["tensor_list"]:
-                        yaml_str += (
-                            f"                          - shape: {tensor['shape']}\n"
-                        )
-                        yaml_str += (
-                            f"                            dtype: {tensor['dtype']}\n"
-                        )
-                        yaml_str += (
-                            f"                            device: {tensor['device']}\n"
-                        )
-                        yaml_str += (
-                            f"                            init: {tensor['init']}\n"
-                        )
-                elif "value" in arg:
-                    yaml_str += f"                      - value: {arg['value']}\n"
-
-        else:
-            yaml_str += "                    args: []\n"
-
-        if entry["forward_inputs"]["kwargs"]:
-            yaml_str += "                    kwargs:\n"
-            for key, value in entry["forward_inputs"]["kwargs"].items():
-                if isinstance(value, dict) and "tensor" in value:
-                    yaml_str += f"                      {key}:\n"
-                    yaml_str += "                        tensor:\n"
-                    tensor = value["tensor"]
-                    yaml_str += f"                          shape: {tensor['shape']}\n"
-                    yaml_str += f"                          dtype: {tensor['dtype']}\n"
-                    yaml_str += (
-                        f"                          device: {tensor['device']}\n"
-                    )
-                    yaml_str += f"                          init: {tensor['init']}\n"
-                    if tensor.get("init_args"):
-                        yaml_str += "                          init_args:\n"
-                        for k, v in tensor["init_args"].items():
-                            yaml_str += f"                            {k}: {v}\n"
-                elif isinstance(value, dict) and "tensor_list" in value:
-                    yaml_str += f"                      {key}:\n"
-                    yaml_str += "                        tensor_list:\n"
-                    for tensor in value["tensor_list"]:
-                        yaml_str += (
-                            f"                          - shape: {tensor['shape']}\n"
-                        )
-                        yaml_str += (
-                            f"                            dtype: {tensor['dtype']}\n"
-                        )
-                        yaml_str += (
-                            f"                            device: {tensor['device']}\n"
-                        )
-                        yaml_str += (
-                            f"                            init: {tensor['init']}\n"
-                        )
-                else:
-                    yaml_str += f"                      {key}: {value}\n"
-        else:
-            yaml_str += "                    kwargs: {}\n"
-
-        yaml_str += "\n"
-
-    # Add custom tests section for eager/compile, layout, and stride validation
-    yaml_str += "    # Custom tests for eager/compile, layout, and stride validation\n"
-    yaml_str += "    - path: ${TORCH_DEVICE_ROOT}/tests/test_modules_custom.py\n"
-    yaml_str += "      unlisted_test_mode: skip\n"
-    yaml_str += "      tests:\n"
-    yaml_str += "        - names:\n"
-    yaml_str += "            - '*TestModuleCustom*::test_eager_vs_compile'\n"
-    yaml_str += "            - '*TestModuleCustom*::test_layout'\n"
-    yaml_str += "            - '*TestModuleCustom*::test_stride'\n"
-    yaml_str += "          mode: mandatory_success\n"
-    yaml_str += "          tags:\n"
-    yaml_str += f"            - model__{model_name}\n"
-    yaml_str += "            - custom_tests\n"
-    yaml_str += "          edits:\n"
-    yaml_str += "            modules:\n"
-    yaml_str += "              include:\n"
-
-    # Add all modules again for custom tests (without complexity tags)
-    for entry in all_module_entries:
-        yaml_str += f"                - name: {entry['name']}\n"
-        yaml_str += f"                  module_path: {entry['module_path']}\n"
-        yaml_str += f"                  description: 'Module: {entry['module_path']}'\n"
-
-        # Constructor inputs
-        yaml_str += "                  constructor_inputs:\n"
-        if entry["constructor_inputs"]["args"]:
-            yaml_str += "                    args:\n"
-            for arg in entry["constructor_inputs"]["args"]:
-                if "tensor" in arg:
-                    yaml_str += "                      - tensor:\n"
-                    tensor = arg["tensor"]
-                    yaml_str += f"                          shape: {tensor['shape']}\n"
-                    if tensor.get("stride"):
-                        yaml_str += (
-                            f"                          stride: {tensor['stride']}\n"
-                        )
-                    yaml_str += f"                          storage_offset: {tensor['storage_offset']}\n"
-                    yaml_str += f"                          dtype: {tensor['dtype']}\n"
-                    yaml_str += (
-                        f"                          device: {tensor['device']}\n"
-                    )
-                    yaml_str += f"                          init: {tensor['init']}\n"
-                    if tensor.get("init_args"):
-                        yaml_str += "                          init_args:\n"
-                        for k, v in tensor["init_args"].items():
-                            yaml_str += f"                            {k}: {v}\n"
-                elif "tensor_list" in arg:
-                    yaml_str += "                      - tensor_list:\n"
-                    for tensor in arg["tensor_list"]:
-                        yaml_str += (
-                            f"                          - shape: {tensor['shape']}\n"
-                        )
-                        yaml_str += (
-                            f"                            dtype: {tensor['dtype']}\n"
-                        )
-                        yaml_str += (
-                            f"                            device: {tensor['device']}\n"
-                        )
-                        yaml_str += (
-                            f"                            init: {tensor['init']}\n"
-                        )
-                elif "value" in arg:
-                    yaml_str += f"                      - value: {arg['value']}\n"
-        else:
-            yaml_str += "                    args: []\n"
-
-        if entry["constructor_inputs"]["kwargs"]:
-            yaml_str += "                    kwargs:\n"
-            for key, value in entry["constructor_inputs"]["kwargs"].items():
-                yaml_str += f"                      {key}: {value}\n"
-        else:
-            yaml_str += "                    kwargs: {}\n"
-
-        # Forward inputs
-        yaml_str += "                  forward_inputs:\n"
-        if entry["forward_inputs"]["args"]:
-            yaml_str += "                    args:\n"
-            for arg in entry["forward_inputs"]["args"]:
-                if "tensor" in arg:
-                    yaml_str += "                      - tensor:\n"
-                    tensor = arg["tensor"]
-                    yaml_str += f"                          shape: {tensor['shape']}\n"
-                    if tensor.get("stride"):
-                        yaml_str += (
-                            f"                          stride: {tensor['stride']}\n"
-                        )
-                    yaml_str += f"                          storage_offset: {tensor['storage_offset']}\n"
-                    yaml_str += f"                          dtype: {tensor['dtype']}\n"
-                    yaml_str += (
-                        f"                          device: {tensor['device']}\n"
-                    )
-                    yaml_str += f"                          init: {tensor['init']}\n"
-                    if tensor.get("init_args"):
-                        yaml_str += "                          init_args:\n"
-                        for k, v in tensor["init_args"].items():
-                            yaml_str += f"                            {k}: {v}\n"
-                elif "tensor_list" in arg:
-                    yaml_str += "                      - tensor_list:\n"
-                    for tensor in arg["tensor_list"]:
-                        yaml_str += (
-                            f"                          - shape: {tensor['shape']}\n"
-                        )
-                        yaml_str += (
-                            f"                            dtype: {tensor['dtype']}\n"
-                        )
-                        yaml_str += (
-                            f"                            device: {tensor['device']}\n"
-                        )
-                        yaml_str += (
-                            f"                            init: {tensor['init']}\n"
-                        )
-                elif "value" in arg:
-                    yaml_str += f"                      - value: {arg['value']}\n"
-        else:
-            yaml_str += "                    args: []\n"
-
-        if entry["forward_inputs"]["kwargs"]:
-            yaml_str += "                    kwargs:\n"
-            for key, value in entry["forward_inputs"]["kwargs"].items():
-                if isinstance(value, dict) and "tensor" in value:
-                    yaml_str += f"                      {key}:\n"
-                    yaml_str += "                        tensor:\n"
-                    tensor = value["tensor"]
-                    yaml_str += f"                          shape: {tensor['shape']}\n"
-                    yaml_str += f"                          dtype: {tensor['dtype']}\n"
-                    yaml_str += (
-                        f"                          device: {tensor['device']}\n"
-                    )
-                    yaml_str += f"                          init: {tensor['init']}\n"
-                    if tensor.get("init_args"):
-                        yaml_str += "                          init_args:\n"
-                        for k, v in tensor["init_args"].items():
-                            yaml_str += f"                            {k}: {v}\n"
-                elif isinstance(value, dict) and "tensor_list" in value:
-                    yaml_str += f"                      {key}:\n"
-                    yaml_str += "                        tensor_list:\n"
-                    for tensor in value["tensor_list"]:
-                        yaml_str += (
-                            f"                          - shape: {tensor['shape']}\n"
-                        )
-                        yaml_str += (
-                            f"                            dtype: {tensor['dtype']}\n"
-                        )
-                        yaml_str += (
-                            f"                            device: {tensor['device']}\n"
-                        )
-                        yaml_str += (
-                            f"                            init: {tensor['init']}\n"
-                        )
-                else:
-                    yaml_str += f"                      {key}: {value}\n"
-        else:
-            yaml_str += "                    kwargs: {}\n"
-
-        yaml_str += "\n"
-
-    # Global configuration
-    yaml_str += "  global:\n"
-    yaml_str += "    supported_dtypes:\n"
-    yaml_str += "      - name: float16\n"
-    yaml_str += "        precision:\n"
-    yaml_str += "          atol: 0.005\n"
-    yaml_str += "          rtol: 0.005\n"
-    yaml_str += "      - name: float32\n"
-    yaml_str += "        precision:\n"
-    yaml_str += "          atol: 0.001\n"
-    yaml_str += "          rtol: 0.001\n"
-    yaml_str += "\n"
-    yaml_str += "    input_config:\n"
-    yaml_str += "      seed: 123\n"
-
+    # Use custom Dumper with 2-space indentation for consistency
+    yaml_str = header + yaml.dump(
+        config,
+        Dumper=PrettyDumper,
+        default_flow_style=False,
+        sort_keys=False,
+        indent=2,
+        width=float("inf"),  # Prevent line wrapping
+    )
     return yaml_str
 
 
