@@ -147,7 +147,12 @@ class ScratchPadAllocator:
                     inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
                     inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
                     inp_i_eol = mem_usage[inp_i]["last_usage"]
-                    if inp_i_on_lx and inp_i_size_match and inp_i_lay_match and inp_i_eol:
+                    if (
+                        inp_i_on_lx
+                        and inp_i_size_match
+                        and inp_i_lay_match
+                        and inp_i_eol
+                    ):
                         found_matched_input = True
                         break  # see TODO
                 if found_matched_input:
