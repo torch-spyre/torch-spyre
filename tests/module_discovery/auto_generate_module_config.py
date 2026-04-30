@@ -325,55 +325,6 @@ def get_unique_modules(model) -> Dict[str, Tuple[str, Any]]:
     return unique
 
 
-def classify_module_complexity(module_info: Dict[str, Any]) -> str:
-    """Classify module as 'simple' or 'complex' based on characteristics.
-
-    Simple modules:
-    - Normalization layers (RMSNorm, LayerNorm)
-    - Activation functions (SiLU, GELU)
-    - Simple linear transformations
-
-    Complex modules:
-    - Attention mechanisms (require masks, position embeddings)
-    - Decoder layers (stateful, caching, dropout)
-    - Modules with training/eval differences
-
-    Returns:
-        'simple' or 'complex'
-    """
-    module_name = module_info["name"].lower()
-
-    # Simple modules
-    if any(
-        keyword in module_name
-        for keyword in ["norm", "activation", "silu", "gelu", "relu"]
-    ):
-        return "simple"
-
-    # Check for simple structure (no complex inputs)
-    has_complex_inputs = False
-    for inp in module_info.get("inputs", []):
-        # Tuples (like position_embeddings) indicate complexity
-        if inp.get("type") == "tuple":
-            has_complex_inputs = True
-        # Multiple tensor inputs indicate complexity
-        if (
-            inp.get("name", "").startswith("arg_")
-            and len(module_info.get("inputs", [])) > 2
-        ):
-            has_complex_inputs = True
-
-    # Complex modules
-    if any(keyword in module_name for keyword in ["attention", "attn", "decoder"]):
-        return "complex"
-
-    if has_complex_inputs:
-        return "complex"
-
-    # Default to simple for basic modules (MLP, Linear, etc.)
-    return "simple"
-
-
 def _convert_constructor_arg_to_sample_input(
     arg_spec: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -455,21 +406,16 @@ def _convert_captured_input_to_sample_input(inp_spec: Dict[str, Any]) -> Dict[st
         return {"value": None}
 
 
-def _build_module_entry_dict(
-    module_info: Dict[str, Any], include_complexity_tag: bool = False
-) -> Dict[str, Any]:
+def _build_module_entry_dict(module_info: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build a module entry dictionary for YAML generation.
 
     Args:
         module_info: Captured module information
-        include_complexity_tag: Whether to include complexity tag for complex modules
 
     Returns:
         Dictionary representing a module entry for YAML
     """
-    complexity = classify_module_complexity(module_info)
-
     # Build constructor_inputs
     constructor_args = []
     constructor_kwargs = {}
@@ -509,10 +455,6 @@ def _build_module_entry_dict(
         },
     }
 
-    # Add complexity tag if requested and module is complex
-    if include_complexity_tag and complexity == "complex":
-        entry["tags"] = ["complex"]
-
     return entry
 
 
@@ -526,17 +468,8 @@ def generate_unified_yaml_config(
     - constructor_inputs: Args/kwargs for module.__init__()
     - forward_inputs: Args/kwargs for module.forward()
     """
-    # Build module entries for upstream tests (with complexity tags)
-    upstream_modules = [
-        _build_module_entry_dict(m, include_complexity_tag=True)
-        for m in captured_modules
-    ]
-
-    # Build module entries for custom tests (without complexity tags)
-    custom_modules = [
-        _build_module_entry_dict(m, include_complexity_tag=False)
-        for m in captured_modules
-    ]
+    # Build module entries
+    module_entries = [_build_module_entry_dict(m) for m in captured_modules]
 
     # Build the complete configuration dictionary
     config = {
@@ -550,7 +483,7 @@ def generate_unified_yaml_config(
                             "names": ["*TestModule*::test_forward"],
                             "mode": "mandatory_success",
                             "tags": [f"model__{model_name}"],
-                            "edits": {"modules": {"include": upstream_modules}},
+                            "edits": {"modules": {"include": module_entries}},
                         }
                     ],
                 },
@@ -566,7 +499,7 @@ def generate_unified_yaml_config(
                             ],
                             "mode": "mandatory_success",
                             "tags": [f"model__{model_name}", "custom_tests"],
-                            "edits": {"modules": {"include": custom_modules}},
+                            "edits": {"modules": {"include": module_entries}},
                         }
                     ],
                 },
@@ -727,23 +660,11 @@ def main():
     print(f"\n✓ Generated unified configuration: {output_file}")
 
     # Print module summary
-    simple_count = sum(
-        1
-        for m in capture.get_captured_modules()
-        if classify_module_complexity(m) == "simple"
-    )
-    complex_count = len(capture.get_captured_modules()) - simple_count
-
+    total_modules = len(capture.get_captured_modules())
     print("\n  Module Summary:")
-    print(f"    Simple modules: {simple_count}")
+    print(f"    Total modules captured: {total_modules}")
     for module_info in capture.get_captured_modules():
-        if classify_module_complexity(module_info) == "simple":
-            print(f"      - {module_info['name']}")
-
-    print(f"\n    Complex modules: {complex_count}")
-    for module_info in capture.get_captured_modules():
-        if classify_module_complexity(module_info) == "complex":
-            print(f"      - {module_info['name']}")
+        print(f"      - {module_info['name']}")
 
     print("\nNext steps:")
     print(f"1. Review the generated YAML file: {output_file}")
