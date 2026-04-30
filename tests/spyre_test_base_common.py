@@ -59,6 +59,21 @@ from spyre_test_common_methods_invocations import (
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 
 
+# ---------------------------------------------------------------------------
+# Logging utilities
+# ---------------------------------------------------------------------------
+
+
+def _log_warning(msg: str) -> None:
+    """Write warning message to stderr for visibility during test runs."""
+    os.write(2, f"[OOTDeviceTestBase WARNING] {msg}\n".encode())
+
+
+def _log_error(msg: str) -> None:
+    """Write error message to stderr for visibility during test runs."""
+    os.write(2, f"[OOTDeviceTestBase ERROR] {msg}\n".encode())
+
+
 # Resolve the actual backend name registered for privateuse1.
 # torch._C._get_privateuse1_backend_name() returns e.g. "spyre".
 # This is what slf.device_type will be at test runtime.
@@ -229,7 +244,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         try:
             from torch.testing._internal.common_modules import module_db, ModuleInfo
-        except ImportError:
+        except ImportError as e:
+            _log_warning(
+                f"Cannot register custom modules: torch.testing._internal.common_modules "
+                f"not available: {e}"
+            )
             return
 
         # Get existing module names to avoid duplicates
@@ -243,17 +262,27 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             # Try to import the module class
             module_path = getattr(module_item, "module_path", None)
             if not module_path:
+                _log_warning(
+                    f"Module '{module_name}' has no module_path, skipping registration"
+                )
                 continue
 
             try:
                 # Import the module class
                 parts = module_path.rsplit(".", 1)
                 if len(parts) != 2:
+                    _log_error(
+                        f"Invalid module_path format for '{module_name}': {module_path}"
+                    )
                     continue
                 module_pkg, class_name = parts
                 pkg = __import__(module_pkg, fromlist=[class_name])
                 module_cls = getattr(pkg, class_name)
-            except (ImportError, AttributeError):
+            except (ImportError, AttributeError) as e:
+                _log_error(
+                    f"Failed to import module '{module_name}' from {module_path}: "
+                    f"{type(e).__name__}: {e}"
+                )
                 continue
 
             # Create ModuleInfo and add to module_db
@@ -267,7 +296,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 )
                 module_db.append(module_info)
                 existing_names.add(module_name)
-            except Exception:
+            except Exception as e:
+                _log_error(
+                    f"Failed to create ModuleInfo for '{module_name}': "
+                    f"{type(e).__name__}: {e}"
+                )
                 continue
 
     @classmethod
@@ -281,8 +314,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         """
         try:
             from torch.testing._internal.common_modules import module_db
-        except ImportError:
-            return  # module_db not available
+        except ImportError as e:
+            _log_warning(
+                f"Cannot register module input generators: module_db not available: {e}"
+            )
+            return
 
         for module_name, module_config in module_configs.items():
             if not module_config.has_inline_inputs():
@@ -291,6 +327,10 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             # Find the module in module_db
             matching_modules = [m for m in module_db if m.name == module_name]
             if not matching_modules:
+                _log_warning(
+                    f"Module '{module_name}' not found in module_db, "
+                    f"cannot register input generator"
+                )
                 continue
 
             module_info = matching_modules[0]
@@ -337,20 +377,15 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 if dtype in excluded:
                     return False, f"Excluded dtype: {dtype_str}", False, False
 
-                # if explicitly included via edits
-                # This is the additive path — dtype is IN ADDITION to global.supported_dtypes
-                if dtype in included:
-                    pass  # allow through regardless of global.supported_dtypes
-
-                # Not explicitly included — apply global ceiling
-                # This is the base intersection path:
-                # (global.supported_dtypes ∩ op.dtypes ∩ test.allowed_dtypes)
-                elif cls.GLOBAL_SUPPORTED_DTYPES is not None:
+                if dtype not in included and cls.GLOBAL_SUPPORTED_DTYPES is not None:
                     if dtype not in cls.GLOBAL_SUPPORTED_DTYPES:
                         return False, f"Unsupported dtype: {dtype_str}", False, False
 
-            except ValueError:
-                pass
+            except ValueError as e:
+                _log_warning(
+                    f"Failed to parse dtype '{dtype_str}' in test '{method_name}': {e}"
+                )
+                # Continue with test execution - dtype filtering is optional
 
         # apply force_xfail from op-level config
         # extract op name from method_name — format: test_name_opname_device_dtype
@@ -405,12 +440,18 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         # Union: test-level tags + op-level tags (deduplicated)
         all_tags = tags + [t for t in op_tags if t not in set(tags)]
-        if all_tags and generic_cls is not None:
-            os.write(
-                2,
-                f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
-                f"tags: [{', '.join(all_tags)}]\n".encode(),
-            )
+        if all_tags:
+            if generic_cls is not None:
+                os.write(
+                    2,
+                    f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
+                    f"tags: [{', '.join(all_tags)}]\n".encode(),
+                )
+            else:
+                _log_warning(
+                    f"Test '{name}' has tags {all_tags} but generic_cls is None, "
+                    f"cannot print tag information"
+                )
 
         # op list filtering
         supported_ops = cls._get_supported_ops()
