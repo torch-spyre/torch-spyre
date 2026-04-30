@@ -251,19 +251,12 @@ DTYPE_OP_SHAPES = [
     # (4, 8), # FIXME deeptools accuracy issue #4261
 ]
 
-# FIXME: DtException: Expect valid lower and upper bound parameters
-DTYPE_OP_PAIRS_EXCLUDE = {
-    (torch.float16, torch.float32),
-    (torch.bfloat16, torch.float32),
-}
-
 DTYPE_OP_PAIRS = {
     f"{str(src).replace('torch.', '')}_to_{str(dst).replace('torch.', '')}": (
         src,
         dst,
     )
     for (src, dst) in DtypeOpTable.get_dtype_pairs()
-    if (src, dst) not in DTYPE_OP_PAIRS_EXCLUDE
 }
 
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
