@@ -184,6 +184,10 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
   auto& allocator = SpyreAllocator::instance();
   arts.device_alloc = std::move(allocator.allocate(arts.program_size));
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
+  TORCH_CHECK(arts.program_size <= ctx->composite_addr.total_size(),
+              "Program size (", arts.program_size,
+              ") exceeds allocated device memory (",
+              ctx->composite_addr.total_size(), ")");
   stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
   stream.synchronize();
 
