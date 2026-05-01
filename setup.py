@@ -53,7 +53,6 @@ def check_libflex():
 
 
 ROOT_DIR = Path(__file__).absolute().parent
-CODEGEN_DIR = ROOT_DIR / "codegen"
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
 
 
@@ -149,37 +148,6 @@ class clean(Command):
                 shutil.rmtree(str(path), ignore_errors=True)
 
 
-def run_codegen():
-    import importlib
-    import sys
-
-    is_meta = any(
-        cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
-    )
-
-    if not importlib.util.find_spec("sendnn"):
-        if not is_meta:
-            raise ImportError("sendnn is required for building. Install it first.")
-
-        print("Skipping codegen (sendnn not available, metadata extraction only)")
-        return None
-
-    gen_script = CODEGEN_DIR / "gen.py"
-
-    if not gen_script.exists():
-        raise FileNotFoundError(f"Codegen script not found: {gen_script}")
-
-    print("Running codegen...")
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("gen", gen_script)
-    assert spec is not None
-    assert spec.loader is not None
-    gen = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gen)
-    return gen.generate_and_register_wrappers(CODEGEN_DIR)
-
-
 if __name__ == "__main__":
     import sys
 
@@ -198,11 +166,7 @@ if __name__ == "__main__":
     else:
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-        OUTPUT_CODEGEN_DIR = run_codegen()
-
         sources = list(CSRC_DIR.glob("*.cpp"))
-        if OUTPUT_CODEGEN_DIR:
-            sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
 
         # Filenames that belong to the tiny hooks module.
         # "shared" files are compiled into both _hooks.so and _C.so.

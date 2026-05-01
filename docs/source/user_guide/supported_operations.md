@@ -59,19 +59,19 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.amax` | | Y | Spyre | Compiled only (no eager dispatch) |
 | `torch.amin` | | Y | Spyre | Compiled only (no eager dispatch) |
 | `torch.max` | | Y | Spyre | Compiled only (no eager dispatch) |
-| `torch.linalg.vector_norm` | Y | | Spyre | Eager only (via codegen) |
+| `torch.linalg.vector_norm` | Y | | Spyre | Eager only |
 | **View Ops** | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | |
 | `torch.transpose` | | Y | Spyre | |
-| `torch.t` | Y | Y | Spyre | View op (via codegen) |
+| `torch.t` | Y | Y | Spyre | View op |
 | `torch.permute` | Y | Y | Spyre | |
 | `torch.clone` | | Y | Spyre | Compiled only (with `.contiguous()`) |
 | `torch.contiguous` | | Y | Spyre | Compiled only |
 | `torch.squeeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.unsqueeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.cat` | Y | Y | Spyre | |
-| `torch.stack` | Y | | Spyre | Eager only (via codegen) |
-| `torch.repeat` | Y | | Spyre | Eager only (via codegen, view op) |
+| `torch.stack` | Y | | Spyre | Eager only |
+| `torch.repeat` | Y | | Spyre | Eager only |
 | `torch.expand` | | | Spyre | Planned; not yet implemented |
 | `torch.narrow` / `torch.select` | | | Spyre | Planned; not yet implemented |
 | **Tensor Creation** | | | | |
@@ -91,8 +91,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 >
 > - **Eager** — supported when running operations directly on a Spyre
 >   tensor without `torch.compile`. Eager ops are registered via
->   `codegen_ops.py` (generated at install time from
->   `codegen/inputs/Metadata.yaml`), `torch_spyre/ops/eager.py`, and
+>   `torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py` and
 >   select decompositions.
 > - **Compiled** — supported when using `torch.compile(model, backend="spyre")`.
 > - **Execution** — whether the op runs natively on the Spyre accelerator
@@ -105,8 +104,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 > development.
 >
 > This table reflects the operations validated in the torch-spyre test
-> suite (`tests/inductor/test_inductor_ops.py`) and codegen inputs
-> (`codegen/inputs/Metadata.yaml`) at the time of writing. Coverage
+> suite (`tests/inductor/test_inductor_ops.py`). Coverage
 > grows continuously — check the
 > [test suite](https://github.com/torch-spyre/torch-spyre/tree/main/tests)
 > for the latest state.

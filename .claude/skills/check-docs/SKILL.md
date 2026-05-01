@@ -46,13 +46,8 @@ what is truly tested in the compiled path:
 
 ### 1b. Eager support (direct tensor ops without torch.compile)
 
-Eager support comes from **multiple sources**. The primary source of
-truth is `torch_spyre/codegen_ops.py`, which is **generated at pip
-install time** by `codegen/gen.py` from `codegen/inputs/Metadata.yaml`.
-This file is not checked into the repo — it only exists in an installed
-build. It registers a large number of ATen ops for eager dispatch.
-
-Additional eager op sources:
+Eager support comes from **multiple sources**.
+Eager op sources:
   - `torch_spyre/ops/eager.py` — manually registered ops via
     `@torch.library.register_kernel` (e.g., `mm`, `silu`, `mish`).
   - `torch_spyre/_inductor/decompositions.py` — some decomposed ops
@@ -60,13 +55,8 @@ Additional eager op sources:
     `softplus`, `linear`, and `scaled_dot_product_attention`.
 
 To verify the Eager column:
-  - Read `codegen/inputs/Metadata.yaml` — this is the input to the
-    codegen and lists every op that `codegen_ops.py` will register.
-    Every `operator_name` entry with `template_name: base` is a
-    compute op; entries with `template_name: view` are view ops.
-    This is the best proxy when the generated file is not available.
   - Read `torch_spyre/ops/eager.py` for additional manual registrations
-    (e.g., `mm`, `silu`, `mish`) that supplement codegen_ops.
+    (e.g., `mm`, `silu`, `mish`).
   - Some decompositions in `torch_spyre/_inductor/decompositions.py`
     are also triggered in eager mode: `rms_norm`, `layer_norm`,
     `softplus`, `linear`, and `scaled_dot_product_attention`. These
