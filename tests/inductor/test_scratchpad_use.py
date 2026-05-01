@@ -102,10 +102,6 @@ class TestScratchpadUsage(unittest.TestCase):
         def new_pass(nodes: list[Operation]) -> None:
             for node in nodes:
                 f(node)
-                # if isinstance(node, FusedSchedulerNode):
-                #    new_pass(list(node.get_nodes()))
-                # else:
-                #    f(node)
 
         self.our_pre_scheduling_passes.append(new_pass)
         yield
