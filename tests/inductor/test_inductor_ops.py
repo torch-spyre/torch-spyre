@@ -154,7 +154,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((55, 2), (2, 99)),
                     ((67, 67), (67, 67)),
                     ((67, 255), (255, 128)),
-                ]
+                ],
+                rand_type="xavier",
             ),
         },
         ("test_bmm", "test_mm_relaxed"): {
@@ -167,7 +168,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     # Padding
                     ((2, 55, 2), (2, 2, 99)),
                     ((2, 99, 65), (2, 65, 55)),
-                ]
+                ],
+                rand_type="xavier",
             ),
         },
         ("test_matmul", "test_binary_op_cpu"): {
@@ -195,7 +197,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2, 99, 65), (2, 65, 55)),
                     ((2, 3, 55, 2), (2, 3, 2, 99)),
                     ((2, 3, 99, 65), (2, 3, 65, 55)),
-                ]
+                ],
+                rand_type="xavier",
             ),
         },
         ("test_large_matmul", "test_mm_relaxed"): {
