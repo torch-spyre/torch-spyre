@@ -197,6 +197,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "aten.mm.default should be replaced by bmm after unflatten pass"
         )
 
+    def test_mixed_device_seq(self):
+        model = torch.compile(torch.sin)
+        cpu_1 = torch._inductor.utils.get_code(model, torch.randn(5))[0]
+
+        model = torch.compile(torch.sin)
+        spyre_1 = torch._inductor.utils.get_code(model, torch.randn(5, device="spyre"))[
+            0
+        ]
+
+        torch._dynamo.reset()
+        model = torch.compile(torch.sin)
+        cpu_2 = torch._inductor.utils.get_code(model, torch.randn(5))[0]
+
+        assert cpu_1.split("\n", 1)[1] == cpu_2.split("\n", 1)[1], (
+            "CPU graph should be the same across compilations"
+        )
+        assert spyre_1 != cpu_1, "SPYRE graph should differ from CPU graph"
+
 
 class TestInsertPadding(unittest.TestCase):
     """Unit tests for the insert_padding post-grad FX pass."""
