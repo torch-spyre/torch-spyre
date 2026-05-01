@@ -239,6 +239,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),
             inspect.getfile(scratchpad_planning),

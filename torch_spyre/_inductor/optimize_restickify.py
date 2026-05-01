@@ -218,14 +218,9 @@ class AnyInNode(RestickNodeCost):
         return 0.0
 
 
-def record_stick_decisions(
-    op, out_key: LayoutKey, in_layouts: "list[LayoutKey]"
-) -> None:
-    """Store the optimizer's chosen output layout and input layouts on op for the restickify insertion pass."""
-    op.stick_decisions = {
-        "out_key": out_key,
-        "arg_in_layouts": in_layouts,
-    }
+def record_stick_decisions(op, out_key: LayoutKey) -> None:
+    """Store the optimizer's chosen output layout on op for the restickify insertion pass."""
+    op.stick_decisions = {"out_key": out_key}
 
 
 def optimize_restickify_locations(operations: list) -> None:
@@ -278,13 +273,11 @@ def greedy_local_min_cost(operations: list) -> None:
             if not tb.layouts:
                 raise AssertionError(f"graph input {name} has empty layouts set")
             layout = next(iter(tb.layouts))
-            tb.data.data.layout = layout
             tb.data.data.committed_layout = LayoutKey.from_stl(layout.device_layout)
             tb.committed_layout = tb.data.data.committed_layout
             print(
                 f"MRA input committed: {name} -> {list(tb.committed_layout.stride_map)}"
             )
-            del tb.layouts
 
     for op in operations:
         print("Processing node:", op.get_name())
@@ -345,6 +338,6 @@ def greedy_local_min_cost(operations: list) -> None:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             op.layout = layout
         op.committed_layout = out_key
-        record_stick_decisions(op, out_key, in_layouts)
+        record_stick_decisions(op, out_key)
 
     _print_op_layouts(operations, "after")

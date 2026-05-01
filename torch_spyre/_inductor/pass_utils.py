@@ -269,7 +269,7 @@ def apply_splits_from_index_coeff(
     return result
 
 
-# The following restickify helpers are use only by the restickify
+# The following restickify helpers are used only by the restickify
 # but are here to avoid circular dependences in those files
 
 

@@ -52,6 +52,7 @@ from .pass_utils import (
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import matching_dim
+
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
 # concretize_expr calls in this file can be removed.
@@ -348,10 +349,9 @@ def _multi_arg_pointwise_layouts(
         if device_coordinates(layout, arg.dep)[-1] != 0
     }
     print("MRA: stick_exprs (from all layouts):", stick_exprs)
-    stick_expr = next(iter(stick_exprs)) if stick_exprs else None
 
     if len(stick_exprs) > 1:
-        logger.warning(
+        logger.info(
             f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
         )
 
@@ -375,7 +375,7 @@ def _multi_arg_pointwise_layouts(
 
     results: list[FixedTiledLayout] = []
     # Sort stick exprs for determinism
-    for stick_expr in sorted(stick_exprs, key=str) if stick_exprs else [None]:
+    for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else [None]:
         if can_use_same_layout:
             template_stl = next(iter(args[0].layouts)).device_layout
             stl = SpyreTensorLayout(

@@ -19,7 +19,7 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .optimize_restickify import FixedInOutNode, LayoutKey
 from .pass_utils import host_coordinates, device_coordinates
-from .propagate_layouts import compute_restickify_target_layout
+from .pass_utils import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -223,9 +223,14 @@ def finalize_layouts(operations: list) -> None:
             and isinstance(tb.data.data, InputBuffer)
             and hasattr(tb, "layouts")
         ):
-            chosen = next(iter(tb.layouts))
-            tb.data.data.layout = chosen
-            tb.data.data.committed_layout = LayoutKey.from_stl(chosen.device_layout)
+            ib = tb.data.data
+            assert hasattr(ib, "committed_layout"), (
+                f"graph input {name} has no committed_layout — optimizer did not run"
+            )
+            ib.layout = next(
+                lo for lo in tb.layouts
+                if LayoutKey.from_stl(lo.device_layout) == ib.committed_layout
+            )
             del tb.layouts
 
     restickify_plan: dict = defaultdict(list)
@@ -266,7 +271,7 @@ def finalize_layouts(operations: list) -> None:
             print(
                 f"    -> scheduling restickify {list(in_key.stride_map)} -> {list(req_key.stride_map)}"
             )
-            logger.warning(
+            logger.info(
                 f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
                 f"{list(in_key.stride_map)} -> {list(req_key.stride_map)} "
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
@@ -316,7 +321,7 @@ def finalize_layouts(operations: list) -> None:
                 f"    -> scheduling restickify {list(in_key.stride_map)} "
                 f"-> {list(target_key.stride_map)}"
             )
-            logger.warning(
+            logger.info(
                 f"Injecting restickify on {op.get_name()} input {dep.name}: "
                 f"{list(in_key.stride_map)} -> {list(target_key.stride_map)} "
                 f"target_stride_map={list(tgt.device_layout.stride_map)}"
