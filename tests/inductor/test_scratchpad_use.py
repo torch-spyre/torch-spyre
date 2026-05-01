@@ -115,6 +115,11 @@ class TestScratchpadUsage(unittest.TestCase):
         def visitor(node: Operation) -> None:
             nonlocal mem_usages
             mem_usage = mem_usage_by_op(node)
+            mem_usage = {
+                key: value
+                for key, value in mem_usage.items()
+                if isinstance(value, dict)
+            }
             for buffer_name, usage in mem_usage.items():
                 buffer = V.graph.get_buffer(buffer_name)
                 layout = buffer.get_layout()
