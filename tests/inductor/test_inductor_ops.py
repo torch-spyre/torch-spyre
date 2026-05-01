@@ -20,10 +20,11 @@ from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
     cached_xavier,
+    compare,
+    compare_with_cpu,
     make_param_dict,
     unique_randn_along_dim,
 )
-from utils_inductor import compare, compare_with_cpu
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -145,7 +146,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_mm", "test_mm_relaxed"): {
             "ops_dict": {
                 "mm": torch.mm,
-                # "einsum": lambda a, b: torch.einsum('mk, kn -> mn', a, b),  # bmm not supported yet
             },
             "param_sets": make_param_dict(
                 [
@@ -156,6 +156,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 255), (255, 128)),
                 ]
             ),
+        },
+        ("test_einsum", "test_mm_relaxed"): {
+            "ops_dict": {
+                "einsum": lambda a, b: torch.einsum("mk, kn -> mn", a, b),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((67, 256), (256, 128)),
+                    ((55, 2), (2, 99)),
+                    ((67, 67), (67, 67)),
+                    ((67, 255), (255, 128)),
+                ]
+            ),
+            "expect_fail": [
+                "67x256_256x128",
+                "55x2_2x99",
+                "67x67_67x67",
+                "67x255_255x128",
+            ],
         },
         ("test_bmm", "test_mm_relaxed"): {
             "ops_dict": {"bmm": torch.bmm},
@@ -224,15 +243,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_0": (0, cached_randn((63, 129))),
                 "2d_1": (1, cached_randn((63, 129))),
-                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
-                # "2d_01": ((0, 1), cached_randn((63, 129))),
+                "2d_01": ((0, 1), cached_randn((63, 129))),
                 "3d_0": (0, cached_randn((3, 7, 9))),
                 "3d_1": (1, cached_randn((3, 7, 9))),
                 "3d_2": (2, cached_randn((3, 7, 9))),
                 "3d_01": ((0, 1), cached_randn((3, 7, 9))),
                 "3d_12": ((1, 2), cached_randn((3, 7, 9))),
-                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
-                # "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
+                "3d_012": ((0, 1, 2), cached_randn((3, 7, 9))),
                 "4d_0": (0, cached_randn((3, 7, 9, 32))),
                 "4d_1": (1, cached_randn((3, 7, 9, 32))),
                 "4d_2": (2, cached_randn((3, 7, 9, 32))),
@@ -244,8 +261,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "dim_0": (0, unique_randn_along_dim((3, 7), dim=0)),
                 "dim_1": (1, unique_randn_along_dim((3, 7), dim=1)),
-                #  Disabled because torch-sendnn fails
-                # "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
+                "dim_01": ([0, 1], torch.ones((3, 7), dtype=torch.float16)),
             },
         },
         ("test_amax_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -271,8 +287,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_dim_neg1": (-1, cached_randn((3, 7, 9))),
                 "3d_dim_neg12": ((-1, -2), cached_randn((3, 7, 9))),
                 # 0D / scalar tensor
-                # "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)), #TODO
+                "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
+            "expect_fail": ["scalar_tensor"],
         },
         ("test_amax_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {"amax": torch.amax},
@@ -343,24 +360,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
-        # TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
-        # Spyre represents scalars as 1D tensors [1], while CPU uses 0D tensors.
-        # This inconsistency causes shape mismatches when moving tensors from Spyre to CPU.
-        # See: https://github.com/torch-spyre/torch-spyre/issues/1172
-        # ("test_max_default", "test_reduce_cpu"): {
-        #        "ops_dict": {
-        #            "max": torch.max,
-        #        },
-        #        "param_sets": {
-        #            "1d_float16": (unique_randn_along_dim((64,), dtype=torch.float16),),
-        #            "2d_float16": (unique_randn_along_dim((8, 64), dtype=torch.float16),),
-        #            "3d_float16": (
-        #                unique_randn_along_dim((2, 4, 64), dtype=torch.float16),
-        #            ),
-        #            "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
-        #            "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
-        #        },
-        #    },
+        ("test_max_default", "test_reduce_cpu"): {
+            "ops_dict": {
+                "max": torch.max,
+            },
+            "param_sets": {
+                "1d_float16": (unique_randn_along_dim((64,), dtype=torch.float16),),
+                "2d_float16": (unique_randn_along_dim((8, 64), dtype=torch.float16),),
+                "3d_float16": (
+                    unique_randn_along_dim((2, 4, 64), dtype=torch.float16),
+                ),
+                "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
+                "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
+            },
+            "expect_fail": [
+                "1d_float16",
+                "2d_float16",
+                "3d_float16",
+                "1d_int64",
+                "2d_int64",
+            ],
+        },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu_no_eager"): {
             "ops_dict": {
@@ -451,16 +471,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
                 "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
-                # "2d_dim_01": ([0, 1], cached_randn((67, 256))), # spyre scalar represented as 1d instead of 0d
-                # "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)), # layout needs repermutation
+                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                "3d_dim_0": (0, cached_randn((67, 71, 256), scale=0.01)),
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.01)),
                 "3d_dim_2": (
                     2,
                     cached_randn((67, 71, 256), scale=0.01),
                 ),  # sparse tensor output
-                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
-                # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
-                # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)), # spyre scalar represented as 1d instead of 0d
+                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.01)),
+                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.01)),
             },
         },
         ("test_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
@@ -470,17 +489,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_dim_0": (0, cached_randn((67, 256))),
                 "2d_dim_1": (1, cached_randn((67, 256))),  # sparse tensor output
-                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
-                # "2d_dim_01": ([0, 1], cached_randn((67, 256))),
+                "2d_dim_01": ([0, 1], cached_randn((67, 256))),
                 "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
                 "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.1)),
                 "3d_dim_2": (
                     2,
                     cached_randn((67, 71, 256), scale=0.1),
                 ),  # sparse tensor output
-                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
-                # "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
-                # "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
+                "3d_dim_01": ([0, 1], cached_randn((67, 71, 256), scale=0.1)),
+                "3d_dim_012": ([0, 1, 2], cached_randn((67, 71, 256), scale=0.1)),
                 "4d_dim_0": (0, cached_randn((6, 7, 12, 256), scale=0.1)),
                 "4d_dim_1": (1, cached_randn((6, 7, 12, 256), scale=0.1)),
                 "4d_dim_2": (2, cached_randn((6, 7, 12, 256), scale=0.1)),
@@ -1276,9 +1293,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_bool": (cached_randn((1, 2, 4, 128), dtype=torch.float16) > 0,),
                 "fp16_single_elem": (cached_randn(1, dtype=torch.float16),),
                 "bool_single_elem": (cached_randn(1, dtype=torch.float16) > 0,),
-                # TODO: Fix torch.eq(-0.0,0.0) equality bug (Issue 628)
-                # "fp16_signed_0": (torch.tensor([0.0, -0.0, 1.0, -1.0], dtype=torch.float16),),
+                "fp16_signed_0": (
+                    torch.tensor([0.0, -0.0, 1.0, -1.0], dtype=torch.float16),
+                ),
             },
+            "expect_fail": ["fp16_signed_0"],
         },
         (
             "test_inplace_op",
@@ -1327,11 +1346,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.zeros(128, dtype=torch.bool),  # bool tensor
                     (cached_randn((128,)) > 0),  # bool tensor
                 ),
-                # TODO: Copying bool tensors to host is not working yet. See issue #488.
-                # "float2bool": (
-                #     torch.zeros(128, dtype=torch.bool),  # bool tensor
-                #     (cached_randn((128,)) > 0).to(dtype=torch.float16),  # float tensor
-                # ),
+                "float2bool": (
+                    torch.zeros(128, dtype=torch.bool),  # bool tensor
+                    (cached_randn((128,)) > 0).to(dtype=torch.float16),  # float tensor
+                ),
                 "bool2float": (
                     torch.zeros(128, dtype=torch.float16),  # float tensor
                     cached_randn((128,)) > 0,  # bool tensor
@@ -1341,6 +1359,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256, 128)).t(),
                 ),
             },
+            "expect_fail": ["float2bool"],
         },
         (
             "test_inplace_copy_noncontiguous",
@@ -1413,10 +1432,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d0": (0, cached_randn((2, 3, 4, 128))),
                 "4d1": (1, cached_randn((2, 3, 4, 128))),
                 "4d2": (2, cached_randn((2, 3, 4, 128))),
-                # TODO: Support sparse tensors
-                # "3d2": (2, cached_randn((3, 4, 128))),
-                # "2d1": (1, cached_randn((4, 128))),
-                # "4d3": (3, cached_randn((2, 3, 4, 128))),
+                "3d2": (2, cached_randn((3, 4, 128))),
+                "2d1": (1, cached_randn((4, 128))),
+                "4d3": (3, cached_randn((2, 3, 4, 128))),
             },
         },
         (
@@ -1483,11 +1501,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d0": (0, cached_randn((2, 3, 4, 128)), cached_randn((3, 4, 128))),
                 "3d1": (1, cached_randn((2, 3, 4, 128)), cached_randn((2, 4, 128))),
                 "3d2": (2, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 128))),
-                # TODO: Support dim=-1 for broadcasting. See: #598
-                # "1d1": (1, cached_randn((4, 128)), cached_randn((4,))),
-                # "2d2": (2, cached_randn((3, 4, 128)), cached_randn((3, 4))),
-                # "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
+                "1d1": (1, cached_randn((4, 128)), cached_randn((4,))),
+                "2d2": (2, cached_randn((3, 4, 128)), cached_randn((3, 4))),
+                "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
             },
+            "expect_fail": ["1d1", "2d2", "3d3"],
         },
         ("test_attention", "test_attention_cpu"): {
             "param_sets": {
@@ -1830,35 +1848,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     True,
                 ),
-                # TODO(aviros): Implement broadcast for batch dim in batch matmul
-                # "mha_decode": (
-                #     cached_randn(
-                #         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
-                #     ),
-                #     False,
-                #     False,
-                # ),
-                # TODO(aviros): Implement broadcast for batch dim in batch matmul, expand
-                # "gqa_decode": (
-                #     cached_randn(
-                #         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
-                #     ),
-                #     cached_randn(
-                #         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
-                #     ),
-                #     False,
-                #     True,
-                # ),
-            }
+                "mha_decode": (
+                    cached_randn(
+                        (2, 1, 32, 128), differentiation=1, dtype=torch.float16
+                    ),
+                    cached_randn(
+                        (2, 257, 32, 128), differentiation=2, dtype=torch.float16
+                    ),
+                    cached_randn(
+                        (2, 257, 32, 128), differentiation=3, dtype=torch.float16
+                    ),
+                    False,
+                    False,
+                ),
+                "gqa_decode": (
+                    cached_randn(
+                        (2, 1, 32, 128), differentiation=1, dtype=torch.float16
+                    ),
+                    cached_randn(
+                        (2, 257, 8, 128), differentiation=2, dtype=torch.float16
+                    ),
+                    cached_randn(
+                        (2, 257, 8, 128), differentiation=3, dtype=torch.float16
+                    ),
+                    False,
+                    True,
+                ),
+            },
+            "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
@@ -2048,10 +2065,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             torch.nn.functional.linear, x, weight, bias, atol=3e-1, rtol=2e-1
         )
 
-    @unittest.skip("deeptools: error")
-    def test_add_broadcast(self, x, y):
-        compare(lambda x, y: torch.add(x[None, :], y), x, y)
-
     # Example where base function is not parameterized
     def test_add_broadcast_cpu(self, x, y):
         compare_with_cpu(lambda x, y: torch.add(x[None, :], y), x, y)
@@ -2060,10 +2073,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
         compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
 
-    # @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    # @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
-    # def test_reduce_cpu(self, op, x):
-    #    compare_with_cpu(lambda x: op(x), x)
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_reduce_cpu(self, op, x):
+        compare_with_cpu(lambda x: op(x), x)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
@@ -2240,7 +2253,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, x)
 
-    @unittest.skip("dtype override may not be supported on Spyre")
     def test_empty_like_dtype_override_cpu(self, x):
         """Test empty_like with dtype override (fp16->fp32 or fp32->fp16)."""
         # Determine target dtype (opposite of input)
