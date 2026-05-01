@@ -168,12 +168,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 255), (255, 128)),
                 ]
             ),
-            "expect_fail": [
-                "67x256_256x128",
-                "55x2_2x99",
-                "67x67_67x67",
-                "67x255_255x128",
-            ],
         },
         ("test_bmm", "test_mm_relaxed"): {
             "ops_dict": {"bmm": torch.bmm},
