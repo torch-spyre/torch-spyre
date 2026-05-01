@@ -66,6 +66,9 @@ When opening an issue, include:
 - [ ] `spyre_trace.json` or the TensorBoard log directory
 - [ ] Summary table printed by `prof.key_averages().table(...)`
 - [ ] What you expected vs. what you saw (latency or throughput)
+- [ ] **For a performance regression**, cite the previous metric — the
+  numeric value, the build date or commit SHA it was measured on, and
+  the workload type — so the regression window is unambiguous.
 
 ## See also
 

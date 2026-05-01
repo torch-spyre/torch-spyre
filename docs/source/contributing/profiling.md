@@ -48,10 +48,13 @@ Keep `<short-description>` to **3–5 hyphenated words**. `cmake-libaiupti`
 is about right. `sol` is too terse to read at a glance, and
 `tex-scratchpad-vram-sol-average` should be split into smaller PRs.
 
-## Commit message prefix
+## PR title prefix
 
-Prefix every commit with `[profiler]` so it is easy to slice profiler work
-out of `git log`. Stack a sub-area tag when one is obvious:
+Prefix the **PR title** with `[profiler]` so it is easy to slice profiler
+work out of `git log` after merge. Because we squash-merge, the PR title
+becomes the single commit message landed on `main` — there is no need to
+prefix every individual commit on the feature branch. Stack a sub-area
+tag when one is obvious:
 
 ```text
 [profiler] Add profile_spyre() context manager
@@ -60,6 +63,12 @@ out of `git log`. Stack a sub-area tag when one is obvious:
 [profiler][test] Add scaffold with USE_SPYRE_PROFILER skip markers
 [profiler][docs] Document kineto-spyre wheel install
 ```
+
+Tooling that slices profiler work looks for this tag in `main` history
+(merged work) and in `profiler/*` branches (in-flight work), so the
+branch prefix plus the PR title prefix together are enough — individual
+commits on the branch can carry whatever message is most useful while
+you iterate.
 
 Sign off your commits (`git commit -s`) like every other torch-spyre
 commit.
@@ -117,7 +126,7 @@ pytest tests/profiler/test_spyre_profiler.py -k activity
 pytest tests/profiler/test_spyre_profiler.py -k trace
 ```
 
-Smoke checks before you open a PR:
+Smoke test validation before you open a PR:
 
 1. `import torch_spyre.profiler` succeeds with `USE_SPYRE_PROFILER=0`.
 2. `tests/profiler/` passes with the kineto-spyre wheel installed.
@@ -138,6 +147,25 @@ metrics, attach one of the following to the PR description:
 
 This is the most common review request on profiler PRs. Including it up
 front saves a round trip.
+
+:::{tip}
+**Cross-check with `chrome://tracing` when validating event ordering.**
+Perfetto silently truncates overlapping events on the same thread — two
+events that overlap (which is impossible within a single thread and
+indicates a real bug) are rendered as a single clean span, hiding the
+problem. `chrome://tracing` instead renders the overlap as garbled,
+intermingled labels, which makes the bug obvious. Using it has two
+benefits for "is the trace correct?" reviews:
+
+1. Overlapping/interleaved events on the same thread are visible
+   instead of hidden.
+2. It runs locally — your trace data does not transit a third-party web
+   service.
+
+Use Perfetto for analysis and presentation, but reach for
+`chrome://tracing` when you specifically need to verify that no two
+events on the same thread overlap.
+:::
 
 ## Coordinating with kineto-spyre
 

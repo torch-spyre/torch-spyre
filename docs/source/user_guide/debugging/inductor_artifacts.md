@@ -45,7 +45,7 @@ torch_compile_debug/
             ├── ir_pre_fusion.txt                               ← LoopLevelIR before fusion
             ├── ir_post_fusion.txt                              ← LoopLevelIR after fusion
             ├── output_code.py                                  ← generated host code
-            └── sdsc.json                                       ← spec fed to DeepTools backend
+            └── sdsc_<index>.json                               ← per-kernel specs fed to DeepTools backend
 ```
 
 ## What each layer tells you
@@ -75,9 +75,12 @@ answers:
 Mismatches here typically indicate a bug in Inductor lowering or in
 stickification.
 
-### `sdsc.json`
+### `sdsc_<index>.json`
 
-The final specification handed to the DeepTools back-end. Encodes:
+The final specifications handed to the DeepTools back-end — one
+`sdsc_<index>.json` per compiled kernel in the graph (e.g.,
+`sdsc_0.json`, `sdsc_1.json`, …), indexed in lowering order. Each file
+encodes:
 
 - Op name (e.g., `clone`, `bmm`, `layernorm`)
 - Input/output tensor layouts (`device_size`, `stride_map`,
@@ -85,9 +88,10 @@ The final specification handed to the DeepTools back-end. Encodes:
 - Work division (how cores split the op)
 - Scratchpad allocations
 
-Bugs that only show up in the final output frequently trace back to
-`sdsc.json` — this is the first file to check when a kernel produces
-the wrong numeric result.
+Bugs that only show up in the final output frequently trace back to one
+of these files — when a kernel produces the wrong numeric result, find
+the corresponding `sdsc_<index>.json` (cross-reference `output_code.py`
+to map kernel index → op) and inspect it first.
 
 ### `inductor_provenance_tracking_node_mappings.json`
 
@@ -138,7 +142,7 @@ INDUCTOR_PROVENANCE=1 \
 python my_reproducer.py
 
 # Locate the artifacts
-find . -name "sdsc.json" 2>/dev/null
+find . -name "sdsc_*.json" 2>/dev/null
 find /tmp -name "fx_graph_readable.py" 2>/dev/null
 ```
 
