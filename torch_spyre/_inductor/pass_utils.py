@@ -269,6 +269,10 @@ def apply_splits_from_index_coeff(
     return result
 
 
+# The following restickify helpers are use only by the restickify
+# but are here to avoid circular dependences in those files
+
+
 def restickify_device_size(
     old_device_size: list,
     old_sd_outer_dim: int,
@@ -277,7 +281,8 @@ def restickify_device_size(
     new_sd_host_size: int,
     stick_size: int,
 ) -> list:
-    """Compute device_size after moving the stick from old_sd to new_sd."""
+    """Computes the new device size after a restickify is performed
+    moving the stick from old_sd to new_sd."""
     assert new_sd_host_size % stick_size == 0, (
         f"Cannot move stick to dimension with size {new_sd_host_size}: "
         f"without padding since not a multiple of stick_size={stick_size}"
@@ -297,7 +302,7 @@ def restickify_stride_map(
     new_sd_host_stride: int,
     stick_size: int,
 ) -> list:
-    """Compute stride_map after moving the stick from old_sd to new_sd."""
+    """Computes the new stride_map after a restickify is performed moving the stick from old_sd to new_sd."""
     new_stride_map = list(old_stride_map)
     new_stride_map[-1] = new_sd_host_stride
     new_stride_map[old_sd_outer_dim] = new_sd_host_stride * stick_size
@@ -311,7 +316,9 @@ def compute_restickify_target_layout(
     ic: list,
     idc: list,
 ) -> "FixedTiledLayout | None":
-    """Pure. Returns target layout, or None if restickify is infeasible."""
+    """Compute the target FixedTiledLayout that results from moving layout's stick to target_stick_expr.
+    Returns None if the restickify is infeasible.
+    """
     dl = layout.device_layout
     new_sd = matching_dim(ic, target_stick_expr)
     if new_sd is None:

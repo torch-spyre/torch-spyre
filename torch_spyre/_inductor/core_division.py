@@ -507,11 +507,11 @@ def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
 ) -> tuple[list[TensorDep], TensorDep]:
     """Build TensorDep lists for inputs and the output of op."""
-    input_tds = [TensorDep(a.dep, a.layout) for a in args]
+    # SchedNodeArg.layout is Optional, but collect_tensor_deps is only called after
+    # finalize_layouts has committed a FixedTiledLayout to every arg.
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]  # type: ignore[arg-type]
     rw = op.get_read_writes()
-    # finalize_layouts has already committed a FixedTiledLayout to every op by this
-    # point, so _resolve_layout is guaranteed non-None here.
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))  # type: ignore[arg-type]
+    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
     return input_tds, output_td
 
 

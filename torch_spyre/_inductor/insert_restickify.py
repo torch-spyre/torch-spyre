@@ -327,5 +327,3 @@ def finalize_layouts(operations: list) -> None:
     print(
         f"MRA finalize_layouts: set restickify_plan id={id(V.graph.restickify_plan)} keys={list(restickify_plan.keys())}"
     )
-
-
