@@ -33,7 +33,6 @@ repos:
         args:
           - --filter=-whitespace/braces,-whitespace/indent_namespace,-build/include_order,-build/include_subdir
           - --extensions=cpp,h
-          - --exclude=codegen/inputs/RegistrationDeclarations.h
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.11.1
     hooks:

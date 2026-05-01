@@ -78,8 +78,8 @@ def register_spyre_decomposition(
         # 2. For aten ops, also register via PrivateUse1 dispatch key (for eager mode).
         #    Non-aten ops (e.g. spyre::compact) are custom Spyre ops that don't need
         #    PrivateUse1 kernel registration.
-        #    Skip ops that already have a PrivateUse1 kernel (e.g. from codegen_ops.py
-        #    or eager.py) to avoid registration conflicts.
+        #    Skip ops that already have a PrivateUse1 kernel (e.g. from eager.py) to
+        #    avoid registration conflicts.
         ops_list = ops if isinstance(ops, list) else [ops]
         aten_ops = [
             op
