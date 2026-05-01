@@ -50,7 +50,7 @@ from .pass_utils import (
     device_coordinates,
     iter_var_id,
 )
-from .optimize_restickify import AllSameNode, FixedInOutNode
+from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import matching_dim
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -450,6 +450,15 @@ def compute_layouts(
         ]
         op.restick_cost_fn = AllSameNode.from_args(args[:1], layouts, output_dep)
         return layouts
+
+    if aten_op == aten.clone.default:
+        # clone materializes a new buffer in a fixed row-major layout regardless of
+        # input stick — equivalent to a restickify. No restickify before it is needed.
+        layout = _single_arg_op_layout(
+            op, output, output_dep, args[0].dep, next(iter(args[0].layouts))
+        )
+        op.restick_cost_fn = AnyInNode.from_args()
+        return [layout]
 
     # All other single arg ops
     layouts = [

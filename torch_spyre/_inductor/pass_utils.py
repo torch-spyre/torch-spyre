@@ -280,7 +280,7 @@ def restickify_device_size(
     """Compute device_size after moving the stick from old_sd to new_sd."""
     assert new_sd_host_size % stick_size == 0, (
         f"Cannot move stick to dimension with size {new_sd_host_size}: "
-        f"not a multiple of stick_size={stick_size}"
+        f"without padding since not a multiple of stick_size={stick_size}"
     )
     new_device_size = list(old_device_size)
     new_device_size[-1] = stick_size

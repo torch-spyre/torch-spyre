@@ -203,6 +203,21 @@ class FixedInOutNode(RestickNodeCost):
         return total
 
 
+class AnyInNode(RestickNodeCost):
+    """Cost node for ops that accept any input layout and produce a fixed output layout.
+
+    Used for aten.clone.default: the clone materializes a new buffer in the output
+    layout regardless of input stick, so no restickify is ever needed before it.
+    """
+
+    @classmethod
+    def from_args(cls):
+        return cls(edge_costs=[])
+
+    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
+        return 0.0
+
+
 def record_stick_decisions(
     op, out_key: LayoutKey, in_layouts: "list[LayoutKey]"
 ) -> None:
