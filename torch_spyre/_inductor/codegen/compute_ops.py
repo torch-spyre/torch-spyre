@@ -409,7 +409,7 @@ def generate_sdsc(sdsc_spec):
                                 "inputLabeledDs": [
                                     f"Tensor{i}-idx{i}"
                                     for i in range(sdsc_spec.num_inputs)
-                                ],
+                                ] + ([f"Tensor{out_idx}-idx{out_idx}"] if sdsc_spec.num_inputs < len(sdsc_spec.args) else []),
                                 "outputLabeledDs": [f"Tensor{out_idx}-idx{out_idx}"],
                             }
                         ],
