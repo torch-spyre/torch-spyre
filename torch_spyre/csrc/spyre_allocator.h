@@ -19,9 +19,7 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
-#include <flex/allocator/alloc_address.hpp>
-#include <flex/allocator/flex_allocator.hpp>
-#include <flex/device_types/device_memory_allocator.hpp>
+#include <flex/flex.hpp>
 #include <memory>
 #include <utility>
 
