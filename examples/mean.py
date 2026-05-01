@@ -4,7 +4,7 @@ import torch
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
-x = torch.rand(128, 64, dtype=torch.float32)
+x = torch.rand(128, 64, dtype=torch.float16)
 
 cpu_result = torch.mean(x, dim=0)
 
