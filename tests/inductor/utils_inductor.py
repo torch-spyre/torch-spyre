@@ -15,6 +15,7 @@
 import functools
 import torch
 import os
+import pytest
 
 DEVICE = torch.device("spyre")
 
@@ -420,6 +421,7 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
+            expect_fail = cases.get("expect_fail", [])
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -446,6 +448,10 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
+                        if test_case in expect_fail:
+                            namespace[test_name] = pytest.mark.xfail(
+                                reason=f"Expected fail for {test_case}", strict=True
+                            )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -467,6 +473,10 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
+                    if test_case in expect_fail:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Expected fail for {test_case}", strict=True
+                        )(namespace[test_name])
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
@@ -623,36 +633,3 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
         target = _compile_and_run(fn, args, DEVICE)
     pytorch_result = fn_pytorch(*args)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
-
-
-def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False, target=None):
-    """Compare compiled Spyre execution against sendnn backend execution."""
-    if target is None:
-        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
-    sendnn_result = _compile_and_run(fn, args, "cpu", backend="sendnn")
-    _assert_results_close(target, sendnn_result, atol, rtol, "sendnn")
-
-
-def compare(
-    fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
-):
-    """3-way comparison: compiled Spyre vs uncompiled CPU vs sendnn backend."""
-    spyre_compiled_result = _compile_and_run(
-        fn, args, DEVICE, needs_device=needs_device
-    )
-    compare_with_cpu(
-        fn,
-        *args,
-        atol=cpu_atol,
-        rtol=cpu_rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )
-    compare_with_sendnn(
-        fn,
-        *args,
-        atol=atol,
-        rtol=rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )

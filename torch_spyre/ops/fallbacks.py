@@ -49,6 +49,9 @@ import os
 import warnings
 
 import torch
+from torch._ops import OpOverload, OpOverloadPacket
+
+from typing import Union
 
 aten = torch._ops.ops.aten
 
@@ -76,6 +79,23 @@ def warn_fallback(op, fallback_device="cpu"):
         category=FallbackWarning,
         skip_file_prefixes=_warn_skips,
     )
+
+
+def _get_op_overloads(
+    ops: Union[OpOverloadPacket, OpOverload, list[Union[OpOverload, OpOverloadPacket]]],
+) -> list[OpOverload]:
+    result = []
+    if isinstance(ops, list):
+        for op in ops:
+            result.extend(_get_op_overloads(op))
+        return result
+
+    if isinstance(ops, OpOverloadPacket):
+        result.extend([getattr(ops, op) for op in ops.overloads()])
+    else:
+        result.append(ops)
+
+    return result
 
 
 def register_fallback(ops, device="cpu"):
@@ -207,7 +227,19 @@ def register_fallback(ops, device="cpu"):
     return _decorator
 
 
+def register_fallback_default(ops):
+    for op in _get_op_overloads(ops):
+        register_fallback([op.name()])(op)
+
+
 #  CPU-fallback eager operators
+
+register_fallback_default(
+    [
+        aten.cumsum,
+        aten.repeat.out,
+    ]
+)
 
 
 @register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
@@ -234,7 +266,7 @@ def spyre__cos(input, **kwargs):
 # Manually append to fallback_ops: register_fallback cannot be used here because
 # normal_ is an in-place op — register_fallback is designed for out-of-place ops
 # and would leave the original Spyre tensor unfilled.
-# The kernel itself is registered in ops.py (and therefore codegen_ops.py).
+# The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
 
 

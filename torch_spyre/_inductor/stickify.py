@@ -43,7 +43,7 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -418,10 +418,7 @@ def reduction_layout(
     restickify_plan: dict[str, list[dict[str, Any]]],
 ) -> FixedTiledLayout:
     data = op.data
-    if (
-        data.reduction_type == MATMUL_REDUCTION_OP
-        or data.reduction_type == BATCH_MATMUL_OP
-    ):
+    if data.reduction_type == BATCH_MATMUL_OP:
         x = args[0]
         y = args[1]
         x_coords = host_coordinates(x.layout, x.dep)
