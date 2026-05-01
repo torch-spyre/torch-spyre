@@ -439,7 +439,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     if coordinate_masking:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
 
-    num_inputs = len(args[:-1]) if is_matmul or op_spec.is_reduction else len(args)
+    num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
 
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
