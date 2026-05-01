@@ -105,8 +105,9 @@ class ScratchPadAllocator:
         3. for an output tensor, if this op is on the "white list" => prep for pinning
             => alloc a new LX block for the "output" of the op
         If can_reuse => add lx info to corresponding buffer.layout
-        TODO if more than 1 matched input for inplace Op, is it good enough to always
-             use the first one? e.g. C=A+B, A and B have same size, both on LX
+        TODO 1. if more than 1 matched input for inplace Op, is it good enough to always
+                use the first one? e.g. C=A+B, A and B have same size, both on LX
+             2. needed_size needs to consider core-division cases
         NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
                  have different names -> end-of-life analysis will take care of dealloc
               2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
@@ -191,7 +192,19 @@ class ScratchPadAllocator:
             if buf in self.usage:
                 del self.usage[buf]
 
-    # TODO add dealloc and defrag mechanism to allocator later
+    def evict_all(self):
+        """
+        Use this method when we need to make room for backend compiler, e.g. right
+        before matmul, as insufficient streaming buffer will bottleneck the compute.
+        Need a few things before implementing this method:
+        1. a way to allocate HBM tensors in torch-spyre, need new address in sdsc.json
+        2. insert clone node to perform LX-to-HBM transfer, similar to HBM-to-LX case.
+        3. set DXP_LX_FRAC_AVAIL to 1.0, make sure deeptools will read it dynamically.
+        4. need a mechanism to set this ENV VAR back to 0.2 after compute-bound OP.
+        """
+        raise NotImplementedError
+
+    # TODO add defrag mechanism to allocator later
 
 
 def mem_usage_by_op(
