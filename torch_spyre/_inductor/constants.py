@@ -47,6 +47,8 @@ SPYRE_FP32_OPS = [
     "layernormnorm",
     "identity",
     "overwrite",
+    "mean",
+    "sum"
 ]
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
