@@ -507,7 +507,9 @@ def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
 ) -> tuple[list[TensorDep], TensorDep]:
     """Build TensorDep lists for inputs and the output of op."""
-    input_tds = [TensorDep(a.dep, a.layout) for a in args]
+    # layout is Optional during propagation but always non-None by the time
+    # core_division runs (after select_restickify_locations commits a layout).
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]  # type: ignore[arg-type]
     rw = op.get_read_writes()
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
     return input_tds, output_td
