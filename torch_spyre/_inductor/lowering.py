@@ -74,16 +74,37 @@ def register_spyre_lowering(
 # the op is registered by default. Here, we unregister ops that are falling back
 # to eager ops
 # Note: If an op has a decomposition defined, a lowering is not registered
-def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=False):
-    for overload in lowering.get_overloads(op):
-        if overload in lowering_dict:
-            del lowering_dict[overload]
-        elif not allow_missing:
-            raise RuntimeError(f"lowering of {overload} is not registered")
+def unregister_lowerings(fallback_ops, lowering_dict, allow_missing=False):
+    saved_overloads = {}
+    # Pass 1: Pre-check for exception safety (Fail-fast)
+    if not allow_missing:
+        missing = [
+            overload
+            for op in fallback_ops
+            for overload in lowering.get_overloads(op)
+            if overload not in lowering_dict
+        ]
+        if missing:
+            raise RuntimeError(f"Cannot unregister. Missing lowerings for: {missing}")
+
+    # Pass 2: Safely remove and store
+    for op in fallback_ops:
+        saved_overloads[op] = {}
+        for overload in lowering.get_overloads(op):
+            if overload in lowering_dict:
+                # .pop() grabs the function and
+                # deletes the key in one atomic step
+                # if all overloads are unique then the op
+                # key is not needed here.
+                saved_overloads[op][overload] = lowering_dict.pop(overload)
+    return saved_overloads
 
 
-for op in fallback_ops:
-    unregister_lowering(op, allow_missing=True)
+def restore_lowerings(saved_overloads, lowering_dict):
+    for _, op_stored_overloads in saved_overloads.items():
+        for overload, func in op_stored_overloads.items():
+            lowering_dict[overload] = func
+
 
 # Overload names for aten.clamp
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
@@ -105,6 +126,10 @@ def enable_spyre_lowerings():
         _lowerings_nesting += 1
 
         if first_enter:
+            enable_spyre_lowerings._removed_fallbacks = {}
+            enable_spyre_lowerings._removed_fallbacks = unregister_lowerings(
+                fallback_ops, lowering.lowerings, allow_missing=True
+            )
             saved_intree_lowerings = {}
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
                 if spyre_lowering_op in lowering.lowerings:
@@ -174,8 +199,13 @@ def enable_spyre_lowerings():
                         ]
                     else:
                         lowering.lowerings.pop(spyre_lowering_op, None)
+                restore_lowerings(
+                    enable_spyre_lowerings._removed_fallbacks, lowering.lowerings
+                )
+
                 # Clean up
                 enable_spyre_lowerings._saved_lowerings = {}
+                enable_spyre_lowerings._removed_fallbacks = {}
 
 
 def ensure_default_handler(op_name):
