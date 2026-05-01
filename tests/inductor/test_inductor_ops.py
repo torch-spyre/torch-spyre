@@ -20,7 +20,6 @@ from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
     cached_xavier,
-    compare,
     compare_with_cpu,
     make_param_dict,
     unique_randn_along_dim,
