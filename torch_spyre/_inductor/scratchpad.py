@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Callable
+from typing import Callable, Any
 
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -30,9 +30,15 @@ from . import config
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
     "sum",
-    "clone",
-    # "exp",
+    # "clone",
+    "exp",
+    "sub",
     # "mul",
+]
+
+OP_GOOD_FOR_LX_INPLACE = [
+    "exp",
+    "sub",
 ]
 
 logger = get_inductor_logger("LX_PLANNING")
@@ -93,10 +99,14 @@ class ScratchPadAllocator:
     def try_allocate(self, mem_usage: dict, idx: int, org_op_name: str):
         """
         Simple reuse rule:
-        1. for an "input" tensor, found a matched tensor (name and size) on LX
-        2. for an output tensor, if this op is on the "white list" => prep for pinning
+        1. for an "input" tensor, find a matched tensor (name and size) on LX
+        2. for output of an "inplace Op", find out which input (must be on LX) can be
+            used to store output, use that input's LX addr
+        3. for an output tensor, if this op is on the "white list" => prep for pinning
             => alloc a new LX block for the "output" of the op
         If can_reuse => add lx info to corresponding buffer.layout
+        TODO if more than 1 matched input for inplace Op, is it good enough to always
+             use the first one? e.g. C=A+B, A and B have same size, both on LX
         NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
                  have different names -> end-of-life analysis will take care of dealloc
               2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
@@ -104,32 +114,58 @@ class ScratchPadAllocator:
               4. greedy alloc may cause fragments, can further improve
         """
         graph_output_buf_name = V.graph.get_output_names()
-        for tensor_name, needed in mem_usage.items():
+        for tensor_name in mem_usage["all_buf_used"]:
+            tensor_info = mem_usage[tensor_name]
             is_graph_input = tensor_name not in V.graph.name_to_buffer
             is_graph_output = tensor_name in graph_output_buf_name
-            core_div_mismatch = (not needed["is_input"]) and needed["core_div_mismatch"]
+            needed_size = tensor_info["size"]
+            is_input = tensor_info["is_input"]
+            core_div_mismatch = (not is_input) and tensor_info["core_div_mismatch"]
             if is_graph_input or is_graph_output or core_div_mismatch:
-                # graph input itself cannot be pinned, but we may be able to clone
+                # graph input itself cannot be pinned (see try_insert_clone_())
                 # graph output has to go back to HBM
                 # if buf users have diff core-splits -> cause cross-core LX read/write
                 continue
 
-            # Decide whether to reuse.
+            # Decide whether to reuse/pin.
             addr = -1
             tensor_on_lx = self.usage.get(tensor_name, {})
-            size_match = tensor_on_lx.get("size", 0) == needed["size"]
-            allowed_output_op = any(
+            size_match = tensor_on_lx.get("size", 0) == needed_size
+            allow_output_to_lx = any(
                 op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
             )
+            allow_inplace = any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
 
-            if needed["is_input"] and tensor_on_lx and size_match:
+            if is_input and tensor_on_lx and size_match:
                 addr = self.usage[tensor_name]["addr"]
-            elif not needed["is_input"] and allowed_output_op:
-                addr = self.find_free_block(needed["size"])
+            elif not is_input and allow_inplace:
+                found_matched_input = False
+                ten_dev_lay = V.graph.get_buffer(tensor_name).layout.device_layout
+                for inp_i in mem_usage["all_inputs"]:
+                    inp_i_dev_lay = V.graph.get_buffer(inp_i).layout.device_layout
+                    inp_i_on_lx = inp_i in self.usage
+                    inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
+                    inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
+                    inp_i_eol = mem_usage[inp_i]["last_usage"]
+                    if (
+                        inp_i_on_lx
+                        and inp_i_size_match
+                        and inp_i_lay_match
+                        and inp_i_eol
+                    ):
+                        found_matched_input = True
+                        break  # see TODO
+                if found_matched_input:
+                    addr = self.usage[inp_i]["addr"]
+                else:
+                    # NOTE allow_inplace also implies allow_output_to_lx
+                    addr = self.find_free_block(needed_size)
+            elif not is_input and allow_output_to_lx:
+                addr = self.find_free_block(needed_size)
 
             # add lx info into V.graph.buffers.layout for later codegen use.
             if addr != -1:
-                self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
+                self.usage[tensor_name] = {"addr": addr, "size": needed_size}
 
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
@@ -142,7 +178,7 @@ class ScratchPadAllocator:
                         "op_name": org_op_name,
                         "tensor_name": tensor_name,
                         "addr": addr,
-                        "size": needed["size"],
+                        "size": needed_size,
                     }
                 )
 
@@ -158,10 +194,23 @@ class ScratchPadAllocator:
     # TODO add dealloc and defrag mechanism to allocator later
 
 
-def mem_usage_by_op(op: ComputedBuffer):
-    """Get a summary of memory usage of the input operation."""
+def mem_usage_by_op(
+    op: ComputedBuffer, core_div_mismatch: dict[str, bool] = {}, release_next: list = []
+):
+    """
+    Get a summary of memory usage of the given operation. Two types of info can be found
+    1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
+    2. Detailed info of individual buf, e.g. mem_usage[<buf_name>], which has
+        "is_input", "size", "core_div_mismatch" fields
+    NOTE:
+    if a buf is not in core_div_mismatch => it has no users => graph output
+    if a buf is on release_next => it's the last time it'll be used => allow inplace
+    """
     rw = op.get_read_writes()
-    mem_usage = {}
+    mem_usage: dict[str, Any] = {
+        "all_inputs": [],
+        "all_outputs": [],
+    }
     for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
         for dep in deps:
             buf = V.graph.get_buffer(dep.name)
@@ -172,7 +221,16 @@ def mem_usage_by_op(op: ComputedBuffer):
             mem_usage[dep.name] = {
                 "is_input": is_input,
                 "size": dev_size,
+                "core_div_mismatch": core_div_mismatch.get(dep.name, False),
+                "last_usage": dep.name in release_next,
             }
+
+            if is_input:
+                mem_usage["all_inputs"].append(dep.name)
+            else:
+                mem_usage["all_outputs"].append(dep.name)
+
+    mem_usage["all_buf_used"] = mem_usage["all_inputs"] + mem_usage["all_outputs"]
 
     return mem_usage
 
@@ -182,6 +240,7 @@ def consider_for_scratchpad(
     alloc: ScratchPadAllocator,
     idx: int,
     core_div_mismatch: dict[str, bool] = {},
+    release_next: list = [],
 ):
     """
     If core_div_mismatch is not provided, we will consider LX pinning without taking
@@ -189,14 +248,12 @@ def consider_for_scratchpad(
     scattered over different core's scratchpad, which may result in unusable tensor and
     incorrect results.
     """
-    # 1. summarize both inputs and output sizes used by this node.
-    mem_usage = mem_usage_by_op(op)
-    for buf in mem_usage:
-        mem_usage[buf]["core_div_mismatch"] = core_div_mismatch.get(buf, False)
-        # if a buf is not in core_div_mismatch => it has no users => graph output
+    # 1. summarize both inputs and output sizes used by this node, also merge core_div
+    #    info into the table.
+    mem_usage = mem_usage_by_op(op, core_div_mismatch, release_next)
 
-    # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
-    # which will be used in generate_sdsc() later.
+    # 2. Try to allocate as many buffers on LX as we can. If successful, lx info (addr)
+    #    will be added to buffer.FixedTiledLayout and used in generate_sdsc() later.
     org_op_name = op.origin_node.target._opname
     alloc.try_allocate(mem_usage, idx, org_op_name)
 
@@ -435,10 +492,12 @@ def scratchpad_planning(
 
     for idx, op in enumerate(operations):
         # release unneeded LX allocations before actual planning
-        alloc.deallocate(idx_to_dealloc_bufs.get(idx, []))
+        release_now = idx_to_dealloc_bufs.get(idx, [])
+        release_next = idx_to_dealloc_bufs.get(idx + 1, [])
+        alloc.deallocate(release_now)
 
         if isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
-            consider_for_scratchpad(op, alloc, idx, core_div_mismatch)
+            consider_for_scratchpad(op, alloc, idx, core_div_mismatch, release_next)
     # logger.info(alloc.lx_usage_hist)

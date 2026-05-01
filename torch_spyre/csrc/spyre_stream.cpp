@@ -160,10 +160,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     auto& storage = spyre_impl->storage();
     auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
 
-    // Generate data conversion info
-    // So we always pass &src, not cpu_tensor
     DataConversionInfo dci = generate_dci(
-        dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
 
     copyAsyncImpl(cpu_ptr, &ctx->composite_addr, dci, host2device);
 
@@ -212,7 +210,7 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   // This ensures getRuntimeHandle() resolves stream 0 to the real RuntimeStream
   // instance owned by RuntimeContext.
   auto runtime = GlobalRuntime::get();
-  pool.stream_handle_map[0] = runtime->getDefaultStream(device_index);
+  pool.stream_handle_map[0] = runtime->getDefaultStream();
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
@@ -300,7 +298,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
     flex::RuntimeStream* flex_handle =
-        runtime->createStream(device.index(), runtime->toPriority(priority));
+        runtime->createStream(runtime->toPriority(priority));
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 

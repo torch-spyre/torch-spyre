@@ -1,0 +1,262 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_torch.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestBasicVitalSigns::test_basic_vitals_read_write
+            - TestBasicVitalSigns::test_dataloader_vitals
+            - TestTorch::test_RNGState
+            - TestTorch::test_RNGStateAliasing
+            - TestTorch::test_RNG_after_pickle
+            - TestTorch::test_Size
+            - TestTorch::test_Size_concat_non_tuple_sequence
+            - TestTorch::test_Size_concat_wildcard
+            - TestTorch::test_Size_iter
+            - TestTorch::test_Size_scalar
+            - TestTorch::test_add_meta_scalar
+            - TestTorch::test_allow_tensor_metadata_change
+            - TestTorch::test_apply
+            - TestTorch::test_as_subclass
+            - TestTorch::test_assert_async
+            - TestTorch::test_backward_hooks_traverse
+            - TestTorch::test_batch_norm_cpu_inference
+            - TestTorch::test_bf16_supported_on_cpu
+            - TestTorch::test_bmm_multithreaded
+            - TestTorch::test_boxMullerState
+            - TestTorch::test_cat_neg_dim
+            - TestTorch::test_check
+            - TestTorch::test_chunk_neg_dim
+            - TestTorch::test_conj_neg_tolist
+            - TestTorch::test_conj_physical_meta_stride
+            - TestTorch::test_contains
+            - TestTorch::test_copy_dtypes
+            - TestTorch::test_copy_float16
+            - TestTorch::test_copy_many_to_one
+            - TestTorch::test_copy_transpose
+            - TestTorch::test_cuda_not_built
+            - TestTorch::test_cummax_neg_dim
+            - TestTorch::test_cummin_neg_dim
+            - TestTorch::test_cumprod_neg_dim
+            - TestTorch::test_cumsum_neg_dim
+            - TestTorch::test_cxx_flags
+            - TestTorch::test_data_ptr_of_empty_tensor_with_storage
+            - TestTorch::test_data_ptr_of_empty_view_with_storage
+            - TestTorch::test_deepcopy_gradient
+            - TestTorch::test_deepcopy_parameter
+            - TestTorch::test_deterministic_fill_uninitialized_memory
+            - TestTorch::test_deterministic_flag
+            - TestTorch::test_device
+            - TestTorch::test_dim_order
+            - TestTorch::test_dir
+            - TestTorch::test_doc
+            - TestTorch::test_doc_template
+            - TestTorch::test_dot_data_use
+            - TestTorch::test_dtype_is_signed
+            - TestTorch::test_element_size
+            - TestTorch::test_empty_meta
+            - TestTorch::test_empty_storage_view
+            - TestTorch::test_equal
+            - TestTorch::test_error_msg_type_translation
+            - TestTorch::test_fill_diagonal
+            - TestTorch::test_format_scalar_meta
+            - TestTorch::test_from_buffer
+            - TestTorch::test_from_file
+            - TestTorch::test_gather_neg_dim
+            - TestTorch::test_generator_cpu
+            - TestTorch::test_get_cpu_capability
+            - TestTorch::test_has_internal_overlap
+            - TestTorch::test_has_storage
+            - TestTorch::test_index_add
+            - TestTorch::test_index_add_all_dtypes
+            - TestTorch::test_index_add_cornercase
+            - TestTorch::test_index_add_correctness
+            - TestTorch::test_index_add_neg_dim
+            - TestTorch::test_index_copy_neg_dim
+            - TestTorch::test_index_fill_neg_dim
+            - TestTorch::test_index_select_neg_dim
+            - TestTorch::test_invalid_arg_error_handling
+            - TestTorch::test_invalid_generator_raises
+            - TestTorch::test_is_nonzero
+            - TestTorch::test_is_same_size
+            - TestTorch::test_iter
+            - TestTorch::test_kthvalue_neg_dim
+            - TestTorch::test_linspace_logspace
+            - TestTorch::test_logcumsumexp_neg_dim
+            - TestTorch::test_manual_seed
+            - TestTorch::test_map
+            - TestTorch::test_map2
+            - TestTorch::test_max_neg_dim
+            - TestTorch::test_mean_neg_dim
+            - TestTorch::test_median_neg_dim
+            - TestTorch::test_memory_format
+            - TestTorch::test_memory_format_contiguous_returns_same_tensor_if_already_satisfies
+            - TestTorch::test_memory_format_empty
+            - TestTorch::test_min_neg_dim
+            - TestTorch::test_mode_neg_dim
+            - TestTorch::test_nanmedian_neg_dim
+            - TestTorch::test_narrow_neg_dim
+            - TestTorch::test_nbytes
+            - TestTorch::test_ndim
+            - TestTorch::test_new
+            - TestTorch::test_newaxis_numpy_comparison
+            - TestTorch::test_newindex
+            - TestTorch::test_no_cuda_monkeypatch
+            - TestTorch::test_norm_neg_dim
+            - TestTorch::test_normal_shape
+            - TestTorch::test_numel
+            - TestTorch::test_parallel_info
+            - TestTorch::test_parsing_double
+            - TestTorch::test_parsing_int64
+            - TestTorch::test_parsing_intlist
+            - TestTorch::test_permute
+            - TestTorch::test_pickle
+            - TestTorch::test_pickle_dtype
+            - TestTorch::test_pickle_function
+            - TestTorch::test_pickle_generator
+            - TestTorch::test_pickle_parameter
+            - TestTorch::test_pickle_parameter_no_requires_grad
+            - TestTorch::test_pickle_size
+            - TestTorch::test_pin_memory
+            - TestTorch::test_print
+            - TestTorch::test_prod_neg_dim
+            - TestTorch::test_pyobj_preserved
+            - TestTorch::test_qengine
+            - TestTorch::test_renorm_neg_dim
+            - TestTorch::test_resizable
+            - TestTorch::test_reversed
+            - TestTorch::test_scatter_neg_dim
+            - TestTorch::test_select_neg_dim
+            - TestTorch::test_setting_real_imag_to_a_number
+            - TestTorch::test_show_config
+            - TestTorch::test_size_neg_dim
+            - TestTorch::test_size_stride
+            - TestTorch::test_sizeof
+            - TestTorch::test_slice
+            - TestTorch::test_sobolengine_bounds
+            - TestTorch::test_sobolengine_continuing
+            - TestTorch::test_sobolengine_default_dtype
+            - TestTorch::test_sobolengine_distribution
+            - TestTorch::test_sobolengine_draw
+            - TestTorch::test_sobolengine_draw_base2
+            - TestTorch::test_sobolengine_fast_forward
+            - TestTorch::test_sobolengine_first_point
+            - TestTorch::test_sobolengine_high_dim
+            - TestTorch::test_sobolengine_raise
+            - TestTorch::test_sobolengine_reset
+            - TestTorch::test_sort_neg_dim
+            - TestTorch::test_split_neg_dim
+            - TestTorch::test_split_with_sizes_copy_out
+            - TestTorch::test_squeeze_neg_dim
+            - TestTorch::test_std_neg_dim
+            - TestTorch::test_storage_base_init
+            - TestTorch::test_storage_base_new
+            - TestTorch::test_storage_byteswap
+            - TestTorch::test_storage_casts
+            - TestTorch::test_storage_cycle_via_dict
+            - TestTorch::test_storage_cycle_via_slots
+            - TestTorch::test_storage_dead_weak_ref
+            - TestTorch::test_storage_dealloc
+            - TestTorch::test_storage_dealloc_resurrected
+            - TestTorch::test_storage_dealloc_subclass_resurrected
+            - TestTorch::test_storage_dealloc_subclass_zombie
+            - TestTorch::test_storage_dict_dealloc
+            - TestTorch::test_storage_error
+            - TestTorch::test_storage_error_no_attribute
+            - TestTorch::test_storage_finalizer_dealloc
+            - TestTorch::test_storage_fix_weakref_no_leak
+            - TestTorch::test_storage_from_tensor_dealloc
+            - TestTorch::test_storage_from_tensor_dealloc_resurrected
+            - TestTorch::test_storage_from_tensor_dealloc_zombie
+            - TestTorch::test_storage_preserve_nonhermetic_in_hermetic_context
+            - TestTorch::test_storage_resurrected_weak_ref
+            - TestTorch::test_storage_slot_dealloc
+            - TestTorch::test_storage_thread_safety
+            - TestTorch::test_storage_weakref_dealloc
+            - TestTorch::test_structseq_repr
+            - TestTorch::test_sum_neg_dim
+            - TestTorch::test_swap_basic
+            - TestTorch::test_swap_fail_slots
+            - TestTorch::test_t_not_2d_error
+            - TestTorch::test_tensor_ctor_scalar
+            - TestTorch::test_tensor_cycle_via_dict
+            - TestTorch::test_tensor_dead_weak_ref
+            - TestTorch::test_tensor_dict_dealloc
+            - TestTorch::test_tensor_fix_weakref_no_leak
+            - TestTorch::test_tensor_item_no_warning
+            - TestTorch::test_tensor_ressurecting_clear
+            - TestTorch::test_tensor_resurrected_weak_ref
+            - TestTorch::test_tensor_set
+            - TestTorch::test_tensor_set_errors
+            - TestTorch::test_tensor_weakref_dealloc
+            - TestTorch::test_tensor_where_scalar
+            - TestTorch::test_tensor_with_grad_to_scalar_warning
+            - TestTorch::test_tensoriterator_output_setup
+            - TestTorch::test_to
+            - TestTorch::test_to_with_tensor
+            - TestTorch::test_topk_neg_dim
+            - TestTorch::test_torch_from_file
+            - TestTorch::test_transpose_neg_dim
+            - TestTorch::test_type
+            - TestTorch::test_type_alias
+            - TestTorch::test_type_conversion_via_dtype_name
+            - TestTorch::test_typed_storage_deprecation_warning
+            - TestTorch::test_typed_storage_internal_no_warning
+            - TestTorch::test_unbind_neg_dim
+            - TestTorch::test_unflatten
+            - TestTorch::test_unfold_neg_dim
+            - TestTorch::test_unsqueeze_neg_dim
+            - TestTorch::test_upsample_nearest1d_meta
+            - TestTorch::test_upsample_nearest2d_meta
+            - TestTorch::test_var_neg_dim
+            - TestTorch::test_warn_types
+            - TestTorch::test_wildcard_import
+            - TestTorchDeviceType::test_clone_not_memory_dense
+            - TestTorchDeviceType::test_clone_zero_stride_dim
+            - TestTorchDeviceType::test_cov
+            - TestTorchDeviceType::test_expected_failure_xla
+            - TestTorchDeviceType::test_memory_format_consistency
+            - TestTorchDeviceType::test_narrow_empty
+            - TestTorchDeviceType::test_nullary_op_mem_overlap
+            - TestTorchDeviceType::test_set_default_tensor_type_warnings
+            - TestTorchDeviceType::test_skip_xla
+            - TestTorchDeviceType::test_tensor_type
+          mode: mandatory_success
+        - names:
+            - TestTorchDeviceType::test_multinomial_cpu
+          mode: mandatory_success
+          edits:
+            dtypes:
+              include:
+                - name: float32
+                  description: The test creates random probability distributions of various shapes and contiguity patterns, then runs torch.multinomial
+                    on CPU for several floating‑point dtypes to verify correct behavior. The largest floating-point type supported by spyre is float32.
+                    Hence it is included.
+        - names:
+            - TestTorchDeviceType::test_storage_meta_errors
+          mode: mandatory_success
+          edits:
+            dtypes:
+              include:
+                - name: bfloat16
+                - name: bool
+                - name: complex128
+                - name: complex64
+                - name: float16
+                - name: float32
+                - name: float64
+                - name: int16
+                - name: int32
+                - name: int64
+                - name: int8
+                - name: uint8
+        - names:
+            - TestTorchDeviceType::test_ternary_op_mem_overlap
+          mode: mandatory_success
+          edits:
+            dtypes:
+              include:
+                - name: float32
+                  description: The test iterates over several ternary PyTorch operations (addcmul, addcdiv, lerp) on both CPU and CUDA, checking that memory‑overlap
+                    detection works correctly for both in‑place and out‑of‑place variants when using double‑precision tensors. Double precision (float64)
+                    is not yet supported in spyre. The largest floating-point type supported by spyre is float32. Hence it is included.
