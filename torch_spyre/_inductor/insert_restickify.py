@@ -34,6 +34,8 @@ from torch._inductor.virtualized import V
 
 from torch.utils._ordered_set import OrderedSet
 
+from .errors import Unsupported
+
 logger = get_inductor_logger("insert_restickify")
 
 
@@ -305,10 +307,11 @@ def finalize_layouts(operations: list) -> None:
             tgt = compute_restickify_target_layout(
                 in_layout, target_stick_expr, ic, idc
             )
-            assert tgt is not None, (
-                f"mutation op {op.get_name()} arg={dep.name}: cannot restickify "
-                f"{list(in_key.stride_map)} -> {list(target_key.stride_map)}"
-            )
+            if tgt is None:
+                raise Unsupported(
+                    f"mutation op {op.get_name()} arg={dep.name}: cannot restickify "
+                    f"{list(in_key.stride_map)} -> {list(target_key.stride_map)}"
+                )
             print(
                 f"    -> scheduling restickify {list(in_key.stride_map)} "
                 f"-> {list(target_key.stride_map)}"
@@ -326,16 +329,3 @@ def finalize_layouts(operations: list) -> None:
     )
 
 
-def _format_restickify_plan(restickify_plan: dict) -> None:
-    print()
-    print("=== restickify_plan (entering insert_restickify) ===")
-    if not restickify_plan:
-        print("  (empty)")
-        return
-    for consumer_name, entries in restickify_plan.items():
-        for e in entries:
-            print(
-                f"  consumer={consumer_name} arg={e['arg_name']} "
-                f"target_stride_map={list(e['target_layout'].device_layout.stride_map)} "
-                f"target_device_size={list(e['target_layout'].device_layout.device_size)}"
-            )

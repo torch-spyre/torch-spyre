@@ -57,7 +57,7 @@ from .views import matching_dim
 # concretize_expr calls in this file can be removed.
 # ---------------------------------------------------------------------------
 
-logger = get_inductor_logger("stickify")
+logger = get_inductor_logger("propagate_layouts")
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -372,8 +372,6 @@ def _multi_arg_pointwise_layouts(
             ):
                 can_use_same_layout = False
                 break
-        if stick_expr not in stick_exprs:
-            can_use_same_layout = False
 
     results: list[FixedTiledLayout] = []
     # Sort stick exprs for determinism

@@ -190,10 +190,8 @@ class FixedInOutNode(RestickNodeCost):
         )
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
-        assert out_key == self.required_out_key, (
-            f"FixedInOutNode: out_key {out_key} != required_out_key {self.required_out_key}; "
-            "stick compatibility check not implemented because propagate layouts should have only one layout"
-        )
+        if out_key != self.required_out_key:
+            return INF
         total = 0.0
         for edge_cost, layout_key, req_key in zip(
             self.edge_costs, in_layouts, self.required_in_keys

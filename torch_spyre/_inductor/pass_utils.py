@@ -26,7 +26,7 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
 from .ir import FixedTiledLayout
@@ -275,7 +275,7 @@ def restickify_device_size(
     old_sd_host_size: int,
     new_sd_outer_dim: int,
     new_sd_host_size: int,
-    stick_size: int = 64,
+    stick_size: int,
 ) -> list:
     """Compute device_size after moving the stick from old_sd to new_sd."""
     assert new_sd_host_size % stick_size == 0, (
@@ -295,7 +295,7 @@ def restickify_stride_map(
     old_sd_host_stride: int,
     new_sd_outer_dim: int,
     new_sd_host_stride: int,
-    stick_size: int = 64,
+    stick_size: int,
 ) -> list:
     """Compute stride_map after moving the stick from old_sd to new_sd."""
     new_stride_map = list(old_stride_map)
@@ -325,7 +325,7 @@ def compute_restickify_target_layout(
     old_stride_map = list(dl.stride_map)
     old_var = next(iter(old_stick_expr.free_symbols))
     new_var = next(iter(target_stick_expr.free_symbols))
-    stick_size = 64
+    stick_size = get_elem_in_stick(layout.dtype)
     old_sd_outer_dim = next(
         (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
         next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
@@ -344,6 +344,7 @@ def compute_restickify_target_layout(
         host_size[old_sd],
         new_sd_outer_dim,
         host_size[new_sd],
+        stick_size,
     )
     stride_map = restickify_stride_map(
         old_stride_map,
@@ -351,6 +352,7 @@ def compute_restickify_target_layout(
         host_stride[old_sd],
         new_sd_outer_dim,
         host_stride[new_sd],
+        stick_size,
     )
     stl = SpyreTensorLayout(device_size, stride_map, dl.device_dtype)
     return FixedTiledLayout(
