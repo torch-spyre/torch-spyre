@@ -372,6 +372,11 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
+  if (g_debug_info_enabled) {
+    std::stringstream s;
+    dci.exportJson(s);
+    DEBUGINFO("DataConversionInfo: ", s.str());
+  }
   return dci;
 }
 

@@ -1,0 +1,8 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_pooling.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestPoolingNNDeviceType::test_adaptive_pool_odd_size
+          mode: mandatory_success
