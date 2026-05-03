@@ -199,10 +199,12 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
     auto op =
         flex::RuntimeOperationH2D::create(cpu_ptr, *device_address, dci_ptr);
     flex_stream->launchOperation(*op);
+    flex::RuntimeOperationH2D::destroyOperation(op);
   } else {
     auto op =
         flex::RuntimeOperationD2H::create(*device_address, cpu_ptr, dci_ptr);
     flex_stream->launchOperation(*op);
+    flex::RuntimeOperationD2H::destroyOperation(op);
   }
 }
 
