@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -133,13 +134,14 @@ std::string get_pagi_path(const std::string& code_dir) {
 
 // Cache: code_dir -> artifacts (loaded once)
 std::unordered_map<std::string, KernelArtifacts> g_artifact_cache;
-std::mutex g_artifact_cache_mtx;  // protects g_artifact_cache and g_key_mtxs
+std::shared_mutex
+    g_artifact_cache_mtx;  // protects g_artifact_cache and g_key_mtxs
 std::unordered_map<std::string, std::unique_ptr<std::mutex>> g_key_mtxs;
 
 KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
                                     const SpyreStream& stream) {
   {
-    std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+    std::unique_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
     auto it = g_artifact_cache.find(code_dir);
     if (it != g_artifact_cache.end()) {
       return it->second;
@@ -153,14 +155,14 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
   // Per-key lock: only one thread loads a given key
   std::mutex* key_mtx = nullptr;
   {
-    std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+    std::shared_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
     key_mtx = g_key_mtxs[code_dir].get();
   }
   std::lock_guard<std::mutex> key_lock(*key_mtx);
 
   // Double-check after acquiring per-key lock
   {
-    std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+    std::shared_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
     auto it = g_artifact_cache.find(code_dir);
     if (it != g_artifact_cache.end()) {
       return it->second;
@@ -195,7 +197,7 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
   TORCH_CHECK(std::filesystem::exists(arts.sdsc_json_path),
               "SuperDSC not found: ", arts.sdsc_json_path);
 
-  std::lock_guard<std::mutex> lock(g_artifact_cache_mtx);
+  std::unique_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
   auto [it, inserted] = g_artifact_cache.emplace(code_dir, std::move(arts));
   if (inserted) {
     DEBUGINFO(it->second);
