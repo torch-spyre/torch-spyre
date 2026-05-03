@@ -33,6 +33,7 @@ from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import generate_sdsc
 
@@ -608,7 +609,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
 
-    if is_matmul:
+    if is_matmul or DtypeOpTable.is_dtype_op(op_spec.op):
         pad_args, pad_sdsc_args = list(op_spec.args), args
     elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
