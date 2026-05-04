@@ -37,7 +37,7 @@ INF = math.inf
 class LayoutKey:
     """Hashable Python surrogate for SpyreTensorLayout, used as a dict/set key.
 
-    SpyreTensorLayout is not hashable and includes dtype, which is irrelevant
+    SpyreTensorLayout is not hashable and includes dtype, which is not needed 
     for stick-compatibility comparisons.
     """
 
@@ -68,15 +68,19 @@ class EdgeCostMap:
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+
+        # _cost and _layout are parallel maps.  
+        # _cost stores the cost for a given in/target layout pair 
+        # _layout stores the FixedTiledLayout to use as the restickify target if this path is chosen
         self._cost: defaultdict[LayoutKey, dict[LayoutKey, float]] = defaultdict(dict)
-        self._restick_target: defaultdict[LayoutKey, dict[LayoutKey, Any]] = (
+        self._layout: defaultdict[LayoutKey, dict[LayoutKey, Any]] = (
             defaultdict(dict)
         )
 
     def _compute_and_cache_cost(
         self, in_key: "LayoutKey", target_key: "LayoutKey"
     ) -> None:
-        """Populate _cost and _restick_target for (in_key, target_key).
+        """Populate _cost and _layout for (in_key, target_key).
 
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
@@ -110,7 +114,7 @@ class EdgeCostMap:
         else:
             cost = float(math.prod(s for s in in_layout.size))
         self._cost[in_key][target_key] = cost
-        self._restick_target[in_key][target_key] = tgt
+        self._layout[in_key][target_key] = tgt
 
     def cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> float:
         """Return the restick cost for (in_key, target_key), computing it on first access."""
@@ -118,11 +122,11 @@ class EdgeCostMap:
             self._compute_and_cache_cost(in_key, target_key)
         return self._cost[in_key][target_key]
 
-    def restick_target(self, in_key: "LayoutKey", target_key: "LayoutKey"):
-        """Restickified layout to insert, or None if no restickify needed."""
+    def layout(self, in_key: "LayoutKey", target_key: "LayoutKey"):
+        """Return FixedTiledLayout restickify target for (in_key, target_key), or None if no restickify needed."""
         if target_key not in self._cost[in_key]:
             self._compute_and_cache_cost(in_key, target_key)
-        return self._restick_target[in_key][target_key]
+        return self._layout[in_key][target_key]
 
 
 class RestickNodeCost(abc.ABC):
@@ -152,13 +156,7 @@ class AllSameNode(RestickNodeCost):
         return cls(edge_costs)
 
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
-        total = 0.0
-        for edge_cost, layout_key in zip(self.edge_costs, in_layouts):
-            c = edge_cost.cost(layout_key, out_key)
-            if c == INF:
-                return INF
-            total += c
-        return total
+        return sum(ec.cost(lk, out_key) for ec, lk in zip(self.edge_costs, in_layouts))
 
 
 class FixedInOutNode(RestickNodeCost):
@@ -192,22 +190,17 @@ class FixedInOutNode(RestickNodeCost):
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         if out_key != self.required_out_key:
             return INF
-        total = 0.0
-        for edge_cost, layout_key, req_key in zip(
-            self.edge_costs, in_layouts, self.required_in_keys
-        ):
-            c = edge_cost.cost(layout_key, req_key)
-            if c == INF:
-                return INF
-            total += c
-        return total
+        return sum(
+            ec.cost(lk, rk)
+            for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_keys)
+        )
 
 
 class AnyInNode(RestickNodeCost):
     """Cost node for ops that accept any input layout and produce a fixed output layout.
 
-    Used for aten.clone.default: the clone materializes a new buffer in the output
-    layout regardless of input stick, so no restickify is ever needed before it.
+    Eg, aten.clone.default: the clone become a restickify when sticks are incompatible
+    so no restickify is ever needed before it.
     """
 
     @classmethod
@@ -217,10 +210,6 @@ class AnyInNode(RestickNodeCost):
     def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
         return 0.0
 
-
-def record_stick_decisions(op, out_key: LayoutKey) -> None:
-    """Store the optimizer's chosen output layout on op for the restickify insertion pass."""
-    op.stick_decisions = {"out_key": out_key}
 
 
 def optimize_restickify_locations(operations: list) -> None:
@@ -307,7 +296,6 @@ def greedy_local_min_cost(operations: list) -> None:
                 )
                 in_layouts.append(buf.committed_layout)
 
-        # TODO: Don't out layout keys every time sigh
         out_layout_keys = [LayoutKey.from_stl(ol.device_layout) for ol in op.layouts]
         assert out_layout_keys, (
             f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
@@ -338,6 +326,6 @@ def greedy_local_min_cost(operations: list) -> None:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             op.layout = layout
         op.committed_layout = out_key
-        record_stick_decisions(op, out_key)
+        op.stick_decisions = {"out_key": out_key}
 
     _print_op_layouts(operations, "after")

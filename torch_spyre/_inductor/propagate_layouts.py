@@ -422,8 +422,9 @@ def compute_layouts(
     args: list[SchedNodeArg],
 ) -> list[FixedTiledLayout]:
     """
-    Compute candidate output FixedTiledLayouts given the set(s) of input layouts.
-    Attach a restick cost function based on the type of op.
+    Main driver for propagating layouts. There are two tasks performed
+    1. Compute candidate output FixedTiledLayouts given a set of layouts for each input arg.
+    2. Attach a restick cost function based on the type of op.
     """
     data = op.data
     print()

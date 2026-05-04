@@ -259,7 +259,7 @@ def finalize_layouts(operations: list) -> None:
         for rc, req_key in zip(cost_fn.edge_costs, required_in_keys):
             buf = V.graph.get_buffer(rc.dep.name)
             in_key = LayoutKey.from_stl(buf.get_layout().device_layout)
-            tgt = rc.restick_target(in_key, req_key)
+            tgt = rc.layout(in_key, req_key)
             print(
                 f"    arg={rc.dep.name} in_key={list(in_key.stride_map)} "
                 f"req_key={list(req_key.stride_map)} "
