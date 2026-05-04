@@ -191,7 +191,6 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
               ") exceeds allocated device memory (",
               ctx->composite_addr.total_size(), ")");
   stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
-  stream.synchronize();
 
   arts.sdsc_json_path = (dir / "sdsc_0.json").string();
   TORCH_CHECK(std::filesystem::exists(arts.sdsc_json_path),
