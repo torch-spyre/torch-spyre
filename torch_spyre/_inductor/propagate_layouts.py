@@ -263,29 +263,29 @@ def _matmul_layouts(
             f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
         )
 
-    x_req_layout = (
-        FixedTiledLayout(x.layout.device, x.layout.dtype, x.layout.size, x.layout.stride, x_stl)
-        if reduction_coord == x_dev_coords[-1]
-        else compute_restickify_target_layout(
+    if reduction_coord == x_dev_coords[-1]:
+        x_req_stl = x_stl
+    else:
+        _tgt = compute_restickify_target_layout(
             x_stl, x.layout, reduction_coord, x_coords, x_dev_coords
         )
-    )
-    if x_req_layout is None:
-        raise Unsupported(
-            f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
-        )
+        if _tgt is None:
+            raise Unsupported(
+                f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
+            )
+        x_req_stl = _tgt.device_layout
 
-    y_req_layout = (
-        FixedTiledLayout(y.layout.device, y.layout.dtype, y.layout.size, y.layout.stride, y_stl)
-        if generated_coord == y_dev_coords[-1]
-        else compute_restickify_target_layout(
+    if generated_coord == y_dev_coords[-1]:
+        y_req_stl = y_stl
+    else:
+        _tgt = compute_restickify_target_layout(
             y_stl, y.layout, generated_coord, y_coords, y_dev_coords
         )
-    )
-    if y_req_layout is None:
-        raise Unsupported(
-            f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
-        )
+        if _tgt is None:
+            raise Unsupported(
+                f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
+            )
+        y_req_stl = _tgt.device_layout
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
     print(f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}")
@@ -306,7 +306,7 @@ def _matmul_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_layout.device_layout, y_req_layout.device_layout]
+        [x, y], out_stl, [x_req_stl, y_req_stl]
     )
     print(f"MRA: matmul output stl: {out_stl}")
     return [out_stl]
@@ -459,7 +459,7 @@ def generic_layout(op: Operation) -> SpyreTensorLayout:
 def propagate_spyre_tensor_layouts(
     operations: list[Operation],
 ) -> None:
-    # Convert InputBuffers from FixedLayout to FixedTiledLayouts
+    # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
@@ -487,8 +487,8 @@ def propagate_spyre_tensor_layouts(
                 tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).
-    # Visit them and use the inputs' FixedTiledLayouts and the operation being
-    # performed to convert each output FixedLayout to a FixedTiledLayout.
+    # Visit them and use the input SpyreTensorLayouts and the operation being
+    # performed to compute the set of possible output SpyreTensorLayouts
     it = iter(operations)
     for op in it:
         if op.is_no_op():

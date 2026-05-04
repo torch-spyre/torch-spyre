@@ -17,7 +17,7 @@ from collections import defaultdict
 
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .optimize_restickify import FixedInOutNode, LayoutKey
+from .optimize_restickify import FixedInOutNode
 from .pass_utils import host_coordinates, device_coordinates
 from .pass_utils import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
@@ -211,80 +211,76 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 def finalize_layouts(operations: list) -> None:
     """Build V.graph.restickify_plan for insert_restickify:
-    - Translate stick_decisions (set by the optimizer) into restickify entries.
+    - Translate committed_stl (set by the optimizer) into restickify entries.
     - Handle mutation ops whose stick must match their target buffer.
     - Commit chosen layouts and clean up optimizer-only attributes.
     """
     for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
+        tensor_box = V.graph.graph_inputs[name]
         if (
-            isinstance(tb, TensorBox)
-            and isinstance(tb.data, StorageBox)
-            and isinstance(tb.data.data, InputBuffer)
-            and hasattr(tb, "layouts")
+            isinstance(tensor_box, TensorBox)
+            and isinstance(tensor_box.data, StorageBox)
+            and isinstance(tensor_box.data.data, InputBuffer)
+            and hasattr(tensor_box, "layouts")
         ):
-            ib = tb.data.data
-            assert hasattr(ib, "committed_layout"), (
-                f"graph input {name} has no committed_layout — optimizer did not run"
+            input_buf = tensor_box.data.data
+            assert hasattr(input_buf, "committed_stl"), (
+                f"graph input {name} has no committed_stl — optimizer did not run"
             )
-            stl = next(stl for stl in tb.layouts if LayoutKey.from_stl(stl) == ib.committed_layout)
-            ib.layout = FixedTiledLayout(ib.layout.device, ib.layout.dtype, ib.layout.size, ib.layout.stride, stl)
-            del tb.layouts
+            stl = input_buf.committed_stl
+            input_buf.layout = FixedTiledLayout(input_buf.layout.device, input_buf.layout.dtype, input_buf.layout.size, input_buf.layout.stride, stl)
+            del tensor_box.layouts
 
     restickify_plan: dict = defaultdict(list)
     print()
     print("=== In finalize_layouts ===")
 
     for op in operations:
-        decisions = getattr(op, "stick_decisions", None)
         cost_fn = getattr(op, "restick_cost_fn", None)
         op_layouts = getattr(op, "layouts", None)
-        for attr in ("layouts", "restick_cost_fn", "stick_decisions"):
+        committed = getattr(op, "committed_stl", None)
+        for attr in ("layouts", "restick_cost_fn", "committed_stl"):
             if hasattr(op, attr):
                 delattr(op, attr)
 
         # Commit the chosen output layout.
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            if decisions:
-                out_key = decisions["out_key"]
-                stl = next(stl for stl in op_layouts if LayoutKey.from_stl(stl) == out_key)
-            else:
-                stl = op_layouts[0]
+            stl = committed if cost_fn else op_layouts[0]
             op.layout = FixedTiledLayout(op.layout.device, op.layout.dtype, op.layout.size, op.layout.stride, stl)
 
         # Populate restickify_plan for ops that need edge restickifies.
-        if not decisions:
+        if not cost_fn:
             continue
-        out_key = decisions["out_key"]
+        out_key = committed
         print(f"  op={op.get_name()} out_key={list(out_key.stride_map)}")
         if cost_fn is None:
             continue
-        required_in_keys = (
-            cost_fn.required_in_keys
+        required_in_stls = (
+            cost_fn.required_in_stls
             if isinstance(cost_fn, FixedInOutNode)
             else [out_key] * len(cost_fn.edge_costs)
         )
-        for rc, req_key in zip(cost_fn.edge_costs, required_in_keys):
-            buf = V.graph.get_buffer(rc.dep.name)
-            in_key = LayoutKey.from_stl(buf.get_layout().device_layout)  # already FixedTiledLayout post-finalize
-            tgt = rc.layout(in_key, req_key)
+        for edge_cost, req_stl in zip(cost_fn.edge_costs, required_in_stls):
+            input_buf = V.graph.get_buffer(edge_cost.dep.name)
+            in_stl = input_buf.get_layout().device_layout  # already FixedTiledLayout post-finalize
+            restick_target = edge_cost.layout(in_stl, req_stl)
             print(
-                f"    arg={rc.dep.name} in_key={list(in_key.stride_map)} "
-                f"req_key={list(req_key.stride_map)} "
-                f"tgt={'None' if tgt is None else list(tgt.device_layout.stride_map)}"
+                f"    arg={edge_cost.dep.name} in_key={list(in_stl.stride_map)} "
+                f"req_key={list(req_stl.stride_map)} "
+                f"tgt={'None' if restick_target is None else list(restick_target.device_layout.stride_map)}"
             )
-            if tgt is None:
+            if restick_target is None:
                 print("    -> no restickify needed")
                 continue
             print(
-                f"    -> scheduling restickify {list(in_key.stride_map)} -> {list(req_key.stride_map)}"
+                f"    -> scheduling restickify {list(in_stl.stride_map)} -> {list(req_stl.stride_map)}"
             )
             logger.info(
-                f"Injecting restickify on {op.get_name()} input {rc.dep.name}: "
-                f"{list(in_key.stride_map)} -> {list(req_key.stride_map)} "
-                f"target_stride_map={list(tgt.device_layout.stride_map)}"
+                f"Injecting restickify on {op.get_name()} input {edge_cost.dep.name}: "
+                f"{list(in_stl.stride_map)} -> {list(req_stl.stride_map)} "
+                f"target_stride_map={list(restick_target.device_layout.stride_map)}"
             )
-            _record_restickify(op, rc.dep.name, tgt, restickify_plan)
+            _record_restickify(op, edge_cost.dep.name, restick_target, restickify_plan)
 
     # Handle mutation ops: check if their inputs need restickifying to match target buffer's stick.
     for op in operations:
@@ -294,47 +290,47 @@ def finalize_layouts(operations: list) -> None:
         assert isinstance(target_layout, FixedTiledLayout), (
             f"mutation op {op.get_name()} target has no committed FixedTiledLayout"
         )
-        target_key = LayoutKey.from_stl(target_layout.device_layout)
-        rw = op.get_read_writes()
-        output_dep = next(iter(rw.writes))
-        for dep in rw.reads:
+        target_stl = target_layout.device_layout
+        read_writes = op.get_read_writes()
+        output_dep = next(iter(read_writes.writes))
+        for dep in read_writes.reads:
             if not isinstance(dep, MemoryDep):
                 continue
-            buf = V.graph.get_buffer(dep.name)
-            in_layout = buf.get_layout()
+            input_buf = V.graph.get_buffer(dep.name)
+            in_layout = input_buf.get_layout()
             if not isinstance(in_layout, FixedTiledLayout):
                 continue
-            in_key = LayoutKey.from_stl(in_layout.device_layout)
-            ic = host_coordinates(in_layout, dep)
-            idc = device_coordinates(in_layout.device_layout, dep)
-            target_stick_expr = device_coordinates(target_layout.device_layout, output_dep)[-1]
-            in_stick_expr = idc[-1]
+            in_stl = in_layout.device_layout
+            host_coords = host_coordinates(in_layout, dep)
+            device_coords = device_coordinates(in_stl, dep)
+            target_stick_expr = device_coordinates(target_stl, output_dep)[-1]
+            in_stick_expr = device_coords[-1]
             print(
                 f"  mutation op={op.get_name()} arg={dep.name} "
-                f"in_key={list(in_key.stride_map)} target_key={list(target_key.stride_map)} "
+                f"in_key={list(in_stl.stride_map)} target_key={list(target_stl.stride_map)} "
                 f"in_stick={in_stick_expr} target_stick={target_stick_expr}"
             )
             if in_stick_expr == target_stick_expr:
                 print("    -> no restickify needed")
                 continue
-            tgt = compute_restickify_target_layout(
-                in_layout.device_layout, in_layout, target_stick_expr, ic, idc
+            restick_target = compute_restickify_target_layout(
+                in_stl, in_layout, target_stick_expr, host_coords, device_coords
             )
-            if tgt is None:
+            if restick_target is None:
                 raise Unsupported(
                     f"mutation op {op.get_name()} arg={dep.name}: cannot restickify "
-                    f"{list(in_key.stride_map)} -> {list(target_key.stride_map)}"
+                    f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
                 )
             print(
-                f"    -> scheduling restickify {list(in_key.stride_map)} "
-                f"-> {list(target_key.stride_map)}"
+                f"    -> scheduling restickify {list(in_stl.stride_map)} "
+                f"-> {list(target_stl.stride_map)}"
             )
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {dep.name}: "
-                f"{list(in_key.stride_map)} -> {list(target_key.stride_map)} "
-                f"target_stride_map={list(tgt.device_layout.stride_map)}"
+                f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)} "
+                f"target_stride_map={list(restick_target.device_layout.stride_map)}"
             )
-            _record_restickify(op, dep.name, tgt, restickify_plan)
+            _record_restickify(op, dep.name, restick_target, restickify_plan)
 
     V.graph.restickify_plan = restickify_plan
     print(

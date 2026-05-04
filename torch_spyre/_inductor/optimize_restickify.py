@@ -37,8 +37,7 @@ INF = math.inf
 class LayoutKey:
     """Hashable Python surrogate for SpyreTensorLayout, used as a dict/set key.
 
-    SpyreTensorLayout is not hashable and includes dtype, which is not needed 
-    for stick-compatibility comparisons.
+    Can be removed if we make SpyreTensorLayout hashable.
     """
 
     device_size: tuple[int, ...]
@@ -110,14 +109,24 @@ class EdgeCostMap:
         self._cost[in_key][target_key] = cost
         self._layout[in_key][target_key] = tgt
 
-    def cost(self, in_key: "LayoutKey", target_key: "LayoutKey") -> float:
-        """Return the restick cost for (in_key, target_key), computing it on first access."""
+    def cost(self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout") -> float:
+        """Return the restick cost for (in_stl, target_stl), computing it on first access."""
+
+        # Remove conversions by making STL hashable
+        in_key = LayoutKey.from_stl(in_stl)
+        target_key = LayoutKey.from_stl(target_stl)
+
         if target_key not in self._cost[in_key]:
             self._compute_and_cache_cost(in_key, target_key)
         return self._cost[in_key][target_key]
 
-    def layout(self, in_key: "LayoutKey", target_key: "LayoutKey"):
-        """Return FixedTiledLayout restickify target for (in_key, target_key), or None if no restickify needed."""
+    def layout(self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"):
+        """Return FixedTiledLayout restickify target for (in_stl, target_stl), or None if no restickify needed."""
+
+        # Remove conversions by making STL hashable
+        in_key = LayoutKey.from_stl(in_stl)
+        target_key = LayoutKey.from_stl(target_stl)
+
         if target_key not in self._cost[in_key]:
             self._compute_and_cache_cost(in_key, target_key)
         return self._layout[in_key][target_key]
@@ -135,7 +144,7 @@ class RestickNodeCost(abc.ABC):
         self.edge_costs = edge_costs
 
     @abc.abstractmethod
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float: ...
+    def cost(self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout") -> float: ...
 
 
 class AllSameNode(RestickNodeCost):
@@ -149,8 +158,8 @@ class AllSameNode(RestickNodeCost):
         ]
         return cls(edge_costs)
 
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
-        return sum(ec.cost(lk, out_key) for ec, lk in zip(self.edge_costs, in_layouts))
+    def cost(self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout") -> float:
+        return sum(ec.cost(lk, out_stl) for ec, lk in zip(self.edge_costs, in_layouts))
 
 
 class FixedInOutNode(RestickNodeCost):
@@ -159,34 +168,32 @@ class FixedInOutNode(RestickNodeCost):
     def __init__(
         self,
         edge_costs,
-        required_out_key: "LayoutKey",
-        required_in_keys: "list[LayoutKey]",
+        required_out_stl: "SpyreTensorLayout",
+        required_in_stls: "list[SpyreTensorLayout]",
     ):
         super().__init__(edge_costs)
-        self.required_out_key = required_out_key  # output layout currently assigned
-        self.required_in_keys = (
-            required_in_keys  # each input must be stick-compatible with this layout
+        self.required_out_stl = required_out_stl  # output layout currently assigned
+        self.required_in_stls = (
+            required_in_stls  # each input must be stick-compatible with this layout
         )
 
     @classmethod
-    def from_args(cls, args, out_stl, req_layouts):
-        assert req_layouts, "FixedInOutNode.from_args: req_layouts is empty"
-        required_out_key = LayoutKey.from_stl(out_stl)
+    def from_args(cls, args, out_stl, req_stls):
+        assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
             EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep)
-            for arg, req in zip(args, req_layouts)
+            for arg, req in zip(args, req_stls)
         ]
-        req_keys = [LayoutKey.from_stl(req) for req in req_layouts]
         return cls(
-            edge_costs, required_out_key=required_out_key, required_in_keys=req_keys
+            edge_costs, required_out_stl=out_stl, required_in_stls=req_stls
         )
 
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
-        if out_key != self.required_out_key:
+    def cost(self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout") -> float:
+        if LayoutKey.from_stl(out_stl) != LayoutKey.from_stl(self.required_out_stl):
             return INF
         return sum(
             ec.cost(lk, rk)
-            for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_keys)
+            for ec, lk, rk in zip(self.edge_costs, in_layouts, self.required_in_stls)
         )
 
 
@@ -201,7 +208,7 @@ class AnyInNode(RestickNodeCost):
     def from_args(cls):
         return cls(edge_costs=[])
 
-    def cost(self, in_layouts: "list[LayoutKey]", out_key: "LayoutKey") -> float:
+    def cost(self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout") -> float:
         return 0.0
 
 
@@ -239,7 +246,7 @@ def greedy_local_min_cost(operations: list) -> None:
 
     print()
     print("-- Running greedy algorithm --")
-    # Process graph inputs first so all upstreams have committed_layout.
+    # Process graph inputs first so all upstreams have committed_stl.
     # For now inputs are always a set of size 1, since we use it as it
     # was tranferred to device
     for name in V.graph.graph_input_names:
@@ -251,15 +258,15 @@ def greedy_local_min_cost(operations: list) -> None:
             and hasattr(tb, "layouts")
         ):
             print(
-                f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(lo).stride_map) for lo in tb.layouts]}"
+                f"MRA input layouts: {name} -> {[list(lo.stride_map) for lo in tb.layouts]}"
             )
             if not tb.layouts:
                 raise AssertionError(f"graph input {name} has empty layouts set")
             stl = next(iter(tb.layouts))
-            tb.data.data.committed_layout = LayoutKey.from_stl(stl)
-            tb.committed_layout = tb.data.data.committed_layout
+            tb.data.data.committed_stl = stl
+            tb.committed_stl = stl
             print(
-                f"MRA input committed: {name} -> {list(tb.committed_layout.stride_map)}"
+                f"MRA input committed: {name} -> {list(tb.committed_stl.stride_map)}"
             )
 
     for op in operations:
@@ -271,7 +278,7 @@ def greedy_local_min_cost(operations: list) -> None:
             if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 # Must set the layout for Mutation Ops
                 # TODO should this be done in propagate_layouts?
-                op.committed_layout = LayoutKey.from_stl(op.layouts[0])
+                op.committed_stl = op.layouts[0]
 
             # nothing to do here.
             continue
@@ -283,38 +290,36 @@ def greedy_local_min_cost(operations: list) -> None:
         for dep in op.get_read_writes().reads:
             if isinstance(dep, MemoryDep):
                 buf = V.graph.get_buffer(dep.name)
-                assert hasattr(buf, "committed_layout"), (
-                    f"buffer {dep.name} has no committed_layout — "
+                assert hasattr(buf, "committed_stl"), (
+                    f"buffer {dep.name} has no committed_stl — "
                     "topological order violated or input not committed"
                 )
-                in_layouts.append(buf.committed_layout)
+                in_layouts.append(buf.committed_stl)
 
-        out_layout_keys = [LayoutKey.from_stl(ol) for ol in op.layouts]
-        assert out_layout_keys, (
+        assert op.layouts, (
             f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
         )
-        out_key = None
+        out_stl = None
         best_cost = float("inf")
-        for out_layout_key in out_layout_keys:
-            out_layout_cost = cost_fn.cost(in_layouts, out_layout_key)
+        for candidate_stl in op.layouts:
+            out_layout_cost = cost_fn.cost(in_layouts, candidate_stl)
             print(
                 f"MRA candidate ({op.get_name()}): "
-                f"stick={list(out_layout_key.stride_map)} cost={out_layout_cost}"
+                f"stick={list(candidate_stl.stride_map)} cost={out_layout_cost}"
             )
             if out_layout_cost < best_cost:
                 best_cost = out_layout_cost
-                out_key = out_layout_key
+                out_stl = candidate_stl
 
-        assert out_key is not None, (
+        assert out_stl is not None, (
             f"({op.get_name()}): all stick possibilities had infinite cost. Cannot proceed"
         )
 
         print(
             f"MRA select_restickify_locations ({op.get_name()}): "
-            f"stick={list(out_key.stride_map)} cost={best_cost} "
+            f"stick={list(out_stl.stride_map)} cost={best_cost} "
             f"in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
         )
-        op.committed_layout = out_key
-        op.stick_decisions = {"out_key": out_key}
+        op.committed_stl = out_stl
 
     _print_op_layouts(operations, "after")
