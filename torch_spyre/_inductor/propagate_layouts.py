@@ -189,19 +189,7 @@ def _matmul_layouts(
        3. Construct the FixdInOutNode cost function
     """
     data = op.data
-    print(f"MRA:  ====== In MatMul ({op.get_name()})  ======")
     out_coords = host_coordinates(output, output_dep)
-
-    print("MRA: ARGS:")
-    for i, arg in enumerate(args):
-        print("MRA: arg:", i, arg)
-        _hc = host_coordinates(arg.layout, arg.dep)
-        _dc = device_coordinates(next(iter(arg.layouts)), arg.dep)
-        print("MRA: host_coords:", _hc)
-        print("MRA: device_coords:", _dc)
-        print("MRA: Matching host stick dim:", matching_dim(_hc, _dc[-1]))
-    print("MRA: out_coords:", out_coords)
-    print()
 
     x = args[0]
     y = args[1]
@@ -214,15 +202,10 @@ def _matmul_layouts(
 
     x_stick_expr = x_dev_coords[-1]
     y_stick_expr = y_dev_coords[-1]
-    x_stick_dim = matching_dim(x_coords, x_stick_expr)
-    y_stick_dim = matching_dim(y_coords, y_stick_expr)
-    print(
-        f"MRA: x_stick_expr={x_stick_expr} x_stick_dim={x_stick_dim} x_stick_iv=iv{iter_var_id(x_stick_expr)}"
-    )
-    print(
-        f"MRA: y_stick_expr={y_stick_expr} y_stick_dim={y_stick_dim} y_stick_iv=iv{iter_var_id(y_stick_expr)}"
-    )
-    if x_stick_dim is None or y_stick_dim is None:
+    if (
+        matching_dim(x_coords, x_stick_expr) is None
+        or matching_dim(y_coords, y_stick_expr) is None
+    ):
         raise Unsupported(
             f"{data.reduction_type}: failed to map stick_dims to host coords"
         )
@@ -237,14 +220,8 @@ def _matmul_layouts(
             for c in x_coords
             if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
         )
-        print(
-            f"MRA: x stick iv{iter_var_id(x_stick_expr)} is on output dim -> needs restickify to reduction_coord={reduction_coord} iv{iter_var_id(reduction_coord)}"
-        )
     else:
         reduction_coord = x_stick_expr
-        print(
-            f"MRA: x stick iv{iter_var_id(x_stick_expr)} already on reduction dim -> reduction_coord={reduction_coord}"
-        )
 
     if matching_dim(out_coords, y_stick_expr) is None:
         generated_coord = next(
@@ -254,41 +231,34 @@ def _matmul_layouts(
             and matching_dim(out_coords, c) is not None
             and matching_dim(x_coords, c) is None
         )
-        print(
-            f"MRA: y stick iv{iter_var_id(y_stick_expr)} not on output dim -> needs restickify to generated_coord={generated_coord} iv{iter_var_id(generated_coord)}"
-        )
     else:
         generated_coord = y_stick_expr
-        print(
-            f"MRA: y stick iv{iter_var_id(y_stick_expr)} already on generated dim -> generated_coord={generated_coord}"
-        )
 
     if reduction_coord == x_dev_coords[-1]:
         x_req_stl = x_stl
     else:
-        _tgt = compute_restickify_target_layout(
+        _x = compute_restickify_target_layout(
             x_stl, x.layout, reduction_coord, x_coords, x_dev_coords
         )
-        if _tgt is None:
+        if _x is None:
             raise Unsupported(
                 f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
             )
-        x_req_stl = _tgt.device_layout
+        x_req_stl = _x
 
     if generated_coord == y_dev_coords[-1]:
         y_req_stl = y_stl
     else:
-        _tgt = compute_restickify_target_layout(
+        _y = compute_restickify_target_layout(
             y_stl, y.layout, generated_coord, y_coords, y_dev_coords
         )
-        if _tgt is None:
+        if _y is None:
             raise Unsupported(
                 f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
             )
-        y_req_stl = _tgt.device_layout
+        y_req_stl = _y
 
     out_stick_dim = matching_dim(out_coords, generated_coord)
-    print(f"MRA: out_stick_dim={out_stick_dim} from generated_coord={generated_coord}")
     if out_stick_dim is None:
         raise Unsupported(
             f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {generated_coord}"
@@ -300,7 +270,6 @@ def _matmul_layouts(
         out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
     else:
         out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
-    print(f"MRA: out_dim_order={out_dim_order}")
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -308,7 +277,6 @@ def _matmul_layouts(
     op.restick_cost_fn = FixedInOutNode.from_args(
         [x, y], out_stl, [x_req_stl, y_req_stl]
     )
-    print(f"MRA: matmul output stl: {out_stl}")
     return [out_stl]
 
 
@@ -331,7 +299,6 @@ def _multi_arg_pointwise_layouts(
         for stl in arg.layouts
         if device_coordinates(stl, arg.dep)[-1] != 0
     }
-    print("MRA: stick_exprs (from all layouts):", stick_exprs)
 
     if len(stick_exprs) > 1:
         logger.info(
@@ -386,9 +353,6 @@ def _multi_arg_pointwise_layouts(
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
             stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-            print(
-                f"MRA: stick_expr={stick_expr} out_stick_dim={out_stick_dim} dim_order={dim_order} stride_map={list(stl.stride_map)}"
-            )
         results.append(stl)
     op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
@@ -406,8 +370,6 @@ def compute_layouts(
     2. Attach a restick cost function based on the type of op.
     """
     data = op.data
-    print()
-    print(f"MRA:  ====== In compute_layouts ({op.get_name()})  ======")
 
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
@@ -435,7 +397,12 @@ def compute_layouts(
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed.
         stl = _single_arg_op_layout(
-            op, output, output_dep, args[0].dep, args[0].layout, next(iter(args[0].layouts))
+            op,
+            output,
+            output_dep,
+            args[0].dep,
+            args[0].layout,
+            next(iter(args[0].layouts)),
         )
         op.restick_cost_fn = AnyInNode.from_args()
         return [stl]
@@ -477,13 +444,11 @@ def propagate_spyre_tensor_layouts(
                     or not isinstance(tb.data.data, InputBuffer)
                 ):
                     raise Unsupported(
-                        "graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                        f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
                     )
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
-                    raise Unsupported("graph input {name} does not have a FixedLayout")
-                print("Created STL for Input:", name)
-                print(stl)
+                    raise Unsupported(f"graph input {name} does not have a FixedLayout")
                 tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).

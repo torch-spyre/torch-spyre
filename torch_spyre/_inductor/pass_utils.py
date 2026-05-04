@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, NamedTuple, Optional, TypeVar, Union
+from typing import Callable, NamedTuple, TypeVar, Union
 
 
 import sympy
@@ -101,16 +101,10 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
             buf = V.graph.get_buffer(arg.name)
             layout = buf.get_layout()
             if hasattr(buf, "layouts"):
-                print(
-                    f"MRA get_mem_deps_from_rw: {arg.name} has layouts: {buf.layouts}"
-                )
                 res.append(SchedNodeArg(arg, layout, list(buf.layouts)))
             else:
                 if not isinstance(layout, FixedTiledLayout):
                     raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-                print(
-                    f"MRA get_mem_deps_from_rw: {arg.name} using get_layout: {layout}"
-                )
                 res.append(SchedNodeArg(arg, layout, [layout.device_layout]))
     return res
 
@@ -316,8 +310,8 @@ def compute_restickify_target_layout(
     target_stick_expr,
     ic: list,
     idc: list,
-) -> "FixedTiledLayout | None":
-    """Compute the target FixedTiledLayout that results from moving stl's stick to target_stick_expr.
+) -> "SpyreTensorLayout | None":
+    """Compute the target STL that results from moving stl's stick to target_stick_expr.
     Returns None if the restickify is infeasible.
     """
     new_sd = matching_dim(ic, target_stick_expr)
@@ -361,10 +355,7 @@ def compute_restickify_target_layout(
         host_stride[new_sd],
         stick_size,
     )
-    new_stl = SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
-    return FixedTiledLayout(
-        host_layout.device, host_layout.dtype, host_layout.size, host_layout.stride, new_stl
-    )
+    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
 def compute_restickify_needed(
@@ -373,7 +364,7 @@ def compute_restickify_needed(
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
     out_dep: MemoryDep,
-) -> "tuple[bool, FixedTiledLayout | None]":
+) -> "tuple[bool, SpyreTensorLayout | None]":
     """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
 
     in_dep and out_dep may differ when the output buffer is accessed with a
@@ -381,7 +372,7 @@ def compute_restickify_needed(
 
     Returns:
       (False, None)   — same stick or broadcast: no restickify needed
-      (True, layout)  — restickify needed, layout is the restickified input to produce
+      (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
     idc = device_coordinates(in_stl, in_dep)
