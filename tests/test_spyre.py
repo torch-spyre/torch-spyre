@@ -237,7 +237,6 @@ class TestSpyre(TestCase):
                 check_dtype=False,
             )
 
-    # ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1187
     @parametrize(
         "factory_name",
         [
