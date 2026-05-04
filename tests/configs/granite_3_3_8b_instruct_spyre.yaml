@@ -15,7 +15,7 @@ test_suite_config:
           edits:
             modules:
               include: &id001
-                - name: GraniteRotaryEmbedding_93b52f93
+                - name: GraniteRotaryEmbedding_64892356
                   module_path: transformers.models.granite.modeling_granite.GraniteRotaryEmbedding
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteRotaryEmbedding'
                   constructor_inputs:
@@ -255,7 +255,7 @@ test_suite_config:
                               init: randint
                               init_args:
                                 high: 10000
-                - name: GraniteMLP_6de6632e
+                - name: GraniteMLP_77d2613c
                   module_path: transformers.models.granite.modeling_granite.GraniteMLP
                   description: 'Module: transformers.models.granite.modeling_granite.GraniteMLP'
                   constructor_inputs:
@@ -281,7 +281,7 @@ test_suite_config:
                             device: spyre
                             init: randn
                       kwargs: {}
-                - name: SiLUActivation_d81dab2c
+                - name: SiLUActivation_d2f532e9
                   module_path: transformers.activations.SiLUActivation
                   description: 'Module: transformers.activations.SiLUActivation'
                   constructor_inputs:

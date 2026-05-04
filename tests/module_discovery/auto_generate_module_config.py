@@ -395,7 +395,7 @@ class ModuleInfoCapture:
         # This ensures uniqueness while keeping names readable
         import hashlib
 
-        sig_hash = hashlib.md5(config_signature.encode()).hexdigest()[:8]
+        sig_hash = hashlib.sha256(config_signature.encode()).hexdigest()[:8]
         return f"{module_type}_{sig_hash}"
 
     def _create_invocation_signature(
@@ -462,7 +462,7 @@ class ModuleInfoCapture:
         # Hash for compact signature
         import hashlib
 
-        return hashlib.md5(pattern_str.encode()).hexdigest()
+        return hashlib.sha256(pattern_str.encode()).hexdigest()
 
     def get_captured_modules(self) -> List[Dict[str, Any]]:
         """Return list of captured module information."""
