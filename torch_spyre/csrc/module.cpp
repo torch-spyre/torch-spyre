@@ -23,7 +23,7 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
-#include <cstdlib>  // std::getenv
+#include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
 #include <iostream>
