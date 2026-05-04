@@ -183,6 +183,10 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
 
+    # File-level module filtering (populated during config load)
+    _FILE_LEVEL_INCLUDED_MODULES: Set[str] = set()
+    _FILE_LEVEL_EXCLUDED_MODULES: Set[str] = set()
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -232,8 +236,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.TEST_ENTRIES = _build_test_entry_map(file_entry)
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
-        cls._FILE_LEVEL_INCLUDED_MODULES: Set[str] = set()
-        cls._FILE_LEVEL_EXCLUDED_MODULES: Set[str] = set()
+        # Reset file-level module tracking for this config load
+        cls._FILE_LEVEL_INCLUDED_MODULES = set()
+        cls._FILE_LEVEL_EXCLUDED_MODULES = set()
 
         for entry in file_entry.tests:
             if entry.edits.modules.include:
