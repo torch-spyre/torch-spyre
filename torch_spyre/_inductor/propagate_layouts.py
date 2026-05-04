@@ -73,31 +73,32 @@ def _single_arg_op_layout(
     output: FixedLayout,
     output_dep: MemoryDep,
     dep: MemoryDep,
-    layout: FixedTiledLayout,
-) -> FixedTiledLayout:
+    in_layout: FixedLayout,
+    stl: SpyreTensorLayout,
+) -> SpyreTensorLayout:
     """
-    Compute the output FixedTiledLayout for a single-arg op given one input layout.
-    Called once per candidate input layout to produce the corresponding output layout.
+    Compute the output STL for a single-arg op given one candidate input STL.
+    Called once per candidate input STL to produce the corresponding output STL.
     """
     data = op.data
 
     if isinstance(data, Reduction):
         if data.reduction_type == "exx2":
-            x_coords = host_coordinates(layout, dep)
-            x_dev_coords = device_coordinates(layout, dep)
+            x_coords = host_coordinates(in_layout, dep)
+            x_dev_coords = device_coordinates(stl, dep)
             x_stick_expr = x_dev_coords[-1]
             x_stick_dim = matching_dim(x_coords, x_stick_expr)
-            if x_stick_dim is None or x_stick_dim != len(layout.size) - 1:
+            if x_stick_dim is None or x_stick_dim != len(in_layout.size) - 1:
                 # TODO: Insert a restickify to enable the operation to be performed
-                raise Unsupported(f"exx2: illegal device layout {layout}")
+                raise Unsupported(f"exx2: illegal device layout {stl}")
             dim_order = list(range(len(output.size))) + [-1]
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
-            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+            return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
         else:
             # Propagate input stick to output if the dim survives, else put stick last.
-            x_coords = host_coordinates(layout, dep)
-            x_dev_coords = device_coordinates(layout, dep)
+            x_coords = host_coordinates(in_layout, dep)
+            x_dev_coords = device_coordinates(stl, dep)
             out_coords = host_coordinates(output, output_dep)
             x_stick_expr = x_dev_coords[-1]
             out_stick_dim = matching_dim(out_coords, x_stick_expr)
@@ -110,10 +111,7 @@ def _single_arg_op_layout(
                 out_dim_order = out_dim_order + [out_stick_dim]
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
-            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-        return FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
+            return SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
@@ -125,36 +123,29 @@ def _single_arg_op_layout(
             # Concretize for C++ SpyreTensorLayout constructor.
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
-            stl = SpyreTensorLayout(
+            return SpyreTensorLayout(
                 c_size,
                 c_stride,
                 output.dtype,
                 list(range(len(output.size))),
             )
-            return FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
-            )
 
         case spyreop.overwrite.default:
-            stl = SpyreTensorLayout(output.size, output.dtype)
-            return FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
-            )
+            return SpyreTensorLayout(output.size, output.dtype)
 
         case _:
-            x_stl = layout.device_layout
-            in_coords = host_coordinates(layout, dep)
+            in_coords = host_coordinates(in_layout, dep)
             out_coords = host_coordinates(output, output_dep)
             if (
                 in_coords == out_coords
                 and dep.index == output_dep.index
-                and same_device_size(layout.dtype, output.dtype)
+                and same_device_size(in_layout.dtype, output.dtype)
             ):
                 # Input and output tensors are being accessed identically and elem size is the same.
                 # We can simply propagate the device_layout.
-                stl = SpyreTensorLayout(
-                    x_stl.device_size,
-                    x_stl.stride_map,
+                return SpyreTensorLayout(
+                    stl.device_size,
+                    stl.stride_map,
                     get_device_dtype(output.dtype),
                 )
             else:
@@ -163,7 +154,7 @@ def _single_arg_op_layout(
                 #       For now, use the default layout for a mostly row major dimension
                 #       ordering, adjusted to put the stick dimension last and move all
                 #       non-stick size one dimensions to the right to avoid tiling them.
-                in_device_coords = device_coordinates(layout, dep)
+                in_device_coords = device_coordinates(stl, dep)
                 stick_expr = in_device_coords[-1]
                 maybe_stick_dim = matching_dim(out_coords, stick_expr)
                 out_stick_dim = -1 if maybe_stick_dim is None else maybe_stick_dim
@@ -181,12 +172,7 @@ def _single_arg_op_layout(
                 # Concretize for C++ SpyreTensorLayout constructor.
                 c_size = [concretize_expr(s) for s in output.size]
                 c_stride = [concretize_expr(s) for s in output.stride]
-                stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-
-            # FixedTiledLayout keeps original (possibly symbolic) size/stride.
-            return FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
-            )
+                return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
 
 
 def _matmul_layouts(
@@ -194,7 +180,7 @@ def _matmul_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
-) -> list[FixedTiledLayout]:
+) -> list[SpyreTensorLayout]:
     """
     Matmul has fixed in/out stick requirements so handled specially.
     Algorithm is
@@ -209,7 +195,7 @@ def _matmul_layouts(
     print("MRA: ARGS:")
     for i, arg in enumerate(args):
         print("MRA: arg:", i, arg)
-        _hc = host_coordinates(next(iter(arg.layouts)), arg.dep)
+        _hc = host_coordinates(arg.layout, arg.dep)
         _dc = device_coordinates(next(iter(arg.layouts)), arg.dep)
         print("MRA: host_coords:", _hc)
         print("MRA: device_coords:", _dc)
@@ -219,12 +205,12 @@ def _matmul_layouts(
 
     x = args[0]
     y = args[1]
-    x_layout = next(iter(x.layouts))
-    y_layout = next(iter(y.layouts))
-    x_coords = host_coordinates(x_layout, x.dep)
-    x_dev_coords = device_coordinates(x_layout, x.dep)
-    y_coords = host_coordinates(y_layout, y.dep)
-    y_dev_coords = device_coordinates(y_layout, y.dep)
+    x_stl = next(iter(x.layouts))
+    y_stl = next(iter(y.layouts))
+    x_coords = host_coordinates(x.layout, x.dep)
+    x_dev_coords = device_coordinates(x_stl, x.dep)
+    y_coords = host_coordinates(y.layout, y.dep)
+    y_dev_coords = device_coordinates(y_stl, y.dep)
 
     x_stick_expr = x_dev_coords[-1]
     y_stick_expr = y_dev_coords[-1]
@@ -278,10 +264,10 @@ def _matmul_layouts(
         )
 
     x_req_layout = (
-        x_layout
+        FixedTiledLayout(x.layout.device, x.layout.dtype, x.layout.size, x.layout.stride, x_stl)
         if reduction_coord == x_dev_coords[-1]
         else compute_restickify_target_layout(
-            x_layout, reduction_coord, x_coords, x_dev_coords
+            x_stl, x.layout, reduction_coord, x_coords, x_dev_coords
         )
     )
     if x_req_layout is None:
@@ -290,10 +276,10 @@ def _matmul_layouts(
         )
 
     y_req_layout = (
-        y_layout
+        FixedTiledLayout(y.layout.device, y.layout.dtype, y.layout.size, y.layout.stride, y_stl)
         if generated_coord == y_dev_coords[-1]
         else compute_restickify_target_layout(
-            y_layout, generated_coord, y_coords, y_dev_coords
+            y_stl, y.layout, generated_coord, y_coords, y_dev_coords
         )
     )
     if y_req_layout is None:
@@ -318,15 +304,12 @@ def _matmul_layouts(
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    result_layout = FixedTiledLayout(
-        output.device, output.dtype, output.size, output.stride, stl
-    )
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], stl, [x_req_layout, y_req_layout]
+        [x, y], out_stl, [x_req_layout.device_layout, y_req_layout.device_layout]
     )
-    print(f"MRA: matmul output layout: {result_layout}")
-    return [result_layout]
+    print(f"MRA: matmul output stl: {out_stl}")
+    return [out_stl]
 
 
 def _multi_arg_pointwise_layouts(
@@ -334,19 +317,19 @@ def _multi_arg_pointwise_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
-) -> list[FixedTiledLayout]:
+) -> list[SpyreTensorLayout]:
     """
     Multi-arg pointwise is a join point so handled specially.
     Algorithm is
        1. Compute set of output stick expressions possible given the input layouts
-       2. Compute an out layout for each
+       2. Compute an out STL for each
        3. Construct the AllSameNode cost function since in and out sticks must always match
     """
     stick_exprs = {
-        device_coordinates(layout, arg.dep)[-1]
+        device_coordinates(stl, arg.dep)[-1]
         for arg in args
-        for layout in arg.layouts
-        if device_coordinates(layout, arg.dep)[-1] != 0
+        for stl in arg.layouts
+        if device_coordinates(stl, arg.dep)[-1] != 0
     }
     print("MRA: stick_exprs (from all layouts):", stick_exprs)
 
@@ -357,7 +340,7 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(next(iter(arg.layouts)), arg.dep) for arg in args]
+    in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
     out_coords = host_coordinates(output, output_dep)
     can_use_same_layout = True
 
@@ -368,16 +351,16 @@ def _multi_arg_pointwise_layouts(
             if (
                 arg_coors != out_coords
                 or arg.dep.index != output_dep.index
-                or not same_device_size(next(iter(arg.layouts)).dtype, output.dtype)
+                or not same_device_size(arg.layout.dtype, output.dtype)
             ):
                 can_use_same_layout = False
                 break
 
-    results: list[FixedTiledLayout] = []
+    results: list[SpyreTensorLayout] = []
     # Sort stick exprs for determinism
     for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else [None]:
         if can_use_same_layout:
-            template_stl = next(iter(args[0].layouts)).device_layout
+            template_stl = next(iter(args[0].layouts))
             stl = SpyreTensorLayout(
                 template_stl.device_size,
                 template_stl.stride_map,
@@ -406,11 +389,7 @@ def _multi_arg_pointwise_layouts(
             print(
                 f"MRA: stick_expr={stick_expr} out_stick_dim={out_stick_dim} dim_order={dim_order} stride_map={list(stl.stride_map)}"
             )
-        results.append(
-            FixedTiledLayout(
-                output.device, output.dtype, output.size, output.stride, stl
-            )
-        )
+        results.append(stl)
     op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
 
@@ -420,10 +399,10 @@ def compute_layouts(
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[SchedNodeArg],
-) -> list[FixedTiledLayout]:
+) -> list[SpyreTensorLayout]:
     """
     Main driver for propagating layouts. There are two tasks performed
-    1. Compute candidate output FixedTiledLayouts given a set of layouts for each input arg.
+    1. Compute candidate output STLs given a set of STLs for each input arg.
     2. Attach a restick cost function based on the type of op.
     """
     data = op.data
@@ -440,14 +419,14 @@ def compute_layouts(
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and output
         # must have matching size/stride, but only the first arg drives the output layout.
-        first_layout = next(iter(args[0].layouts))
-        if first_layout.size != output.size or first_layout.stride != output.stride:
+        in_layout = args[0].layout
+        if in_layout.size != output.size or in_layout.stride != output.stride:
             raise Unsupported(
-                f"views not supported for spyre.layernormnorm({first_layout.size})=>{output.size})"
+                f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
         layouts = [
-            _single_arg_op_layout(op, output, output_dep, args[0].dep, lo)
-            for lo in args[0].layouts
+            _single_arg_op_layout(op, output, output_dep, args[0].dep, in_layout, stl)
+            for stl in args[0].layouts
         ]
         op.restick_cost_fn = AllSameNode.from_args(args[:1], layouts, output_dep)
         return layouts
@@ -455,30 +434,26 @@ def compute_layouts(
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed.
-        layout = _single_arg_op_layout(
-            op, output, output_dep, args[0].dep, next(iter(args[0].layouts))
+        stl = _single_arg_op_layout(
+            op, output, output_dep, args[0].dep, args[0].layout, next(iter(args[0].layouts))
         )
         op.restick_cost_fn = AnyInNode.from_args()
-        return [layout]
+        return [stl]
 
     # All other single arg ops
     layouts = [
-        _single_arg_op_layout(op, output, output_dep, args[0].dep, lo)
-        for lo in args[0].layouts
+        _single_arg_op_layout(op, output, output_dep, args[0].dep, args[0].layout, stl)
+        for stl in args[0].layouts
     ]
     op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep)
     return layouts
 
 
-def generic_layout(op: Operation) -> FixedTiledLayout:
+def generic_layout(op: Operation) -> SpyreTensorLayout:
     output: FixedLayout = op.get_layout()
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
-    # Use the generic stick format
-    stl = SpyreTensorLayout(c_size, output.dtype)
-    return FixedTiledLayout(
-        output.device, output.dtype, output.size, output.stride, stl
-    )
+    return SpyreTensorLayout(c_size, output.dtype)
 
 
 def propagate_spyre_tensor_layouts(
@@ -507,10 +482,9 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported("graph input {name} does not have a FixedLayout")
-                ftl = FixedTiledLayout(ptl.device, ptl.dtype, ptl.size, ptl.stride, stl)
-                print("Created FixedTiledLayout for Input:", name)
-                print(ftl)
-                tb.layouts = {ftl}
+                print("Created STL for Input:", name)
+                print(stl)
+                tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the inputs' FixedTiledLayouts and the operation being

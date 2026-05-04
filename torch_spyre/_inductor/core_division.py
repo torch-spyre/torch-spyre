@@ -66,7 +66,7 @@ class TensorDep:
     device_coords: list[Expr] = dataclasses.field(init=False)
 
     def __post_init__(self):
-        self.device_coords = device_coordinates(self.layout, self.dep)
+        self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
 
 
 def core_split(size: int, max_cores: int) -> int:

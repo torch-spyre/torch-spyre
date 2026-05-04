@@ -68,6 +68,8 @@ class EdgeCostMap:
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
+        self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
+        self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
 
         # _cost and _layout are parallel maps.  
         # _cost stores the cost for a given in/target layout pair 
@@ -84,35 +86,27 @@ class EdgeCostMap:
 
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
-        in_layout = next(
-            (
-                layout
-                for layout in self._in_layouts
-                if LayoutKey.from_stl(layout.device_layout) == in_key
-            ),
+        in_stl = next(
+            (stl for stl in self._in_layouts if LayoutKey.from_stl(stl) == in_key),
             None,
         )
-        target_layout = next(
-            (
-                layout
-                for layout in self._target_layouts
-                if LayoutKey.from_stl(layout.device_layout) == target_key
-            ),
+        target_stl = next(
+            (stl for stl in self._target_layouts if LayoutKey.from_stl(stl) == target_key),
             None,
         )
-        assert in_layout is not None, f"in_key {in_key} not found in in_layouts"
-        assert target_layout is not None, (
+        assert in_stl is not None, f"in_key {in_key} not found in in_layouts"
+        assert target_stl is not None, (
             f"target_key {target_key} not found in target_layouts"
         )
         needed, tgt = compute_restickify_needed(
-            in_layout, self.dep, target_layout, self._target_dep
+            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep
         )
         if not needed:
             cost = 0.0
         elif tgt is None:
             cost = INF  # infeasible restickify
         else:
-            cost = float(math.prod(s for s in in_layout.size))
+            cost = float(math.prod(in_stl.device_size))
         self._cost[in_key][target_key] = cost
         self._layout[in_key][target_key] = tgt
 
@@ -182,7 +176,7 @@ class FixedInOutNode(RestickNodeCost):
             EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep)
             for arg, req in zip(args, req_layouts)
         ]
-        req_keys = [LayoutKey.from_stl(req.device_layout) for req in req_layouts]
+        req_keys = [LayoutKey.from_stl(req) for req in req_layouts]
         return cls(
             edge_costs, required_out_key=required_out_key, required_in_keys=req_keys
         )
@@ -257,12 +251,12 @@ def greedy_local_min_cost(operations: list) -> None:
             and hasattr(tb, "layouts")
         ):
             print(
-                f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(lo.device_layout).stride_map) for lo in tb.layouts]}"
+                f"MRA input layouts: {name} -> {[list(LayoutKey.from_stl(lo).stride_map) for lo in tb.layouts]}"
             )
             if not tb.layouts:
                 raise AssertionError(f"graph input {name} has empty layouts set")
-            layout = next(iter(tb.layouts))
-            tb.data.data.committed_layout = LayoutKey.from_stl(layout.device_layout)
+            stl = next(iter(tb.layouts))
+            tb.data.data.committed_layout = LayoutKey.from_stl(stl)
             tb.committed_layout = tb.data.data.committed_layout
             print(
                 f"MRA input committed: {name} -> {list(tb.committed_layout.stride_map)}"
@@ -277,8 +271,7 @@ def greedy_local_min_cost(operations: list) -> None:
             if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 # Must set the layout for Mutation Ops
                 # TODO should this be done in propagate_layouts?
-                op.layout = op.layouts[0]
-                op.committed_layout = LayoutKey.from_stl(op.layouts[0].device_layout)
+                op.committed_layout = LayoutKey.from_stl(op.layouts[0])
 
             # nothing to do here.
             continue
@@ -296,14 +289,13 @@ def greedy_local_min_cost(operations: list) -> None:
                 )
                 in_layouts.append(buf.committed_layout)
 
-        out_layout_keys = [LayoutKey.from_stl(ol.device_layout) for ol in op.layouts]
+        out_layout_keys = [LayoutKey.from_stl(ol) for ol in op.layouts]
         assert out_layout_keys, (
             f"op {op.get_name()} has restick_cost_fn but no candidate output layouts"
         )
-        layout = None
         out_key = None
         best_cost = float("inf")
-        for out_layout, out_layout_key in zip(op.layouts, out_layout_keys):
+        for out_layout_key in out_layout_keys:
             out_layout_cost = cost_fn.cost(in_layouts, out_layout_key)
             print(
                 f"MRA candidate ({op.get_name()}): "
@@ -311,7 +303,6 @@ def greedy_local_min_cost(operations: list) -> None:
             )
             if out_layout_cost < best_cost:
                 best_cost = out_layout_cost
-                layout = out_layout
                 out_key = out_layout_key
 
         assert out_key is not None, (
@@ -323,8 +314,6 @@ def greedy_local_min_cost(operations: list) -> None:
             f"stick={list(out_key.stride_map)} cost={best_cost} "
             f"in_layouts={[list(lk.stride_map) for lk in in_layouts]}"
         )
-        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            op.layout = layout
         op.committed_layout = out_key
         op.stick_decisions = {"out_key": out_key}
 

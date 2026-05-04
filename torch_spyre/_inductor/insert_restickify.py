@@ -227,10 +227,8 @@ def finalize_layouts(operations: list) -> None:
             assert hasattr(ib, "committed_layout"), (
                 f"graph input {name} has no committed_layout — optimizer did not run"
             )
-            ib.layout = next(
-                lo for lo in tb.layouts
-                if LayoutKey.from_stl(lo.device_layout) == ib.committed_layout
-            )
+            stl = next(stl for stl in tb.layouts if LayoutKey.from_stl(stl) == ib.committed_layout)
+            ib.layout = FixedTiledLayout(ib.layout.device, ib.layout.dtype, ib.layout.size, ib.layout.stride, stl)
             del tb.layouts
 
     restickify_plan: dict = defaultdict(list)
@@ -240,9 +238,19 @@ def finalize_layouts(operations: list) -> None:
     for op in operations:
         decisions = getattr(op, "stick_decisions", None)
         cost_fn = getattr(op, "restick_cost_fn", None)
+        op_layouts = getattr(op, "layouts", None)
         for attr in ("layouts", "restick_cost_fn", "stick_decisions"):
             if hasattr(op, attr):
                 delattr(op, attr)
+
+        # Commit the chosen output layout.
+        if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            if decisions:
+                out_key = decisions["out_key"]
+                stl = next(stl for stl in op_layouts if LayoutKey.from_stl(stl) == out_key)
+            else:
+                stl = op_layouts[0]
+            op.layout = FixedTiledLayout(op.layout.device, op.layout.dtype, op.layout.size, op.layout.stride, stl)
 
         # Populate restickify_plan for ops that need edge restickifies.
         if not decisions:
@@ -258,7 +266,7 @@ def finalize_layouts(operations: list) -> None:
         )
         for rc, req_key in zip(cost_fn.edge_costs, required_in_keys):
             buf = V.graph.get_buffer(rc.dep.name)
-            in_key = LayoutKey.from_stl(buf.get_layout().device_layout)
+            in_key = LayoutKey.from_stl(buf.get_layout().device_layout)  # already FixedTiledLayout post-finalize
             tgt = rc.layout(in_key, req_key)
             print(
                 f"    arg={rc.dep.name} in_key={list(in_key.stride_map)} "
@@ -298,8 +306,8 @@ def finalize_layouts(operations: list) -> None:
                 continue
             in_key = LayoutKey.from_stl(in_layout.device_layout)
             ic = host_coordinates(in_layout, dep)
-            idc = device_coordinates(in_layout, dep)
-            target_stick_expr = device_coordinates(target_layout, output_dep)[-1]
+            idc = device_coordinates(in_layout.device_layout, dep)
+            target_stick_expr = device_coordinates(target_layout.device_layout, output_dep)[-1]
             in_stick_expr = idc[-1]
             print(
                 f"  mutation op={op.get_name()} arg={dep.name} "
@@ -310,7 +318,7 @@ def finalize_layouts(operations: list) -> None:
                 print("    -> no restickify needed")
                 continue
             tgt = compute_restickify_target_layout(
-                in_layout, target_stick_expr, ic, idc
+                in_layout.device_layout, in_layout, target_stick_expr, ic, idc
             )
             if tgt is None:
                 raise Unsupported(
