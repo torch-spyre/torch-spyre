@@ -22,12 +22,14 @@ from .pass_utils import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
+    FixedLayout,
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
     StorageBox,
     TensorBox,
 )
+from torch_spyre._C import SpyreTensorLayout
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
@@ -36,6 +38,12 @@ from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
 
 logger = get_inductor_logger("insert_restickify")
+
+
+def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
+    return FixedTiledLayout(
+        layout.device, layout.dtype, layout.size, layout.stride, stl
+    )
 
 
 def _record_restickify(
@@ -222,13 +230,7 @@ def finalize_layouts(operations: list) -> None:
                 f"graph input {name} has no committed_stl — optimizer did not run"
             )
             stl = input_buf.committed_stl
-            input_buf.layout = FixedTiledLayout(
-                input_buf.layout.device,
-                input_buf.layout.dtype,
-                input_buf.layout.size,
-                input_buf.layout.stride,
-                stl,
-            )
+            input_buf.layout = _fixed_tiled(input_buf.layout, stl)
             del tensor_box.layouts
 
     restickify_plan: dict = defaultdict(list)
@@ -244,9 +246,7 @@ def finalize_layouts(operations: list) -> None:
         # Commit the chosen STL and wrap in a FixedTiledLayout
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
-            op.layout = FixedTiledLayout(
-                op.layout.device, op.layout.dtype, op.layout.size, op.layout.stride, stl
-            )
+            op.layout = _fixed_tiled(op.layout, stl)
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
@@ -259,13 +259,7 @@ def finalize_layouts(operations: list) -> None:
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
                 continue
-            restick_target = FixedTiledLayout(
-                in_layout.device,
-                in_layout.dtype,
-                in_layout.size,
-                in_layout.stride,
-                restick_stl,
-            )
+            restick_target = _fixed_tiled(in_layout, restick_stl)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
@@ -306,13 +300,7 @@ def finalize_layouts(operations: list) -> None:
                     f"mutation op {op.get_name()} arg={dep.name}: cannot restickify "
                     f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
                 )
-            restick_target = FixedTiledLayout(
-                in_layout.device,
-                in_layout.dtype,
-                in_layout.size,
-                in_layout.stride,
-                restick_stl,
-            )
+            restick_target = _fixed_tiled(in_layout, restick_stl)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"

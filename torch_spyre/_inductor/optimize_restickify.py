@@ -254,7 +254,7 @@ def greedy_local_min_cost(operations: list) -> None:
 
     # Process graph inputs first so all upstreams have committed_stl.
     # For now inputs are always a set of size 1, since we use it as it
-    # was tranferred to device
+    # was transferred to device
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if (
@@ -273,12 +273,12 @@ def greedy_local_min_cost(operations: list) -> None:
             continue  # FallbackKernel and other unhandled op types
 
         if not hasattr(op, "restick_cost_fn"):
-            if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                # Must set the layout for Mutation Ops
-                # TODO should this be done in propagate_layouts?
-                op.committed_stl = op.layouts[0]
-
-            # nothing to do here.
+            # REMOVE ME: assert believed dead — mutation ops should never reach here
+            # because propagate_spyre_tensor_layouts skips them (no layouts set).
+            assert not isinstance(op.layout, MutationLayoutSHOULDREMOVE), (
+                f"mutation op {op.get_name()} unexpectedly has layouts but no restick_cost_fn"
+            )
+            op.committed_stl = op.layouts[0]
             continue
 
         cost_fn = op.restick_cost_fn
