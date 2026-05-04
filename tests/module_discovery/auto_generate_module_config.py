@@ -713,8 +713,7 @@ def generate_unified_yaml_config(
                         {
                             "names": [
                                 "*TestModuleCustom*::test_eager_vs_compile",
-                                "*TestModuleCustom*::test_layout",
-                                "*TestModuleCustom*::test_stride",
+                                "*TestModuleCustom*::test_layout_stride",
                             ],
                             "mode": "mandatory_success",
                             "tags": [f"model__{model_name}", "custom_tests"],

@@ -311,8 +311,7 @@ test_suite_config:
       tests:
         - names:
             - '*TestModuleCustom*::test_eager_vs_compile'
-            - '*TestModuleCustom*::test_layout'
-            - '*TestModuleCustom*::test_stride'
+            - '*TestModuleCustom*::test_layout_stride'
           mode: mandatory_success
           tags:
             - model__granite_3_3_8b_instruct

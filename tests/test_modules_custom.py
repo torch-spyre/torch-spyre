@@ -3,8 +3,7 @@ Custom module tests for torch-spyre.
 
 This file contains additional test methods for modules defined in YAML configs:
 - test_eager_vs_compile: Compare eager and compile mode outputs (CPU vs Spyre eager vs Spyre compiled)
-- test_layout: Validate real YAML-specified SpyreTensorLayouts (CPU vs Spyre)
-- test_stride: Validate real YAML-specified tensor strides (CPU vs Spyre)
+- test_layout_stride: Validate real YAML-specified SpyreTensorLayouts and strides (CPU vs Spyre)
 
 All tests use pytree for robust handling of nested input/output structures and test only
 real model configurations from YAML without artificial modifications.
@@ -121,13 +120,11 @@ class TestModuleCustom(TestCase):
                 )
 
     @modules(module_db)
-    def test_layout(self, device, dtype, module_info, training):
-        """Test module with real YAML-specified layouts only.
+    def test_layout_stride(self, device, dtype, module_info, training):
+        """Test module with real YAML-specified layouts and strides.
 
-        This test validates that modules work correctly with the actual tensor
-        layouts (SpyreTensorLayouts) specified in the YAML configuration, without
-        any artificial modifications. Compares CPU vs device outputs to ensure
-        correctness.
+        Validates modules work correctly with actual SpyreTensorLayouts from YAML config.
+        Compares CPU vs device outputs for correctness.
         """
         module_inputs = module_info.module_inputs_func(
             module_info, device=device, dtype=dtype, requires_grad=False, training=False
@@ -194,84 +191,7 @@ class TestModuleCustom(TestCase):
                 self.assertEqual(
                     cpu_tensor,
                     device_tensor.cpu(),
-                    msg=f"{module_info.name}: layout mismatch on real inputs",
-                )
-
-    @modules(module_db)
-    def test_stride(self, device, dtype, module_info, training):
-        """Test module with real YAML-specified strides only.
-
-        This test validates that modules work correctly with the actual tensor
-        sizes and strides specified in the YAML configuration, without any
-        artificial modifications. Compares CPU vs device outputs to ensure
-        correctness.
-        """
-        module_inputs = module_info.module_inputs_func(
-            module_info, device=device, dtype=dtype, requires_grad=False, training=False
-        )
-
-        for module_input in module_inputs:
-            # Create module on CPU
-            module_cpu = module_info.module_cls(
-                *module_input.constructor_input.args,
-                **module_input.constructor_input.kwargs,
-            )
-            module_cpu.eval()
-
-            # Create module on device
-            module_device = module_info.module_cls(
-                *module_input.constructor_input.args,
-                **module_input.constructor_input.kwargs,
-            ).to(device)
-            module_device.eval()
-
-            # Copy weights from CPU to device
-            module_device.load_state_dict(module_cpu.state_dict())
-
-            # Prepare inputs
-            args_cpu = module_input.forward_input.args
-            kwargs_cpu = module_input.forward_input.kwargs
-
-            # Move inputs to device using pytree to handle nested structures
-            args_device = tree_map(
-                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, args_cpu
-            )
-            kwargs_device = tree_map(
-                lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, kwargs_cpu
-            )
-
-            # Run forward passes
-            with torch.no_grad():
-                output_cpu = module_cpu(*args_cpu, **kwargs_cpu)
-                output_device = module_device(*args_device, **kwargs_device)
-
-            # Extract first tensor from output using pytree
-            def extract_first_tensor(output):
-                """Extract first tensor from potentially nested output structure."""
-                tensors = []
-
-                def collect_tensors(x):
-                    if isinstance(x, torch.Tensor):
-                        tensors.append(x)
-                    return x
-
-                tree_map(collect_tensors, output)
-                return tensors[0] if tensors else None
-
-            cpu_tensor = extract_first_tensor(output_cpu)
-            device_tensor = extract_first_tensor(output_device)
-
-            if (
-                cpu_tensor is not None
-                and isinstance(cpu_tensor, torch.Tensor)
-                and device_tensor is not None
-                and isinstance(device_tensor, torch.Tensor)
-            ):
-                # Compare CPU vs device outputs
-                self.assertEqual(
-                    cpu_tensor,
-                    device_tensor.cpu(),
-                    msg=f"{module_info.name}: stride/layout mismatch on real inputs",
+                    msg=f"{module_info.name}: layout/stride mismatch on real inputs",
                 )
 
 
