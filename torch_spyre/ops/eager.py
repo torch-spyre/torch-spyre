@@ -14,11 +14,15 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
+from .fallbacks import _get_op_overloads
 import torch_spyre._C as _C
 import warnings
 import functools
 import inspect
 import operator
+
+
+aten = torch.ops.aten
 
 
 # Decorator to keep track of compiled variant
@@ -40,7 +44,7 @@ def compile_once(op, **compile_kwargs):
         # a clean signature.
         old_signature = inspect.signature(fn)
         params = dict(old_signature.parameters)
-        params.pop("compiled")
+        params.pop("compiled", None)
         new_signature = old_signature.replace(parameters=params.values())
         wrapper.__signature__ = new_signature
 
@@ -55,18 +59,60 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-@torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
-@compile_once(torch.mm, dynamic=False)
-def spyre__mm(self: torch.Tensor, mat2: torch.Tensor, compiled) -> torch.Tensor:
-    return compiled(self, mat2)
+def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
+    return compiled(*args, **kwargs)
 
 
-@torch.library.register_kernel("aten::mm.out", ["spyre"])  # type:ignore
-@compile_once(torch.mm, dynamic=False)
-def spyre__mm_out(
-    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor, compiled
-) -> torch.Tensor:
-    return compiled(self, mat2, out=out)
+def register_torch_compile_kernel(ops):
+    for op in _get_op_overloads(ops):
+        if "Tensor" not in str(op._schema):
+            # there are some ops that do not take in Tensors
+            # like aten.sum.int
+            continue
+        if "dtype" in op.name():
+            # ops that change dtype are not supported yet
+            continue
+        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
+
+
+register_torch_compile_kernel(
+    [
+        aten.mm,
+        aten.silu.out,
+        aten.mish.out,
+        aten.abs,
+        aten.add,
+        aten.bitwise_not,
+        aten.logical_not,
+        aten.bmm,
+        aten.cat,
+        aten.div,
+        aten.exp,
+        aten.log,
+        aten.mean,
+        aten.mul,
+        aten.reciprocal,
+        aten.neg,
+        aten.relu,
+        aten.rsqrt,
+        aten.sigmoid,
+        aten._softmax,
+        aten.stack,
+        aten.sum,
+        aten.sqrt,
+        aten.tanh,
+        aten.sub,
+        aten.addmm,
+        aten.eq,
+        aten.ge,
+        aten.gt,
+        aten.lt,
+        aten.maximum,
+        aten.pow,
+        aten.linalg_vector_norm,
+    ]
+)
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -100,24 +146,6 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     self.copy_(tmp)
     # TODO: Can we zero out tensors in-place without copy
     return self
-
-
-@torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
-@compile_once(torch.ops.aten.silu.out, dynamic=False)
-def spyre__silu_out(
-    self: torch.Tensor, out: torch.Tensor = None, compiled=None
-) -> torch.Tensor:
-    # Out variant
-    return compiled(self, out=out)
-
-
-@torch.library.register_kernel("aten::mish.out", ["spyre"])  # type:ignore
-@compile_once(torch.ops.aten.mish.out, dynamic=False)
-def spyre__mish_out(
-    self: torch.Tensor, out: torch.Tensor = None, compiled=None
-) -> torch.Tensor:
-    # Out variant
-    return compiled(self, out=out)
 
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore

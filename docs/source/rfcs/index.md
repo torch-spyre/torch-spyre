@@ -63,7 +63,8 @@ See also: [Profiling](../user_guide/profiling.md)
 Defines the Kernel Tile IR — an MLIR-based data-parallel intermediate
 representation that replaces SuperDSC bundles as the target for the
 Torch-Spyre compiler back-end. KTIR expresses tile-level operations,
-scratchpad allocation, and DMA transfers in a hardware-independent form
-that is then lowered to device-specific code by the DeepTools back-end.
+scratchpad allocation, and the load/store traffic between device
+memory and scratchpad in a hardware-independent form that DeepTools
+then lowers to device-specific code.
 
 See also: [Compiler Backend](../compiler/backend.md)

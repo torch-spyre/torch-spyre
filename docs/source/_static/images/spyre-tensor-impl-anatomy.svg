@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 660" font-family="sans-serif" font-size="13">
+  <rect width="900" height="660" fill="white"/>
+
+  <text x="450" y="30" text-anchor="middle" font-size="17" font-weight="bold" fill="#0f172a">SpyreTensorImpl: anatomy of a Spyre tensor</text>
+  <text x="450" y="52" text-anchor="middle" font-size="13" fill="#475569">tracing a Spyre tensor from the Python handle down to the Spyre layout descriptor</text>
+
+  <!-- Outer: at::Tensor -->
+  <rect x="30" y="76" width="840" height="490" rx="12" fill="#eff6ff" stroke="#1e40af" stroke-width="1.6"/>
+  <text x="50" y="100" font-size="14" font-weight="bold" fill="#1e3a8a">at::Tensor — what Python sees</text>
+  <text x="50" y="120" font-size="12" font-style="italic" fill="#475569">A smart-pointer-style handle. It refcounts an underlying TensorImpl, and Python never gets a raw device pointer.</text>
+
+  <!-- TensorImpl base -->
+  <rect x="55" y="135" width="790" height="412" rx="10" fill="#dbeafe" stroke="#1e40af" stroke-width="1.4"/>
+  <text x="75" y="160" font-size="14" font-weight="bold" fill="#1e3a8a">c10::TensorImpl — PyTorch's base tensor class</text>
+  <text x="75" y="180" font-size="12" font-style="italic" fill="#475569">CPU, CUDA, Spyre, and other backends all extend this. It owns the size, strides, dtype, device,</text>
+  <text x="75" y="196" font-size="12" font-style="italic" fill="#475569">storage pointer, and the tensor refcount.</text>
+
+  <!-- SpyreTensorImpl -->
+  <rect x="80" y="212" width="740" height="325" rx="10" fill="#bfdbfe" stroke="#1e3a8a" stroke-width="1.4"/>
+  <text x="100" y="236" font-size="14" font-weight="bold" fill="#1e3a8a">SpyreTensorImpl — the Spyre subclass (csrc/spyre_tensor_impl.cpp)</text>
+  <text x="100" y="256" font-size="12" font-style="italic" fill="#475569">It only overrides what is needed to expose a tiled device shape, and inherits everything else from TensorImpl.</text>
+
+  <!-- Inherited row -->
+  <rect x="100" y="270" width="700" height="42" rx="6" fill="#e0e7ff" stroke="#6366f1" stroke-width="1"/>
+  <text x="115" y="287" font-size="12" font-weight="bold" fill="#3730a3">inherited from TensorImpl:</text>
+  <text x="115" y="304" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#0f172a">size, strides, dtype, device = "spyre", storage</text>
+
+  <!-- SpyreTensorLayout -->
+  <rect x="100" y="324" width="700" height="205" rx="8" fill="#fff7ed" stroke="#b45309" stroke-width="1.6"/>
+  <text x="120" y="348" font-size="14" font-weight="bold" fill="#92400e">SpyreTensorLayout — the embedded layout descriptor</text>
+  <text x="120" y="368" font-size="12" font-style="italic" fill="#92400e">SpyreTensorImpl owns this by value, so the descriptor lives inline.</text>
+  <text x="120" y="384" font-size="12" font-style="italic" fill="#92400e">It carries everything the runtime needs to walk the tensor on device.</text>
+
+  <g font-size="12" fill="#0f172a">
+    <rect x="120" y="394" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
+    <text x="135" y="411" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">device_size</text>
+    <text x="245" y="411" fill="#475569">the tensor's shape on device, including the extra tiling and padding dims</text>
+
+    <rect x="120" y="420" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
+    <text x="135" y="437" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">stride_map</text>
+    <text x="245" y="437" fill="#475569">one host stride per device dim; -1 marks a synthetic or fully-padded dim</text>
+
+    <rect x="120" y="446" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
+    <text x="135" y="463" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">device_dtype</text>
+    <text x="245" y="463" fill="#475569">the on-device data format, for example SEN169_FP16</text>
+
+    <rect x="120" y="472" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
+    <text x="135" y="489" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">dma_sizes</text>
+    <text x="245" y="489" fill="#475569">host-shape DMA descriptor that D2H copies of views read from</text>
+
+    <rect x="120" y="498" width="660" height="24" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="0.8"/>
+    <text x="135" y="515" font-family="ui-monospace, monospace" font-weight="bold" fill="#92400e">dma_strides</text>
+    <text x="245" y="515" fill="#475569">paired with dma_sizes — together they drive copyAsync()</text>
+  </g>
+
+  <text x="450" y="600" text-anchor="middle" font-size="12" font-style="italic" fill="#64748b">Each layer adds a little more metadata. Nothing on this stack hands Python a raw device pointer.</text>
+  <text x="450" y="624" text-anchor="middle" font-size="12" font-style="italic" fill="#64748b">A Python handle keeps a refcount on TensorImpl, which in turn keeps a Spyre device allocation alive behind the storage.</text>
+</svg>

@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 620" font-family="sans-serif" font-size="11">
+  <rect width="720" height="620" fill="white"/>
+
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 Z" fill="#374151"/>
+    </marker>
+    <marker id="ahring-end" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 Z" fill="#16a34a"/>
+    </marker>
+    <marker id="ahring-start" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto-start-reverse">
+      <path d="M0,0 L9,4 L0,8 Z" fill="#16a34a"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="360" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#0f172a">Spyre Core Microarchitecture</text>
+  <text x="360" y="42" text-anchor="middle" font-size="11" fill="#475569">Two corelets sharing a 2 MB LX scratchpad</text>
+
+  <!-- Outer core boundary -->
+  <rect x="40" y="60" width="640" height="430" rx="14" fill="#f8fafc" stroke="#475569" stroke-width="1.5"/>
+  <text x="60" y="82" font-size="11" font-weight="bold" fill="#475569">Spyre core</text>
+
+  <!-- ===================== CORELET 0 ===================== -->
+  <rect x="70" y="100" width="280" height="240" rx="10" fill="#dbeafe" stroke="#1e40af" stroke-width="1.5"/>
+  <text x="210" y="120" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">Corelet 0</text>
+
+  <g transform="translate(95,135)">
+    <rect x="0" y="0" width="160" height="160" fill="white" stroke="#1e40af" stroke-width="1.2"/>
+    <g stroke="#93c5fd" stroke-width="0.8">
+      <line x1="20" y1="0" x2="20" y2="160"/>
+      <line x1="40" y1="0" x2="40" y2="160"/>
+      <line x1="60" y1="0" x2="60" y2="160"/>
+      <line x1="80" y1="0" x2="80" y2="160"/>
+      <line x1="100" y1="0" x2="100" y2="160"/>
+      <line x1="120" y1="0" x2="120" y2="160"/>
+      <line x1="140" y1="0" x2="140" y2="160"/>
+      <line x1="0" y1="20" x2="160" y2="20"/>
+      <line x1="0" y1="40" x2="160" y2="40"/>
+      <line x1="0" y1="60" x2="160" y2="60"/>
+      <line x1="0" y1="80" x2="160" y2="80"/>
+      <line x1="0" y1="100" x2="160" y2="100"/>
+      <line x1="0" y1="120" x2="160" y2="120"/>
+      <line x1="0" y1="140" x2="160" y2="140"/>
+    </g>
+    <text x="80" y="86" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a8a">8 × 8 PE array</text>
+    <text x="80" y="102" text-anchor="middle" font-size="9" fill="#1e3a8a">(systolic, PT execution)</text>
+  </g>
+
+  <rect x="265" y="135" width="75" height="160" rx="6" fill="#fef3c7" stroke="#b45309" stroke-width="1.2"/>
+  <text x="302" y="200" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">SFU</text>
+  <text x="302" y="216" text-anchor="middle" font-size="9" fill="#92400e">(1D vector)</text>
+  <text x="302" y="232" text-anchor="middle" font-size="9" fill="#92400e">non-linear</text>
+  <text x="302" y="246" text-anchor="middle" font-size="9" fill="#92400e">activations</text>
+
+  <line x1="255" y1="215" x2="265" y2="215" stroke="#1e40af" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <text x="210" y="325" text-anchor="middle" font-size="9" fill="#1e3a8a" font-style="italic">PE feeds SFU; both share LX scratchpad below</text>
+
+  <!-- ===================== CORELET 1 ===================== -->
+  <rect x="370" y="100" width="280" height="240" rx="10" fill="#dcfce7" stroke="#166534" stroke-width="1.5"/>
+  <text x="510" y="120" text-anchor="middle" font-size="12" font-weight="bold" fill="#14532d">Corelet 1</text>
+
+  <g transform="translate(395,135)">
+    <rect x="0" y="0" width="160" height="160" fill="white" stroke="#166534" stroke-width="1.2"/>
+    <g stroke="#86efac" stroke-width="0.8">
+      <line x1="20" y1="0" x2="20" y2="160"/>
+      <line x1="40" y1="0" x2="40" y2="160"/>
+      <line x1="60" y1="0" x2="60" y2="160"/>
+      <line x1="80" y1="0" x2="80" y2="160"/>
+      <line x1="100" y1="0" x2="100" y2="160"/>
+      <line x1="120" y1="0" x2="120" y2="160"/>
+      <line x1="140" y1="0" x2="140" y2="160"/>
+      <line x1="0" y1="20" x2="160" y2="20"/>
+      <line x1="0" y1="40" x2="160" y2="40"/>
+      <line x1="0" y1="60" x2="160" y2="60"/>
+      <line x1="0" y1="80" x2="160" y2="80"/>
+      <line x1="0" y1="100" x2="160" y2="100"/>
+      <line x1="0" y1="120" x2="160" y2="120"/>
+      <line x1="0" y1="140" x2="160" y2="140"/>
+    </g>
+    <text x="80" y="86" text-anchor="middle" font-size="11" font-weight="bold" fill="#14532d">8 × 8 PE array</text>
+    <text x="80" y="102" text-anchor="middle" font-size="9" fill="#14532d">(systolic, PT execution)</text>
+  </g>
+
+  <rect x="565" y="135" width="75" height="160" rx="6" fill="#fef3c7" stroke="#b45309" stroke-width="1.2"/>
+  <text x="602" y="200" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">SFU</text>
+  <text x="602" y="216" text-anchor="middle" font-size="9" fill="#92400e">(1D vector)</text>
+  <text x="602" y="232" text-anchor="middle" font-size="9" fill="#92400e">non-linear</text>
+  <text x="602" y="246" text-anchor="middle" font-size="9" fill="#92400e">activations</text>
+
+  <line x1="555" y1="215" x2="565" y2="215" stroke="#166534" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <text x="510" y="325" text-anchor="middle" font-size="9" fill="#14532d" font-style="italic">PE feeds SFU; both share LX scratchpad below</text>
+
+  <!-- Arrows from each corelet down to LX -->
+  <line x1="210" y1="340" x2="210" y2="370" stroke="#374151" stroke-width="2" marker-end="url(#ah)"/>
+  <line x1="510" y1="340" x2="510" y2="370" stroke="#374151" stroke-width="2" marker-end="url(#ah)"/>
+
+  <!-- LX scratchpad shared -->
+  <rect x="100" y="375" width="520" height="55" rx="8" fill="#f5d0fe" stroke="#86198f" stroke-width="1.5"/>
+  <text x="360" y="400" text-anchor="middle" font-size="13" font-weight="bold" fill="#701a75">LX Scratchpad — 2 MB shared (SRAM)</text>
+  <text x="360" y="418" text-anchor="middle" font-size="10" fill="#701a75">explicitly compiler-managed; no hardware cache</text>
+
+  <!-- Bi-directional load/store path between LX and LPDDR5 (single line, arrowheads on both ends) -->
+  <line x1="360" y1="430" x2="360" y2="475" stroke="#374151" stroke-width="2" marker-start="url(#ahring-start)" marker-end="url(#ah)"/>
+  <text x="395" y="458" font-size="9" fill="#374151" font-style="italic">load/store</text>
+
+  <!-- ===================== LPDDR5 (off-chip) ===================== -->
+  <rect x="100" y="480" width="520" height="55" rx="8" fill="#fee2e2" stroke="#b91c1c" stroke-width="1.5"/>
+  <text x="360" y="513" text-anchor="middle" font-size="13" font-weight="bold" fill="#991b1b">Off-chip device memory — LPDDR5 (up to 128 GB)</text>
+
+  <!-- Ring interconnect: single bi-directional arrow with arrowheads on BOTH ends -->
+  <text x="360" y="565" text-anchor="middle" font-size="11" font-weight="bold" fill="#15803d">Bi-directional ring interconnect (128 B/cycle/direction)</text>
+
+  <line x1="100" y1="588" x2="620" y2="588" stroke="#16a34a" stroke-width="2.5"
+        marker-start="url(#ahring-start)" marker-end="url(#ahring-end)"/>
+
+  <text x="100" y="608" text-anchor="start" font-size="9" fill="#15803d">to neighbouring core</text>
+  <text x="620" y="608" text-anchor="end"   font-size="9" fill="#15803d">to neighbouring core</text>
+</svg>
