@@ -115,7 +115,11 @@ class ModuleInfoCapture:
 
     def __init__(self):
         self.module_data: Dict[str, Dict[str, Any]] = {}
-        self.seen_module_types: Set[str] = set()
+        self.seen_module_configs: Set[str] = (
+            set()
+        )  # Track unique configs, not just types
+        # Track model-level context (KV cache, execution mode)
+        self.current_model_context: Dict[str, Any] = {}
 
     def capture_constructor_info(
         self, module, module_name: str, module_type: str
@@ -233,61 +237,252 @@ class ModuleInfoCapture:
             "constructor_kwargs": constructor_kwargs,
         }
 
+    def create_model_hook(self):
+        """Create a model-level hook to detect execution mode (prefill vs decode)..
+
+        This hook runs BEFORE module-level hooks and sets context that module hooks can use.
+        """
+
+        def model_hook(model, args, kwargs):
+            # Capture model-level context
+            past_key_values = kwargs.get("past_key_values", None)
+            attention_mask = kwargs.get("attention_mask", None)
+
+            # Detect execution mode
+            if past_key_values is None:
+                mode = "prefill"
+            else:
+                mode = "decode"
+
+            # Store context for module hooks to access
+            self.current_model_context = {
+                "mode": mode,
+                "attention_mask": attention_mask,
+            }
+
+        return model_hook
+
     def create_hook(self, module_name: str, module_type: str, module_instance):
-        """Create a forward hook that captures module input information."""
+        """Create a forward hook that captures module input information.
+
+        This hook captures unique invocations of the module, deduplicating by input pattern.
+        This allows testing with multiple input configurations (e.g., prefill + decode)
+        without storing redundant identical invocations.
+        """
 
         def hook(module, args, kwargs):
-            # Only capture first occurrence of each module type
-            if module_type in self.seen_module_types:
-                return
-
-            self.seen_module_types.add(module_type)
-
-            # Capture constructor information
+            # Capture constructor information to create unique config identifier
             constructor_info = self.capture_constructor_info(
                 module, module_name, module_type
             )
 
-            # Capture module information
-            module_info = {
-                "name": module_type,
-                "module_path": f"{module.__class__.__module__}.{module.__class__.__name__}",
-                "example_instance": module_name,
-                "constructor_args": constructor_info["constructor_args"],
-                "constructor_kwargs": constructor_info["constructor_kwargs"],
-                "inputs": [],
-            }
+            # Create a unique identifier based on module type + constructor args
+            # This allows us to capture multiple variants of the same module type
+            config_signature = self._create_config_signature(
+                module_type, constructor_info
+            )
+
+            # Create unique module name for this variant
+            unique_module_name = self._create_unique_module_name(
+                module_type, constructor_info, config_signature
+            )
+
+            # Initialize module_info if this is the first invocation
+            if unique_module_name not in self.module_data:
+                self.seen_module_configs.add(config_signature)
+
+                self.module_data[unique_module_name] = {
+                    "name": unique_module_name,
+                    "module_type": module_type,
+                    "module_path": f"{module.__class__.__module__}.{module.__class__.__name__}",
+                    "example_instance": module_name,
+                    "constructor_args": constructor_info["constructor_args"],
+                    "constructor_kwargs": constructor_info["constructor_kwargs"],
+                    "invocations": [],  # List of unique invocations
+                    "invocation_signatures": set(),  # Track seen invocation patterns
+                }
+
+            # Capture this invocation's inputs
+            invocation_inputs = []
 
             # Analyze positional arguments using pytree
             for i, arg in enumerate(args):
                 input_info = _process_pytree_structure(arg, f"arg_{i}")
                 if input_info:
-                    module_info["inputs"].append(input_info)
+                    invocation_inputs.append(input_info)
 
             # Analyze keyword arguments using pytree
             for key, value in kwargs.items():
+                if key in ("past_key_values", "past_key_value"):
+                    continue  # Skip - not needed for module-level tests
                 input_info = _process_pytree_structure(value, key)
                 if input_info:
-                    module_info["inputs"].append(input_info)
+                    invocation_inputs.append(input_info)
 
-            # Store the captured information
-            self.module_data[module_type] = module_info
+            # Create signature for this invocation to detect duplicates
+            invocation_sig = self._create_invocation_signature(invocation_inputs)
+
+            # Only add if this is a new unique invocation pattern
+            if (
+                invocation_sig
+                not in self.module_data[unique_module_name]["invocation_signatures"]
+            ):
+                self.module_data[unique_module_name]["invocation_signatures"].add(
+                    invocation_sig
+                )
+                self.module_data[unique_module_name]["invocations"].append(
+                    invocation_inputs
+                )
 
         return hook
 
+    def _create_config_signature(
+        self, module_type: str, constructor_info: Dict[str, Any]
+    ) -> str:
+        """Create a unique signature for a module configuration.
+
+        This signature is used to detect duplicate configurations.
+        layer_idx is EXCLUDED because we only need one representative layer.
+        """
+        # Build signature from constructor args
+        sig_parts = [module_type]
+
+        for arg in constructor_info.get("constructor_args", []):
+            if arg["type"] == "int":
+                sig_parts.append(f"int_{arg['value']}")
+            elif arg["type"] == "config":
+                sig_parts.append(f"config_{arg['config_path']}")
+            else:
+                sig_parts.append(f"{arg['type']}")
+
+        # IMPORTANT: Exclude layer_idx from signature
+        # We only need one representative layer, not all 40 decoder layers
+        for key, kwarg in constructor_info.get("constructor_kwargs", {}).items():
+            if key == "layer_idx":
+                continue  # Skip layer_idx - treat all layers as same config
+            if kwarg["type"] == "int":
+                sig_parts.append(f"{key}_{kwarg['value']}")
+
+        return "__".join(sig_parts)
+
+    def _create_unique_module_name(
+        self, module_type: str, constructor_info: Dict[str, Any], config_signature: str
+    ) -> str:
+        """Create a unique, human-readable name for a module variant.
+
+        Names are based on the config signature (which excludes layer_idx),
+        ensuring that modules with identical configs get the same name and
+        their invocations are grouped together.
+
+        Examples:
+            MyRMSNorm with dim=4096 -> MyRMSNorm_4096
+            MyRMSNorm with dim=2048 -> MyRMSNorm_2048
+            GraniteDecoderLayer (all layers same config) -> GraniteDecoderLayer_layer0
+        """
+        # Check if there's a simple int arg (common for norm layers)
+        args = constructor_info.get("constructor_args", [])
+        if len(args) == 1 and args[0]["type"] == "int":
+            return f"{module_type}_{args[0]['value']}"
+
+        # For modules with layer_idx, use "layer0" as representative name
+        # since all layers have the same config (layer_idx excluded from signature)
+        kwargs = constructor_info.get("constructor_kwargs", {})
+        if "layer_idx" in kwargs:
+            # Use layer0 as the canonical name for all layers
+            return f"{module_type}_layer0"
+
+        # If no simple identifier, use a hash of the config signature
+        # This ensures uniqueness while keeping names readable
+        import hashlib
+
+        sig_hash = hashlib.md5(config_signature.encode()).hexdigest()[:8]
+        return f"{module_type}_{sig_hash}"
+
+    def _create_invocation_signature(
+        self, invocation_inputs: List[Dict[str, Any]]
+    ) -> str:
+        """Create a signature for an invocation based on input patterns.
+
+        This signature captures the structure of inputs (shapes, dtypes, types)
+        but not the actual values, allowing us to deduplicate identical invocations.
+
+        Args:
+            invocation_inputs: List of input info dicts from _process_pytree_structure
+
+        Returns:
+            A string signature representing this invocation pattern
+        """
+        import json
+
+        def _extract_pattern(input_info: Dict[str, Any]) -> Dict[str, Any]:
+            """Extract the pattern from an input, removing variable data.
+
+            input_info structure from _process_pytree_structure:
+            - Single tensor: {"name": "arg_0", "shape": [...], "dtype": ..., ...}
+            - Container: {"name": "arg_0", "type": "list/tuple/dict/pytree", "items": [...]}
+            """
+            # Check if this is a container with items
+            if "type" in input_info and "items" in input_info:
+                # Container (list, tuple, dict, pytree)
+                pattern = {
+                    "type": input_info["type"],
+                    "items": [
+                        {
+                            "shape": item.get("shape"),
+                            "dtype": str(item.get("dtype")),
+                            "init": item.get("init"),
+                        }
+                        for item in input_info["items"]
+                    ],
+                }
+                return pattern
+            elif "shape" in input_info:
+                # Single tensor
+                return {
+                    "type": "tensor",
+                    "shape": input_info.get("shape"),
+                    "dtype": str(input_info.get("dtype")),
+                    "init": input_info.get("init"),
+                }
+            else:
+                # Unknown structure
+                return {"type": "unknown"}
+
+        # Build pattern for all inputs
+        patterns = []
+        for input_info in invocation_inputs:
+            # input_info is already a dict with structure like:
+            # {"name": "arg_0", "tensor": {...}} or {"name": "x", "type": "list", "items": [...]}
+            # We want to extract the pattern from the whole input_info
+            patterns.append(_extract_pattern(input_info))
+
+        # Convert to JSON for consistent string representation
+        pattern_str = json.dumps(patterns, sort_keys=True)
+
+        # Hash for compact signature
+        import hashlib
+
+        return hashlib.md5(pattern_str.encode()).hexdigest()
+
     def get_captured_modules(self) -> List[Dict[str, Any]]:
         """Return list of captured module information."""
-        return list(self.module_data.values())
+        # Remove invocation_signatures before returning (internal tracking only)
+        result = []
+        for module_data in self.module_data.values():
+            module_copy = module_data.copy()
+            module_copy.pop("invocation_signatures", None)
+            result.append(module_copy)
+        return result
 
 
-def get_unique_modules(model) -> Dict[str, Tuple[str, Any]]:
+def get_all_custom_modules(model) -> List[Tuple[str, str, Any]]:
     """
-    Get unique module types from the model.
+    Get ALL custom module instances from the model (not just unique types).
 
     Returns:
-        Dict mapping module_type -> (module_name, module_instance)
+        List of (module_name, module_type, module_instance) tuples
     """
-    unique = {}
+    custom_modules = []
 
     # Get existing modules from PyTorch's module_db to avoid duplicates
     try:
@@ -315,14 +510,12 @@ def get_unique_modules(model) -> Dict[str, Tuple[str, Any]]:
 
         # Skip if already in upstream module_db
         if module_type in existing_modules:
-            print(f"  Skipping {module_type} (already in module_db)")
             continue
 
-        # Only keep first occurrence of each type
-        if module_type not in unique:
-            unique[module_type] = (name, module)
+        # Keep ALL instances (not just first of each type)
+        custom_modules.append((name, module_type, module))
 
-    return unique
+    return custom_modules
 
 
 def _convert_constructor_arg_to_sample_input(
@@ -411,7 +604,7 @@ def _build_module_entry_dict(module_info: Dict[str, Any]) -> Dict[str, Any]:
     Build a module entry dictionary for YAML generation.
 
     Args:
-        module_info: Captured module information
+        module_info: Captured module information with multiple invocations
 
     Returns:
         Dictionary representing a module entry for YAML
@@ -427,18 +620,47 @@ def _build_module_entry_dict(module_info: Dict[str, Any]) -> Dict[str, Any]:
         if kwarg_spec["type"] == "int":
             constructor_kwargs[key] = kwarg_spec["value"]
 
-    # Build forward_inputs
-    forward_args = []
-    forward_kwargs = {}
+    # Build forward_inputs from all invocations
+    # NEW: Handle multiple invocations - each invocation becomes a separate input set
+    invocations = module_info.get("invocations", [])
 
-    for inp_spec in module_info.get("inputs", []):
-        inp_name = inp_spec["name"]
-        converted = _convert_captured_input_to_sample_input(inp_spec)
+    if not invocations:
+        # Fallback for old format (backward compatibility)
+        invocations = [module_info.get("inputs", [])]
 
-        if inp_name.startswith("arg_"):
-            forward_args.append(converted)
-        else:
-            forward_kwargs[inp_name] = converted
+    # Process each invocation
+    forward_inputs_list = []
+    for invocation_inputs in invocations:
+        forward_args = []
+        forward_kwargs = {}
+
+        for inp_spec in invocation_inputs:
+            # Validate inp_spec has required fields
+            if "name" not in inp_spec:
+                import sys
+
+                print(
+                    f"[ERROR] inp_spec missing 'name' field: {inp_spec}",
+                    file=sys.stderr,
+                )
+                continue  # Skip malformed entries
+
+            inp_name = inp_spec["name"]
+            converted = _convert_captured_input_to_sample_input(inp_spec)
+
+            if inp_name.startswith("arg_"):
+                forward_args.append(converted)
+            else:
+                forward_kwargs[inp_name] = converted
+
+        forward_inputs_list.append(
+            {
+                "args": forward_args if forward_args else [],
+                "kwargs": forward_kwargs if forward_kwargs else {},
+            }
+        )
+
+    forward_inputs = forward_inputs_list
 
     # Build module entry
     entry = {
@@ -449,10 +671,7 @@ def _build_module_entry_dict(module_info: Dict[str, Any]) -> Dict[str, Any]:
             "args": constructor_args if constructor_args else [],
             "kwargs": constructor_kwargs if constructor_kwargs else {},
         },
-        "forward_inputs": {
-            "args": forward_args if forward_args else [],
-            "kwargs": forward_kwargs if forward_kwargs else {},
-        },
+        "forward_inputs": forward_inputs,
     }
 
     return entry
@@ -569,15 +788,19 @@ def main():
     model = AutoModel.from_pretrained(args.model_path).eval()
 
     print("Analyzing model structure...")
-    unique_modules = get_unique_modules(model)
-    print(f"Found {len(unique_modules)} unique module types")
+    all_custom_modules = get_all_custom_modules(model)
+    print(f"Found {len(all_custom_modules)} custom module instances")
 
     # Create capture object
     capture = ModuleInfoCapture()
 
-    # Register hooks on all unique modules
-    handles = []
-    for module_type, (module_name, module_instance) in unique_modules.items():
+    # This hook sets context that module-level hooks will read
+    model_hook = capture.create_model_hook()
+    model_handle = model.register_forward_pre_hook(model_hook, with_kwargs=True)
+    handles = [model_handle]
+
+    # Register hooks on ALL custom module instances (not just unique types)
+    for module_name, module_type, module_instance in all_custom_modules:
         hook = capture.create_hook(module_name, module_type, module_instance)
         handle = module_instance.register_forward_pre_hook(hook, with_kwargs=True)
         handles.append(handle)
@@ -597,29 +820,86 @@ def main():
     )
     print(f"  Input shape: {inputs['input_ids'].shape}")
 
-    # Run forward pass (this triggers all hooks)
-    with torch.no_grad():
-        model(**inputs)
+    # Count invocations before prefill
+    invocations_before = sum(
+        len(data.get("invocations", [])) for data in capture.module_data.values()
+    )
+    print(f"  Invocations before prefill: {invocations_before}")
 
-    with torch.no_grad():
-        decode_inputs = {
-            "input_ids": torch.cat(
-                [
-                    inputs["input_ids"],
-                    torch.zeros((inputs["input_ids"].shape[0], 1), dtype=torch.long),
-                ],
-                dim=1,
-            ),
-            "attention_mask": torch.cat(
-                [
-                    inputs["attention_mask"],
-                    torch.ones((inputs["input_ids"].shape[0], 1), dtype=torch.long),
-                ],
-                dim=1,
-            ),
-        }
+    print("  Running prefill pass...")
+    outputs = None
+    try:
+        with torch.no_grad():
+            outputs = model(**inputs, use_cache=True)
+    except Exception as e:
+        print(f"  ERROR during prefill: {e}")
+        import traceback
 
-        _ = model(**decode_inputs)
+        traceback.print_exc()
+
+    # Count invocations after prefill
+    invocations_after_prefill = sum(
+        len(data.get("invocations", [])) for data in capture.module_data.values()
+    )
+    print(f"  Invocations after prefill: {invocations_after_prefill}")
+    print(
+        f"  New invocations from prefill: {invocations_after_prefill - invocations_before}"
+    )
+
+    if (
+        outputs is not None
+        and hasattr(outputs, "past_key_values")
+        and outputs.past_key_values is not None
+    ):
+        print("\n  Running decode pass...")
+        try:
+            with torch.no_grad():
+                # Single new token for decode
+                next_token = torch.zeros(
+                    (inputs["input_ids"].shape[0], 1), dtype=torch.long
+                )
+                decode_inputs = {
+                    "input_ids": next_token,  # Shape: [B, 1]
+                    "attention_mask": torch.cat(
+                        [
+                            inputs["attention_mask"],
+                            torch.ones(
+                                (inputs["input_ids"].shape[0], 1), dtype=torch.long
+                            ),
+                        ],
+                        dim=1,
+                    ),
+                    "past_key_values": outputs.past_key_values,  # Use cached KV
+                    "use_cache": True,
+                }
+                print(f"  Decode input_ids shape: {decode_inputs['input_ids'].shape}")
+                print(
+                    f"  Decode attention_mask shape: {decode_inputs['attention_mask'].shape}"
+                )
+                print(
+                    f"  Decode past_key_values layers: {len(decode_inputs['past_key_values'])}"
+                )
+
+                decode_outputs = model(**decode_inputs)
+                print(
+                    f"  Decode complete. Output shape: {decode_outputs.logits.shape if hasattr(decode_outputs, 'logits') else 'N/A'}"
+                )
+        except Exception as e:
+            print(f"  ERROR during decode: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        # Count invocations after decode
+        invocations_after_decode = sum(
+            len(data.get("invocations", [])) for data in capture.module_data.values()
+        )
+        print(f"  Invocations after decode: {invocations_after_decode}")
+        print(
+            f"  New invocations from decode: {invocations_after_decode - invocations_after_prefill}"
+        )
+    else:
+        print("\n  Skipping decode pass - no KV cache available")
 
     # Remove hooks
     for handle in handles:

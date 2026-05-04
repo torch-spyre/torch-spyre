@@ -470,7 +470,12 @@ InputArg = Union[InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy]
 
 
 def _parse_input_arg(raw: Any) -> InputArg:
-    """Parse one element of edits.inputs.args into the correct InputArg variant."""
+    """Parse one element of edits.inputs.args into the correct InputArg variant.
+
+    Handles both:
+    - Fresh dict parsing (first YAML load)
+    - Already-parsed InputArg objects (from YAML anchor reuse like *id001)
+    """
     # Handle already-parsed InputArg objects (from YAML anchors/aliases)
     if isinstance(raw, (InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy)):
         return raw
@@ -618,7 +623,7 @@ class ModulesNamedItem(BaseModel):
 
     Supports two input specifications:
     - constructor_inputs: Args/kwargs for module.__init__()
-    - forward_inputs: Args/kwargs for module.forward() (defaults to sample_inputs_func for backward compat)
+    - forward_inputs: Args/kwargs for module.forward() (single or list for multiple invocations)
     """
 
     name: str
@@ -626,7 +631,27 @@ class ModulesNamedItem(BaseModel):
     description: Optional[str] = None
     sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
     constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
-    forward_inputs: Optional[InputsEdits] = None  # New: explicit forward inputs
+    forward_inputs: Optional[Union[InputsEdits, List[InputsEdits]]] = (
+        None  # New: explicit forward inputs (single or list)
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_forward_inputs(cls, values: Any) -> Any:
+        """Parse forward_inputs to handle both dict and list formats."""
+        if isinstance(values, dict) and "forward_inputs" in values:
+            forward_inputs = values["forward_inputs"]
+            # If it's a list of dicts, parse each one as InputsEdits
+            if isinstance(forward_inputs, list):
+                parsed_list = []
+                for item in forward_inputs:
+                    if isinstance(item, dict):
+                        # Parse each dict as InputsEdits
+                        parsed_list.append(InputsEdits.model_validate(item))
+                    else:
+                        parsed_list.append(item)
+                values["forward_inputs"] = parsed_list
+        return values
 
     def build_module_input(
         self,
@@ -660,6 +685,15 @@ class ModulesNamedItem(BaseModel):
 
         # Build forward inputs (prefer forward_inputs, fallback to sample_inputs_func for backward compat)
         forward_spec = self.forward_inputs or self.sample_inputs_func
+
+        # Handle list format (multiple invocations) - return first one for backward compat
+        # The full list handling is done in create_module_inputs_func_from_yaml
+        if isinstance(forward_spec, list):
+            if forward_spec:
+                forward_spec = forward_spec[0]  # Use first invocation
+            else:
+                forward_spec = InputsEdits()  # Empty if list is empty
+
         forward_args = forward_spec.build_cpu_args(
             seed=(None if seed is None else seed + 10000),  # Different seed for forward
             op_name=self.name,
@@ -946,7 +980,9 @@ class SupportedModuleConfig(BaseModel):
     force_xfail: bool = False
     dtypes: List[SupportedOpDtypeConfig] = []
     constructor_inputs: Optional[InputsEdits] = None  # Inline constructor inputs
-    forward_inputs: Optional[InputsEdits] = None  # Inline forward inputs
+    forward_inputs: Optional[Union[InputsEdits, List[InputsEdits]]] = (
+        None  # Inline forward inputs (single or list)
+    )
 
     def get_name(self) -> str:
         return self.name
@@ -958,9 +994,16 @@ class SupportedModuleConfig(BaseModel):
 
     def has_inline_inputs(self) -> bool:
         """Check if this config has inline input specifications."""
-        return (
+        has_constructor = (
             self.constructor_inputs is not None and self.constructor_inputs.has_inputs()
-        ) or (self.forward_inputs is not None and self.forward_inputs.has_inputs())
+        )
+        has_forward = False
+        if self.forward_inputs is not None:
+            if isinstance(self.forward_inputs, list):
+                has_forward = any(inp.has_inputs() for inp in self.forward_inputs)
+            else:
+                has_forward = self.forward_inputs.has_inputs()
+        return has_constructor or has_forward
 
 
 class InputConfig(BaseModel):

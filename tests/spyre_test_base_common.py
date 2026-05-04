@@ -232,6 +232,21 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.TEST_ENTRIES = _build_test_entry_map(file_entry)
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
+        cls._FILE_LEVEL_INCLUDED_MODULES: Set[str] = set()
+        cls._FILE_LEVEL_EXCLUDED_MODULES: Set[str] = set()
+
+        for entry in file_entry.tests:
+            if entry.edits.modules.include:
+                cls._register_custom_modules_from_edits(entry.edits.modules.include)
+                # Track included module names for filtering
+                cls._FILE_LEVEL_INCLUDED_MODULES.update(
+                    entry.edits.modules.included_module_names()
+                )
+            if entry.edits.modules.exclude:
+                cls._FILE_LEVEL_EXCLUDED_MODULES.update(
+                    entry.edits.modules.excluded_module_names()
+                )
+
         cls._yaml_loaded = True
 
     @classmethod
@@ -458,19 +473,23 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         if supported_ops is not None:
             _OOTOpListPatcher(test, supported_ops).patch()
 
-        # @modules filtering - but first register any custom modules from edits.modules.include
+        # @modules filtering using file-level included/excluded modules
+        # Custom modules were already registered during _load_test_suite_config()
         supported_modules = cls._get_supported_modules()
 
-        included_modules = (
-            entry.edits.modules.included_module_names() if entry is not None else set()
-        )
-        excluded_modules = (
-            entry.edits.modules.excluded_module_names() if entry is not None else set()
-        )
+        # Use file-level included/excluded modules (collected from ALL test entries)
+        # This ensures filtering applies to ALL instantiate_test() calls, not just the first one
+        included_modules = getattr(cls, "_FILE_LEVEL_INCLUDED_MODULES", set())
+        excluded_modules = getattr(cls, "_FILE_LEVEL_EXCLUDED_MODULES", set())
 
-        # Register custom modules from edits.modules.include BEFORE filtering
-        if entry is not None and entry.edits.modules.include:
-            cls._register_custom_modules_from_edits(entry.edits.modules.include)
+        # Also merge in test-specific includes/excludes if present
+        if entry is not None:
+            included_modules = (
+                included_modules | entry.edits.modules.included_module_names()
+            )
+            excluded_modules = (
+                excluded_modules | entry.edits.modules.excluded_module_names()
+            )
 
         if supported_modules is not None or included_modules or excluded_modules:
             _OOTModuleListPatcher(

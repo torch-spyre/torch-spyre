@@ -37,14 +37,63 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
         if hasattr(item, "build_module_input"):
             test_device = torch.device(device) if isinstance(device, str) else device
             seed = kwargs.get("seed")
-            return [
-                item.build_module_input(
-                    seed=seed,
-                    test_device=test_device,
-                    FunctionInput=FunctionInput,
-                    ModuleInput=ModuleInput,
-                )
-            ]
+
+            # Check if forward_inputs is a list (multiple invocations)
+            forward_inputs = getattr(item, "forward_inputs", None)
+            if isinstance(forward_inputs, list) and len(forward_inputs) > 1:
+                # Multiple invocations - create ModuleInput for each
+                module_inputs = []
+                for i, forward_spec in enumerate(forward_inputs):
+                    # Build constructor inputs (same for all invocations)
+                    constructor_spec = getattr(item, "constructor_inputs", None)
+                    if constructor_spec and hasattr(constructor_spec, "build_cpu_args"):
+                        constructor_args = constructor_spec.build_cpu_args(
+                            seed=seed,
+                            op_name=item.name,
+                            test_device=test_device,
+                        )
+                        constructor_kwargs = constructor_spec.resolved_kwargs(
+                            test_device=test_device
+                        )
+                    else:
+                        constructor_args = []
+                        constructor_kwargs = {}
+                    constructor_input = FunctionInput(
+                        *constructor_args, **constructor_kwargs
+                    )
+
+                    # Build forward inputs for this invocation
+                    if hasattr(forward_spec, "build_cpu_args"):
+                        forward_args = forward_spec.build_cpu_args(
+                            seed=(None if seed is None else seed + 10000 + i * 1000),
+                            op_name=item.name,
+                            test_device=test_device,
+                        )
+                        forward_kwargs = forward_spec.resolved_kwargs(
+                            test_device=test_device
+                        )
+                    else:
+                        forward_args = []
+                        forward_kwargs = {}
+                    forward_input = FunctionInput(*forward_args, **forward_kwargs)
+
+                    module_inputs.append(
+                        ModuleInput(
+                            constructor_input=constructor_input,
+                            forward_input=forward_input,
+                        )
+                    )
+                return module_inputs
+            else:
+                # Single invocation - use existing method
+                return [
+                    item.build_module_input(
+                        seed=seed,
+                        test_device=test_device,
+                        FunctionInput=FunctionInput,
+                        ModuleInput=ModuleInput,
+                    )
+                ]
 
         # Fallback: empty inputs
         return [
@@ -102,26 +151,64 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
 
         constructor_input = FunctionInput(*constructor_args, **constructor_kwargs)
 
-        # Build forward inputs
+        # Build forward inputs - handle both single and list formats
         forward_spec = config.forward_inputs
-        if forward_spec and forward_spec.has_inputs():
-            forward_args = forward_spec.build_cpu_args(
-                seed=(None if seed is None else seed + 10000),
-                op_name=module_info.name,
-                test_device=test_device,
-            )
-            forward_kwargs = forward_spec.resolved_kwargs(test_device=test_device)
+        module_inputs = []
+
+        if forward_spec:
+            # Handle list of forward_inputs (multiple invocations)
+            if isinstance(forward_spec, list):
+                for i, spec in enumerate(forward_spec):
+                    if spec.has_inputs():
+                        forward_args = spec.build_cpu_args(
+                            seed=(None if seed is None else seed + 10000 + i * 1000),
+                            op_name=module_info.name,
+                            test_device=test_device,
+                        )
+                        forward_kwargs = spec.resolved_kwargs(test_device=test_device)
+                    else:
+                        forward_args = []
+                        forward_kwargs = {}
+
+                    forward_input = FunctionInput(*forward_args, **forward_kwargs)
+                    module_inputs.append(
+                        ModuleInput(
+                            constructor_input=constructor_input,
+                            forward_input=forward_input,
+                        )
+                    )
+            # Handle single forward_inputs (backward compatibility)
+            else:
+                if forward_spec.has_inputs():
+                    forward_args = forward_spec.build_cpu_args(
+                        seed=(None if seed is None else seed + 10000),
+                        op_name=module_info.name,
+                        test_device=test_device,
+                    )
+                    forward_kwargs = forward_spec.resolved_kwargs(
+                        test_device=test_device
+                    )
+                else:
+                    forward_args = []
+                    forward_kwargs = {}
+
+                forward_input = FunctionInput(*forward_args, **forward_kwargs)
+                module_inputs.append(
+                    ModuleInput(
+                        constructor_input=constructor_input,
+                        forward_input=forward_input,
+                    )
+                )
         else:
-            forward_args = []
-            forward_kwargs = {}
-
-        forward_input = FunctionInput(*forward_args, **forward_kwargs)
-
-        return [
-            ModuleInput(
-                constructor_input=constructor_input,
-                forward_input=forward_input,
+            # No forward inputs specified
+            forward_input = FunctionInput()
+            module_inputs.append(
+                ModuleInput(
+                    constructor_input=constructor_input,
+                    forward_input=forward_input,
+                )
             )
-        ]
+
+        return module_inputs
 
     return module_inputs_func
