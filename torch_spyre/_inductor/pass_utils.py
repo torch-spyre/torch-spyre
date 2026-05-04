@@ -35,8 +35,8 @@ from .views import compute_coordinates, matching_dim
 
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
-    layout: "FixedLayout"
-    layouts: "list[SpyreTensorLayout]"
+    layout: "FixedLayout"  # committed post-finalize_layouts
+    layouts: "list[SpyreTensorLayout]"  # candidates pre-finalize_layouts
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
