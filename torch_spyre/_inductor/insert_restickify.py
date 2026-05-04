@@ -212,10 +212,17 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
-    """Build V.graph.restickify_plan for insert_restickify:
-    - Translate committed_stl (set by the optimizer) into restickify entries.
-    - Handle mutation ops whose stick must match their target buffer.
-    - Commit chosen layouts and clean up optimizer-only attributes.
+    """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
+    V.graph.restickify_plan for insert_restickify.
+
+    Three steps:
+    - Commit: wrap each op's committed_stl in a FixedTiledLayout and assign it to
+      op.layout; clean up optimizer-only attributes (layouts, restick_cost_fn,
+      committed_stl).
+    - Schedule restickifies: for each input edge where the committed input STL is
+      incompatible with what the op requires, record a restickify in the plan.
+    - Mutation ops: check inputs of MutationLayoutSHOULDREMOVE ops and schedule
+      restickifies where the input stick doesn't match the target buffer's stick.
     """
     for name in V.graph.graph_input_names:
         tensor_box = V.graph.graph_inputs[name]

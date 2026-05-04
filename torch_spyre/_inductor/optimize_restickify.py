@@ -267,18 +267,15 @@ def greedy_local_min_cost(operations: list) -> None:
                 raise AssertionError(f"graph input {name} has empty layouts set")
             stl = next(iter(tb.layouts))
             tb.data.data.committed_stl = stl
+            tb.committed_stl = stl
 
     for op in operations:
         if not hasattr(op, "layouts"):
             continue  # FallbackKernel and other unhandled op types
 
         if not hasattr(op, "restick_cost_fn"):
-            # REMOVE ME: assert believed dead — mutation ops should never reach here
-            # because propagate_spyre_tensor_layouts skips them (no layouts set).
-            assert not isinstance(op.layout, MutationLayoutSHOULDREMOVE), (
-                f"mutation op {op.get_name()} unexpectedly has layouts but no restick_cost_fn"
-            )
-            op.committed_stl = op.layouts[0]
+            if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                op.committed_stl = op.layouts[0]
             continue
 
         cost_fn = op.restick_cost_fn
