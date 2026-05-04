@@ -118,12 +118,36 @@ for both.
 
 A number of operations on Spyre produce _sparse_ tensors, i.e., tensors with a
 single element per _stick_. A **stick** is a 128-byte aligned, 128-byte contiguous
-block of tensor elements in device memory. In order to describe sparse tensor
-layouts we permit Spyre tensor layouts to optionally include a single synthetic
-dimension that does not correspond to any dimension of the PyTorch layout. This
-synthetic inner dimension associated with a size equal to the maximal number of
-elements per stick for the tensor data type will ensure that the sparse tensor has
-a single element of the corresponding PyTorch tensor per stick.
+block of tensor elements in device memory. The constant `BYTES_IN_STICK = 128` is defined in [`spyre_tensor_impl.cpp`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_tensor_impl.cpp) and used throughout the runtime, compiler, and tensor-layout code. At fp16 it works out to 64 elements per stick. The size lines up with the natural granularity of transfers between LPDDR5 device memory and the per-core LX scratchpad, so the hardware can pull in a full stick of contiguous elements in a single transfer.
+
+In order to describe sparse tensor layouts we permit Spyre tensor layouts to
+optionally include a single synthetic dimension that does not correspond to any
+dimension of the PyTorch layout. This synthetic inner dimension associated with
+a size equal to the maximal number of elements per stick for the tensor data
+type will ensure that the sparse tensor has a single element of the
+corresponding PyTorch tensor per stick.
+
+### Per-operation stick and padding constraints
+
+Most Spyre operations place constraints on how their operand tensors must
+be sticked, and on which dimensions need to be padded to a full stick.
+Two common cases:
+
+- **Pointwise (`C = A + B`).** Every operand and the result must share
+  the same stick dimension: `stick(A) = stick(B) = stick(C)`. Partial
+  sticks are padded out to a full stick (for example, 150 fp16 values
+  pad to 192).
+- **Matrix multiply (`C[m, n] = A[m, k] @ B[k, n]`).** `A` is sticked on
+  the `k` dimension, while `B` and `C` are both sticked on the `n`
+  dimension. `B`'s `k` dimension must be padded to full sticks as well,
+  and the padded entries on the reduction side have to be set to a
+  neutral value (zero) before the op runs so they do not perturb the
+  sum.
+
+The compiler enforces these constraints during layout propagation and
+inserts `restickify` operations or padding nodes (`insert_padding` in
+`CustomPostPasses`) wherever an operand's natural layout would not
+satisfy them.
 
 ## Spyre Tensor Layouts
 
@@ -182,6 +206,74 @@ The corresponding stride_map is `[512, 64, 131072, 1]`.
 The stride_map is used together with device_size to derive DMA loop nests
 that transfer elements between host and device memory.
 
+The relationship between PyTorch addressing and device addressing comes
+out as a single identity. PyTorch computes a host offset as
+`offset = dot(coordinates, stride)`, the device computes its own offset
+as `device_offset = dot(device_coordinates, device_stride)`, and the two
+are related through:
+
+```
+offset = dot(device_coordinates, stride_map)
+```
+
+In other words, the stride_map is precisely what lets you walk a tensor
+in device-coordinate order and still land on the right host element.
+
+### Why stride_map replaced dim_map
+
+The first version of the Spyre layout took a different approach. It
+carried a `dim_map`: a vector that, for each device dimension, named
+the index of the PyTorch dimension it came from. For a PyTorch tensor
+of shape `[128, 256, 512]` laid out on device as
+`device_size = [256, 8, 128, 64]`, the `dim_map` would be
+`[1, 2, 0, 2]`. Read from left to right, that says device dim 0 came
+from PyTorch dim 1, device dim 1 from PyTorch dim 2 (the tile-index
+half of the inner dimension), device dim 2 from PyTorch dim 0, and
+device dim 3 from PyTorch dim 2 again (this time the within-stick
+half).
+
+That representation reads nicely on slides, but it gets messy in the
+cases the Spyre stack handles every day. Padded dimensions are the
+first symptom. When the compiler rounds 150 fp16 values up to 192, or
+pads B's k-dim to a full stick for a matmul, the device dim no longer
+maps cleanly back to a single PyTorch dim. A `dim_map` has to fall
+back on a sentinel, and every pass that reads it grows a
+"if it's the sentinel, do something else" branch.
+
+Fused and split dimensions are the second symptom. A `flatten`
+collapses two PyTorch dims into one; a `reshape` can split one into
+two. Tracking that with dim indices means tagging entries with
+"this is the upper half of dim 2", and the tag has to survive every
+intermediate pass: core division, scratchpad planning, codegen.
+
+Sparse Spyre layouts then add a synthetic inner dimension that has no
+corresponding PyTorch dim at all. Yet another sentinel. Views without
+copies make the picture even worse: when the compiler implements
+`transpose`, `flatten`, or `permute` as a different read pattern over
+the same storage, the PyTorch dim indices the view exposes have nothing
+to do with the device dims of the underlying buffer, and `dim_map` has
+to translate at every boundary.
+
+Strides sidestep all of that. A stride is just an integer count of
+"how many host elements to step by", and that number stays meaningful
+through padding, splits, fuses, synthetic dims, and views. So the
+representation moved to a `stride_map`: one host stride per device
+dimension, with `-1` reserved for synthetic or fully-padded dims that
+have no host counterpart. Code that walks the device-coordinate space
+just dot-products with `stride_map` to recover the host offset, and
+the special cases listed above stop needing dedicated code paths.
+
+The compiler team puts it more directly: tensor strides are robust;
+tensor dimensions are not.
+
+:::{figure} ../_static/images/spyre-stride-map.png
+:alt: From PyTorch shape to Spyre device shape — logical view, physical view, stride_map identity
+:width: 95%
+:align: center
+
+A worked end-to-end example. The same data shows up two ways: PyTorch sees a 3D tensor of size `[50, 10, 200]`, Spyre stores it as `device_size [10, 4, 50, 64]`. Each `stride_map` entry counts the host elements you advance when you step `+1` along the matching `device_size` dimension, and the identity `offset = dot(device_coordinates, stride_map)` ties the two coordinate systems together.
+:::
+
 :::{figure} ../_static/images/tensor-device-layout.png
 :alt: Spyre tensor device memory layout
 :width: 680px
@@ -225,7 +317,7 @@ for i in range(4):       # 4 tiles per row
       device[i*65536 + j*64 + k] = host[j*256 + i*64 + k]
 ```
 
-These DCI (Data Copy Instruction) specs are generated automatically by
+These DCI (Data Conversion Information) specs are generated automatically by
 the compiler from the `SpyreTensorLayout` stored in `SpyreTensorImpl`.
 
 ## Access Patterns
@@ -237,7 +329,8 @@ but on different tile ranges identified by their core ID.
 
 Key access pattern properties:
 - Sticks belonging to the same tile are **stored contiguously** in
-  device memory, enabling efficient bulk DMA loads
+  device memory, so a tile can be staged into the scratchpad as one
+  bulk read instead of many scattered ones
 - Memory access requests are limited in Spyre, so contiguous stick
   layout is required for full bandwidth utilization
 - The work division pass (see
@@ -359,7 +452,7 @@ reconcile incompatible layouts between adjacent operations.
 
 For each `torch.compile`d function, the front-end compiler generates:
 
-1. **DCI (Data Copy Instructions)** — host code for DMA transfers that
+1. **DCI (Data Conversion Information)** — host-side descriptors for DMA transfers that
    move tensor tiles between host memory and device DDR. These are
    derived directly from the `SpyreTensorLayout` of each graph input
    and output.
