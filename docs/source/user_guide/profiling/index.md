@@ -22,6 +22,13 @@ workloads running on the Spyre accelerator. The full design of the
 planned toolkit is in
 [RFC 0601 — Spyre Profiling Toolkit][rfc-0601].
 
+The in-tree `torch_spyre.profiler` package is currently a scaffold —
+`torch_spyre.profiler.is_available()` returns `False`, and there is no
+public API yet. Profiling today goes through `torch.profiler` plus the
+external integrations described on this page (`kineto-spyre`,
+`aiu-smi`, `aiu-trace-analyzer`); the in-tree API will be populated as
+RFC 0601 lands.
+
 ## What can be profiled today
 
 | Capability | Status | Where |
