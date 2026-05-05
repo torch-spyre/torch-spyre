@@ -1,0 +1,23 @@
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: torch-spyre-build
+  #namespace: github-actions-runners
+spec:
+  source:
+    type: Binary
+    binary: {}
+
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+      noCache: true
+
+  output:
+    to:
+      kind: DockerImage
+      name: us.icr.io/github-actions-runners/torch-spyre:latest
+
+  triggers:
+    - type: ConfigChange
