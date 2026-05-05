@@ -17,6 +17,7 @@ import dataclasses
 import math
 import itertools
 from sympy import Expr, Symbol, divisors
+from .ir import SpyreConstantFallback
 
 import torch
 from torch._inductor.ir import (
@@ -630,6 +631,10 @@ def core_division_planning(
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             # Core division not supported on fallback kernels
         elif isinstance(op, ExternKernel):
-            logger.warning(f"unhandled node type {type(op)}")
+            if isinstance(op, SpyreConstantFallback):
+                # Core division not supported on SpyreConstantFallback kernel
+                pass
+            else:
+                logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")

@@ -14,7 +14,7 @@
 
 import logging
 from typing import Any
-
+from .ir import SpyreConstantFallback
 
 import sympy
 import torch
@@ -627,7 +627,10 @@ def propagate_spyre_tensor_layouts(
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             op.layout = generic_layout(op)
         elif isinstance(op, ExternKernel):
-            logger.warning(f"unhandled node type {type(op)}")
+            if isinstance(op, SpyreConstantFallback):
+                op.layout = generic_layout(op)
+            else:
+                logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 

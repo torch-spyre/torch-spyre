@@ -359,3 +359,22 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
 #    Returns a scalar (0D) tensor matching the input dtype.
 #    """
 #    return input.new_empty([])
+
+
+@torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
+def spyre_constant(
+    fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
+) -> torch.types.Number:
+    # This custom operator marks scalar constant in the FX graph.
+    # Returning the scalar constant to avoid change in the operator schema which
+    # consume the scalar constant as input.
+    # This node will have a special handling at lowering to convert the scalar
+    # constant to tensor.
+    return fill_value
+
+
+@spyre_constant.register_fake
+def _constant(
+    fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
+) -> torch.types.Number:
+    return fill_value
