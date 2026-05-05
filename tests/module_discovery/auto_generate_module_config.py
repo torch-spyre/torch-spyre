@@ -9,7 +9,7 @@ in a model by:
 4. Analyzing captured data to generate YAML config
 
 Usage:
-    python auto_generate_module_config.py --model_path ibm-granite/granite-3.3-8b-instruct --batch_size 2 --seq_len 128
+    python auto_generate_module_config.py --model_path ibm-granite/granite-3.3-8b-instruct --seq_len 128
 """
 
 import torch
@@ -755,12 +755,6 @@ def main():
         type=str,
         required=True,
         help="HuggingFace model path (e.g., ibm-granite/granite-3.3-8b-instruct)",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=2,
-        help="Batch size for forward pass (default: 2)",
     )
     parser.add_argument(
         "--seq_len",
