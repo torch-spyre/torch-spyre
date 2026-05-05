@@ -1,4 +1,4 @@
-FROM icr.io/ai_sw_accel/2.0/spyre-runtime
+FROM icr.io/ai_sw_accel/2.0/spyre-runtime:latest
 USER root
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN cd "$HOME" && \
