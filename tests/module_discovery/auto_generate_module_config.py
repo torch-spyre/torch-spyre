@@ -15,10 +15,37 @@ Usage:
 import torch
 import argparse
 import yaml
+import json
 from pathlib import Path
+import traceback
+import hashlib
 from typing import Dict, List, Any, Tuple, Set
 from transformers import AutoModel, AutoTokenizer
 from torch.utils._pytree import tree_flatten
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# Get existing modules from PyTorch's module_db to avoid duplicates
+try:
+    from torch.testing._internal.common_modules import module_db
+
+    # Extract just the class name from module_db names (e.g., "nn.Linear" -> "Linear")
+    existing_modules = set()
+    for m in module_db:
+        # module_db names are like "nn.Linear", "nn.Conv2d", etc.
+        if "." in m.name:
+            class_name = m.name.split(".")[-1]
+            existing_modules.add(class_name)
+        else:
+            existing_modules.add(m.name)
+    logger.info(
+        f"Found {len(existing_modules)} existing modules in PyTorch's module_db"
+    )
+except ImportError:
+    existing_modules = set()
+    logger.warning("could not import module_db, will not filter duplicates")
 
 
 class PrettyDumper(yaml.SafeDumper):
@@ -393,8 +420,6 @@ class ModuleInfoCapture:
 
         # If no simple identifier, use a hash of the config signature
         # This ensures uniqueness while keeping names readable
-        import hashlib
-
         sig_hash = hashlib.sha256(config_signature.encode()).hexdigest()[:8]
         return f"{module_type}_{sig_hash}"
 
@@ -412,7 +437,6 @@ class ModuleInfoCapture:
         Returns:
             A string signature representing this invocation pattern
         """
-        import json
 
         def _extract_pattern(input_info: Dict[str, Any]) -> Dict[str, Any]:
             """Extract the pattern from an input, removing variable data.
@@ -458,10 +482,6 @@ class ModuleInfoCapture:
 
         # Convert to JSON for consistent string representation
         pattern_str = json.dumps(patterns, sort_keys=True)
-
-        # Hash for compact signature
-        import hashlib
-
         return hashlib.sha256(pattern_str.encode()).hexdigest()
 
     def get_captured_modules(self) -> List[Dict[str, Any]]:
@@ -483,25 +503,6 @@ def get_all_custom_modules(model) -> List[Tuple[str, str, Any]]:
         List of (module_name, module_type, module_instance) tuples
     """
     custom_modules = []
-
-    # Get existing modules from PyTorch's module_db to avoid duplicates
-    try:
-        from torch.testing._internal.common_modules import module_db
-
-        # Extract just the class name from module_db names (e.g., "nn.Linear" -> "Linear")
-        existing_modules = set()
-        for m in module_db:
-            # module_db names are like "nn.Linear", "nn.Conv2d", etc.
-            if "." in m.name:
-                class_name = m.name.split(".")[-1]
-                existing_modules.add(class_name)
-            else:
-                existing_modules.add(m.name)
-        print(f"Found {len(existing_modules)} existing modules in PyTorch's module_db")
-    except ImportError:
-        existing_modules = set()
-        print("Warning: Could not import module_db, will not filter duplicates")
-
     for name, module in model.named_modules():
         if name == "":  # Skip root
             continue
@@ -637,12 +638,7 @@ def _build_module_entry_dict(module_info: Dict[str, Any]) -> Dict[str, Any]:
         for inp_spec in invocation_inputs:
             # Validate inp_spec has required fields
             if "name" not in inp_spec:
-                import sys
-
-                print(
-                    f"[ERROR] inp_spec missing 'name' field: {inp_spec}",
-                    file=sys.stderr,
-                )
+                logger.error(f"inp_spec missing 'name' field: {inp_spec}")
                 continue  # Skip malformed entries
 
             inp_name = inp_spec["name"]
@@ -782,13 +778,11 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"Loading model: {args.model_path}")
+    logger.info(f"Loading model: {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     model = AutoModel.from_pretrained(args.model_path).eval()
-
-    print("Analyzing model structure...")
     all_custom_modules = get_all_custom_modules(model)
-    print(f"Found {len(all_custom_modules)} custom module instances")
+    logger.info(f"Found {len(all_custom_modules)} custom module instances")
 
     # Create capture object
     capture = ModuleInfoCapture()
@@ -804,7 +798,6 @@ def main():
         handle = module_instance.register_forward_pre_hook(hook, with_kwargs=True)
         handles.append(handle)
 
-    print("Running forward pass to capture module inputs...")
     # Create dummy input with specified sequence length
     # Generate enough text to reach desired seq_len
     text = "This is a test input for capturing module information. " * (
@@ -817,40 +810,19 @@ def main():
         truncation=True,
         padding="max_length",
     )
-    print(f"  Input shape: {inputs['input_ids'].shape}")
-
-    # Count invocations before prefill
-    invocations_before = sum(
-        len(data.get("invocations", [])) for data in capture.module_data.values()
-    )
-    print(f"  Invocations before prefill: {invocations_before}")
-
-    print("  Running prefill pass...")
+    logger.info(f"  Input shape: {inputs['input_ids'].shape}")
     outputs = None
     try:
         with torch.no_grad():
             outputs = model(**inputs, use_cache=True)
     except Exception as e:
-        print(f"  ERROR during prefill: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-    # Count invocations after prefill
-    invocations_after_prefill = sum(
-        len(data.get("invocations", [])) for data in capture.module_data.values()
-    )
-    print(f"  Invocations after prefill: {invocations_after_prefill}")
-    print(
-        f"  New invocations from prefill: {invocations_after_prefill - invocations_before}"
-    )
+        logger.exception(f"  ERROR during prefill: {e}")
 
     if (
         outputs is not None
         and hasattr(outputs, "past_key_values")
         and outputs.past_key_values is not None
     ):
-        print("\n  Running decode pass...")
         try:
             with torch.no_grad():
                 # Single new token for decode
@@ -871,40 +843,29 @@ def main():
                     "past_key_values": outputs.past_key_values,  # Use cached KV
                     "use_cache": True,
                 }
-                print(f"  Decode input_ids shape: {decode_inputs['input_ids'].shape}")
-                print(
-                    f"  Decode attention_mask shape: {decode_inputs['attention_mask'].shape}"
+                logger.info(
+                    f"Decode input_ids shape: {decode_inputs['input_ids'].shape}"
                 )
-                print(
-                    f"  Decode past_key_values layers: {len(decode_inputs['past_key_values'])}"
+                logger.info(
+                    f"Decode attention_mask shape: {decode_inputs['attention_mask'].shape}"
+                )
+                logger.info(
+                    f"Decode past_key_values layers: {len(decode_inputs['past_key_values'])}"
                 )
 
                 decode_outputs = model(**decode_inputs)
-                print(
-                    f"  Decode complete. Output shape: {decode_outputs.logits.shape if hasattr(decode_outputs, 'logits') else 'N/A'}"
+                logger.info(
+                    f"Decode complete. Output shape: {decode_outputs.logits.shape if hasattr(decode_outputs, 'logits') else 'N/A'}"
                 )
         except Exception as e:
-            print(f"  ERROR during decode: {e}")
-            import traceback
-
+            logger.exception(f"ERROR during decode: {e}")
             traceback.print_exc()
-
-        # Count invocations after decode
-        invocations_after_decode = sum(
-            len(data.get("invocations", [])) for data in capture.module_data.values()
-        )
-        print(f"  Invocations after decode: {invocations_after_decode}")
-        print(
-            f"  New invocations from decode: {invocations_after_decode - invocations_after_prefill}"
-        )
     else:
-        print("\n  Skipping decode pass - no KV cache available")
+        logger.info("\n  Skipping decode pass - no KV cache available")
 
     # Remove hooks
     for handle in handles:
         handle.remove()
-
-    print(f"Captured information for {len(capture.get_captured_modules())} modules")
 
     # Generate YAML
     # Extract model name from path (handle both local paths and HuggingFace paths)
@@ -915,8 +876,6 @@ def main():
 
     # For the YAML content, use underscores for the model_name field
     model_name_normalized = model_name.replace("-", "_").replace(".", "_")
-
-    print(f"Model name: {model_name} (normalized: {model_name_normalized})")
 
     # Generate unified YAML config (new format)
     unified_yaml_content = generate_unified_yaml_config(
@@ -936,21 +895,14 @@ def main():
     with open(output_file, "w") as f:
         f.write(unified_yaml_content)
 
-    print(f"\n✓ Generated unified configuration: {output_file}")
+    logger.info(f"\n✓ Generated unified configuration: {output_file}")
 
     # Print module summary
     total_modules = len(capture.get_captured_modules())
-    print("\n  Module Summary:")
-    print(f"    Total modules captured: {total_modules}")
+    logger.info("\n  Module Summary:")
+    logger.info(f"    Total modules captured: {total_modules}")
     for module_info in capture.get_captured_modules():
-        print(f"      - {module_info['name']}")
-
-    print("\nNext steps:")
-    print(f"1. Review the generated YAML file: {output_file}")
-    print("2. Run tests:")
-    print(f"   export PYTORCH_TEST_CONFIG={output_file.absolute()}")
-    print("   cd $PYTORCH/test")
-    print(f"   python test_model_ops_v2.py -k {model_name_normalized}")
+        logger.info(f"      - {module_info['name']}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from torch.testing._internal.common_device_type import instantiate_device_type_t
 from torch.testing._internal.common_modules import modules, module_db
 from torch.testing._internal.common_utils import TestCase
 from torch.utils._pytree import tree_map
+from torch.testing._internal.common_utils import run_tests
 
 
 class TestModuleCustom(TestCase):
@@ -200,6 +201,4 @@ instantiate_device_type_tests(TestModuleCustom, globals())
 
 
 if __name__ == "__main__":
-    from torch.testing._internal.common_utils import run_tests
-
     run_tests()

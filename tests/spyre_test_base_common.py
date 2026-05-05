@@ -443,7 +443,6 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     def instantiate_test(cls, name, test, *, generic_cls=None):
         _OOTOnlyOnPatcher(test, _SPYRE_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
-
         # print tags to stderr
         entry = cls.TEST_ENTRIES.get(name)
         tags = entry.tags if entry is not None else []
