@@ -17,7 +17,6 @@ import argparse
 import yaml
 import json
 from pathlib import Path
-import traceback
 import hashlib
 from typing import Dict, List, Any, Tuple, Set
 from transformers import AutoModel, AutoTokenizer
@@ -857,9 +856,8 @@ def main():
                 logger.info(
                     f"Decode complete. Output shape: {decode_outputs.logits.shape if hasattr(decode_outputs, 'logits') else 'N/A'}"
                 )
-        except Exception as e:
-            logger.exception(f"ERROR during decode: {e}")
-            traceback.print_exc()
+        except Exception:
+            logger.exception("ERROR during decode")
     else:
         logger.info("\n  Skipping decode pass - no KV cache available")
 
