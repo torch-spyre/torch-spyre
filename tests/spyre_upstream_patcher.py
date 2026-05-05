@@ -23,6 +23,36 @@ from typing import Set, Optional
 import torch
 
 
+def _extract_base_module_name(name: str) -> str:
+    """Extract base module name by stripping YAML-generated suffixes.
+
+    Strips suffixes like:
+    - _93b52f93 (8-char hex hash)
+    - _4096 (numeric identifier)
+    - _layer0 (layer identifier)
+
+    Examples:
+        GraniteRotaryEmbedding_93b52f93 -> GraniteRotaryEmbedding
+        GraniteRMSNorm_4096 -> GraniteRMSNorm
+        GraniteDecoderLayer_layer0 -> GraniteDecoderLayer
+
+    Args:
+        name: YAML module name with potential suffix
+
+    Returns:
+        Base module name without suffix
+    """
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2:
+        base_name, suffix = parts
+        # Check if suffix looks like a hash (hex) or number or "layerN"
+        if suffix.replace("layer", "").isdigit() or all(
+            c in "0123456789abcdef" for c in suffix
+        ):
+            return base_name
+    return name
+
+
 class _OOTOnlyOnPatcher:
     """Patches @onlyOn decorated test methods to also allow privateuse1.
 
@@ -335,19 +365,9 @@ class _OOTModuleListPatcher:
             existing_names = {m.name for m in self._modules_instance.module_info_list}
 
             # Extract base names from YAML names (strip suffixes)
-            included_base_names = set()
-            for name in self._included_modules:
-                parts = name.rsplit("_", 1)
-                if len(parts) == 2:
-                    base_name, suffix = parts
-                    if suffix.replace("layer", "").isdigit() or all(
-                        c in "0123456789abcdef" for c in suffix
-                    ):
-                        included_base_names.add(base_name)
-                    else:
-                        included_base_names.add(name)
-                else:
-                    included_base_names.add(name)
+            included_base_names = {
+                _extract_base_module_name(name) for name in self._included_modules
+            }
 
             # Try to find modules in module_db by base name
             for base_name in included_base_names:
@@ -372,24 +392,9 @@ class _OOTModuleListPatcher:
             # Extract base module names from included_modules (strip suffixes like _93b52f93)
             # YAML names: GraniteRotaryEmbedding_93b52f93
             # ModuleInfo.name: GraniteRotaryEmbedding
-            included_base_names = set()
-            for name in self._included_modules:
-                # Try to extract base name by removing suffix after last underscore followed by hex
-                # e.g., "GraniteRotaryEmbedding_93b52f93" -> "GraniteRotaryEmbedding"
-                # e.g., "GraniteRMSNorm_4096" -> "GraniteRMSNorm"
-                parts = name.rsplit("_", 1)
-                if len(parts) == 2:
-                    base_name, suffix = parts
-                    # Check if suffix looks like a hash (hex) or number or "layerN"
-                    if suffix.replace("layer", "").isdigit() or all(
-                        c in "0123456789abcdef" for c in suffix
-                    ):
-                        included_base_names.add(base_name)
-                    else:
-                        # Not a recognized suffix pattern, use full name
-                        included_base_names.add(name)
-                else:
-                    included_base_names.add(name)
+            included_base_names = {
+                _extract_base_module_name(name) for name in self._included_modules
+            }
 
             filtered = [
                 m

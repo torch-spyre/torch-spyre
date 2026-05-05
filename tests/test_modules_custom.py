@@ -16,11 +16,19 @@ from torch.testing._internal.common_utils import TestCase, run_tests
 from torch.utils._pytree import tree_map
 
 
-def _extract_first_tensor(output):
-    """Extract first tensor from potentially nested output structure.
+def _extract_all_tensors(output):
+    """Extract all tensors from potentially nested output structure.
 
     Uses pytree to handle nested structures (tuples, lists, dicts, etc.)
-    and returns the first tensor found, or None if no tensors exist.
+    and returns all tensors found. This ensures complete validation of
+    module outputs including hidden states, KV caches, attention weights, etc.
+
+    Args:
+        output: Module output (can be tensor, tuple, list, dict, or nested structure)
+
+    Returns:
+        List of all tensors found in the output structure, in traversal order.
+        Returns empty list if no tensors exist.
     """
     tensors = []
 
@@ -30,7 +38,7 @@ def _extract_first_tensor(output):
         return x
 
     tree_map(collect_tensors, output)
-    return tensors[0] if tensors else None
+    return tensors
 
 
 class TestModuleCustom(TestCase):
@@ -97,31 +105,39 @@ class TestModuleCustom(TestCase):
                     *args_device, **kwargs_device
                 )
 
-            # Extract first tensor from output using pytree
-            output_cpu_tensor = _extract_first_tensor(output_cpu)
-            output_device_eager_tensor = _extract_first_tensor(output_device_eager)
-            output_device_compile_tensor = _extract_first_tensor(output_device_compile)
+            # Extract all tensors from outputs using pytree
+            cpu_tensors = _extract_all_tensors(output_cpu)
+            device_eager_tensors = _extract_all_tensors(output_device_eager)
+            device_compile_tensors = _extract_all_tensors(output_device_compile)
 
-            if (
-                output_cpu_tensor is not None
-                and isinstance(output_cpu_tensor, torch.Tensor)
-                and output_device_eager_tensor is not None
-                and isinstance(output_device_eager_tensor, torch.Tensor)
-                and output_device_compile_tensor is not None
-                and isinstance(output_device_compile_tensor, torch.Tensor)
+            # Verify all outputs have the same number of tensors
+            if not (
+                len(cpu_tensors)
+                == len(device_eager_tensors)
+                == len(device_compile_tensors)
+            ):
+                self.fail(
+                    f"{module_info.name}: Output tensor count mismatch - "
+                    f"CPU: {len(cpu_tensors)}, Spyre eager: {len(device_eager_tensors)}, "
+                    f"Spyre compile: {len(device_compile_tensors)}"
+                )
+
+            # Compare all tensors (hidden states, KV cache, attention weights, etc.)
+            for i, (cpu_t, eager_t, compile_t) in enumerate(
+                zip(cpu_tensors, device_eager_tensors, device_compile_tensors)
             ):
                 # Compare CPU eager vs Spyre eager
                 self.assertEqual(
-                    output_cpu_tensor,
-                    output_device_eager_tensor.cpu(),
-                    msg=f"{module_info.name}: CPU eager vs Spyre eager mismatch",
+                    cpu_t,
+                    eager_t.cpu(),
+                    msg=f"{module_info.name}: CPU eager vs Spyre eager mismatch (tensor {i})",
                 )
 
                 # Compare Spyre eager vs Spyre compile
                 self.assertEqual(
-                    output_device_eager_tensor,
-                    output_device_compile_tensor,
-                    msg=f"{module_info.name}: Spyre eager vs Spyre compile mismatch",
+                    eager_t,
+                    compile_t,
+                    msg=f"{module_info.name}: Spyre eager vs Spyre compile mismatch (tensor {i})",
                 )
 
     @modules(module_db)
@@ -170,21 +186,23 @@ class TestModuleCustom(TestCase):
                 output_cpu = module_cpu(*args_cpu, **kwargs_cpu)
                 output_device = module_device(*args_device, **kwargs_device)
 
-            # Extract first tensor from output using pytree
-            cpu_tensor = _extract_first_tensor(output_cpu)
-            device_tensor = _extract_first_tensor(output_device)
+            # Extract all tensors from outputs using pytree
+            cpu_tensors = _extract_all_tensors(output_cpu)
+            device_tensors = _extract_all_tensors(output_device)
 
-            if (
-                cpu_tensor is not None
-                and isinstance(cpu_tensor, torch.Tensor)
-                and device_tensor is not None
-                and isinstance(device_tensor, torch.Tensor)
-            ):
-                # Compare CPU vs device outputs
+            # Verify both outputs have the same number of tensors
+            if len(cpu_tensors) != len(device_tensors):
+                self.fail(
+                    f"{module_info.name}: Output tensor count mismatch - "
+                    f"CPU: {len(cpu_tensors)}, Spyre: {len(device_tensors)}"
+                )
+
+            # Compare all tensors (hidden states, KV cache, attention weights, etc.)
+            for i, (cpu_t, device_t) in enumerate(zip(cpu_tensors, device_tensors)):
                 self.assertEqual(
-                    cpu_tensor,
-                    device_tensor.cpu(),
-                    msg=f"{module_info.name}: layout/stride mismatch on real inputs",
+                    cpu_t,
+                    device_t.cpu(),
+                    msg=f"{module_info.name}: layout/stride mismatch on real inputs (tensor {i})",
                 )
 
 
