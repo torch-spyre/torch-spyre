@@ -184,8 +184,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
 
     # File-level module filtering (populated during config load)
-    _FILE_LEVEL_INCLUDED_MODULES: Set[str] = set()
-    _FILE_LEVEL_EXCLUDED_MODULES: Set[str] = set()
+    # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
+    _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
+    _FILE_LEVEL_EXCLUDED_MODULES: Optional[Set[str]] = None
 
     @classmethod
     def setUpClass(cls):
@@ -236,7 +237,8 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.TEST_ENTRIES = _build_test_entry_map(file_entry)
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
-        # Reset file-level module tracking for this config load
+        # Initialize file-level module tracking for this config load
+        # Create new sets to avoid sharing state between test classes
         cls._FILE_LEVEL_INCLUDED_MODULES = set()
         cls._FILE_LEVEL_EXCLUDED_MODULES = set()
 
@@ -483,8 +485,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         # Use file-level included/excluded modules (collected from ALL test entries)
         # This ensures filtering applies to ALL instantiate_test() calls, not just the first one
-        included_modules = getattr(cls, "_FILE_LEVEL_INCLUDED_MODULES", set())
-        excluded_modules = getattr(cls, "_FILE_LEVEL_EXCLUDED_MODULES", set())
+        # Use getattr with set() default to handle None (not yet initialized) case
+        included_modules = getattr(cls, "_FILE_LEVEL_INCLUDED_MODULES", None) or set()
+        excluded_modules = getattr(cls, "_FILE_LEVEL_EXCLUDED_MODULES", None) or set()
 
         # Also merge in test-specific includes/excludes if present
         if entry is not None:
