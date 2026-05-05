@@ -41,7 +41,7 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .pass_utils import (
     compute_restickify_target_layout,
@@ -387,6 +387,61 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
+def _topk_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    x = args[0]
+    x_coords = host_coordinates(x.layout, x.dep)
+    out_coords = host_coordinates(output, output_dep)
+
+    # Reduction coordinate: in x's host coords but absent from output's host coords.
+    reduction_coord = next(
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+    )
+    reduction_dim = matching_dim(x_coords, reduction_coord)
+
+    # Coords that survive the reduction into the output.
+    surviving_coords = [
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
+    ]
+
+    # Collect candidate output stick dims. A valid input stick passes through;
+    # a stick on the reduction dim requires a restickify, so every surviving
+    # coord becomes a candidate.
+    out_stick_dims: set[int | None] = set()
+    for stl in x.layouts:
+        x_stick_expr = device_coordinates(stl, x.dep)[-1]
+        if matching_dim(x_coords, x_stick_expr) == reduction_dim:
+            for c in surviving_coords:
+                out_stick_dims.add(matching_dim(out_coords, c))
+        else:
+            out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
+
+    # Build one output STL per candidate stick dim.
+    # Note: the stick dim STL will never be added so will never be
+    #       selected as a candidate output STL
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    results: list[SpyreTensorLayout] = []
+    for out_stick_dim in out_stick_dims:
+        if out_stick_dim is None:
+            out_dim_order = list(range(len(output.size))) + [-1]
+        else:
+            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+            out_dim_order += [out_stick_dim]
+        results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
+
+    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
+    return results
+
+
 def compute_layouts(
     op: Operation,
     output: FixedLayout,
@@ -405,6 +460,9 @@ def compute_layouts(
 
     if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
         return _matmul_layouts(op, output, output_dep, args)
+
+    if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
+        return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:

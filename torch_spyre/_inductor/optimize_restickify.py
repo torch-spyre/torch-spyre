@@ -37,7 +37,7 @@ INF = math.inf
 class LayoutKey:
     """Hashable Python surrogate for SpyreTensorLayout, used as a dict/set key.
 
-    Can be removed if we make SpyreTensorLayout hashable.
+    Will be removed once PR to make SpyreTensorLayout hashable is merged.
     """
 
     device_size: tuple[int, ...]
@@ -116,7 +116,7 @@ class EdgeCostMap:
     ) -> float:
         """Return the restick cost for (in_stl, target_stl), computing it on first access."""
 
-        # Remove conversions by making STL hashable
+        # Remove conversions once STL is hashable
         in_key = LayoutKey.from_stl(in_stl)
         target_key = LayoutKey.from_stl(target_stl)
 
