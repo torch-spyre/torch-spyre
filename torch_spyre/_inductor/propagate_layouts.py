@@ -40,7 +40,7 @@ from torch_spyre._C import (
 )
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .pass_utils import (
     SchedNodeArg,
     compute_restickify_target_layout,
@@ -475,6 +475,9 @@ def propagate_spyre_tensor_layouts(
             if not isinstance(op, MultiOutput):
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             op.layouts = [generic_layout(op)]
+        elif isinstance(op, SpyreConstantFallback):
+            op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:
