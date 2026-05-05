@@ -35,8 +35,7 @@ from .views import compute_coordinates, matching_dim
 
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
-    layout: "FixedLayout"  # committed post-finalize_layouts
-    layouts: "list[SpyreTensorLayout]"  # candidates pre-finalize_layouts
+    layout: "FixedTiledLayout"
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
@@ -45,12 +44,9 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
             layout = buf.get_layout()
-            if hasattr(buf, "layouts"):
-                res.append(SchedNodeArg(arg, layout, list(buf.layouts)))
-            else:
-                if not isinstance(layout, FixedTiledLayout):
-                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-                res.append(SchedNodeArg(arg, layout, [layout.device_layout]))
+            if not isinstance(layout, FixedTiledLayout):
+                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+            res.append(SchedNodeArg(arg, layout))
     return res
 
 
@@ -100,12 +96,9 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
             layout = buf.get_layout()
-            if hasattr(buf, "layouts"):
-                res.append(SchedNodeArg(arg, layout, list(buf.layouts)))
-            else:
-                if not isinstance(layout, FixedTiledLayout):
-                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-                res.append(SchedNodeArg(arg, layout, [layout.device_layout]))
+            if not isinstance(layout, FixedTiledLayout):
+                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+            res.append(SchedNodeArg(arg, layout))
     return res
 
 

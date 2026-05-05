@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import NamedTuple
+
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
@@ -42,10 +44,8 @@ from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .pass_utils import (
-    SchedNodeArg,
     compute_restickify_target_layout,
     concretize_expr,
-    get_mem_deps_from_rw,
     host_coordinates,
     device_coordinates,
     iter_var_id,
@@ -62,6 +62,35 @@ logger = get_inductor_logger("propagate_layouts")
 
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
+
+
+class PropArg(NamedTuple):
+    """Input arg during layout propagation.
+
+    layout is the host FixedLayout (may not be FixedTiledLayout until finalize_layouts).
+    layouts is the set of candidate device layouts being propagated.
+    """
+
+    dep: MemoryDep
+    layout: FixedLayout
+    layouts: list[SpyreTensorLayout]
+
+
+def _get_prop_args(reads) -> list[PropArg]:
+    # Local to this pass — the FixedLayout/FixedTiledLayout ambiguity only exists
+    # during propagation and should not infect downstream passes.
+    res: list[PropArg] = []
+    for arg in reads:
+        if isinstance(arg, MemoryDep):
+            buf = V.graph.get_buffer(arg.name)
+            layout = buf.get_layout()
+            if hasattr(buf, "layouts"):
+                res.append(PropArg(arg, layout, list(buf.layouts)))
+            else:
+                if not isinstance(layout, FixedTiledLayout):
+                    raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+                res.append(PropArg(arg, layout, [layout.device_layout]))
+    return res
 
 
 def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
@@ -179,7 +208,7 @@ def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
-    args: list[SchedNodeArg],
+    args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
     """
     Matmul has fixed in/out stick requirements so handled specially.
@@ -284,7 +313,7 @@ def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
-    args: list[SchedNodeArg],
+    args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
     """
     Multi-arg pointwise is a join point so handled specially.
@@ -362,7 +391,7 @@ def compute_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
-    args: list[SchedNodeArg],
+    args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
     """
     Main driver for propagating layouts. There are two tasks performed
@@ -464,7 +493,7 @@ def propagate_spyre_tensor_layouts(
             op.decide_layout()
             rw = op.get_read_writes()
             output_dep = next(iter(rw.writes))
-            args = get_mem_deps_from_rw(rw)
+            args = _get_prop_args(rw.reads)
             output = op.get_layout()
             if isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
@@ -496,8 +525,6 @@ def propagate_mutation_layouts(
     This pass runs as a _pre_fusion_custom_pass (after scheduler init) to
     assign FixedTiledLayout to those remaining mutation ops.
     """
-    from .pass_utils import get_mem_deps
-
     for n in nodes:
         if not (isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer)):
             continue
@@ -510,7 +537,7 @@ def propagate_mutation_layouts(
             else:
                 rw = n.read_writes
                 output_dep = next(iter(rw.writes))
-                args = get_mem_deps(n)
+                args = _get_prop_args(rw.reads)
                 output = n.node.get_layout()
                 layouts = list(compute_layouts(n.node, output, output_dep, args))
                 n.node.layout = layouts[0]
