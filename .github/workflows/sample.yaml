@@ -1,0 +1,43 @@
+name: Openshift connection
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+jobs:
+  deploy:
+    runs-on: official-aiu-x86-64-arc-runner-set-v3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Cache OpenShift CLI
+        id: cache-oc
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/oc
+          key: oc-${{ runner.os }}-${{ hashFiles('scripts/preflight.sh') }}
+      
+      - name: Install OpenShift CLI
+        if: steps.cache-oc.outputs.cache-hit != 'true'
+        run: |
+          chmod +x scripts/preflight.sh
+          ./scripts/preflight.sh
+          
+      
+      - name: Verify OC Installation
+        run: |
+          oc version --client
+
+      - name:  Workload
+        run: |
+          echo ${{ secrets.KUBECONFIG }} | base64 --decode > kubeconfig.yaml
+          export KUBECONFIG=$PWD/kubeconfig.yaml
+          oc get pods
+          oc get buildconfig
+
+         

@@ -15,7 +15,10 @@
 import functools
 import torch
 import os
+<<<<<<< HEAD
+=======
 import pytest
+>>>>>>> main
 
 DEVICE = torch.device("spyre")
 

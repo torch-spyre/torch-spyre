@@ -376,6 +376,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+<<<<<<< HEAD
+        # TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
+        # Spyre represents scalars as 1D tensors [1], while CPU uses 0D tensors.
+        # This inconsistency causes shape mismatches when moving tensors from Spyre to CPU.
+        # See: https://github.com/torch-spyre/torch-spyre/issues/1172
+        # ("test_max_default", "test_reduce_cpu"): {
+        #        "ops_dict": {
+        #            "max": torch.max,
+        #        },
+        #        "param_sets": {
+        #            "1d_float16": (unique_randn_along_dim((64,), dtype=torch.float16),),
+        #            "2d_float16": (unique_randn_along_dim((8, 64), dtype=torch.float16),),
+        #            "3d_float16": (
+        #                unique_randn_along_dim((2, 4, 64), dtype=torch.float16),
+        #            ),
+        #            "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
+        #            "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
+        #        },
+        #    },
+=======
         ("test_max_default", "test_reduce_cpu"): {
             "ops_dict": {
                 "max": torch.max,
@@ -397,6 +417,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_int64",
             ],
         },
+>>>>>>> main
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu_no_eager"): {
             "ops_dict": {
@@ -1375,7 +1396,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256, 128)).t(),
                 ),
             },
+<<<<<<< HEAD
+=======
             "expect_fail": ["float2bool"],
+>>>>>>> main
         },
         (
             "test_inplace_copy_noncontiguous",
@@ -1989,6 +2013,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+<<<<<<< HEAD
+=======
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
             "param_sets": {
@@ -2956,6 +2982,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_4d_dim_3",
             ],
         },
+>>>>>>> main
     }
 
     def __init__(self, *args, **kwargs):
@@ -3013,6 +3040,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fallback_binary_op_cpu(self, op, x, y):
         compare_with_cpu(op, x, y, run_eager=False)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_fallback_binary_op_cpu(self, op, x, y):
+        compare_with_cpu(op, x, y, run_eager=False)
+
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
@@ -3050,10 +3081,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
         compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
 
+<<<<<<< HEAD
+    # @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    # @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    # def test_reduce_cpu(self, op, x):
+    #    compare_with_cpu(lambda x: op(x), x)
+=======
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
     def test_reduce_cpu(self, op, x):
         compare_with_cpu(lambda x: op(x), x)
+>>>>>>> main
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
@@ -3230,6 +3268,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, x)
 
+<<<<<<< HEAD
+    @unittest.skip("dtype override may not be supported on Spyre")
+=======
+>>>>>>> main
     def test_empty_like_dtype_override_cpu(self, x):
         """Test empty_like with dtype override (fp16->fp32 or fp32->fp16)."""
         # Determine target dtype (opposite of input)
@@ -3602,6 +3644,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_cpu(fn, q, freqs, cpu_compile=False)
 
+<<<<<<< HEAD
+=======
     def test_sum_eager(self, op, dim: int, keepdim: bool, x):
         compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
 
@@ -3614,6 +3658,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_min_eager(self, op, dim: int, keepdim: bool, x):
         compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim)[0], x)
 
+>>>>>>> main
     def test_attn_qkv_paths(self, q, k, v):
         # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
         def fn(q, k, v):

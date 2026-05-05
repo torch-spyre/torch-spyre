@@ -43,10 +43,13 @@ class SpyreStream {
   void synchronize() const;  // Block until work done
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+<<<<<<< HEAD
+=======
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
   void executeProgramAsync(const KernelArtifacts& arts,
                            const std::vector<at::Tensor>& args) const;
+>>>>>>> main
 
   // Conversions
   c10::Stream unwrap() const;
@@ -55,10 +58,16 @@ class SpyreStream {
   mutable flex::RuntimeStream* flex_handle_ = nullptr;
 
   flex::RuntimeStream* getRuntimeHandle() const;
+<<<<<<< HEAD
+  void copyAsyncImpl(void* cpu_ptr,
+                     const flex::CompositeAddress* device_address,
+                     const DataConversionInfo& dci, bool host2device) const;
+=======
   flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr,
                      const flex::CompositeAddress* device_address,
                      const DataConversionInfo* dci, bool host2device) const;
+>>>>>>> main
 };
 
 /**

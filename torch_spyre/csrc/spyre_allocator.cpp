@@ -136,12 +136,25 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   // Allocate first-class raw storage via CompositeAddress.
   flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
 
+<<<<<<< HEAD
+  // Bridge to the legacy DeviceMemoryAllocationPtr view for existing PF-mode
+  // users that still expect a pointer-like object referring to the same
+  // storage.
+  flex::DeviceMemoryAllocationPtr data =
+      flex_alloc->makeInterimAllocationPtr(composite_addr);
+  TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
+
+  // Create context with both owner and CompositeAddress
+  auto* ctx = new SharedOwnerCtx(std::move(data), std::move(composite_addr),
+                                 device_id, nbytes);
+=======
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
   // accurate memory profiling.
   size_t actual_nbytes = composite_addr.total_size();
 
   auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id);
+>>>>>>> main
   void* ctx_void = static_cast<void*>(ctx);
 
   // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.

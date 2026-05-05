@@ -355,6 +355,14 @@ auto get_device_stride_infos(c10::IntArrayRef sizes,
 /*
  * Generate description of data conversion for a tensor.
  *
+<<<<<<< HEAD
+ * @param tensor: device-side tensor
+ * @return data conversion information
+ */
+auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
+                  int64_t cpu_offset, bool host2device) -> DataConversionInfo {
+  auto str_type = torchScalarToString[tensor->scalar_type()];
+=======
  * @param cpu_tensor: CPU-side tensor (source for H2D, destination for D2H)
  * @param dev_tensor: device-side tensor (destination for H2D, source for D2H)
  * @return data conversion information
@@ -363,6 +371,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
                   SpyreTensorLayout stl, int64_t cpu_offset, bool host2device)
     -> DataConversionInfo {
   auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
+>>>>>>> main
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
 
   DataConversionInfo dci{};
@@ -400,11 +409,14 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
+<<<<<<< HEAD
+=======
   if (g_debug_info_enabled) {
     std::stringstream s;
     dci.exportJson(s);
     DEBUGINFO("DataConversionInfo: ", s.str());
   }
+>>>>>>> main
   return dci;
 }
 

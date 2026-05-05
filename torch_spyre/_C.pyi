@@ -238,6 +238,10 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+<<<<<<< HEAD
+def convert_artifacts(arg0: str) -> None: ...
+=======
+>>>>>>> main
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:

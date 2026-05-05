@@ -16,6 +16,10 @@
 
 import os
 import regex as re
+<<<<<<< HEAD
+import unittest
+=======
+>>>>>>> main
 import psutil
 import warnings
 from contextlib import contextmanager
@@ -359,7 +363,11 @@ class TestSpyre(TestCase):
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
 
+<<<<<<< HEAD
+    @unittest.skip("Skip for now")
+=======
     @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
+>>>>>>> main
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")

@@ -1,0 +1,27 @@
+name: Build and push to ICR
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - tester
+jobs:
+  deploy:
+    runs-on: official-aiu-x86-64-arc-runner-set-v3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Project
+        env:
+          OC_NAMESPACE: ${{ secrets.OC_NAMESPACE }}
+        run: |
+          oc project "$OC_NAMESPACE"
+
+      - name: Apply BuildConfig
+        run: |
+          oc apply -f buildconfig.yaml
+
+      - name: Trigger Build
+        run: |
+          oc start-build torch-spyre-build --wait --follow

@@ -14,7 +14,10 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
+<<<<<<< HEAD
+=======
 from .fallbacks import _get_op_overloads
+>>>>>>> main
 import torch_spyre._C as _C
 import warnings
 import functools
@@ -22,9 +25,12 @@ import inspect
 import operator
 
 
+<<<<<<< HEAD
+=======
 aten = torch.ops.aten
 
 
+>>>>>>> main
 # Decorator to keep track of compiled variant
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
@@ -44,7 +50,11 @@ def compile_once(op, **compile_kwargs):
         # a clean signature.
         old_signature = inspect.signature(fn)
         params = dict(old_signature.parameters)
+<<<<<<< HEAD
+        params.pop("compiled")
+=======
         params.pop("compiled", None)
+>>>>>>> main
         new_signature = old_signature.replace(parameters=params.values())
         wrapper.__signature__ = new_signature
 
@@ -59,6 +69,20 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
+<<<<<<< HEAD
+@torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
+@compile_once(torch.mm, dynamic=False)
+def spyre__mm(self: torch.Tensor, mat2: torch.Tensor, compiled) -> torch.Tensor:
+    return compiled(self, mat2)
+
+
+@torch.library.register_kernel("aten::mm.out", ["spyre"])  # type:ignore
+@compile_once(torch.mm, dynamic=False)
+def spyre__mm_out(
+    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor, compiled
+) -> torch.Tensor:
+    return compiled(self, mat2, out=out)
+=======
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
     return compiled(*args, **kwargs)
 
@@ -113,6 +137,7 @@ register_torch_compile_kernel(
         aten.linalg_vector_norm,
     ]
 )
+>>>>>>> main
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -148,6 +173,27 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
+<<<<<<< HEAD
+@torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
+@compile_once(torch.ops.aten.silu.out, dynamic=False)
+def spyre__silu_out(
+    self: torch.Tensor, out: torch.Tensor = None, compiled=None
+) -> torch.Tensor:
+    # Out variant
+    return compiled(self, out=out)
+
+
+@torch.library.register_kernel("aten::mish.out", ["spyre"])  # type:ignore
+@compile_once(torch.ops.aten.mish.out, dynamic=False)
+def spyre__mish_out(
+    self: torch.Tensor, out: torch.Tensor = None, compiled=None
+) -> torch.Tensor:
+    # Out variant
+    return compiled(self, out=out)
+
+
+=======
+>>>>>>> main
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Create a new tensor on cpu
