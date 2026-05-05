@@ -49,6 +49,9 @@ import os
 import warnings
 
 import torch
+from torch._ops import OpOverload, OpOverloadPacket
+
+from typing import Union
 
 aten = torch._ops.ops.aten
 
@@ -76,6 +79,23 @@ def warn_fallback(op, fallback_device="cpu"):
         category=FallbackWarning,
         skip_file_prefixes=_warn_skips,
     )
+
+
+def _get_op_overloads(
+    ops: Union[OpOverloadPacket, OpOverload, list[Union[OpOverload, OpOverloadPacket]]],
+) -> list[OpOverload]:
+    result = []
+    if isinstance(ops, list):
+        for op in ops:
+            result.extend(_get_op_overloads(op))
+        return result
+
+    if isinstance(ops, OpOverloadPacket):
+        result.extend([getattr(ops, op) for op in ops.overloads()])
+    else:
+        result.append(ops)
+
+    return result
 
 
 def register_fallback(ops, device="cpu"):
@@ -179,7 +199,17 @@ def register_fallback(ops, device="cpu"):
             return out
 
         # Otherwise, return result moved to the target Spyre device
-        return fallback_result.to(spyre_device)
+        # Handle both single tensor and tuple/list of tensors
+        def _move_to_spyre(result):
+            if isinstance(result, (tuple, list)):
+                # Handle tuple/list of tensors (e.g., torch.max returns (values, indices))
+                moved = [_move_to_spyre(item) for item in result]
+                # Preserve the original type (tuple or list)
+                return type(result)(moved)
+
+            return result.to(spyre_device)
+
+        return _move_to_spyre(fallback_result)
 
     def _decorator(fn):
         for op in ops:
@@ -197,7 +227,19 @@ def register_fallback(ops, device="cpu"):
     return _decorator
 
 
+def register_fallback_default(ops):
+    for op in _get_op_overloads(ops):
+        register_fallback([op.name()])(op)
+
+
 #  CPU-fallback eager operators
+
+register_fallback_default(
+    [
+        aten.cumsum,
+        aten.repeat.out,
+    ]
+)
 
 
 @register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
@@ -224,7 +266,7 @@ def spyre__cos(input, **kwargs):
 # Manually append to fallback_ops: register_fallback cannot be used here because
 # normal_ is an in-place op — register_fallback is designed for out-of-place ops
 # and would leave the original Spyre tensor unfilled.
-# The kernel itself is registered in ops.py (and therefore codegen_ops.py).
+# The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
 
 
@@ -282,3 +324,27 @@ def spyre__bitwise_xor(input1, input2, **kwargs):
 @register_fallback([aten.bitwise_or.Tensor, aten.bitwise_or.Tensor_out])
 def spyre__bitwise_or(input1, input2, **kwargs):
     return torch.bitwise_or(input1, input2, **kwargs)
+
+
+@register_fallback([aten.argmax.default])
+def spyre__argmax(*args, **kwargs):
+    return torch.argmax(*args, **kwargs)
+
+
+@register_fallback(["spyre::max_dim_int64_fallback"])
+def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
+    """
+    CPU fallback for torch.max(input, dim) when input is int64.
+    """
+    return torch.max(input, dim=dim, keepdim=keepdim, **kwargs)
+
+
+@register_fallback(["spyre::max_default_int64_fallback"])
+def spyre__max_default_int64_fallback(input, **kwargs):
+    """
+    CPU fallback for torch.max(input) when input is int64.
+
+    Returns a scalar (0D) tensor containing the maximum value.
+    This avoids recursive decomposition by directly calling torch.max on CPU.
+    """
+    return torch.max(input, **kwargs)

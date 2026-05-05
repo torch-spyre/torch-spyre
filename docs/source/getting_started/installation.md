@@ -9,6 +9,15 @@ have progressed to a publicly available release.
 Watch this repository for updates or open an issue to express interest
 in early access.
 
+## Requirements
+
+| Component | Version |
+|---|---|
+| Python | ≥ 3.11 |
+| PyTorch | ~= 2.10.0 |
+
+The exact pins live in [`pyproject.toml`](https://github.com/torch-spyre/torch-spyre/blob/main/pyproject.toml) and are resolved through [`requirements/run.txt`](https://github.com/torch-spyre/torch-spyre/blob/main/requirements/run.txt).
+
 ## Verify the Installation
 
 Once installed, verify your setup with:

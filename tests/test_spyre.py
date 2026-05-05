@@ -16,7 +16,6 @@
 
 import os
 import regex as re
-import unittest
 import psutil
 import warnings
 from contextlib import contextmanager
@@ -75,7 +74,7 @@ class TestSpyre(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    @unittest.skip("Skip for now")
+    @pytest.mark.xfail(reason="autograd not yet supported", strict=True)
     def test_autograd_init(self):
         # Make sure autograd is initialized
         torch.ones(2, requires_grad=True, device="spyre").sum().backward()
@@ -360,7 +359,7 @@ class TestSpyre(TestCase):
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
 
-    @unittest.skip("Skip for now")
+    @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")

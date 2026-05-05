@@ -89,8 +89,11 @@ Assign cores in two passes:
    greedily assigning the largest valid divisor of each dimension's size that
    fits within the remaining core budget.
 
-The result is stored as `op_it_space_splits` on the scheduler node — a dict
-mapping each iteration variable to its slice count.
+The result is stored as `op_it_space_splits` on the `ComputedBuffer`. It is a `dict` keyed by the index coefficients of the buffer's read and write index expressions (computed by `splits_by_index_coeff` in [pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)), and each coefficient maps to its slice count. Downstream passes can recover an iteration-variable view by calling `apply_splits_from_index_coeff(splits, write_index, read_index, it_space)`.
+
+:::{note}
+**Two distinct memory limits.** The 256 MB span limit in step 1 is a per-core addressable device memory constraint, set by how much DDR each core can reach in its address space. It is not the same thing as the 2 MB on-core LX scratchpad. Scratchpad allocation is a separate decision, made by the `scratchpad_planning` pass when `LX_PLANNING` is enabled (see [scratchpad.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad.py)).
+:::
 
 ## Operation-Specific Strategies
 

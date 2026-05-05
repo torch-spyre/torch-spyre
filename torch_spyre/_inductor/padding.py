@@ -70,7 +70,7 @@ def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) ->
             output.meta["val"] = torch.empty(output_shape, dtype=dtype, device=device)
         with graph.inserting_after(output):
             padded = graph.call_function(
-                torch.ops.spyre.overwrite.default,
+                torch.ops.spyre.overwrite_f.default,
                 args=(arg, output, [dim], [0]),
             )
             padded.meta["val"] = torch.empty(output_shape, dtype=dtype, device=device)

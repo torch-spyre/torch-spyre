@@ -45,9 +45,12 @@ source_suffix = {
 master_doc = "index"
 
 # -- Intersphinx mapping -----------------------------------------------------
+# The PyTorch docs site moved its inventory and the canonical URL now 404s
+# under -W. None of our pages use :py:class:`torch.X` style cross-references
+# (links to pytorch.org are written as plain Markdown links instead), so we
+# drop the torch entry until the upstream URL stabilizes.
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
-    "torch": ("https://pytorch.org/docs/stable", None),
 }
 
 # -- Options for HTML output -------------------------------------------------

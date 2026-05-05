@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
 # run_test.sh -- Single-entry-point test runner for torch-spyre OOT tests.
 #
-# Usage:
-#   bash run_test.sh /path/to/test_suite_config.yaml [extra pytest args...]
+# Usage (single config):
+#   bash run_test.sh /path/to/yaml/config [extra pytest args...]
+#
+# Usage (multiple configs -- merged at runtime, temp file cleaned up on exit):
+#   bash run_test.sh config_a.yaml config_b.yaml [config_c.yaml ...] [extra pytest args...]
+#   bash run_test.sh configs/                            # all YAMLs in a directory
+#   bash run_test.sh configs/ extra.yaml -- [extra pytest args...]
+
+# When more than one YAML file is supplied the configs are merged in order via
+# spyre_test_utilities.py
+#   - `files` entries with the same path are combined (tests deduplicated).
+#   - `global` list keys form a superset; identical items are deduplicated.
+#   - Conflicting scalar globals raise an error.
+# The merged temp file is removed by the EXIT trap at the end of the run.
 #
 # For each test file, any TestCase subclass that is NOT already passed to
 # instantiate_device_type_tests() is automatically wrapped: a temporary
@@ -28,20 +41,114 @@ set -euo pipefail
 
 
 if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <config.yaml | config_dir/> [config2.yaml ...] [extra pytest args...]" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Multi-config support
+#
+# Collect all leading positional arguments that are YAML files or directories
+# as YAML configs.  The first non-YAML / non-directory argument (or anything
+# after "--") is the start of extra pytest args.  A single YAML argument is
+# the original backward-compatible path and behaves exactly as before.
+#
+# Supported forms (mixable in any order before pytest args):
+#   run_test.sh config.yaml                    # single file (original)
+#   run_test.sh a.yaml b.yaml                  # explicit list
+#   run_test.sh configs/                       # all YAMLs in a directory
+#   run_test.sh configs/ extra.yaml            # directory + extra file
+#   run_test.sh a.yaml configs/ b.yaml -- -v   # mixed, "--" boundary
+#
+# Directory expansion: all *.yaml / *.yml files directly inside the directory
+# are collected in sorted order.
+# ---------------------------------------------------------------------------
+YAML_CONFIGS=()
+EXTRA_PYTEST_ARGS=()
+_parsing_yamls=1
+
+for _arg in "$@"; do
+    if [[ "$_arg" == "--" ]]; then
+        _parsing_yamls=0
+        continue
+    fi
+    if [[ $_parsing_yamls -eq 1 && -d "$_arg" ]]; then
+        _dir_yamls=()
+        while IFS= read -r -d '' _f; do
+            _dir_yamls+=("$(realpath "$_f")")
+        done < <(find "$(realpath "$_arg")" -maxdepth 1 \
+                     \( -name '*.yaml' -o -name '*.yml' \) \
+                     -type f -print0 | sort -z)
+        if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
+            echo "WARNING: No YAML files found in directory: $_arg" >&2
+        else
+            echo "[spyre_run] Expanded directory '$_arg' -> ${#_dir_yamls[@]} config(s):"
+            for _f in "${_dir_yamls[@]}"; do echo "[spyre_run]   $_f"; done
+            YAML_CONFIGS+=("${_dir_yamls[@]}")
+        fi
+    elif [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
+        YAML_CONFIGS+=("$(realpath "$_arg")")
+    else
+        _parsing_yamls=0
+        EXTRA_PYTEST_ARGS+=("$_arg")
+    fi
+done
+
+if [[ ${#YAML_CONFIGS[@]} -eq 0 ]]; then
+    echo "ERROR: No YAML config file(s) found in the arguments." >&2
     echo "Usage: $0 <path/to/test_suite_config.yaml> [extra pytest args...]" >&2
     exit 1
 fi
 
-YAML_CONFIG="$(realpath "$1")"
-shift
-EXTRA_PYTEST_ARGS=("$@")
+# MERGED_CONFIG_IS_TEMP=1 means we created the file and must delete it on EXIT.
+MERGED_CONFIG_IS_TEMP=0
 
-if [[ ! -f "$YAML_CONFIG" ]]; then
-    echo "ERROR: YAML config not found: $YAML_CONFIG" >&2
-    exit 1
+if [[ ${#YAML_CONFIGS[@]} -eq 1 ]]; then
+    # -----------------------------------------------------------------------
+    # Single-config path
+    # -----------------------------------------------------------------------
+    YAML_CONFIG="${YAML_CONFIGS[0]}"
+
+    if [[ ! -f "$YAML_CONFIG" ]]; then
+        echo "ERROR: YAML config not found: $YAML_CONFIG" >&2
+        exit 1
+    fi
+
+    echo "[spyre_run] Using YAML config: $YAML_CONFIG"
+else
+    # -----------------------------------------------------------------------
+    # Multi-config path -- merge via spyre_test_utilities.py
+    # -----------------------------------------------------------------------
+    echo "[spyre_run] Merging ${#YAML_CONFIGS[@]} YAML config(s):"
+    for _c in "${YAML_CONFIGS[@]}"; do
+        echo "[spyre_run]   $_c"
+    done
+
+    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _UTILITIES_PY=""
+    if [[ -f "${_script_dir}/spyre_test_utilities.py" ]]; then
+        _UTILITIES_PY="${_script_dir}/spyre_test_utilities.py"
+    else
+        _first_config_dir="$(dirname "${YAML_CONFIGS[0]}")"
+        if [[ -f "${_first_config_dir}/spyre_test_utilities.py" ]]; then
+            _UTILITIES_PY="${_first_config_dir}/spyre_test_utilities.py"
+        fi
+    fi
+
+    if [[ -z "$_UTILITIES_PY" ]]; then
+        echo "ERROR: spyre_test_utilities.py not found beside run_test.sh or beside the first config." >&2
+        echo "       Place spyre_test_utilities.py in the same directory as run_test.sh." >&2
+        exit 1
+    fi
+
+    YAML_CONFIG=$(python3 "$_UTILITIES_PY" "${YAML_CONFIGS[@]}") || {
+        echo "ERROR: Failed to merge YAML configs." >&2
+        exit 1
+    }
+    MERGED_CONFIG_IS_TEMP=1
+    echo "[spyre_run] Merged config written to: $YAML_CONFIG"
 fi
 
-echo "[spyre_run] Using YAML config: $YAML_CONFIG"
 YAML_DIR="$(dirname "$YAML_CONFIG")"
 
 # ---------------------------------------------------------------------------
@@ -439,6 +546,19 @@ _cleanup_wrappers() {
         [[ -f "$wf" ]] && rm -f "$wf" && \
             echo "[spyre_run] Cleaned up wrapper: $wf"
     done
+    # Remove merged config temp file (only if we created it)
+    if [[ $MERGED_CONFIG_IS_TEMP -eq 1 && -n "${YAML_CONFIG:-}" && -f "$YAML_CONFIG" ]]; then
+        rm -f "$YAML_CONFIG"
+        echo "[spyre_run] Removed merged temp config: $YAML_CONFIG"
+    fi
+    # Remove marker sidecar JSON written by TorchTestBase.instantiate_test.
+    # Normally deleted by _XML_INJECT_PY after injection, but when --junit-xml
+    # is not supplied _XML_INJECT_PY never runs
+    local _sidecar="${YAML_CONFIG}.markers.json"
+    if [[ -f "$_sidecar" ]]; then
+        rm -f "$_sidecar"
+        echo "[spyre_run] Cleaned up marker sidecar: $_sidecar"
+    fi
 }
 trap _cleanup_wrappers EXIT
 
@@ -781,7 +901,7 @@ echo ""
 # ---------------------------------------------------------------------------
 
 _XML_INJECT_PY='
-import sys, re
+import sys, re, json, os
 from pathlib import Path
 try:
     import yaml
@@ -790,8 +910,20 @@ except ImportError:
 
 xml_path, yaml_path = sys.argv[1], sys.argv[2]
 
+# Load sidecar written by TorchTestBase.instantiate_test.
+# Keys are bare method names matching the XML `name=` attribute exactly.
+# Values are already-merged lists of all tags (YAML tests tags + op__ + dtype__ + module__ markers).
+_sidecar: dict = {}
+_sidecar_path = yaml_path + ".markers.json"
+try:
+    with open(_sidecar_path) as _f:
+        _sidecar = json.load(_f)
+except Exception:
+    pass
+
+# Fallback YAML-only tag_map for tests not in sidecar
 data = yaml.safe_load(open(yaml_path)) or {}
-tag_map = {}
+tag_map: dict = {}
 for fe in data.get("test_suite_config", {}).get("files", []):
     for te in fe.get("tests", []):
         tags = sorted(set(te.get("tags", []) or []))
@@ -802,7 +934,11 @@ for fe in data.get("test_suite_config", {}).get("files", []):
             if name:
                 tag_map.setdefault(name, set()).update(tags)
 
-def match_tags(classname, testname):
+def _all_tags(classname, testname):
+    # Sidecar has the full merged tag list -- use it when available.
+    if testname in _sidecar:
+        return sorted(_sidecar[testname])
+    # Fallback: YAML tests `tags` only lookup.
     matched = set()
     for yaml_name, tags in tag_map.items():
         if "::" in yaml_name:
@@ -824,15 +960,23 @@ def build_props(tags):
 
 def inject_full(m):
     attrs, content = m.group(1), m.group(2)
-    if "<properties>" in content:
-        return m.group(0)
     cn = re.search(r"classname=\"([^\"]*)\"", attrs)
     tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
     if not cn or not tn:
         return m.group(0)
-    tags = match_tags(cn.group(1), tn.group(1))
+    tags = _all_tags(cn.group(1), tn.group(1))
     if not tags:
         return m.group(0)
+    if "<properties>" in content:
+        existing = set(re.findall(r"<property name=\"tag\" value=\"([^\"]*)\"/>", content))
+        new_props = "".join(
+            f"<property name=\"tag\" value=\"{t}\"/>"
+            for t in tags if t not in existing
+        )
+        if not new_props:
+            return m.group(0)
+        content = content.replace("</properties>", new_props + "</properties>", 1)
+        return f"<testcase{attrs}>{content}</testcase>"
     return f"<testcase{attrs}>{build_props(tags)}{content}</testcase>"
 
 def inject_self_closing(m):
@@ -841,7 +985,7 @@ def inject_self_closing(m):
     tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
     if not cn or not tn:
         return m.group(0)
-    tags = match_tags(cn.group(1), tn.group(1))
+    tags = _all_tags(cn.group(1), tn.group(1))
     if not tags:
         return m.group(0)
     return f"<testcase{attrs}>{build_props(tags)}</testcase>"
@@ -850,10 +994,108 @@ xml = Path(xml_path).read_text()
 xml = re.sub(r"<testcase([^>]*)>(.*?)</testcase>", inject_full,        xml, flags=re.DOTALL)
 xml = re.sub(r"<testcase([^>]*?)/>",               inject_self_closing, xml)
 Path(xml_path).write_text(xml)
+
+try:
+    os.remove(_sidecar_path)
+except OSError:
+    pass
+
 print(f"[spyre_run] Tags injected into XML: {xml_path}", flush=True)
 '
 
 OVERALL_EXIT=0
+
+# ---------------------------------------------------------------------------
+# Extract the caller-supplied --junit-xml destination BEFORE the
+# per-file loop so we can:
+#   1. Route each per-file pytest run to a shard XML (e.g. report__shard_0.xml)
+#      instead of the shared final path, preventing later runs from overwriting
+#      the XML and the already-injected <properties> tags of earlier runs.
+#   2. Merge all shards into the original --junit-xml path after all runs finish.
+# ---------------------------------------------------------------------------
+_FINAL_XML_PATH=""
+_prev_arg=""
+for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
+    case "$_arg" in
+        --junit-xml=*) _FINAL_XML_PATH="${_arg#--junit-xml=}" ;;
+        --junit-xml)   : ;;
+        *)  [[ "$_prev_arg" == "--junit-xml" ]] && _FINAL_XML_PATH="$_arg" ;;
+    esac
+    _prev_arg="$_arg"
+done
+
+# Build a copy of EXTRA_PYTEST_ARGS with --junit-xml stripped out.
+# Each per-file run injects its own shard path instead.
+_EXTRA_NO_XML=()
+_skip_next=0
+for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
+    if [[ $_skip_next -eq 1 ]]; then
+        _skip_next=0
+        continue
+    fi
+    case "$_arg" in
+        --junit-xml=*) ;;                  # drop combined form
+        --junit-xml)   _skip_next=1 ;;     # drop flag; value dropped next iteration
+        *)             _EXTRA_NO_XML+=("$_arg") ;;
+    esac
+done
+
+# Accumulate shard paths for the final merge step.
+_XML_SHARDS=()
+
+# ---------------------------------------------------------------------------
+# XML shard merger: combines N JUnit XML files (each produced by a separate
+# pytest run) into one, summing suite-level counters and concatenating all
+# <testcase> elements (which already carry their injected <properties> tags).
+# ---------------------------------------------------------------------------
+_XML_MERGE_PY='
+import sys, re
+from pathlib import Path
+
+out_path    = sys.argv[1]
+shard_paths = sys.argv[2:]
+
+all_cases   = []
+total_tests = 0
+total_err   = 0
+total_fail  = 0
+total_skip  = 0
+total_time  = 0.0
+
+def _attr(xml, name, default="0"):
+    m = re.search(rf"{name}=\"([^\"]*)\"", xml)
+    return m.group(1) if m else default
+
+for sp in shard_paths:
+    txt = Path(sp).read_text()
+    suite_m = re.search(r"<testsuite([^>]*)>", txt)
+    if suite_m:
+        attrs = suite_m.group(1)
+        total_tests += int(_attr(attrs, "tests"))
+        total_err   += int(_attr(attrs, "errors"))
+        total_fail  += int(_attr(attrs, "failures"))
+        total_skip  += int(_attr(attrs, "skipped"))
+        try:
+            total_time += float(_attr(attrs, "time", "0"))
+        except ValueError:
+            pass
+    # Collect full and self-closing <testcase> blocks.
+    blocks  = re.findall(r"<testcase[^>]*>.*?</testcase>", txt, re.DOTALL)
+    blocks += re.findall(r"<testcase[^>]*/>",              txt)
+    all_cases.extend(blocks)
+
+merged = (
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+    "<testsuites>"
+    f"<testsuite name=\"pytest\" tests=\"{total_tests}\" "
+    f"errors=\"{total_err}\" failures=\"{total_fail}\" "
+    f"skipped=\"{total_skip}\" time=\"{total_time:.3f}\">"
+    + "\n".join(all_cases)
+    + "</testsuite></testsuites>"
+)
+Path(out_path).write_text(merged)
+print(f"[spyre_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
+'
 
 for i in "${!RUN_FILES[@]}"; do
     run_file="${RUN_FILES[$i]}"
@@ -869,27 +1111,84 @@ for i in "${!RUN_FILES[@]}"; do
     fi
     echo "========================================================================"
 
+    # Derive a shard XML path for this file's pytest run.
+    _SHARD_XML=""
+    if [[ -n "$_FINAL_XML_PATH" ]]; then
+        _SHARD_XML="${_FINAL_XML_PATH%.xml}__shard_${i}.xml"
+        _XML_SHARDS+=("$_SHARD_XML")
+    fi
+
+    # Build per-file args: base args (--junit-xml stripped) + shard path.
+    if [[ -n "$_SHARD_XML" ]]; then
+        _FILE_PYTEST_ARGS=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" "--junit-xml=${_SHARD_XML}")
+    else
+        _FILE_PYTEST_ARGS=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}")
+    fi
+
+    # ---------------------------------------------------------------------------
+    # -m marker pre-flight
+    #
+    # When a -m MARKEXPR is present, probe whether this specific file has any
+    # tests that match it before running.  The probe uses --collect-only which
+    # is fast as no test execution happens and runs from the file's own directory
+    # so conftest.py files are discovered correctly.
+    #
+    # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
+    # from _FILE_PYTEST_ARGS so the file's tests all run normally. 
+    # the marker filter applies to files that USE that marker
+    # family; files that don't use it are unaffected.
+    #
+    # ---------------------------------------------------------------------------
+    _HAS_M=0
+    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+        [[ "$_a" == "-m" ]] && { _HAS_M=1; break; }
+    done
+
+    if [[ $_HAS_M -eq 1 ]]; then
+        # Extract just the -m args for the probe (no --junit-xml, no -v, etc.)
+        _PROBE_ARGS=()
+        _take_next=0
+        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+            if [[ $_take_next -eq 1 ]]; then
+                _PROBE_ARGS+=("$_a")
+                _take_next=0
+                continue
+            fi
+            if [[ "$_a" == "-m" ]]; then
+                _PROBE_ARGS+=("$_a")
+                _take_next=1
+            fi
+        done
+
+        _probe_exit=0
+        (cd "$run_dir" && python3 -m pytest "$run_basename" \
+            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null)
+        _probe_exit=$?
+
+        if [[ $_probe_exit -eq 5 ]]; then
+            # 0 tests match this marker in this file — strip -m from args.
+            echo "[spyre_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
+            _ARGS_NO_M=()
+            _skip_m=0
+            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
+                if [[ $_skip_m -eq 1 ]]; then _skip_m=0; continue; fi
+                if [[ "$_a" == "-m" ]]; then _skip_m=1; continue; fi
+                _ARGS_NO_M+=("$_a")
+            done
+            _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
+        fi
+    fi
+
     (
         cd "$run_dir"
-        python3 -m pytest "$run_basename" "${EXTRA_PYTEST_ARGS[@]}" || true
+        python3 -m pytest "$run_basename" "${_FILE_PYTEST_ARGS[@]}" || true
     )
 
     _exit=$?
 
     # Post-process XML to inject YAML tags as <properties>.
-    _XML_PATH=""
-    _prev_arg=""
-    for _arg in "${EXTRA_PYTEST_ARGS[@]+"${EXTRA_PYTEST_ARGS[@]}"}"; do
-        case "$_arg" in
-            --junit-xml=*) _XML_PATH="${_arg#--junit-xml=}" ;;
-            --junit-xml)   : ;;
-            *)  [[ "$_prev_arg" == "--junit-xml" ]] && _XML_PATH="$_arg" ;;
-        esac
-        _prev_arg="$_arg"
-    done
-
-    if [[ -n "$_XML_PATH" && -f "$_XML_PATH" ]]; then
-        python3 -c "$_XML_INJECT_PY" "$_XML_PATH" "$YAML_CONFIG" || true
+    if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" ]]; then
+        python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
     fi
 
     if [[ $_exit -ne 0 ]]; then
@@ -897,6 +1196,30 @@ for i in "${!RUN_FILES[@]}"; do
         OVERALL_EXIT=$_exit
     fi
 done
+
+# ---------------------------------------------------------------------------
+# Merge all XML shards into the final output path requested by the caller.
+# ---------------------------------------------------------------------------
+if [[ -n "$_FINAL_XML_PATH" && ${#_XML_SHARDS[@]} -gt 0 ]]; then
+    _existing_shards=()
+    for _s in "${_XML_SHARDS[@]}"; do
+        [[ -f "$_s" ]] && _existing_shards+=("$_s")
+    done
+
+    if [[ ${#_existing_shards[@]} -eq 1 ]]; then
+        # Single file run: just rename the shard, no merge needed.
+        mv "${_existing_shards[0]}" "$_FINAL_XML_PATH"
+        echo "[spyre_run] Single XML shard moved to: $_FINAL_XML_PATH"
+    elif [[ ${#_existing_shards[@]} -gt 1 ]]; then
+        python3 -c "$_XML_MERGE_PY" "$_FINAL_XML_PATH" "${_existing_shards[@]}" || true
+        # Clean up shards after successful merge.
+        for _s in "${_existing_shards[@]}"; do
+            rm -f "$_s"
+        done
+    else
+        echo "[spyre_run] WARNING: No XML shards found to merge." >&2
+    fi
+fi
 
 echo ""
 echo "[spyre_run] Done. Overall exit code: $OVERALL_EXIT"
