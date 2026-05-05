@@ -1,4 +1,4 @@
 sphinx>=7.0
-sphinx-rtd-theme>=2.0
+sphinx-rtd-theme>=3.1.0
 myst-parser>=3.0
 sphinx-autobuild>=2025.8.25   # optional: live-reload server
