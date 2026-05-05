@@ -25,6 +25,27 @@ Some of the key features of the Spyre device are listed below:
 * It is manufactured using advanced 5nm node technology.
 * Each card supports up to 128 GB of LPDDR5 memory, with ensembles of up to eight cards delivering 1 TB memory and massive AI performance.
 * It delivers exceptional AI compute, exceeding 300 TOPS per card, while consuming just 75W.
+* PCIe gen5 x16 host interface (PCIe form factor card).
+
+### Core microarchitecture
+
+Each Spyre core is built from two corelets that share a single 2 MB LX scratchpad (SRAM). Inside each corelet there is an 8 × 8 systolic Processing Element (PE) array, used for matrix-style compute on the PT execution unit, plus a 1D Special Function Unit (SFU) for non-linear activations such as GELU and softmax.
+
+Cores talk to each other over a bi-directional ring interconnect at 128 B per cycle per direction. The architecture descends from IBM's research-stage RaPiD AI accelerator (Venkataramani et al., ISCA 2021, [DOI:10.1109/ISCA52012.2021.00021](https://doi.org/10.1109/ISCA52012.2021.00021)).
+
+### Memory and tiling constants
+
+The runtime, compiler, and tensor-layout code all share one tiling constant:
+
+```
+BYTES_IN_STICK = 128
+```
+
+A *stick* is a 128-byte aligned memory chunk, which works out to 64 elements at fp16. The size matches the natural granularity of data transfers between LPDDR5 device memory and the per-core LX scratchpad, so the hardware can pull in a full stick of contiguous elements in a single transfer.
+
+### Production deployments
+
+As of 2025, Spyre is shipping in two production systems. IBM z17 mainframes support up to 48 Spyre cards, each delivering 300+ TOPS (see the [IBM Z press release](https://newsroom.ibm.com/ai-on-z)). IBM Power11 servers run the same silicon as a 75W PCIe gen5 x16 card with 128 GB of LPDDR5 memory (see the [IBM Power11 press release](https://newsroom.ibm.com/2025-07-08-ibm-power11-raises-the-bar-for-enterprise-it)). The Torch-Spyre integration described in these docs targets that PCIe card configuration.
 
 ## Use cases
 

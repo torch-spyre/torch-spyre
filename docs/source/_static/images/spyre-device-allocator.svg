@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 620" font-family="sans-serif" font-size="13">
+  <rect width="460" height="620" fill="white"/>
+
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 Z" fill="#1d4ed8"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="230" y="28" text-anchor="middle" font-size="14" font-weight="bold" fill="#0f172a">Spyre Device Allocator Call Chain</text>
+
+  <!-- Box 1: torch.empty -->
+  <rect x="60" y="60" width="340" height="70" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="230" y="92" text-anchor="middle" fill="white" font-weight="bold" font-size="14">torch.empty(..., device="spyre")</text>
+  <text x="230" y="112" text-anchor="middle" fill="#dbeafe" font-size="11">PyTorch user API</text>
+
+  <!-- Arrow 1 -->
+  <line x1="230" y1="130" x2="230" y2="180" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Box 2: spyre_empty_strided -->
+  <rect x="60" y="190" width="340" height="70" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="230" y="222" text-anchor="middle" fill="white" font-weight="bold" font-size="14">spyre_empty_strided</text>
+  <text x="230" y="242" text-anchor="middle" fill="#dbeafe" font-size="11">PrivateUse1 dispatch (csrc/spyre_mem.cpp)</text>
+
+  <!-- Arrow 2 -->
+  <line x1="230" y1="260" x2="230" y2="310" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Box 3: SpyreAllocator::allocate -->
+  <rect x="60" y="320" width="340" height="70" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="230" y="352" text-anchor="middle" fill="white" font-weight="bold" font-size="14">SpyreAllocator::allocate</text>
+  <text x="230" y="372" text-anchor="middle" fill="#dbeafe" font-size="11">c10::Allocator (csrc/spyre_allocator.cpp)</text>
+
+  <!-- Arrow 3 -->
+  <line x1="230" y1="390" x2="230" y2="440" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Box 4: flex::FlexAllocator::allocate -->
+  <rect x="60" y="450" width="340" height="70" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="230" y="482" text-anchor="middle" fill="white" font-weight="bold" font-size="14">flex::FlexAllocator::allocate</text>
+  <text x="230" y="502" text-anchor="middle" fill="#dbeafe" font-size="11">flex runtime · returns CompositeAddress</text>
+
+  <!-- Footer caption -->
+  <text x="230" y="565" text-anchor="middle" fill="#94a3b8" font-size="10" font-style="italic">SpyreAllocator wraps each allocation in a c10::DataPtr whose deleter</text>
+  <text x="230" y="580" text-anchor="middle" fill="#94a3b8" font-size="10" font-style="italic">frees the backing memory when the tensor's storage refcount reaches 0.</text>
+</svg>

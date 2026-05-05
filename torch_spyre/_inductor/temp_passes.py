@@ -22,9 +22,11 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
+from .logging_utils import get_inductor_logger
 
 aten = torch.ops.aten
 
+logger = get_inductor_logger("core_division")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -238,11 +240,11 @@ def _unflatten_bmm_batch_dims(
                 graph.erase_node(expand_node)
 
 
-def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
+def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
     """
-    Replace constant arguments to any operation with tensor.
-    Scalars are converted to size=1 tensor and passed to the corresponding
-    operations which was consuming the scalar value.
+    Replace constant arguments to any operation with spyre.constant node.
+    Scalar constants are converted to size=1 tensor and passed to the corresponding
+    operations which was consuming the scalar value at lowering.
     """
 
     ops_support_list = [
@@ -267,14 +269,15 @@ def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
                 if isinstance(in_arg, (int, float)):
                     scalar_indexes.append(i)
                 else:
-                    print(f"Warning: unhandled node type {type(in_arg)}")
+                    logger.warning(f"Warning: unhandled node type {type(in_arg)}")
 
         if len(scalar_indexes) > 0:
-            with graph.inserting_before(node):
-                for idx in scalar_indexes:
-                    scalar_val = node.args[idx]
+            for idx in scalar_indexes:
+                scalar_val = node.args[idx]
+
+                with graph.inserting_before(node):
                     if scalar_val in const_node_map:
-                        full_node = const_node_map[scalar_val]
+                        const_node = const_node_map[scalar_val]
                     else:
                         # Currently the dtype of the scalar tensor is set as same as the output dtype.
                         # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
@@ -283,9 +286,17 @@ def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
                         meta = node.meta.get("tensor_meta", None)
                         if meta:
                             dtype = meta.dtype
-                        full_node = graph.call_function(
-                            torch.ops.spyre.full.default,
-                            args=((1,), scalar_val, torch.device("spyre"), dtype),
+                        node_name = "py_const"
+                        node_args = [scalar_val, dtype, torch.device("spyre")]
+                        const_node = graph.create_node(
+                            "call_function",
+                            torch.ops.spyre.constant.default,
+                            tuple(node_args),
+                            {},
+                            node_name,
+                            node.type,
                         )
-                        const_node_map[scalar_val] = full_node
-                    node.update_arg(idx, full_node)
+                        const_node_map[scalar_val] = const_node
+                    node.update_arg(idx, const_node)
+
+    graph.lint()

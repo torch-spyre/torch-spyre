@@ -15,6 +15,7 @@
 import functools
 import torch
 import os
+import pytest
 
 DEVICE = torch.device("spyre")
 
@@ -339,10 +340,18 @@ def unique_randn_along_dim(
 
 
 # init_helper initiates tensors given a list of shape tuples
-def init_helper(shapes, dtype=torch.float16, cached=True):
-    randn_func = cached_randn if cached else torch.randn
+def init_helper(shapes, dtype=torch.float16, cached=True, rand_type="randn"):
+    def uncached_xavier(shape, dtype):
+        return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+
+    cached_fn, uncached_fn = {
+        "randn": (cached_randn, torch.randn),
+        "xavier": (cached_xavier, uncached_xavier),
+    }[rand_type]
+    rand_fn = cached_fn if cached else uncached_fn
+
     return tuple(
-        randn_func(shape, differentiation=i, dtype=dtype)
+        rand_fn(shape, dtype=dtype, **({"differentiation": i} if cached else {}))
         for i, shape in enumerate(shapes)
     )
 
@@ -356,8 +365,10 @@ def shapes2key(shapes):
 
 
 # cases: Tuple of cases. Each case is defined by shapes of tensors
-def make_param_dict(cases):
-    return {shapes2key(shapes): init_helper(shapes) for shapes in cases}
+def make_param_dict(cases, rand_type="randn"):
+    return {
+        shapes2key(shapes): init_helper(shapes, rand_type=rand_type) for shapes in cases
+    }
 
 
 # ParameterizedTestMeta injects parameterized test methods
@@ -420,6 +431,7 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
+            expect_fail = cases.get("expect_fail", [])
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -446,6 +458,10 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
+                        if test_case in expect_fail:
+                            namespace[test_name] = pytest.mark.xfail(
+                                reason=f"Expected fail for {test_case}", strict=True
+                            )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -467,6 +483,10 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
+                    if test_case in expect_fail:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Expected fail for {test_case}", strict=True
+                        )(namespace[test_name])
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
@@ -623,36 +643,3 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
         target = _compile_and_run(fn, args, DEVICE)
     pytorch_result = fn_pytorch(*args)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
-
-
-def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False, target=None):
-    """Compare compiled Spyre execution against sendnn backend execution."""
-    if target is None:
-        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
-    sendnn_result = _compile_and_run(fn, args, "cpu", backend="sendnn")
-    _assert_results_close(target, sendnn_result, atol, rtol, "sendnn")
-
-
-def compare(
-    fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
-):
-    """3-way comparison: compiled Spyre vs uncompiled CPU vs sendnn backend."""
-    spyre_compiled_result = _compile_and_run(
-        fn, args, DEVICE, needs_device=needs_device
-    )
-    compare_with_cpu(
-        fn,
-        *args,
-        atol=cpu_atol,
-        rtol=cpu_rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )
-    compare_with_sendnn(
-        fn,
-        *args,
-        atol=atol,
-        rtol=rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )

@@ -1,0 +1,29 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_embedding.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestEmbeddingNN::test_embedding_bag_from_pretrained
+            - TestEmbeddingNN::test_embedding_bag_from_pretrained_padding_idx
+            - TestEmbeddingNN::test_embedding_bag_functional
+            - TestEmbeddingNN::test_embedding_bag_padding_idx_error
+            - TestEmbeddingNN::test_embedding_from_pretrained_float32
+            - TestEmbeddingNN::test_embedding_from_pretrained_float64
+            - TestEmbeddingNN::test_embedding_from_pretrained_int16
+            - TestEmbeddingNN::test_embedding_from_pretrained_int32
+            - TestEmbeddingNN::test_embedding_from_pretrained_int64
+            - TestEmbeddingNN::test_embedding_from_pretrained_int8
+            - TestEmbeddingNN::test_embedding_from_pretrained_options
+            - TestEmbeddingNN::test_embedding_from_pretrained_padding_idx
+            - TestEmbeddingNN::test_embedding_from_pretrained_uint8
+            - TestEmbeddingNN::test_embedding_functional
+            - TestEmbeddingNN::test_embedding_max_norm
+            - TestEmbeddingNN::test_embedding_sparse_basic
+            - TestEmbeddingNN::test_embedding_sparse_empty_tensor
+            - TestEmbeddingNN::test_embeddingbag_2d_include_last_offset
+            - TestEmbeddingNN::test_embeddingbag_from_pretrained
+            - TestEmbeddingNN::test_embeddingbag_from_pretrained_options
+            - TestEmbeddingNN::test_embeddingbag_include_last_offset
+            - TestEmbeddingNN::test_move_sparse_half_embedding
+          mode: mandatory_success

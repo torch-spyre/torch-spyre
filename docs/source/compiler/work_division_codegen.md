@@ -70,8 +70,10 @@ For example, a matrix multiplication might have logical dimensions [M, N] but de
 Pointwise operations are the simplest case for work division. Each core processes a contiguous slice of the output tensor, reading corresponding slices from input tensors.
 
 The code generator:
-1. Determines which dimension is split (currently it's hard-coded as the stick dimension)
-2. Creates a core-to-slice mapping where only the split dimension varies
+1. Determines which dimensions are split. `divide_pointwise_op`
+   ([core_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/core_division.py))
+   may split across any candidate dimension, not just the stick dimension.
+2. Creates a core-to-slice mapping for every split dimension
 3. Calculates memory offsets for each core
 4. Generates coordinate information for accessing elements within each slice
 
@@ -81,9 +83,17 @@ All cores use the same computational kernel but operate on different data region
 
 Matrix multiplication is more complex because multiple dimensions are split and different tensors have different layouts.
 
+:::{figure} ../_static/images/work-division-matmul.svg
+:alt: Matmul work division across cores: A split along M, B split along N, C split along both
+:width: 75%
+:align: center
+
+Matmul work division. Matrix A is split along the M dimension, matrix B along N, and the output C along both. K, the reduction dimension, is not split. The split counts in the figure (`M_split=4`, `K_split=1`, `N_split=2`) are stored in the `op_it_space_splits` dict on the `ComputedBuffer` (see "Integration with Planning Phase" below), and the matmul dimension labels come from `MATMUL_DIM_LABELS = ["y", "x", "mb", "out", "in"]` in `constants.py`.
+:::
+
 For a matrix multiplication C = A × B:
 - The left matrix A is split along the M dimension
-- The right matrix B is split along the N dimension  
+- The right matrix B is split along the N dimension
 - The output matrix C is split along both M and N dimensions
 
 The code generator must:
@@ -102,19 +112,15 @@ The batch dimension is typically split first because batch elements are complete
 
 ## Integration with Planning Phase
 
-The code generation phase reads the work division plan produced by the planning phase. The plan specifies:
-- `op_dim_splits`: a list of split counts, one per operation dimension, in the same order as the dimension labels used in code generation (e.g. `["mb", "in", "out"]` for matmul)
-- The total number of cores used (equal to the product of all splits)
+The code generator reads the plan produced by the planning phase. The plan is stored on each `ComputedBuffer` as the `op_it_space_splits` attribute, set by `apply_splits` in [core_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/core_division.py) together with `splits_by_index_coeff` in [pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py).
 
-The `op_dim_splits` list is operation-centric: it describes how the logical computation is divided, independent of how any particular tensor is laid out in device memory. The code generator uses it directly as `dim_splits` without any mapping through device dimensions.
+`op_it_space_splits` is a `dict` keyed by the index coefficients of the buffer's read and write index expressions, with each coefficient mapping to its slice count. Downstream passes can recover an iteration-variable view of the splits by calling `apply_splits_from_index_coeff(splits, write_index, read_index, it_space)`. The total number of cores in use is the product of all slice counts.
 
-The code generator uses this information to:
-1. Create the core-to-slice mapping via `_get_core_to_slice_mapping(iteration_space, dim_splits, num_cores)` (defined in [`superdsc.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py))
-2. Calculate memory offsets for each core
-3. Generate dimension metadata
-4. Produce the SuperDSC structure
+The dimension labels used in code generation live in [`constants.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/constants.py). For matmul they are `MATMUL_DIM_LABELS = ["y", "x", "mb", "out", "in"]`, which `_get_op_dim_labels` ([codegen/superdsc.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py)) slices to `ndim` entries.
 
-The planning and code generation phases are loosely coupled: the planner makes high-level decisions about parallelization, while the code generator handles the low-level details of translating those decisions into executable structures.
+From there, the code generator resolves `op_it_space_splits` against `OpSpec.iteration_space` to produce the per-dimension `dim_splits` list consumed by `_get_core_to_slice_mapping(iteration_space, dim_splits, num_cores)`, calculates memory offsets for each core, generates dimension metadata, and assembles the SuperDSC structure (see `SDSCSpec` in `codegen/superdsc.py`).
+
+Planning and code generation are loosely coupled: the planner makes high-level decisions about parallelization, and the code generator translates those decisions into executable structures.
 
 ## Performance Considerations
 

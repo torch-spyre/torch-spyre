@@ -106,20 +106,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 67, 256), dtype=torch.float16).to("spyre"),
                     cached_randn((2, 256, 128), dtype=torch.float16).to("spyre"),
                 ),
-                # TODO(aviros): Fails on codegen
-                # "3d_3d_bcast": (
-                #     cached_randn((4, 67, 256), dtype=torch.float16).to("spyre"),
-                #     cached_randn((1, 256, 128), dtype=torch.float16).to("spyre"),
-                # ),
+                "3d_3d_bcast": (
+                    cached_randn((4, 67, 256), dtype=torch.float16).to("spyre"),
+                    cached_randn((1, 256, 128), dtype=torch.float16).to("spyre"),
+                ),
                 "4d_4d": (
                     cached_randn((3, 17, 128, 256), dtype=torch.float16).to("spyre"),
                     cached_randn((3, 17, 256, 128), dtype=torch.float16).to("spyre"),
                 ),
-                # TODO(aviros): Fails on codegen
-                # "4d_4d_bcast": (
-                #     cached_randn((3, 1, 128, 256), dtype=torch.float16).to("spyre"),
-                #     cached_randn((1, 17, 256, 128), dtype=torch.float16).to("spyre"),
-                # ),
+                "4d_4d_bcast": (
+                    cached_randn((3, 1, 128, 256), dtype=torch.float16).to("spyre"),
+                    cached_randn((1, 17, 256, 128), dtype=torch.float16).to("spyre"),
+                ),
             },
         },
     }
@@ -198,6 +196,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert "aten.mm.default" not in inductor_graph_str, (
             "aten.mm.default should be replaced by bmm after unflatten pass"
         )
+
+    def test_mixed_device_seq(self):
+        model = torch.compile(torch.sin)
+        cpu_1 = torch._inductor.utils.get_code(model, torch.randn(5))[0]
+
+        model = torch.compile(torch.sin)
+        spyre_1 = torch._inductor.utils.get_code(model, torch.randn(5, device="spyre"))[
+            0
+        ]
+
+        torch._dynamo.reset()
+        model = torch.compile(torch.sin)
+        cpu_2 = torch._inductor.utils.get_code(model, torch.randn(5))[0]
+
+        assert cpu_1.split("\n", 1)[1] == cpu_2.split("\n", 1)[1], (
+            "CPU graph should be the same across compilations"
+        )
+        assert spyre_1 != cpu_1, "SPYRE graph should differ from CPU graph"
 
 
 class TestInsertPadding(unittest.TestCase):

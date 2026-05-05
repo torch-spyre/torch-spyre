@@ -33,7 +33,7 @@ from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    replace_scalar_with_tensor,
+    convert_constant_with_graph_node,
 )
 from . import config
 from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
@@ -128,7 +128,7 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         insert_padding,
-        replace_scalar_with_tensor,
+        convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]

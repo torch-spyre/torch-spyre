@@ -7,7 +7,7 @@
 
   <!-- TITLE -->
   <text x="290" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">Work Division: matmul C = A × B with 8 cores</text>
-  <text x="290" y="40" text-anchor="middle" font-size="12" fill="#374151">op_dim_splits = [4, 1, 2]  —  M_split=4,  K not split,  N_split=2</text>
+  <text x="290" y="40" text-anchor="middle" font-size="12" fill="#374151">op_it_space_splits  —  M_split=4,  K not split,  N_split=2</text>
 
   <!-- ===== MATRIX A (M=128 × K=64) ===== -->
   <!-- K=64 arrow: 96px — same scale as N=64 in B and C -->
@@ -90,7 +90,7 @@
   <!-- ===== ANNOTATION BOX ===== -->
   <rect x="30" y="310" width="520" height="112" rx="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
 
-  <text x="290" y="329" text-anchor="middle" fill="#0f172a" font-size="12" font-weight="bold">op_dim_splits = [<tspan fill="#1e40af">4</tspan>, <tspan fill="#374151">1</tspan>, <tspan fill="#7c3aed">2</tspan>]   &#x2192;   4 &#xd7; 1 &#xd7; 2 = <tspan fill="#1e3a8a">8 cores total</tspan></text>
+  <text x="290" y="329" text-anchor="middle" fill="#0f172a" font-size="12" font-weight="bold">M_split=<tspan fill="#1e40af">4</tspan>, K_split=<tspan fill="#374151">1</tspan>, N_split=<tspan fill="#7c3aed">2</tspan>   &#x2192;   4 &#xd7; 1 &#xd7; 2 = <tspan fill="#1e3a8a">8 cores total</tspan></text>
 
   <line x1="50" y1="337" x2="540" y2="337" stroke="#e2e8f0" stroke-width="1"/>
   <text x="88"  y="350" text-anchor="middle" fill="#6b7280" font-size="10" font-weight="bold">Dim</text>
@@ -113,4 +113,6 @@
   <text x="190" y="400" text-anchor="middle" fill="#374151" font-size="11">"out"</text>
   <text x="278" y="400" text-anchor="middle" fill="#7c3aed" font-size="11" font-weight="bold">2</text>
   <text x="420" y="400" text-anchor="middle" fill="#374151" font-size="10">2 column tiles — each core takes one N-tile</text>
+
+  <text x="290" y="418" text-anchor="middle" fill="#6b7280" font-size="9" font-style="italic">MATMUL_DIM_LABELS = ["y", "x", "mb", "out", "in"] (constants.py)</text>
 </svg>

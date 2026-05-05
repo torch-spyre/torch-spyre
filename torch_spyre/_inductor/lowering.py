@@ -19,10 +19,12 @@ import torch
 
 from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
 import torch._inductor.lowering as lowering
+import torch._inductor.ir as ir
+from .ir import SpyreConstantFallback
 
 from typing import Any, Callable, Union
 
-from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction
@@ -74,16 +76,37 @@ def register_spyre_lowering(
 # the op is registered by default. Here, we unregister ops that are falling back
 # to eager ops
 # Note: If an op has a decomposition defined, a lowering is not registered
-def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=False):
-    for overload in lowering.get_overloads(op):
-        if overload in lowering_dict:
-            del lowering_dict[overload]
-        elif not allow_missing:
-            raise RuntimeError(f"lowering of {overload} is not registered")
+def unregister_lowerings(fallback_ops, lowering_dict, allow_missing=False):
+    saved_overloads = {}
+    # Pass 1: Pre-check for exception safety (Fail-fast)
+    if not allow_missing:
+        missing = [
+            overload
+            for op in fallback_ops
+            for overload in lowering.get_overloads(op)
+            if overload not in lowering_dict
+        ]
+        if missing:
+            raise RuntimeError(f"Cannot unregister. Missing lowerings for: {missing}")
+
+    # Pass 2: Safely remove and store
+    for op in fallback_ops:
+        saved_overloads[op] = {}
+        for overload in lowering.get_overloads(op):
+            if overload in lowering_dict:
+                # .pop() grabs the function and
+                # deletes the key in one atomic step
+                # if all overloads are unique then the op
+                # key is not needed here.
+                saved_overloads[op][overload] = lowering_dict.pop(overload)
+    return saved_overloads
 
 
-for op in fallback_ops:
-    unregister_lowering(op, allow_missing=True)
+def restore_lowerings(saved_overloads, lowering_dict):
+    for _, op_stored_overloads in saved_overloads.items():
+        for overload, func in op_stored_overloads.items():
+            lowering_dict[overload] = func
+
 
 # Overload names for aten.clamp
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
@@ -105,6 +128,10 @@ def enable_spyre_lowerings():
         _lowerings_nesting += 1
 
         if first_enter:
+            enable_spyre_lowerings._removed_fallbacks = {}
+            enable_spyre_lowerings._removed_fallbacks = unregister_lowerings(
+                fallback_ops, lowering.lowerings, allow_missing=True
+            )
             saved_intree_lowerings = {}
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
                 if spyre_lowering_op in lowering.lowerings:
@@ -174,8 +201,13 @@ def enable_spyre_lowerings():
                         ]
                     else:
                         lowering.lowerings.pop(spyre_lowering_op, None)
+                restore_lowerings(
+                    enable_spyre_lowerings._removed_fallbacks, lowering.lowerings
+                )
+
                 # Clean up
                 enable_spyre_lowerings._saved_lowerings = {}
+                enable_spyre_lowerings._removed_fallbacks = {}
 
 
 def ensure_default_handler(op_name):
@@ -216,7 +248,6 @@ def lower_mm(x, y):
 
     # Handle 3D input with 2D weight (batched matmul)
     if x_ndim == 3 and y_ndim == 2:
-        reduction_type = BATCH_MATMUL_OP  # Use BATCH_MATMUL_OP for 3D×2D
         ranges = [x_size[0], x_size[1], y_size[1]]  # [B, M, N]
 
         def inner_fn(index, reduction_index):
@@ -224,7 +255,6 @@ def lower_mm(x, y):
             (r0,) = reduction_index
             return (x_loader([i0, i1, r0]), y_loader([r0, i2]))
     elif x_ndim == 2 and y_ndim == 2:
-        reduction_type = MATMUL_REDUCTION_OP  # Use MATMUL_REDUCTION_OP for 2D×2D
         ranges = [x_size[0], y_size[1]]
 
         def inner_fn(index, reduction_index):
@@ -242,7 +272,7 @@ def lower_mm(x, y):
         result = lowering.mul(x, y)
     else:
         result = Reduction.create(
-            reduction_type=reduction_type,
+            reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
             dst_dtype=x.get_dtype(),
@@ -405,6 +435,98 @@ def lower_layernormscale(x, eps):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.topkvalue)
+def lower_topkvalue(x, k, dim):
+    x_size = x.get_size()
+    ndim = len(x_size)
+    # Normalize dim to a positive index.
+    norm_dim = dim % ndim
+    loader = x.make_loader()
+
+    if norm_dim == ndim - 1:
+        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
+        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
+        mb = x_size[0]
+        n_in = x_size[1]
+
+        def inner_fn(index, rindex):
+            return loader([index[0], rindex[0]])
+
+        ranges = [mb, k]
+        reduction_ranges = [n_in]
+    else:
+        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
+        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
+        mb = x_size[1]
+
+        def inner_fn(index, rindex):
+            # index = [k_idx, mb_idx], rindex = [n_in_idx]
+            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
+            return loader([rindex[0], index[1]])
+
+        ranges = [k, mb]
+        reduction_ranges = x_size[:1]
+
+    result = Reduction.create(
+        reduction_type="topkvalue",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.spyre.topkindex)
+def lower_topkindex(x, k, dim):
+    x_size = x.get_size()
+    ndim = len(x_size)
+    # Normalize dim to a positive index.
+    norm_dim = dim % ndim
+    loader = x.make_loader()
+
+    if norm_dim == ndim - 1:
+        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
+        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
+        mb = x_size[0]
+        n_in = x_size[1]
+
+        def inner_fn(index, rindex):
+            return loader([index[0], rindex[0]])
+
+        ranges = [mb, k]
+        reduction_ranges = [n_in]
+    else:
+        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
+        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
+        mb = x_size[1]
+
+        def inner_fn(index, rindex):
+            # index = [k_idx, mb_idx], rindex = [n_in_idx]
+            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
+            return loader([rindex[0], index[1]])
+
+        ranges = [k, mb]
+        reduction_ranges = x_size[:1]
+
+    result = Reduction.create(
+        reduction_type="topkindex",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
 
 
 @register_spyre_lowering(torch.ops.aten.mean.dim)
@@ -581,3 +703,17 @@ def lower_restickify(x):
 
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.aten.slice.Tensor, type_promotion_kind=None)
+def lower_slice(x, dim=0, start=None, end=None, step=1):
+    result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
+    return clone(result, memory_format=torch.contiguous_format)
+
+
+@register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
+def lower_constant(value, dtype, device):
+    op_overload = getattr(
+        torch.ops.spyre.constant, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(SpyreConstantFallback(op_overload, value, dtype, device))

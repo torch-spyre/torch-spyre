@@ -11,7 +11,6 @@ device. Any model compiled with `torch.compile` and targeting the
 
 ```python
 import torch
-import torch_spyre
 
 DEVICE = torch.device("spyre")
 

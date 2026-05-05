@@ -75,18 +75,25 @@ git branch -d my-feature-branch
 ## Code Quality Standards
 
 * Follow the **Google Python Style Guide** and **Google C++ Style Guide**.
-* **Run pre-commit** before submitting to ensure linting passes:
+* **Use `import regex as re`, never `import re`.** The `enforce-import-regex-instead-of-re` pre-commit hook enforces this. Using the standard-library `re` module will fail pre-commit.
+* **Line length** is 88 characters, enforced by ruff.
+* **Run pre-commit** before submitting to make sure linting passes:
 
   ```bash
   pip install pre-commit
   pre-commit run --all-files
   ```
 
-  See the [pre-commit docs](https://pre-commit.com/#usage) if this is new
-  to you.
+  See the [pre-commit docs](https://pre-commit.com/#usage) if this is new to you. The configured hooks include `ruff`, `clang-format`, `cpplint`, `mypy`, `pymarkdown`, `yamlfmt`, and `actionlint`, plus local hooks for the `import regex` rule, DCO sign-off, filename checks, and pinned `requirements/dev.txt` validation.
 
-* **Write tests** — both unit tests and integration tests — to keep the
-  project correct and robust.
+* **Write tests**, both unit and integration, to keep the project correct and robust. The test suite is organized into four tiers, all of which run in CI on every PR:
+
+  | Tier | Where | What it covers |
+  |---|---|---|
+  | Upstream PyTorch compatibility | OpInfo-based tests instantiated against the `spyre` device via `instantiate_device_type_tests` (see `tests/test_spyre.py` and `tests/spyre_test_base_common.py`). | Confirms Spyre tensors behave correctly at the PyTorch API level. An allowlist tracks which test variants pass; update it with each PR. |
+  | Op-level | `tests/inductor/test_inductor_ops.py` | Each op compared against a CPU reference output. |
+  | Building blocks | `tests/inductor/test_building_blocks.py` | Composed transformer subgraphs such as attention heads, FFN, and normalization. |
+  | Model-level | `tests/models/test_model_ops.py`, `tests/models/test_model_ops_v2.py` | Full model forward passes with real Granite weights, validated against YAML-specified tolerance profiles. |
 
 * **Document user-facing changes.** If your PR modifies how Torch-Spyre
   behaves from a user's perspective, add or update the relevant page under

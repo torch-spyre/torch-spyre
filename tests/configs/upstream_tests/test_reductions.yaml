@@ -1,0 +1,12 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_reductions.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestReductions::test_all_issue117215
+            - TestReductions::test_argminmax_axis_with_dim_one
+            - TestReductions::test_dim_multi_unsupported
+            - TestReductions::test_scalar_tensor_as_dim_argument
+            - TestReductions::test_scalar_tensor_dim_compiled_mode
+          mode: mandatory_success
