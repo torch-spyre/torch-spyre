@@ -46,7 +46,11 @@ SPYRE_FP32_OPS = [
     "layernormnorm",
     "identity",
     "overwrite",
+    "topkvalue",
+    "topkindex",
 ]
+
+TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]

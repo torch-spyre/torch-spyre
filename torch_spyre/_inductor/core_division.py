@@ -34,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -573,6 +573,11 @@ def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
 def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
     red: Reduction = op.data
     is_matmul = red.reduction_type == BATCH_MATMUL_OP
+
+    # Currently we support Topk for k<=4, which can be handled efficiently on single core
+    # TODO: Modification will be required to enable Topk for k>4
+    if red.reduction_type in TOPK_OPS:
+        return
 
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)

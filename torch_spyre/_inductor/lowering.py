@@ -437,6 +437,98 @@ def lower_layernormscale(x, eps):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.topkvalue)
+def lower_topkvalue(x, k, dim):
+    x_size = x.get_size()
+    ndim = len(x_size)
+    # Normalize dim to a positive index.
+    norm_dim = dim % ndim
+    loader = x.make_loader()
+
+    if norm_dim == ndim - 1:
+        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
+        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
+        mb = x_size[0]
+        n_in = x_size[1]
+
+        def inner_fn(index, rindex):
+            return loader([index[0], rindex[0]])
+
+        ranges = [mb, k]
+        reduction_ranges = [n_in]
+    else:
+        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
+        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
+        mb = x_size[1]
+
+        def inner_fn(index, rindex):
+            # index = [k_idx, mb_idx], rindex = [n_in_idx]
+            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
+            return loader([rindex[0], index[1]])
+
+        ranges = [k, mb]
+        reduction_ranges = x_size[:1]
+
+    result = Reduction.create(
+        reduction_type="topkvalue",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.spyre.topkindex)
+def lower_topkindex(x, k, dim):
+    x_size = x.get_size()
+    ndim = len(x_size)
+    # Normalize dim to a positive index.
+    norm_dim = dim % ndim
+    loader = x.make_loader()
+
+    if norm_dim == ndim - 1:
+        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
+        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
+        mb = x_size[0]
+        n_in = x_size[1]
+
+        def inner_fn(index, rindex):
+            return loader([index[0], rindex[0]])
+
+        ranges = [mb, k]
+        reduction_ranges = [n_in]
+    else:
+        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
+        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
+        mb = x_size[1]
+
+        def inner_fn(index, rindex):
+            # index = [k_idx, mb_idx], rindex = [n_in_idx]
+            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
+            return loader([rindex[0], index[1]])
+
+        ranges = [k, mb]
+        reduction_ranges = x_size[:1]
+
+    result = Reduction.create(
+        reduction_type="topkindex",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mean.dim)
 def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     kwargs = lowering._make_reduction_inner(

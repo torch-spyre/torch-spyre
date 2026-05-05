@@ -28,6 +28,7 @@ from torch_spyre._inductor.constants import (
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
     SEGMENT_OFFSETS,
+    TOPK_OPS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
@@ -240,6 +241,10 @@ def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul")
 
 
+def _is_topk(op: str) -> bool:
+    return op in TOPK_OPS
+
+
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
         return MATMUL_DIM_LABELS[5 - ndim :]
@@ -270,7 +275,7 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
         use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
-        if use_op_dims and dim_order != dims:
+        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
 
@@ -342,7 +347,12 @@ def _create_sdsc_tensors(
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     if op == "to_dtype" or op == "overwrite":
         return IDENTITY_OP
-    if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
+    if (
+        is_reduction
+        and not _is_matmul(op)
+        and not _is_topk(op)
+        and -2 not in output_scales.values()
+    ):
         return op + "nonstick"
     return op
 
@@ -440,6 +450,9 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
 
     num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
+
+    if _is_topk(op_spec.op):
+        num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),

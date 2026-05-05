@@ -480,6 +480,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_topk", "test_topk_cpu"): {
+            "param_sets": {
+                "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
+                "2d_k4_dim_minusone": (
+                    unique_randn_along_dim((64, 256), dim=-1),
+                    4,
+                    -1,
+                ),
+                # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
+                # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
+            },
+        },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {
                 "sum": torch.sum,
@@ -3092,6 +3104,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
+
+    def test_topk_cpu(self, x, k: int, dim: int):
+        # torch.topk returns (values, indices); only compare values since
+        # index tie-breaking can differ between backends.
+        # aten::topk is not registered for Spyre eager dispatch.
+        compare_with_cpu(lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False)
 
     def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
