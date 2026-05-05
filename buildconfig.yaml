@@ -2,7 +2,6 @@ apiVersion: build.openshift.io/v1
 kind: BuildConfig
 metadata:
   name: torch-spyre-build
-<<<<<<< HEAD
   namespace: arc-runners
 spec:
   source:
@@ -10,29 +9,18 @@ spec:
     git:
       uri: https://github.com/mayurrai5/torch-spyre.git
       ref: dev
-=======
-  #namespace: github-actions-runners
-spec:
-  source:
-    type: Binary
-    binary: {}
->>>>>>> main
 
   strategy:
     type: Docker
     dockerStrategy:
-<<<<<<< HEAD
       pullSecret:
         name: icr-global
-=======
->>>>>>> main
       dockerfilePath: Dockerfile
       noCache: true
 
   output:
     to:
       kind: DockerImage
-<<<<<<< HEAD
       name: 
     pushSecret:
       name: icr-global
@@ -42,9 +30,3 @@ spec:
   
   # ADD THIS:
   completionDeadlineSeconds: 3600  # 1 hour timeoutoc get bc torch-spyre-build -o yaml | grep -A3 pushSecret
-=======
-      name: us.icr.io/github-actions-runners/torch-spyre:latest
-
-  triggers:
-    - type: ConfigChange
->>>>>>> main
