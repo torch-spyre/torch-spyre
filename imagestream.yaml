@@ -10,4 +10,8 @@ spec:
   - name: latest
     from:
       kind: DockerImage
+<<<<<<< HEAD
       name: torch-spyre:latest
+=======
+      name: torch-spyre:latest
+>>>>>>> main

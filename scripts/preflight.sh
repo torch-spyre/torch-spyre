@@ -7,6 +7,7 @@ log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" | tee -a "$LOG_FILE"
 }
 
+<<<<<<< HEAD
 OC_BIN="/usr/local/bin/oc"
 
 log "Starting OpenShift CLI check"
@@ -26,11 +27,23 @@ if [ -x "$OC_BIN" ]; then
 fi
 
 log "Installing fresh oc binary..."
+=======
+log "Starting OpenShift CLI check"
+
+if [ -x /usr/local/bin/oc ]; then
+    log "oc already installed"
+    /usr/local/bin/oc version --client | tee -a "$LOG_FILE"
+    exit 0
+fi
+
+log "oc not found. Installing..."
+>>>>>>> main
 
 TMP_DIR=$(mktemp -d)
 cd "$TMP_DIR"
 
 log "Downloading oc client"
+<<<<<<< HEAD
 curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz
 
 log "Extracting archive"
@@ -44,3 +57,17 @@ log "Validating installation"
 "$OC_BIN" version --client | tee -a "$LOG_FILE"
 
 log "Installation completed"
+=======
+curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
+
+log "Extracting archive"
+tar -xvf openshift-client-linux.tar.gz
+
+log "Installing binary"
+sudo mv oc /usr/local/bin/
+
+log "Validating installation"
+/usr/local/bin/oc version --client | tee -a "$LOG_FILE"
+
+log "Installation completed"
+>>>>>>> main

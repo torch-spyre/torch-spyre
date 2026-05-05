@@ -17,7 +17,6 @@ __all__: list[str] = [
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
-    "convert_artifacts",
     "empty_with_layout",
     "copy_tensor",
     "encode_constant",
@@ -239,7 +238,10 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+<<<<<<< HEAD
 def convert_artifacts(arg0: str) -> None: ...
+=======
+>>>>>>> main
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:
@@ -269,7 +271,9 @@ def get_downcast_warning() -> bool:
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
-def launch_kernel(arg0: str, arg1: collections.abc.Sequence[torch.Tensor]) -> None: ...
+def launch_kernel(
+    code_dir: str, args: collections.abc.Sequence[torch.Tensor]
+) -> None: ...
 def set_downcast_warning(arg0: bool) -> None:
     """
     Enable/disable downcast warnings for this process.

@@ -16,7 +16,11 @@
 
 #include "spyre_device_enum.h"
 
+<<<<<<< HEAD
 #include <flex/runtime_stream/runtime_entry.hpp>
+=======
+#include <flex/flex.hpp>
+>>>>>>> main
 
 namespace spyre {
 

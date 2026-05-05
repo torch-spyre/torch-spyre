@@ -14,6 +14,10 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
+<<<<<<< HEAD
+=======
+from .fallbacks import _get_op_overloads
+>>>>>>> main
 import torch_spyre._C as _C
 import warnings
 import functools
@@ -21,6 +25,12 @@ import inspect
 import operator
 
 
+<<<<<<< HEAD
+=======
+aten = torch.ops.aten
+
+
+>>>>>>> main
 # Decorator to keep track of compiled variant
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
@@ -40,7 +50,11 @@ def compile_once(op, **compile_kwargs):
         # a clean signature.
         old_signature = inspect.signature(fn)
         params = dict(old_signature.parameters)
+<<<<<<< HEAD
         params.pop("compiled")
+=======
+        params.pop("compiled", None)
+>>>>>>> main
         new_signature = old_signature.replace(parameters=params.values())
         wrapper.__signature__ = new_signature
 
@@ -55,6 +69,7 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
+<<<<<<< HEAD
 @torch.library.register_kernel("aten::mm", ["spyre"])  # type:ignore
 @compile_once(torch.mm, dynamic=False)
 def spyre__mm(self: torch.Tensor, mat2: torch.Tensor, compiled) -> torch.Tensor:
@@ -67,6 +82,62 @@ def spyre__mm_out(
     self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor, compiled
 ) -> torch.Tensor:
     return compiled(self, mat2, out=out)
+=======
+def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
+    return compiled(*args, **kwargs)
+
+
+def register_torch_compile_kernel(ops):
+    for op in _get_op_overloads(ops):
+        if "Tensor" not in str(op._schema):
+            # there are some ops that do not take in Tensors
+            # like aten.sum.int
+            continue
+        if "dtype" in op.name():
+            # ops that change dtype are not supported yet
+            continue
+        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
+
+
+register_torch_compile_kernel(
+    [
+        aten.mm,
+        aten.silu.out,
+        aten.mish.out,
+        aten.abs,
+        aten.add,
+        aten.bitwise_not,
+        aten.logical_not,
+        aten.bmm,
+        aten.cat,
+        aten.div,
+        aten.exp,
+        aten.log,
+        aten.mean,
+        aten.mul,
+        aten.reciprocal,
+        aten.neg,
+        aten.relu,
+        aten.rsqrt,
+        aten.sigmoid,
+        aten._softmax,
+        aten.stack,
+        aten.sum,
+        aten.sqrt,
+        aten.tanh,
+        aten.sub,
+        aten.addmm,
+        aten.eq,
+        aten.ge,
+        aten.gt,
+        aten.lt,
+        aten.maximum,
+        aten.pow,
+        aten.linalg_vector_norm,
+    ]
+)
+>>>>>>> main
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
@@ -102,6 +173,7 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
+<<<<<<< HEAD
 @torch.library.register_kernel("aten::silu.out", ["spyre"])  # type:ignore
 @compile_once(torch.ops.aten.silu.out, dynamic=False)
 def spyre__silu_out(
@@ -120,6 +192,8 @@ def spyre__mish_out(
     return compiled(self, out=out)
 
 
+=======
+>>>>>>> main
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Create a new tensor on cpu

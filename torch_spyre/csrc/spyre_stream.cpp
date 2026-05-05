@@ -19,12 +19,21 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+<<<<<<< HEAD
+=======
+#include <cstddef>
+>>>>>>> main
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+<<<<<<< HEAD
 #include "flex/runtime_stream/runtime_operation.hpp"
+=======
+#include "flex/flex.hpp"
+>>>>>>> main
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
@@ -129,6 +138,16 @@ c10::Stream SpyreStream::unwrap() const {
   return stream_;
 }
 
+<<<<<<< HEAD
+=======
+void SpyreStream::copyProgramAsync(
+    void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
+  // NOTE: the assumption is that the size of the program match the size of
+  // device_address
+  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
+}
+
+>>>>>>> main
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
   DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
@@ -160,12 +179,19 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     auto& storage = spyre_impl->storage();
     auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
 
+<<<<<<< HEAD
     // Generate data conversion info
     // So we always pass &src, not cpu_tensor
     DataConversionInfo dci = generate_dci(
         dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
 
     copyAsyncImpl(cpu_ptr, &ctx->composite_addr, dci, host2device);
+=======
+    DataConversionInfo dci = generate_dci(
+        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+
+    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+>>>>>>> main
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -174,6 +200,14 @@ void SpyreStream::copyAsync(const at::Tensor& src,
 }
 
 flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
+  if (flex_handle_ != nullptr) {
+    return flex_handle_;
+  }
+  flex_handle_ = resolveRuntimeHandle();
+  return flex_handle_;
+}
+
+flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
 
@@ -186,10 +220,17 @@ flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
 
 void SpyreStream::copyAsyncImpl(void* cpu_ptr,
                                 const flex::CompositeAddress* device_address,
+<<<<<<< HEAD
                                 const DataConversionInfo& dci,
                                 bool host2device) const {
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = std::make_shared<data_conversion_info>(dci);
+=======
+                                const DataConversionInfo* dci,
+                                bool host2device) const {
+  // Wrap dci in shared_ptr for flex API
+  auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
+>>>>>>> main
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
@@ -202,6 +243,30 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
     flex::RuntimeOperationD2H op(device_address, cpu_ptr, dci_ptr);
     flex_stream->launchOperation(op);
   }
+<<<<<<< HEAD
+=======
+}
+
+void SpyreStream::executeProgramAsync(
+    const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
+  // NOTE: Maybe it's better/faster if we know the exact number of arguments
+  // as it is tracked inside KerntlArtifacts
+  std::vector<const flex::CompositeAddress*> tensor_allocs;
+  for (size_t i = 0; i < args.size(); ++i) {
+    auto* ctx = static_cast<SharedOwnerCtx*>(
+        args[i].storage().data_ptr().get_context());
+    tensor_allocs.push_back(&ctx->composite_addr);
+  }
+
+  // Program
+  auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
+  flex::RuntimeOperationCompute compute_op(
+      &ctx->composite_addr, std::move(tensor_allocs), arts.sdsc_json_path);
+
+  // Get the flex runtime stream handle
+  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+  flex_stream->launchOperation(compute_op);
+>>>>>>> main
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
@@ -212,7 +277,7 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   // This ensures getRuntimeHandle() resolves stream 0 to the real RuntimeStream
   // instance owned by RuntimeContext.
   auto runtime = GlobalRuntime::get();
-  pool.stream_handle_map[0] = runtime->getDefaultStream(device_index);
+  pool.stream_handle_map[0] = runtime->getDefaultStream();
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
@@ -300,7 +365,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
     flex::RuntimeStream* flex_handle =
-        runtime->createStream(device.index(), runtime->toPriority(priority));
+        runtime->createStream(runtime->toPriority(priority));
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 

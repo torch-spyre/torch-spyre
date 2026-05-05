@@ -79,7 +79,6 @@ available in PyTorch). Spyre workloads can be profiled with
 
 ```python
 import torch
-import torch_spyre
 from torch.profiler import profile, ProfilerActivity
 
 model = torch.compile(MyModel().to("spyre"))
@@ -148,7 +147,7 @@ direct analog in GPU profiling:
 | Metric | Description |
 |--------|-------------|
 | Pipeline utilization | Fraction of functional units active per cycle |
-| DMA overhead | Transfer time between DDR and scratchpad |
+| Tile-staging overhead | Time to move tiles between LPDDR5 and the LX scratchpad |
 | Reconfiguration latency | Time to load new dataflow configurations between kernels |
 | Inter-core communication | Work division efficiency across up to 32 cores |
 | Stick alignment overhead | Padding/reformatting cost for 128-byte stick misalignment |
