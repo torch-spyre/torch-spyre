@@ -12,9 +12,25 @@ real model configurations from YAML without artificial modifications.
 import torch
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_modules import modules, module_db
-from torch.testing._internal.common_utils import TestCase
+from torch.testing._internal.common_utils import TestCase, run_tests
 from torch.utils._pytree import tree_map
-from torch.testing._internal.common_utils import run_tests
+
+
+def _extract_first_tensor(output):
+    """Extract first tensor from potentially nested output structure.
+
+    Uses pytree to handle nested structures (tuples, lists, dicts, etc.)
+    and returns the first tensor found, or None if no tensors exist.
+    """
+    tensors = []
+
+    def collect_tensors(x):
+        if isinstance(x, torch.Tensor):
+            tensors.append(x)
+        return x
+
+    tree_map(collect_tensors, output)
+    return tensors[0] if tensors else None
 
 
 class TestModuleCustom(TestCase):
@@ -82,21 +98,9 @@ class TestModuleCustom(TestCase):
                 )
 
             # Extract first tensor from output using pytree
-            def extract_first_tensor(output):
-                """Extract first tensor from potentially nested output structure."""
-                tensors = []
-
-                def collect_tensors(x):
-                    if isinstance(x, torch.Tensor):
-                        tensors.append(x)
-                    return x
-
-                tree_map(collect_tensors, output)
-                return tensors[0] if tensors else None
-
-            output_cpu_tensor = extract_first_tensor(output_cpu)
-            output_device_eager_tensor = extract_first_tensor(output_device_eager)
-            output_device_compile_tensor = extract_first_tensor(output_device_compile)
+            output_cpu_tensor = _extract_first_tensor(output_cpu)
+            output_device_eager_tensor = _extract_first_tensor(output_device_eager)
+            output_device_compile_tensor = _extract_first_tensor(output_device_compile)
 
             if (
                 output_cpu_tensor is not None
@@ -167,20 +171,8 @@ class TestModuleCustom(TestCase):
                 output_device = module_device(*args_device, **kwargs_device)
 
             # Extract first tensor from output using pytree
-            def extract_first_tensor(output):
-                """Extract first tensor from potentially nested output structure."""
-                tensors = []
-
-                def collect_tensors(x):
-                    if isinstance(x, torch.Tensor):
-                        tensors.append(x)
-                    return x
-
-                tree_map(collect_tensors, output)
-                return tensors[0] if tensors else None
-
-            cpu_tensor = extract_first_tensor(output_cpu)
-            device_tensor = extract_first_tensor(output_device)
+            cpu_tensor = _extract_first_tensor(output_cpu)
+            device_tensor = _extract_first_tensor(output_device)
 
             if (
                 cpu_tensor is not None
