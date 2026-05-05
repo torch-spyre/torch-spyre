@@ -116,7 +116,7 @@ def _create_restickify_node(
     first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
     with fx_graph.inserting_before(first_compute_node):
         restick_fx_node = fx_graph.create_node(
-            "call_function", torch.ops.spyre.restickify, (fx_arg_node,)
+            "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
         )
     # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
