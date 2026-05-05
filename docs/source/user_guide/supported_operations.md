@@ -37,6 +37,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.reciprocal` | Y | Y | Spyre | |
 | `torch.tanh` | Y | Y | Spyre | |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
+| `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.clamp` | | Y | Spyre | Custom op + lowering |
 | `torch.pow` | Y | Y | Spyre | |
 | **Pointwise Binary** | | | | |
@@ -45,6 +46,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.mul` | Y | Y | Spyre | |
 | `torch.div` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
+| `torch.bitwise_and` | | Y | Spyre | Custom decomposition |
 | `torch.where` | | Y | Spyre | Compiled only |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
@@ -59,24 +61,28 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.amax` | | Y | Spyre | Compiled only (no eager dispatch) |
 | `torch.amin` | | Y | Spyre | Compiled only (no eager dispatch) |
 | `torch.max` | | Y | Spyre | Compiled only (no eager dispatch) |
-| `torch.linalg.vector_norm` | Y | | Spyre | Eager only |
-| **View Ops** | | | | |
-| `torch.reshape` / `torch.view` | | Y | Spyre | |
+| `torch.linalg.vector_norm` | Y | | Spyre | Eager only; compiled support not validated |
+| **View Ops** [^views] | | | | |
+| `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` lowering |
 | `torch.transpose` | | Y | Spyre | |
 | `torch.t` | Y | Y | Spyre | View op |
 | `torch.permute` | Y | Y | Spyre | |
-| `torch.clone` | | Y | Spyre | Compiled only (with `.contiguous()`) |
+| `torch.clone` | | Y | Spyre | Compiled-tested as `clone().contiguous()`; standalone `clone` is also lowered and used by many decompositions |
 | `torch.contiguous` | | Y | Spyre | Compiled only |
 | `torch.squeeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.unsqueeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.cat` | Y | Y | Spyre | |
 | `torch.stack` | Y | | Spyre | Eager only |
 | `torch.repeat` | Y | | Spyre | Eager only |
-| `torch.expand` | | | Spyre | Planned; not yet implemented |
-| `torch.narrow` / `torch.select` | | | Spyre | Planned; not yet implemented |
+| `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
+| `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
+| `torch.narrow` / `torch.select` | | Y | Spyre | Compiled only; basic slicing works (see `test_slice` / `test_split`); broader `narrow`/`select` coverage in development |
 | **Tensor Creation** | | | | |
 | `torch.ones` | Y | Y | Spyre | Custom decomposition |
+| `torch.new_ones` | Y | Y | Spyre | Custom decomposition |
+| `torch.zeros` | Y | Y | Spyre | Eager via `aten::zero_` (`ops/eager.py`) |
 | `torch.full` | Y | Y | Spyre | Custom decomposition |
+| `torch.nn.functional.pad` / `torch.constant_pad_nd` | | Y | Spyre | Custom decomposition |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
 | **CPU Fallback** | | | | |
@@ -86,6 +92,11 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.cos` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.tril` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.triu` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.isin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**
 >
@@ -108,6 +119,13 @@ see [Adding Operations](../compiler/adding_operations.md).
 > grows continuously — check the
 > [test suite](https://github.com/torch-spyre/torch-spyre/tree/main/tests)
 > for the latest state.
+
+[^views]: View ops are implemented without cloning whenever the compiler
+    can express the new layout as a different read pattern over the same
+    storage. The translation happens during layout propagation in the
+    pre-scheduling pipeline; the "Views and Index Translation" section
+    of the [Inductor Front-End](../compiler/inductor_frontend.md) walks
+    through how this works.
 
 ## Unsupported Operations
 

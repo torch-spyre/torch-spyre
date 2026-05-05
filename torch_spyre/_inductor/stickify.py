@@ -14,7 +14,7 @@
 
 import logging
 from typing import Any
-
+from .ir import SpyreConstantFallback
 
 import sympy
 import torch
@@ -43,7 +43,7 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -515,6 +515,48 @@ def reduction_layout(
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
+    elif data.reduction_type in TOPK_OPS:
+        x = args[0]
+        x_coords = host_coordinates(x.layout, x.dep)
+        x_dev_coords = device_coordinates(x.layout, x.dep)
+        x_stick_expr = x_dev_coords[-1]
+        out_coords = host_coordinates(output, output_dep)
+        reduction_coord = next(
+            c
+            for c in x_coords
+            if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+        )
+        if matching_dim(x_coords, x_stick_expr) == matching_dim(
+            x_coords, reduction_coord
+        ):
+            # dim=-1: input shape [mb, n_in]; topk hardware requires stick on mb (dim 0),
+            # i.e. the reduction dimension (n_in, last dim) must NOT be the stick.
+            mb_coord = x_coords[0]
+            logger.warning(
+                "Injecting restickify on topk input to move stick from "
+                "reduction dim (n_in) to mb dim"
+            )
+            schedule_restickify(
+                op, x, mb_coord, x_coords, x_dev_coords, restickify_plan
+            )
+            out_stick_dim = matching_dim(out_coords, mb_coord)
+        else:
+            # dim=0: input shape [n_in, mb]; stick is already on mb (dim 1) by
+            # default row-major layout, so no restickify is needed.
+            mb_coord = x_coords[1]
+            out_stick_dim = matching_dim(out_coords, mb_coord)
+        if out_stick_dim is None:
+            out_dim_order = list(range(len(output.size))) + [-1]
+        else:
+            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+            out_dim_order = out_dim_order + [out_stick_dim]
+        # Concretize for C++ SpyreTensorLayout constructor.
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
     else:
         x = args[0]
         x_coords = host_coordinates(x.layout, x.dep)
@@ -627,7 +669,10 @@ def propagate_spyre_tensor_layouts(
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             op.layout = generic_layout(op)
         elif isinstance(op, ExternKernel):
-            logger.warning(f"unhandled node type {type(op)}")
+            if isinstance(op, SpyreConstantFallback):
+                op.layout = generic_layout(op)
+            else:
+                logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 

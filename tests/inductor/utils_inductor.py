@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import torch
 import os
 import pytest
+from torch._inductor.utils import run_and_get_code
+import unittest
 
 DEVICE = torch.device("spyre")
 
@@ -340,10 +343,18 @@ def unique_randn_along_dim(
 
 
 # init_helper initiates tensors given a list of shape tuples
-def init_helper(shapes, dtype=torch.float16, cached=True):
-    randn_func = cached_randn if cached else torch.randn
+def init_helper(shapes, dtype=torch.float16, cached=True, rand_type="randn"):
+    def uncached_xavier(shape, dtype):
+        return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+
+    cached_fn, uncached_fn = {
+        "randn": (cached_randn, torch.randn),
+        "xavier": (cached_xavier, uncached_xavier),
+    }[rand_type]
+    rand_fn = cached_fn if cached else uncached_fn
+
     return tuple(
-        randn_func(shape, differentiation=i, dtype=dtype)
+        rand_fn(shape, dtype=dtype, **({"differentiation": i} if cached else {}))
         for i, shape in enumerate(shapes)
     )
 
@@ -357,8 +368,10 @@ def shapes2key(shapes):
 
 
 # cases: Tuple of cases. Each case is defined by shapes of tensors
-def make_param_dict(cases):
-    return {shapes2key(shapes): init_helper(shapes) for shapes in cases}
+def make_param_dict(cases, rand_type="randn"):
+    return {
+        shapes2key(shapes): init_helper(shapes, rand_type=rand_type) for shapes in cases
+    }
 
 
 # ParameterizedTestMeta injects parameterized test methods
@@ -503,7 +516,15 @@ def _to_cpu(result, device):
         return result
 
 
-def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile=True):
+def _compile_and_run(
+    fn,
+    args,
+    device,
+    backend="inductor",
+    needs_device=False,
+    compile=True,
+    source_check=None,
+):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     device = torch.device(device) if isinstance(device, str) else device
@@ -513,10 +534,16 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
     device_kwargs = {"device": device} if needs_device else {}
 
     if compile:
-        if backend:
-            result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+        comp_func = torch.compile(fn, backend=backend)
+
+        if source_check is not None and device == "spyre":
+            result, source_codes = run_and_get_code(
+                comp_func, *device_args, **device_kwargs
+            )
+            if len(source_codes) > 0:
+                source_check(source_codes[0])
         else:
-            result = torch.compile(fn)(*device_args, **device_kwargs)
+            result = comp_func(*device_args, **device_kwargs)
     else:
         result = fn(*device_args, **device_kwargs)
 
@@ -564,6 +591,7 @@ def compare_with_cpu(
     target=None,
     run_eager=True,
     run_compile=True,
+    source_check=None,
 ):
     """Compare Spyre execution against CPU for one or both Spyre execution paths.
 
@@ -606,7 +634,12 @@ def compare_with_cpu(
             target
             if target is not None
             else _compile_and_run(
-                fn, args, DEVICE, needs_device=needs_device, compile=compiled
+                fn,
+                args,
+                DEVICE,
+                needs_device=needs_device,
+                compile=compiled,
+                source_check=source_check,
             )
         )
 
@@ -633,3 +666,31 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
         target = _compile_and_run(fn, args, DEVICE)
     pytorch_result = fn_pytorch(*args)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
+
+
+def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):  # noqa: B902
+    for name, value in my_cls.__dict__.items():
+        if name.startswith("test_"):
+            # You cannot copy functions in Python, so we use closures here to
+            # create objects with different ids. Otherwise, unittest.skip
+            # would modify all methods sharing the same object id. Also, by
+            # using a default argument, we create a copy instead of a
+            # reference. Otherwise, we would lose access to the value.
+
+            @functools.wraps(value)
+            def new_test(self, value=value):
+                return value(self)
+
+            # Copy __dict__ which may contain test metadata
+            new_test.__dict__ = copy.deepcopy(value.__dict__)
+
+            tf = test_failures and name in test_failures
+            if tf:
+                skip_func = unittest.skip("Skipped!")
+                new_test = skip_func(new_test)
+
+            setattr(other_cls, f"{name}_{suffix}", new_test)
+
+    # Special case convenience routine
+    if hasattr(my_cls, "is_dtype_supported"):
+        other_cls.is_dtype_supported = my_cls.is_dtype_supported

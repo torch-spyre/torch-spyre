@@ -9,6 +9,62 @@ You are auditing the torch-spyre documentation for consistency with the current
 state of the codebase. Run through each section below systematically. Report
 every issue found with the file path, what is wrong, and a suggested fix.
 
+## 0. Preflight: fetch the latest upstream refs (read-only)
+
+The audit has to read against the latest code, but it must not change
+the user's branch. Fetch the upstream refs only — do not merge,
+rebase, pull, reset, or check anything out. When you compare docs to
+code below, read from `upstream/main` (for example
+`git show upstream/main:path/to/file.py`) rather than relying on the
+local checkout, which may be behind.
+
+The canonical repo is `https://github.com/torch-spyre/torch-spyre.git`.
+In a fork-based workflow the remote pointing at it is typically
+`upstream`, with `origin` being the user's own fork. In a direct
+clone of the canonical repo it is `origin`. The steps below assume
+`upstream`; substitute the correct name if `git remote -v` says
+otherwise.
+
+Steps:
+
+1. Run `git remote -v` and confirm which remote points at
+   `torch-spyre/torch-spyre`. If it is not `upstream`, swap in the
+   correct name in everything that follows.
+2. Run `git fetch upstream --prune`. This only updates the
+   remote-tracking refs; it does not touch the working tree or the
+   current branch.
+3. For "what landed on main since I last synced", run
+   `git log --oneline $(git merge-base HEAD upstream/main)..upstream/main`
+   and skim the subjects so the audit knows what is new.
+4. Throughout the audit, read against `upstream/main` whenever the
+   local checkout might be stale. Examples:
+   - `git show upstream/main:torch_spyre/_inductor/customops.py`
+   - `git diff upstream/main -- docs/source/`
+5. **Do not** run `git merge`, `git rebase`, `git pull`, `git reset`,
+   `git checkout`, `git stash`, or anything else that mutates the
+   user's branch or working tree. An audit is read-only.
+
+## Terminology guardrails
+
+A few terms keep getting muddled in doc passes. Reviewers have flagged
+these directly, so check for them in any prose, table, caption, or
+SVG label:
+
+- **DMA** and **DCI (Data Conversion Information)** describe transfers
+  between **host memory and LPDDR5** only — the PCIe / DMA-engine
+  path. A DCI is the host-side descriptor (loop ranges, host strides,
+  device strides, plus dtype info) that drives one of these transfers;
+  in code it is the `DataConversionInfo` struct built by
+  `generate_dci()` in `spyre_mem.cpp` and consumed by `copyAsync`. The
+  `dma_sizes` and `dma_strides` fields on `SpyreTensorLayout` feed the
+  DCI.
+- **Do not** call LPDDR5 ↔ LX scratchpad transfers DMA. Those are
+  driven by load/store instructions emitted by the compiler for the
+  on-core load/store units. Use wording like "the compiler stages
+  tiles into the scratchpad" or "load/store instructions move tiles
+  between LPDDR5 and the LX scratchpad" — never "DMA" or "DCI" for
+  this hop.
+
 ## Audience
 
 Documentation serves two personas:
@@ -46,26 +102,24 @@ what is truly tested in the compiled path:
 
 ### 1b. Eager support (direct tensor ops without torch.compile)
 
-Eager support comes from **multiple sources**.
-Eager op sources:
+Eager support comes from three sources:
   - `torch_spyre/ops/eager.py` — manually registered ops via
     `@torch.library.register_kernel` (e.g., `mm`, `silu`, `mish`).
-  - `torch_spyre/_inductor/decompositions.py` — some decomposed ops
-    also work in eager mode, specifically: `rms_norm`, `layer_norm`,
-    `softplus`, `linear`, and `scaled_dot_product_attention`.
+  - `torch_spyre/ops/fallbacks.py` — CPU-fallback registrations via
+    `@register_fallback` and `register_fallback_default` (e.g.,
+    `arange`, `embedding`, `cumsum`, `tril`/`triu`, `isin`).
+  - `torch_spyre/_inductor/decompositions.py` — five decompositions
+    also dispatch eagerly: `rms_norm`, `layer_norm`, `softplus`,
+    `linear`, and `scaled_dot_product_attention`.
 
 To verify the Eager column:
-  - Read `torch_spyre/ops/eager.py` for additional manual registrations
-    (e.g., `mm`, `silu`, `mish`).
-  - Some decompositions in `torch_spyre/_inductor/decompositions.py`
-    are also triggered in eager mode: `rms_norm`, `layer_norm`,
-    `softplus`, `linear`, and `scaled_dot_product_attention`. These
-    should be marked Eager = Y.
-  - For compiled-only determination: check `tests/inductor/test_inductor_ops.py`
-    for `run_eager=False` — any op tested with this flag is
-    **compiled-only** and must NOT have Eager = Y.
-  - The full eager op set is: Metadata.yaml ops + eager.py ops +
-    the five decompositions listed above. Do not use `eager.py` alone.
+  - Read `eager.py` and `fallbacks.py` for the explicit registrations.
+  - Confirm that any op tested with `run_eager=False` in
+    `tests/inductor/test_inductor_ops.py` does NOT have Eager = Y;
+    those are compiled-only.
+  - Ops registered through `register_fallback` should appear under
+    the "CPU Fallback" section of the table with Execution = "CPU
+    fallback".
 
 ### 1c. View ops
 

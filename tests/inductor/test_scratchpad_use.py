@@ -25,7 +25,7 @@ from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import Operation
 
-from torch_spyre._inductor.scratchpad import mem_usage_by_op
+from torch_spyre._inductor.scratchpad import ScratchPadAllocator
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
@@ -111,10 +111,11 @@ class TestScratchpadUsage(unittest.TestCase):
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
     ) -> tuple[torch.Tensor, list[dict[str, dict[str, Any]]]]:
         mem_usages = []
+        alloc = ScratchPadAllocator()
 
         def visitor(node: Operation) -> None:
             nonlocal mem_usages
-            mem_usage = mem_usage_by_op(node)
+            mem_usage = alloc.mem_usage_by_op(node)
             mem_usage = {
                 key: value
                 for key, value in mem_usage.items()

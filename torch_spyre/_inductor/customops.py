@@ -125,6 +125,40 @@ def _(
     return x.new_empty(x.size())
 
 
+@torch.library.custom_op("spyre::topkvalue", mutates_args=(), device_types="spyre")
+def topkvalue(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
+    if len(x.size()) != 2:
+        raise Unsupported("topk only implemented for 2-D tensors")
+    pass
+
+
+@topkvalue.register_fake
+def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
+    if len(x.size()) != 2:
+        raise Unsupported("topk only implemented for 2-D tensors")
+    norm_dim = dim % len(x.size())
+    out_size = list(x.size())
+    out_size[norm_dim] = k
+    return x.new_empty(out_size)
+
+
+@torch.library.custom_op("spyre::topkindex", mutates_args=(), device_types="spyre")
+def topkindex(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
+    if len(x.size()) != 2:
+        raise Unsupported("topk only implemented for 2-D tensors")
+    pass
+
+
+@topkindex.register_fake
+def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
+    if len(x.size()) != 2:
+        raise Unsupported("topk only implemented for 2-D tensors")
+    norm_dim = dim % len(x.size())
+    out_size = list(x.size())
+    out_size[norm_dim] = k
+    return x.new_empty(out_size, dtype=torch.int64)
+
+
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
 def gelu(
     input: torch.Tensor,
@@ -359,3 +393,22 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
 #    Returns a scalar (0D) tensor matching the input dtype.
 #    """
 #    return input.new_empty([])
+
+
+@torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
+def spyre_constant(
+    fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
+) -> torch.types.Number:
+    # This custom operator marks scalar constant in the FX graph.
+    # Returning the scalar constant to avoid change in the operator schema which
+    # consume the scalar constant as input.
+    # This node will have a special handling at lowering to convert the scalar
+    # constant to tensor.
+    return fill_value
+
+
+@spyre_constant.register_fake
+def _constant(
+    fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
+) -> torch.types.Number:
+    return fill_value

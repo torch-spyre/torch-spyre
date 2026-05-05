@@ -155,6 +155,10 @@ def make_spyre_module() -> types.ModuleType:
     mod._is_compiled = lambda: True
     mod.memory = memory
 
+    import torch  # noqa: E402
+
+    mod.get_amp_supported_dtype = lambda: [torch.float16, torch.bfloat16]
+
     # Optional: forward unknown attrs to the impl or _C for convenience
     def __getattr__(name):
         if name in ["__file__", "_C"]:

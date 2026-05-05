@@ -460,6 +460,19 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
+@register_spyre_decomposition([torch.ops.aten.topk])
+def spyre_topk(
+    input: torch.Tensor,
+    k: int,
+    dim: Optional[int] = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k > 4:
+        raise Unsupported("Topk is not supported for this config")
+    return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
+        input, k, dim
+    )
+
+
 @register_spyre_decomposition([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
