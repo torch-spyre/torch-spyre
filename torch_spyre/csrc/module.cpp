@@ -169,6 +169,10 @@ PYBIND11_MODULE(_C, m) {
            [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
       .def(py::self == py::self)
+      .def("__hash__",
+           [](const spyre::SpyreTensorLayout& c) {
+             return std::hash<spyre::SpyreTensorLayout>{}(c);
+           })
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, c10::ScalarType,
