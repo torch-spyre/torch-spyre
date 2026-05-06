@@ -51,6 +51,8 @@ Controlling logging:
 * `DT_DEEPRT_VERBOSE=-1` to reduce Spyre stack logging
 * `DTLOG_LEVEL=error` to reduce Spyre stack logging
 
+For more debugging techniques, check out the [debugging guide](https://torch-spyre.readthedocs.io/en/latest/user_guide/debugging/index.html).
+
 ## Description
 
 This implementation of a PyTorch backend for IBM Spyre device is based on the self-contained example of a PyTorch out-of-tree backend leveraging the "PrivateUse1" backend from core. For that project, you can visit this [link](https://github.com/pytorch/pytorch/tree/v2.9.1/test/cpp_extensions/open_registration_extension).
