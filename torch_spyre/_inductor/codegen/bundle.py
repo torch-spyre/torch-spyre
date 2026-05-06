@@ -28,13 +28,17 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list[OpSpec]):
 
     # 1. Generate SDSC.json for each OpSpec
     sdscs_json = []
-    for ks in specs:
-        sdsc_json = compile_op_spec(kernel_name, ks)
+    for idx, ks in enumerate(specs):
+        sdsc_json = compile_op_spec(idx, ks)
         sdscs_json.append(sdsc_json)
 
     # Write JSON SDSCs to file system
-    for idx, sdsc_json in enumerate(sdscs_json):
-        with open(os.path.join(output_dir, f"sdsc_{idx}.json"), "w") as file:
+    files = []
+    for sdsc_json in sdscs_json:
+        sdsc_name = next(iter(sdsc_json))
+        file_name = f"sdsc_{sdsc_name}.json"
+        files.append(file_name)
+        with open(os.path.join(output_dir, file_name), "w") as file:
             logger.info(f"Generating {file.name}")
             json.dump(sdsc_json, file, indent=2)
 
@@ -43,12 +47,8 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list[OpSpec]):
         logger.info(f"Generating {file.name}")
         file.write("module {\n")
         file.write("\tfunc.func @sdsc_bundle() {\n")
-        for i in range(len(sdscs_json)):
-            file.write(
-                '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_'
-                + f"{i}"
-                + '.json"}\n'
-            )
+        for f in files:
+            file.write('\t\tsdscbundle.sdsc_execute () {sdsc_filename="' + f + '"}\n')
         file.write("\t\treturn\n")
         file.write("\t}\n")
         file.write("}\n")
