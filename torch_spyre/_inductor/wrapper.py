@@ -24,7 +24,7 @@ from torch._inductor.ir import GraphPartitionSignature
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
-from .stickify import FixedTiledLayout
+from .ir import FixedTiledLayout
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
