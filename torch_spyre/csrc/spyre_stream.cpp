@@ -233,7 +233,7 @@ void SpyreStream::executeProgramAsync(
   // Program
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
   flex::RuntimeOperationCompute compute_op(
-      &ctx->composite_addr, std::move(tensor_allocs), arts.sdsc_json_path);
+      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
