@@ -78,8 +78,8 @@ def register_spyre_decomposition(
         # 2. For aten ops, also register via PrivateUse1 dispatch key (for eager mode).
         #    Non-aten ops (e.g. spyre::compact) are custom Spyre ops that don't need
         #    PrivateUse1 kernel registration.
-        #    Skip ops that already have a PrivateUse1 kernel (e.g. from codegen_ops.py
-        #    or eager.py) to avoid registration conflicts.
+        #    Skip ops that already have a PrivateUse1 kernel (e.g. from eager.py) to
+        #    avoid registration conflicts.
         ops_list = ops if isinstance(ops, list) else [ops]
         aten_ops = [
             op
@@ -458,6 +458,19 @@ def spyre_layer_norm(
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+@register_spyre_decomposition([torch.ops.aten.topk])
+def spyre_topk(
+    input: torch.Tensor,
+    k: int,
+    dim: Optional[int] = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k > 4:
+        raise Unsupported("Topk is not supported for this config")
+    return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
+        input, k, dim
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.gelu.default])

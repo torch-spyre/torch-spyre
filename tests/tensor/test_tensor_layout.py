@@ -386,25 +386,17 @@ class TestSpyreTensorLayout(TestCase):
         x_dev = x_sliced.to(device_layout=x_stl)
         self.assertEqual(x_sliced, x_dev.cpu())
 
-    @unittest.skip(
-        "Skip until device transfers are updated to account for non-dense tensors"
-    )
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides",
         [
-            ([40, 120], [120, 1], [1, 60, 64], [7680, 1, 120]),
-            ([40, 120], [120, 1], [1, 40, 64], [64, 120, 1]),
+            ([40, 120], [120, 1]),
+            ([40, 120], [120, 1]),
         ],
     )
-    def test_to_spyre_layout_explicit_sliced_other(
-        self, sizes, strides, device_size, stride_map
-    ):
+    def test_to_spyre_sliced_other(self, sizes, strides):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[:, sizes[1] // 2 :]
-        x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
-        )
-        x_dev = x_sliced.to(device_layout=x_stl)
+        x_dev = x_sliced.to("spyre")
         # Sliced tensors (that are not sliced along the batch dimension) are
         # non-dense but produce dense tensors when transferred across devices.
         # This requires an update the the stride_map after the device transfer

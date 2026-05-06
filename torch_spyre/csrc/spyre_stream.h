@@ -19,7 +19,10 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <vector>
+
 #include "module.h"
+#include "spyre_kernel.h"
 
 namespace spyre {
 class SpyreStream {
@@ -40,15 +43,22 @@ class SpyreStream {
   void synchronize() const;  // Block until work done
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+  void copyProgramAsync(void* prog_cpu_ptr,
+                        const flex::CompositeAddress* device_address) const;
+  void executeProgramAsync(const KernelArtifacts& arts,
+                           const std::vector<at::Tensor>& args) const;
 
   // Conversions
   c10::Stream unwrap() const;
 
  private:
+  mutable flex::RuntimeStream* flex_handle_ = nullptr;
+
   flex::RuntimeStream* getRuntimeHandle() const;
+  flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr,
                      const flex::CompositeAddress* device_address,
-                     const DataConversionInfo& dci, bool host2device) const;
+                     const DataConversionInfo* dci, bool host2device) const;
 };
 
 /**

@@ -17,6 +17,7 @@ import dataclasses
 import math
 import itertools
 from sympy import Expr, Symbol, divisors
+from .ir import SpyreConstantFallback
 
 import torch
 from torch._inductor.ir import (
@@ -33,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -573,6 +574,11 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     red: Reduction = op.data
     is_matmul = red.reduction_type == BATCH_MATMUL_OP
 
+    # Currently we support Topk for k<=4, which can be handled efficiently on single core
+    # TODO: Modification will be required to enable Topk for k>4
+    if red.reduction_type in TOPK_OPS:
+        return
+
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
 
@@ -630,6 +636,10 @@ def core_division_planning(
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             # Core division not supported on fallback kernels
         elif isinstance(op, ExternKernel):
-            logger.warning(f"unhandled node type {type(op)}")
+            if isinstance(op, SpyreConstantFallback):
+                # Core division not supported on SpyreConstantFallback kernel
+                pass
+            else:
+                logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")
