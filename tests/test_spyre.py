@@ -44,10 +44,6 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# Applied per parametrized variant (see test_cross_device_copy_scalar_fill).
-# TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1172
-_SCALAR_FILL_XFAIL = pytest.mark.xfail(reason="Support 0-dim tensors in Spyre")
-
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     reason="Support scalar eager add with to_dtype lowering in Spyre"
@@ -245,8 +241,8 @@ class TestSpyre(TestCase):
     @parametrize(
         "factory_name",
         [
-            subtest("zeros", name="zeros", decorators=[_SCALAR_FILL_XFAIL]),
-            subtest("ones", name="ones", decorators=[_SCALAR_FILL_XFAIL]),
+            subtest("zeros", name="zeros"),
+            subtest("ones", name="ones"),
         ],
     )
     def test_cross_device_copy_scalar_fill(self, factory_name):
@@ -652,6 +648,11 @@ class TestSpyre(TestCase):
                 dtype=torch.float16,
             ),
         )
+
+    def test_scalar_tensor(self):
+        """Test to ensure we have scalar tensor on Spyre"""
+        scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
+        assert scalar.dim() == 0
 
 
 if __name__ == "__main__":
