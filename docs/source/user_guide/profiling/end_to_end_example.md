@@ -19,10 +19,7 @@ The Granite end-to-end path on Spyre today goes through the
 The script below wires `torch.profiler` around `fms.get_model(...)`
 explicitly. Once [RFC 0601][rfc-0601] lands, the in-tree
 `torch_spyre.profiler` API will replace this glue and the script will
-shrink. `torch_spyre.profiler.is_available()` returns `False` today;
-this page will be revised to the in-tree API once it ships. See
-[Forward compatibility](#forward-compatibility) below for the gate
-pattern.
+shrink. This page will be revised to the in-tree API once it ships.
 :::
 
 ## What you need
@@ -130,11 +127,7 @@ with profile(
 #    them ≈ device-side work.
 cpu_per_run_ms = sum(e.self_cpu_time_total for e in prof.events()) / 1000 / N_RUNS
 
-print(
-    prof.key_averages()
-    .table(sort_by="cpu_time_total", row_limit=15)
-    .replace("CUDA", "AIU")
-)
+print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 print(f"wall-clock ms: mean={mean(wall_clock_ms):.3f} median={median(wall_clock_ms):.3f}")
 print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 ```
@@ -151,15 +144,32 @@ Three patterns to call out:
   Per-step JSON files isolate compile-time warmup from steady-state
   runs and open in TensorBoard *and* Chrome / Perfetto.
 
-The `.replace("CUDA", "AIU")` is a cosmetic workaround — the
-profiler's column category is still named after CUDA upstream; native
-renaming is on the roadmap. See [PyTorch Profiler](pytorch_profiler.md).
+See [PyTorch Profiler](pytorch_profiler.md).
+
+## Inspect the trace
+
+The `logs/granite/` directory will contain one JSON per profiler step.
+Open in any of:
+
+- `chrome://tracing` — built into Chromium / Chrome.
+- [Perfetto UI](https://ui.perfetto.dev/) — drag-and-drop the file.
+- TensorBoard — `tensorboard --logdir=logs/granite`.
+
+Then post-process with `aiu-trace-analyzer` to extract derived metrics
+(kernel durations, gap analysis, idle bubbles). See
+[Trace analysis](trace_analysis.md).
 
 ## Run with telemetry alongside
+
+`aiu-smi` requires the senlib config file environment variable to be
+set before it can talk to the device. Set it (and any other
+device-discovery env vars your environment requires) in the same shell
+before launching `aiu-smi`.
 
 In one terminal:
 
 ```bash
+export SENLIB_DEVEL_CONFIG_FILE=/path/to/senlib_config.json
 aiu-smi dmon | tee /tmp/aiu-smi.log
 ```
 
@@ -175,19 +185,6 @@ timestamps with the trace timeline to attribute idle gaps to either
 host-side work or device-side stalls. See
 [Device monitoring](device_monitoring.md).
 
-## Inspect the trace
-
-The `logs/granite/` directory will contain one JSON per profiler step.
-Open in any of:
-
-- `chrome://tracing` — built into Chromium / Chrome.
-- [Perfetto UI](https://ui.perfetto.dev/) — drag-and-drop the file.
-- TensorBoard — `tensorboard --logdir=logs/granite`.
-
-Then post-process with `aiu-trace-analyzer` to extract derived metrics
-(kernel durations, gap analysis, idle bubbles). See
-[Trace analysis](trace_analysis.md).
-
 ## What to look for
 
 For a Granite-class transformer the typical signals are:
@@ -201,27 +198,6 @@ For a Granite-class transformer the typical signals are:
 | Low PT-array utilization in `aiu-smi` | Work-division inefficiency, stick-alignment padding | [Compiler work division](../../compiler/work_division_planning.md) |
 | Long Inductor pass times in stderr | Compile-time regression | [Inductor debug artifacts](../debugging/inductor_artifacts.md) |
 | Idle bubbles between consecutive kernels | Reconfiguration latency or DMA stalls | `aiu-trace-analyzer` gap analysis |
-
-## Forward compatibility
-
-Once [RFC 0601][rfc-0601] lands, the in-tree `torch_spyre.profiler`
-API will subsume the explicit `torch.profiler` block above. You can
-gate the script today so it picks up the in-tree path automatically
-when it ships:
-
-```python
-import torch_spyre.profiler
-
-if torch_spyre.profiler.is_available():
-    # In-tree API will live here once RFC 0601 lands.
-    pass
-else:
-    # The torch.profiler block from the previous section.
-    ...
-```
-
-The `else` branch is the workflow on this page; the `if` body fills in
-mechanically when the API ships.
 
 ## See also
 
