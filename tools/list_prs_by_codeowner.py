@@ -28,7 +28,10 @@ import json
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+
+STALE_DAYS = 14
 
 
 def load_codeowners(repo_root: Path) -> list[tuple[str, list[str]]]:
@@ -112,12 +115,17 @@ def fetch_prs(repo: str, limit: int) -> list[dict]:
         "--repo",
         repo,
         "--json",
-        "number,title,author,files,url",
+        "number,title,author,files,url,createdAt",
         "--limit",
         str(limit),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return json.loads(result.stdout)
+
+
+def pr_age_days(pr: dict) -> int:
+    created = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - created).days
 
 
 def format_markdown(
@@ -130,14 +138,15 @@ def format_markdown(
         if owners_str:
             lines.append(f"*Owners: {owners_str}*")
         lines.append("")
-        lines.append("| # | Title | Author |")
-        lines.append("|---|---|---|")
+        lines.append("| # | Title | Author | Age (days) |")
+        lines.append("|---|---|---|---|")
         for pr in sorted(grouped[area], key=lambda p: p["number"], reverse=True):
             num = pr["number"]
             title = pr["title"]
             url = pr["url"]
             author = pr["author"]["login"]
-            lines.append(f"| [#{num}]({url}) | {title} | {author} |")
+            age = pr_age_days(pr)
+            lines.append(f"| [#{num}]({url}) | {title} | {author} | {age} |")
         lines.append("")
     return "\n".join(lines)
 
@@ -155,7 +164,8 @@ def format_text(
         lines.append("")
         for pr in sorted(grouped[area], key=lambda p: p["number"], reverse=True):
             author = pr["author"]["login"]
-            lines.append(f"  #{pr['number']:5d}  [{author}]  {pr['title']}")
+            age = pr_age_days(pr)
+            lines.append(f"  #{pr['number']:5d}  [{author}]  {pr['title']}  ({age}d)")
         lines.append("")
     return "\n".join(lines)
 
@@ -190,6 +200,11 @@ def main() -> None:
         default="",
         help="Filter to PRs that touch files under this repo path (e.g. torch_spyre/_inductor/)",
     )
+    parser.add_argument(
+        "--stale",
+        action="store_true",
+        help=f"Only show PRs that have been open more than {STALE_DAYS} days",
+    )
     args = parser.parse_args()
 
     # Resolve repo root for CODEOWNERS
@@ -219,6 +234,10 @@ def main() -> None:
     print(f"Fetching open PRs from {repo}...", file=sys.stderr)
     prs = fetch_prs(repo, args.limit)
     print(f"  {len(prs)} open PRs found", file=sys.stderr)
+
+    if args.stale:
+        prs = [pr for pr in prs if pr_age_days(pr) > STALE_DAYS]
+        print(f"  {len(prs)} PRs open more than {STALE_DAYS} days", file=sys.stderr)
 
     if args.path:
         filter_prefix = args.path.lstrip("/").rstrip("/") + "/"
