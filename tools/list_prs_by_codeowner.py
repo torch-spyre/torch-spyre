@@ -138,15 +138,16 @@ def format_markdown(
         if owners_str:
             lines.append(f"*Owners: {owners_str}*")
         lines.append("")
-        lines.append("| # | Title | Author | Age (days) |")
+        lines.append("| # | Days open | Author | Title |")
         lines.append("|---|---|---|---|")
-        for pr in sorted(grouped[area], key=lambda p: p["number"], reverse=True):
+        for pr in sorted(grouped[area], key=lambda p: pr_age_days(p), reverse=True):
             num = pr["number"]
             title = pr["title"]
-            url = pr["url"]
+            if len(title) > 80:
+                title = title[:79] + "…"
             author = pr["author"]["login"]
             age = pr_age_days(pr)
-            lines.append(f"| [#{num}]({url}) | {title} | {author} | {age} |")
+            lines.append(f"| #{num} | {age} | {author} | {title} |")
         lines.append("")
     return "\n".join(lines)
 
@@ -154,6 +155,24 @@ def format_markdown(
 def format_text(
     grouped: dict[str, list[dict]], area_owners: dict[str, list[str]]
 ) -> str:
+    all_prs = [pr for prs in grouped.values() for pr in prs]
+    w_num = max((len(str(pr["number"])) for pr in all_prs), default=1) + 1  # leading #
+    w_age = (
+        max((len(str(pr_age_days(pr))) for pr in all_prs), default=1) + 1
+    )  # trailing d
+    w_author = max((len(pr["author"]["login"]) for pr in all_prs), default=6)
+
+    # Ensure column widths are at least as wide as the header labels
+    w_num = max(w_num, len("#"))
+    w_age = max(w_age, len("Days"))
+    w_author = max(w_author, len("Author"))
+
+    def header_line() -> str:
+        return f"  {'#':<{w_num}}  {'Days':<{w_age}}  {'Author':<{w_author}}  Title"
+
+    def separator_line() -> str:
+        return f"  {'-' * w_num}  {'-' * w_age}  {'-' * w_author}  -----"
+
     lines: list[str] = []
     for area in sorted(grouped):
         owners_str = " ".join(area_owners.get(area, []))
@@ -162,10 +181,18 @@ def format_text(
         if owners_str:
             lines.append(f"Owners: {owners_str}")
         lines.append("")
-        for pr in sorted(grouped[area], key=lambda p: p["number"], reverse=True):
+        lines.append(header_line())
+        lines.append(separator_line())
+        for pr in sorted(grouped[area], key=lambda p: pr_age_days(p), reverse=True):
+            num = f"#{pr['number']}"
+            age = f"{pr_age_days(pr)}d"
             author = pr["author"]["login"]
-            age = pr_age_days(pr)
-            lines.append(f"  #{pr['number']:5d}  [{author}]  {pr['title']}  ({age}d)")
+            title = pr["title"]
+            if len(title) > 80:
+                title = title[:79] + "…"
+            lines.append(
+                f"  {num:<{w_num}}  {age:<{w_age}}  {author:<{w_author}}  {title}"
+            )
         lines.append("")
     return "\n".join(lines)
 
