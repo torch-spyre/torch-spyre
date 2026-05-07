@@ -52,7 +52,7 @@ class OpSpec:
     Attributes:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
-        iteration_space: The iteration space of the operation. The values are tuples of (range, core_division).
+        iteration_space: The iteration space of the operation. The values are tuples of (range, work_division).
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
     """

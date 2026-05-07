@@ -285,7 +285,7 @@ class GreedyAllocationStrategy(AllocationStrategy):
     ):
         """
         If core_div_mismatch is not provided, we will consider LX pinning without taking
-        core division into account (previous behavior), may result in slices of a LX tensor
+        work division into account (previous behavior), may result in slices of a LX tensor
         scattered over different core's scratchpad, which may result in unusable tensor and
         incorrect results.
         """
@@ -302,8 +302,8 @@ class GreedyAllocationStrategy(AllocationStrategy):
         """
         First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
         Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
-        Then check core division -> If any of the operations on a given buffer has different
-        core division => should not pin this buffer to LX
+        Then check work division -> If any of the operations on a given buffer has different
+        work division => should not pin this buffer to LX
         NOTE Because each core can only write to its own scratchpad. For example, if a
               buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> each core
               in next op has to read from 2 different scratchpads...
