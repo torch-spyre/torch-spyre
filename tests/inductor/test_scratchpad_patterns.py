@@ -1017,6 +1017,192 @@ class TestExamplePattern(TestCase):
     def test_gqattention_pattern(self):
         self.run_pattern(self.make_gqattention_pattern())
 
+    def make_moe_mlp_pattern(self) -> Pattern:
+        """This pattern is a (simplified) mixture of experts multi-layer perceptron.
+
+        We start with a hidden state, of dimension batch x seq_len x hidden_size. We matmul with a
+        selector matrix (of dimension hidden_size x num_experts) to obtain qualities of dimension
+        batch x seq_len x num_experts, indicating the quality of each expert for each token. We find
+        the top k indices for each subtensor in the last dimension (an integer tensor of dimension
+        batch x seq_len x k). We create a masked version of quality of the same dimension (replacing
+        the non-selected entries by -inf). We apply softmax to this to get the weights - we pretend
+        here that softmax is simply a pointwise operation.
+
+        We now determine the tokens for each expert from the top k indices. This is an integer
+        tensor of dimension num_experts x (batch * seq_len * 2), giving for each expert the batch
+        and seq_len index for each token that they need to process; there are at most batch *
+        seq_len such indices for any one expert.
+
+        Now, for each expert, we collect the n_tokens x hidden_size matrix of selected_tokens from
+        the hidden state (where n_tokens <= batch * seq_len), compute up = selected_tokens @ M1 +
+        bias_1 and gate = selected_tokens @ M2 + bias_2 where M1 and M2 are (expert-dependent)
+        matrices of dimension hidden_size x mlp_size and bias_1 and bias_2 are (expert-dependent)
+        vectors of dimension mlp_size. We define out = up * silu(gate), and down = out @ M3 +
+        bias_3, where M3 is an (expert-dependent) mlp_size x hidden_size matrix and bias_3 is an
+        (expert-dependent) hidden_size vector. Now we add the entries of out to the appropriate
+        entries of hidden state, scaled by the appropriate weight. After all experts are done, we
+        save the hidden state to HBM.
+
+        We assume that both integers and floats are 16 bits. This means that there are at most 65536
+        experts and that batch_size and seq_len are at most 32768, assuming we want to use -1 as a
+        special value in tokens_per_expert.
+        """
+        B = 4  # batch size
+        S = 96  # sequence length
+        H = 512  # hidden size
+        N = 5  # number of experts
+        K = 2  # number of experts *selected*
+        M = 256  # "internal" size of the mlp
+
+        T = [200, 150, 350, 25]  # selected tokens per expert
+        T.append(B * S * K - sum(T))
+        self.assertGreaterEqual(
+            T[-1],
+            0,
+            "increase B * S * K, or reduce the token counts per expert",
+        )
+        assert N == len(T)
+
+        # Abbreviations. The factor 2 is bytes per entry.
+        BSH2 = B * S * H * 2
+        HN2 = H * N * 2
+        BSN2 = B * S * N * 2
+        BSK2 = B * S * K * 2
+        HM2 = H * M * 2
+        H2 = H * 2
+        M2 = M * 2
+
+        buffers = make_buffer_registry(
+            {
+                "hidden_HBM": BSH2,
+                "hidden": BSH2,
+                "selector_HBM": HN2,
+                "selector": HN2,
+                "qualities": BSN2,
+                "top_k_idx": BSK2,
+                "masked_qualities": BSN2,
+                "weights": BSN2,
+                "tok_per_expert": BSN2 * 2,
+                "result_HBM": BSH2,
+            }
+            | {
+                f"{key}_{i}": value
+                for i in range(N)
+                for key, value in {
+                    "selected_tokens": T[i] * H2,
+                    "M1_HBM": HM2,
+                    "bias1_HBM": M2,
+                    "M2_HBM": HM2,
+                    "bias2_HBM": M2,
+                    "up": T[i] * M2,
+                    "gate": T[i] * M2,
+                    "out": T[i] * M2,
+                    "M3_HBM": HM2,
+                    "bias3_HBM": H2,
+                    "down": T[i] * H2,
+                }.items()
+            }
+        )
+
+        ops = make_operations(
+            [
+                ("load_hidden", "hidden_HBM", "hidden"),
+                ("load_selector", "selector_HBM", "selector"),
+                ("matmul_0", ["hidden", "selector"], "qualities"),
+                ("topk", "qualities", "top_k_idx"),
+                ("mask_qualities", ["qualities", "top_k_idx"], "masked_qualities"),
+                ("softmax", "masked_qualities", "weights"),
+                ("select_tokens", "top_k_idx", "tok_per_expert"),
+            ]
+            + [
+                (f"{tupl[0]}_{i}", tupl[1], tupl[2])
+                for i in range(N)
+                for tupl in [
+                    ("gather", ["hidden", "tok_per_expert"], f"selected_tokens_{i}"),
+                    (
+                        "matmul_add_1",
+                        [f"selected_tokens_{i}", f"M1_HBM_{i}", f"bias1_HBM_{i}"],
+                        f"up_{i}",
+                    ),
+                    (
+                        "matmul_add_2",
+                        [f"selected_tokens_{i}", f"M2_HBM_{i}", f"bias2_HBM_{i}"],
+                        f"gate_{i}",
+                    ),
+                    ("swiglu", [f"up_{i}", f"gate_{i}"], f"out_{i}"),
+                    (
+                        "matmul_add_3",
+                        [f"out_{i}", f"M3_HBM_{i}", f"bias3_HBM_{i}"],
+                        f"down_{i}",
+                    ),
+                    (
+                        "scatter",
+                        [f"down_{i}", "weights", "hidden", "tok_per_expert"],
+                        "hidden",
+                    ),
+                ]
+            ]
+            + [("save_result", "hidden", "result_HBM")],
+            buffers,
+        )
+
+        # The allocation works as follows, where every address and size is in 2-byte words.
+        #
+        # | buffer           | address                     | size   | on top of                  |
+        # |------------------|-----------------------------|--------|----------------------------|
+        # | hidden           | 0                           | BSH    | -                          |
+        # | qualities        | BSH                         | BSN    | hidden                     |
+        # | selector         | BSH+BSN                     | HN     | qualities                  |
+        # | masked_qualities | BSH+BSN                     | BSN    | qualities                  |
+        # | top_k_idx        | BSH+BSN+BSN*2               | BSK    | selector, masked_qualities |
+        # | weights          | BSH                         | BSN    | hidden                     |
+        # | tok_per_expert   | BSH+BSN                     | BSN*2  | weights                    |
+        # | selected_tokens  | BSH+BSN+BSN*2               | T[i]*H | tok_per_expert             |
+        # | up               | BSH+BSN+BSN*2+T[i]*H        | T[i]*M | selected_tokens            |
+        # | gate             | BSH+BSN+BSN*2+T[i]*H+T[i]*M | T[i]*M | up                         |
+        # | out              | BSH+BSN+BSN*2               | T[i]*M | tok_per_expert             |
+        # | down             | BSH+BSN+BSN*2+T[i]*M        | T[i]*H | out                        |
+
+        assert 2 * B * S >= H, (
+            "this is an assumption in the allocation below, for ensuring that "
+            "top_k_idx doesn't overlap with selector"
+        )
+
+        good_allocation = make_nonevicting_allocation_result(
+            buffers,
+            {
+                "hidden": 0,
+                "selector": BSH2 + BSN2,
+                "qualities": BSH2,
+                "top_k_idx": BSH2 + BSN2 * 3,
+                "masked_qualities": BSH2 + BSN2,
+                "weights": BSH2,
+                "tok_per_expert": BSH2 + BSN2,
+            }
+            | {
+                f"{key}_{i}": value
+                for i in range(N)
+                for key, value in {
+                    "selected_tokens": BSH2 + BSN2 * 3,
+                    "up": BSH2 + BSN2 * 3 + T[i] * H2,
+                    "gate": BSH2 + BSN2 * 3 + T[i] * H2 + T[i] * M2,
+                    "out": BSH2 + BSN2 * 3,
+                    "down": BSH2 + BSN2 * 3 + T[i] * M2,
+                }.items()
+            },
+            ops,
+        )
+
+        pattern = Pattern(buffers, ops, good_allocation=good_allocation)
+        return pattern
+
+    def test_verify_moe_mlp_pattern(self):
+        self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
+
+    @usuallyExpectedFailure
+    def test_moe_mlp_pattern(self):
+        self.run_pattern(self.make_moe_mlp_pattern())
+
 
 if __name__ == "__main__":
     import unittest
