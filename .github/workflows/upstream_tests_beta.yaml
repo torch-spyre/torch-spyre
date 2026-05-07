@@ -1,4 +1,4 @@
-name: upstream-pytorch-tests
+name: upstream-pytorch-tests-beta
 
 on:
   # Run automatically on every merge to main
@@ -147,10 +147,12 @@ jobs:
           echo 'installing with dependencies, this could take a while...'
           pip install uv
           uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
+          echo "VENV_PATH=${GITHUB_WORKSPACE}/torch-spyre/.venv" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} upstream test suite
         working-directory: torch-spyre/tests
         run: |
+          source "${VENV_PATH}/bin/activate"
           echo 'Running ${{ matrix.suite.name }} upstream tests...'
           bash run_test.sh configs/upstream_tests/${{ matrix.suite.config }} -v
           echo '${{ matrix.suite.name }} upstream tests done'
