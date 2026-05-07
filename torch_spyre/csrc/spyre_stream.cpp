@@ -241,7 +241,7 @@ void SpyreStream::executeProgramAsync(
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
-  flex_stream->launchOperation(compute_op);
+  flex_stream->launchOperation(*compute_op);
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
