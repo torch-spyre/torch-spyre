@@ -21,3 +21,4 @@ The pipeline consists of two compilers:
    work_division_planning
    work_division_codegen
    adding_operations
+   op_enablement
