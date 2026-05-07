@@ -112,7 +112,7 @@ class ScratchPadAllocator:
         for inp_i in mem_usage["all_inputs"]:
             inp_i_dev_lay = self.graph_lowering.get_buffer(inp_i).layout.device_layout
             inp_i_on_lx = inp_i in self.usage
-            inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
+            inp_i_size_match = needed_size == mem_usage[inp_i]["size_per_core"]
             inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
             inp_i_eol = mem_usage[inp_i]["last_usage"]
             if inp_i_on_lx and inp_i_size_match and inp_i_lay_match and inp_i_eol:
@@ -141,13 +141,16 @@ class ScratchPadAllocator:
               2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
               3. may be able to generalize this decision in buf end-of-life analysis
               4. greedy alloc may cause fragments, can further improve
+              5. For multi-core cases, assuming every core has the same allocations for
+                 now, even if not all the cores are being used. (over-allocated for
+                 simplicity reason)
         """
         graph_output_buf_name = self.get_output_names()
         for tensor_name in mem_usage["all_buf_used"]:
             tensor_info = mem_usage[tensor_name]
             is_graph_input = self.is_graph_input(tensor_name)
             is_graph_output = tensor_name in graph_output_buf_name
-            needed_size = tensor_info["size"]
+            needed_size = tensor_info["size_per_core"]
             is_input = tensor_info["is_input"]
             core_div_mismatch = (not is_input) and tensor_info["core_div_mismatch"]
             if is_graph_input or is_graph_output or core_div_mismatch:
@@ -167,9 +170,8 @@ class ScratchPadAllocator:
                 addr = self.usage[tensor_name]["addr"]
             elif not is_input and allow_inplace:
                 addr = self.find_inplace_address(tensor_name, mem_usage, needed_size)
-                if (
-                    addr is None
-                ):  # NOTE 0 is a legitimate address, so we can't test "if not addr:"
+                if addr is None:
+                    # NOTE 0 is a legitimate address, so we can't test "if not addr:"
                     addr = self.find_free_block(needed_size)
             elif not is_input and allow_output_to_lx:
                 addr = self.find_free_block(needed_size)
@@ -186,7 +188,7 @@ class ScratchPadAllocator:
                         "op_name": org_op_name,
                         "tensor_name": tensor_name,
                         "addr": addr,
-                        "size": needed_size,
+                        "size_per_core": needed_size,
                     }
                 )
 
@@ -245,6 +247,9 @@ class ScratchPadAllocator:
             "all_inputs": [],
             "all_outputs": [],
         }
+        num_cores = math.prod(
+            [s for p in getattr(op, "op_it_space_splits", ()) for s in p.values()]
+        )
 
         for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
             for dep in deps:
@@ -256,14 +261,15 @@ class ScratchPadAllocator:
                 mem_usage[dep.name] = {
                     "is_input": is_input,
                     "size": dev_size,
+                    "size_per_core": dev_size // num_cores,
                     "core_div_mismatch": core_div_mismatch.get(dep.name, False),
                     "last_usage": dep.name in release_next,
                 }
 
-            if is_input:
-                mem_usage["all_inputs"].append(dep.name)
-            else:
-                mem_usage["all_outputs"].append(dep.name)
+                if is_input:
+                    mem_usage["all_inputs"].append(dep.name)
+                else:
+                    mem_usage["all_outputs"].append(dep.name)
 
         mem_usage["all_buf_used"] = mem_usage["all_inputs"] + mem_usage["all_outputs"]
 
