@@ -326,6 +326,11 @@ def spyre__bitwise_or(input1, input2, **kwargs):
     return torch.bitwise_or(input1, input2, **kwargs)
 
 
+@register_fallback([aten.ne.Scalar, aten.ne.Scalar_out])
+def spyre__ne_scalar(input, other, **kwargs):
+    return torch.ne(input, other, **kwargs)
+
+
 @register_fallback([aten.argmax.default])
 def spyre__argmax(*args, **kwargs):
     return torch.argmax(*args, **kwargs)
