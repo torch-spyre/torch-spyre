@@ -59,6 +59,8 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_INDUCTOR_LOG=1` | Enable Spyre-specific Inductor logging |
 | `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | Set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR) |
 | `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
+| `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
+| `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 Run your reproducer with all three enabled:
 

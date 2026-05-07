@@ -26,15 +26,16 @@ from torch._inductor.ir import (
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
+from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
 from .ir import FixedTiledLayout
-from .views import compute_coordinates
+from .views import compute_coordinates, matching_dim
 
 
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
-    layout: FixedTiledLayout
+    layout: "FixedTiledLayout"
 
 
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
@@ -113,16 +114,30 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
     return compute_coordinates(
-        layout.device_layout.device_size,
-        layout.device_layout.stride_map,
+        stl.device_size,
+        stl.stride_map,
         dep.ranges,
         index,
     )
+
+
+def iter_var_id(stick_expr) -> int:
+    """Iteration variable index from a stick expr: Mod(d2,64) -> 2, d2 -> 2.
+    Returns -1 for constant-zero (scalar/broadcast, no real stick).
+    NOTE: this is the loop variable index (suffix of dN), NOT a tensor dimension index."""
+    if stick_expr == sympy.S.Zero or not stick_expr.free_symbols:
+        return -1
+    sym = next(iter(stick_expr.free_symbols))
+    name = str(sym)
+    i = len(name) - 1
+    while i >= 0 and name[i].isdigit():
+        i -= 1
+    return int(name[i + 1 :])
 
 
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
@@ -239,3 +254,125 @@ def apply_splits_from_index_coeff(
             if rc != 0 and rc in reduction_coeff_splits:
                 result[sym] = reduction_coeff_splits[rc]
     return result
+
+
+# The following restickify helpers are used only by the restickify
+# but are here to avoid circular dependences in those files
+
+
+def restickify_device_size(
+    old_device_size: list,
+    old_sd_outer_dim: int,
+    old_sd_host_size: int,
+    new_sd_outer_dim: int,
+    new_sd_host_size: int,
+    stick_size: int,
+) -> list:
+    """Computes the new device size after a restickify is performed
+    moving the stick from old_sd to new_sd."""
+    assert new_sd_host_size % stick_size == 0, (
+        f"Cannot move stick to dimension with size {new_sd_host_size}: "
+        f"without padding since not a multiple of stick_size={stick_size}"
+    )
+    new_device_size = list(old_device_size)
+    new_device_size[-1] = stick_size
+    new_device_size[old_sd_outer_dim] = new_sd_host_size // stick_size
+    new_device_size[new_sd_outer_dim] = old_sd_host_size
+    return new_device_size
+
+
+def restickify_stride_map(
+    old_stride_map: list,
+    old_sd_outer_dim: int,
+    old_sd_host_stride: int,
+    new_sd_outer_dim: int,
+    new_sd_host_stride: int,
+    stick_size: int,
+) -> list:
+    """Computes the new stride_map after a restickify is performed moving the stick from old_sd to new_sd."""
+    new_stride_map = list(old_stride_map)
+    new_stride_map[-1] = new_sd_host_stride
+    new_stride_map[old_sd_outer_dim] = new_sd_host_stride * stick_size
+    new_stride_map[new_sd_outer_dim] = old_sd_host_stride
+    return new_stride_map
+
+
+def compute_restickify_target_layout(
+    stl: SpyreTensorLayout,
+    host_layout: FixedLayout,
+    target_stick_expr,
+    ic: list,
+    idc: list,
+) -> "SpyreTensorLayout | None":
+    """Compute the target STL that results from moving stl's stick to target_stick_expr.
+    Returns None if the restickify is infeasible.
+    """
+    new_sd = matching_dim(ic, target_stick_expr)
+    if new_sd is None:
+        return None
+    host_size = [concretize_expr(s) for s in host_layout.size]
+    host_stride = [concretize_expr(s) for s in host_layout.stride]
+    old_sd = matching_dim(ic, idc[-1])
+    if old_sd is None:
+        return None
+    old_stick_expr = idc[-1]
+    old_stride_map = list(stl.stride_map)
+    old_var = next(iter(old_stick_expr.free_symbols))
+    new_var = next(iter(target_stick_expr.free_symbols))
+    stick_size = get_elem_in_stick(host_layout.dtype)
+    old_sd_outer_dim = next(
+        (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
+        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+    )
+    if old_sd_outer_dim is None:
+        return None
+    candidates = [j for j in range(len(idc) - 1) if new_var in idc[j].free_symbols]
+    if not candidates:
+        return None
+    new_sd_outer_dim = candidates[0]
+    if host_size[new_sd] % stick_size != 0:
+        return None
+    device_size = restickify_device_size(
+        list(stl.device_size),
+        old_sd_outer_dim,
+        host_size[old_sd],
+        new_sd_outer_dim,
+        host_size[new_sd],
+        stick_size,
+    )
+    stride_map = restickify_stride_map(
+        old_stride_map,
+        old_sd_outer_dim,
+        host_stride[old_sd],
+        new_sd_outer_dim,
+        host_stride[new_sd],
+        stick_size,
+    )
+    return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
+
+
+def compute_restickify_needed(
+    in_stl: SpyreTensorLayout,
+    in_host: FixedLayout,
+    in_dep: MemoryDep,
+    out_stl: SpyreTensorLayout,
+    out_dep: MemoryDep,
+) -> "tuple[bool, SpyreTensorLayout | None]":
+    """Determine whether a restickify is needed for one (in_stl, out_stl) pair.
+
+    in_dep and out_dep may differ when the output buffer is accessed with a
+    different index than the input (e.g. a transposed read).
+
+    Returns:
+      (False, None)   — same stick or broadcast: no restickify needed
+      (True, stl)     — restickify needed, stl is the target STL for the restickified input
+      (True, None)    — restickify needed but infeasible
+    """
+    idc = device_coordinates(in_stl, in_dep)
+    out_idc = device_coordinates(out_stl, out_dep)
+    if iter_var_id(idc[-1]) == -1 or not out_idc or iter_var_id(out_idc[-1]) == -1:
+        return False, None
+    if out_idc[-1] == idc[-1]:
+        return False, None
+    ic = host_coordinates(in_host, in_dep)
+    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)

@@ -36,8 +36,12 @@ from .temp_passes import (
     convert_constant_with_graph_node,
 )
 from . import config
-from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
-from .insert_restickify import insert_restickify
+from .propagate_layouts import (
+    propagate_mutation_layouts,
+    propagate_spyre_tensor_layouts,
+)
+from .optimize_restickify import optimize_restickify_locations
+from .insert_restickify import insert_restickify, finalize_layouts
 from .core_division import core_division_planning
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
@@ -221,6 +225,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        optimize_restickify_locations(operations)
+        finalize_layouts(operations)
         insert_restickify(operations)
         core_division_planning(operations)
         if config.lx_planning:
@@ -233,6 +239,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),
             inspect.getfile(scratchpad_planning),

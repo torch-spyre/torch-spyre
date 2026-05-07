@@ -43,7 +43,6 @@ std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k) {
   os << "  init_bin.size       = " << k.init_bin.size() << " bytes\n";
   os << "  program_size        = " << k.program_size << " bytes\n";
   os << "  bundle_mlir_path    = \"" << k.bundle_mlir_path << "\"\n";
-  os << "  sdsc_json_path      = \"" << k.sdsc_json_path << "\"\n";
   os << "}";
   return os;
 }
@@ -191,10 +190,6 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
               ") exceeds allocated device memory (",
               ctx->composite_addr.total_size(), ")");
   stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
-
-  arts.sdsc_json_path = (dir / "sdsc_0.json").string();
-  TORCH_CHECK(std::filesystem::exists(arts.sdsc_json_path),
-              "SuperDSC not found: ", arts.sdsc_json_path);
 
   std::unique_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
   auto [it, inserted] = g_artifact_cache.emplace(code_dir, std::move(arts));

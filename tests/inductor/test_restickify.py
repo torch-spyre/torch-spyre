@@ -192,6 +192,23 @@ def test_4d_x_plus_transpose13(tensors_4d):
     _compare(lambda a, x: x + a.transpose(1, 3), a, x)
 
 
+# View + unsqueeze tests
+
+
+def test_view_unsqueeze_add():
+    d0, d1, d2, d3, d4 = 2, 3, 4, 2, 64
+    a = torch.randn((1, d0, d1 * d3 * d4), dtype=torch.float16) * 0.1
+    b = torch.randn((1, d0, d1 * d3 * d4), dtype=torch.float16) * 0.1
+    c = torch.randn((1, d0, d2, d3, d4), dtype=torch.float16) * 0.1
+
+    def func(a, b, c):
+        x = a + b
+        z = x.view(1, d0, d1, d3, d4)
+        return z.unsqueeze(2) + c.unsqueeze(3)
+
+    _compare(func, a, b, c)
+
+
 # Expand tests
 SIZES_EXPAND = [(128, 256)]
 
@@ -217,6 +234,56 @@ def test_expand_yt_expand_plus_x(tensors_expand):
         y,
         check_strides=False,  # Stride differes from CPU even before restickify, skipping stride check
     )
+
+
+# Expand + transpose tests: b.unsqueeze(0 or 1).expand(s,s) forces layout
+# choice because the expand side cannot always be restickified — the optimizer
+# must choose the a.t() side's stick instead.
+
+
+def test_expand_unsqueeze0_expand_plus_at():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(
+        lambda a, b: b.unsqueeze(0).expand(s, s) + a.t(), a, b, check_strides=False
+    )
+
+
+def test_expand_at_plus_unsqueeze0_expand():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(lambda a, b: a.t() + b.unsqueeze(0).expand(s, s), a, b)
+
+
+def test_expand_unsqueeze1_expand_plus_at():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(
+        lambda a, b: b.unsqueeze(1).expand(s, s) + a.t(), a, b, check_strides=False
+    )
+
+
+def test_expand_at_plus_unsqueeze1_expand():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s,), dtype=torch.float16) * 0.1
+    _compare(lambda a, b: a.t() + b.unsqueeze(1).expand(s, s), a, b)
+
+
+# cat after two-stick add: the add produces two candidate sticks; the cat
+# forces a mutation op downstream and requires the chosen stick to be
+# compatible with the cat output layout.
+
+
+def test_cat_after_at_plus_b():
+    s = 128
+    a = torch.randn((s, s), dtype=torch.float16) * 0.1
+    b = torch.randn((s, s), dtype=torch.float16) * 0.1
+    c = torch.randn((s, s), dtype=torch.float16) * 0.1
+    _compare(lambda a, b, c: torch.cat([a.t() + b, c]), a, b, c, check_strides=False)
 
 
 # 2-arg tests with size-1
