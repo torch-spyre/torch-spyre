@@ -29,7 +29,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
 
-from .padding import insert_padding
+from .padding import insert_padding_ir
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
@@ -131,7 +131,6 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
-        insert_padding,
         convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
@@ -228,6 +227,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
+        insert_padding_ir(operations)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
@@ -245,6 +245,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
+            inspect.getfile(insert_padding_ir),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),

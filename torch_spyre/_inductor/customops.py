@@ -213,6 +213,28 @@ def _(
     return torch.empty(size, dtype=dtype, device="spyre")
 
 
+@torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
+def spyre_empty(
+    size: Sequence[int],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    # Fall back to CPU: allocate uninitialised storage and copy to device.
+    # On real Spyre hardware this allocation carries no initialisation cost.
+    warn_fallback("torch.ops.spyre.empty")
+    tmp = torch.empty(size, dtype=dtype, device="cpu")
+    return tmp.to(device)
+
+
+@spyre_empty.register_fake
+def _(
+    size: Sequence[int],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+):
+    return torch.empty(size, dtype=dtype, device="spyre")
+
+
 @torch.library.custom_op("spyre::logical_not", mutates_args=(), device_types="spyre")
 def logical_not(input: torch.Tensor) -> torch.Tensor:
     pass

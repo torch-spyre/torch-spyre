@@ -14,12 +14,15 @@
 
 from typing import Callable, NamedTuple, TypeVar, Union
 
-
+import torch
 import sympy
 from sympy import Expr
 from torch._inductor.ir import (
+    Buffer,
     ComputedBuffer,
     FixedLayout,
+    MultiOutput,
+    Operation,
     Pointwise,
     Reduction,
 )
@@ -396,3 +399,234 @@ def compute_restickify_needed(
         return False, None
     ic = host_coordinates(in_host, in_dep)
     return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
+
+
+def rebuild_computed_buffer(
+    op: ComputedBuffer,
+    new_data,
+    operations: list[Operation],
+) -> ComputedBuffer:
+    """Replace ``op`` in ``operations`` with a new ComputedBuffer sharing its layout.
+
+    Preserves all metadata fields required by downstream passes: ``operation_name``,
+    ``origins``, ``origin_node``, and the ``_split_size`` / ``_original_*`` fields
+    used by ``get_default_sizes_body``.  Clears the ``get_default_sizes_body`` cache
+    on the new buffer so stale size results from the old ``data`` are not reused.
+
+    Returns the replacement ComputedBuffer.
+    """
+    new_buf = ComputedBuffer(
+        name=op.get_name(),
+        layout=op.layout,
+        data=new_data,
+        _split_size=op._split_size,
+        _original_inner_fn=op._original_inner_fn,
+        _original_ranges=op._original_ranges,
+        _original_reduction_ranges=op._original_reduction_ranges,
+    )
+    new_buf.operation_name = op.operation_name
+    new_buf.origins = op.origins
+    new_buf.origin_node = op.origin_node
+    ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
+
+    op_idx = operations.index(op)
+    operations[op_idx] = new_buf
+    return new_buf
+
+
+def lower_pad_sequence(
+    arg_fx_node: torch.fx.Node,
+    padded_size: list[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    dim: int,
+    insert_before: torch.fx.Node,
+    fill_value: float = 0.0,
+    fill_cache: dict | None = None,
+) -> tuple[Buffer, list[Operation]]:
+    """Lower an IR-level pad sequence that extends a buffer along one dimension.
+
+    Allocates a padded buffer of ``padded_size``, fills the pad region with
+    ``fill_value``, then copies the original data into offset 0 along ``dim``.
+
+    The pad region extent is ``padded_size[dim] - original_size[dim]`` where
+    ``original_size`` is read from ``arg_fx_node.meta["val"].shape``.  This
+    works for any pad amount, not only one stick.
+
+    FX nodes created (in order):
+      1. spyre.empty(padded_size)                        — uninitialised allocation
+      2. spyre.full(one_stick_size, fill_value)           — one stick DMA (cached)
+      3. aten.expand(full, pad_size)                     — broadcast to fill-region shape; free
+      4. aten.clone(expand)                              — on-device broadcast → fill buffer
+      5. overwrite(fill_buf, empty, [dim], [fill_offset]) — write pad region
+      6. overwrite(orig,     empty, [dim], [0])           — copy original data
+
+    ``pad_size`` equals ``padded_size`` with ``pad_size[dim] = pad_extent``
+    where ``pad_extent = padded_size[dim] - original_size[dim]``.
+    ``fill_offset = original_size[dim]``.
+    ``one_stick_size = [1]*(ndim-1) + [pad_size[-1]]`` broadcasts along all
+    leading dims so only one stick is DMA'd from host.
+
+    ``fill_cache`` maps ``(tuple(one_stick_size), device, dtype)`` to an existing
+    ``spyre.full`` FX node.  On a cache hit that node is reused and not re-lowered.
+
+    ``insert_before`` is the FX node before which new nodes are inserted.
+
+    Returns ``(padded_buf, new_ops)`` where ``padded_buf`` is the allocated buffer
+    and ``new_ops`` is the list of new IR operations in topological order.
+    """
+    from .propagate_layouts import generic_layout  # deferred to avoid circular import
+
+    graph_lowering = V.graph
+    fx_graph = graph_lowering.graph
+
+    # Count operations before lowering so we can identify newly added ones.
+    ops_before = len(graph_lowering.operations)
+
+    ndim = len(padded_size)
+    original_size_dim: int = arg_fx_node.meta["val"].shape[dim]
+    pad_extent = padded_size[dim] - original_size_dim
+    assert pad_extent > 0, (
+        f"lower_pad_sequence: pad_extent={pad_extent} for dim={dim}; "
+        f"padded_size={padded_size}, original_size_dim={original_size_dim}"
+    )
+    fill_offset = original_size_dim
+
+    # Fill-region shape: padded_size with dim replaced by pad_extent.
+    pad_size = list(padded_size)
+    pad_size[dim] = pad_extent
+
+    # Minimal fill source: scalar in all dims except the last.
+    # pad_size[-1] == pad_extent when dim is last; padded_size[-1] otherwise.
+    one_stick_size = [1] * (ndim - 1) + [pad_size[-1]]
+    cache_key = (tuple(one_stick_size), device, dtype)
+    one_stick_is_new = fill_cache is None or cache_key not in fill_cache
+
+    with fx_graph.inserting_before(insert_before):
+        # 1. Uninitialised padded buffer.
+        empty_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.spyre.empty.default,
+            args=(padded_size, device, dtype),
+        )
+        empty_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
+
+        # 2. One stick of fill values — only this is DMA'd from host (reused if cached).
+        if fill_cache is not None and cache_key in fill_cache:
+            one_stick_fx = fill_cache[cache_key]
+        else:
+            one_stick_fx = fx_graph.create_node(
+                "call_function",
+                torch.ops.spyre.full.default,
+                args=(one_stick_size, fill_value, device, dtype),
+            )
+            one_stick_fx.meta["val"] = torch.empty(
+                one_stick_size, dtype=dtype, device=device
+            )
+            if fill_cache is not None:
+                fill_cache[cache_key] = one_stick_fx
+
+        # 3. Broadcast to fill-region shape (ExpandView — no allocation).
+        expand_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.aten.expand.default,
+            args=(one_stick_fx, pad_size),
+        )
+        expand_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
+
+        # 4. On-device broadcast copy: clone materialises the fill buffer.
+        clone_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.aten.clone.default,
+            args=(expand_fx,),
+        )
+        clone_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
+
+        # 5. Write fill values into the pad region of empty.
+        overwrite_fill_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.spyre.overwrite.default,
+            args=(clone_fx, empty_fx, [dim], [fill_offset]),
+        )
+        overwrite_fill_fx.meta["val"] = None
+
+        # 6. Copy original data into offset 0 along dim.
+        overwrite_data_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.spyre.overwrite.default,
+            args=(arg_fx_node, empty_fx, [dim], [0]),
+        )
+        overwrite_data_fx.meta["val"] = None
+
+    # Lower each node in dependency order, assigning FixedTiledLayouts immediately.
+    # propagate_spyre_tensor_layouts already ran, so new ops keep FlexibleLayout
+    # unless we assign here.
+    #
+    # spyre.empty / spyre.full lower to FallbackKernel + MultiOutput; the
+    # MultiOutput is unwrapped from the returned TensorBox to set its layout.
+    # aten.expand lowers to an ExpandView (no Buffer produced, no layout needed).
+    # aten.clone lowers to a ComputedBuffer with FlexibleLayout → FixedTiledLayout.
+    # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
+    #
+    # Important: layouts must be FixedTiledLayout (an Inductor Layout subclass), NOT
+    # bare SpyreTensorLayout.  Inductor's get_layout() raises NotImplementedError on
+    # SpyreTensorLayout; aten.expand's lowering calls get_layout() on its input.
+
+    def _assign_layout(buf: Buffer) -> None:
+        """Wrap the buffer's current FixedLayout in a FixedTiledLayout."""
+        host_layout = buf.layout
+        buf.layout = FixedTiledLayout(
+            host_layout.device,
+            host_layout.dtype,
+            host_layout.size,
+            host_layout.stride,
+            generic_layout(buf),
+        )
+
+    empty_tb = graph_lowering.run_node(empty_fx)
+    graph_lowering.env[empty_fx] = empty_tb
+    padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> MultiOutput
+    assert isinstance(padded_buf, MultiOutput)
+    _assign_layout(padded_buf)
+
+    if one_stick_is_new:
+        one_stick_tb = graph_lowering.run_node(one_stick_fx)
+        graph_lowering.env[one_stick_fx] = one_stick_tb
+        one_stick_buf = one_stick_tb.data.data  # TensorBox -> StorageBox -> MultiOutput
+        assert isinstance(one_stick_buf, MultiOutput)
+        _assign_layout(one_stick_buf)
+
+    expand_tb = graph_lowering.run_node(expand_fx)
+    graph_lowering.env[expand_fx] = expand_tb
+    # aten.expand lowers to an ExpandView — no Buffer, no layout assignment needed.
+
+    clone_tb = graph_lowering.run_node(clone_fx)
+    graph_lowering.env[clone_fx] = clone_tb
+    clone_buf = clone_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+    assert isinstance(clone_buf, ComputedBuffer)
+    _assign_layout(clone_buf)
+    # assign_origin_node sets origin_node on the inner Pointwise, not the ComputedBuffer.
+    # LX planning (scratchpad.py) accesses op.origin_node directly on the ComputedBuffer.
+    object.__setattr__(clone_buf, "origin_node", clone_fx)
+
+    graph_lowering.run_node(overwrite_fill_fx)
+    graph_lowering.env[overwrite_fill_fx] = empty_tb
+    # overwrite lowers to ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
+    # run_node returns empty_tb (not the new overwrite buffer), so origin_node is not set.
+    object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_fill_fx)
+
+    graph_lowering.run_node(overwrite_data_fx)
+    graph_lowering.env[overwrite_data_fx] = empty_tb
+    # overwrite lowers to ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
+    object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_data_fx)
+
+    # Collect all newly added operations (appended at the end of graph.operations).
+    # Fresh path: spyre.empty(FK+MO=2) + spyre.full(FK+MO=2) + clone(1) + overwrite×2(2) = 7.
+    # Cache-hit path: spyre.full is reused, so spyre.empty(2) + clone(1) + overwrite×2(2) = 5.
+    new_ops = graph_lowering.operations[ops_before:]
+    expected = 5 if not one_stick_is_new else 7
+    assert len(new_ops) >= expected, (
+        f"Expected at least {expected} new ops, got {len(new_ops)}"
+    )
+
+    return padded_buf, list(new_ops)
