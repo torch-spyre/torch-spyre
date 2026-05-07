@@ -56,7 +56,7 @@ integration via `REGISTER_PRIVATEUSE1_PROFILER`, dual-memory profiling (DDR
 and scratchpad), AIU SMI for device monitoring, IR instrumentation-based
 fine-grained profiling, and the Holistic Trace Analyser for Spyre.
 
-See also: [Profiling](../user_guide/profiling.md)
+See also: [Profiling](../user_guide/profiling/index.md)
 
 ### RFC 0682 — Kernel Tile Intermediate Representation (KTIR)
 

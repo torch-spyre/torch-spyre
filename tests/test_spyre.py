@@ -44,10 +44,6 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# Applied per parametrized variant (see test_cross_device_copy_scalar_fill).
-# TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1172
-_SCALAR_FILL_XFAIL = pytest.mark.xfail(reason="Support 0-dim tensors in Spyre")
-
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     reason="Support scalar eager add with to_dtype lowering in Spyre"
@@ -245,8 +241,8 @@ class TestSpyre(TestCase):
     @parametrize(
         "factory_name",
         [
-            subtest("zeros", name="zeros", decorators=[_SCALAR_FILL_XFAIL]),
-            subtest("ones", name="ones", decorators=[_SCALAR_FILL_XFAIL]),
+            subtest("zeros", name="zeros"),
+            subtest("ones", name="ones"),
         ],
     )
     def test_cross_device_copy_scalar_fill(self, factory_name):
@@ -579,6 +575,84 @@ class TestSpyre(TestCase):
         b.copy_(a)
         assert torch.allclose(a.cpu(), b.cpu())
         assert torch.allclose(a.cpu().view(64, 8, 512), c.cpu())
+
+    def test_d2h_copy_of_expanded_view(self):
+        """D2H copy of a tensor with stride-0 (broadcast) dims must produce
+        the broadcast values, not the underlying storage's contents."""
+        src = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16, device="spyre")
+        expected = torch.tensor([[1, 2, 3, 4]] * 3, dtype=torch.float16)
+
+        expanded = src.unsqueeze(0).expand(3, 4)
+        self.assertFalse(expanded.is_contiguous())
+        self.assertEqual(expanded.stride(), (0, 1))
+        self.assertEqual(expanded.cpu(), expected)
+
+        # broadcast_to is the alternate API for the same view shape.
+        self.assertEqual(src.broadcast_to(3, 4).cpu(), expected)
+
+        # Multiple stride-0 dims (column-broadcast inside row-broadcast).
+        col = torch.tensor([10.0, 20.0], dtype=torch.float16, device="spyre")
+        wide = col.unsqueeze(1).expand(2, 5)
+        self.assertEqual(
+            wide.cpu(),
+            torch.tensor([[10] * 5, [20] * 5], dtype=torch.float16),
+        )
+
+        # Slice then expand: storage_offset != 0 exercises the asymmetry
+        # between the on-device alloc view (must read from offset 0) and
+        # the CPU-side view (must read from self.storage_offset()).
+        base = torch.tensor(
+            [float(i) for i in range(20)], dtype=torch.float16, device="spyre"
+        )
+        sliced_expanded = base[5:9].unsqueeze(0).expand(3, 4)
+        self.assertEqual(sliced_expanded.storage_offset(), 5)
+        self.assertEqual(
+            sliced_expanded.cpu(),
+            torch.tensor([[5, 6, 7, 8]] * 3, dtype=torch.float16),
+        )
+
+    def test_d2h_copy_of_strided_slice(self):
+        """D2H of a strided slice (e.g. t[::2]) must produce the slice's
+        logical values, not over-DMA the parent's full allocation."""
+        t = torch.tensor(
+            [float(i) for i in range(10)],
+            dtype=torch.float16,
+            device="spyre",
+        )
+        sliced = t[::2]
+        self.assertEqual(sliced.size(), (5,))
+        self.assertEqual(sliced.stride(), (2,))
+        self.assertEqual(
+            sliced.cpu(),
+            torch.tensor([0.0, 2.0, 4.0, 6.0, 8.0], dtype=torch.float16),
+        )
+
+    def test_d2h_copy_of_transposed_view(self):
+        """Transpose / column-major D2H must NOT be intercepted by the
+        realize-on-CPU path; the existing DMA path handles those layouts
+        correctly. Guards against re-broadening the trigger to
+        !is_contiguous(), which infinite-loops when dma_strides is
+        column-major (as produced by some Inductor-codegen outputs)."""
+        m = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+            dtype=torch.float16,
+            device="spyre",
+        )
+        mt = m.t()
+        self.assertFalse(mt.is_contiguous())
+        self.assertEqual(mt.stride(), (1, 4))
+        self.assertEqual(
+            mt.cpu(),
+            torch.tensor(
+                [[1, 5, 9], [2, 6, 10], [3, 7, 11], [4, 8, 12]],
+                dtype=torch.float16,
+            ),
+        )
+
+    def test_scalar_tensor(self):
+        """Test to ensure we have scalar tensor on Spyre"""
+        scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
+        assert scalar.dim() == 0
 
 
 if __name__ == "__main__":

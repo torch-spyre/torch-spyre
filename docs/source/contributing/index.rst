@@ -11,3 +11,4 @@ For compiler-specific patterns such as adding new operation support, see
    :maxdepth: 2
 
    guidelines
+   profiling

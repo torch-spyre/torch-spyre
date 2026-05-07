@@ -29,6 +29,10 @@ myst_enable_extensions = [
     "deflist",  # definition lists
 ]
 
+# Auto-generate heading anchors up to H3, so links like
+# `[text](other.md#some-heading)` resolve across Markdown files.
+myst_heading_anchors = 3
+
 # Paths that contain templates
 templates_path = ["_templates"]
 

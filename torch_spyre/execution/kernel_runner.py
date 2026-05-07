@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from torch_spyre._C import launch_kernel
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -36,7 +35,5 @@ class SpyreSDSCKernelRunner:
         self.code_dir = code_dir
 
     def run(self, *args, **kw_args):
-        g2 = os.path.join(self.code_dir, "g2.graph.cbor")
-        logger.info(f"RUN: {self.kernel_name} {g2}")
-        actuals = list(args)
-        launch_kernel(g2, actuals)
+        logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
+        launch_kernel(self.code_dir, args)

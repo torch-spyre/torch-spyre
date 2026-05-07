@@ -1,4 +1,14 @@
-# Debugging Guide
+# Debugging
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+
+inductor_artifacts
+```
+
+**Scope:** correctness — *why is the result wrong?* For performance
+questions (*why is it slow?*) see [Profiling](../profiling/index.md).
 
 This guide describes a systematic approach to debugging incorrect or
 unexpected behaviour in Torch-Spyre. The workflow applies whether you
@@ -13,7 +23,7 @@ from the outside in:
 1. **Isolate** — reduce the problem to a minimal, self-contained script
 2. **Observe data transfers** — verify tensors arrive on device correctly
 3. **Inspect compiler artifacts** — trace the issue through the
-   compilation pipeline (FX Graph → Loop IR → sdsc.json)
+   compilation pipeline (FX Graph → Loop IR → `sdsc_<index>.json`)
 4. **Bisect frontend vs. backend** — use the `sendnn` backend to
    determine whether the bug is in Torch-Spyre's front-end or in the
    DeepTools back-end compiler
@@ -49,6 +59,8 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_INDUCTOR_LOG=1` | Enable Spyre-specific Inductor logging |
 | `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | Set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR) |
 | `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
+| `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
+| `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 Run your reproducer with all three enabled:
 
@@ -100,11 +112,13 @@ Check that loop ranges and buffer shapes reflect the correct tensor
 sizes including padding. Mismatches here indicate a problem in the
 Inductor lowering or stickification pass.
 
-**sdsc.json**
-This is the final specification fed to the DeepTools back-end compiler.
-It encodes the op name, input/output tensor layouts (`device_size`,
-`stride_map`, `device_dtype`), work division, and scratchpad allocations.
-Bugs that appear only in the final output often trace back here.
+**`sdsc_<index>.json`**
+The final specifications fed to the DeepTools back-end compiler — one
+file per compiled kernel (`sdsc_0.json`, `sdsc_1.json`, …), indexed in
+lowering order. Each file encodes the op name, input/output tensor
+layouts (`device_size`, `stride_map`, `device_dtype`), work division,
+and scratchpad allocations. Bugs that appear only in the final output
+often trace back to one of these files.
 
 ### Example: debugging an incorrect `clone` result
 
@@ -121,7 +135,9 @@ correct:
   transfer OK
 ```
 
-Inspecting `sdsc.json` for the clone kernel then revealed:
+Inspecting the `sdsc_<index>.json` for the clone kernel (locate it via
+`output_code.py`, which maps each launched kernel to its index) then
+revealed:
 
 ```
 {
@@ -141,7 +157,7 @@ for the full investigation.)*
 
 ## Step 4 — Bisect Frontend vs. Backend with `sendnn`
 
-If the sdsc.json looks correct, the bug is likely in the DeepTools
+If the `sdsc_<index>.json` files look correct, the bug is likely in the DeepTools
 back-end compiler. To confirm, re-run the same script using the
 `sendnn` backend instead of `spyre`:
 
@@ -186,7 +202,8 @@ When opening an issue, include:
 - [ ] PyTorch version (`python -c "import torch; print(torch.__version__)"`)
 - [ ] Torch-Spyre version or commit SHA
 - [ ] Output of `TORCH_SPYRE_DEBUG=1` showing the data transfer log
-- [ ] Relevant excerpts from `fx_graph_readable.py` and `sdsc.json`
+- [ ] Relevant excerpts from `fx_graph_readable.py` and the affected
+  `sdsc_<index>.json`
 - [ ] Result of the `sendnn` comparison (frontend vs. backend bisect)
 
 ---
@@ -201,6 +218,6 @@ TORCH_COMPILE_DEBUG=1 \
 python my_reproducer.py
 
 # Find the generated artifacts
-find . -name "sdsc.json" 2>/dev/null
+find . -name "sdsc_*.json" 2>/dev/null
 find /tmp -name "fx_graph_readable.py" 2>/dev/null
 ```
