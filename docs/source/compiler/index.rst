@@ -19,6 +19,5 @@ The pipeline consists of two compilers:
    inductor_frontend
    backend
    work_division_planning
-   work_division_codegen
    adding_operations
    op_enablement
