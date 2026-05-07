@@ -354,7 +354,7 @@ def align_tensors(
         var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()
     }
 
-    # core division for each variable
+    # work division for each variable
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
 
     # for each variable collect bounds (den and mod) for all terms involving variable
@@ -408,7 +408,7 @@ def align_tensors(
     # sort splits
     splits = {var: sorted(val) for var, val in splits.items()}
 
-    # create new vars, var ranges, and core division for each variable
+    # create new vars, var ranges, and work division for each variable
     # with one var per segment (split[i], split[i+1])
     new_var_ranges = {}
     new_op_it_space_splits = {}
@@ -424,12 +424,12 @@ def align_tensors(
                 new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
 
-            # distribute core division for old var to new vars
+            # distribute work division for old var to new vars
             for v in reversed(remap[var]):
                 new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
                 div //= new_op_it_space_splits[v]
         else:
-            # no splits keep existing var, range, and core division
+            # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
             new_var_ranges[var] = var_ranges[var]
             new_op_it_space_splits[var] = (

@@ -39,7 +39,6 @@ struct KernelArtifacts {
   uint64_t program_size;  // (bytes)
 
   std::string bundle_mlir_path;  // Path to bundle.mlir
-  std::string sdsc_json_path;    // Path to sdsc_0.json
 };
 
 std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k);

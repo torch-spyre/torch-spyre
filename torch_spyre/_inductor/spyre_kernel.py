@@ -407,11 +407,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space = iteration_space(self.current_node)
 
         ir_node = self.current_node.node  # ComputedBuffer
-        core_division: dict[sympy.Symbol, int] = {}
+        work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
             write_index = next(iter(self.current_node.read_writes.writes)).index
             read_index = next(iter(self.current_node.read_writes.reads)).index
-            core_division = apply_splits_from_index_coeff(
+            work_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,
                 write_index,
                 read_index,
@@ -419,7 +419,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
 
         it_space_extended = {
-            k: (v, core_division.get(k, 1)) for k, v in it_space.items()
+            k: (v, work_division.get(k, 1)) for k, v in it_space.items()
         }
 
         return OpSpec(

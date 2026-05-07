@@ -1178,23 +1178,56 @@ for i in "${!RUN_FILES[@]}"; do
             _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
         fi
     fi
-
+    _exit=0
     (
         cd "$run_dir"
-        python3 -m pytest "$run_basename" "${_FILE_PYTEST_ARGS[@]}" || true
-    )
+        python3 -m pytest "$run_basename" "${_FILE_PYTEST_ARGS[@]}"
+        echo $? > "/tmp/_spyre_pytest_exit_$$.tmp"
+    ) || true
 
-    _exit=$?
+    # Read the real pytest exit code written from inside the subshell.
+    # If the file doesn't exist the subshell died before writing it
+    # (e.g. segfault, OOM kill) --  treat that as fatal (139 = SIGSEGV).
+    if [[ -f "/tmp/_spyre_pytest_exit_$$.tmp" ]]; then
+        _exit=$(< "/tmp/_spyre_pytest_exit_$$.tmp")
+        rm -f "/tmp/_spyre_pytest_exit_$$.tmp"
+    else
+        _exit=139
+        echo "[spyre_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
+    fi
 
     # Post-process XML to inject YAML tags as <properties>.
     if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" ]]; then
         python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
     fi
 
-    if [[ $_exit -ne 0 ]]; then
-        echo "[spyre_run] WARNING: pytest exited with code $_exit for $original_file" >&2
-        OVERALL_EXIT=$_exit
-    fi
+    # Distinguish fatal errors from normal pytest outcomes:
+    #   0   = all tests passed
+    #   1   = tests ran, some failed/errored  (non-fatal, already reported by pytest)
+    #   5   = no tests collected              (warning only)
+    #   127 = command not found (python3/pytest missing)
+    #   130 = SIGINT (Ctrl-C)
+    #   139 = SIGSEGV / killed before writing exit code
+    case $_exit in
+        0|1|5)
+            ;;
+        127)
+            echo "[spyre_run] FATAL: python3 or pytest not found (exit 127) for $original_file" >&2
+            OVERALL_EXIT=$_exit
+            ;;
+        130)
+            echo "[spyre_run] FATAL: interrupted (exit 130) for $original_file" >&2
+            OVERALL_EXIT=$_exit
+            ;;
+        139)
+            echo "[spyre_run] FATAL: segfault (exit 139) for $original_file" >&2
+            OVERALL_EXIT=$_exit
+            ;;
+        *)
+            echo "[spyre_run] WARNING: pytest exited with code $_exit for $original_file" >&2
+            OVERALL_EXIT=$_exit
+            ;;
+    esac
 done
 
 # ---------------------------------------------------------------------------

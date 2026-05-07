@@ -116,12 +116,30 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.stride_map, [64, 256, 1])
 
-    def test_equality(self):
+    def test_equality_and_hashable(self):
         x = SpyreTensorLayout([512, 256], torch.float16)
         y = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1])
         z = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
+        z2 = SpyreTensorLayout([512, 256], torch.float32)
+
+        self.assertEqual(hash(x), hash(x))
+
         self.assertEqual(x, y)
+        self.assertEqual(hash(x), hash(y))
+
         self.assertNotEqual(y, z)
+        self.assertNotEqual(hash(y), hash(z))
+
+        self.assertNotEqual(x, z2)
+        self.assertNotEqual(hash(x), hash(z2))
+
+        # usable as dict key
+        d = {x: "value"}
+        self.assertEqual(d[y], "value")
+
+        # usable in a set
+        s = {x, y, z}
+        self.assertEqual(len(s), 2)
 
     def test_stl_pickleable(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])

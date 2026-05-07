@@ -705,12 +705,6 @@ def lower_restickify(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.aten.slice.Tensor, type_promotion_kind=None)
-def lower_slice(x, dim=0, start=None, end=None, step=1):
-    result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
-    return clone(result, memory_format=torch.contiguous_format)
-
-
 @register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
 def lower_constant(value, dtype, device):
     op_overload = getattr(

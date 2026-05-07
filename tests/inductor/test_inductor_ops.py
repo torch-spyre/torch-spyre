@@ -305,7 +305,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # 0D / scalar tensor
                 "scalar_tensor": (None, torch.tensor(5.0, dtype=torch.float16)),
             },
-            "expect_fail": ["scalar_tensor"],
         },
         ("test_amax_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {"amax": torch.amax},
