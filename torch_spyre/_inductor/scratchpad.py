@@ -207,18 +207,6 @@ class ScratchPadAllocator:
             if buf in self.usage:
                 del self.usage[buf]
 
-    def evict_all(self):
-        """
-        Use this method when we need to make room for backend compiler, e.g. right
-        before matmul, as insufficient streaming buffer will bottleneck the compute.
-        Need a few things before implementing this method:
-        1. a way to allocate HBM tensors in torch-spyre, need new address in sdsc.json
-        2. insert clone node to perform LX-to-HBM transfer, similar to HBM-to-LX case.
-        3. set DXP_LX_FRAC_AVAIL to 1.0, make sure deeptools will read it dynamically.
-        4. need a mechanism to set this ENV VAR back to 0.2 after compute-bound OP.
-        """
-        raise NotImplementedError
-
     # TODO add defrag mechanism to allocator later
 
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
