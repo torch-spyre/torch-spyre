@@ -8,12 +8,13 @@ dataflow accelerator design pattern.
 :::{note}
 **Key Concepts** — terms used throughout this page:
 
-- **Tile** — a contiguous sub-tensor assigned to a single core for processing.
-- **Scratchpad** — fast on-core SRAM; explicitly managed by the compiler (no hardware caching).
-- **DMA** — Direct Memory Access; the mechanism by which the compiler moves tiles between DDR and scratchpad without CPU involvement.
-- **SPMD** — Single Program, Multiple Data; all cores run the same program on different data tiles identified by their core ID.
-- **SuperDSC** — the Spyre-specific kernel descriptor format; a JSON specification describing a single kernel operation.
-- **DCI** — Data Copy Instructions; compiler-generated directives that drive DMA transfers between DDR and scratchpad.
+- **Tile** — a contiguous sub-tensor assigned to a single core.
+- **Scratchpad** — fast on-core SRAM. The compiler manages it directly; there is no hardware cache.
+- **DMA** — Direct Memory Access. On Spyre this is the PCIe path that carries tensor data between host memory and the device's LPDDR5.
+- **Load/store** — the compiler-emitted instructions used by the on-core load/store units to move tiles between LPDDR5 and the LX scratchpad.
+- **SPMD** — Single Program, Multiple Data. Every core runs the same program on its own slice of the data, picked by core ID.
+- **SuperDSC** — the Spyre-specific kernel descriptor format. A single JSON describes one scheduled kernel operation across all cores.
+- **DCI** — Data Conversion Information. The `DataConversionInfo` struct (built by `generate_dci()` in `spyre_mem.cpp`) that bundles loop ranges, host and device strides, and dtype info; the runtime feeds it to `copyAsync` to drive a host ↔ LPDDR5 DMA transfer.
 :::
 
 ## What is a Dataflow Accelerator?
@@ -54,10 +55,11 @@ dataflow in CPUs. Nodes with multiple inputs act as synchronization
 points, potentially introducing backpressure that limits throughput.
 
 In the Spyre implementation, a **SuperDSC** (kernel descriptor) is what
-"fires" once its associated **DCI** (Data Copy Instructions) have moved
-the necessary **tiles** into the scratchpad. The compiler orchestrates
-this sequence statically: DCI transfers stage data, and the SuperDSC
-kernel executes once all inputs are resident in scratchpad.
+"fires" once the compiler-emitted load/store instructions have staged
+the necessary **tiles** into the scratchpad. The compiler schedules
+this statically: load/store instructions move tiles from LPDDR5 into
+the scratchpad, and the SuperDSC kernel runs once all inputs are
+resident there.
 
 ### Static vs Dynamic Dataflow
 
@@ -115,9 +117,9 @@ Dataflow architectures exploit these properties by:
 - Maximizing data reuse in local scratchpad, avoiding redundant
   off-chip memory accesses
 - Enabling pipeline parallelism across layers and operations
-- Pre-planning the majority of data movement at compile time, reducing
-  runtime allocation overhead (though DMA execution timing still
-  depends on runtime conditions)
+- Pre-planning most data movement at compile time, which keeps
+  runtime allocation overhead low (though execution timing of the
+  staged transfers still depends on runtime conditions)
 
 **Data movement — not compute — is often the dominant cost** in DNN
 execution \[[Sze 2017](#ref-sze2017)\]. This has been dramatically
@@ -130,9 +132,10 @@ data close to compute units and minimizing DDR round-trips.
 :::{note}
 **For Torch-Spyre developers:** The dataflow model has direct
 implications for how PyTorch operations are lowered. Because all data
-movement is explicit and compiler-managed, the backend must specify
-tiling strategy, DMA schedules, and kernel descriptors (SuperDSC) at
-compile time — there is no runtime fallback to a hardware cache. See
+movement is explicit and compiler-managed, the backend has to fix the
+tiling strategy, the load/store schedule that stages tiles into
+scratchpad, and the kernel descriptors (SuperDSC) at compile time —
+there is no runtime fallback to a hardware cache. See
 [Compiler Architecture](../compiler/architecture.md) and
 [Work Division Planning](../compiler/work_division_planning.md) for
 details.
@@ -188,15 +191,16 @@ throughput.
 
 1. **DDR (device DRAM)** — large, off-core storage for full tensors.
 2. **LX Scratchpad** — fast, on-core storage for tiles actively being
-   processed. The compiler is responsible for explicit DMA transfers
-   between DDR and scratchpad.
+   processed. The compiler emits load/store instructions to stage
+   tiles between DDR and the scratchpad; there is no hardware cache
+   to fall back on.
 
 :::{figure} ../_static/images/spyre-memory-hierarchy.svg
 :alt: Spyre two-level memory hierarchy showing DDR and LX Scratchpad
 :width: 600px
 :align: center
 
-Spyre memory hierarchy. Full tensors reside in DDR (128 GB LPDDR5); the compiler DMA-transfers active tiles into fast LX Scratchpad before execution. Minimizing DDR round-trips through effective tiling is the primary performance lever.
+Spyre memory hierarchy. Full tensors live in off-chip LPDDR5 — 128 GB physical, of which 16 GB is reserved for ECC, leaving roughly 112 GB usable. Before a kernel runs, the compiler issues load/store instructions to stage the tiles it needs into the on-core LX Scratchpad. The PCIe link between the host and LPDDR5 is the DMA path. Tiling that keeps traffic on-chip is the main lever for performance.
 :::
 
 The end-to-end data path is:
@@ -205,31 +209,32 @@ The end-to-end data path is:
 Host → DDR → LX Scratchpad → Compute Units → LX Scratchpad → DDR → Host
 ```
 
-The compiler generates two artifacts to drive this pipeline:
+The compiler generates two kinds of artifacts to drive this pipeline:
 
-- **DCI (Data Copy Instructions)** — explicit DMA directives that move
-  tiles between DDR and LX Scratchpad at the right time.
+- **Load/store instructions** that move tiles between DDR and the LX
+  scratchpad at the right time.
 - **SuperDSC** — JSON kernel descriptors that specify the computation
-  performed on each tile once it arrives in scratchpad. (SuperDSC is
-  being superseded by KTIR — a tile-based MLIR intermediate
-  representation; see [RFC 0682](../rfcs/index.md).)
+  performed on each tile once it arrives in scratchpad. SuperDSC is
+  being superseded by KTIR, a tile-based MLIR intermediate
+  representation — see [RFC 0682](../rfcs/index.md).
 
 ## Execution Model
 
 Each Spyre core executes a **kernel** — a self-contained computation
 on a **tile** (a contiguous sub-tensor region) of data. All three of
 the following are determined **at compile time** — there is no global
-instruction scheduler; execution is primarily driven by compile-time
-planning and data readiness, with minimal runtime control for DMA and
-resource arbitration:
+instruction scheduler. Execution is driven by compile-time planning
+and data readiness, with only minimal runtime control for transfer
+sequencing and resource arbitration:
 
 1. **Work division** — how to split a tensor operation across cores
    (see [Work Division Planning](../compiler/work_division_planning.md))
-2. **Data staging** — when and how to DMA tiles into scratchpad
+2. **Data staging** — when, and with what load/store instructions, to
+   move tiles between LPDDR5 and the LX scratchpad
 3. **Kernel specification** — the SuperDSC (Spyre kernel descriptor)
-   JSON that fully describes the operation: operand shapes, data types,
-   tiling parameters, and the sequence of compute instructions for the
-   PT array.
+   JSON that fully describes the operation: operand shapes, data
+   types, tiling parameters, and the sequence of compute instructions
+   for the PT array.
 
 Cores execute in SPMD (Single Program, Multiple Data) fashion: cores
 follow a common program structure but operate on different tiles and
@@ -241,7 +246,7 @@ core ID.
 :width: 50%
 :align: center
 
-Spyre core microarchitecture. An array of Processing Threads (PT) feeds through a Processing Element (PE) and Special Function Processor (SFP). Each PT handles a single compute lane (implementation-defined scalar or vector abstraction); the PE aggregates PT outputs, and the SFP handles non-linear activations (e.g., GELU, softmax). Computed data is staged in fast on-core **LX Scratchpad** memory; the device memory (LPDDR5) sits below and is the primary bandwidth bottleneck. Custom kernels can optimize tiling, fusion, and LX usage to reduce device memory pressure.
+Spyre core microarchitecture. Each Spyre core contains two corelets (Corelet 0 and Corelet 1) that share a single 2 MB LX scratchpad (SRAM). A corelet is built from an 8 × 8 systolic Processing Element (PE) array, used for matrix-style compute on the PT execution unit, plus a 1D Special Function Unit (SFU) vector unit that handles non-linear activations such as GELU and softmax. Compiler-emitted load/store instructions move tiles between the LX scratchpad and off-chip LPDDR5; there is no hardware cache. Cores talk to each other over a bi-directional ring interconnect at 128 B per cycle per direction. The architecture descends from IBM's RaPiD AI accelerator (Venkataramani et al., ISCA 2021, [DOI:10.1109/ISCA52012.2021.00021](https://doi.org/10.1109/ISCA52012.2021.00021)).
 :::
 
 ## Comparison with GPU and Other Accelerators
@@ -254,7 +259,7 @@ operations:
 |--------|-----------|----------------|
 | Scheduling | Warp-level SIMT | Data-driven, core SPMD |
 | Memory model | Shared memory + global | Scratchpad + DDR |
-| Data movement | Implicit caching | Explicit DMA via compiler |
+| Data movement | Implicit caching | Explicit, compiler-scheduled load/store between DDR and scratchpad |
 | Supported precision | fp32 / bf16 / fp16 / int8 | int4 / int8 / fp8 / fp16 |
 | Compiler model | Hybrid (AOT kernels with optional JIT from PTX) | Primarily AOT (scheduling and data movement planned at compile time) |
 | Parallelism granularity | Thread blocks [^gpu] | Core tiles [^gpu] |
@@ -317,10 +322,11 @@ for regular workloads, they face several challenges:
   idle time at synchronization boundaries (see
   [Work Division Planning](../compiler/work_division_planning.md)).
 
-- **Data movement overhead** — while dataflow minimizes unnecessary
-  data movement, the DMA transfers between DDR and scratchpad still
-  incur latency. Communication networks can become bottlenecks at
-  scale, particularly for operations with poor data locality.
+- **Data movement overhead** — dataflow cuts down on redundant
+  movement, but every tile that has to come from DDR still costs
+  latency on the way into and out of the scratchpad. At scale the
+  communication network is the bottleneck, especially for ops with
+  poor data locality.
 
 - **Limited general-purpose adoption** — dataflow architectures have
   been most successful in domain-specific applications (AI inference,

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 660" font-family="sans-serif" font-size="13">
+  <rect width="820" height="660" fill="white"/>
+
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8 Z" fill="#1d4ed8"/>
+    </marker>
+  </defs>
+
+  <text x="410" y="30" text-anchor="middle" font-size="17" font-weight="bold" fill="#0f172a">Tensor lifetime: how a Spyre allocation gets freed</text>
+  <text x="410" y="54" text-anchor="middle" font-size="13" fill="#475569">PyTorch's own refcount drives this chain. Python's garbage collector is not involved.</text>
+
+  <!-- Step 1 -->
+  <rect x="100" y="86" width="620" height="68" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="410" y="115" text-anchor="middle" fill="white" font-weight="bold" font-size="14">A Python tensor goes out of scope</text>
+  <text x="410" y="136" text-anchor="middle" fill="#dbeafe" font-size="12">a function returns, you call del t, or the last reference is reassigned</text>
+
+  <line x1="410" y1="154" x2="410" y2="194" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Step 2 -->
+  <rect x="100" y="204" width="620" height="68" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="410" y="233" text-anchor="middle" fill="white" font-weight="bold" font-size="14">The TensorImpl refcount reaches zero</text>
+  <text x="410" y="254" text-anchor="middle" fill="#dbeafe" font-size="12">this is PyTorch's intrusive refcount, separate from anything Python tracks</text>
+
+  <line x1="410" y1="272" x2="410" y2="312" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Step 3 -->
+  <rect x="100" y="322" width="620" height="68" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="410" y="351" text-anchor="middle" fill="white" font-weight="bold" font-size="14">The storage's c10::DataPtr is destructed</text>
+  <text x="410" y="372" text-anchor="middle" fill="#dbeafe" font-size="12">the storage holds the DataPtr, and the DataPtr holds the device allocation</text>
+
+  <line x1="410" y1="390" x2="410" y2="430" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Step 4 -->
+  <rect x="60" y="440" width="700" height="84" rx="10" fill="#fff7ed" stroke="#b45309" stroke-width="2"/>
+  <text x="410" y="466" text-anchor="middle" fill="#92400e" font-weight="bold" font-size="14">ReportAndDelete runs</text>
+  <text x="410" y="486" text-anchor="middle" fill="#92400e" font-size="12" font-style="italic">SpyreAllocator wired this deleter into the DataPtr at allocation time</text>
+  <text x="410" y="508" text-anchor="middle" fill="#92400e" font-size="12">it bumps the DeviceStats counters and then hands the allocation back to flex_alloc</text>
+
+  <line x1="410" y1="524" x2="410" y2="564" stroke="#1d4ed8" stroke-width="2.5" marker-end="url(#ah)"/>
+
+  <!-- Step 5 -->
+  <rect x="100" y="574" width="620" height="68" rx="10" fill="#1d4ed8" stroke="#1e3a8a" stroke-width="2"/>
+  <text x="410" y="603" text-anchor="middle" fill="white" font-weight="bold" font-size="14">flex_alloc returns the allocation to its pool</text>
+  <text x="410" y="624" text-anchor="middle" fill="#dbeafe" font-size="12">flex::FlexAllocator manages the underlying device memory pool</text>
+</svg>

@@ -1,0 +1,8 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_lazy_modules.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestLazyModules::test_materialize_dtype
+          mode: mandatory_success

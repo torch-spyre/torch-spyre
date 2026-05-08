@@ -18,6 +18,7 @@ from typing import Any, Sequence
 
 from sympy import Symbol, Expr
 from torch_spyre._C import DataFormats
+import torch
 
 
 @dataclasses.dataclass
@@ -51,7 +52,7 @@ class OpSpec:
     Attributes:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
-        iteration_space: The iteration space of the operation. The values are tuples of (range, core_division).
+        iteration_space: The iteration space of the operation. The values are tuples of (range, work_division).
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
     """
@@ -66,3 +67,7 @@ class OpSpec:
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
+
+
+def spyre_constant_tensor(const_val, device, dtype=torch.float16):
+    return torch.tensor([const_val], dtype=dtype).to(device)

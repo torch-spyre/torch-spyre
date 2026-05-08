@@ -11,6 +11,6 @@ debugging, and worked examples.
    running_models
    supported_operations
    tensors_and_layouts
-   profiling
-   debugging
+   profiling/index
+   debugging/index
    examples
