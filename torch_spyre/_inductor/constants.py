@@ -48,6 +48,7 @@ SPYRE_FP32_OPS = [
     "overwrite",
     "topkvalue",
     "topkindex",
+    "floor",
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}
