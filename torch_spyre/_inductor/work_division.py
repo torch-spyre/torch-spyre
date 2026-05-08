@@ -88,6 +88,23 @@ def core_split(size: int, max_cores: int) -> int:
     return 1
 
 
+def _most_splittable_dim(
+    dims: list[Symbol],
+    iteration_space: dict[Symbol, Expr],
+    n_cores: int,
+) -> tuple[Symbol, int] | None:
+    """Return (dim, split) for the dim in dims that maximises core_split(size, n_cores).
+
+    Returns None if no dim yields a split > 1.
+    """
+    best_dim, best_split = None, 0
+    for d in dims:
+        s = core_split(concretize_expr(iteration_space[d]), n_cores)
+        if s > best_split:
+            best_dim, best_split = d, s
+    return (best_dim, best_split) if best_split > 1 else None
+
+
 def multi_dim_iteration_space_split(
     iteration_space: dict[Symbol, Expr],
     max_cores: int,
@@ -139,12 +156,11 @@ def multi_dim_iteration_space_split(
             n_cores_remaining = n_cores_remaining // best_split
 
     if reduction_split_limit == 1 and n_cores_remaining > 1:
-        best_dim, best_split = None, 0
-        for d in reduction_dims:
-            s = core_split(concretize_expr(iteration_space[d]), n_cores_remaining)
-            if s > best_split:
-                best_dim, best_split = d, s
-        if best_split > 1:
+        result = _most_splittable_dim(
+            reduction_dims, iteration_space, n_cores_remaining
+        )
+        if result is not None:
+            best_dim, best_split = result
             splits[best_dim] = best_split
 
     return splits
