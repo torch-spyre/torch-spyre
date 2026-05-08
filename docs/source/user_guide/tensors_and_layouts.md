@@ -244,7 +244,7 @@ Fused and split dimensions are the second symptom. A `flatten`
 collapses two PyTorch dims into one; a `reshape` can split one into
 two. Tracking that with dim indices means tagging entries with
 "this is the upper half of dim 2", and the tag has to survive every
-intermediate pass: core division, scratchpad planning, codegen.
+intermediate pass: work division, scratchpad planning, codegen.
 
 Sparse Spyre layouts then add a synthetic inner dimension that has no
 corresponding PyTorch dim at all. Yet another sentinel. Views without

@@ -26,7 +26,7 @@ from .logging_utils import get_inductor_logger
 
 aten = torch.ops.aten
 
-logger = get_inductor_logger("core_division")
+logger = get_inductor_logger("work_division")
 
 _RESHAPE_OPS = (
     aten.view.default,
