@@ -61,12 +61,13 @@ class ScratchPadAllocator:
     def get_lowest_addr_in_use(self):
         if len(self.usage) > 0:
             return min([rec["addr"] for rec in self.usage.values()])
-        return None
+        return -1
+        # need to update find_free_block() if these 2 func returns None
 
     def get_highest_addr_in_use(self):
         if len(self.usage) > 0:
             return max([rec["addr"] + rec["size"] for rec in self.usage.values()])
-        return None
+        return -1
 
     def get_available_total(self):
         total_avail = self.limit
@@ -78,8 +79,8 @@ class ScratchPadAllocator:
         # cannot perform defragmentation yet, will add more cases in the future
         curr_lo = self.get_lowest_addr_in_use()
         curr_hi = self.get_highest_addr_in_use()
-        if len(self.usage) == 0 or curr_lo >= size_needed:
-            # completely free or enough room at addr0
+        if (len(self.usage) == 0 and size_needed <= self.limit) or curr_lo >= size_needed:
+            # completely free and/or enough room at addr0
             return 0
         elif curr_hi + size_needed < self.limit:
             # enough room at higher addr, return next 128-multiple
