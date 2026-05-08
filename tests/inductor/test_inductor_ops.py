@@ -4517,7 +4517,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         src_dtype, dst_dtype = dtype_pair
         x_src = x.to(dtype=src_dtype)
 
-        compare_with_cpu(
+        self.compare_with_cpu(
             lambda a: a.to(dtype=dst_dtype),
             x_src,
             cpu_compile=False,
