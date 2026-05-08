@@ -25,16 +25,8 @@ import torch
 
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
-    # Deeptools type cast ops
     DL16TOFP32_OP,
     FP32TODL16_OP,
-    # TBD Deeptools type cast ops
-    # FP32TOFP8_OP,
-    # FP8TOFP32_OP,
-    # INT32TOINT16_OP,
-    # INT16TOINT32_OP,
-    # INT32TOINT8_OP,
-    # INT8TOINT32_OP,
 )
 
 
@@ -55,19 +47,6 @@ class DtypeOpTable:
         (torch.float32, torch.float16),
         (torch.float32, torch.bfloat16),
     ]
-
-    # TBD Deeptools dtype cast ops
-    # (torch.float8_e4m3fn, torch.float32): FP32TOFP8_OP,
-    # (torch.float8_e5m2, torch.float32): FP32TOFP8_OP,
-    # (torch.float32, torch.float8_e4m3fn): FP8TOFP32_OP,
-    # (torch.float32, torch.float8_e5m2): FP8TOFP32_OP,
-    # (torch.float16, torch.float8_e4m3fn): FP8TODL16_OP,
-    # (torch.float16, torch.float8_e5m2): FP8TODL16_OP,
-    # Integer conversions (when supported)
-    # (torch.int16, torch.int32): INT32TOINT16_OP,
-    # (torch.int32, torch.int16): INT16TOINT32_OP,
-    # (torch.int8, torch.int32): INT32TOINT8_OP,
-    # (torch.int32, torch.int8): INT8TOINT32_OP,
 
     _TYPECAST_OPS_TABLE = {
         **{pair: IDENTITY_OP for pair in _IDENTITY_DTYPES},
