@@ -100,8 +100,9 @@ For each operation, `work_distribution_pass`:
 2. Ranks the remaining dimensions (those not already committed by Pass 1) for
    additional core assignment (`prioritize_dimensions`): output dimensions
    first by decreasing stick-adjusted size, reduction dimensions last. For
-   non-matmul reductions, reduction dimensions are excluded entirely due to a
-   known backend limitation.
+   non-matmul reductions, at most one reduction dimension is eligible for
+   splitting — the one that maximises `core_split(size, remaining_cores)` after
+   output dimensions have absorbed their share of cores.
 3. Distributes all `max_cores` across committed and priority dimensions
    (`multi_dim_iteration_space_split`): first applies the committed splits as
    minimum requirements, then greedily assigns the largest valid divisor of
@@ -129,10 +130,12 @@ splits are computed jointly over all input and output tensors.
 
 ### Reduction Operations (non-matmul)
 
-Reduction dimensions are excluded from work division candidates due to a known
-backend limitation. Only output dimensions are split. Span-required splits are
-asserted to not involve reduction variables; if they do, the compiler raises an
-error.
+Output dimensions are split first, by decreasing size. After output dimensions
+have been assigned cores, at most one reduction dimension may also be split: the
+one whose size has the most useful divisors for the remaining core budget (i.e.
+maximises `core_split(size, remaining_cores)`). Span-required splits may include
+at most one reduction variable; if more than one reduction variable must be split
+to satisfy the 256 MB limit, the compiler raises an error.
 
 ### Matrix Multiplication
 
@@ -160,7 +163,6 @@ values range from 1 (no parallelization) to 32 (maximum supported cores).
 - Dimensions must divide evenly by the slice count (no uneven splits)
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work division;
   `ExternKernel` and `FallbackKernel` nodes are skipped
-- Non-matmul reductions cannot split along the reduction dimension
 
 **Potential future enhancements:**
 
