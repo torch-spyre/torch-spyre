@@ -91,50 +91,39 @@ def core_split(size: int, max_cores: int) -> int:
 def multi_dim_iteration_space_split(
     iteration_space: dict[Symbol, Expr],
     max_cores: int,
-    priorities: list[Symbol],
+    output_dims: list[Symbol],
+    reduction_dims: list[Symbol],
+    reduction_split_limit: int | None = None,
     min_splits: dict[Symbol, int] | None = None,
 ) -> dict[Symbol, int]:
-    """
-    Distribute max_cores across multiple dimensions of an iteration space.
+    """Distribute max_cores across the iteration space.
 
-    This function tries to split cores across multiple dimensions to maximize
-    parallelism while ensuring even division. It uses a two-pass approach:
-    1. First pass: satisfy minimum split requirements (hardware constraints)
-    2. Second pass: distribute remaining cores by priority
+    Three-pass algorithm:
+      1. Satisfy min_splits (span-reduction commitments).
+      2. Distribute remaining cores to output_dims in priority order.
+      3. Distribute remaining cores to reduction_dims subject to
+         reduction_split_limit (None = unlimited, 0 = skip, 1 = pick best).
 
-    Args:
-        iteration_space: The iteration space to be parallelized
-        max_cores: Total number of cores available
-        priorities: Order in which to consider the dimensions
-        min_splits: Minimum splits required for each dimension (optional)
-
-    Returns:
-        The core splits for the iteration_space
-        The product of all splits will be <= max_cores
+    The product of all splits will be <= max_cores.
     """
     splits = {v: 1 for v in iteration_space.keys()}
     n_cores_remaining = max_cores
 
-    # First pass: satisfy minimum split requirements
     if min_splits:
         for var, min_split in min_splits.items():
-            assert var not in priorities  # there shouldn't be an overlap
+            assert var not in output_dims and var not in reduction_dims
 
-            # Check if we have enough cores for this minimum split
             if n_cores_remaining // min_split <= 0:
                 logger.critical(
                     f"Cannot satisfy minimum split requirement for {var}: "
                     f"need {min_split} splits but only {n_cores_remaining} cores remaining. "
                     f"Skipping this constraint - hardware span limit may be violated."
                 )
-                continue  # Skip this variable, leave splits[var] = 1
-
-            # Safe to apply the minimum split
+                continue
             splits[var] = min_split
             n_cores_remaining = n_cores_remaining // min_split
 
-    # Second pass: distribute remaining cores by priority
-    for v in priorities:
+    for v in output_dims:
         if n_cores_remaining <= 1:
             break
         # TODO(issue#1372): with symbolic work division, concretize_expr
@@ -143,6 +132,25 @@ def multi_dim_iteration_space_split(
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
+
+    if reduction_split_limit is None:
+        for v in reduction_dims:
+            if n_cores_remaining <= 1:
+                break
+            best_split = core_split(
+                concretize_expr(iteration_space[v]), n_cores_remaining
+            )
+            if best_split > 1:
+                splits[v] = best_split
+                n_cores_remaining = n_cores_remaining // best_split
+    elif reduction_split_limit >= 1 and n_cores_remaining > 1:
+        best_dim, best_split = None, 0
+        for d in reduction_dims:
+            s = core_split(concretize_expr(iteration_space[d]), n_cores_remaining)
+            if s > best_split:
+                best_dim, best_split = d, s
+        if best_split > 1:
+            splits[best_dim] = best_split
 
     return splits
 
@@ -403,40 +411,32 @@ def must_split_vars(
 def prioritize_dimensions(
     output: TensorDep,
     it_space_adjusted: dict[Symbol, Expr],
-    exclude_reduction: bool = False,
-) -> list[Symbol]:
-    """Return iteration variables in priority order for work distribution.
+) -> tuple[list[Symbol], list[Symbol]]:
+    """Partition iteration variables into output dims and reduction dims.
+
+    Output dims are those whose symbols appear in the output tensor's device
+    coordinate expressions (excluding the stick coordinate). Reduction dims are
+    the remainder. Both lists are sorted by decreasing concrete size.
 
     Variables already committed as min_splits should be filtered out of
     it_space_adjusted before calling this function.
-
-    Priority tiers:
-      1. Output dims (present in output device coords), by decreasing size.
-      2. Reduction dims (absent from output coords), by decreasing size.
     """
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
-    remaining_output = []
-    reduction_dims: list[tuple[Symbol, Expr]] = []
+    output_pairs: list[tuple[Symbol, Expr]] = []
+    reduction_pairs: list[tuple[Symbol, Expr]] = []
     for s, e in it_space_adjusted.items():
-        if s in coord_vars:
-            remaining_output.append((s, e))
-        else:
-            reduction_dims.append((s, e))
+        (output_pairs if s in coord_vars else reduction_pairs).append((s, e))
 
     # Concretize sort keys: comparing two sympy Symbols returns a Relational
     # whose truth value is undefined and would raise inside Python's sort.
     # The priority order is a structural decision (largest dim first) that
     # needs a concrete numeric ordering.
     # TODO(issue#1372): Symbolic work division will keep this symbolic.
-    remaining_output.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
-    reduction_dims.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
+    output_pairs.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
+    reduction_pairs.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
 
-    priority = [t[0] for t in remaining_output]
-    if not exclude_reduction:
-        priority += [t[0] for t in reduction_dims]
-
-    return priority
+    return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
 
 
 def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
@@ -505,7 +505,7 @@ def span_reduction_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
-    exclude_reduction: bool,
+    reduction_split_limit: int | None,
 ) -> None:
     """Mandatory per-op pass: compute minimum splits to satisfy the 256MB span limit.
 
@@ -521,15 +521,16 @@ def span_reduction_pass(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores
     )
 
-    if exclude_reduction:
+    if reduction_split_limit is not None:
         coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
         reduction_vars_to_split = set(min_splits) - coord_vars
-        if reduction_vars_to_split:
+        if len(reduction_vars_to_split) > reduction_split_limit:
             raise Unsupported(
                 f"Cannot satisfy hardware memory span limit "
-                f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting reduction "
-                f"dimensions {reduction_vars_to_split}, but the backend does not "
-                f"support splitting reduction dimensions for this operation type."
+                f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting "
+                f"{len(reduction_vars_to_split)} reduction dimension(s) "
+                f"({reduction_vars_to_split}), but the backend supports at most "
+                f"{reduction_split_limit}."
             )
 
     apply_splits(
@@ -548,7 +549,7 @@ def work_distribution_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
-    exclude_reduction: bool,
+    reduction_split_limit: int | None,
 ) -> None:
     """Optional per-op pass: distribute remaining cores to maximize parallelism.
 
@@ -586,14 +587,17 @@ def work_distribution_pass(
     it_space_remaining = {
         s: e for s, e in it_space_adjusted.items() if s not in committed_splits
     }
-    priorities = prioritize_dimensions(
-        output_td, it_space_remaining, exclude_reduction=exclude_reduction
-    )
+    output_dims, reduction_dims = prioritize_dimensions(output_td, it_space_remaining)
     # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
     # accounts for committed_splits in its first pass, consuming those cores
     # itself before distributing the rest by priority.
     splits = multi_dim_iteration_space_split(
-        it_space_adjusted, max_cores, priorities, committed_splits
+        it_space_adjusted,
+        max_cores,
+        output_dims,
+        reduction_dims,
+        reduction_split_limit,
+        committed_splits,
     )
     apply_splits(
         op,
@@ -601,7 +605,7 @@ def work_distribution_pass(
         output_td,
         it_space,
         it_space_adjusted,
-        priorities,
+        output_dims + reduction_dims,
         committed_splits,
         kind="work_distribution",
     )
@@ -614,7 +618,7 @@ def divide_pointwise_op(
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    pass_fn(op, args, max_cores, exclude_reduction=False)
+    pass_fn(op, args, max_cores, reduction_split_limit=None)
 
 
 def divide_reduction_op(
@@ -631,10 +635,8 @@ def divide_reduction_op(
         return
 
     is_matmul = red.reduction_type == BATCH_MATMUL_OP
-    # FIXME: For non-matmul reduction, excluding reduction dimensions from work
-    #        division candidates temporarily till known backend issue is fixed
-    #        https://github.com/torch-spyre/torch-spyre/issues/1304
-    pass_fn(op, args, max_cores, exclude_reduction=not is_matmul)
+    reduction_split_limit = None if is_matmul else 1
+    pass_fn(op, args, max_cores, reduction_split_limit=reduction_split_limit)
 
 
 def _validate_max_cores() -> int:
