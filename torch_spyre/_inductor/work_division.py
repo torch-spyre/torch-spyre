@@ -106,6 +106,8 @@ def multi_dim_iteration_space_split(
 
     The product of all splits will be <= max_cores.
     """
+    assert reduction_split_limit is None or 0 <= reduction_split_limit <= 1
+
     splits = {v: 1 for v in iteration_space.keys()}
     n_cores_remaining = max_cores
 
@@ -123,7 +125,10 @@ def multi_dim_iteration_space_split(
             splits[var] = min_split
             n_cores_remaining = n_cores_remaining // min_split
 
-    for v in output_dims:
+    greedy_dims = (
+        output_dims + reduction_dims if reduction_split_limit is None else output_dims
+    )
+    for v in greedy_dims:
         if n_cores_remaining <= 1:
             break
         # TODO(issue#1372): with symbolic work division, concretize_expr
@@ -133,17 +138,7 @@ def multi_dim_iteration_space_split(
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
 
-    if reduction_split_limit is None:
-        for v in reduction_dims:
-            if n_cores_remaining <= 1:
-                break
-            best_split = core_split(
-                concretize_expr(iteration_space[v]), n_cores_remaining
-            )
-            if best_split > 1:
-                splits[v] = best_split
-                n_cores_remaining = n_cores_remaining // best_split
-    elif reduction_split_limit >= 1 and n_cores_remaining > 1:
+    if reduction_split_limit == 1 and n_cores_remaining > 1:
         best_dim, best_split = None, 0
         for d in reduction_dims:
             s = core_split(concretize_expr(iteration_space[d]), n_cores_remaining)
