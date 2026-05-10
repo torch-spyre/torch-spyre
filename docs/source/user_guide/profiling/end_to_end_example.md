@@ -11,7 +11,9 @@ telemetry. It uses today's tooling: `torch.profiler` +
 The Granite end-to-end path on Spyre today goes through the
 [Foundation Model Stack][fms] and
 [`aiu-fms-testing-utils`][aiu-fms] — **not** HuggingFace
-`AutoModelForCausalLM` directly.
+`AutoModelForCausalLM` directly. Spyre support for both currently
+exists on the `eager_spyre` branch of each repo, so install them from
+source off that branch rather than from PyPI.
 
 :::{admonition} Where this page is going
 :class: note
@@ -26,8 +28,8 @@ shrink. This page will be revised to the in-tree API once it ships.
 
 | Piece | Source | Sample install (verify against the upstream README) |
 |---|---|---|
-| `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] | `pip install ibm-fms` |
-| `aiu-fms-testing-utils` | [github.com/foundation-model-stack/aiu-fms-testing-utils][aiu-fms] | `pip install aiu-fms-testing-utils` |
+| `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./foundation-model-stack` |
+| `aiu-fms-testing-utils` | [github.com/foundation-model-stack/aiu-fms-testing-utils][aiu-fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./aiu-fms-testing-utils` |
 | `kineto-spyre` | [github.com/IBM/kineto-spyre][kineto-spyre] | `uv pip install --no-deps <release-wheel-url-matching-your-pytorch>` (see [releases page][kineto-spyre-releases]) |
 | `aiu-trace-analyzer` (optional) | [github.com/IBM/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
 | Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `huggingface-cli download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
@@ -39,9 +41,14 @@ build.
 
 ## Setup
 
-After installing the packages above:
-
 ```bash
+# Install fms and aiu-fms-testing-utils from the eager_spyre branch
+# (the branch that registers the Spyre device backend today).
+git clone -b eager_spyre https://github.com/foundation-model-stack/foundation-model-stack.git
+git clone -b eager_spyre https://github.com/foundation-model-stack/aiu-fms-testing-utils.git
+uv pip install -e ./foundation-model-stack
+uv pip install -e ./aiu-fms-testing-utils
+
 # Cache HuggingFace artifacts and download the Granite checkpoint.
 export HF_HOME=/tmp/models/hf_cache
 huggingface-cli download ibm-granite/granite-3.3-8b-instruct \
