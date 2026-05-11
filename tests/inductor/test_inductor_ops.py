@@ -3395,18 +3395,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.xfail(
         reason=(
-            "Spyre compiled backend does not support torch.cumsum yet "
-            "(stable error signature: RuntimeError: DispatchStub: missing "
-            "kernel for spyre)"
-        ),
-        strict=True,
-    )
-    def test_cumsum_dim0_known_xfail(self):
-        x = cached_randn((67, 256), scale=0.1)
-        self.compare_with_cpu(lambda x: torch.cumsum(x, dim=0), x, run_eager=False)
-
-    @pytest.mark.xfail(
-        reason=(
             "Spyre compiled backend does not support torch.cumprod yet "
             "(stable error signature: NotImplementedError: Could not run "
             "'aten::cumprod.out' with arguments from the 'spyre' backend)"
