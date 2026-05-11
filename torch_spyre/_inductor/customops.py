@@ -219,9 +219,9 @@ def spyre_empty(
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    # Fall back to CPU: allocate uninitialised storage and copy to device.
-    # On real Spyre hardware this allocation carries no initialisation cost.
-    warn_fallback("torch.ops.spyre.empty")
+    # Eager-mode simulation: allocate on CPU and move to the Spyre device.
+    # This is not a compute fallback — on hardware the compiled kernel receives
+    # a device allocation from SpyreAllocator with no host-side initialisation.
     tmp = torch.empty(size, dtype=dtype, device="cpu")
     return tmp.to(device)
 

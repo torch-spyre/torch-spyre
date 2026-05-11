@@ -438,6 +438,92 @@ class TestInsertPaddingIR(unittest.TestCase):
             expected_y, mo_sizes, f"y padded size {expected_y} not found in {mo_sizes}"
         )
 
+    def test_padded_buffer_preserves_stick_dimension(self) -> None:
+        """Padded buffers have the same within-stick dimension as their originals.
+
+        ``lower_pad_sequence`` derives the padded buffer's ``SpyreTensorLayout``
+        from the original buffer's ``stride_map[-1]`` so that
+        ``device_coordinates[-1]`` (the stick coordinate expression) is identical
+        for both.  Concretely, ``stride_map[-1]`` must be the same for the padded
+        ``MultiOutput`` as it was for the original input buffer.
+
+        This test covers three cases:
+        - 2D mm: original [M, K], padded [M, K_padded] — K is the stick dim.
+        - 3D bmm: original [B, M, K], padded [B, M, K_padded] — K is the stick dim.
+        - einsum mk,kn→mn: x_buf is 2D [M, K] but the matmul inner_fn accesses it
+          as 3D [1, M, K] via mm_to_bmm_pass; padded_size is [1, M, K_padded].
+          The within-stick dim must be recovered from the 3D view's strides, not
+          from x_buf's 2D ``stride_map``.
+
+        In all cases the within-stick dimension is K (the last host dim), so
+        ``stride_map[-1] == 1`` for every padded buffer.  The test would catch a
+        regression that confused the stick dim (e.g. producing ``stride_map[-1] ==
+        K_padded`` from a default layout constructed with the wrong dim_order).
+        """
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        assert 67 % stick_size != 0
+
+        cases: list[
+            tuple[str, Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]
+        ] = [
+            (
+                "mm [55,67]x[67,128]",
+                lambda x, w: x @ w,
+                (
+                    torch.randn(55, 67, dtype=dtype, device="spyre"),
+                    torch.randn(67, 128, dtype=dtype, device="spyre"),
+                ),
+            ),
+            (
+                "bmm [2,55,67]x[2,67,128]",
+                lambda x, w: torch.bmm(x, w),
+                (
+                    torch.randn(2, 55, 67, dtype=dtype, device="spyre"),
+                    torch.randn(2, 67, 128, dtype=dtype, device="spyre"),
+                ),
+            ),
+            (
+                "einsum mk,kn->mn [55,67]x[67,128]",
+                lambda x, w: torch.einsum("mk,kn->mn", x, w),
+                (
+                    torch.randn(55, 67, dtype=dtype, device="spyre"),
+                    torch.randn(67, 128, dtype=dtype, device="spyre"),
+                ),
+            ),
+        ]
+
+        for name, fn, args in cases:
+            with self.subTest(case=name):
+                ops = self.compile_and_capture(fn, args)
+                matmuls = self._matmul_ops(ops)
+                self.assertEqual(len(matmuls), 1, f"{name}: expected 1 matmul")
+                mm = matmuls[0]
+                ops_before = self._ops_before(ops, mm)
+
+                padded_mos = [op for op in ops_before if isinstance(op, MultiOutput)]
+                self.assertGreaterEqual(
+                    len(padded_mos), 2, f"{name}: expected at least 2 padded buffers"
+                )
+
+                for mo in padded_mos:
+                    layout = mo.get_layout()
+                    self.assertIsInstance(
+                        layout,
+                        FixedTiledLayout,
+                        f"{name}: padded buffer has wrong layout type {type(layout)}",
+                    )
+                    sm_last = int(list(layout.device_layout.stride_map)[-1])
+                    self.assertEqual(
+                        sm_last,
+                        1,
+                        f"{name}: padded buffer stride_map[-1]={sm_last}, "
+                        f"expected 1 (K is within-stick dim); "
+                        f"size={[int(s) for s in mo.get_size()]}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

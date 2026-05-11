@@ -21,6 +21,7 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     FixedLayout,
+    Loops,
     MultiOutput,
     Operation,
     Pointwise,
@@ -403,7 +404,7 @@ def compute_restickify_needed(
 
 def rebuild_computed_buffer(
     op: ComputedBuffer,
-    new_data,
+    new_data: Loops,
     operations: list[Operation],
 ) -> ComputedBuffer:
     """Replace ``op`` in ``operations`` with a new ComputedBuffer sharing its layout.
@@ -473,10 +474,13 @@ def lower_pad_sequence(
     identical.  This is achieved by recovering the within-stick host dimension
     from ``orig_stl.stride_map[-1]`` (the host stride of the within-stick dim)
     and constructing the padded STL via ``SpyreTensorLayout(padded_size,
-    padded_host_stride, dtype, dim_order)`` with the same ``dim_order``.  Falls
-    back to ``SpyreTensorLayout(padded_size, dtype)`` when ``orig_stl`` has a
-    different number of dimensions than ``padded_size`` (e.g. when
-    mm_to_bmm_pass adds a batch dimension).
+    padded_host_stride, dtype, dim_order)`` with the same ``dim_order``.
+    ``arg_fx_node.meta["val"].stride()`` gives the strides of the view the
+    inner_fn actually accesses, so the lookup works even when ``orig_stl`` has
+    fewer dimensions than ``padded_size`` (e.g. when mm_to_bmm_pass adds a
+    batch dimension to x).  Falls back to ``SpyreTensorLayout(padded_size,
+    dtype)`` only when no stride in the view matches ``stride_map[-1]``, which
+    should not occur in practice.
 
     ``fill_cache`` maps ``(fill_value, device, dtype)`` to an existing
     ``spyre.constant`` FX node.  On a cache hit that node is reused and not

@@ -181,9 +181,9 @@ def insert_padding_ir(operations: list[Operation]) -> None:
     Mutates ``operations`` in place.  All new buffers are inserted immediately
     before the matmul that consumes them to preserve topological order.
 
-    A fill_cache is shared across all matmuls so that spyre.full is lowered
-    only once per unique (one_stick_size, device, dtype) combination.  All pad
-    operations with the same N and dtype reuse the same host-allocated fill row.
+    A fill_cache is shared across all matmuls so that spyre.constant is lowered
+    only once per unique (fill_value, device, dtype) combination.  All pad
+    operations with the same fill value and dtype reuse the same constant node.
     """
     fill_cache: dict[tuple, torch.fx.Node] = {}
     for op in list(operations):
