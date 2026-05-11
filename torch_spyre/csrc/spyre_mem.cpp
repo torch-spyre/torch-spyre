@@ -572,48 +572,22 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     stream = getCurrentStream(dst.device());
   } else {
     stream = getCurrentStream(self.device());
-    // D2H staging path: DMA the full physical allocation into a CPU buffer
-    // using dma_sizes/dma_strides/spyre_layout (the layout the data was
-    // written with), then apply the logical view on the CPU side.
-    //
-    // This path is taken when either:
-    //   (a) the tensor is not dense+non-overlapping (e.g. expanded/broadcast),
-    //       where the DMA path would drop broadcast/strided dims, OR
-    //   (b) product(dma_sizes) != self.numel(), meaning the physical allocation
-    //       is larger than the logical view (e.g. a slice of a flattened
-    //       tensor).  In that case the fast dense path would DMA dma_sizes
-    //       bytes into a dst sized from the logical shape, overflowing the
-    //       allocation and corrupting the heap.
-    if (self.is_privateuseone()) {
+    // D2H of a non-(dense+non-overlapping) source: the DMA path uses
+    // dma_sizes/dma_strides directly and would drop broadcast/strided dims.
+    // Stage the underlying allocation, then realize self's logical view on
+    // top of it after the copy.
+    if (self.is_privateuseone() &&
+        !self.unsafeGetTensorImpl()->is_non_overlapping_and_dense_default()) {
+      non_overlapping_and_dense = false;
       auto* spyre_impl =
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-      int64_t dma_numel = 1;
-      for (auto s : spyre_impl->dma_sizes) dma_numel *= s;
-      const bool physical_exceeds_logical = (dma_numel != self.numel());
-
-      if (!self.unsafeGetTensorImpl()->is_non_overlapping_and_dense_default() ||
-          physical_exceeds_logical) {
-        non_overlapping_and_dense = false;
-        c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
-        c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
-        alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
-                                    /*storage_offset=*/0);
-        // propagate_layouts computes alloc_view's dma_sizes and spyre_layout
-        // from self's current LOGICAL sizes, not from dma_sizes.  After a
-        // shrink, self's logical sizes are smaller than dma_sizes, so the
-        // propagated metadata is wrong — the DMA would only transfer the
-        // logical portion and leave the rest of cpu_alloc uninitialised.
-        // Override with self's physical metadata so the DMA reads the full
-        // original allocation using the layout the data was written with.
-        auto* alloc_impl =
-            static_cast<SpyreTensorImpl*>(alloc_view.unsafeGetTensorImpl());
-        alloc_impl->spyre_layout = spyre_impl->spyre_layout;
-        alloc_impl->dma_sizes = spyre_impl->dma_sizes;
-        alloc_impl->dma_strides = spyre_impl->dma_strides;
-        cpu_alloc = at::empty(alloc_sizes, dst.options());
-        copy_from = &alloc_view;
-        copy_to = &cpu_alloc;
-      }
+      c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
+      c10::IntArrayRef alloc_strides(spyre_impl->dma_strides);
+      alloc_view = at::as_strided(self, alloc_sizes, alloc_strides,
+                                  /*storage_offset=*/0);
+      cpu_alloc = at::empty(alloc_sizes, dst.options());
+      copy_from = &alloc_view;
+      copy_to = &cpu_alloc;
     }
   }
 
@@ -678,124 +652,10 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
-const at::Tensor& spyre_resize_(
-    const at::Tensor& self, c10::SymIntArrayRef size,
-    std::optional<c10::MemoryFormat> memory_format_opt) {
-  auto size_int = c10::asIntArrayRefUnchecked(size);
-
-  // Case 1: No-op.
-  if (self.sizes() == size_int) return self;
-
-  // Spyre tensors are always contiguous; treat Preserve as Contiguous.
-  if (memory_format_opt == c10::MemoryFormat::Preserve)
-    memory_format_opt = c10::MemoryFormat::Contiguous;
-  TORCH_CHECK(!memory_format_opt.has_value() ||
-                  *memory_format_opt == c10::MemoryFormat::Contiguous,
-              "aten::resize_ on Spyre only supports contiguous memory format");
-
-  const auto dtype = c10::typeMetaToScalarType(self.dtype());
-  TORCH_CHECK(spyre::is_supported_dtype(dtype),
-              "Spyre backend does not support dtype ", dtype);
-
-  // Compute contiguous strides for the new shape.
-  std::vector<int64_t> new_strides(size_int.size());
-  {
-    int64_t s = 1;
-    for (int i = static_cast<int>(size_int.size()) - 1; i >= 0; --i) {
-      new_strides[i] = s;
-      s *= size_int[i];
-    }
-  }
-
-  int64_t new_numel = 1;
-  for (auto d : size_int) new_numel *= d;
-  const int64_t old_numel = self.numel();
-  auto* self_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-
-  // Case 2: Same-numel — shape changes, no reallocation, no data movement.
-  //
-  // product(dma_sizes) == product(new sizes) == old_numel, so the D2H path
-  // writes exactly as many bytes as the CPU destination holds — no overflow.
-  // The DMA reads elements 0..N-1 sequentially using the original tile layout,
-  // which is the correct flat representation regardless of the new shape.
-  // All three physical fields (spyre_layout, dma_sizes, dma_strides) are left
-  // unchanged; only the logical sizes/strides are updated.
-  if (new_numel == old_numel) {
-    self_impl->set_sizes_and_strides(size_int, c10::IntArrayRef(new_strides));
-    DEBUGINFO("resize_ same-numel reshape to shape=", size_int,
-              " layout=", self_impl->spyre_layout.toString());
-    return self;
-  }
-
-  // Case 3: Shrink — metadata-only update, no reallocation.
-  //
-  // spyre_layout, dma_sizes, and dma_strides describe the physical allocation
-  // and are left unchanged — the storage still holds the original data in the
-  // original tile layout.  Only the logical sizes/strides are updated to
-  // expose the smaller view.
-  //
-  // D2H is safe because spyre_copy_from now detects product(dma_sizes) !=
-  // self.numel() and routes through the staging path: it DMAs the full
-  // physical allocation into a CPU buffer using the original layout, then
-  // applies as_strided(new_sizes, new_strides, 0) to extract only the first
-  // new_numel elements before copying to dst.
-  if (new_numel < old_numel) {
-    self_impl->set_sizes_and_strides(size_int, c10::IntArrayRef(new_strides));
-    DEBUGINFO("resize_ shrink to shape=", size_int,
-              " layout=", self_impl->spyre_layout.toString());
-    return self;
-  }
-
-  // Case 4: Expand — allocate new storage and D2D copy existing data.
-  //
-  //
-  // copy_from_d2d compiles via torch.compile → Inductor.  propagate_layouts
-  // assigns each tensor its spyre_layout (copied unchanged by flatten/slice),
-  // so the kernel uses separate DCIs for src and dst and retiles elements to
-  // their correct physical stick addresses in the new layout.
-  auto new_layout = SpyreTensorLayout(size_int.vec(), dtype);
-  const size_t new_size_bytes = get_device_size_in_bytes(new_layout);
-  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
-  auto new_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
-      c10::StorageImpl::use_byte_size_t(), new_size_bytes,
-      &SpyreAllocator::instance(), /*resizeable=*/true);
-
-  at::Tensor new_tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
-      c10::Storage(new_storage_impl), pu1_dks,
-      c10::scalarTypeToTypeMeta(dtype));
-  auto* new_impl =
-      static_cast<SpyreTensorImpl*>(new_tensor.unsafeGetTensorImpl());
-  new_impl->set_sizes_contiguous(size_int);
-  new_impl->spyre_layout = new_layout;
-  new_impl->dma_sizes = size_int.vec();
-  new_impl->dma_strides = new_strides;
-
-  // Flatten both tensors to 1D so at::_copy_from sees matching shapes, then
-  // slice the destination to [old_numel] before the D2D copy.  Elements
-  // beyond old_numel in the new allocation are left uninitialised.
-  at::Tensor flat_self = self.flatten();
-  at::Tensor flat_new = new_tensor.flatten();
-  at::Tensor flat_new_slice =
-      flat_new.slice(/*dim=*/0, /*start=*/0, /*end=*/old_numel);
-  at::_copy_from(flat_self, flat_new_slice, /*non_blocking=*/false);
-
-  // Swap self's storage and update all metadata in-place.
-  self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
-  self_impl->set_sizes_contiguous(size_int);
-  self_impl->spyre_layout = new_layout;
-  self_impl->dma_sizes = size_int.vec();
-  self_impl->dma_strides = new_strides;
-
-  DEBUGINFO("resize_ expand to shape=", size_int,
-            " layout=", self_impl->spyre_layout.toString());
-  return self;
-}
-
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
-  m.impl("resize_", TORCH_FN(spyre_resize_));
 }
 
 }  // namespace spyre
