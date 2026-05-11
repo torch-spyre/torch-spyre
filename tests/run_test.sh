@@ -512,7 +512,7 @@ def analyze(path):
     # can gate them via the YAML config, AND need cleanup so the raw star-imported
     # instance is not collected by pytest as a plain TestCase.
     class_level_parametrized_mixed = set()
-    for node in ast.walk(tree):
+    for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 base_name = ""
@@ -534,11 +534,35 @@ def analyze(path):
                             elif isinstance(fn, ast.Attribute): dec_name = fn.attr
                         if dec_name == "instantiate_parametrized_tests":
                             if all_parametrized:
-                                # All methods are @parametrize — pure class, skip injection.
                                 class_level_parametrized_pure.add(node.name)
                             else:
-                                # Mixed class — needs injection + cleanup.
-                                class_level_parametrized_mixed.add(node.name)
+                                # Mixed class: needs injection only if this is an
+                                # upstream PyTorch file (under TORCH_ROOT). For
+                                # OOT-native files (under TORCH_DEVICE_ROOT),
+                                # @instantiate_parametrized_tests is sufficient
+                                # and injection into instantiate_device_type_tests
+                                # would produce unwanted device-type subclasses.
+                                import os as _os
+                                torch_root = _os.environ.get("TORCH_ROOT", "")
+                                torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+                                is_upstream = (
+                                    torch_root
+                                    and _os.path.abspath(path).startswith(
+                                        _os.path.abspath(torch_root)
+                                    )
+                                )
+                                is_oot = (
+                                    torch_device_root
+                                    and _os.path.abspath(path).startswith(
+                                        _os.path.abspath(torch_device_root)
+                                    )
+                                )
+                                if is_upstream and not is_oot:
+                                    class_level_parametrized_mixed.add(node.name)
+                                else:
+                                    # OOT-native mixed class: fully handled by
+                                    # @instantiate_parametrized_tests, no injection needed.
+                                    class_level_parametrized_pure.add(node.name)
                     break
 
     # Classify instantiate_device_type_tests() calls:
@@ -548,26 +572,29 @@ def analyze(path):
     device_type_restricted = set()   # has only_for kwarg
     parametrized_instantiated = set()
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        fname = ""
-        if isinstance(func, ast.Name):        fname = func.id
-        elif isinstance(func, ast.Attribute): fname = func.attr
+    for stmt in ast.iter_child_nodes(tree):
+        if isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue  # skip class and function bodies — only module-level calls
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            fname = ""
+            if isinstance(func, ast.Name):        fname = func.id
+            elif isinstance(func, ast.Attribute): fname = func.attr
 
-        if fname == "instantiate_device_type_tests" and node.args:
-            arg = node.args[0]
-            if isinstance(arg, ast.Name):
-                cls_name = arg.id
-                if _call_has_only_for_kwarg(node):
-                    device_type_restricted.add(cls_name)
-                else:
-                    device_type_open.add(cls_name)
-        elif fname == "instantiate_parametrized_tests" and node.args:
-            arg = node.args[0]
-            if isinstance(arg, ast.Name):
-                parametrized_instantiated.add(arg.id)
+            if fname == "instantiate_device_type_tests" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Name):
+                    cls_name = arg.id
+                    if _call_has_only_for_kwarg(node):
+                        device_type_restricted.add(cls_name)
+                    else:
+                        device_type_open.add(cls_name)
+            elif fname == "instantiate_parametrized_tests" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Name):
+                    parametrized_instantiated.add(arg.id)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already

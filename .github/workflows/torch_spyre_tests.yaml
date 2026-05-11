@@ -1,4 +1,4 @@
-name: tests-v2
+name: torch-spyre-tests
 
 on:
   push:
@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   test:
-    name: build torch-spyre and run tests
+    name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
       - spyre_pf
@@ -39,6 +39,57 @@ jobs:
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          # Top-level tests
+          - name: Test Device Enum
+            config: torch_spyre_tests/test_device_enum_config.yaml
+          - name: Test Fallbacks
+            config: torch_spyre_tests/test_fallbacks_config.yaml
+          - name: Test Modules
+            config: torch_spyre_tests/test_modules_config.yaml
+          - name: Test Regex
+            config: torch_spyre_tests/test_regex_config.yaml
+          - name: Test Spyre
+            config: torch_spyre_tests/test_spyre_config.yaml
+          - name: Test Spyre Lazy Silent
+            config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
+          - name: Test Stream
+            config: torch_spyre_tests/test_stream_config.yaml
+          # Inductor tests
+          - name: Inductor Building Blocks
+            config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
+          - name: Inductor Codegen
+            config: torch_spyre_tests/inductor/test_codegen_config.yaml
+          - name: Inductor Decomp
+            config: torch_spyre_tests/inductor/test_decomp_config.yaml
+          - name: Inductor FX Passes
+            config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
+          - name: Inductor Normalization Scalars
+            config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
+          - name: Inductor Ops
+            config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
+          - name: Inductor Ops LX Planning
+            config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
+          - name: Inductor Scalar
+            config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
+          - name: Inductor Logging
+            config: torch_spyre_tests/inductor/test_logging_config.yaml
+          - name: Inductor Restickify
+            config: torch_spyre_tests/inductor/test_restickify_config.yaml
+          - name: Inductor Scratchpad Patterns
+            config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
+          - name: Inductor Scratchpad Use
+            config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
+          # Tensor tests
+          - name: Tensor Coordinates
+            config: torch_spyre_tests/tensors/test_coordinates_config.yaml
+          - name: Tensor It Space Splits
+            config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
+          - name: Tensor Layout
+            config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
     steps:
       - name: Checkout PR branch/commit in pre-cloned torch-spyre
         env:
@@ -119,19 +170,16 @@ jobs:
           uv pip show torch
           uv pip freeze
 
-      - name: Run unit tests
+      - name: Run ${{ matrix.suite.name }} tests
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_TORCH_SPYRE_DIR"
-          # shellcheck disable=SC1091
           source .venv/bin/activate
-          EXIT_CODE=0
-          pytest tests/ -vvv -s || EXIT_CODE=$?
-          echo "pytest EXIT_CODE: ${EXIT_CODE}"
-          if [[ "$EXIT_CODE" == '0' ]] ; then
-            echo 'pytest success'
-          else
-            echo 'pytest failed'
-          fi
-          exit "$EXIT_CODE"
+
+          CONFIG="${{ matrix.suite.config }}"
+
+          echo "Running ${{ matrix.suite.name }} tests..."
+          bash tests/run_test.sh "tests/configs/${CONFIG}" -v
+          echo "${{ matrix.suite.name }} tests done"
+
