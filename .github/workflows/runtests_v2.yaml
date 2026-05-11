@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   test:
-    name: Run Spyre unit tests
+    name: build torch-spyre and run tests
     runs-on:
       - x86_64
       - spyre_pf
