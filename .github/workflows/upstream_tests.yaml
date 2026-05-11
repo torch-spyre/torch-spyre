@@ -4,6 +4,10 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,14 +33,14 @@ jobs:
     #     config: <filename inside tests/configs/>
     #
     # The JUnit XML report is automatically named after the config file, e.g.:
-    #   test_suite_config.yaml  ->  test_suite_config.xml
+    #   test_view_ops_config.yaml  ->  test_view_ops_config.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
-          - name: View ops
-            config: test_suite_config.yaml
+          - name: View Ops
+            config: test_view_ops_config.yaml
           - name: Profiler
             config: test_profiler_config.yaml
 
@@ -140,7 +144,7 @@ jobs:
         run: |
           # Derive the XML report name from the config filename
           # Example:
-          #   test_suite_config.yaml    ->  test_suite_config.xml
+          #   test_view_ops_config.yaml    ->  test_view_ops_config.xml
           #   test_profiler_config.yaml ->  test_profiler_config.xml
 
           source "${VENV_PATH}/bin/activate"
@@ -149,7 +153,7 @@ jobs:
           REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
 
           echo "Running ${{ matrix.suite.name }} upstream tests..."
-          bash run_test.sh configs/${CONFIG} -v --junit-xml="${REPORT_PATH}"
+          bash run_test.sh configs/upstream_tests/${CONFIG} -v --junit-xml="${REPORT_PATH}"
           echo "${{ matrix.suite.name }} upstream tests done"
 
           # Expose report path/name to subsequent steps via GITHUB_ENV
