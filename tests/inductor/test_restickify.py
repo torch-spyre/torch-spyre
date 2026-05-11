@@ -455,6 +455,17 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+# ------- FallbackKernel + restickify regression test ---------
+
+
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+def test_fallback_with_restickify():
+    # FallbackKernel (torch.sin) produces a MultiOutput node. Verify the optimizer
+    # handles it via AnyInNode and still makes a correct restickify decision downstream.
+    x, y = _make_tensors(2, S, S)
+    _compare(lambda x, y: torch.sin(x) + y.t(), x, y, optimal_cost=S * S)
+
+
 # ------- Mutation + restickify regression test ---------
 
 
