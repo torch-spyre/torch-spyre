@@ -14,10 +14,14 @@
 
 
 import abc
+import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
+
+from . import config
+from .logging_utils import get_inductor_logger
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
@@ -31,6 +35,8 @@ from torch_spyre._C import SpyreTensorLayout
 from .pass_utils import compute_restickify_needed
 
 INF = math.inf
+
+logger = get_inductor_logger("optimize_restickify")
 
 
 @dataclass(frozen=True)
@@ -237,14 +243,6 @@ class AnyInNode(RestickNodeCost):
         return []
 
 
-def optimize_restickify_locations(operations: list) -> None:
-    """Select restickify locations for all ops, minimizing total restickify cost.
-
-    Currently uses a greedy local algorithm; intended to be replaced with a global optimizer.
-    """
-    greedy_local_min_cost(operations)
-
-
 def greedy_local_min_cost(operations: list) -> None:
     """Greedy layout selection: process ops in topological order, picking the output layout with minimum local restick cost.
 
@@ -307,3 +305,173 @@ def greedy_local_min_cost(operations: list) -> None:
         )
 
         op.committed_stl = out_stl
+
+
+# Global Stick Optimizer
+#
+# The global optimizer is a simple forward-propagation algorithm that tracks a frontier of possible
+# "states" and their corresponding cost. A state is a combination of concrete restickify decisions
+# that have been made so far. The cost is a proxy for the runtime cost of executing those restickify
+# decisions.
+#
+# The number of states can grow exponentially. To prevent this blow-up the number of states is bounded
+# by a "beam width". When beam width is exceeded, the highest cost states are trimmed. Optimal cost is
+# only achieved if the optimal state always remains in the beam.
+#
+# Future improvements include (a) using live node analysis to prune dead states and (b) back-propagating
+# a "min_cost" to avoid dropping states that become important later. These will be added only once
+# we see evidence it matters in the models we are targeting.
+
+
+@dataclass
+class BeamState:
+    """One hypothesis in the beam: a partial assignment of STLs to ops, with accumulated cost.
+
+    assignments is a tuple parallel to a shared buf_names list — index i holds the
+    chosen SpyreTensorLayout for buf_names[i], or None for passthrough ops.
+    """
+
+    assignments: tuple  # tuple[SpyreTensorLayout | None, ...]
+    cost: float
+
+
+BEAM_WIDTH = 64
+
+
+class Frontier:
+    """Beam search frontier: shared buf_names index plus a list of BeamStates."""
+
+    def __init__(self, K: int):
+        self.K = K
+        self.buf_names: list[str] = []  # parallel index for BeamState.assignments
+        self._buf_idx: dict[str, int] = {}  # name -> index into buf_names
+        self.states: list[BeamState] = [BeamState(assignments=(), cost=0.0)]
+
+    def add_buf(self, name: str) -> None:
+        self._buf_idx[name] = len(self.buf_names)
+        self.buf_names.append(name)
+
+    def input_stl(self, state: BeamState, name: str) -> "SpyreTensorLayout | None":
+        """Return the hypothesized STL for an input buffer in this state."""
+        idx = self._buf_idx[name]
+        return state.assignments[idx]
+
+    def best(self) -> BeamState:
+        return self.states[0]
+
+    def trim(self) -> None:
+        self.states.sort(key=lambda s: s.cost)
+        before = len(self.states)
+        self.states = self.states[: self.K]
+        if len(self.states) < before:
+            logger.debug(
+                "beam trimmed: %d -> %d states (beam_width=%d)",
+                before,
+                len(self.states),
+                self.K,
+            )
+
+
+def beam_global_min_cost(operations: list) -> None:
+    """Global beam search layout selection.
+
+    Processes ops in topological order. For each op with a restick_cost_fn,
+    expands every current state by branching over candidate output STLs and
+    accumulating cost. After each op the beam is pruned to K best states.
+    At the end, the best state's assignments are committed to the ops.
+    """
+    # Commit graph inputs — fixed STL, same across all states.
+    for name in V.graph.graph_input_names:
+        tb = V.graph.graph_inputs[name]
+        if (
+            isinstance(tb, TensorBox)
+            and isinstance(tb.data, StorageBox)
+            and isinstance(tb.data.data, InputBuffer)
+            and hasattr(tb, "layouts")
+        ):
+            stl = next(iter(tb.layouts))
+            tb.data.data.committed_stl = stl
+            tb.committed_stl = stl
+
+    frontier = Frontier(BEAM_WIDTH)
+    max_states = 1
+
+    for op in operations:
+        if not hasattr(op, "layouts"):
+            continue
+
+        frontier.add_buf(op.get_name())
+
+        if not hasattr(op, "restick_cost_fn"):
+            assert len(op.layouts) == 1, (
+                f"passthrough op {op.get_name()} has {len(op.layouts)} layouts, expected 1"
+            )
+            frontier.states = [
+                BeamState(
+                    assignments=state.assignments + (op.layouts[0],),
+                    cost=state.cost,
+                )
+                for state in frontier.states
+            ]
+            continue
+
+        cost_fn = op.restick_cost_fn
+        deps = [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
+
+        next_states = []
+        for state in frontier.states:
+            in_layouts = []
+            for dep in deps:
+                if dep.name in V.graph.graph_input_names:
+                    # When we allow multiple STLs for inputs this special case will go away
+                    in_layouts.append(V.graph.get_buffer(dep.name).committed_stl)
+                else:
+                    in_layouts.append(frontier.input_stl(state, dep.name))
+
+            for candidate_stl in op.layouts:
+                extra_cost = cost_fn.cost(in_layouts, candidate_stl)
+                if extra_cost < INF:
+                    next_states.append(
+                        BeamState(
+                            assignments=state.assignments + (candidate_stl,),
+                            cost=state.cost + extra_cost,
+                        )
+                    )
+
+        frontier.states = next_states
+        frontier.trim()
+        if not frontier.states:
+            raise RuntimeError(
+                f"beam search: no feasible layout combination found after op {op.get_name()}"
+            )
+        max_states = max(max_states, len(frontier.states))
+        if logger.isEnabledFor(logging.DEBUG):
+            lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]
+            for i, s in enumerate(frontier.states):
+                lines.append(f"  state {i} (cost={s.cost}):")
+                for name, stl in zip(frontier.buf_names, s.assignments):
+                    lines.append(f"    {name}: stride_map={list(stl.stride_map)}")
+            logger.debug("\n".join(lines))
+
+    logger.info(
+        "beam search done: max states = %d, best cost = %s",
+        max_states,
+        frontier.best().cost,
+    )
+
+    # Commit the best state's assignments to all ops.
+    best = frontier.best()
+    for name, stl in zip(frontier.buf_names, best.assignments):
+        op = V.graph.get_buffer(name)
+        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            op.committed_stl = stl
+
+
+def optimize_restickify_locations(operations: list) -> None:
+    """Select restickify locations for all ops, minimizing total restickify cost."""
+    if config.global_stick_optimizer:
+        logger.info("optimizer: beam (global)")
+        beam_global_min_cost(operations)
+    else:
+        logger.info("optimizer: greedy (local)")
+        greedy_local_min_cost(operations)

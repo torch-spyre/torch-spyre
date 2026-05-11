@@ -29,11 +29,16 @@ POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
     "cos": torch.cos,
     "exp": torch.exp,
+    "floor": torch.floor,
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sin": torch.sin,
     "tanh": torch.tanh,
+}
+
+POINTWISE_UNARY_OPS_FP32_DICT = {
+    "floor": torch.floor,
 }
 
 POINTWISE_BINARY_OPS_DICT = {
@@ -1013,6 +1018,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
                     cached_randn((2, 4, 12, 64), dtype=torch.float16),
                 ),
+                "4d_dim2_zero": (
+                    2,
+                    cached_randn((0)),
+                    cached_randn((1, 8, 14, 64), dtype=torch.float16),
+                ),
                 "4d_dim3": (
                     3,
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
@@ -1022,6 +1032,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     cached_randn((2, 4, 3, 64), dtype=torch.float32),
                     cached_randn((2, 4, 3, 32), dtype=torch.float32),
+                ),
+                "4d_dim_m2_empty_first": (
+                    -2,
+                    torch.zeros(0, dtype=torch.float16),
+                    cached_randn((1, 8, 14, 64), dtype=torch.float16),
                 ),
             },
         },
@@ -2967,6 +2982,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_4d_dim_3",
             ],
         },
+        (
+            "test_pointwise_unary_op_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": POINTWISE_UNARY_OPS_FP32_DICT,
+            "param_sets": {
+                "256": (cached_randn((256,), dtype=torch.float32),),
+                "67x256": (cached_randn((67, 256), dtype=torch.float32),),
+                "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -2984,6 +3010,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
+        elif op == torch.floor:
+            # To avoid cpu mismatch due to a negative fp16 having a fraction 0b0000000001
+            x = x.to("spyre").cpu()
 
         self.compare_with_cpu(op, x)
 

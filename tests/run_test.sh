@@ -404,16 +404,79 @@ _ANALYZER_PY='
 import ast, sys, json
 from pathlib import Path
 
-def class_methods_info(classdef):
-    """Return (has_device_method, [all_test_method_names]) for a ClassDef."""
+def _get_parametrize_names(tree):
+    """Return the set of names assigned from parametrize(...) calls at module level.
+
+    Handles patterns like:
+        parametrize_unary_ufuncs = parametrize("ufunc", [np.sin])
+        parametrize_casting = parametrize("casting", [...])
+
+    These names are used as decorators (@parametrize_unary_ufuncs) and must be
+    treated identically to @parametrize when determining if a class is pure-parametrize.
+    """
+    parametrize_names = {"parametrize"}  # always include the base name
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            # Look for: name = parametrize(...) or name = parametrize_something(...)
+            if isinstance(node.value, ast.Call):
+                fn = node.value.func
+                fn_name = ""
+                if isinstance(fn, ast.Name):        fn_name = fn.id
+                elif isinstance(fn, ast.Attribute): fn_name = fn.attr
+                if fn_name == "parametrize":
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            parametrize_names.add(target.id)
+    return parametrize_names
+
+
+def class_methods_info(classdef, parametrize_names):
+    """Return (has_device, all_test_methods_parametrized, [method_names]) for a ClassDef.
+
+    has_device                    -- any test method has a `device` parameter
+    all_test_methods_parametrized -- True only when EVERY test method carries a
+                                     @parametrize decorator (or a variable assigned
+                                     from parametrize(...)). Used to distinguish
+                                     pure instantiate_parametrized_tests classes
+                                     (e.g. TestUnaryUfuncs — all methods @parametrize)
+                                     from mixed classes (e.g. TestProfiler — only some
+                                     methods @parametrize). Pure classes must not be
+                                     injected into instantiate_device_type_tests().
+    """
     methods = []
     has_device = False
+    parametrized_count = 0
     for node in ast.walk(classdef):
         if isinstance(node, ast.FunctionDef) and node.name.startswith("test"):
             if any(a.arg == "device" for a in node.args.args):
                 has_device = True
             methods.append(node.name)
-    return has_device, methods
+            # Scan ALL decorators on this method to find if any is @parametrize
+            # or a variable assigned from parametrize(...) (e.g. parametrize_unary_ufuncs).
+            # Do not break early — a method may have @skip as outermost decorator
+            # followed by @parametrize, and we must not miss the @parametrize.
+            method_has_parametrize = False
+            for dec in node.decorator_list:
+                dec_name = ""
+                if isinstance(dec, ast.Name):
+                    dec_name = dec.id
+                elif isinstance(dec, ast.Attribute):
+                    dec_name = dec.attr
+                elif isinstance(dec, ast.Call):
+                    fn = dec.func
+                    if isinstance(fn, ast.Name):        dec_name = fn.id
+                    elif isinstance(fn, ast.Attribute): dec_name = fn.attr
+                if dec_name in parametrize_names:
+                    method_has_parametrize = True
+                    break
+            if method_has_parametrize:
+                parametrized_count += 1
+    # True only when ALL test methods use @parametrize (or a parametrize alias) —
+    # indicates this class belongs to instantiate_parametrized_tests, not
+    # instantiate_device_type_tests. Mixed classes (some @parametrize, some plain)
+    # like TestProfiler are NOT treated as parametrize-only and must still be injected.
+    all_parametrized = bool(methods) and (parametrized_count == len(methods))
+    return has_device, all_parametrized, methods
 
 def _call_has_only_for_kwarg(call_node):
     """Return True if the Call node has an `only_for` keyword argument."""
@@ -428,9 +491,27 @@ def analyze(path):
         tree = ast.parse(source, filename=path)
     except SyntaxError as e:
         print(json.dumps({"error": f"SyntaxError: {e}"})); return
+    
+    # Pre-scan for names assigned from parametrize(...) calls (e.g. parametrize_unary_ufuncs).
+    # These are used as decorators and must be recognised as equivalent to @parametrize.
+    parametrize_names = _get_parametrize_names(tree)
+
 
     # ALL TestCase subclasses in this file
     all_classes = {}   # name -> has_device_method
+    # class_level_parametrized_pure: classes with @instantiate_parametrized_tests
+    # decorator where ALL test methods are also @parametrize-decorated.
+    # These are pure parametrize classes (e.g. TestUnaryUfuncs, TestBinaryUfuncs)
+    # that must never be injected into instantiate_device_type_tests() — their
+    # @parametrize args (e.g. np.sin) are not torch.dtype objects and would crash
+    # upstream dtype_name(). Kept in fully_handled so they are excluded from injection.
+    class_level_parametrized_pure = set()
+    # class_level_parametrized_mixed: classes with @instantiate_parametrized_tests
+    # decorator where only SOME test methods are @parametrize-decorated (e.g. TestProfiler).
+    # These still need injection into instantiate_device_type_tests() so TorchTestBase
+    # can gate them via the YAML config, AND need cleanup so the raw star-imported
+    # instance is not collected by pytest as a plain TestCase.
+    class_level_parametrized_mixed = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
@@ -438,9 +519,28 @@ def analyze(path):
                 if isinstance(base, ast.Name):        base_name = base.id
                 elif isinstance(base, ast.Attribute): base_name = base.attr
                 if "TestCase" in base_name or base_name.endswith("TestBase"):
-                    has_device, _ = class_methods_info(node)
+                    has_device, all_parametrized, _ = class_methods_info(node, parametrize_names)
                     all_classes[node.name] = has_device
+                    # Check for @instantiate_parametrized_tests as a class decorator.
+                    for dec in node.decorator_list:
+                        dec_name = ""
+                        if isinstance(dec, ast.Name):
+                            dec_name = dec.id
+                        elif isinstance(dec, ast.Attribute):
+                            dec_name = dec.attr
+                        elif isinstance(dec, ast.Call):
+                            fn = dec.func
+                            if isinstance(fn, ast.Name):        dec_name = fn.id
+                            elif isinstance(fn, ast.Attribute): dec_name = fn.attr
+                        if dec_name == "instantiate_parametrized_tests":
+                            if all_parametrized:
+                                # All methods are @parametrize — pure class, skip injection.
+                                class_level_parametrized_pure.add(node.name)
+                            else:
+                                # Mixed class — needs injection + cleanup.
+                                class_level_parametrized_mixed.add(node.name)
                     break
+
     # Classify instantiate_device_type_tests() calls:
     #   without only_for  -> fully open, framework already controls all devices
     #   with    only_for  -> restricted; spyre/privateuse1 likely excluded
@@ -473,16 +573,34 @@ def analyze(path):
     # only_for and once without) is treated as open: the open call already
     # covers all devices including spyre.
     device_type_restricted -= device_type_open
-    
-    # "Fully handled" = open device_type + parametrized
+
+    # "Fully handled" = open device_type + parametrized (standalone call form)
+    #                 + class_level_parametrized_pure (decorator form, all methods @parametrize).
+    # class_level_parametrized_mixed is intentionally excluded: those classes still
+    # need injection into instantiate_device_type_tests() so TorchTestBase can gate
+    # them via the YAML config (they land in uncontrolled below).
     # (restricted is NOT fully handled for spyre)
-    fully_handled = device_type_open | parametrized_instantiated
+    fully_handled = device_type_open | parametrized_instantiated | class_level_parametrized_pure
 
     # uncontrolled: never passed to any instantiate_* call
     uncontrolled = sorted(set(all_classes) - fully_handled - device_type_restricted)
 
     # needs_injection: everything the wrapper must re-inject
     needs_injection = sorted(set(uncontrolled) | device_type_restricted)
+
+    # needs_cleanup: classes whose original name survives the star-import in the
+    # wrapper globals() and would be collected by pytest as a plain TestCase,
+    # bypassing TorchTestBase._should_run() entirely. This causes YAML mode:skip
+    # entries to be ignored and the raw test body to execute (potentially hitting
+    # hardware or crashing). Two sources:
+    #   1. uncontrolled classes: injected fresh; star-import leaves original in globals.
+    #   2. class_level_parametrized_mixed classes: @instantiate_parametrized_tests
+    #      decorator leaves the class in globals() after the star-import just like
+    #      uncontrolled classes; they are injected (via uncontrolled above) and need
+    #      cleanup so pytest does not also collect the raw star-imported instance.
+    # Restricted classes are NOT in this set — their name is already removed
+    # from globals() by the upstream only_for instantiate_device_type_tests call.
+    needs_cleanup = sorted(set(uncontrolled) | class_level_parametrized_mixed)
 
     # Plain classes (no device arg in any test method) within needs_injection
     plain_no_device = sorted(
@@ -496,6 +614,7 @@ def analyze(path):
         "parametrized":           sorted(parametrized_instantiated),
         "uncontrolled":           uncontrolled,
         "needs_injection":        needs_injection,
+        "needs_cleanup":          needs_cleanup,
         "plain_no_device":        plain_no_device,
     }))
 
@@ -564,6 +683,8 @@ trap _cleanup_wrappers EXIT
 
 # generate_wrapper_if_needed <test_file>
 # Sets global _RUN_FILE to the path pytest should actually run.
+# generate_wrapper_if_needed <test_file>
+# Sets global _RUN_FILE to the path pytest should actually run.
 _RUN_FILE=""
 generate_wrapper_if_needed() {
     local test_file="$1"
@@ -584,7 +705,7 @@ import json,sys; d=json.load(sys.stdin); print(d.get('error',''))
         return 0
     fi
 
-    local needs_injection_str plain_str restricted_str uncontrolled_str
+    local needs_injection_str plain_str restricted_str uncontrolled_str cleanup_str
     needs_injection_str=$(echo "$result" | python3 -c "
 import json,sys; d=json.load(sys.stdin); print(' '.join(d['needs_injection']))
 ")
@@ -596,6 +717,9 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['device_type_restricte
 ")
     uncontrolled_str=$(echo "$result" | python3 -c "
 import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
+")
+    cleanup_str=$(echo "$result" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(' '.join(d['needs_cleanup']))
 ")
 
     if [[ -z "$needs_injection_str" ]]; then
@@ -609,6 +733,8 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
     [[ -n "$restricted_str" ]] && read -r -a RESTRICTED_CLASSES <<< "$restricted_str"
     local -a UNCONTROLLED_CLASSES=()
     [[ -n "$uncontrolled_str" ]] && read -r -a UNCONTROLLED_CLASSES <<< "$uncontrolled_str"
+    local -a CLEANUP_CLASSES=()
+    [[ -n "$cleanup_str" ]] && read -r -a CLEANUP_CLASSES <<< "$cleanup_str"
     # Warn about plain classes -- they are safe only when YAML skips them.
     if [[ ${#PLAIN_CLASSES[@]} -gt 0 ]]; then
         echo "[spyre_run] NOTE: the following classes have no 'device' arg in their"
@@ -656,6 +782,27 @@ _instantiate(_cls_${cls}, globals())
 _restore_staticmethods(_cls_${cls}, globals())
 "
     done
+
+    # ---------------------------------------------------------------------------
+    # Build cleanup block: delete injected uncontrolled classes from wrapper
+    # globals() after injection so pytest only sees the OOT-controlled
+    # device-type subclass (e.g. TestProfilerPRIVATEUSE1), not the raw
+    # star-imported TestCase (e.g. TestProfiler) which would bypass
+    # TorchTestBase._should_run() and ignore YAML mode:skip entries entirely.
+    # Only uncontrolled classes need this — restricted classes are already
+    # removed from globals() by the upstream only_for call.
+    # ---------------------------------------------------------------------------
+    local cleanup_block=""
+    for cls in "${CLEANUP_CLASSES[@]}"; do
+        cleanup_block+="
+# Remove original class from wrapper scope — pytest must only collect the
+# OOT-controlled device-type subclass generated above, not the raw TestCase
+# left in globals() by the star-import.
+if '${cls}' in globals():
+    del globals()['${cls}']
+"
+    done
+
     # Separate quoted lists for restricted vs uncontrolled classes --
     # each is retrieved differently from the private module.
     local quoted_restricted_list=""
@@ -833,6 +980,17 @@ def _restore_staticmethods(original_cls, scope):
 # instantiate_device_type_tests unwrapped during member copying.
 #
 ${injection_block}
+
+# ---------------------------------------------------------------------------
+# Cleanup: remove original uncontrolled class names from wrapper globals()
+# so pytest does not collect them as plain TestCase instances in addition to
+# the OOT-controlled device-type subclasses generated above. Without this,
+# the raw star-imported class (e.g. TestProfiler) would be collected and run
+# directly, bypassing TorchTestBase._should_run() and ignoring YAML mode:skip.
+# Restricted classes are excluded here — the upstream only_for call already
+# removed them from globals() before the star-import.
+# ---------------------------------------------------------------------------
+${cleanup_block}
 
 WRAPPER_EOF
 

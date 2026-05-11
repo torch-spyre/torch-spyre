@@ -167,6 +167,10 @@ class SpyreOpFuncs:
         return f"spyre.exx2({a} {b} {c})"
 
     @staticmethod
+    def floor(x):
+        return PointwiseOp("floor", [x])
+
+    @staticmethod
     def ge(a, b):
         return PointwiseOp("greaterequal", [a, b])
 
