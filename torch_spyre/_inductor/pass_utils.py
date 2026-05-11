@@ -441,6 +441,7 @@ def lower_pad_sequence(
     dtype: torch.dtype,
     dim: int,
     insert_before: torch.fx.Node,
+    orig_stl: SpyreTensorLayout,
     fill_value: float = 0.0,
     fill_cache: dict | None = None,
 ) -> tuple[Buffer, list[Operation]]:
@@ -464,6 +465,18 @@ def lower_pad_sequence(
     ``pad_size`` equals ``padded_size`` with ``pad_size[dim] = pad_extent``
     where ``pad_extent = padded_size[dim] - original_size[dim]``.
     ``fill_offset = original_size[dim]``.
+
+    ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer.  The
+    padded allocation's ``SpyreTensorLayout`` is derived from it so that the
+    within-stick host dimension is preserved: the last entry of
+    ``device_coordinates`` for both the original and padded buffers will be
+    identical.  This is achieved by recovering the within-stick host dimension
+    from ``orig_stl.stride_map[-1]`` (the host stride of the within-stick dim)
+    and constructing the padded STL via ``SpyreTensorLayout(padded_size,
+    padded_host_stride, dtype, dim_order)`` with the same ``dim_order``.  Falls
+    back to ``SpyreTensorLayout(padded_size, dtype)`` when ``orig_stl`` has a
+    different number of dimensions than ``padded_size`` (e.g. when
+    mm_to_bmm_pass adds a batch dimension).
 
     ``fill_cache`` maps ``(fill_value, device, dtype)`` to an existing
     ``spyre.constant`` FX node.  On a cache hit that node is reused and not
@@ -583,7 +596,40 @@ def lower_pad_sequence(
     graph_lowering.env[empty_fx] = empty_tb
     padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> MultiOutput
     assert isinstance(padded_buf, MultiOutput)
-    _assign_layout(padded_buf)
+    # Build the padded STL preserving the within-stick host dimension of orig_stl.
+    # stride_map[-1] is the host stride of the within-stick dimension; find the
+    # corresponding dim in the (possibly larger) view's stride list and use it as
+    # the last entry of dim_order so that device_coordinates[-1] (the stick
+    # coordinate expression) is identical for the original and padded buffers.
+    # arg_fx_node.meta["val"].stride() gives the strides of the view that the
+    # matmul inner_fn actually accesses (e.g. [1,M,K] when mm_to_bmm_pass added
+    # a batch dim), so the lookup works even when ndim(orig_stl) < ndim(padded_size).
+    # Falls back to generic only when no stride matches (should not occur in practice).
+    orig_host_stride = list(arg_fx_node.meta["val"].stride())
+    sm_last = int(list(orig_stl.stride_map)[-1])
+    within_stick_dim = next(
+        (i for i, s in enumerate(orig_host_stride) if int(s) == sm_last), None
+    )
+    if within_stick_dim is not None:
+        dim_order = [i for i in range(len(padded_size)) if i != within_stick_dim] + [
+            within_stick_dim
+        ]
+        padded_host_stride = [1] * len(padded_size)
+        for i in range(len(padded_size) - 2, -1, -1):
+            padded_host_stride[i] = padded_host_stride[i + 1] * padded_size[i + 1]
+        padded_stl = SpyreTensorLayout(
+            padded_size, padded_host_stride, dtype, dim_order
+        )
+    else:
+        padded_stl = SpyreTensorLayout([concretize_expr(s) for s in padded_size], dtype)
+    host_layout = padded_buf.layout
+    padded_buf.layout = FixedTiledLayout(
+        host_layout.device,
+        host_layout.dtype,
+        host_layout.size,
+        host_layout.stride,
+        padded_stl,
+    )
 
     if const_is_new:
         const_tb = graph_lowering.run_node(const_fx)

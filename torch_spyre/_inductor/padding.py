@@ -270,6 +270,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             )
             continue
 
+        x_orig_stl = x_buf.get_layout().device_layout
         x_padded_buf, x_new_ops = lower_pad_sequence(
             x_fx_node,
             padded_size=x_padded_size,
@@ -277,6 +278,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             dtype=dtype,
             dim=len(x_padded_size) - 1,
             insert_before=matmul_fx_node,
+            orig_stl=x_orig_stl,
             fill_cache=fill_cache,
         )
 
@@ -296,6 +298,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             )
             continue
 
+        y_orig_stl = y_buf.get_layout().device_layout
         y_padded_buf, y_new_ops = lower_pad_sequence(
             y_fx_node,
             padded_size=y_padded_size,
@@ -303,6 +306,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             dtype=dtype,
             dim=y_k_dim,
             insert_before=matmul_fx_node,
+            orig_stl=y_orig_stl,
             fill_cache=fill_cache,
         )
 
