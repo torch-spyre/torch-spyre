@@ -36,6 +36,7 @@ from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+from torch_spyre._inductor.ir import SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 
 
@@ -159,17 +160,9 @@ class TestInsertPaddingIR(unittest.TestCase):
         return result
 
     @staticmethod
-    def _full_nodes(ops: list[Operation]) -> list[MultiOutput]:
-        """Return MultiOutput ops whose origin_node comes from a spyre.full node."""
-        result = []
-        for op in ops:
-            if not isinstance(op, MultiOutput):
-                continue
-            origin = getattr(op, "origin_node", None)
-            if origin is not None and hasattr(origin, "target"):
-                if origin.target is torch.ops.spyre.full.default:
-                    result.append(op)
-        return result
+    def _constant_nodes(ops: list[Operation]) -> list[SpyreConstantFallback]:
+        """Return SpyreConstantFallback ops (fill-value constants for padding)."""
+        return [op for op in ops if isinstance(op, SpyreConstantFallback)]
 
     # ------------------------------------------------------------------
     # Tests
@@ -343,19 +336,12 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(int(reduction.reduction_ranges[0]), k_padded)
 
     def test_fill_cache_shared_across_same_dtype(self) -> None:
-        """Two matmuls with the same shapes share spyre.full nodes via fill_cache.
+        """Two matmuls with the same shapes share the spyre.constant node via fill_cache.
 
-        With K=67 and N=128 for both matmuls, each pad sequence (x and y) has
-        the same one_stick_size cache key.  The second matmul's padding reuses
-        the same spyre.full nodes as the first, so the total spyre.full count
-        equals the unique (one_stick_size, device, dtype) combinations — not
-        2 × (per-matmul count).
-
-        For 3D bmm with K=67→128 and N=128:
-          x padding: one_stick_size = [1, 1, stick_size]
-          y padding: one_stick_size = [1, 1, N]  (= [1, 1, 128])
-        These are two distinct cache keys, so 2 spyre.full nodes total (both
-        reused by the second matmul).
+        The fill_cache key is (fill_value, device, dtype).  All padding — x and y
+        for both matmuls — uses fill_value=0.0 and the same device and dtype, so
+        exactly one spyre.constant node is lowered and reused for all four pad
+        sequences.
         """
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
@@ -372,15 +358,13 @@ class TestInsertPaddingIR(unittest.TestCase):
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 2, "Expected 2 matmul ops")
 
-        # Count spyre.full MultiOutput ops.  With fill_cache, each unique
-        # one_stick_size key is lowered once.  For this 3D bmm the two keys are
-        # [1, 1, stick_size] and [1, 1, N=128], so expect exactly 2 full nodes —
-        # not 4 (2 per matmul without caching).
-        full_ops = self._full_nodes(ops)
+        # With fill_cache, the single (0.0, device, float16) key is shared across
+        # all padding calls, so exactly 1 spyre.constant node is lowered total.
+        constant_ops = self._constant_nodes(ops)
         self.assertEqual(
-            len(full_ops),
-            2,
-            f"Expected 2 spyre.full (one per unique shape, cache shared), got {len(full_ops)}",
+            len(constant_ops),
+            1,
+            f"Expected 1 spyre.constant (cache shared across all padding), got {len(constant_ops)}",
         )
 
     def test_origin_node_set_on_rebuilt_matmul(self) -> None:

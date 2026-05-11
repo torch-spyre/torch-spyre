@@ -18,22 +18,22 @@ after insert_restickify, when every ComputedBuffer has a FixedTiledLayout.
 
 Both x and y are padded along their K dimension.  For each argument:
   spyre.empty(padded_size)                         — uninitialised allocation
-  spyre.full([1]*(ndim-1) + [pad_extent], 0.0)     — one stick of zeros (128 bytes DMA)
-  aten.expand(full, pad_size)                      — broadcast to pad-region shape; free
+  spyre.constant(0.0)                              — scalar zero, generated on-device (cached)
+  aten.expand(constant, pad_size)                  — broadcast to pad-region shape; free
   aten.clone(expand)                               — on-device broadcast copy → fill buffer
   overwrite(fill_buf, empty, [dim], [fill_offset]) — write zeros into pad region
   overwrite(orig,     empty, [dim], [0])           — copy original data at offset 0
 
-Only spyre.full crosses the host→device DMA bus; its last dimension equals
-pad_extent (the actual pad amount) to ensure the DMA covers exactly one full
-stick.  aten.expand broadcasts the one-stick source to the full pad-region
-shape and aten.clone materialises it on-device.
+spyre.constant generates the fill value in-place on device with no host→device
+DMA.  aten.expand broadcasts the scalar to the full pad-region shape and
+aten.clone materialises it on-device.
 
 fill_offset = original_size[dim] so the pad region starts right after the
 original data.  pad_size equals padded_size with pad_size[dim] = pad_extent.
 
-spyre.full is cached across all matmuls with the same (one_stick_size, device,
-dtype) key so the DMA is issued at most once per unique pad extent and dtype.
+spyre.constant is cached across all matmuls with the same (fill_value, device,
+dtype) key so it is lowered at most once per unique fill value and dtype,
+regardless of tensor shape or which dimension is padded.
 
 x's effective size is derived from the output ranges ([batch..., M, K]) rather
 than from the underlying buffer's shape.  This handles cases where mm_to_bmm_pass

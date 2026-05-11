@@ -455,8 +455,8 @@ def lower_pad_sequence(
 
     FX nodes created (in order):
       1. spyre.empty(padded_size)                        — uninitialised allocation
-      2. spyre.full(one_stick_size, fill_value)           — one stick DMA (cached)
-      3. aten.expand(full, pad_size)                     — broadcast to fill-region shape; free
+      2. spyre.constant(fill_value)                      — scalar constant, on-device (cached)
+      3. aten.expand(constant, pad_size)                 — broadcast to fill-region shape; free
       4. aten.clone(expand)                              — on-device broadcast → fill buffer
       5. overwrite(fill_buf, empty, [dim], [fill_offset]) — write pad region
       6. overwrite(orig,     empty, [dim], [0])           — copy original data
@@ -464,11 +464,11 @@ def lower_pad_sequence(
     ``pad_size`` equals ``padded_size`` with ``pad_size[dim] = pad_extent``
     where ``pad_extent = padded_size[dim] - original_size[dim]``.
     ``fill_offset = original_size[dim]``.
-    ``one_stick_size = [1]*(ndim-1) + [pad_size[-1]]`` broadcasts along all
-    leading dims so only one stick is DMA'd from host.
 
-    ``fill_cache`` maps ``(tuple(one_stick_size), device, dtype)`` to an existing
-    ``spyre.full`` FX node.  On a cache hit that node is reused and not re-lowered.
+    ``fill_cache`` maps ``(fill_value, device, dtype)`` to an existing
+    ``spyre.constant`` FX node.  On a cache hit that node is reused and not
+    re-lowered.  All padding with the same fill value, device, and dtype shares
+    one constant node regardless of tensor shape or padded dimension.
 
     ``insert_before`` is the FX node before which new nodes are inserted.
 
@@ -476,6 +476,7 @@ def lower_pad_sequence(
     and ``new_ops`` is the list of new IR operations in topological order.
     """
     from .propagate_layouts import generic_layout  # deferred to avoid circular import
+    from .ir import SpyreConstantFallback  # deferred to avoid circular import
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -483,7 +484,6 @@ def lower_pad_sequence(
     # Count operations before lowering so we can identify newly added ones.
     ops_before = len(graph_lowering.operations)
 
-    ndim = len(padded_size)
     original_size_dim: int = arg_fx_node.meta["val"].shape[dim]
     pad_extent = padded_size[dim] - original_size_dim
     assert pad_extent > 0, (
@@ -496,11 +496,8 @@ def lower_pad_sequence(
     pad_size = list(padded_size)
     pad_size[dim] = pad_extent
 
-    # Minimal fill source: scalar in all dims except the last.
-    # pad_size[-1] == pad_extent when dim is last; padded_size[-1] otherwise.
-    one_stick_size = [1] * (ndim - 1) + [pad_size[-1]]
-    cache_key = (tuple(one_stick_size), device, dtype)
-    one_stick_is_new = fill_cache is None or cache_key not in fill_cache
+    cache_key = (fill_value, device, dtype)
+    const_is_new = fill_cache is None or cache_key not in fill_cache
 
     with fx_graph.inserting_before(insert_before):
         # 1. Uninitialised padded buffer.
@@ -511,26 +508,24 @@ def lower_pad_sequence(
         )
         empty_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
 
-        # 2. One stick of fill values — only this is DMA'd from host (reused if cached).
+        # 2. Scalar constant — generated on-device, no DMA (reused if cached).
         if fill_cache is not None and cache_key in fill_cache:
-            one_stick_fx = fill_cache[cache_key]
+            const_fx = fill_cache[cache_key]
         else:
-            one_stick_fx = fx_graph.create_node(
+            const_fx = fx_graph.create_node(
                 "call_function",
-                torch.ops.spyre.full.default,
-                args=(one_stick_size, fill_value, device, dtype),
+                torch.ops.spyre.constant.default,
+                args=(fill_value, dtype, device),
             )
-            one_stick_fx.meta["val"] = torch.empty(
-                one_stick_size, dtype=dtype, device=device
-            )
+            const_fx.meta["val"] = fill_value
             if fill_cache is not None:
-                fill_cache[cache_key] = one_stick_fx
+                fill_cache[cache_key] = const_fx
 
         # 3. Broadcast to fill-region shape (ExpandView — no allocation).
         expand_fx = fx_graph.create_node(
             "call_function",
             torch.ops.aten.expand.default,
-            args=(one_stick_fx, pad_size),
+            args=(const_fx, pad_size),
         )
         expand_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
 
@@ -562,8 +557,9 @@ def lower_pad_sequence(
     # propagate_spyre_tensor_layouts already ran, so new ops keep FlexibleLayout
     # unless we assign here.
     #
-    # spyre.empty / spyre.full lower to FallbackKernel + MultiOutput; the
-    # MultiOutput is unwrapped from the returned TensorBox to set its layout.
+    # spyre.empty lowers to FallbackKernel + MultiOutput; the MultiOutput is
+    # unwrapped from the returned TensorBox to set its layout.
+    # spyre.constant lowers to SpyreConstantFallback (single op, ExternKernel subclass).
     # aten.expand lowers to an ExpandView (no Buffer produced, no layout needed).
     # aten.clone lowers to a ComputedBuffer with FlexibleLayout → FixedTiledLayout.
     # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
@@ -589,12 +585,14 @@ def lower_pad_sequence(
     assert isinstance(padded_buf, MultiOutput)
     _assign_layout(padded_buf)
 
-    if one_stick_is_new:
-        one_stick_tb = graph_lowering.run_node(one_stick_fx)
-        graph_lowering.env[one_stick_fx] = one_stick_tb
-        one_stick_buf = one_stick_tb.data.data  # TensorBox -> StorageBox -> MultiOutput
-        assert isinstance(one_stick_buf, MultiOutput)
-        _assign_layout(one_stick_buf)
+    if const_is_new:
+        const_tb = graph_lowering.run_node(const_fx)
+        graph_lowering.env[const_fx] = const_tb
+        const_buf = (
+            const_tb.data.data
+        )  # TensorBox -> StorageBox -> SpyreConstantFallback
+        assert isinstance(const_buf, SpyreConstantFallback)
+        _assign_layout(const_buf)
 
     expand_tb = graph_lowering.run_node(expand_fx)
     graph_lowering.env[expand_fx] = expand_tb
@@ -621,10 +619,10 @@ def lower_pad_sequence(
     object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_data_fx)
 
     # Collect all newly added operations (appended at the end of graph.operations).
-    # Fresh path: spyre.empty(FK+MO=2) + spyre.full(FK+MO=2) + clone(1) + overwrite×2(2) = 7.
-    # Cache-hit path: spyre.full is reused, so spyre.empty(2) + clone(1) + overwrite×2(2) = 5.
+    # Fresh path: spyre.empty(FK+MO=2) + spyre.constant(1) + clone(1) + overwrite×2(2) = 6.
+    # Cache-hit path: spyre.constant is reused, so spyre.empty(2) + clone(1) + overwrite×2(2) = 5.
     new_ops = graph_lowering.operations[ops_before:]
-    expected = 5 if not one_stick_is_new else 7
+    expected = 5 if not const_is_new else 6
     assert len(new_ops) >= expected, (
         f"Expected at least {expected} new ops, got {len(new_ops)}"
     )
