@@ -79,7 +79,9 @@ class ScratchPadAllocator:
         # cannot perform defragmentation yet, will add more cases in the future
         curr_lo = self.get_lowest_addr_in_use()
         curr_hi = self.get_highest_addr_in_use()
-        if (len(self.usage) == 0 and size_needed <= self.limit) or curr_lo >= size_needed:
+        if (
+            len(self.usage) == 0 and size_needed <= self.limit
+        ) or curr_lo >= size_needed:
             # completely free and/or enough room at addr0
             return 0
         elif curr_hi + size_needed < self.limit:
@@ -293,9 +295,9 @@ class GreedyAllocationStrategy(AllocationStrategy):
     ):
         """
         If core_div_mismatch is not provided, we will consider LX pinning without taking
-        work division into account (previous behavior), may result in slices of a LX tensor
-        scattered over different core's scratchpad, which may result in unusable tensor and
-        incorrect results.
+        work division compatibility into account. When a tensor is sliced and scattered
+        over multiple cores' scratchpad, it may result in unusable tensor, incorrect
+        results, or backend compiler will simply throw out errors.
         """
         # 1. summarize both inputs and output sizes used by this node, also merge core_div
         #    info into the table.
