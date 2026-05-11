@@ -170,7 +170,6 @@ def spyre__local_scalar_dense(self):
 @torch.library.register_kernel("aten::_copy_from", ["spyre"])
 def spyre__copy_from(self, dst, non_blocking=False):
 
-
     # Check if views of same data
     if (
         self.data_ptr() == dst.data_ptr()
