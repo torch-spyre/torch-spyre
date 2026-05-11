@@ -1033,6 +1033,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((2, 4, 3, 64), dtype=torch.float32),
                     cached_randn((2, 4, 3, 32), dtype=torch.float32),
                 ),
+                "4d_dim_m2_empty_first": (
+                    -2,
+                    torch.zeros(0, dtype=torch.float16),
+                    cached_randn((1, 8, 14, 64), dtype=torch.float16),
+                ),
             },
         },
         (
