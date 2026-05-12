@@ -140,10 +140,13 @@ class SpyreConstantFallback(ir.ExternKernel):
 class SpyreEmptyFallback(ir.ExternKernel):
     """IR node for spyre.empty — emits spyre_empty_with_layout via make_buffer_allocation.
 
-    should_allocate() returns True so the wrapper calls make_buffer_allocation,
-    which emits spyre_empty_with_layout(size, stride, dtype, device_layout).
-    The layout is a placeholder FixedLayout at construction time; lower_pad_sequence
-    overwrites it with the correct FixedTiledLayout before codegen runs.
+    should_allocate() returns True so the wrapper calls make_buffer_allocation.
+    SpyrePythonWrapperCodegen.make_buffer_allocation emits
+    spyre_empty_with_layout(size, stride, dtype, device_layout) when the layout is
+    a FixedTiledLayout; the placeholder FixedLayout set at construction time must be
+    replaced with a FixedTiledLayout before codegen runs (lower_pad_sequence does
+    this immediately after calling run_node).  If the layout is never upgraded the
+    wrapper falls back to the generic CPU allocator, which is incorrect on Spyre.
     codegen() is a no-op because the allocation IS the result — there is no
     separate kernel call.
     """

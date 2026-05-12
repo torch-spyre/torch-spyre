@@ -142,10 +142,6 @@ class TestInsertPaddingIR(unittest.TestCase):
         return operations[:idx]
 
     @staticmethod
-    def _empty_fallback_ops(operations: list[Operation]) -> list[SpyreEmptyFallback]:
-        return [op for op in operations if isinstance(op, SpyreEmptyFallback)]
-
-    @staticmethod
     def _overwrite_ops(ops: list[Operation]) -> list[ComputedBuffer]:
         """Return ComputedBuffers whose origin_node calls spyre.overwrite."""
         result = []
