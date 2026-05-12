@@ -694,7 +694,11 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None): 
     # Copy helper routines that copied tests may call on self.
     for name in dir(my_cls):
         value = getattr(my_cls, name)
-        if name.startswith("_get_") and callable(value) and not hasattr(other_cls, name):
+        if (
+            name.startswith("_get_")
+            and callable(value)
+            and not hasattr(other_cls, name)
+        ):
             setattr(other_cls, name, value)
 
     # Special case convenience routine
