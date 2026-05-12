@@ -37,6 +37,20 @@
 # does not emit marker <properties> for unittest.TestCase items even with
 # junit_family=xunit2 -- which seems to be a pytest limitation.
 
+# Segfault resilience
+# -------------------
+# If a file-level pytest run exits with any signal (exit >= 128, e.g. SIGSEGV/139
+# or C-level abort/255), the file is automatically retried with "-n1" via
+# pytest-xdist.  xdist spawns each test in a worker subprocess; when a worker
+# crashes the xdist controller catches the worker death, records that test as
+# ERROR, and continues with the remaining tests.
+#
+# --collect-only is NOT used as the fallback strategy: the process that crashes
+# during test execution often also crashes during collection, yielding zero IDs.
+# xdist's forking model sidesteps this entirely — collection runs in the
+# controller (which stays alive) and execution runs in workers (which can crash
+# safely).  Requires pytest-xdist: pip install pytest-xdist.
+
 set -euo pipefail
 
 
@@ -1282,6 +1296,117 @@ Path(out_path).write_text(merged)
 print(f"[spyre_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
+# ---------------------------------------------------------------------------
+# _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> [pytest_args...]
+#
+# Runs a single pytest invocation inside a subshell that is fully isolated
+# from the parent process's errexit/pipefail settings.  The real pytest exit
+# code is written to <exit_tmp> so the caller can read it even when the
+# subshell itself exits non-zero.  The subshell's stdout/stderr are NOT
+# redirected so output streams to the terminal as usual.
+#
+# Returns 0 always; caller reads <exit_tmp> for the real exit code.
+# ---------------------------------------------------------------------------
+_run_pytest_isolated() {
+    local _dir="$1" _base="$2" _exit_tmp="$3"
+    shift 3
+    local _args=("$@")
+    (
+        set +euo pipefail
+        cd "$_dir"
+        python3 -m pytest "$_base" "${_args[@]}"
+        echo $? > "$_exit_tmp"
+    ) || true
+}
+
+# ---------------------------------------------------------------------------
+# _run_xdist_fallback <run_dir> <run_basename> <original_file>
+#                     <exit_tmp> <shard_xml> [pytest_args...]
+#
+# Called when a file-level pytest run exits with a signal (exit >= 128, most
+# commonly SIGSEGV or exit 255 from a C-level abort).
+#
+# Re-runs the same file with "-n1" (pytest-xdist, 1 worker subprocess).
+# xdist spawns each test in a worker process; when a worker crashes the
+# xdist controller catches the worker death, marks that test as ERROR, and
+# continues with the remaining tests
+#
+#   The process that segfaults during test execution is often the same Python
+#   interpreter that would run --collect-only, so collection itself crashes
+#   and yields zero IDs.  xdist's forking model sidesteps this entirely.
+#
+# Arguments:
+#   $1  run_dir       -- directory to cd into for pytest
+#   $2  run_basename  -- pytest target (wrapper or original filename)
+#   $3  original_file -- original source path (logging only)
+#   $4  exit_tmp      -- temp file path for exit code (reused from caller)
+#   $5  shard_xml     -- destination XML path (empty if no --junit-xml)
+#   rest              -- extra pytest args (already stripped of --junit-xml)
+#
+# Side-effects:
+#   - Updates global OVERALL_EXIT.
+#   - Injects XML tags into shard_xml when present.
+# ---------------------------------------------------------------------------
+_run_xdist_fallback() {
+    local _dir="$1" _base="$2" _orig="$3" _exit_tmp="$4" _shard_xml="$5"
+    shift 5
+    local _extra=("$@")
+
+    echo ""
+    echo "[spyre_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
+    echo "[spyre_run]     File: $_orig"
+    echo "[spyre_run]     Each test runs in its own worker; crashes are contained."
+    echo ""
+
+    # Check pytest-xdist is available before proceeding.
+    if ! python3 -m pytest --co -q --no-header -p xdist /dev/null &>/dev/null 2>&1; then
+        if ! python3 -c "import xdist" 2>/dev/null; then
+            echo "[spyre_run] WARNING: pytest-xdist not installed — cannot use -n1 fallback." >&2
+            echo "[spyre_run]          Install with: pip install pytest-xdist" >&2
+            echo "[spyre_run]          Skipping remaining tests in: $_orig" >&2
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            return
+        fi
+    fi
+
+    local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
+    [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
+
+    _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "${_xdist_args[@]}"
+
+    local _xexit=139
+    if [[ -f "$_exit_tmp" ]]; then
+        _xexit=$(< "$_exit_tmp")
+        rm -f "$_exit_tmp"
+    else
+        echo "[spyre_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
+    fi
+
+    # Inject XML tags into the shard produced by the xdist run.
+    if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
+        python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+    fi
+
+    case $_xexit in
+        0|5)
+            echo "[spyre_run] xdist fallback completed cleanly for: $(basename "$_orig")"
+            ;;
+        1)
+            echo "[spyre_run] xdist fallback: some tests failed in: $(basename "$_orig")" >&2
+            OVERALL_EXIT=1
+            ;;
+        130)
+            echo "[spyre_run] FATAL: interrupted (Ctrl-C) during xdist fallback." >&2
+            OVERALL_EXIT=130
+            exit 130
+            ;;
+        *)
+            echo "[spyre_run] xdist fallback exited with code $_xexit for: $(basename "$_orig")" >&2
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=$_xexit
+            ;;
+    esac
+}
+
 for i in "${!RUN_FILES[@]}"; do
     run_file="${RUN_FILES[$i]}"
     original_file="${TEST_FILES[$i]}"
@@ -1363,54 +1488,101 @@ for i in "${!RUN_FILES[@]}"; do
             _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
         fi
     fi
-    _exit=0
-    (
-        cd "$run_dir"
-        python3 -m pytest "$run_basename" "${_FILE_PYTEST_ARGS[@]}"
-        echo $? > "/tmp/_spyre_pytest_exit_$$.tmp"
-    ) || true
 
-    # Read the real pytest exit code written from inside the subshell.
-    # If the file doesn't exist the subshell died before writing it
-    # (e.g. segfault, OOM kill) --  treat that as fatal (139 = SIGSEGV).
-    if [[ -f "/tmp/_spyre_pytest_exit_$$.tmp" ]]; then
-        _exit=$(< "/tmp/_spyre_pytest_exit_$$.tmp")
-        rm -f "/tmp/_spyre_pytest_exit_$$.tmp"
+    # -----------------------------------------------------------------------
+    # Run pytest for this file.
+    #
+    # SPYRE_TEST_FILE is exported so xdist worker processes can determine
+    # the current test file during collection.  Workers inherit the parent
+    # environment but receive an empty sys.argv[], and PYTEST_CURRENT_TEST
+    # is only set during execution (not collection), so this env var is the
+    # only reliable source for resolve_current_file() in all scenarios.
+    # spyre_test_parsing.py strips the __oot_wrapper suffix automatically.
+    #
+    # The exit code is written to a temp file from inside the subshell so it
+    # survives even when the process exits abnormally (SIGSEGV, OOM, etc.).
+    # Using a PID-namespaced temp file prevents collisions across parallel
+    # invocations of run_test.sh.
+    # -----------------------------------------------------------------------
+    export SPYRE_TEST_FILE="$run_file"
+
+    _EXIT_TMP="/tmp/_spyre_pytest_exit_${$}_${i}.tmp"
+    _exit=0
+
+    _run_pytest_isolated "$run_dir" "$run_basename" "$_EXIT_TMP" "${_FILE_PYTEST_ARGS[@]}"
+
+    if [[ -f "$_EXIT_TMP" ]]; then
+        _exit=$(< "$_EXIT_TMP")
+        rm -f "$_EXIT_TMP"
     else
+        # Subshell died before writing the exit code (segfault, OOM, SIGKILL).
         _exit=139
         echo "[spyre_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
     fi
 
     # Post-process XML to inject YAML tags as <properties>.
-    if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" ]]; then
+    # Only do this for a clean or test-failure run (not for signal exits that
+    # triggered the fallback path below, which handles XML injection itself).
+    if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -lt 128 ]]; then
         python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
     fi
 
-    # Distinguish fatal errors from normal pytest outcomes:
+    # -----------------------------------------------------------------------
+    # Exit code handling
+    #
     #   0   = all tests passed
-    #   1   = tests ran, some failed/errored  (non-fatal, already reported by pytest)
+    #   1   = tests ran, some failed/errored  (reported by pytest; non-fatal)
     #   5   = no tests collected              (warning only)
-    #   127 = command not found (python3/pytest missing)
-    #   130 = SIGINT (Ctrl-C)
-    #   139 = SIGSEGV / killed before writing exit code
+    #   127 = command not found (python3/pytest missing) — fatal
+    #   128+= signal/abnormal termination    — retry with -n1 (xdist fallback)
+    #         Common: 139 (SIGSEGV), 255 (C abort).  130 (Ctrl-C) breaks loop.
+    # -----------------------------------------------------------------------
     case $_exit in
         0|1|5)
+            # Normal pytest outcomes (tests ran, some may have failed/xpassed).
+            # Individual results are visible in pytest output; run_test.sh
+            # always exits 0 for these so CI sees the report rather than a
+            # blanket failure.  Signal exits (>= 128) are the only codes that
+            # trigger the xdist fallback and propagate a non-zero exit.
             ;;
         127)
             echo "[spyre_run] FATAL: python3 or pytest not found (exit 127) for $original_file" >&2
             OVERALL_EXIT=$_exit
             ;;
         130)
-            echo "[spyre_run] FATAL: interrupted (exit 130) for $original_file" >&2
+            echo "[spyre_run] FATAL: interrupted (exit 130) — aborting run." >&2
             OVERALL_EXIT=$_exit
-            ;;
-        139)
-            echo "[spyre_run] FATAL: segfault (exit 139) for $original_file" >&2
-            OVERALL_EXIT=$_exit
+            # Propagate immediately; no point continuing after Ctrl-C.
+            break
             ;;
         *)
-            echo "[spyre_run] WARNING: pytest exited with code $_exit for $original_file" >&2
-            OVERALL_EXIT=$_exit
+            # Exit >= 128 (excluding 130): signal termination — most likely SIGSEGV
+            # (139) or a C-level abort (255).  Re-run the same file with -n1 so
+            # pytest-xdist spawns each test in a worker subprocess; a crashing
+            # worker is caught by the xdist controller and the remaining tests
+            # continue.  --collect-only is not used: the same process that crashes
+            # during execution often also crashes during collection.
+            echo "[spyre_run] WARNING: pytest exited with signal (code $_exit) for $original_file" >&2
+
+            # Strip --junit-xml from _FILE_PYTEST_ARGS; _run_xdist_fallback
+            # re-adds _SHARD_XML itself so it owns the XML output path.
+            _FALLBACK_ARGS=()
+            _skip_xml=0
+            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
+                if [[ $_skip_xml -eq 1 ]]; then _skip_xml=0; continue; fi
+                case "$_a" in
+                    --junit-xml=*) ;;
+                    --junit-xml)   _skip_xml=1 ;;
+                    *)             _FALLBACK_ARGS+=("$_a") ;;
+                esac
+            done
+
+            _run_xdist_fallback \
+                "$run_dir" "$run_basename" "$original_file" \
+                "$_EXIT_TMP" "$_SHARD_XML" \
+                "${_FALLBACK_ARGS[@]+"${_FALLBACK_ARGS[@]}"}"
+
+            # OVERALL_EXIT updated inside _run_xdist_fallback.
             ;;
     esac
 done
