@@ -167,6 +167,7 @@ def _single_arg_op_layout(
             out_coords = host_coordinates(output, output_dep)
             if (
                 in_coords == out_coords
+                and in_layout.size == output.size
                 and dep.index == output_dep.index
                 and same_device_size(in_layout.dtype, output.dtype)
             ):
@@ -346,6 +347,7 @@ def _multi_arg_pointwise_layouts(
         for arg, arg_coors in zip(args, in_coords):
             if (
                 arg_coors != out_coords
+                or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
                 or not same_device_size(arg.layout.dtype, output.dtype)
             ):
