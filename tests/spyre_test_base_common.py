@@ -4,7 +4,6 @@ Shared class and methods for all OOT PyTorch test overrides.
 """
 
 import os
-import sys
 import json
 from typing import Dict, List, Optional, Set
 import warnings
