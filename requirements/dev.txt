@@ -19,6 +19,8 @@ colorama==0.4.6 ; (os_name != 'nt' and sys_platform == 'win32') or (os_name == '
     #   tqdm
 distlib==0.4.0
     # via virtualenv
+execnet==2.1.2
+    # via pytest-xdist
 expecttest==0.3.0
     # via torch-spyre
 filelock==3.24.3
@@ -89,6 +91,10 @@ pygments==2.19.2
 pyproject-hooks==1.2.0
     # via build
 pytest==9.0.2
+    # via
+    #   pytest-xdist
+    #   torch-spyre
+pytest-xdist==3.8.0
     # via torch-spyre
 pyyaml==6.0.3
     # via

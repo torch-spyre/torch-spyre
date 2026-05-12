@@ -46,7 +46,8 @@ class TestDatatypeScalarOperations:
     shapes, and edge magnitudes. Spyre vs CPU via ``compare_with_cpu`` where applicable.
     """
 
-    torch.manual_seed(0xAFFE)
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
 
     @pytest.mark.parametrize(
         "tensor_dtype,scalar_type,scalar_value,atol,rtol",
@@ -372,7 +373,8 @@ class TestNegativeScalarOperations:
     Uses ``_run_spyre`` when assertions are not expressible as CPU reference equality.
     """
 
-    torch.manual_seed(0xAFFE)
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
 
     @pytest.mark.parametrize(
         "invalid_scalar,desc",

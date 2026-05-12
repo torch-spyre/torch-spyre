@@ -50,8 +50,9 @@ build = [ # no-isolation build
 ]
 test = [
     "pytest~=9.0.0",
-    "pydantic", # needed by test framework to support pydantic models for config
-#    "torch_sendnn", # must be installed manually
+    "pydantic",             # needed by test framework to support pydantic models for config
+    "pytest-xdist",         # -n1 worker isolation for segfault resilience
+#    "torch_sendnn",        # must be installed manually
     "transformers~=4.57.1"
 ]
 lint = [
