@@ -1,0 +1,15 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      # Tests in this file are dynamically generated via copy_tests() from
+      # test_inductor_ops.TestOps, patched with lx_planning config overrides.
+      # POINTWISE_TEST_FAILURES and REDUCTION_TEST_FAILURES are passed to
+      # copy_tests() as the skip list, meaning those tests are never registered
+      # as test methods at all and won't be collected by pytest.
+      # The remaining tests (not in the failure lists) are what actually run,
+      # but since we don't have the full TestOps test list statically available
+      # here, we use unlisted_test_mode: mandatory_success to automatically
+      # require all dynamically generated and collected tests to pass, rather
+      # than enumerating each LxPlanningTwoOpPointwiseAdditionTest:: and
+      # LxPlanningTwoOpReductionTest:: test name explicitly.
+      unlisted_test_mode: mandatory_success

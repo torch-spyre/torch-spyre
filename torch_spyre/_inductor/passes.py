@@ -33,12 +33,16 @@ from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    replace_scalar_with_tensor,
+    convert_constant_with_graph_node,
 )
 from . import config
-from .stickify import propagate_mutation_layouts, propagate_spyre_tensor_layouts
-from .insert_restickify import insert_restickify
-from .core_division import core_division_planning
+from .propagate_layouts import (
+    propagate_mutation_layouts,
+    propagate_spyre_tensor_layouts,
+)
+from .optimize_restickify import optimize_restickify_locations
+from .insert_restickify import insert_restickify, finalize_layouts
+from .work_division import span_reduction, work_distribution
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
@@ -128,7 +132,7 @@ class CustomPostPasses(CustomGraphPass):
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
         insert_padding,
-        replace_scalar_with_tensor,
+        convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]
@@ -221,8 +225,11 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        optimize_restickify_locations(operations)
+        finalize_layouts(operations)
         insert_restickify(operations)
-        core_division_planning(operations)
+        span_reduction(operations)
+        work_distribution(operations)
         if config.lx_planning:
             scratchpad_planning(operations)
 
@@ -233,8 +240,10 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
-            inspect.getfile(core_division_planning),
+            inspect.getfile(span_reduction),
+            inspect.getfile(work_distribution),
             inspect.getfile(scratchpad_planning),
         ]
         return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))

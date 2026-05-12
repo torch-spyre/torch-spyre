@@ -30,7 +30,6 @@ from torch._inductor.utils import IndentedBuffer, sympy_subs
 from torch._inductor.virtualized import V
 
 from .constants import (
-    MATMUL_REDUCTION_OP,
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     IDENTITY_OP,
@@ -166,6 +165,10 @@ class SpyreOpFuncs:
     @staticmethod
     def exx2(a, b, c):
         return f"spyre.exx2({a} {b} {c})"
+
+    @staticmethod
+    def floor(x):
+        return PointwiseOp("floor", [x])
 
     @staticmethod
     def ge(a, b):
@@ -408,11 +411,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space = iteration_space(self.current_node)
 
         ir_node = self.current_node.node  # ComputedBuffer
-        core_division: dict[sympy.Symbol, int] = {}
+        work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
             write_index = next(iter(self.current_node.read_writes.writes)).index
             read_index = next(iter(self.current_node.read_writes.reads)).index
-            core_division = apply_splits_from_index_coeff(
+            work_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,
                 write_index,
                 read_index,
@@ -420,7 +423,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
 
         it_space_extended = {
-            k: (v, core_division.get(k, 1)) for k, v in it_space.items()
+            k: (v, work_division.get(k, 1)) for k, v in it_space.items()
         }
 
         return OpSpec(
@@ -548,7 +551,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op == MATMUL_REDUCTION_OP or value.op == BATCH_MATMUL_OP:
+        if value.op == BATCH_MATMUL_OP:
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))

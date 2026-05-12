@@ -4,6 +4,10 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,13 +31,16 @@ jobs:
     # To add a new upstream test suite, append an entry here:
     #   - name: <human-readable label shown in the GHA UI>
     #     config: <filename inside tests/configs/>
+    #
+    # The JUnit XML report is automatically named after the config file, e.g.:
+    #   test_view_ops_config.yaml  ->  test_view_ops_config.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
-          - name: View ops
-            config: test_suite_config.yaml
+          - name: View Ops
+            config: test_view_ops_config.yaml
           - name: Profiler
             config: test_profiler_config.yaml
 
@@ -47,15 +54,15 @@ jobs:
       # Derive the PyTorch release branch from pyproject.toml so there is a
       # single source of truth — no hardcoded version in this workflow.
       #
-      # pyproject.toml declares:  torch~=2.10.0
-      # This step extracts "2.10.0", strips the patch -> "2.10", and builds
-      # the branch name "release/2.10".
+      # pyproject.toml declares:  torch~=2.11.0
+      # This step extracts "2.11.0", strips the patch -> "2.11", and builds
+      # the branch name "release/2.11".
       # ---------------------------------------------------------------------------
       - name: Derive PyTorch release branch from pyproject.toml
         id: pytorch-branch
         working-directory: torch-spyre
         run: |
-          # Extract the version constraint, e.g. "2.10.0" from "torch~=2.10.0"
+          # Extract the version constraint, e.g. "2.11.0" from "torch~=2.11.0"
           VERSION=$(python3 - <<'PYEOF'
           import tomllib
 
@@ -64,13 +71,14 @@ jobs:
 
           requires = data.get('build-system', {}).get('requires', [])
           torch_dep = next(x for x in requires if x.startswith('torch'))
-          version = torch_dep.removeprefix('torch~=')   # e.g. "2.10.0"
-          print('.'.join(version.split('.')[:2]))        # --> "2.10"
+          version = torch_dep.removeprefix('torch~=')   # e.g. "2.11.0"
+          print('.'.join(version.split('.')[:2]))        # --> "2.11"
           PYEOF
           )
           BRANCH="release/${VERSION}"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "Derived PyTorch branch: $BRANCH"
+
       # ---------------------------------------------------------------------------
       # PyTorch source caching
       #
@@ -129,10 +137,44 @@ jobs:
           echo 'installing with dependencies, this could take a while...'
           pip install uv
           uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
+          echo "VENV_PATH=${GITHUB_WORKSPACE}/torch-spyre/.venv" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.suite.name }} upstream test suite
         working-directory: torch-spyre/tests
         run: |
-          echo 'Running ${{ matrix.suite.name }} upstream tests...'
-          bash run_test.sh configs/${{ matrix.suite.config }} -v
-          echo '${{ matrix.suite.name }} upstream tests done'
+          # Derive the XML report name from the config filename
+          # Example:
+          #   test_view_ops_config.yaml    ->  test_view_ops_config.xml
+          #   test_profiler_config.yaml ->  test_profiler_config.xml
+
+          source "${VENV_PATH}/bin/activate"
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="${CONFIG%.yaml}.xml"
+          REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
+
+          echo "Running ${{ matrix.suite.name }} upstream tests..."
+          bash run_test.sh configs/upstream_tests/${CONFIG} -v --junit-xml="${REPORT_PATH}"
+          echo "${{ matrix.suite.name }} upstream tests done"
+
+          # Expose report path/name to subsequent steps via GITHUB_ENV
+          echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------------
+      # Upload the JUnit XML as a GHA artifact so it can be downloaded and
+      # ingested by the Spyre dashboard.
+      #
+      # if: always() ensures the report is uploaded even when tests fail —
+      # a failed run is exactly when you most want the dashboard to show results.
+      #
+      # Artifact name matches the report filename so multiple matrix jobs don't
+      # overwrite each other (each config produces a distinct name).
+      # ---------------------------------------------------------------------------
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn (not fail) if pytest itself crashed
+          retention-days: 90 # for now keep it for 90 days until we push to COS

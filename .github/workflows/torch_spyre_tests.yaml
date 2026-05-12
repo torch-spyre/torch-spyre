@@ -1,0 +1,185 @@
+name: torch-spyre-tests
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    name: ${{ matrix.suite.name }}
+    runs-on:
+      - x86_64
+      - spyre_pf
+      - linux
+      - image_torch_spyre
+    # increase timeout to 12 hours
+    timeout-minutes: 720
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          # Top-level tests
+          - name: Test Device Enum
+            config: torch_spyre_tests/test_device_enum_config.yaml
+          - name: Test Fallbacks
+            config: torch_spyre_tests/test_fallbacks_config.yaml
+          - name: Test Modules
+            config: torch_spyre_tests/test_modules_config.yaml
+          - name: Test Regex
+            config: torch_spyre_tests/test_regex_config.yaml
+          - name: Test Spyre
+            config: torch_spyre_tests/test_spyre_config.yaml
+          - name: Test Spyre Lazy Silent
+            config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
+          - name: Test Stream
+            config: torch_spyre_tests/test_stream_config.yaml
+          # Inductor tests
+          - name: Inductor Building Blocks
+            config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
+          - name: Inductor Codegen
+            config: torch_spyre_tests/inductor/test_codegen_config.yaml
+          - name: Inductor Decomp
+            config: torch_spyre_tests/inductor/test_decomp_config.yaml
+          - name: Inductor FX Passes
+            config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
+          - name: Inductor Normalization Scalars
+            config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
+          - name: Inductor Ops
+            config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
+          - name: Inductor Ops LX Planning
+            config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
+          - name: Inductor Scalar
+            config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
+          - name: Inductor Logging
+            config: torch_spyre_tests/inductor/test_logging_config.yaml
+          - name: Inductor Restickify
+            config: torch_spyre_tests/inductor/test_restickify_config.yaml
+          - name: Inductor Scratchpad Patterns
+            config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
+          - name: Inductor Scratchpad Use
+            config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
+          # Tensor tests
+          - name: Tensor Coordinates
+            config: torch_spyre_tests/tensors/test_coordinates_config.yaml
+          - name: Tensor It Space Splits
+            config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
+          - name: Tensor Layout
+            config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
+    steps:
+      - name: Checkout PR branch/commit in pre-cloned torch-spyre
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          # The pre-cloned repo may be owned by a different user than the
+          # runner process; mark all directories as safe to avoid git's
+          # "dubious ownership" error (covers the repo and any submodules).
+          git config --global --add safe.directory '*'
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          # Prefer the PR head SHA when triggered by pull_request, otherwise
+          # fall back to the SHA of the push/tag that triggered the workflow.
+          TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+          TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git log -1 --oneline
+
+      - name: Install uv
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          # shellcheck disable=SC1091
+          source "$HOME/.bashrc"
+          uv --version
+
+      - name: Gather runner info
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          date
+          pwd
+          whoami
+          id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+          echo "--- env ---"
+          env | sort
+          echo "--- AIU env ---"
+          env | sort | grep AIU || true
+          echo "--- repo listing ---"
+          ls -lart "$CLONED_TORCH_SPYRE_DIR"
+
+      - name: Build torch-spyre
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+          # uv sync reconciles the .venv against pyproject.toml + uv.lock,
+          # so torch is reinstalled only when the resolved version or source
+          # differs from what's already installed (e.g., a PR bumps the
+          # torch~=2.10.0 constraint, or the pre-baked venv has a torch from
+          # a different index than the pytorch-cpu source in uv.lock).
+          # --reinstall-package torch-spyre: always rebuild torch-spyre from
+          #   the freshly-checked-out sources.
+          uv sync \
+            --verbose \
+            --all-extras \
+            --active \
+            --inexact \
+            --reinstall-package torch-spyre
+          # Print the resolved torch install for log visibility.
+          uv pip show torch
+          uv pip freeze
+
+      - name: Run ${{ matrix.suite.name }} tests
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
+          CONFIG="${{ matrix.suite.config }}"
+
+          echo "Running ${{ matrix.suite.name }} tests..."
+          bash tests/run_test.sh "tests/configs/${CONFIG}" -v
+          echo "${{ matrix.suite.name }} tests done"
+

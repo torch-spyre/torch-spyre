@@ -107,6 +107,11 @@ at::Tensor spyre__unsafe_view(const at::Tensor& self, c10::IntArrayRef size) {
   return spyre_view_impl(self, size);
 }
 
+at::Tensor spyre_reshape_alias(const at::Tensor& self, c10::IntArrayRef sizes,
+                               c10::IntArrayRef strides) {
+  return spyre_alias_with_sizes_and_strides(self, sizes, strides);
+}
+
 at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
                             c10::IntArrayRef stride,
                             std::optional<int64_t> storage_offset_) {
@@ -183,6 +188,7 @@ at::Tensor spyre_alias(const at::Tensor& self) {
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(spyre_view));
   m.impl("_unsafe_view", TORCH_FN(spyre__unsafe_view));
+  m.impl("_reshape_alias", TORCH_FN(spyre_reshape_alias));
   m.impl("alias", TORCH_FN(spyre_alias));
   m.impl("as_strided", TORCH_FN(spyre_as_strided));
 }

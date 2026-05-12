@@ -1,0 +1,13 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_linalg.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestLinalg::test_einsum_error_cases
+            - TestLinalg::test_lower_precision_accumulation_with_ref_path
+            - TestLinalg::test_matrix_rank_removed_error
+            - TestLinalg::test_permute_matmul
+            - TestLinalg::test_solve_removed_error
+            - TestLinalg::test_vector_norm_decom_unbacked_checks
+          mode: mandatory_success
