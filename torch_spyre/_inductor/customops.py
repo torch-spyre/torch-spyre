@@ -395,6 +395,17 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
 #    return input.new_empty([])
 
 
+@torch.library.custom_op("spyre::batched_matmul", mutates_args=(), device_types="spyre")
+def batched_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@batched_matmul.register_fake
+def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output_shape = list(x.shape[:-1]) + [y.shape[-1]]
+    return x.new_empty(output_shape)
+
+
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
 def spyre_constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device

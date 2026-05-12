@@ -190,11 +190,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         inductor_graph_str = normalize_gm(
             backend.inductor_graphs[0].print_readable(print_output=False)
         )
-        assert "aten.bmm.default" in inductor_graph_str, (
-            "Expected aten.bmm.default after unflatten_mm_to_bmm pass"
+        has_batched_matmul = (
+            "aten.bmm.default" in inductor_graph_str
+            or "spyre.batched_matmul" in inductor_graph_str
+        )
+        assert has_batched_matmul, (
+            "Expected aten.bmm.default or spyre.batched_matmul after passes"
         )
         assert "aten.mm.default" not in inductor_graph_str, (
-            "aten.mm.default should be replaced by bmm after unflatten pass"
+            "aten.mm.default should be replaced by bmm/batched_matmul after passes"
         )
 
     def test_mixed_device_seq(self):
@@ -214,6 +218,63 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "CPU graph should be the same across compilations"
         )
         assert spyre_1 != cpu_1, "SPYRE graph should differ from CPU graph"
+
+
+class TestBmmUnflattenWithResidual(unittest.TestCase):
+    """Regression test for bmm unflatten pass with SDPA + Dense + LayerNorm.
+
+    The QFormer projector pattern (SDPA followed by Dense + LayerNorm + residual)
+    previously crashed with "batch1 must be a 3D tensor" in FakeTensorUpdater
+    because bmm_unflatten_pass created aten.bmm nodes with 4D inputs.
+    """
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore::UserWarning")
+    def test_sdpa_dense_layernorm_compiles(self):
+        """SDPA + Dense + LayerNorm + residual should compile without error."""
+        import torch._inductor.config as config
+        from torch._dynamo.testing import InductorAndRecordGraphs, normalize_gm
+
+        config.force_disable_caches = True
+
+        B, S, H, E = 1, 32, 12, 64
+        hidden = H * E
+
+        class QFormerAttentionLike(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.query = torch.nn.Linear(hidden, hidden, bias=False)
+                self.key = torch.nn.Linear(hidden, hidden, bias=False)
+                self.value = torch.nn.Linear(hidden, hidden, bias=False)
+                self.dense = torch.nn.Linear(hidden, hidden, bias=False)
+                self.layernorm = torch.nn.LayerNorm(hidden)
+
+            def forward(self, x):
+                residual = x
+                q = self.query(x).view(B, S, H, E).transpose(1, 2)
+                k = self.key(x).view(B, S, H, E).transpose(1, 2)
+                v = self.value(x).view(B, S, H, E).transpose(1, 2)
+                attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                attn = attn.transpose(1, 2).contiguous().view(B, S, hidden)
+                out = self.dense(attn)
+                out = self.layernorm(out + residual)
+                return out
+
+        model = QFormerAttentionLike().half().to("spyre").eval()
+        x = torch.randn(B, S, hidden, dtype=torch.float16, device="spyre")
+
+        torch.compiler.reset()
+        backend = InductorAndRecordGraphs()
+        compiled = torch.compile(model, backend=backend)
+        compiled(x)
+
+        graph_str = normalize_gm(
+            backend.inductor_graphs[0].print_readable(print_output=False)
+        )
+        assert "spyre.batched_matmul" in graph_str, (
+            "Expected spyre.batched_matmul for 4D SDPA matmuls, "
+            f"but got graph:\n{graph_str}"
+        )
 
 
 class TestInsertPadding(unittest.TestCase):
