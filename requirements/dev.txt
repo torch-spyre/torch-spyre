@@ -114,9 +114,9 @@ sympy==1.14.0
     # via torch
 tokenizers==0.22.2
     # via transformers
-torch==2.10.0 ; sys_platform == 'darwin'
+torch==2.11.0 ; sys_platform == 'darwin'
     # via torch-spyre
-torch==2.10.0+cpu ; sys_platform != 'darwin'
+torch==2.11.0+cpu ; sys_platform != 'darwin'
     # via torch-spyre
 tqdm==4.67.3
     # via

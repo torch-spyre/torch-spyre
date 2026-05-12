@@ -81,7 +81,7 @@ torch-spyre/
 │
 ├── examples/                    # Usage examples (softmax, gelu, mul, etc.)
 ├── setup.py                     # Build: C++ extension compilation
-├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.10.0)
+├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.11.0)
 └── tools/                       # Developer tooling (lint, format, mypy)
 ```
 
@@ -194,7 +194,7 @@ Two separate pybind11 modules:
    against `sendnn`, `flex`
 2. **Entry point**: `torch.backends` → `torch_spyre = torch_spyre:_autoload`
 
-Key external deps: `torch~=2.10.0`, `sendnn`, `flex`, `dxp_standalone`
+Key external deps: `torch~=2.11.0`, `sendnn`, `flex`, `dxp_standalone`
 
 ---
 

@@ -545,6 +545,7 @@ def propagate_spyre_tensor_layouts(
     for op in it:
         if op.is_no_op():
             op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
@@ -562,6 +563,7 @@ def propagate_spyre_tensor_layouts(
             if not isinstance(op, MultiOutput):
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreConstantFallback):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()

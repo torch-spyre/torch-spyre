@@ -197,6 +197,7 @@ def _patch_tensor_for_spyre():
                 or x.device_tensor_layout() == expected_layout
             ),
             [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
+            guard.user_stack,
         )
 
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH

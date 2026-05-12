@@ -271,11 +271,9 @@ def greedy_local_min_cost(operations: list) -> None:
         if not hasattr(op, "layouts"):
             continue  # FallbackKernel and other unhandled op types
 
-        if not hasattr(op, "restick_cost_fn"):
-            if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                op.committed_stl = op.layouts[0]
-            continue
-
+        assert hasattr(op, "restick_cost_fn"), (
+            f"op {op.get_name()} has layouts but no restick_cost_fn"
+        )
         cost_fn = op.restick_cost_fn
 
         # Collect each input arg's committed layout (finalized by earlier topo iterations).
@@ -380,7 +378,8 @@ def beam_global_min_cost(operations: list) -> None:
     accumulating cost. After each op the beam is pruned to K best states.
     At the end, the best state's assignments are committed to the ops.
     """
-    # Commit graph inputs — fixed STL, same across all states.
+    frontier = Frontier(BEAM_WIDTH)
+    # Commit graph inputs and seed into the frontier so input_stl() works uniformly for all deps.
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if (
@@ -391,9 +390,12 @@ def beam_global_min_cost(operations: list) -> None:
         ):
             stl = next(iter(tb.layouts))
             tb.data.data.committed_stl = stl
-            tb.committed_stl = stl
+            frontier.add_buf(name)
+            frontier.states = [
+                BeamState(assignments=state.assignments + (stl,), cost=state.cost)
+                for state in frontier.states
+            ]
 
-    frontier = Frontier(BEAM_WIDTH)
     max_states = 1
 
     for op in operations:
@@ -402,31 +404,15 @@ def beam_global_min_cost(operations: list) -> None:
 
         frontier.add_buf(op.get_name())
 
-        if not hasattr(op, "restick_cost_fn"):
-            assert len(op.layouts) == 1, (
-                f"passthrough op {op.get_name()} has {len(op.layouts)} layouts, expected 1"
-            )
-            frontier.states = [
-                BeamState(
-                    assignments=state.assignments + (op.layouts[0],),
-                    cost=state.cost,
-                )
-                for state in frontier.states
-            ]
-            continue
-
+        assert hasattr(op, "restick_cost_fn"), (
+            f"op {op.get_name()} has layouts but no restick_cost_fn"
+        )
         cost_fn = op.restick_cost_fn
         deps = [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
 
         next_states = []
         for state in frontier.states:
-            in_layouts = []
-            for dep in deps:
-                if dep.name in V.graph.graph_input_names:
-                    # When we allow multiple STLs for inputs this special case will go away
-                    in_layouts.append(V.graph.get_buffer(dep.name).committed_stl)
-                else:
-                    in_layouts.append(frontier.input_stl(state, dep.name))
+            in_layouts = [frontier.input_stl(state, dep.name) for dep in deps]
 
             for candidate_stl in op.layouts:
                 extra_cost = cost_fn.cost(in_layouts, candidate_stl)

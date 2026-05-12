@@ -1,0 +1,10 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/tensor/test_tensor_layout.py
+      # This file uses @instantiate_parametrized_tests which is a pure parametrize
+      # class (all methods are @parametrize-decorated), so run_test.sh does NOT
+      # inject instantiate_device_type_tests for it. The wrapper is not generated
+      # and pytest collects the original TestSpyreTensorLayout class directly.
+      # The skipped test (test_to_spyre_layout_explicit_expanded_*) is excluded
+      # via @unittest.skip and will not be collected.
+      unlisted_test_mode: mandatory_success
