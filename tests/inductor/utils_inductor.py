@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import torch
+import os
+import pytest
+from torch._inductor.utils import run_and_get_code
+import unittest
 
 DEVICE = torch.device("spyre")
 
@@ -30,9 +35,20 @@ def cached_randn(
 
 
 @functools.lru_cache(maxsize=None)
+def cached_xavier(
+    shape,
+    differentiation=None,
+    dtype=torch.float16,
+):
+    out = torch.empty(shape, dtype=dtype)
+    torch.nn.init.xavier_uniform_(out)
+    return out
+
+
+@functools.lru_cache(maxsize=None)
 def unique_randn_along_dim(
     shape,
-    dim=-1,
+    dim=None,
     min_val=-100.0,
     max_val=100.0,
     dtype=torch.float16,
@@ -40,11 +56,11 @@ def unique_randn_along_dim(
     warn_precision=True,
 ):
     """
-    Generate tensor with unique values along a specified dimension.
+    Generate tensor with unique values along a specified dimension or globally.
 
     This is useful for testing operations like argmax/argmin where you want
     to avoid that multiple elements in a tensor have the same maximum value,
-    whcih is called "tie-breaking". For large tensors, generating globally
+    which is called "tie-breaking". For large tensors, generating globally
     unique values can cause float16 overflow. This function generates unique
     values only along the specified dimension, keeping values in a safe range.
 
@@ -54,40 +70,111 @@ def unique_randn_along_dim(
 
     Args:
         shape: Tuple specifying tensor shape (e.g., (64, 128, 256))
-        dim: Dimension along which to ensure uniqueness (default: -1, last dim)
-             Can be negative to count from the end
+        dim: Dimension along which to ensure uniqueness (default: None, globally unique)
+             If None, generates globally unique values across entire tensor
+             Can be an integer (positive or negative) to ensure uniqueness along that dimension
         min_val: Minimum value in the range
         max_val: Maximum value in the range
-        dtype: Target data type (torch.float16 or torch.float32)
+        dtype: Target data type (torch.float16, torch.float32, or integer types)
         seed: Random seed for reproducibility
         warn_precision: If True, warn about potential float16 precision issues
 
     Returns:
-        Tensor with unique values along the specified dimension
+        Tensor with unique values along the specified dimension or globally
 
     Raises:
         ValueError: If parameters would cause float16 overflow or precision loss
 
     Examples:
+        >>> # Globally unique values across entire tensor (default)
+        >>> tensor = unique_randn_along_dim((10, 10))
+        >>> # All 100 values are unique
+
         >>> # Unique values along last dimension (rows)
-        >>> tensor = create_unique_along_dim((64, 128), dim=-1)
+        >>> tensor = unique_randn_along_dim((64, 128), dim=-1)
         >>> # Each row has 128 unique values
 
         >>> # Unique values along first dimension (columns)
-        >>> tensor = create_unique_along_dim((64, 128), dim=0)
+        >>> tensor = unique_randn_along_dim((64, 128), dim=0)
         >>> # Each column has 64 unique values
 
         >>> # 3D tensor with unique values along middle dimension
-        >>> tensor = create_unique_along_dim((32, 64, 128), dim=1)
+        >>> tensor = unique_randn_along_dim((32, 64, 128), dim=1)
         >>> # For each (i, k), tensor[i, :, k] has 64 unique values
 
         >>> # Large tensor - automatically uses safe range
-        >>> tensor = create_unique_along_dim((1000, 1000), dim=-1)
+        >>> tensor = unique_randn_along_dim((1000, 1000), dim=-1)
         >>> # Warns if range is too large for float16 precision
     """
 
     if seed is not None:
         torch.random.manual_seed(seed)
+
+    # Check if dtype is an integer type
+    is_integer_dtype = dtype in (
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    )
+
+    # Handle global uniqueness (dim=None)
+    if dim is None:
+        # Generate globally unique values
+        total_elements = 1
+        for s in shape:
+            total_elements *= s
+
+        unique_size = total_elements
+        num_slices = 1
+
+        # Check for float16 overflow
+        if dtype == torch.float16:
+            float16_max = torch.finfo(torch.float16).max
+            if abs(min_val) > float16_max or abs(max_val) > float16_max:
+                raise ValueError(
+                    f"Values [{min_val}, {max_val}] exceed float16 range "
+                    f"[{-float16_max}, {float16_max}]. Use smaller range or float32."
+                )
+
+        # Check for float16 precision issues
+        value_range = max_val - min_val
+        min_spacing = value_range / unique_size
+
+        if dtype == torch.float16 and warn_precision:
+            max_abs_val = max(abs(min_val), abs(max_val))
+            float16_eps = 0.001
+            estimated_precision = max_abs_val * float16_eps
+
+            if min_spacing < estimated_precision * 2:
+                import warnings
+
+                warnings.warn(
+                    f"Float16 precision warning: Spacing between values ({min_spacing:.4f}) "
+                    f"is close to float16 precision (~{estimated_precision:.4f}) at this range. "
+                    f"With {unique_size} unique values in range [{min_val}, {max_val}], "
+                    f"some values may become equal after float16 conversion.\n"
+                    f"Recommendations:\n"
+                    f"  1. Use smaller range (e.g., [{-max_abs_val / 2:.0f}, {max_abs_val / 2:.0f}])\n"
+                    f"  2. Use smaller tensor size\n"
+                    f"  3. Use dtype=torch.float32 instead",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        # Generate globally unique values
+        intermediate_dtype = torch.int64 if is_integer_dtype else torch.float32
+        if is_integer_dtype:
+            unique_vals = torch.randperm(unique_size, dtype=torch.int64)
+            scaled = min_val + (unique_vals * value_range) // unique_size
+        else:
+            unique_vals = torch.randperm(unique_size, dtype=torch.float32)
+            scaled = min_val + (unique_vals / unique_size) * value_range
+
+        # Reshape to target shape and convert to target dtype
+        result = scaled.reshape(shape).to(dtype)
+        return result
 
     # Normalize dimension to positive index
     ndim = len(shape)
@@ -148,7 +235,9 @@ def unique_randn_along_dim(
             )
 
     # Create result tensor
-    result = torch.zeros(shape, dtype=torch.float32)
+    # Use float32 for intermediate calculations, or int64 for integer dtypes
+    intermediate_dtype = torch.int64 if is_integer_dtype else torch.float32
+    result = torch.zeros(shape, dtype=intermediate_dtype)
 
     # Flatten all dimensions except the unique dimension
     # This makes it easier to iterate over slices
@@ -156,8 +245,13 @@ def unique_randn_along_dim(
         # Special case: unique along first dimension
         for slice_idx in range(num_slices):
             # Generate unique values
-            unique_ints = torch.randperm(unique_size, dtype=torch.float32)
-            scaled = min_val + (unique_ints / unique_size) * value_range
+            if is_integer_dtype:
+                # For integers, generate unique integers in range
+                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                scaled = min_val + (unique_ints * value_range) // unique_size
+            else:
+                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                scaled = min_val + (unique_ints / unique_size) * value_range
 
             # Compute multi-dimensional index for this slice
             remaining_shape = shape[1:]
@@ -174,8 +268,13 @@ def unique_randn_along_dim(
         # Special case: unique along last dimension (most common, optimized)
         result_flat = result.view(-1, unique_size)
         for i in range(num_slices):
-            unique_ints = torch.randperm(unique_size, dtype=torch.float32)
-            scaled = min_val + (unique_ints / unique_size) * value_range
+            if is_integer_dtype:
+                # For integers, generate unique integers in range
+                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                scaled = min_val + (unique_ints * value_range) // unique_size
+            else:
+                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
 
     else:
@@ -189,13 +288,18 @@ def unique_randn_along_dim(
         result_flat = result_permuted.reshape(-1, unique_size)
         # Generate unique values for each slice
         for i in range(num_slices):
-            unique_ints = torch.randperm(unique_size, dtype=torch.float32)
-            scaled = min_val + (unique_ints / unique_size) * value_range
+            if is_integer_dtype:
+                # For integers, generate unique integers in range
+                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                scaled = min_val + (unique_ints * value_range) // unique_size
+            else:
+                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
         # Reshape and permute back
         result_permuted = result_flat.reshape(result_permuted.shape)
         result = result_permuted.permute(perm)
-    # Convert to target dtype
+    # Convert to target dtype (no-op if already correct dtype)
     result = result.to(dtype)
 
     # Verify uniqueness after conversion (for float16)
@@ -239,10 +343,18 @@ def unique_randn_along_dim(
 
 
 # init_helper initiates tensors given a list of shape tuples
-def init_helper(shapes, dtype=torch.float16, cached=True):
-    randn_func = cached_randn if cached else torch.randn
+def init_helper(shapes, dtype=torch.float16, cached=True, rand_type="randn"):
+    def uncached_xavier(shape, dtype):
+        return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+
+    cached_fn, uncached_fn = {
+        "randn": (cached_randn, torch.randn),
+        "xavier": (cached_xavier, uncached_xavier),
+    }[rand_type]
+    rand_fn = cached_fn if cached else uncached_fn
+
     return tuple(
-        randn_func(shape, differentiation=i, dtype=dtype)
+        rand_fn(shape, dtype=dtype, **({"differentiation": i} if cached else {}))
         for i, shape in enumerate(shapes)
     )
 
@@ -256,8 +368,10 @@ def shapes2key(shapes):
 
 
 # cases: Tuple of cases. Each case is defined by shapes of tensors
-def make_param_dict(cases):
-    return {shapes2key(shapes): init_helper(shapes) for shapes in cases}
+def make_param_dict(cases, rand_type="randn"):
+    return {
+        shapes2key(shapes): init_helper(shapes, rand_type=rand_type) for shapes in cases
+    }
 
 
 # ParameterizedTestMeta injects parameterized test methods
@@ -320,6 +434,7 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
+            expect_fail = cases.get("expect_fail", [])
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -346,6 +461,10 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
+                        if test_case in expect_fail:
+                            namespace[test_name] = pytest.mark.xfail(
+                                reason=f"Expected fail for {test_case}", strict=True
+                            )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -367,6 +486,10 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
+                    if test_case in expect_fail:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Expected fail for {test_case}", strict=True
+                        )(namespace[test_name])
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
@@ -393,7 +516,15 @@ def _to_cpu(result, device):
         return result
 
 
-def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile=True):
+def _compile_and_run(
+    fn,
+    args,
+    device,
+    backend="inductor",
+    needs_device=False,
+    compile=True,
+    source_check=None,
+):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
     device = torch.device(device) if isinstance(device, str) else device
@@ -403,10 +534,16 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
     device_kwargs = {"device": device} if needs_device else {}
 
     if compile:
-        if backend:
-            result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+        comp_func = torch.compile(fn, backend=backend)
+
+        if source_check is not None and device == "spyre":
+            result, source_codes = run_and_get_code(
+                comp_func, *device_args, **device_kwargs
+            )
+            if len(source_codes) > 0:
+                source_check(source_codes[0])
         else:
-            result = torch.compile(fn)(*device_args, **device_kwargs)
+            result = comp_func(*device_args, **device_kwargs)
     else:
         result = fn(*device_args, **device_kwargs)
 
@@ -450,20 +587,59 @@ def compare_with_cpu(
     atol=0.1,
     rtol=0.1,
     needs_device=False,
-    cpu_compile=True,
+    cpu_compile=None,
     target=None,
     run_eager=True,
+    run_compile=True,
+    source_check=None,
 ):
-    """Compare Spyre execution (compiled and optionally eager) against CPU execution."""
+    """Compare Spyre execution against CPU for one or both Spyre execution paths.
+
+    ``run_compile`` and ``run_eager`` select ``torch.compile`` vs eager on ``DEVICE``
+    (spyre). At least one must be ``True``:
+
+    - **Both** (default): ``run_compile=True``, ``run_eager=True`` — run compiled
+      Spyre, then eager Spyre (same order as before).
+    - **Compiled only**: ``run_compile=True``, ``run_eager=False``.
+    - **Eager only**: ``run_compile=False``, ``run_eager=True``.
+    - **Neither**: raises ``ValueError``.
+
+    When ``cpu_compile`` is True, each selected Spyre path is also compared to CPU
+    using the same compile flag (compiled vs compiled, or eager vs eager).
+
+    Args:
+        run_compile: Run the compiled path on Spyre.
+        run_eager: Run the eager (non-compiled) path on Spyre.
+    """
+    # if this flag is explicitly passed in by the test, use it
+    if cpu_compile is None:
+        # the bool function parses all non-empty strings to true
+        # if this env var is set at all, it gets marked as true
+        cpu_compile = bool(os.getenv("TEST_COMPARE_CPU_COMPILE"))
+
     cpu_result = fn(*args)
 
-    for compiled in [True, False] if run_eager else [True]:
+    # Order: compiled first, then eager (matches prior [True, False] when both on).
+    modes = tuple(
+        compiled
+        for compiled, enabled in ((True, run_compile), (False, run_eager))
+        if enabled
+    )
+    if not modes:
+        raise ValueError("At least one of run_compile or run_eager must be True")
+
+    for compiled in modes:
         mode = "compiled" if compiled else "eager"
         spyre_result = (
             target
             if target is not None
             else _compile_and_run(
-                fn, args, DEVICE, needs_device=needs_device, compile=compiled
+                fn,
+                args,
+                DEVICE,
+                needs_device=needs_device,
+                compile=compiled,
+                source_check=source_check,
             )
         )
 
@@ -492,34 +668,29 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
 
 
-def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False, target=None):
-    """Compare compiled Spyre execution against sendnn backend execution."""
-    if target is None:
-        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
-    sendnn_result = _compile_and_run(fn, args, "cpu", backend="sendnn")
-    _assert_results_close(target, sendnn_result, atol, rtol, "sendnn")
+def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):  # noqa: B902
+    for name, value in my_cls.__dict__.items():
+        if name.startswith("test_"):
+            # You cannot copy functions in Python, so we use closures here to
+            # create objects with different ids. Otherwise, unittest.skip
+            # would modify all methods sharing the same object id. Also, by
+            # using a default argument, we create a copy instead of a
+            # reference. Otherwise, we would lose access to the value.
 
+            @functools.wraps(value)
+            def new_test(self, value=value):
+                return value(self)
 
-def compare(
-    fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
-):
-    """3-way comparison: compiled Spyre vs uncompiled CPU vs sendnn backend."""
-    spyre_compiled_result = _compile_and_run(
-        fn, args, DEVICE, needs_device=needs_device
-    )
-    compare_with_cpu(
-        fn,
-        *args,
-        atol=cpu_atol,
-        rtol=cpu_rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )
-    compare_with_sendnn(
-        fn,
-        *args,
-        atol=atol,
-        rtol=rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )
+            # Copy __dict__ which may contain test metadata
+            new_test.__dict__ = copy.deepcopy(value.__dict__)
+
+            tf = test_failures and name in test_failures
+            if tf:
+                skip_func = unittest.skip("Skipped!")
+                new_test = skip_func(new_test)
+
+            setattr(other_cls, f"{name}_{suffix}", new_test)
+
+    # Special case convenience routine
+    if hasattr(my_cls, "is_dtype_supported"):
+        other_cls.is_dtype_supported = my_cls.is_dtype_supported

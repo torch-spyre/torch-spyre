@@ -78,8 +78,8 @@ def register_spyre_decomposition(
         # 2. For aten ops, also register via PrivateUse1 dispatch key (for eager mode).
         #    Non-aten ops (e.g. spyre::compact) are custom Spyre ops that don't need
         #    PrivateUse1 kernel registration.
-        #    Skip ops that already have a PrivateUse1 kernel (e.g. from codegen_ops.py
-        #    or eager.py) to avoid registration conflicts.
+        #    Skip ops that already have a PrivateUse1 kernel (e.g. from eager.py) to
+        #    avoid registration conflicts.
         ops_list = ops if isinstance(ops, list) else [ops]
         aten_ops = [
             op
@@ -325,8 +325,7 @@ def ones_decomp(
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     scalar = torch.ops.spyre.ones_scalar(device, dtype=dtype)
-    expanded = scalar.expand(size)
-    return expanded.clone()
+    return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
 
 @register_spyre_decomposition([torch.ops.aten.new_ones.default])
@@ -344,8 +343,7 @@ def new_ones_decomp(
     dev = device if device is not None else self.device
     dt = dtype if dtype is not None else self.dtype
     scalar = torch.ops.spyre.ones_scalar(dev, dtype=dt)
-    expanded = scalar.expand(size)
-    return expanded.clone()
+    return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
 
 # To avoid constant folding, we introduce a custom op `spyre::full` that runs
@@ -458,6 +456,19 @@ def spyre_layer_norm(
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+@register_spyre_decomposition([torch.ops.aten.topk])
+def spyre_topk(
+    input: torch.Tensor,
+    k: int,
+    dim: Optional[int] = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k > 4:
+        raise Unsupported("Topk is not supported for this config")
+    return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
+        input, k, dim
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.gelu.default])
@@ -584,6 +595,52 @@ def spyre__sdpa_overrideable(
     )
 
 
+## TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
+## See: https://github.com/torch-spyre/torch-spyre/issues/1172
+## This will be enabled after solving this.
+# @register_spyre_decomposition([torch.ops.aten.max.default])
+# def spyre_max_default_decomp(input):
+#    """
+#    Decompose torch.max(input) with conditional CPU fallback for int64.
+#
+#    For int64 tensors, use custom op spyre::max_default_int64_fallback which has
+#    a CPU fallback registered in fallbacks.py.
+#    For other dtypes (float16, float32, etc.), use amax.
+#    """
+#    if input.dtype == torch.int64:
+#        # Use custom op with CPU fallback to avoid recursive decomposition
+#        # Returns a scalar (0D) tensor
+#        return torch.ops.spyre.max_default_int64_fallback(input)
+#    else:
+#        # Use amax for supported dtypes (can run on Spyre)
+#        # Returns a scalar (0D) tensor
+#        return torch.ops.aten.amax(input)
+
+
+@register_spyre_decomposition([torch.ops.aten.max.dim])
+def spyre_max_dim_decomp(input, dim, keepdim=False):
+    """
+    Decompose torch.max(input, dim) with conditional CPU fallback for int64.
+
+    For int64 tensors, use custom op spyre::max_dim_int64_fallback which has
+    a CPU fallback registered in fallbacks.py.
+    For other dtypes (float16, float32, etc.), decompose into amax and argmax operations.
+
+    Returns a named tuple (values, indices) as expected by torch.max.
+
+    # TODO (imaihal): Decomposed into torch.topk with k=1 to obtain both values and indices,
+    #  or implement argmax in the backend compiler to get indices
+    """
+    if input.dtype == torch.int64:
+        # Use custom op with CPU fallback to avoid recursive decomposition
+        return torch.ops.spyre.max_dim_int64_fallback(input, dim, keepdim)
+    else:
+        # Use amax and argmax for supported dtypes (can run on Spyre)
+        values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmax(input, dim=dim, keepdim=keepdim)
+        return torch.return_types.max((values, indices))
+
+
 @register_spyre_decomposition([torch.ops.aten.cat.default])
 def decompose_cat(
     tensors: list[torch.Tensor],
@@ -599,7 +656,7 @@ def decompose_cat(
         output = tensors[0].new_empty(output_size)
         offset = 0
         for input in tensors:
-            output = torch.ops.spyre.overwrite(
+            output = torch.ops.spyre.overwrite_f(
                 input=input, output=output, dims=[dim], offsets=[offset]
             )
             offset += input.size(dim)
@@ -659,9 +716,31 @@ def pad_decomp(
         return input
 
     output = scalar.expand(output_size).clone()
-    return torch.ops.spyre.overwrite(
+    output = torch.ops.spyre.overwrite_f(
         input=input, output=output, dims=dims, offsets=offsets
     )
+    return output
+
+
+@register_spyre_decomposition([torch.ops.aten.bitwise_not])
+def bitwise_not(input: torch.Tensor) -> torch.Tensor:
+    if input.dtype is torch.bool:
+        return torch.logical_not(input)
+    else:
+        neg_one = torch.ops.aten.full_like(input, -1)
+        return torch.ops.aten.bitwise_xor(input, neg_one)
+
+
+@register_spyre_decomposition([torch.ops.aten.bitwise_and])
+def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
+    if input1.dtype is torch.bool and input2.dtype is torch.bool:
+        return torch.ops.aten.logical_and(input1, input2)
+    else:
+        return torch.ops.aten.bitwise_not(
+            torch.ops.aten.bitwise_or(
+                torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
+            )
+        )
 
 
 ###############################################################################################

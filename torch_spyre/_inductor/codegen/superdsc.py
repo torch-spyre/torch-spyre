@@ -18,6 +18,7 @@ from typing import Any
 
 from sympy import Integer, Symbol, Expr, Mod, floor
 
+from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
@@ -27,6 +28,7 @@ from torch_spyre._inductor.constants import (
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
     SEGMENT_OFFSETS,
+    TOPK_OPS,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
@@ -239,9 +241,13 @@ def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul")
 
 
+def _is_topk(op: str) -> bool:
+    return op in TOPK_OPS
+
+
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
-        return MATMUL_DIM_LABELS[5 - ndim :]
+        return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
     return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
@@ -257,26 +263,7 @@ def _create_sdsc_tensors(
     use_op_dims = not _is_matmul(op_spec.op)
 
     missing_dim = None
-    backGap: dict[Symbol, int] = {}
-    overwrite_infos: dict = (
-        dict(op_spec.op_info.get("overwrite_infos", {})) if op_spec.op_info else {}
-    )
     adjusted_output_size = op_spec.args[-1].device_size.copy()
-    if overwrite_infos:
-        output = op_spec.args[-1]
-        dim_order, stick_dim = _get_device_dim_order(output, symbol_mapping)
-        for dim_idx, dim in enumerate(dim_order):
-            for info in overwrite_infos.values():
-                if info["device_stride"] == math.prod(
-                    output.device_size[-dim_idx - 1 :]
-                ):
-                    dim_size = iteration_space[dim]
-                    dev_dim_idx = len(output.device_size) - 2 - dim_idx
-                    adjusted_output_size[dev_dim_idx] = (
-                        dim_size // output.device_dtype.elems_per_stick()
-                        if dim == stick_dim
-                        else dim_size
-                    )
     sdsc_args: list[SDSCArgs] = []
     for arg in op_spec.args:
         addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
@@ -284,19 +271,25 @@ def _create_sdsc_tensors(
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
+        backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
         use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
-        if use_op_dims and dim_order != dims:
+        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
+
         if op_stick_dim is None:
             # No stick dim found in op - add one
             stick_dim = next(d for d in dims if d not in op_dim_order)
             dim_order = dim_order + [stick_dim]
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
-        for dim_idx, dim in enumerate(dim_order):
+        stride_dim_order = [
+            d for d in dim_order if d not in reduced_dims
+        ] + reduced_dims
+        for dim in dim_order:
+            stride_idx = stride_dim_order.index(dim)
             if dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
@@ -304,19 +297,25 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
             strides[dim] = _calculate_device_stride(
-                dim_idx,
+                stride_idx,
                 arg.device_size if not use_adjusted_size else adjusted_output_size,
             )
             offsets[dim] = 0
-            dim_device_stride = math.prod(arg.device_size[-dim_idx - 1 :])
-            for key in list(overwrite_infos.keys()):
-                info = overwrite_infos[key]
-                if info["device_stride"] == dim_device_stride and not arg.is_input:
-                    backGap[dim] = info["gap"]
-                    offsets[dim] = info["device_offset"] * info["device_stride"]
-                    overwrite_infos.pop(key)
-                    use_adjusted_size = False
-                    break
+            dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+
+            dev_dim_size = arg.device_size[-stride_idx - 2]
+            it_dim_size = iteration_space[dim]
+            if dim == stick_dim:
+                stick_size = arg.device_dtype.elems_per_stick()
+                dev_dim_size *= stick_size
+                it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+
+            if dev_dim_size > it_dim_size:
+                dim_coord = arg.device_coordinates[-stride_idx - 2]
+                dim_offset = int(dim_coord.as_coeff_Add()[0])
+                offsets[dim] = dim_offset * dim_device_stride
+                backGap[dim] = dev_dim_size - it_dim_size
+                strides[dim] = strides[dim] / dev_dim_size * it_dim_size
 
             max_dim_sizes[dim] = -1
 
@@ -337,32 +336,10 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address=addr,
-                backGap=backGap if not arg.is_input else {},
+                start_address=addr if not arg.allocation else arg.allocation["lx"],
+                backGap=backGap,
             )
         )
-
-    # For each overwrite entry with a device dimension of size 1 (absent from
-    # the iteration space), inject a synthetic dimension.
-    for info in overwrite_infos.values():
-        missing_dim = Symbol(INPUT_DIM_LABELS[len(op_dim_order)])
-        iteration_space[missing_dim] = 1
-        for sdsc_arg, src_arg in zip(sdsc_args, op_spec.args):
-            dim_idx = len(sdsc_arg.scales)
-            sdsc_arg.scales[missing_dim] = 1
-            sdsc_arg.max_dim_sizes[missing_dim] = -1
-            sdsc_arg.strides[missing_dim] = _calculate_device_stride(
-                dim_idx, src_arg.device_size
-            )
-            if not src_arg.is_input:
-                sdsc_arg.backGap[missing_dim] = info["gap"]
-                sdsc_arg.offsets[missing_dim] = (
-                    info["device_offset"] * info["device_stride"]
-                )
-            if missing_dim not in layouts[sdsc_arg.layout]["dim_order"]:
-                layouts[sdsc_arg.layout]["dim_order"] = layouts[sdsc_arg.layout][
-                    "dim_order"
-                ] + [missing_dim]
 
     return sdsc_args, layouts, missing_dim
 
@@ -370,9 +347,36 @@ def _create_sdsc_tensors(
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     if op == "to_dtype" or op == "overwrite":
         return IDENTITY_OP
-    if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
+    if (
+        is_reduction
+        and not _is_matmul(op)
+        and not _is_topk(op)
+        and -2 not in output_scales.values()
+    ):
         return op + "nonstick"
     return op
+
+
+def _concretize_for_sdsc(expr: Expr) -> int:
+    """Concretize a symbolic expression at the SDSC generation boundary.
+
+    SDSC generation (and the downstream DeepTools backend compiler) currently
+    requires all iteration-space sizes to be concrete integers.  This is the
+    final concretization point in the pipeline: everything upstream may be
+    symbolic, but the SDSC JSON emitted here is fully concrete.
+
+    TODO(issue#220): once SDSC generation emits ``symbolDefinitions_`` and
+    ``symbolicDimInfo_`` for the DeepTools VariableDefinition DAG, this
+    function can be replaced with symbolic expression serialisation and
+    iteration-space sizes can remain symbolic all the way through.
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, Integer):
+        return int(expr)
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        return V.graph.sizevars.size_hint(expr)
+    return int(expr)
 
 
 def _ref_arg(op_spec):
@@ -396,7 +400,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
     sdsc_iteration_space = {
-        symbol_mapping[sym]: (size.p if isinstance(size, Integer) else size)
+        symbol_mapping[sym]: _concretize_for_sdsc(size)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
 
@@ -447,6 +451,9 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
     num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
 
+    if _is_topk(op_spec.op):
+        num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
+
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
         execution_unit="pt" if is_matmul else "sfp",
@@ -468,7 +475,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
 
-def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> Any:
+def compile_op_spec(idx: int, op_spec: OpSpec) -> Any:
     sdsc_spec = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    return generate_sdsc(sdsc_spec)
+    return generate_sdsc(idx, sdsc_spec)

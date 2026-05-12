@@ -1,21 +1,13 @@
 """
 Shared class and methods for all OOT PyTorch test overrides.
 
-Usage:
-    export PYTORCH_TESTING_DEVICE_ONLY_FOR="privateuse1"
-
-    # Clone pytorch
-    $DTI_PROJECT_ROOT/torch-spyre-docs/scripts/checkout-pytorch-src.sh
-
-    export TORCH_TEST_DEVICES="$DTI_PROJECT_ROOT/torch-spyre/tests/spyre_test_base_common.py"
-    export PYTORCH_TEST_CONFIG="$DTI_PROJECT_ROOT/torch-spyre/tests/test_suite_config.yaml"
-
-    cd $DTI_PROJECT_ROOT/pytorch/test/
-    python3 -m pytest test_binary_ufuncs.py -v
 """
 
 import os
-from typing import Dict, Optional, Set
+import json
+from typing import Dict, List, Optional, Set
+import warnings
+
 
 import pytest  # type: ignore
 import torch
@@ -42,18 +34,24 @@ from spyre_test_parsing import (
 
 from spyre_upstream_patcher import (
     _OOTDtypePatcher,
+    _OOTModuleMarkerPatcher,
     _OOTOnlyOnPatcher,
     _OOTOpDtypeExpander,
     _OOTOpListPatcher,
     _OOTModuleListPatcher,
     _OOTModuleDtypePatcher,
+    _OOTOpMarkerPatcher,
+    _OOTPrecisionOverridePatcher,
 )
 from spyre_test_config_models import (
     OOTTestConfig,
+    Precision,
     SupportedOpConfig,
     SupportedModuleConfig,
     TestEntry,
 )
+
+warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 
 
 # Resolve the actual backend name registered for privateuse1.
@@ -163,6 +161,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         str, "SupportedModuleConfig"
     ] = {}  # {module_name -> config}
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
+    GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
 
     @classmethod
     def setUpClass(cls):
@@ -202,6 +201,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             cls.SUPPORTED_MODULES_CONFIG = module_configs
 
         cls.GLOBAL_SUPPORTED_DTYPES = config.global_config.resolved_supported_dtypes()
+        cls.GLOBAL_DTYPE_PRECISION = (
+            config.global_config.resolved_supported_dtypes_precision()
+        )
 
         file_entry: FileEntry = resolve_current_file(config, path)
 
@@ -298,15 +300,27 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     def instantiate_test(cls, name, test, *, generic_cls=None):
         _OOTOnlyOnPatcher(test, _SPYRE_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
-
         # print tags to stderr
         entry = cls.TEST_ENTRIES.get(name)
         tags = entry.tags if entry is not None else []
-        if tags:
+        # Collect op-level tags from all OpsNamedItem entries in this TestEntry
+        # and union them with test-level tags so pytest -m works for both levels.
+        op_tags: List[str] = []
+        if entry is not None:
+            seen_op_tags: set = set()
+            for ops_item in entry.edits.ops.include:
+                for t in ops_item.tags:
+                    if t not in seen_op_tags:
+                        seen_op_tags.add(t)
+                        op_tags.append(t)
+
+        # Union: test-level tags + op-level tags (deduplicated)
+        all_tags = tags + [t for t in op_tags if t not in set(tags)]
+        if all_tags:
             os.write(
                 2,
                 f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
-                f"tags: [{', '.join(tags)}]\n".encode(),
+                f"tags: [{', '.join(all_tags)}]\n".encode(),
             )
 
         # op list filtering
@@ -364,7 +378,10 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 and isinstance(p.__self__, _modules_cls)
             ):
                 for mod_info in p.__self__.module_info_list:
-                    mod_cfg = cls.SUPPORTED_MODULES_CONFIG.get(mod_info.name)
+                    mod_cfg = cls.SUPPORTED_MODULES_CONFIG.get(
+                        mod_info.name
+                    ) or cls.SUPPORTED_MODULES_CONFIG.get(f"torch.{mod_info.name}")
+
                     if mod_cfg is not None:
                         resolved = mod_cfg.resolved_dtypes()
                         if resolved is not None:
@@ -379,10 +396,27 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 _OOTDtypePatcher(test, extra_dtypes).patch()
                 _OOTOpDtypeExpander(test, extra_dtypes).patch()
 
+        _OOTPrecisionOverridePatcher(
+            test,
+            global_dtype_precision=cls.GLOBAL_DTYPE_PRECISION,
+            include_dtype_precision=(
+                entry.edits.dtypes.resolved_include_precision()
+                if entry is not None
+                else {}
+            ),
+        ).patch()
+
+        # Dynamically adds pytest marker to each of ops and dtype passed to @ops
+        _OOTOpMarkerPatcher(test).patch()
+
+        # Dynamically adds pytest marker to each of modules and dtype passed to @modules
+        _OOTModuleMarkerPatcher(test).patch()
+
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
 
+        _tags_to_write: Dict[str, List[str]] = {}
         for method_name in new_methods:
             enabled, reason, is_xfail, is_strict = cls._should_run(
                 method_name=method_name,
@@ -415,14 +449,33 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             #     setattr(cls, method_name, _skip)
             #     continue
 
-            # apply pytest tags as marks
-            if tags:
+            # Collect dynamic markers (op__, dtype__, module__) that the
+            # patchers attached to this specific instantiated method, and
+            # union them with the YAML-declared tags so _XML_INJECT_PY
+            # only needs to handle one flat tag list per method.
+            _DYNAMIC_PREFIXES = ("op__", "dtype__", "module__")
+            existing_fn = cls.__dict__.get(method_name)
+            dynamic_tags: List[str] = []
+            if existing_fn is not None:
+                dynamic_tags = sorted(
+                    {
+                        m.name
+                        for m in getattr(existing_fn, "pytestmark", [])
+                        if any(m.name.startswith(p) for p in _DYNAMIC_PREFIXES)
+                    }
+                )
+
+            method_tags = all_tags + [t for t in dynamic_tags if t not in set(all_tags)]
+
+            # apply all tags (YAML + dynamic) as marks
+            if method_tags:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
                     marked_fn = existing_fn
-                    for tag in tags:
+                    for tag in method_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
+                _tags_to_write[method_name] = method_tags
 
             # apply xfail if needed
             if is_xfail:
@@ -433,6 +486,25 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                         method_name,
                         pytest.mark.xfail(strict=is_strict)(existing_fn),
                     )
+
+        # Flush {method_name: [tags]} to sidecar for _XML_INJECT_PY.
+        # so that XML reads global + op/dtype/module tags in one shot
+        if _tags_to_write:
+            _cfg = os.environ.get(ENV_TEST_CONFIG, "")
+            if _cfg:
+                _sidecar = _cfg + ".markers.json"
+                _existing_tags: dict = {}
+                try:
+                    with open(_sidecar) as _sf:
+                        _existing_tags = json.load(_sf)
+                except Exception:
+                    pass
+                _existing_tags.update(_tags_to_write)
+                try:
+                    with open(_sidecar, "w") as _sf:
+                        json.dump(_existing_tags, _sf)
+                except Exception:
+                    pass
 
 
 TEST_CLASS = TorchTestBase

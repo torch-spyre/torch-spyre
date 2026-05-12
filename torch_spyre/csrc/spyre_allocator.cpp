@@ -15,6 +15,7 @@
  */
 #include "spyre_allocator.h"
 
+#include <memory>
 #include <utility>
 
 #include "logging.h"
@@ -29,12 +30,13 @@ c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
 c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
-flex::DeviceMemoryAllocatorPtr SpyreAllocator::getAllocator(
-    unsigned int /*dev_id*/) {
-  // Each process has exactly one runtime with one device handle (index 0).
-  // The PyTorch device index (dev_id) is the logical index across processes,
-  // not an index into the runtime's device handle vector.
-  return GlobalRuntime::get()->GetDeviceHandle(0)->GetDeviceMemoryAllocator();
+std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
+  // FlexAllocator is owned by RuntimeContext (one per device per process).
+  // RuntimeContext::getAllocator() returns shared_ptr<const FlexAllocator>;
+  // we const_cast to shared_ptr<FlexAllocator> because allocate()/deallocate()
+  // are non-const (internally mutex-protected and thread-safe).
+  auto const_alloc = flex::getFlexRuntimeContext()->getAllocator();
+  return std::const_pointer_cast<flex::FlexAllocator>(const_alloc);
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
@@ -82,7 +84,7 @@ void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id) {
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
   c10::reportMemoryUsageToProfiler(
-      &data,
+      data,
       nbytes,  // alloc_size
       stats_
           .allocated_bytes[static_cast<size_t>(
@@ -105,7 +107,7 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
   c10::reportMemoryUsageToProfiler(
-      &data,
+      data,
       -nbytes,  // alloc_size
       stats_
           .allocated_bytes[static_cast<size_t>(
@@ -128,16 +130,25 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
-  auto allocator = getAllocator(device_id);
-  flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-  // NOTE: last argument should be set to 0
-  allocator->TryAllocate(&data, nbytes, 0);
-  TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-  auto* ctx = new SharedOwnerCtx{std::move(data), device_id, nbytes};
+  // Get shared_ptr to keep FlexAllocator alive during operations
+  auto flex_alloc = getFlexAllocator();
+
+  // Allocate first-class raw storage via CompositeAddress.
+  flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
+
+  // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
+  // allocation may be larger than the requested nbytes. Use total_size() for
+  // accurate memory profiling.
+  size_t actual_nbytes = composite_addr.total_size();
+
+  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id);
   void* ctx_void = static_cast<void*>(ctx);
 
-  void* data_void = static_cast<void*>(ctx->owner.get());
-  recordAlloc(nbytes, data_void, device_id);
+  // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.
+  // This pointer is never dereferenced — it serves only as a unique token for
+  // memory profiling (recordAlloc/recordRelease).
+  void* data_void = static_cast<void*>(ctx);
+  recordAlloc(actual_nbytes, data_void, device_id);
 
   auto data_ptr_result =
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
@@ -150,10 +161,10 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
     return;
   }
   auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-  size_t nbytes = ctx->nbytes;
+  size_t nbytes = ctx->composite_addr.total_size();
 
-  SpyreAllocator::instance().recordRelease(
-      nbytes, static_cast<void*>(ctx->owner.get()), ctx->device_id);
+  SpyreAllocator::instance().recordRelease(nbytes, static_cast<void*>(ctx),
+                                           ctx->device_id);
   delete ctx;
 }
 

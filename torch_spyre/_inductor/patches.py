@@ -95,6 +95,7 @@ def enable_spyre_context(
         "unroll_reductions_threshold": 1,
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
+        "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
     }
 
     from torch._inductor.ir import Loops

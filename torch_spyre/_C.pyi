@@ -17,8 +17,8 @@ __all__: list[str] = [
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
-    "convert_artifacts",
     "empty_with_layout",
+    "copy_tensor",
     "encode_constant",
     "free_runtime",
     "get_device_dtype",
@@ -135,21 +135,16 @@ class SpyreTensorLayout:
     def __init__(
         self,
         device_size: collections.abc.Sequence[typing.SupportsInt],
-        dim_map: collections.abc.Sequence[typing.SupportsInt],
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
     def elems_per_stick(self) -> int: ...
-    def host_stick_dim(self) -> int: ...
-    def similar_dim_order(self, arg0: typing.SupportsInt) -> list[int]: ...
     @property
     def device_dtype(self) -> DataFormats: ...
     @property
     def device_size(self) -> list[int]: ...
-    @property
-    def dim_map(self) -> list[int]: ...
     @property
     def stride_map(self) -> list[int]: ...
 
@@ -243,7 +238,17 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def convert_artifacts(arg0: str) -> None: ...
+def copy_tensor(
+    self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
+) -> None:
+    """
+    Copy tensor
+
+    Args:
+        self or dst: one of that must be on spyre device
+    """
+    ...
+
 def empty_with_layout(
     arg0: tuple[int, ...],
     arg1: SpyreTensorLayout,
@@ -262,7 +267,9 @@ def get_downcast_warning() -> bool:
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
-def launch_kernel(arg0: str, arg1: collections.abc.Sequence[torch.Tensor]) -> None: ...
+def launch_kernel(
+    code_dir: str, args: collections.abc.Sequence[torch.Tensor]
+) -> None: ...
 def set_downcast_warning(arg0: bool) -> None:
     """
     Enable/disable downcast warnings for this process.

@@ -35,9 +35,28 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: get some info
         run: |
+          MY_DELIM="=================================================================="
+
+          # The CI env var is very important.
+          # GitHub actions automatically sets CI=true
+          # which causes the pytest inductor tests to fail with AssetionError
+          # due to a mix of fallbacks and decompositions.
+          # Here we set it to an empty string (or we could also unset it)
+          export CI=
+
+          CLONED_TORCH_SPYRE_DIR=$(pwd)
+          CLONED_TORCH_SENDNN_DIR="${HOME}/torch_sendnn"
+
+          echo "$MY_DELIM"
+          echo 'install uv'
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          source "$HOME/.bashrc"
+
+          echo "$MY_DELIM"
           echo 'gather info start'
+          date
           pwd
-          ls -la
+          ls -lart
           whoami
           id
           echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
@@ -45,23 +64,39 @@ jobs:
           echo "HOME $HOME"
           python3 --version
           python3 -c 'import sys; print(sys.path)'
+          echo "$MY_DELIM"
+          env | sort
+          echo "$MY_DELIM"
+          env | sort | grep AIU
           echo 'gather info end'
-      - name: Install the torch-spyre package and dependencies
-        run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          # avoid the extra step required by --no-build-isolation
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-      - name: Run unit tests
-        run: |
-          echo 'Run unit tests start'
+
+          echo "$MY_DELIM"
+          echo 'building torch-spyre...'
+          uv sync --verbose --all-extras --active --inexact --reinstall-package torch-spyre || exit 1
+          source .venv/bin/activate || exit 1
+
+          echo "$MY_DELIM"
+          echo 'building torch_sendnn...'
+          cd
+          cd "$CLONED_TORCH_SENDNN_DIR" || exit 1
+          # python3 -m pip install build
+          # uv pip install build
+          python3 -m build --wheel . || exit 1
+          uv pip uninstall torch-sendnn
+          uv pip install --upgrade dist/torch_sendnn-*.whl --no-deps
+
+          echo "$MY_DELIM"
+          echo 'run unit tests start'
+          cd
+          cd "$CLONED_TORCH_SPYRE_DIR" || exit 1
+          EXIT_CODE=0
           pytest tests/ -vvv -s || EXIT_CODE=$?
-          EXIT_CODE=${EXIT_CODE:-0}
           echo "pytest EXIT_CODE: ${EXIT_CODE}"
           if [[ "$EXIT_CODE" == '0' ]] ; then
             echo 'pytest success'
           else
             echo 'pytest failed'
           fi
-          echo 'Run unit tests end'
+
+          echo 'run unit tests end'
           exit "$EXIT_CODE"
