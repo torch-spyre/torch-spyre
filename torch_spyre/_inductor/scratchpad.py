@@ -213,7 +213,9 @@ class ScratchPadAllocator:
     # TODO add defrag mechanism to allocator later
 
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
-        return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+        return config.allow_all_ops_in_lx_planning or any(
+            op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
+        )
 
     def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
         return any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
