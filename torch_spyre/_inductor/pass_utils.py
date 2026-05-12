@@ -22,7 +22,6 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     Loops,
-    MultiOutput,
     Operation,
     Pointwise,
     Reduction,
@@ -493,7 +492,10 @@ def lower_pad_sequence(
     and ``new_ops`` is the list of new IR operations in topological order.
     """
     from .propagate_layouts import generic_layout  # deferred to avoid circular import
-    from .ir import SpyreConstantFallback  # deferred to avoid circular import
+    from .ir import (
+        SpyreConstantFallback,
+        SpyreEmptyFallback,
+    )  # deferred to avoid circular import
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -574,7 +576,7 @@ def lower_pad_sequence(
     # propagate_spyre_tensor_layouts already ran, so new ops keep FlexibleLayout
     # unless we assign here.
     #
-    # spyre.empty lowers to FallbackKernel + MultiOutput; the MultiOutput is
+    # spyre.empty lowers to SpyreEmptyFallback (single op, ExternKernel subclass);
     # unwrapped from the returned TensorBox to set its layout.
     # spyre.constant lowers to SpyreConstantFallback (single op, ExternKernel subclass).
     # aten.expand lowers to an ExpandView (no Buffer produced, no layout needed).
@@ -598,8 +600,8 @@ def lower_pad_sequence(
 
     empty_tb = graph_lowering.run_node(empty_fx)
     graph_lowering.env[empty_fx] = empty_tb
-    padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> MultiOutput
-    assert isinstance(padded_buf, MultiOutput)
+    padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> SpyreEmptyFallback
+    assert isinstance(padded_buf, SpyreEmptyFallback)
     # Build the padded STL preserving the within-stick host dimension of orig_stl.
     # stride_map[-1] is the host stride of the within-stick dimension; find the
     # corresponding dim in the (possibly larger) view's stride list and use it as
@@ -669,10 +671,10 @@ def lower_pad_sequence(
     object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_data_fx)
 
     # Collect all newly added operations (appended at the end of graph.operations).
-    # Fresh path: spyre.empty(FK+MO=2) + spyre.constant(1) + clone(1) + overwrite×2(2) = 6.
-    # Cache-hit path: spyre.constant is reused, so spyre.empty(2) + clone(1) + overwrite×2(2) = 5.
+    # Fresh path: spyre.empty(1) + spyre.constant(1) + clone(1) + overwrite×2(2) = 5.
+    # Cache-hit path: spyre.constant is reused, so spyre.empty(1) + clone(1) + overwrite×2(2) = 4.
     new_ops = graph_lowering.operations[ops_before:]
-    expected = 5 if not const_is_new else 6
+    expected = 4 if not const_is_new else 5
     assert len(new_ops) >= expected, (
         f"Expected at least {expected} new ops, got {len(new_ops)}"
     )

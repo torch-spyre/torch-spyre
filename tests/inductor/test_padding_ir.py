@@ -27,7 +27,6 @@ import torch
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import (
     ComputedBuffer,
-    MultiOutput,
     Operation,
     Reduction,
 )
@@ -36,7 +35,7 @@ from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
-from torch_spyre._inductor.ir import SpyreConstantFallback
+from torch_spyre._inductor.ir import SpyreConstantFallback, SpyreEmptyFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 
 
@@ -143,8 +142,8 @@ class TestInsertPaddingIR(unittest.TestCase):
         return operations[:idx]
 
     @staticmethod
-    def _multioutput_ops(operations: list[Operation]) -> list[MultiOutput]:
-        return [op for op in operations if isinstance(op, MultiOutput)]
+    def _empty_fallback_ops(operations: list[Operation]) -> list[SpyreEmptyFallback]:
+        return [op for op in operations if isinstance(op, SpyreEmptyFallback)]
 
     @staticmethod
     def _overwrite_ops(ops: list[Operation]) -> list[ComputedBuffer]:
@@ -396,10 +395,8 @@ class TestInsertPaddingIR(unittest.TestCase):
     def test_padded_buffer_sizes_x_and_y(self) -> None:
         """Padded x and y buffers have the correct sizes with K_padded.
 
-        spyre.empty lowers to FallbackKernel + MultiOutput.  The MultiOutput's
-        origin_node is overwritten by subsequent overwrite ops (because the same
-        empty_tb is returned from run_node for those calls), so we identify the
-        padded MultiOutputs by their tensor size rather than origin_node target.
+        spyre.empty lowers to SpyreEmptyFallback.  We identify the padded
+        SpyreEmptyFallback ops by their tensor size.
         """
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
@@ -421,21 +418,25 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         ops_before = self._ops_before(ops, mm)
 
-        # Padded buffers are the MultiOutput ops before the matmul whose size
-        # matches either [B,M,k_padded] (x) or [B,k_padded,N] (y).
-        mo_sizes = [
+        # Padded buffers are the SpyreEmptyFallback ops before the matmul whose
+        # size matches either [B,M,k_padded] (x) or [B,k_padded,N] (y).
+        empty_sizes = [
             [int(s) for s in op.get_size()]
             for op in ops_before
-            if isinstance(op, MultiOutput)
+            if isinstance(op, SpyreEmptyFallback)
         ]
 
         expected_x = [B, M, k_padded]
         expected_y = [B, k_padded, N]
         self.assertIn(
-            expected_x, mo_sizes, f"x padded size {expected_x} not found in {mo_sizes}"
+            expected_x,
+            empty_sizes,
+            f"x padded size {expected_x} not found in {empty_sizes}",
         )
         self.assertIn(
-            expected_y, mo_sizes, f"y padded size {expected_y} not found in {mo_sizes}"
+            expected_y,
+            empty_sizes,
+            f"y padded size {expected_y} not found in {empty_sizes}",
         )
 
     def test_padded_buffer_preserves_stick_dimension(self) -> None:
@@ -445,7 +446,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         from the original buffer's ``stride_map[-1]`` so that
         ``device_coordinates[-1]`` (the stick coordinate expression) is identical
         for both.  Concretely, ``stride_map[-1]`` must be the same for the padded
-        ``MultiOutput`` as it was for the original input buffer.
+        ``SpyreEmptyFallback`` as it was for the original input buffer.
 
         This test covers three cases:
         - 2D mm: original [M, K], padded [M, K_padded] — K is the stick dim.
@@ -503,13 +504,17 @@ class TestInsertPaddingIR(unittest.TestCase):
                 mm = matmuls[0]
                 ops_before = self._ops_before(ops, mm)
 
-                padded_mos = [op for op in ops_before if isinstance(op, MultiOutput)]
+                padded_empties = [
+                    op for op in ops_before if isinstance(op, SpyreEmptyFallback)
+                ]
                 self.assertGreaterEqual(
-                    len(padded_mos), 2, f"{name}: expected at least 2 padded buffers"
+                    len(padded_empties),
+                    2,
+                    f"{name}: expected at least 2 padded buffers",
                 )
 
-                for mo in padded_mos:
-                    layout = mo.get_layout()
+                for empty in padded_empties:
+                    layout = empty.get_layout()
                     self.assertIsInstance(
                         layout,
                         FixedTiledLayout,
@@ -521,7 +526,7 @@ class TestInsertPaddingIR(unittest.TestCase):
                         1,
                         f"{name}: padded buffer stride_map[-1]={sm_last}, "
                         f"expected 1 (K is within-stick dim); "
-                        f"size={[int(s) for s in mo.get_size()]}",
+                        f"size={[int(s) for s in empty.get_size()]}",
                     )
 
 
