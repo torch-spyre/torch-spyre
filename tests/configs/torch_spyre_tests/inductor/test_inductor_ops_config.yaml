@@ -1,0 +1,16 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      # Tests in this file are generated via ParameterizedTestMeta, which
+      # cross-products ops_dict keys with param_sets keys to produce test names
+      # like test_pointwise_unary_op_exp_67x71x256, test_mm_mm_67x67_67x67, etc.
+      # Additionally, many param_sets have "expect_fail" entries which are
+      # registered as xfail by the metaclass at collection time, and several
+      # tests are plain unparameterized methods (test_bool, test_pad_unsupported,
+      # test_isin_tensor_scalar_cpu, etc.).
+      # Enumerating every generated test name explicitly would be impractical
+      # (hundreds of combinations) and fragile against future param additions.
+      # Instead, unlisted_test_mode: mandatory_success captures all collected
+      # tests automatically, consistent with what pytest collects when run
+      # directly.
+      unlisted_test_mode: mandatory_success

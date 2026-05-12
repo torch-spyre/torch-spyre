@@ -247,7 +247,7 @@ def _is_topk(op: str) -> bool:
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
     if is_matmul:
-        return MATMUL_DIM_LABELS[5 - ndim :]
+        return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
     return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 

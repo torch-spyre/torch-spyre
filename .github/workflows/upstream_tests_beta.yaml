@@ -65,15 +65,15 @@ jobs:
       # Derive the PyTorch release branch from pyproject.toml so there is a
       # single source of truth — no hardcoded version in this workflow.
       #
-      # pyproject.toml declares:  torch~=2.10.0
-      # This step extracts "2.10.0", strips the patch -> "2.10", and builds
-      # the branch name "release/2.10".
+      # pyproject.toml declares:  torch~=2.11.0
+      # This step extracts "2.11.0", strips the patch -> "2.11", and builds
+      # the branch name "release/2.11".
       # ---------------------------------------------------------------------------
       - name: Derive PyTorch release branch from pyproject.toml
         id: pytorch-branch
         working-directory: torch-spyre
         run: |
-          # Extract the version constraint, e.g. "2.10.0" from "torch~=2.10.0"
+          # Extract the version constraint, e.g. "2.11.0" from "torch~=2.11.0"
           VERSION=$(python3 - <<'PYEOF'
           import tomllib
 
@@ -82,8 +82,8 @@ jobs:
 
           requires = data.get('build-system', {}).get('requires', [])
           torch_dep = next(x for x in requires if x.startswith('torch'))
-          version = torch_dep.removeprefix('torch~=')   # e.g. "2.10.0"
-          print('.'.join(version.split('.')[:2]))        # --> "2.10"
+          version = torch_dep.removeprefix('torch~=')   # e.g. "2.11.0"
+          print('.'.join(version.split('.')[:2]))        # --> "2.11"
           PYEOF
           )
           BRANCH="release/${VERSION}"
