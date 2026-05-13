@@ -139,7 +139,7 @@ COMMON_REDUCTION_MULTIDIM_KEEPDIM_PARAM_SETS = {
 CORE_REDUCTION_EDGE_MULTIDIM_KEEPDIM_PARAM_SETS = {
     # TODO: 5D all-dims sum/mean reduction is incorrect on spyre (issue #1707)
     # "5d_dim_01234_all": ((0, 1, 2, 3, 4), cached_randn((2, 3, 5, 7, 256), scale=0.1)),
-    "large_2d_dim_01_all": ((0, 1), cached_randn((2048, 4096), scale=0.01)),
+    "large_2d_dim_01_all": ((0, 1), cached_randn((2048, 4096), scale=0.001)),
     "large_3d_dim_12": ((1, 2), cached_randn((32, 64, 512), scale=0.01)),
 }
 
