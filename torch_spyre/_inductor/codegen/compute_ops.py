@@ -325,6 +325,8 @@ def generate_sdsc(idx, sdsc_spec):
                                             )
                                             * num_bytes(tensor.data_format)
                                         )
+                                        if not tensor.allocation
+                                        else str(tensor.start_address)
                                         for c in range(sdsc_spec.num_cores)
                                         #  lx addr is baked into tensor.start_addr already
                                     },
