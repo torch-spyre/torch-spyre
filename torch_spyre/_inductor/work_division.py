@@ -530,6 +530,9 @@ def span_reduction_pass(
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars_to_split = set(min_splits) - coord_vars
+    # Each entry in Reduction.reduction_ranges maps to at most one Symbol via
+    # index_vars_squeeze (size-1 entries are squeezed away). So len > 1 means
+    # genuinely distinct reduction dimensions, not multiple symbols from one dim.
     if len(reduction_vars_to_split) > 1:
         raise Unsupported(
             f"Cannot satisfy hardware memory span limit "
