@@ -34,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -110,7 +110,6 @@ def multi_dim_iteration_space_split(
     max_cores: int,
     output_dims: list[Symbol],
     reduction_dims: list[Symbol],
-    reduction_split_limit: int | None = None,
     min_splits: dict[Symbol, int] | None = None,
 ) -> dict[Symbol, int]:
     """Distribute max_cores across the iteration space.
@@ -118,12 +117,12 @@ def multi_dim_iteration_space_split(
     Three-pass algorithm:
       1. Satisfy min_splits (span-reduction commitments).
       2. Distribute remaining cores to output_dims in priority order.
-      3. Distribute remaining cores to reduction_dims subject to
-         reduction_split_limit (None = unlimited, 0 = skip, 1 = pick best).
+      3. If this is a reduction op, pick the single most-splittable reduction dim
+         for any remaining cores.
 
     The product of all splits will be <= max_cores.
     """
-    assert reduction_split_limit is None or 0 <= reduction_split_limit <= 1
+    is_reduction = bool(reduction_dims)
 
     splits = {v: 1 for v in iteration_space.keys()}
     n_cores_remaining = max_cores
@@ -142,9 +141,7 @@ def multi_dim_iteration_space_split(
             splits[var] = min_split
             n_cores_remaining = n_cores_remaining // min_split
 
-    greedy_dims = (
-        output_dims + reduction_dims if reduction_split_limit is None else output_dims
-    )
+    greedy_dims = output_dims if is_reduction else output_dims + reduction_dims
     for v in greedy_dims:
         if n_cores_remaining <= 1:
             break
@@ -155,7 +152,7 @@ def multi_dim_iteration_space_split(
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
 
-    if reduction_split_limit == 1 and n_cores_remaining > 1:
+    if is_reduction and n_cores_remaining > 1:
         result = _most_splittable_dim(
             reduction_dims, iteration_space, n_cores_remaining
         )
@@ -516,7 +513,6 @@ def span_reduction_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
-    reduction_split_limit: int | None,
 ) -> None:
     """Mandatory per-op pass: compute minimum splits to satisfy the 256MB span limit.
 
@@ -532,17 +528,15 @@ def span_reduction_pass(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores
     )
 
-    if reduction_split_limit is not None:
-        coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-        reduction_vars_to_split = set(min_splits) - coord_vars
-        if len(reduction_vars_to_split) > reduction_split_limit:
-            raise Unsupported(
-                f"Cannot satisfy hardware memory span limit "
-                f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting "
-                f"{len(reduction_vars_to_split)} reduction dimension(s) "
-                f"({reduction_vars_to_split}), but the backend supports at most "
-                f"{reduction_split_limit}."
-            )
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars_to_split = set(min_splits) - coord_vars
+    if len(reduction_vars_to_split) > 1:
+        raise Unsupported(
+            f"Cannot satisfy hardware memory span limit "
+            f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting "
+            f"{len(reduction_vars_to_split)} reduction dimension(s) "
+            f"({reduction_vars_to_split}), but the backend supports at most 1."
+        )
 
     apply_splits(
         op,
@@ -560,7 +554,6 @@ def work_distribution_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
     max_cores: int,
-    reduction_split_limit: int | None,
 ) -> None:
     """Optional per-op pass: distribute remaining cores to maximize parallelism.
 
@@ -607,7 +600,6 @@ def work_distribution_pass(
         max_cores,
         output_dims,
         reduction_dims,
-        reduction_split_limit,
         committed_splits,
     )
     apply_splits(
@@ -629,7 +621,7 @@ def divide_pointwise_op(
     max_cores: int,
     pass_fn: Callable,
 ) -> None:
-    pass_fn(op, args, max_cores, reduction_split_limit=None)
+    pass_fn(op, args, max_cores)
 
 
 def divide_reduction_op(
@@ -645,9 +637,7 @@ def divide_reduction_op(
     if red.reduction_type in TOPK_OPS:
         return
 
-    is_matmul = red.reduction_type == BATCH_MATMUL_OP
-    reduction_split_limit = None if is_matmul else 1
-    pass_fn(op, args, max_cores, reduction_split_limit=reduction_split_limit)
+    pass_fn(op, args, max_cores)
 
 
 def _validate_max_cores() -> int:
