@@ -29,23 +29,23 @@ namespace spyre {
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepH2D::construct(
     LaunchContext&) const {
-  auto op = flex::RuntimeOperationH2D::create(host_address_,
-                                                        device_address_);
+  auto op = std::unique_ptr<flex::RuntimeOperationH2D>(flex::RuntimeOperationH2D::create(host_address_,
+                                                        device_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepD2H::construct(
     LaunchContext&) const {
-  auto op = flex::RuntimeOperationD2H::create(device_address_,
-                                                        host_address_);
+  auto op = std::unique_ptr<flex::RuntimeOperationD2H>(flex::RuntimeOperationD2H::create(device_address_,
+                                                        host_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
     LaunchContext&) const {
-  auto op = flex::RuntimeOperationCompute::create(binary_address_);
+  auto op = std::unique_ptr<flex::RuntimeOperationCompute>(flex::RuntimeOperationCompute::create(binary_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
@@ -80,8 +80,8 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
     function_(metadata_.get(), output_buffer_, &addresses);
   };
 
-  auto op = flex::RuntimeOperationHostCallback::create(
-      pipeline_barrier_, std::move(callback), nullptr);
+  auto op = std::unique_ptr<flex::RuntimeOperationHostCallback>(flex::RuntimeOperationHostCallback::create(
+      pipeline_barrier_, std::move(callback), nullptr));
 
   return op;
 }
@@ -98,8 +98,8 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
 //     inp.push_back((address));
 //   }
 //   auto op =
-//   flex::RuntimeOperationComputeSpecializeResident::create(
-//       &binary_address_, inp);
+//   std::unique_ptr<flex::RuntimeOperation>(flex::RuntimeOperationComputeSpecializeResident::create(
+//       &binary_address_, inp));
 //   return op;
 // }
 
