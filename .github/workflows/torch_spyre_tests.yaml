@@ -118,15 +118,6 @@ jobs:
           git submodule update --init --recursive --force
           git log -1 --oneline
 
-      - name: Install uv
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          # shellcheck disable=SC1091
-          source "$HOME/.bashrc"
-          uv --version
-
       - name: Gather runner info
         run: |
           source "$HOME/.bashrc"
