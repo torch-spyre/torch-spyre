@@ -32,7 +32,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
-from .pass_utils import compute_restickify_needed
+from .pass_utils import compute_restickify_needed, device_coordinates, host_coordinates
 
 INF = math.inf
 
@@ -243,6 +243,41 @@ class AnyInNode(RestickNodeCost):
         return []
 
 
+def _no_feasible_layout_error(op, deps: list, in_layouts: list) -> NotImplementedError:
+    """Build and return a NotImplementedError describing why no output layout was feasible."""
+    node_type = type(getattr(op, "data", op)).__name__
+    out_layout = op.get_layout()
+    out_dep = next(iter(op.get_read_writes().writes))
+    out_h_coords = host_coordinates(out_layout, out_dep)
+    lines = [
+        f"Stick incompatibility for op {op.get_name()} ({node_type}) has no resolution mechanism",
+        "  Output:",
+        f"    host  size={list(out_layout.size)}  stride={list(out_layout.stride)}",
+        f"    host_coordinates: {out_h_coords}",
+        f"  Inputs ({len(deps)}):",
+    ]
+    for dep, stl in zip(deps, in_layouts):
+        host_layout = V.graph.get_buffer(dep.name).get_layout()
+        h_coords = host_coordinates(host_layout, dep)
+        d_coords = device_coordinates(stl, dep)
+        lines += [
+            f"    {dep.name}:",
+            f"      host  size={list(host_layout.size)}  stride={list(host_layout.stride)}",
+            f"      host_coordinates: {h_coords}",
+            f"      device  device_size={list(stl.device_size)}  stride_map={list(stl.stride_map)}  dtype={stl.device_dtype}",
+            f"      device_coordinates: {d_coords}",
+        ]
+    lines.append(f"  Candidate output layouts ({len(op.layouts)}) — all infeasible:")
+    for i, candidate_stl in enumerate(op.layouts):
+        out_d_coords = device_coordinates(candidate_stl, out_dep)
+        lines += [
+            f"    [{i}]",
+            f"      device  device_size={list(candidate_stl.device_size)}  stride_map={list(candidate_stl.stride_map)}  dtype={candidate_stl.device_dtype}",
+            f"      device_coordinates: {out_d_coords}",
+        ]
+    return NotImplementedError("\n".join(lines))
+
+
 def greedy_local_min_cost(operations: list) -> None:
     """Greedy layout selection: process ops in topological order, picking the output layout with minimum local restick cost.
 
@@ -298,9 +333,11 @@ def greedy_local_min_cost(operations: list) -> None:
                 best_cost = out_layout_cost
                 out_stl = candidate_stl
 
-        assert out_stl is not None, (
-            f"({op.get_name()}): all stick possibilities had infinite cost. Cannot proceed"
-        )
+        if out_stl is None:
+            err_deps = [
+                d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
+            ]
+            raise _no_feasible_layout_error(op, err_deps, in_layouts)
 
         op.committed_stl = out_stl
 
@@ -424,12 +461,14 @@ def beam_global_min_cost(operations: list) -> None:
                         )
                     )
 
+        # Capture one state's in_layouts before clearing, for error diagnostics.
+        last_in_layouts = [
+            frontier.input_stl(frontier.states[-1], dep.name) for dep in deps
+        ]
         frontier.states = next_states
         frontier.trim()
         if not frontier.states:
-            raise RuntimeError(
-                f"beam search: no feasible layout combination found after op {op.get_name()}"
-            )
+            raise _no_feasible_layout_error(op, deps, last_in_layouts)
         max_states = max(max_states, len(frontier.states))
         if logger.isEnabledFor(logging.DEBUG):
             lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]

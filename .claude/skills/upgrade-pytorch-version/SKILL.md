@@ -1,6 +1,6 @@
 ---
 name: upgrade-pytorch-version
-description: "Upgrade PyTorch dependency version across torch-spyre and torch-spyre-docs. Updates pyproject.toml, CI workflow comments, documentation, and build scripts; rebuilds downstream C++ extensions (vllm etc.). Use when asked to bump, upgrade, or update the PyTorch version dependency. Accepts target version as argument (e.g., 'upgrade-pytorch-version 2.13')."
+description: "Upgrade the pinned PyTorch version across torch-spyre and torch-spyre-docs. Use when asked to bump, upgrade, or update the PyTorch dependency. Accepts target version as argument (e.g., '2.13')."
 ---
 
 # Upgrading PyTorch Version in torch-spyre
