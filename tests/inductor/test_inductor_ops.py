@@ -2123,9 +2123,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
-                "split3": lambda dim, index, x: (
-                    torch.split(x, x.size()[dim] // 3, dim=dim)[index].clone(),
+                "exp": (
+                    lambda dim, index, x: (
+                        torch.exp(torch.split(x, x.size()[dim] // 3, dim=dim)[index]),
+                    )
                 ),
+                "add": (
+                    lambda dim, index, x: (
+                        y := torch.split(x, x.size()[dim] // 3, dim=dim),
+                        index2 := (index + 1) % 3,
+                        torch.add(y[index], y[index2]),
+                    )[-1]
+                ),
+                "sum": (
+                    lambda dim, index, x: (
+                        torch.sum(
+                            torch.split(x, x.size()[dim] // 3, dim=dim)[index],
+                            dim=dim,
+                            keepdim=True,
+                        ),
+                    )
+                ),
+                "amax": (
+                    lambda dim, index, x: (
+                        torch.amax(
+                            torch.split(x, x.size()[dim] // 3, dim=dim)[index],
+                            dim=dim,
+                            keepdim=False,
+                        ),
+                    )
+                ),
+                "chunk": (lambda dim, index, x: x.chunk(3, dim=dim)[index].clone()),
             },
             "param_sets": {
                 "1d0s0": (0, 0, cached_randn((384,), dtype=torch.float16)),
@@ -2150,13 +2178,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_slice", "test_slice_cpu"): {
             "ops_dict": {
-                "slice3": lambda dim, index, x: x.exp(),
+                "exp": lambda dim, x: torch.exp(x),
+                "add": lambda dim, x: torch.add(x.clone(), x),
+                "sum": lambda dim, x: torch.sum(x, dim=dim, keepdim=True),
+                "amax": lambda dim, x: torch.amax(x, dim=dim, keepdim=False),
             },
             "param_sets": {
-                # TODO: Add more tests by generalizing size-1 dim support. See #1548
+                "1d0s0": (0, 0, cached_randn((192,), dtype=torch.float16)),
+                "1d0s1": (0, 1, cached_randn((192,), dtype=torch.float16)),
+                "1d0s2": (0, 2, cached_randn((192,), dtype=torch.float16)),
+                "2d0s0": (0, 0, cached_randn((3, 192), dtype=torch.float16)),
+                "2d0s1": (0, 1, cached_randn((3, 192), dtype=torch.float16)),
+                "2d0s2": (0, 2, cached_randn((3, 192), dtype=torch.float16)),
+                "2d1s0": (1, 0, cached_randn((3, 192), dtype=torch.float16)),
+                "2d1s1": (1, 1, cached_randn((3, 192), dtype=torch.float16)),
+                "2d1s2": (1, 2, cached_randn((3, 192), dtype=torch.float16)),
+                "3d0s0": (0, 0, cached_randn((3, 5, 192), dtype=torch.float16)),
+                "3d0s1": (0, 1, cached_randn((3, 5, 192), dtype=torch.float16)),
+                "3d0s2": (0, 2, cached_randn((3, 5, 192), dtype=torch.float16)),
                 "3d1s0": (1, 0, cached_randn((5, 3, 192), dtype=torch.float16)),
                 "3d1s1": (1, 1, cached_randn((5, 3, 192), dtype=torch.float16)),
                 "3d1s2": (1, 2, cached_randn((5, 3, 192), dtype=torch.float16)),
+                "3d2s0": (2, 0, cached_randn((3, 3, 192), dtype=torch.float16)),
+                "3d2s1": (2, 1, cached_randn((3, 3, 192), dtype=torch.float16)),
+                "3d2s2": (2, 2, cached_randn((3, 3, 192), dtype=torch.float16)),
             },
         },
         ("test_rope_fms", "test_rope_cpu"): {
@@ -4281,16 +4326,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_slice_cpu(self, op, dim, index, x):
         def fn(x):
-            start = index * (x.size()[0] // 3)
-            end = (index + 1) * (x.size()[0] // 3)
+            start = index * (x.size()[dim] // 3)
+            end = (index + 1) * (x.size()[dim] // 3)
             if dim == 0:
-                return op(dim, index, x[start:end])
+                return op(dim, x[start:end])
             elif dim == 1:
-                return op(dim, index, x[:, start:end])
+                return op(dim, x[:, start:end])
             elif dim == 2:
-                return op(dim, index, x[:, :, start:end])
+                return op(dim, x[:, :, start:end])
 
-        self.compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
+        self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):

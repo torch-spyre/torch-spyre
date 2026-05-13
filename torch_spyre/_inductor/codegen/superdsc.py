@@ -230,10 +230,10 @@ def _get_padded_iteration_space(
         for idx, dim in enumerate(layout["dim_order"]):
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
-            dim_size = dev_size[idx] * layout["stick_size"]
-            if sdsc_iteration_space[dim] < dim_size:
-                padding[dim] = dim_size - sdsc_iteration_space[dim]
-                sdsc_iteration_space[dim] = dim_size
+            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
+            if unaligned > 0:
+                padding[dim] = layout["stick_size"] - unaligned
+                sdsc_iteration_space[dim] += padding[dim]
     return padding
 
 
@@ -315,7 +315,7 @@ def _create_sdsc_tensors(
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
-                strides[dim] = strides[dim] / dev_dim_size * it_dim_size
+                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
             max_dim_sizes[dim] = -1
 
