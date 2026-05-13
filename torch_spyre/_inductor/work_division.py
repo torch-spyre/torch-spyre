@@ -141,8 +141,7 @@ def multi_dim_iteration_space_split(
             splits[var] = min_split
             n_cores_remaining = n_cores_remaining // min_split
 
-    greedy_dims = output_dims if is_reduction else output_dims + reduction_dims
-    for v in greedy_dims:
+    for v in output_dims:
         if n_cores_remaining <= 1:
             break
         # TODO(issue#1372): with symbolic work division, concretize_expr
