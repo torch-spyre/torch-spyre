@@ -1386,25 +1386,6 @@ _run_xdist_fallback() {
     if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
         python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
     fi
-
-    case $_xexit in
-        0|5)
-            echo "[spyre_run] xdist fallback completed cleanly for: $(basename "$_orig")"
-            ;;
-        1)
-            echo "[spyre_run] xdist fallback: some tests failed in: $(basename "$_orig")" >&2
-            OVERALL_EXIT=1
-            ;;
-        130)
-            echo "[spyre_run] FATAL: interrupted (Ctrl-C) during xdist fallback." >&2
-            OVERALL_EXIT=130
-            exit 130
-            ;;
-        *)
-            echo "[spyre_run] xdist fallback exited with code $_xexit for: $(basename "$_orig")" >&2
-            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=$_xexit
-            ;;
-    esac
 }
 
 for i in "${!RUN_FILES[@]}"; do
