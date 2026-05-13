@@ -31,7 +31,7 @@ Test sub-suites:
 
 | Suite | Path |
 |---|---|
-| Eager ops | `tests/test_ops.py` |
+| Eager ops | `tests/test_spyre.py`, `tests/test_fallbacks.py` |
 | Compiled ops | `tests/inductor/test_inductor_ops.py` |
 | Building blocks | `tests/inductor/test_building_blocks.py` |
 | Tensor layout | `tests/tensor/` |
