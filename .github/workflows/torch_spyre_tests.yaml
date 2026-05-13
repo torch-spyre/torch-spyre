@@ -1,4 +1,4 @@
-name: torch-spyre-tests
+name: tests
 
 on:
   push:
@@ -29,7 +29,6 @@ jobs:
       - spyre_pf
       - linux
       - image_torch_spyre
-    # increase timeout to 12 hours
     timeout-minutes: 720
     env:
       # The CI env var is very important.
@@ -39,11 +38,11 @@ jobs:
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+
     strategy:
       fail-fast: false
       matrix:
         suite:
-          # Top-level tests
           - name: Test Device Enum
             config: torch_spyre_tests/test_device_enum_config.yaml
           - name: Test Fallbacks
@@ -90,6 +89,7 @@ jobs:
             config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
           - name: Tensor Layout
             config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
+
     steps:
       - name: Checkout PR branch/commit in pre-cloned torch-spyre
         env:
@@ -174,3 +174,22 @@ jobs:
           bash tests/run_test.sh "tests/configs/${CONFIG}" -v
           echo "${{ matrix.suite.name }} tests done"
 
+  # ---------------------------------------------------------------------------
+  # Required check gate -- this job name must match the existing branch
+  # protection rule: "tests / Run Spyre unit tests".
+  # It fans in all parallel matrix jobs so the single required check
+  # passes only when every suite passes.
+  # ---------------------------------------------------------------------------
+  run-spyre-unit-tests:
+    name: Run Spyre unit tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    steps:
+      - name: Check all suites passed
+        run: |-
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "One or more test suites failed."
+            exit 1
+          fi
+          echo "All test suites passed."
