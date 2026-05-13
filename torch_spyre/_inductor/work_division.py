@@ -122,12 +122,19 @@ def multi_dim_iteration_space_split(
 
     The product of all splits will be <= max_cores.
     """
-    is_reduction = bool(reduction_dims)
+    is_reduction_included = bool(reduction_dims)
 
     splits = {v: 1 for v in iteration_space.keys()}
     n_cores_remaining = max_cores
 
     if min_splits:
+        # Sanity check: making sure that reduction_dims list is cleared up if
+        #               any reduction dim is already selected during span reduction
+        assert (
+            not is_reduction_included  # not empty
+            or not any(v in min_splits for v in reduction_dims)  # no overlap
+        )
+
         for var, min_split in min_splits.items():
             assert var not in output_dims and var not in reduction_dims
 
@@ -151,7 +158,7 @@ def multi_dim_iteration_space_split(
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
 
-    if is_reduction and n_cores_remaining > 1:
+    if is_reduction_included and n_cores_remaining > 1:
         result = _most_splittable_dim(
             reduction_dims, iteration_space, n_cores_remaining
         )
