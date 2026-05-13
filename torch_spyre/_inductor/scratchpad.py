@@ -307,7 +307,13 @@ class GreedyAllocationStrategy(AllocationStrategy):
 
         # 2. Try to allocate as many buffers on LX as we can. If successful, lx info (addr)
         #    will be added to buffer.FixedTiledLayout and used in generate_sdsc() later.
-        org_op_name = op.origin_node.target._opname
+        # Synthetic ComputedBuffers (e.g. the second output of topk, weight-relayout
+        # buffers from temp_passes) have origin_node=None. Use "" so the LX-reuse and
+        # LX-inplace allowlist substring checks both fall through to False — synthetic
+        # buffers are conservatively kept off the scratchpad.
+        org_op_name = (
+            op.origin_node.target._opname if op.origin_node is not None else ""
+        )
         self.alloc.try_allocate(mem_usage, idx, org_op_name)
 
     def buf_analysis(self, operations: list[Operation]):
