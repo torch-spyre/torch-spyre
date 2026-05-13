@@ -592,6 +592,13 @@ def work_distribution_pass(
         s: e for s, e in it_space_adjusted.items() if s not in committed_splits
     }
     output_dims, reduction_dims = prioritize_dimensions(output_td, it_space_remaining)
+
+    # If span_reduction_pass already committed a reduction split, suppress further
+    # reduction splitting so the final result never exceeds one reduction dim split.
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    if any(v not in coord_vars for v in committed_splits):
+        reduction_dims = []
+
     # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
     # accounts for committed_splits in its first pass, consuming those cores
     # itself before distributing the rest by priority.
