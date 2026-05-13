@@ -484,17 +484,10 @@ def apply_splits(
     op: ComputedBuffer,
     splits: dict,
     output_td: TensorDep,
-    it_space: dict,
-    it_space_adjusted: dict,
-    priorities: list,
-    min_splits: dict,
-    kind: str,
 ) -> None:
-    """Commit splits to op and emit a debug log entry.
+    """Commit splits to op.
 
     Does nothing when the product of splits is 1 (no parallelism).
-    kind is a short label used in the log message (e.g. "span_reduction" or
-    "work_distribution").
     """
     cores_used = math.prod(splits.values())
     if cores_used <= 1:
@@ -505,14 +498,6 @@ def apply_splits(
     first_read = next(iter(rw.reads), None)
     read_index = first_read.index if first_read is not None else write_index
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
-
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            f"{kind} work_division {op.get_name()}: cores={cores_used}, "
-            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"priorities={priorities}, min_splits={min_splits}, "
-            f"op_it_space_splits={op.op_it_space_splits}"
-        )
 
 
 def span_reduction_pass(
@@ -547,16 +532,15 @@ def span_reduction_pass(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
-    apply_splits(
-        op,
-        min_splits,
-        output_td,
-        it_space,
-        it_space_adjusted,
-        [],
-        min_splits,
-        kind="span_reduction",
-    )
+    apply_splits(op, min_splits, output_td)
+
+    if logger.isEnabledFor(logging.DEBUG) and math.prod(min_splits.values()) > 1:
+        logger.debug(
+            f"span_reduction work_division {op.get_name()}: cores={math.prod(min_splits.values())}, "
+            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"priorities=[], min_splits={min_splits}, "
+            f"op_it_space_splits={op.op_it_space_splits}"
+        )
 
 
 def work_distribution_pass(
@@ -618,16 +602,16 @@ def work_distribution_pass(
         reduction_dims,
         committed_splits,
     )
-    apply_splits(
-        op,
-        splits,
-        output_td,
-        it_space,
-        it_space_adjusted,
-        output_dims + reduction_dims,
-        committed_splits,
-        kind="work_distribution",
-    )
+    apply_splits(op, splits, output_td)
+
+    if logger.isEnabledFor(logging.DEBUG) and math.prod(splits.values()) > 1:
+        logger.debug(
+            f"work_distribution work_division {op.get_name()}: cores={math.prod(splits.values())}, "
+            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}, "
+            f"op_it_space_splits={op.op_it_space_splits}"
+        )
+
     warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
 
 
