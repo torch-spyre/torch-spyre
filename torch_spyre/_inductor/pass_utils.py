@@ -55,7 +55,7 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
 
     Used at boundaries where concrete values are required (e.g. C++
     constructors that only accept ``int``, comparison operators inside
-    algorithms such as core-division and coordinate computation).
+    algorithms such as work-division and coordinate computation).
 
     Key invariant: only structural parameters (sizes, strides, split
     counts) are concretized.  Symbolic loop variables inside coordinate

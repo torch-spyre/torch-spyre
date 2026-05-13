@@ -1,0 +1,4 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_scratchpad_patterns.py
+      unlisted_test_mode: mandatory_success

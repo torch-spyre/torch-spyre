@@ -43,12 +43,15 @@ from .pass_utils import (
     device_coordinates,
     iteration_space_from_op,
     splits_by_index_coeff,
+    apply_splits_from_index_coeff,
 )
+from typing import Callable
+
 from .logging_utils import get_inductor_logger
 from . import config
 import logging
 
-logger = get_inductor_logger("core_division")
+logger = get_inductor_logger("work_division")
 
 # Maximum memory access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
@@ -134,7 +137,7 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-        # TODO(issue#1372): with symbolic core division, concretize_expr
+        # TODO(issue#1372): with symbolic work division, concretize_expr
         #                   for core_split will not be needed.
         best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
@@ -154,7 +157,7 @@ def adjust_it_space_for_sticks(
     value.
 
     For each tensor, find the variable that indexes its stick dimension and
-    convert its size in it_space from elements to sticks. This ensures core
+    convert its size in it_space from elements to sticks. This ensures work
     division treats sticks as atomic units.
 
     When tensors of different dtypes share a stick variable (e.g. a float16
@@ -219,7 +222,7 @@ def get_per_core_span(
             # ``int(term.subs(...))`` cast below) is a Python int.  Per-core
             # span is a hardware-bound quantity that must be compared against
             # MAX_SPAN_BYTES, so concretization here is the right boundary.
-            # TODO(issue#1372): Symbolic core division will keep this symbolic.
+            # TODO(issue#1372): Symbolic work division will keep this symbolic.
             R = concretize_expr(it_space_orig[v]) // splits.get(v, 1)
             per_core_max += int(term.subs(v, R - 1))
         per_core_size = per_core_max + 1
@@ -288,7 +291,7 @@ def must_split_vars(
             # ``s0 > 1`` returns a sympy Relational whose truth value is
             # undefined.  Span filtering here is a structural decision that
             # needs a concrete answer.
-            # TODO(issue#1372): Symbolic core division will keep this symbolic.
+            # TODO(issue#1372): Symbolic work division will keep this symbolic.
             vars = [
                 v
                 for v in coord.free_symbols
@@ -368,7 +371,7 @@ def must_split_vars(
             # the committed splits, inner dimensions cannot reduce the span further.
             # Concretize it_space_orig[v] so the ``int(coord.subs(...))`` cast
             # below succeeds with symbolic ranges.
-            # TODO(issue#1372): Symbolic core division will keep this symbolic.
+            # TODO(issue#1372): Symbolic work division will keep this symbolic.
             per_core_coord_size = (
                 max(
                     int(
@@ -402,7 +405,7 @@ def prioritize_dimensions(
     it_space_adjusted: dict[Symbol, Expr],
     exclude_reduction: bool = False,
 ) -> list[Symbol]:
-    """Return iteration variables in priority order for core division.
+    """Return iteration variables in priority order for work distribution.
 
     Variables already committed as min_splits should be filtered out of
     it_space_adjusted before calling this function.
@@ -425,7 +428,7 @@ def prioritize_dimensions(
     # whose truth value is undefined and would raise inside Python's sort.
     # The priority order is a structural decision (largest dim first) that
     # needs a concrete numeric ordering.
-    # TODO(issue#1372): Symbolic core division will keep this symbolic.
+    # TODO(issue#1372): Symbolic work division will keep this symbolic.
     remaining_output.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
     reduction_dims.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
 
@@ -436,63 +439,13 @@ def prioritize_dimensions(
     return priority
 
 
-def plan_splits(
-    all_tds: list[TensorDep],
-    output_td: TensorDep,
-    it_space: dict[Symbol, Expr],
-    max_cores: int,
-    exclude_reduction: bool = False,
-) -> tuple[dict[Symbol, int], dict[Symbol, Expr], list[Symbol], dict[Symbol, int]]:
-    """Compute core splits for an op's iteration space.
-
-    Returns (splits, it_space_adjusted, priorities, min_splits).
-
-    When exclude_reduction is True, asserts that no reduction variable appears
-    in min_splits — callers are responsible for only passing exclude_reduction=True
-    when the backend supports it.
-    """
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
-
-    # 1. Determine the minimum splits required to keep each tensor's memory
-    #    span within the hardware limit.
-    min_splits = must_split_vars(
-        all_tds, it_space, it_space_adjusted, stick_vars, max_cores
-    )
-
-    if exclude_reduction:
-        coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-        reduction_vars_to_split = set(min_splits) - coord_vars
-        if reduction_vars_to_split:
-            raise Unsupported(
-                f"Cannot satisfy hardware memory span limit "
-                f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting reduction"
-                f"dimensions {reduction_vars_to_split}, but the backend does not "
-                f"support splitting reduction dimensions for this operation type."
-            )
-
-    # 2. Among the remaining dimensions, decide the priority order for
-    #    distributing leftover cores.
-    it_space_remaining = {
-        s: e for s, e in it_space_adjusted.items() if s not in min_splits
-    }
-    priorities = prioritize_dimensions(
-        output_td, it_space_remaining, exclude_reduction=exclude_reduction
-    )
-
-    # 3. Assign cores: satisfy min_splits first, then fill by priority.
-    splits = multi_dim_iteration_space_split(
-        it_space_adjusted, max_cores, priorities, min_splits
-    )
-    return splits, it_space_adjusted, priorities, min_splits
-
-
 def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
 
     Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
     scheduler can identify them as in-place writes.  Their target buffer already
     has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
-    real_layout() gives us the correct device layout for core division.
+    real_layout() gives us the correct device layout for work division.
     """
     layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
@@ -526,7 +479,8 @@ def apply_splits(
     """Commit splits to op and emit a debug log entry.
 
     Does nothing when the product of splits is 1 (no parallelism).
-    kind is a short label used in the log message (e.g. "pointwise" or "reduction").
+    kind is a short label used in the log message (e.g. "span_reduction" or
+    "work_distribution").
     """
     cores_used = math.prod(splits.values())
     if cores_used <= 1:
@@ -547,99 +501,191 @@ def apply_splits(
         )
 
 
-def divide_pointwise_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
+def span_reduction_pass(
+    op: ComputedBuffer,
+    args: list[SchedNodeArg],
+    max_cores: int,
+    exclude_reduction: bool,
+) -> None:
+    """Mandatory per-op pass: compute minimum splits to satisfy the 256MB span limit.
+
+    Writes results to op.op_it_space_splits. If no span violation exists,
+    op.op_it_space_splits is left unset (apply_splits is a no-op for splits <= 1).
+    """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
+    all_tds = input_tds + [output_td]
 
-    splits: dict[Symbol, int] = {}
-    if max_cores > 1:
-        splits, it_space_adjusted, priorities, min_splits = plan_splits(
-            input_tds + [output_td], output_td, it_space, max_cores
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    min_splits = must_split_vars(
+        all_tds, it_space, it_space_adjusted, stick_vars, max_cores
+    )
+
+    if exclude_reduction:
+        coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+        reduction_vars_to_split = set(min_splits) - coord_vars
+        if reduction_vars_to_split:
+            raise Unsupported(
+                f"Cannot satisfy hardware memory span limit "
+                f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting reduction "
+                f"dimensions {reduction_vars_to_split}, but the backend does not "
+                f"support splitting reduction dimensions for this operation type."
+            )
+
+    apply_splits(
+        op,
+        min_splits,
+        output_td,
+        it_space,
+        it_space_adjusted,
+        [],
+        min_splits,
+        kind="span_reduction",
+    )
+
+
+def work_distribution_pass(
+    op: ComputedBuffer,
+    args: list[SchedNodeArg],
+    max_cores: int,
+    exclude_reduction: bool,
+) -> None:
+    """Optional per-op pass: distribute remaining cores to maximize parallelism.
+
+    Reads op.op_it_space_splits written by span_reduction_pass (if any) to
+    recover the already-committed splits, then fills remaining cores by priority.
+    """
+    it_space = iteration_space_from_op(op)
+    input_tds, output_td = collect_tensor_deps(op, args)
+    all_tds = input_tds + [output_td]
+
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+
+    # Recover splits committed by span_reduction_pass using the same
+    # coeff-keyed encoding that codegen uses — stable across passes.
+    if hasattr(op, "op_it_space_splits"):
+        rw = op.get_read_writes()
+        write_index = next(iter(rw.writes)).index
+        read_index = next((d.index for d in rw.reads), write_index)
+        min_splits = apply_splits_from_index_coeff(
+            op.op_it_space_splits, write_index, read_index, it_space
         )
-        apply_splits(
-            op,
-            splits,
-            output_td,
-            it_space,
-            it_space_adjusted,
-            priorities,
-            min_splits,
-            kind="pointwise",
-        )
+    else:
+        min_splits = {}
 
-    warn_if_per_core_overflow(input_tds + [output_td], it_space, splits, op.get_name())
+    # apply_splits_from_index_coeff returns 1 for every unsplit dim; keep only
+    # dims with actual committed splits so they don't overlap with priorities.
+    committed_splits = {s: v for s, v in min_splits.items() if v > 1}
+
+    # TODO: The final dim committed by span_reduction_pass holds the minimum
+    #       split that gets the span under the limit, so it may have headroom
+    #       for additional parallelism (outer dims committed before it are
+    #       already maximally split and have no headroom). Excluding it here
+    #       leaves that parallelism on the table when other dims can't absorb
+    #       the remaining cores.
+    it_space_remaining = {
+        s: e for s, e in it_space_adjusted.items() if s not in committed_splits
+    }
+    priorities = prioritize_dimensions(
+        output_td, it_space_remaining, exclude_reduction=exclude_reduction
+    )
+    # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
+    # accounts for committed_splits in its first pass, consuming those cores
+    # itself before distributing the rest by priority.
+    splits = multi_dim_iteration_space_split(
+        it_space_adjusted, max_cores, priorities, committed_splits
+    )
+    apply_splits(
+        op,
+        splits,
+        output_td,
+        it_space,
+        it_space_adjusted,
+        priorities,
+        committed_splits,
+        kind="work_distribution",
+    )
+    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
 
 
-def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores):
+def divide_pointwise_op(
+    op: ComputedBuffer,
+    args: list[SchedNodeArg],
+    max_cores: int,
+    pass_fn: Callable,
+) -> None:
+    pass_fn(op, args, max_cores, exclude_reduction=False)
+
+
+def divide_reduction_op(
+    op: ComputedBuffer,
+    args: list[SchedNodeArg],
+    max_cores: int,
+    pass_fn: Callable,
+) -> None:
     red: Reduction = op.data
-    is_matmul = red.reduction_type == BATCH_MATMUL_OP
 
     # Currently we support Topk for k<=4, which can be handled efficiently on single core
     # TODO: Modification will be required to enable Topk for k>4
     if red.reduction_type in TOPK_OPS:
         return
 
-    it_space = iteration_space_from_op(op)
-    input_tds, output_td = collect_tensor_deps(op, args)
-
+    is_matmul = red.reduction_type == BATCH_MATMUL_OP
     # FIXME: For non-matmul reduction, excluding reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
     #        https://github.com/torch-spyre/torch-spyre/issues/1304
-    splits: dict[Symbol, int] = {}
-    if max_cores > 1:
-        splits, it_space_adjusted, priorities, min_splits = plan_splits(
-            input_tds + [output_td],
-            output_td,
-            it_space,
-            max_cores,
-            exclude_reduction=not is_matmul,
-        )
-        apply_splits(
-            op,
-            splits,
-            output_td,
-            it_space,
-            it_space_adjusted,
-            priorities,
-            min_splits,
-            kind="reduction",
-        )
-
-    warn_if_per_core_overflow(input_tds + [output_td], it_space, splits, op.get_name())
+    pass_fn(op, args, max_cores, exclude_reduction=not is_matmul)
 
 
-def core_division_planning(
-    operations: list[Operation],
-) -> None:
-    # Operations are in topological order (guaranteed by GraphLowering).
+def _validate_max_cores() -> int:
     max_cores = config.sencores
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
+    return max_cores
 
+
+def _iter_computed_buffers(operations: list[Operation]):
+    """Yield ComputedBuffer ops, handling FallbackKernel/ExternKernel dispatch."""
     it = iter(operations)
     for op in it:
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
-            rw = op.get_read_writes()
-            args = get_mem_deps_from_rw(rw)
-            if isinstance(op.data, Pointwise):
-                divide_pointwise_op(op, args, max_cores)
-            elif isinstance(op.data, Reduction):
-                divide_reduction_op(op, args, max_cores)
-            else:
-                # Core division not supported on other IRNode types
-                pass
+            yield op
         elif isinstance(op, FallbackKernel):
             op = next(it, None)
             if not isinstance(op, MultiOutput):
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
-            # Core division not supported on fallback kernels
+            # Work division not supported on fallback kernels
         elif isinstance(op, ExternKernel):
             if isinstance(op, SpyreConstantFallback):
-                # Core division not supported on SpyreConstantFallback kernel
+                # Work division not supported on SpyreConstantFallback kernel
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
         else:
             logger.warning(f"unhandled operation type {type(op)}")
+
+
+def span_reduction(operations: list[Operation]) -> None:
+    """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
+    max_cores = _validate_max_cores()
+    for op in _iter_computed_buffers(operations):
+        rw = op.get_read_writes()
+        args = get_mem_deps_from_rw(rw)
+        if isinstance(op.data, Pointwise):
+            divide_pointwise_op(op, args, max_cores, span_reduction_pass)
+        elif isinstance(op.data, Reduction):
+            divide_reduction_op(op, args, max_cores, span_reduction_pass)
+
+
+def work_distribution(operations: list[Operation]) -> None:
+    """Pass 2: distribute remaining cores across ops to maximize parallelism."""
+    max_cores = _validate_max_cores()
+    for op in _iter_computed_buffers(operations):
+        rw = op.get_read_writes()
+        args = get_mem_deps_from_rw(rw)
+        if isinstance(op.data, Pointwise):
+            divide_pointwise_op(op, args, max_cores, work_distribution_pass)
+        elif isinstance(op.data, Reduction):
+            divide_reduction_op(op, args, max_cores, work_distribution_pass)

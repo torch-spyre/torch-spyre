@@ -1,0 +1,153 @@
+<svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+
+  <!-- Title -->
+  <text x="310" y="22" text-anchor="middle" font-size="13" font-weight="700" fill="#374151">Deterministic Latency vs. GPU Runtime Jitter</text>
+  <rect x="548" y="11" width="252" height="17" rx="3" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.2"/>
+  <text x="674" y="23" text-anchor="middle" font-size="9.5" font-weight="700" fill="#92400e">&#x26A0;  Illustrative &#x2014; values not to scale</text>
+  <text x="430" y="40" text-anchor="middle" font-size="10" fill="#1f2937" font-style="italic">Same LLM inference workload, three consecutive requests</text>
+
+  <!-- ══════════════════════════════════════════
+       LEFT PANEL — GPU (variable timing)
+  ══════════════════════════════════════════ -->
+  <rect x="15"  y="46" width="400" height="237" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="15"  y="46" width="400" height="28"  rx="6" fill="#374151"/>
+  <rect x="15"  y="64" width="400" height="10"  fill="#374151"/>
+  <text x="215" y="65" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">GPU  (SIMT, implicit cache)</text>
+
+  <!-- Y axis -->
+  <text x="28" y="168" text-anchor="middle" font-size="9" fill="#374151" transform="rotate(-90 28 168)">Execution time &#x2191;</text>
+  <line x1="44" y1="82" x2="44" y2="248" stroke="#D1D5DB" stroke-width="1"/>
+  <line x1="44" y1="248" x2="400" y2="248" stroke="#D1D5DB" stroke-width="1"/>
+
+  <!-- ── Request 1: small cache miss (13px) ── -->
+  <rect x="54"  y="202" width="96" height="46" rx="2" fill="#374151"/>
+  <text x="102" y="230" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L1</text>
+  <!-- cache miss — label inside in white -->
+  <rect x="54"  y="189" width="96" height="13" rx="0" fill="#dc2626"/>
+  <text x="102" y="199" text-anchor="middle" font-size="7.5" font-weight="600" fill="#ffffff">cache miss</text>
+  <rect x="54"  y="159" width="96" height="30" rx="0" fill="#4b5563"/>
+  <text x="102" y="179" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">FFN</text>
+  <rect x="54"  y="113" width="96" height="46" rx="2" fill="#374151"/>
+  <text x="102" y="141" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L2</text>
+  <line x1="54" y1="113" x2="150" y2="113" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="102" y="261" text-anchor="middle" font-size="9.5" fill="#374151">Request 1</text>
+
+  <!-- ── Request 2: cache miss (21px) + prefetch miss (15px) ── -->
+  <rect x="164" y="202" width="96" height="46" rx="2" fill="#374151"/>
+  <text x="212" y="230" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L1</text>
+  <!-- cache miss — label inside, bigger segment -->
+  <rect x="164" y="181" width="96" height="21" rx="0" fill="#dc2626"/>
+  <text x="212" y="195" text-anchor="middle" font-size="8.5" font-weight="600" fill="#ffffff">cache miss</text>
+  <rect x="164" y="151" width="96" height="30" rx="0" fill="#4b5563"/>
+  <text x="212" y="171" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">FFN</text>
+  <!-- prefetch miss — label inside -->
+  <rect x="164" y="136" width="96" height="15" rx="0" fill="#dc2626" opacity="0.85"/>
+  <text x="212" y="147" text-anchor="middle" font-size="7.5" font-weight="600" fill="#ffffff">prefetch miss</text>
+  <rect x="164" y="90"  width="96" height="46" rx="2" fill="#374151"/>
+  <text x="212" y="118" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L2</text>
+  <line x1="164" y1="90" x2="260" y2="90" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="212" y="261" text-anchor="middle" font-size="9.5" fill="#374151">Request 2</text>
+
+  <!-- ── Request 3: thread scheduling delay (10px) ── -->
+  <rect x="274" y="202" width="96" height="46" rx="2" fill="#374151"/>
+  <text x="322" y="230" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L1</text>
+  <!-- thread delay — small segment, label inside -->
+  <rect x="274" y="192" width="96" height="10" rx="0" fill="#f59e0b"/>
+  <text x="322" y="200" text-anchor="middle" font-size="7" font-weight="600" fill="#7c3a00">thread delay</text>
+  <rect x="274" y="162" width="96" height="30" rx="0" fill="#4b5563"/>
+  <text x="322" y="182" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">FFN</text>
+  <rect x="274" y="116" width="96" height="46" rx="2" fill="#374151"/>
+  <text x="322" y="144" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L2</text>
+  <line x1="274" y1="116" x2="370" y2="116" stroke="#6b7280" stroke-width="1.5"/>
+  <text x="322" y="261" text-anchor="middle" font-size="9.5" fill="#374151">Request 3</text>
+
+  <!-- Jitter bracket — no invented number, just "variable" -->
+  <line x1="374" y1="90"  x2="382" y2="90"  stroke="#dc2626" stroke-width="1.2"/>
+  <line x1="374" y1="128" x2="382" y2="128" stroke="#dc2626" stroke-width="1.2"/>
+  <line x1="378" y1="90"  x2="378" y2="128" stroke="#dc2626" stroke-width="1.2"/>
+  <polygon points="374,93  378,87  382,93"  fill="#dc2626"/>
+  <polygon points="374,125 378,131 382,125" fill="#dc2626"/>
+  <!-- white bg pill behind jitter label -->
+  <rect x="384" y="100" width="26" height="18" rx="3" fill="white" opacity="0.85"/>
+  <text x="397" y="110" text-anchor="middle" font-size="8" fill="#dc2626" font-weight="700">&#x2190; jitter</text>
+  <text x="397" y="120" text-anchor="middle" font-size="7.5" fill="#dc2626">(variable)</text>
+
+  <!-- Legend GPU -->
+  <rect x="54"  y="272" width="10" height="8" rx="1" fill="#374151"/>
+  <text x="68"  y="279" font-size="8.5" fill="#1f2937">Attn / FFN compute</text>
+  <rect x="185" y="272" width="10" height="8" rx="1" fill="#dc2626"/>
+  <text x="199" y="279" font-size="8.5" fill="#1f2937">cache / prefetch miss</text>
+  <rect x="318" y="272" width="10" height="8" rx="1" fill="#f59e0b"/>
+  <text x="332" y="279" font-size="8.5" fill="#1f2937">thread delay</text>
+
+  <!-- ══════════════════════════════════════════
+       RIGHT PANEL — Spyre (deterministic)
+  ══════════════════════════════════════════ -->
+  <rect x="442" y="46" width="403" height="237" rx="6" fill="#FFF7F4" stroke="#F5C8A8" stroke-width="1.5"/>
+  <rect x="442" y="46" width="403" height="28"  rx="6" fill="#E55B15"/>
+  <rect x="442" y="64" width="403" height="10"  fill="#E55B15"/>
+  <text x="643" y="65" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">Spyre  (dataflow, compiler-planned DMA)</text>
+
+  <!-- Y axis -->
+  <text x="455" y="168" text-anchor="middle" font-size="9" fill="#c14a0f" transform="rotate(-90 455 168)">Execution time &#x2191;</text>
+  <line x1="470" y1="82" x2="470" y2="248" stroke="#F5C8A8" stroke-width="1"/>
+  <line x1="470" y1="248" x2="836" y2="248" stroke="#F5C8A8" stroke-width="1"/>
+
+  <!-- Deterministic bound dashed line — moved up, white bg behind label -->
+  <line x1="470" y1="128" x2="836" y2="128" stroke="#166534" stroke-width="1.4" stroke-dasharray="5,3" opacity="0.8"/>
+  <!-- white bg rect so label is clear above the line and above bar tops -->
+  <rect x="548" y="106" width="200" height="16" rx="3" fill="white" opacity="0.88"/>
+  <text x="648" y="118" text-anchor="middle" font-size="9" fill="#166534" font-weight="700">deterministic bound &#x2014; every run</text>
+
+  <!-- ── Spyre Request 1 ── -->
+  <rect x="480" y="243" width="96" height="5"  rx="1" fill="#ffe8d8"/>
+  <rect x="480" y="202" width="96" height="41" rx="2" fill="#E55B15"/>
+  <text x="528" y="228" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L1</text>
+  <rect x="480" y="198" width="96" height="4"  rx="0" fill="#ffe8d8"/>
+  <rect x="480" y="168" width="96" height="30" rx="0" fill="#c14a0f"/>
+  <text x="528" y="188" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">FFN</text>
+  <rect x="480" y="164" width="96" height="4"  rx="0" fill="#ffe8d8"/>
+  <rect x="480" y="128" width="96" height="36" rx="2" fill="#E55B15"/>
+  <text x="528" y="151" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L2</text>
+  <line x1="480" y1="128" x2="576" y2="128" stroke="#E55B15" stroke-width="1.5"/>
+  <text x="528" y="261" text-anchor="middle" font-size="9.5" fill="#c14a0f">Request 1</text>
+
+  <!-- ── Spyre Request 2 (identical) ── -->
+  <rect x="604" y="243" width="96" height="5"  rx="1" fill="#ffe8d8"/>
+  <rect x="604" y="202" width="96" height="41" rx="2" fill="#E55B15"/>
+  <text x="652" y="228" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L1</text>
+  <rect x="604" y="198" width="96" height="4"  rx="0" fill="#ffe8d8"/>
+  <rect x="604" y="168" width="96" height="30" rx="0" fill="#c14a0f"/>
+  <text x="652" y="188" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">FFN</text>
+  <rect x="604" y="164" width="96" height="4"  rx="0" fill="#ffe8d8"/>
+  <rect x="604" y="128" width="96" height="36" rx="2" fill="#E55B15"/>
+  <text x="652" y="151" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L2</text>
+  <line x1="604" y1="128" x2="700" y2="128" stroke="#E55B15" stroke-width="1.5"/>
+  <text x="652" y="261" text-anchor="middle" font-size="9.5" fill="#c14a0f">Request 2</text>
+
+  <!-- ── Spyre Request 3 (identical) ── -->
+  <rect x="728" y="243" width="96" height="5"  rx="1" fill="#ffe8d8"/>
+  <rect x="728" y="202" width="96" height="41" rx="2" fill="#E55B15"/>
+  <text x="776" y="228" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L1</text>
+  <rect x="728" y="198" width="96" height="4"  rx="0" fill="#ffe8d8"/>
+  <rect x="728" y="168" width="96" height="30" rx="0" fill="#c14a0f"/>
+  <text x="776" y="188" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">FFN</text>
+  <rect x="728" y="164" width="96" height="4"  rx="0" fill="#ffe8d8"/>
+  <rect x="728" y="128" width="96" height="36" rx="2" fill="#E55B15"/>
+  <text x="776" y="151" text-anchor="middle" font-size="9" font-weight="600" fill="#ffffff">Attn L2</text>
+  <line x1="728" y1="128" x2="824" y2="128" stroke="#E55B15" stroke-width="1.5"/>
+  <text x="776" y="261" text-anchor="middle" font-size="9.5" fill="#c14a0f">Request 3</text>
+
+  <!-- Legend Spyre -->
+  <rect x="480" y="272" width="10" height="8" rx="1" fill="#E55B15"/>
+  <text x="494" y="279" font-size="8.5" fill="#1f2937">Attn (compiler-scheduled)</text>
+  <rect x="640" y="272" width="10" height="8" rx="1" fill="#c14a0f"/>
+  <text x="654" y="279" font-size="8.5" fill="#1f2937">FFN (compiler-scheduled)</text>
+  <rect x="790" y="274" width="10" height="5" rx="1" fill="#ffe8d8" stroke="#e0915a" stroke-width="0.8"/>
+  <text x="804" y="279" font-size="8.5" fill="#1f2937">DMA</text>
+
+  <!-- Bottom summary bar -->
+  <rect x="15"  y="289" width="830" height="11" rx="3" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+  <text x="430" y="298" text-anchor="middle" font-size="9" font-weight="600" fill="#166534">Spyre's compile-time work partitioning eliminates cache eviction, thread scheduling, and prefetcher variance &#x2014; latency is bounded and repeatable</text>
+</svg>

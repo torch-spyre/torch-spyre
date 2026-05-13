@@ -4,6 +4,10 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,14 +33,14 @@ jobs:
     #     config: <filename inside tests/configs/>
     #
     # The JUnit XML report is automatically named after the config file, e.g.:
-    #   test_suite_config.yaml  ->  test_suite_config.xml
+    #   test_view_ops_config.yaml  ->  test_view_ops_config.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
-          - name: View ops
-            config: test_suite_config.yaml
+          - name: View Ops
+            config: test_view_ops_config.yaml
           - name: Profiler
             config: test_profiler_config.yaml
 
@@ -50,15 +54,15 @@ jobs:
       # Derive the PyTorch release branch from pyproject.toml so there is a
       # single source of truth — no hardcoded version in this workflow.
       #
-      # pyproject.toml declares:  torch~=2.10.0
-      # This step extracts "2.10.0", strips the patch -> "2.10", and builds
-      # the branch name "release/2.10".
+      # pyproject.toml declares:  torch~=2.11.0
+      # This step extracts "2.11.0", strips the patch -> "2.11", and builds
+      # the branch name "release/2.11".
       # ---------------------------------------------------------------------------
       - name: Derive PyTorch release branch from pyproject.toml
         id: pytorch-branch
         working-directory: torch-spyre
         run: |
-          # Extract the version constraint, e.g. "2.10" from "torch~=2.10.0"
+          # Extract the version constraint, e.g. "2.11.0" from "torch~=2.11.0"
           VERSION=$(python3 - <<'PYEOF'
           import tomllib
 
@@ -67,8 +71,8 @@ jobs:
 
           requires = data.get('build-system', {}).get('requires', [])
           torch_dep = next(x for x in requires if x.startswith('torch'))
-          version = torch_dep.removeprefix('torch~=')   # e.g. "2.10.0"
-          print('.'.join(version.split('.')[:2]))        # --> "2.10"
+          version = torch_dep.removeprefix('torch~=')   # e.g. "2.11.0"
+          print('.'.join(version.split('.')[:2]))        # --> "2.11"
           PYEOF
           )
           BRANCH="release/${VERSION}"
@@ -140,7 +144,7 @@ jobs:
         run: |
           # Derive the XML report name from the config filename
           # Example:
-          #   test_suite_config.yaml    ->  test_suite_config.xml
+          #   test_view_ops_config.yaml    ->  test_view_ops_config.xml
           #   test_profiler_config.yaml ->  test_profiler_config.xml
 
           source "${VENV_PATH}/bin/activate"
@@ -149,7 +153,7 @@ jobs:
           REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
 
           echo "Running ${{ matrix.suite.name }} upstream tests..."
-          bash run_test.sh configs/${CONFIG} -v --junit-xml="${REPORT_PATH}"
+          bash run_test.sh configs/upstream_tests/${CONFIG} -v --junit-xml="${REPORT_PATH}"
           echo "${{ matrix.suite.name }} upstream tests done"
 
           # Expose report path/name to subsequent steps via GITHUB_ENV

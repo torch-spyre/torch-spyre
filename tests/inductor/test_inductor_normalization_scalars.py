@@ -41,7 +41,8 @@ class TestNormalizationScalarOperations:
     Validates Spyre vs CPU.
     """
 
-    torch.manual_seed(0xAFFE)
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
 
     @pytest.mark.parametrize(
         "eps,dtype,batch,seq,hidden",
@@ -362,7 +363,8 @@ class TestModelScalarOperations:
     architecture implementation.
     """
 
-    torch.manual_seed(0xAFFE)
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
 
     @pytest.mark.parametrize(
         "batch,heads,seq,d_k",

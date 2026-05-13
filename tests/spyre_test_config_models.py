@@ -668,9 +668,21 @@ class TestEntry(BaseModel):
             v = [v]
         for item in v:
             parts = item.split("::")
-            if len(parts) != 2 or not all(parts):
+            if len(parts) == 1:
+                # Plain method name (no class) -- valid for module-level test functions
+                if not parts[0]:
+                    raise ValueError(
+                        f"Invalid test id {item!r}: test name cannot be empty"
+                    )
+            elif len(parts) == 2:
+                # ClassName::method_name format
+                if not all(parts):
+                    raise ValueError(
+                        f"Invalid test id {item!r}, expected 'ClassName::method_name' or plain 'method_name'"
+                    )
+            else:
                 raise ValueError(
-                    f"Invalid test id {item!r}, expected 'ClassName::method_name'"
+                    f"Invalid test id {item!r}, expected 'ClassName::method_name' or plain 'method_name'"
                 )
         return v
 
@@ -684,16 +696,27 @@ class TestEntry(BaseModel):
         return v
 
     def name_pairs(self) -> List[tuple]:
-        """Return [(class_name, method_name), ...] for all entries in names."""
-        return [tuple(n.split("::")) for n in self.names]
+        """Return [(class_name_or_None, method_name), ...] for all entries in names."""
+        result: List[tuple] = []
+        for n in self.names:
+            parts = n.split("::")
+            if len(parts) == 1:
+                result.append((None, parts[0]))
+            else:
+                result.append((parts[0], parts[1]))
+        return result
 
     def method_names(self) -> List[str]:
         """Return just the method_name part of each entry."""
-        return [n.split("::")[1] for n in self.names]
+        return [n.split("::")[-1] for n in self.names]
 
-    def class_names(self) -> List[str]:
-        """Return just the class_name part of each entry."""
-        return [n.split("::")[0] for n in self.names]
+    def class_names(self) -> List[Optional[str]]:
+        """Return just the class_name part of each entry, or None for plain method names."""
+        result: List[Optional[str]] = []
+        for n in self.names:
+            parts = n.split("::")
+            result.append(parts[0] if len(parts) == 2 else None)
+        return result
 
 
 class FileEntry(BaseModel):
@@ -729,9 +752,9 @@ class FileEntry(BaseModel):
 
     def get_test_entry(self, class_name: str, method_name: str) -> Optional[TestEntry]:
         """Look up a TestEntry by class and method name, or None if not listed."""
-        target = f"{class_name}::{method_name}"
+        qualified = f"{class_name}::{method_name}"
         for entry in self.tests:
-            if target in entry.names:
+            if qualified in entry.names or method_name in entry.names:
                 return entry
         return None
 

@@ -26,7 +26,8 @@ class TestTensorScalarCoreArithmetic:
     Core tensor–scalar arithmetic on Spyre vs CPU
     """
 
-    torch.manual_seed(0xAFFE)
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1545
     @pytest.mark.xfail(
@@ -161,7 +162,8 @@ class TestSdpaScalarHyperparameters:
     and mask patterns (full, local, causal).
     """
 
-    torch.manual_seed(0xAFFE)
+    def setup_method(self):
+        torch.manual_seed(0xAFFE)
 
     # Small shapes (B,H,S,D) keep memory down and reduce backend-specific FP16 overflow issues.
     _MASK_SMALL = dict(b=1, h=2, s=32, d=16)

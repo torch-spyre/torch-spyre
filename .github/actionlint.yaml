@@ -6,3 +6,7 @@ self-hosted-runner:
     - official-aiu-x86-64-arc-runner-set-v1
     - official-aiu-x86-64-arc-runner-set-v2
     - official-aiu-x86-64-arc-runner-set-v3
+    - x86_64
+    - spyre_pf
+    - linux
+    - image_torch_spyre

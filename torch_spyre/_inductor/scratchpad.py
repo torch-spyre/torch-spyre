@@ -61,12 +61,13 @@ class ScratchPadAllocator:
     def get_lowest_addr_in_use(self):
         if len(self.usage) > 0:
             return min([rec["addr"] for rec in self.usage.values()])
-        return None
+        return -1
+        # need to update find_free_block() if these 2 func returns None
 
     def get_highest_addr_in_use(self):
         if len(self.usage) > 0:
             return max([rec["addr"] + rec["size"] for rec in self.usage.values()])
-        return None
+        return -1
 
     def get_available_total(self):
         total_avail = self.limit
@@ -78,8 +79,10 @@ class ScratchPadAllocator:
         # cannot perform defragmentation yet, will add more cases in the future
         curr_lo = self.get_lowest_addr_in_use()
         curr_hi = self.get_highest_addr_in_use()
-        if len(self.usage) == 0 or curr_lo >= size_needed:
-            # completely free or enough room at addr0
+        if (
+            len(self.usage) == 0 and size_needed <= self.limit
+        ) or curr_lo >= size_needed:
+            # completely free and/or enough room at addr0
             return 0
         elif curr_hi + size_needed < self.limit:
             # enough room at higher addr, return next 128-multiple
@@ -112,7 +115,7 @@ class ScratchPadAllocator:
         for inp_i in mem_usage["all_inputs"]:
             inp_i_dev_lay = self.graph_lowering.get_buffer(inp_i).layout.device_layout
             inp_i_on_lx = inp_i in self.usage
-            inp_i_size_match = needed_size == mem_usage[inp_i]["size"]
+            inp_i_size_match = needed_size == mem_usage[inp_i]["size_per_core"]
             inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
             inp_i_eol = mem_usage[inp_i]["last_usage"]
             if inp_i_on_lx and inp_i_size_match and inp_i_lay_match and inp_i_eol:
@@ -133,20 +136,24 @@ class ScratchPadAllocator:
         3. for an output tensor, if this op is on the "white list" => prep for pinning
             => alloc a new LX block for the "output" of the op
         If can_reuse => add lx info to corresponding buffer.layout
-        TODO if more than 1 matched input for inplace Op, is it good enough to always
-             use the first one? e.g. C=A+B, A and B have same size, both on LX
+        TODO 1. if more than 1 matched input for inplace Op, is it good enough to always
+                use the first one? e.g. C=A+B, A and B have same size, both on LX
+             2. needed_size needs to consider core-division cases
         NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
                  have different names -> end-of-life analysis will take care of dealloc
               2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
               3. may be able to generalize this decision in buf end-of-life analysis
               4. greedy alloc may cause fragments, can further improve
+              5. For multi-core cases, assuming every core has the same allocations for
+                 now, even if not all the cores are being used. (over-allocated for
+                 simplicity reason)
         """
         graph_output_buf_name = self.get_output_names()
         for tensor_name in mem_usage["all_buf_used"]:
             tensor_info = mem_usage[tensor_name]
             is_graph_input = self.is_graph_input(tensor_name)
             is_graph_output = tensor_name in graph_output_buf_name
-            needed_size = tensor_info["size"]
+            needed_size = tensor_info["size_per_core"]
             is_input = tensor_info["is_input"]
             core_div_mismatch = (not is_input) and tensor_info["core_div_mismatch"]
             if is_graph_input or is_graph_output or core_div_mismatch:
@@ -166,9 +173,8 @@ class ScratchPadAllocator:
                 addr = self.usage[tensor_name]["addr"]
             elif not is_input and allow_inplace:
                 addr = self.find_inplace_address(tensor_name, mem_usage, needed_size)
-                if (
-                    addr is None
-                ):  # NOTE 0 is a legitimate address, so we can't test "if not addr:"
+                if addr is None:
+                    # NOTE 0 is a legitimate address, so we can't test "if not addr:"
                     addr = self.find_free_block(needed_size)
             elif not is_input and allow_output_to_lx:
                 addr = self.find_free_block(needed_size)
@@ -185,7 +191,7 @@ class ScratchPadAllocator:
                         "op_name": org_op_name,
                         "tensor_name": tensor_name,
                         "addr": addr,
-                        "size": needed_size,
+                        "size_per_core": needed_size,
                     }
                 )
 
@@ -204,10 +210,12 @@ class ScratchPadAllocator:
             if buf in self.usage:
                 del self.usage[buf]
 
-    # TODO add dealloc and defrag mechanism to allocator later
+    # TODO add defrag mechanism to allocator later
 
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
-        return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+        return config.allow_all_ops_in_lx_planning or any(
+            op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
+        )
 
     def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
         return any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
@@ -232,6 +240,9 @@ class ScratchPadAllocator:
             "all_inputs": [],
             "all_outputs": [],
         }
+        num_cores = math.prod(
+            [s for p in getattr(op, "op_it_space_splits", ()) for s in p.values()]
+        )
 
         for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
             for dep in deps:
@@ -243,14 +254,15 @@ class ScratchPadAllocator:
                 mem_usage[dep.name] = {
                     "is_input": is_input,
                     "size": dev_size,
+                    "size_per_core": dev_size // num_cores,
                     "core_div_mismatch": core_div_mismatch.get(dep.name, False),
                     "last_usage": dep.name in release_next,
                 }
 
-            if is_input:
-                mem_usage["all_inputs"].append(dep.name)
-            else:
-                mem_usage["all_outputs"].append(dep.name)
+                if is_input:
+                    mem_usage["all_inputs"].append(dep.name)
+                else:
+                    mem_usage["all_outputs"].append(dep.name)
 
         mem_usage["all_buf_used"] = mem_usage["all_inputs"] + mem_usage["all_outputs"]
 
@@ -285,9 +297,9 @@ class GreedyAllocationStrategy(AllocationStrategy):
     ):
         """
         If core_div_mismatch is not provided, we will consider LX pinning without taking
-        core division into account (previous behavior), may result in slices of a LX tensor
-        scattered over different core's scratchpad, which may result in unusable tensor and
-        incorrect results.
+        work division compatibility into account. When a tensor is sliced and scattered
+        over multiple cores' scratchpad, it may result in unusable tensor, incorrect
+        results, or backend compiler will simply throw out errors.
         """
         # 1. summarize both inputs and output sizes used by this node, also merge core_div
         #    info into the table.
@@ -295,15 +307,25 @@ class GreedyAllocationStrategy(AllocationStrategy):
 
         # 2. Try to allocate as many buffers on LX as we can. If successful, lx info (addr)
         #    will be added to buffer.FixedTiledLayout and used in generate_sdsc() later.
-        org_op_name = op.origin_node.target._opname
+        # Synthetic ComputedBuffers (e.g. the second output of topk, weight-relayout
+        # buffers from temp_passes) have origin_node=None. Use "" so the LX-reuse and
+        # LX-inplace allowlist substring checks both fall through to False — synthetic
+        # buffers are conservatively kept off the scratchpad.
+        target = getattr(getattr(op, "origin_node", None), "target", None)
+        org_op_name = (
+            getattr(target, "_opname", None)
+            or getattr(target, "__name__", None)
+            or getattr(target, "name", None)
+            or str(target)
+        )
         self.alloc.try_allocate(mem_usage, idx, org_op_name)
 
     def buf_analysis(self, operations: list[Operation]):
         """
         First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
         Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
-        Then check core division -> If any of the operations on a given buffer has different
-        core division => should not pin this buffer to LX
+        Then check work division -> If any of the operations on a given buffer has different
+        work division => should not pin this buffer to LX
         NOTE Because each core can only write to its own scratchpad. For example, if a
               buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> each core
               in next op has to read from 2 different scratchpads...

@@ -527,6 +527,7 @@ def _compile_and_run(
 ):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
+    torch._inductor.codecache.FxGraphCache.clear()
     device = torch.device(device) if isinstance(device, str) else device
     device_args = [
         arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args
@@ -690,6 +691,16 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None): 
                 new_test = skip_func(new_test)
 
             setattr(other_cls, f"{name}_{suffix}", new_test)
+
+    # Copy helper routines that copied tests may call on self.
+    for name in dir(my_cls):
+        value = getattr(my_cls, name)
+        if (
+            name.startswith("_get_")
+            and callable(value)
+            and not hasattr(other_cls, name)
+        ):
+            setattr(other_cls, name, value)
 
     # Special case convenience routine
     if hasattr(my_cls, "is_dtype_supported"):

@@ -325,8 +325,7 @@ def ones_decomp(
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     scalar = torch.ops.spyre.ones_scalar(device, dtype=dtype)
-    expanded = scalar.expand(size)
-    return expanded.clone()
+    return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
 
 @register_spyre_decomposition([torch.ops.aten.new_ones.default])
@@ -344,8 +343,7 @@ def new_ones_decomp(
     dev = device if device is not None else self.device
     dt = dtype if dtype is not None else self.dtype
     scalar = torch.ops.spyre.ones_scalar(dev, dtype=dt)
-    expanded = scalar.expand(size)
-    return expanded.clone()
+    return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
 
 # To avoid constant folding, we introduce a custom op `spyre::full` that runs
