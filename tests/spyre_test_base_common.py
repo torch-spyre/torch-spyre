@@ -50,8 +50,27 @@ from spyre_test_config_models import (
     SupportedModuleConfig,
     TestEntry,
 )
+from spyre_test_common_methods_invocations import (
+    create_module_inputs_func_from_yaml,
+    create_module_inputs_func_from_config,
+)
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
+
+
+# ---------------------------------------------------------------------------
+# Logging utilities
+# ---------------------------------------------------------------------------
+
+
+def _log_warning(msg: str) -> None:
+    """Write warning message to stderr for visibility during test runs."""
+    os.write(2, f"[OOTDeviceTestBase WARNING] {msg}\n".encode())
+
+
+def _log_error(msg: str) -> None:
+    """Write error message to stderr for visibility during test runs."""
+    os.write(2, f"[OOTDeviceTestBase ERROR] {msg}\n".encode())
 
 
 # Resolve the actual backend name registered for privateuse1.
@@ -163,6 +182,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
 
+    # File-level module filtering (populated during config load)
+    # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
+    _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
+    _FILE_LEVEL_EXCLUDED_MODULES: Optional[Set[str]] = None
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -199,6 +223,8 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         module_configs = config.global_config.resolved_supported_modules_config()
         if module_configs:
             cls.SUPPORTED_MODULES_CONFIG = module_configs
+            # Register module input generators for modules with inline inputs
+            cls._register_module_input_generators(module_configs)
 
         cls.GLOBAL_SUPPORTED_DTYPES = config.global_config.resolved_supported_dtypes()
         cls.GLOBAL_DTYPE_PRECISION = (
@@ -210,7 +236,130 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.TEST_ENTRIES = _build_test_entry_map(file_entry)
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
+        # Initialize file-level module tracking for this config load
+        # Create new sets to avoid sharing state between test classes
+        cls._FILE_LEVEL_INCLUDED_MODULES = set()
+        cls._FILE_LEVEL_EXCLUDED_MODULES = set()
+
+        for entry in file_entry.tests:
+            if entry.edits.modules.include:
+                cls._register_custom_modules_from_edits(entry.edits.modules.include)
+                # Track included module names for filtering
+                cls._FILE_LEVEL_INCLUDED_MODULES.update(
+                    entry.edits.modules.included_module_names()
+                )
+            if entry.edits.modules.exclude:
+                cls._FILE_LEVEL_EXCLUDED_MODULES.update(
+                    entry.edits.modules.excluded_module_names()
+                )
+
         cls._yaml_loaded = True
+
+    @classmethod
+    def _register_custom_modules_from_edits(cls, modules_named_items: List) -> None:
+        """Register custom modules from edits.modules.include into module_db.
+
+        This allows tests to use modules that aren't in PyTorch's upstream module_db
+        by dynamically registering them before the _OOTModuleListPatcher runs.
+        """
+
+        try:
+            from torch.testing._internal.common_modules import module_db, ModuleInfo
+        except ImportError as e:
+            _log_warning(
+                f"Cannot register custom modules: torch.testing._internal.common_modules "
+                f"not available: {e}"
+            )
+            return
+
+        # Get existing module names to avoid duplicates
+        existing_names = {m.name for m in module_db}
+        for i, module_item in enumerate(modules_named_items):
+            module_name = module_item.name
+            # Skip if already registered
+            if module_name in existing_names:
+                continue
+
+            # Try to import the module class
+            module_path = getattr(module_item, "module_path", None)
+            if not module_path:
+                _log_warning(
+                    f"Module '{module_name}' has no module_path, skipping registration"
+                )
+                continue
+
+            try:
+                # Import the module class
+                parts = module_path.rsplit(".", 1)
+                if len(parts) != 2:
+                    _log_error(
+                        f"Invalid module_path format for '{module_name}': {module_path}"
+                    )
+                    continue
+                module_pkg, class_name = parts
+                pkg = __import__(module_pkg, fromlist=[class_name])
+                module_cls = getattr(pkg, class_name)
+            except (ImportError, AttributeError) as e:
+                _log_error(
+                    f"Failed to import module '{module_name}' from {module_path}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+
+            # Create ModuleInfo and add to module_db
+            try:
+                module_info = ModuleInfo(
+                    module_cls,
+                    module_inputs_func=create_module_inputs_func_from_yaml(module_item),
+                    skips=(),
+                    decorators=None,
+                    dtypes=(torch.float32, torch.float16),
+                )
+                module_db.append(module_info)
+                existing_names.add(module_name)
+            except Exception as e:
+                _log_error(
+                    f"Failed to create ModuleInfo for '{module_name}': "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+
+    @classmethod
+    def _register_module_input_generators(
+        cls, module_configs: Dict[str, SupportedModuleConfig]
+    ) -> None:
+        """Register module input generators for modules with inline input specs.
+
+        This creates generator functions that follow PyTorch's upstream signature:
+        module_inputs_func(module_info, device, dtype, requires_grad, training, **kwargs) -> list[ModuleInput]
+        """
+        try:
+            from torch.testing._internal.common_modules import module_db
+        except ImportError as e:
+            _log_warning(
+                f"Cannot register module input generators: module_db not available: {e}"
+            )
+            return
+
+        for module_name, module_config in module_configs.items():
+            if not module_config.has_inline_inputs():
+                continue
+
+            # Find the module in module_db
+            matching_modules = [m for m in module_db if m.name == module_name]
+            if not matching_modules:
+                _log_warning(
+                    f"Module '{module_name}' not found in module_db, "
+                    f"cannot register input generator"
+                )
+                continue
+
+            module_info = matching_modules[0]
+
+            # Replace the module's input generator
+            module_info.module_inputs_func = create_module_inputs_func_from_config(
+                module_config
+            )
 
     @classmethod
     def _should_run(
@@ -249,20 +398,15 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 if dtype in excluded:
                     return False, f"Excluded dtype: {dtype_str}", False, False
 
-                # if explicitly included via edits
-                # This is the additive path — dtype is IN ADDITION to global.supported_dtypes
-                if dtype in included:
-                    pass  # allow through regardless of global.supported_dtypes
-
-                # Not explicitly included — apply global ceiling
-                # This is the base intersection path:
-                # (global.supported_dtypes ∩ op.dtypes ∩ test.allowed_dtypes)
-                elif cls.GLOBAL_SUPPORTED_DTYPES is not None:
+                if dtype not in included and cls.GLOBAL_SUPPORTED_DTYPES is not None:
                     if dtype not in cls.GLOBAL_SUPPORTED_DTYPES:
                         return False, f"Unsupported dtype: {dtype_str}", False, False
 
-            except ValueError:
-                pass
+            except ValueError as e:
+                _log_warning(
+                    f"Failed to parse dtype '{dtype_str}' in test '{method_name}': {e}"
+                )
+                # Continue with test execution - dtype filtering is optional
 
         # apply force_xfail from op-level config
         # extract op name from method_name — format: test_name_opname_device_dtype
@@ -317,25 +461,42 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # Union: test-level tags + op-level tags (deduplicated)
         all_tags = tags + [t for t in op_tags if t not in set(tags)]
         if all_tags:
-            os.write(
-                2,
-                f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
-                f"tags: [{', '.join(all_tags)}]\n".encode(),
-            )
+            if generic_cls is not None:
+                os.write(
+                    2,
+                    f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
+                    f"tags: [{', '.join(all_tags)}]\n".encode(),
+                )
+            else:
+                _log_warning(
+                    f"Test '{name}' has tags {all_tags} but generic_cls is None, "
+                    f"cannot print tag information"
+                )
 
         # op list filtering
         supported_ops = cls._get_supported_ops()
         if supported_ops is not None:
             _OOTOpListPatcher(test, supported_ops).patch()
 
-        # @modules filtering
+        # @modules filtering using file-level included/excluded modules
+        # Custom modules were already registered during _load_test_suite_config()
         supported_modules = cls._get_supported_modules()
-        included_modules = (
-            entry.edits.modules.included_module_names() if entry is not None else set()
-        )
-        excluded_modules = (
-            entry.edits.modules.excluded_module_names() if entry is not None else set()
-        )
+
+        # Use file-level included/excluded modules (collected from ALL test entries)
+        # This ensures filtering applies to ALL instantiate_test() calls, not just the first one
+        # Use getattr with set() default to handle None (not yet initialized) case
+        included_modules = getattr(cls, "_FILE_LEVEL_INCLUDED_MODULES", None) or set()
+        excluded_modules = getattr(cls, "_FILE_LEVEL_EXCLUDED_MODULES", None) or set()
+
+        # Also merge in test-specific includes/excludes if present
+        if entry is not None:
+            included_modules = (
+                included_modules | entry.edits.modules.included_module_names()
+            )
+            excluded_modules = (
+                excluded_modules | entry.edits.modules.excluded_module_names()
+            )
+
         if supported_modules is not None or included_modules or excluded_modules:
             _OOTModuleListPatcher(
                 test,
@@ -421,7 +582,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             enabled, reason, is_xfail, is_strict = cls._should_run(
                 method_name=method_name,
                 base_test_name=name,
-                generic_cls_name=generic_cls.__name__,
+                generic_cls_name=generic_cls.__name__
+                if generic_cls is not None
+                else "",
             )
 
             if not enabled:
