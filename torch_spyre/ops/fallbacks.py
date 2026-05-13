@@ -229,7 +229,7 @@ def register_fallback(ops, device="cpu"):
 
 def register_fallback_default(ops):
     for op in _get_op_overloads(ops):
-        register_fallback([op.name()])(op)
+        register_fallback([op])(op)
 
 
 #  CPU-fallback eager operators
@@ -238,29 +238,20 @@ register_fallback_default(
     [
         aten.cumsum,
         aten.repeat.out,
+        aten.arange,
+        aten.sin,
+        aten.cos,
+        aten.embedding.default,
+        aten.isin,
+        aten.tril,
+        aten.triu,
+        aten.bitwise_xor.Tensor,
+        aten.bitwise_xor.Tensor_out,
+        aten.bitwise_or.Tensor,
+        aten.bitwise_or.Tensor_out,
+        aten.argmax.default,
     ]
 )
-
-
-@register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
-def spyre__arange(*args, **kwargs):
-    return torch.arange(*args, **kwargs)
-
-
-@register_fallback([aten.arange.out, aten.arange.start_out])
-def spyre__arange_out(*args, out, **kwargs):
-    kwargs.update({"device": "cpu", "dtype": out.dtype, "layout": out.layout})
-    return torch.arange(*args, **kwargs)
-
-
-@register_fallback([aten.sin.default, aten.sin.out])
-def spyre__sin(input, **kwargs):
-    return torch.sin(input, **kwargs)
-
-
-@register_fallback([aten.cos.default, aten.cos.out])
-def spyre__cos(input, **kwargs):
-    return torch.cos(input, **kwargs)
 
 
 # Manually append to fallback_ops: register_fallback cannot be used here because
@@ -268,67 +259,6 @@ def spyre__cos(input, **kwargs):
 # and would leave the original Spyre tensor unfilled.
 # The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
-
-
-@register_fallback([aten.embedding.default])
-def spyre__embedding(
-    weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
-):
-    """
-    Fallback for torch.nn.functional.embedding.
-
-    Embedding requires indirect indexing (weight[indices]), which is not
-    supported by Spyre's current pointwise operation framework.
-    """
-    # TODO: Remove this fallback once we enable gather/scatter ops on spyre
-    return aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse)
-
-
-@register_fallback(
-    [
-        aten.isin.Tensor_Tensor,
-        aten.isin.Tensor_Tensor_out,
-        aten.isin.Tensor_Scalar,
-        aten.isin.Tensor_Scalar_out,
-        aten.isin.Scalar_Tensor,
-        aten.isin.Scalar_Tensor_out,
-    ]
-)
-def spyre__isin(
-    elements, test_elements, *, assume_unique=False, invert=False, **kwargs
-):
-    """
-    Fallback for torch.isin on Spyre.
-
-    """
-    return torch.isin(
-        elements, test_elements, assume_unique=assume_unique, invert=invert, **kwargs
-    )
-
-
-@register_fallback([aten.tril.default, aten.tril.out])
-def spyre__tril(input, diagonal=0, **kwargs):
-    return torch.tril(input, diagonal, **kwargs)
-
-
-@register_fallback([aten.triu.default, aten.triu.out])
-def spyre__triu(input, diagonal=0, **kwargs):
-    return torch.triu(input, diagonal, **kwargs)
-
-
-@register_fallback([aten.bitwise_xor.Tensor, aten.bitwise_xor.Tensor_out])
-def spyre__bitwise_xor(input1, input2, **kwargs):
-    return torch.bitwise_xor(input1, input2, **kwargs)
-
-
-@register_fallback([aten.bitwise_or.Tensor, aten.bitwise_or.Tensor_out])
-def spyre__bitwise_or(input1, input2, **kwargs):
-    return torch.bitwise_or(input1, input2, **kwargs)
-
-
-@register_fallback([aten.argmax.default])
-def spyre__argmax(*args, **kwargs):
-    return torch.argmax(*args, **kwargs)
 
 
 @register_fallback(["spyre::max_dim_int64_fallback"])
