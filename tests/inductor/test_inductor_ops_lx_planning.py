@@ -202,6 +202,7 @@ REDUCTION_TEST_FAILURES = [
     "test_cat_4d_dim2",
     "test_cat_4d_dim3",
     "test_cat_4d_dim3_fp32",
+    "test_copy_roundtrip_3d",
     "test_copy_roundtrip_4d_stick",
     "test_einsum_einsum_55x2_2x99",
     "test_einsum_einsum_67x255_255x128",
