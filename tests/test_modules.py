@@ -40,6 +40,10 @@ class TestOps(TestCase):
         self.atol = 1e-3
         self.dtype = torch.float16
 
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_linear(self):
         with torch.no_grad():
             m = nn.Linear(64, 128, bias=False, dtype=self.dtype)

@@ -41,7 +41,7 @@ sr = sympy.Symbol("sr", integer=True)
 
 class TestItSpaceSplits(TestCase):
     def setUp(self):
-        torch.manual_seed(0)
+        torch.manual_seed(0xAFFE)
 
     # ------------------------------------------------------------------
     # Pointwise: all dims in write dep, no reduction

@@ -196,6 +196,10 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
     reduction, ...) onto the result of each upstream op test.
     """
 
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def wrap(self, fn):
         raise NotImplementedError
 
