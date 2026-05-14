@@ -220,7 +220,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         # padding for x).  y is the other input; its K host dim is derived from the
         # same reduction coord.  This avoids positional assumptions and handles
         # square matrices (M==K==N) correctly.
-        # See propagate_layouts.py for the same reduction-coord derivation.
+        # See propagate_layouts._topk_layouts for the same reduction-coord derivation.
         write_dep = next(iter(rw.writes))
         out_coords = host_coordinates(op.get_layout(), write_dep)
 
@@ -302,13 +302,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         # Look for the FX node with the expected pre-padded x size so that the
         # padded clone has the right dimensionality for the inner_fn's loaders.
         x_padded_size = x_size[:-1] + [k_padded]
-        try:
-            x_fx_node = _find_arg_fx_node(x_name, expected_size=x_size)
-        except RuntimeError:
-            logger.warning(
-                "insert_padding_ir: FX node not found for x=%s, skipping", x_name
-            )
-            continue
+        x_fx_node = _find_arg_fx_node(x_name, expected_size=x_size)
 
         x_orig_stl = x_buf.get_layout().device_layout
         x_padded_buf, x_new_ops = lower_pad_sequence(
@@ -333,13 +327,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
         y_padded_size[y_k_dim] = k_padded
-        try:
-            y_fx_node = _find_arg_fx_node(y_name)
-        except RuntimeError:
-            logger.warning(
-                "insert_padding_ir: FX node not found for y=%s, skipping", y_name
-            )
-            continue
+        y_fx_node = _find_arg_fx_node(y_name)
 
         y_orig_stl = y_buf.get_layout().device_layout
         y_padded_buf, y_new_ops = lower_pad_sequence(
