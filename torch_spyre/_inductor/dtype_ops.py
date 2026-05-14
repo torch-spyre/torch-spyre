@@ -19,7 +19,7 @@ This module provides a centralized table for dtype conversion operators,
 mapping PyTorch dtype pairs to Spyre hardware operators.
 """
 
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 
@@ -45,27 +45,27 @@ from torch_spyre._inductor.constants import (
 
 
 class DtypeOpTable:
-    _IDENTITY_CONVERSIONS = [
+    _IDENTITY_DTYPES = [
         (torch.float16, torch.bool),
         (torch.bool, torch.float16),
         (torch.float16, torch.bfloat16),
         (torch.bfloat16, torch.float16),
     ]
 
-    _FP16_TO_FP32_CONVERSIONS = [
+    _FP16_TO_FP32_DTYPES = [
         (torch.float16, torch.float32),
         (torch.bfloat16, torch.float32),
     ]
 
-    _FP32_TO_FP16_CONVERSIONS = [
+    _FP32_TO_FP16_DTYPES = [
         (torch.float32, torch.float16),
         (torch.float32, torch.bfloat16),
     ]
 
-    _CONVERSIONS = {
-        **{pair: IDENTITY_OP for pair in _IDENTITY_CONVERSIONS},
-        **{pair: FP32TODL16_OP for pair in _FP16_TO_FP32_CONVERSIONS},
-        **{pair: DL16TOFP32_OP for pair in _FP32_TO_FP16_CONVERSIONS},
+    _TYPECAST_OPS_TABLE = {
+        **{pair: IDENTITY_OP for pair in _IDENTITY_DTYPES},
+        **{pair: DL16TOFP32_OP for pair in _FP16_TO_FP32_DTYPES},
+        **{pair: FP32TODL16_OP for pair in _FP32_TO_FP16_DTYPES},
         # TBD Deeptools dtype cast ops
         # (torch.bfloat16, torch.float32): FP32TOBF16_OP,
         # (torch.float32, torch.bfloat16): BF16TOFP32_OP,
@@ -83,8 +83,25 @@ class DtypeOpTable:
         # (torch.int32, torch.int8): INT8TOINT32_OP,
     }
 
+    _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())
+    _TYPECAST_OP_DTYPES = set(_TYPECAST_OPS_TABLE.keys())
+
     @classmethod
     def get_operator(
         cls, src_dtype: torch.dtype, dst_dtype: torch.dtype
     ) -> Optional[str]:
-        return cls._CONVERSIONS.get((src_dtype, dst_dtype))
+        return cls._TYPECAST_OPS_TABLE.get((src_dtype, dst_dtype))
+
+    @classmethod
+    def get_table(
+        cls,
+    ) -> Mapping[tuple[torch.dtype, torch.dtype], str]:
+        return cls._TYPECAST_OPS_TABLE
+
+    @classmethod
+    def get_dtype_pairs(cls) -> set[tuple[torch.dtype, torch.dtype]]:
+        return cls._TYPECAST_OP_DTYPES
+
+    @classmethod
+    def is_dtype_op(cls, op: str) -> bool:
+        return op in cls._TYPECAST_OP_NAMES
