@@ -743,6 +743,24 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+@register_spyre_decomposition(
+    [
+        torch.ops.aten.clamp.default,
+        torch.ops.aten.clamp.out,
+    ]
+)
+def spyre_clamp(
+    input: torch.Tensor,
+    min: Optional[Union[int, float]] = None,
+    max: Optional[Union[int, float]] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    result = torch.ops.spyre.clamp(input, min=min, max=max)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
