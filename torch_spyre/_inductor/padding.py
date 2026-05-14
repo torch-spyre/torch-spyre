@@ -78,7 +78,11 @@ def pad_arg(graph: torch.fx.Graph, node: torch.fx.Node, arg_i: int, dim: int) ->
 
 
 def insert_padding(graph: torch.fx.Graph) -> None:
-    matmul_ops = {aten.mm.default, aten.bmm.default}
+    matmul_ops = {
+        aten.mm.default,
+        aten.bmm.default,
+        torch.ops.spyre.batched_matmul.default,
+    }
     for node in list(graph.nodes):
         if node.op == "call_function" and node.target in matmul_ops:
             args = node.args

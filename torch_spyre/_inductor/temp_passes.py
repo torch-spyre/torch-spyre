@@ -127,9 +127,15 @@ def _unflatten_mm_to_bmm(
             expanded_shape, dtype=rhs_dtype, device="meta"
         )
 
-        # Replace mm with bmm
+        # Use spyre.batched_matmul for >3D to avoid FakeTensorUpdater crash
+        # (aten.bmm requires exactly 3D inputs)
+        target = (
+            torch.ops.spyre.batched_matmul.default
+            if len(output_shape) > 3
+            else aten.bmm.default
+        )
         bmm_node = graph.call_function(
-            aten.bmm.default,
+            target,
             args=(lhs_input, expanded),
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
@@ -215,15 +221,20 @@ def _unflatten_bmm_batch_dims(
     lhs_orig = lhs_reshape.args[0]  # the expand or original tensor
     rhs_orig = rhs_reshape.args[0]
 
-    # Update bmm to take the higher-dimensional inputs directly
-    node.args = (lhs_orig, rhs_orig)
+    # Replace the 3D bmm with a spyre.batched_matmul that accepts N-D inputs.
+    # Using aten.bmm.default with >3D args would crash FakeTensorUpdater.
+    with graph.inserting_before(node):
+        matmul_node = graph.call_function(
+            torch.ops.spyre.batched_matmul.default,
+            args=(lhs_orig, rhs_orig),
+        )
+        matmul_node.meta["val"] = output_view.meta["val"]
 
-    # Update bmm output shape metadata
-    node.meta["val"] = output_view.meta["val"]
-
-    # Replace all uses of the output view with the bmm itself
-    output_view.replace_all_uses_with(node)
+    # Replace all uses of the output view with the new matmul
+    output_view.replace_all_uses_with(matmul_node)
+    node.replace_all_uses_with(matmul_node)
     graph.erase_node(output_view)
+    graph.erase_node(node)
 
     # Clean up dead reshape nodes
     for reshape_node in (lhs_reshape, rhs_reshape):

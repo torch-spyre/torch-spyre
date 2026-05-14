@@ -294,6 +294,7 @@ def lower_mm(x, y):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.batched_matmul.default)
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
     x.realize()
