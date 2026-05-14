@@ -4,10 +4,11 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-  merge_group:
-    types: [checks_requested]
+  # Removing from CICD till the ops tests get matured
+  # pull_request:
+  #   branches: [main]
+  # merge_group:
+  #   types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
