@@ -467,19 +467,29 @@ def lower_pad_sequence(
     ``fill_offset = original_size[dim]``.
 
     ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer.  The
-    padded allocation's ``SpyreTensorLayout`` is derived from it so that the
-    within-stick host dimension is preserved: the last entry of
-    ``device_coordinates`` for both the original and padded buffers will be
-    identical.  This is achieved by recovering the within-stick host dimension
-    from ``orig_stl.stride_map[-1]`` (the host stride of the within-stick dim)
-    and constructing the padded STL via ``SpyreTensorLayout(padded_size,
-    padded_host_stride, dtype, dim_order)`` with the same ``dim_order``.
-    ``arg_fx_node.meta["val"].stride()`` gives the strides of the view the
-    inner_fn actually accesses, so the lookup works even when ``orig_stl`` has
-    fewer dimensions than ``padded_size`` (e.g. when mm_to_bmm_pass adds a
-    batch dimension to x).  Falls back to ``SpyreTensorLayout(padded_size,
-    dtype)`` only when no stride in the view matches ``stride_map[-1]``, which
-    should not occur in practice.
+    padded allocation's ``SpyreTensorLayout`` is derived from the *core* host
+    dimensions that ``orig_stl`` was built from (``len(stride_map) - 1`` dims),
+    stripping any leading phantom batch-1 dims that ``mm_to_bmm_pass`` may have
+    added to ``padded_size``.  Passing the phantom dims to the
+    ``SpyreTensorLayout`` constructor produces a degenerate ``-1`` entry in
+    ``stride_map`` for the size-1 device dim, which causes
+    ``compute_coordinates`` to emit a constant nonzero stick offset and trips
+    ``normalize_coordinates``'s ``assert offset == 0``.  Building from the core
+    suffix avoids this.  The within-stick host dimension is identified from
+    ``orig_stl.stride_map[-1]`` and preserved in the padded STL so that
+    ``device_coordinates[-1]`` is identical for both the original and padded
+    buffers.  Falls back to ``SpyreTensorLayout(core, dtype)`` only when no
+    stride in the view matches ``stride_map[-1]``, which should not occur in
+    practice.
+
+    The fill offset is rounded down to the nearest stick boundary.  When
+    ``original_size_dim`` is not a multiple of ``stick_size``, using the raw
+    fill offset would place the fill overwrite at a nonzero constant position
+    within the device stick dimension, which ``normalize_coordinates`` rejects.
+    Rounding down extends the zeroed region slightly (overwriting a few elements
+    that ``overwrite_data`` subsequently restores with correct values), but keeps
+    the fill overwrite stick-aligned.  ``overwrite_data`` always runs after
+    ``overwrite_fill``, so the valid data is never lost.
 
     ``fill_cache`` maps ``(fill_value, device, dtype)`` to an existing
     ``spyre.constant`` FX node.  On a cache hit that node is reused and not
@@ -511,9 +521,20 @@ def lower_pad_sequence(
     )
     fill_offset = original_size_dim
 
-    # Fill-region shape: padded_size with dim replaced by pad_extent.
+    # If fill_offset is not stick-aligned, the fill overwrite would produce a
+    # nonzero constant in the stick device coordinate, which normalize_coordinates
+    # rejects.  Round the fill region down to the nearest stick boundary so the
+    # fill starts at a stick-aligned offset.  This may zero-fill a few extra
+    # elements that already have valid data from overwrite_data, but overwrite_data
+    # runs after overwrite_fill so the valid data is written on top.
+    stick_size = get_elem_in_stick(dtype)
+    fill_offset_aligned = (fill_offset // stick_size) * stick_size
+    aligned_pad_extent = padded_size[dim] - fill_offset_aligned
+
+    # Fill-region shape: padded_size with dim replaced by aligned_pad_extent.
     pad_size = list(padded_size)
-    pad_size[dim] = pad_extent
+    pad_size[dim] = aligned_pad_extent
+    fill_offset = fill_offset_aligned
 
     cache_key = (fill_value, device, dtype)
     const_is_new = fill_cache is None or cache_key not in fill_cache
@@ -602,32 +623,39 @@ def lower_pad_sequence(
     graph_lowering.env[empty_fx] = empty_tb
     padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> SpyreEmptyFallback
     assert isinstance(padded_buf, SpyreEmptyFallback)
-    # Build the padded STL preserving the within-stick host dimension of orig_stl.
-    # stride_map[-1] is the host stride of the within-stick dimension; find the
-    # corresponding dim in the (possibly larger) view's stride list and use it as
-    # the last entry of dim_order so that device_coordinates[-1] (the stick
-    # coordinate expression) is identical for the original and padded buffers.
-    # arg_fx_node.meta["val"].stride() gives the strides of the view that the
-    # matmul inner_fn actually accesses (e.g. [1,M,K] when mm_to_bmm_pass added
-    # a batch dim), so the lookup works even when ndim(orig_stl) < ndim(padded_size).
-    # Falls back to generic only when no stride matches (should not occur in practice).
-    orig_host_stride = list(arg_fx_node.meta["val"].stride())
+    # Build the padded STL from the core host dimensions that orig_stl was built
+    # from, stripping any leading phantom batch dims that mm_to_bmm_pass may have
+    # added to padded_size but that are absent from the underlying buffer.
+    #
+    # orig_stl.stride_map has one entry per device dim; device dims = host dims + 1
+    # (the extra dim is the within-stick dim), so orig_host_ndim = len(stride_map)-1.
+    # When padded_size has more dims than orig_host_ndim the extras are batch-1 dims
+    # added by mm_to_bmm_pass.  SpyreTensorLayout([1,67,256],...) produces a 4D
+    # device layout with a degenerate -1 stride entry for the size-1 device dim,
+    # which causes compute_coordinates to emit a constant stick offset instead of 0,
+    # and normalize_coordinates then hits assert offset == 0.  Build padded_stl from
+    # the core (non-phantom) suffix of padded_size to get the correct device layout.
+    orig_host_ndim = len(list(orig_stl.stride_map)) - 1
+    n_phantom = len(padded_size) - orig_host_ndim
+    padded_core = padded_size[n_phantom:]  # strip leading phantom 1-dims
+
     sm_last = int(list(orig_stl.stride_map)[-1])
-    within_stick_dim = next(
+    orig_host_stride = list(arg_fx_node.meta["val"].stride())
+    within_stick_dim_view = next(
         (i for i, s in enumerate(orig_host_stride) if int(s) == sm_last), None
     )
-    if within_stick_dim is not None:
-        dim_order = [i for i in range(len(padded_size)) if i != within_stick_dim] + [
-            within_stick_dim
-        ]
-        padded_host_stride = [1] * len(padded_size)
-        for i in range(len(padded_size) - 2, -1, -1):
-            padded_host_stride[i] = padded_host_stride[i + 1] * padded_size[i + 1]
-        padded_stl = SpyreTensorLayout(
-            padded_size, padded_host_stride, dtype, dim_order
-        )
+    if within_stick_dim_view is not None:
+        # within_stick_dim in the core (strip n_phantom leading dims)
+        within_stick_dim_core = within_stick_dim_view - n_phantom
+        dim_order_core = [
+            i for i in range(len(padded_core)) if i != within_stick_dim_core
+        ] + [within_stick_dim_core]
+        core_stride = [1] * len(padded_core)
+        for i in range(len(padded_core) - 2, -1, -1):
+            core_stride[i] = core_stride[i + 1] * padded_core[i + 1]
+        padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
     else:
-        padded_stl = SpyreTensorLayout([concretize_expr(s) for s in padded_size], dtype)
+        padded_stl = SpyreTensorLayout(padded_core, dtype)
     host_layout = padded_buf.layout
     padded_buf.layout = FixedTiledLayout(
         host_layout.device,
