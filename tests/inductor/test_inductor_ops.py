@@ -24,9 +24,11 @@ from utils_inductor import (
     compare_with_cpu,
     make_param_dict,
     unique_randn_along_dim,
+    shapes2key,
 )
 import utils_inductor
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.constants import IDENTITY_OP
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -241,22 +243,56 @@ ALL_DTYPES = [
 
 ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
 
-DTYPE_OP_MAP = {
-    f"{str(src).replace('torch.', '')}_to_{str(dst).replace('torch.', '')}": (src, dst)
+TO_DTYPE_OP_SHAPES_EXPECT_FAIL = [
+    (4, 16),
+    (4, 68),
+    (68, 5),
+]
+
+TO_DTYPE_OP_SHAPES_EXPECT_PASS = [
+    (4, 2),
+    (2, 4),
+    (16, 4),
+    (4, 64),
+]
+
+TO_DTYPE_OP_SHAPES = TO_DTYPE_OP_SHAPES_EXPECT_PASS + TO_DTYPE_OP_SHAPES_EXPECT_FAIL
+
+
+def _dtype_name(dt):
+    return str(dt).split(".")[-1]
+
+
+TO_DTYPE_OP_MAP_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
 }
 
-DTYPE_OP_SHAPES = [
-    (4, 2),
-    # (4, 8), # FIXME deeptools accuracy issue #4261
-]
-
-DTYPE_OP_PAIRS = {
-    f"{str(src).replace('torch.', '')}_to_{str(dst).replace('torch.', '')}": (
-        src,
+TO_DTYPE_OP_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src)
+        if src != torch.bool
+        else torch.randint(0, 2, shape).bool(),
         dst,
     )
-    for (src, dst) in DtypeOpTable.get_dtype_pairs()
+    for src, dst in DtypeOpTable.get_dtype_pairs()
+    for shape in TO_DTYPE_OP_SHAPES
+}
+
+TO_DTYPE_OP_EXPECT_FAIL = [
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
+    for src, dst in DtypeOpTable.get_dtype_pairs()
+    if DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+    for shape in TO_DTYPE_OP_SHAPES_EXPECT_FAIL
+]
+
+TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src),
+        dst,
+    )
+    for src, dst in [(torch.float16, torch.float32)]
+    for shape in TO_DTYPE_OP_SHAPES
 }
 
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
@@ -3281,11 +3317,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_to_dtype_op_map", "test_to_dtype_op_map"): {
-            "param_sets": DTYPE_OP_MAP,
+            "param_sets": TO_DTYPE_OP_MAP_PARAMS_SETS,
         },
         ("test_to_dtype", "test_to_dtype_cpu"): {
-            "ops_dict": DTYPE_OP_PAIRS,
-            "param_sets": make_param_dict(tuple((s,) for s in DTYPE_OP_SHAPES)),
+            "param_sets": TO_DTYPE_OP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
+        },
+        ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
+            "ops_dict": {"add": torch.add},
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
         },
     }
 
@@ -4513,13 +4553,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"Expected None for unsupported {src}->{dst}, got {result}"
             )
 
-    def test_to_dtype_cpu(self, dtype_pair, x):
-        src_dtype, dst_dtype = dtype_pair
-        x_src = x.to(dtype=src_dtype)
+    def test_to_dtype_cpu(self, x, dst_dtype):
+        def fn(x, dst_dtype):
+            return x.to(dtype=dst_dtype)
 
         self.compare_with_cpu(
-            lambda a: a.to(dtype=dst_dtype),
-            x_src,
+            fn,
+            x,
+            dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_round_trip_to_dtype_cpu(self, op, x, dst_dtype):
+        def fn(op, x, dst_dtype):
+            y = x.to(dst_dtype)
+            z = op(y, y)
+            return z.to(x.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
+            dst_dtype,
             cpu_compile=False,
             run_eager=False,
         )
