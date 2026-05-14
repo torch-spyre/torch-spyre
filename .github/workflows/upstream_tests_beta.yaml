@@ -1,8 +1,6 @@
 name: upstream-pytorch-tests-beta
 
 on:
-  pull_request:
-    branches: [main]
   # Run automatically on every merge to main
   push:
     branches: [main]
