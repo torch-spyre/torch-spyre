@@ -305,5 +305,3 @@ copy_tests(
     "lx_planning_reduction",
     REDUCTION_TEST_FAILURES if not tests_lx_planning_run_skips else None,
 )
-
-# Made with Bob
