@@ -90,7 +90,7 @@ for _arg in "$@"; do
         _dir_yamls=()
         while IFS= read -r -d '' _f; do
             _dir_yamls+=("$(realpath "$_f")")
-        done < <(find "$(realpath "$_arg")" -maxdepth 1 \
+        done < <(find "$(realpath "$_arg")" \
                      \( -name '*.yaml' -o -name '*.yml' \) \
                      -type f -print0 | sort -z)
         if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
