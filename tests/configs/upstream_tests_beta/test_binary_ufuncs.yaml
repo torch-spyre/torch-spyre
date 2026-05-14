@@ -99,6 +99,7 @@ test_suite_config:
     supported_dtypes:
       - name: float16
       - name: int64
+      - name: bfloat16
     supported_ops:
       - name: add
         dtypes:

@@ -6,3 +6,8 @@ test_suite_config:
         - names:
             - TestLazyModules::test_materialize_dtype
           mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: int64

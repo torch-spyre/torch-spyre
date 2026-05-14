@@ -8,3 +8,8 @@ test_suite_config:
             - TestShapeOps::test_nonzero_non_diff
             - TestShapeOps::test_unfold_errors
           mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: int64
