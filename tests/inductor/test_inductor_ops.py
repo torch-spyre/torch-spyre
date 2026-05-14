@@ -921,6 +921,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_silu", "test_silu_cpu"): {
+            "param_sets": {
+                "bf16_1x1x32768": (cached_randn((1, 1, 32768), dtype=torch.bfloat16),),
+                "bf16_67x256": (cached_randn((67, 256), dtype=torch.bfloat16),),
+                "bf16_67x71x256": (cached_randn((67, 71, 256), dtype=torch.bfloat16),),
+            },
+        },
         (
             "test_clone",
             "test_clone",
@@ -3658,6 +3665,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_activation_fn(self, op, input, err):
         self.compare_with_cpu(lambda x: op(x), input, atol=err, rtol=err)
+
+    def test_silu_cpu(self, x):
+        self.compare_with_cpu(lambda t: torch.nn.functional.silu(t), x)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
