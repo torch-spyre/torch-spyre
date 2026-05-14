@@ -351,6 +351,26 @@ def compute_restickify_target_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
+def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
+    """Return True if all tensors are stick-compatible.
+
+    coords: list of device_coordinates() results, one per tensor.
+
+    Compatible means: the union of stick variables (free symbols in the last
+    device coordinate) across all tensors has at most one element, and is
+    disjoint from the union of nonstick variables (free symbols in all other
+    device coordinates, excluding each tensor's own stick variable).
+    """
+    stick_vars: set[sympy.Symbol] = set()
+    nonstick_vars: set[sympy.Symbol] = set()
+    for dc in coords:
+        tensor_stick_vars = dc[-1].free_symbols
+        stick_vars |= tensor_stick_vars
+        for coord in dc[:-1]:
+            nonstick_vars |= coord.free_symbols - tensor_stick_vars
+    return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -364,15 +384,15 @@ def compute_restickify_needed(
     different index than the input (e.g. a transposed read).
 
     Returns:
-      (False, None)   — same stick or broadcast: no restickify needed
+      (False, None)   — stick-compatible: no restickify needed
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
     idc = device_coordinates(in_stl, in_dep)
     out_idc = device_coordinates(out_stl, out_dep)
-    if iter_var_id(idc[-1]) == -1 or not out_idc or iter_var_id(out_idc[-1]) == -1:
-        return False, None
-    if out_idc[-1] == idc[-1]:
+    assert idc, "device_coordinates returned empty list for input"
+    assert out_idc, "device_coordinates returned empty list for output"
+    if stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
     return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
