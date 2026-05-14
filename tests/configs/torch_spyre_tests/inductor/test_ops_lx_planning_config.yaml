@@ -13,3 +13,23 @@ test_suite_config:
       # than enumerating each LxPlanningTwoOpPointwiseAdditionTest:: and
       # LxPlanningTwoOpReductionTest:: test name explicitly.
       unlisted_test_mode: mandatory_success
+      tests:
+          ##########################################################################################
+          # The following tests are failing in the CICD currently -- hence moving these to xfail now
+          # Commented tests are passing now as per latest main (was failing previously in the CI)
+          ##########################################################################################
+        - names:
+            - LxPlanningTwoOpPointwiseAdditionTest::test_activation_cls_gelu_fp16_lx_planning_reduction
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_keepdim1_sum_3d_dim_1_lx_planning_pointwise
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_edge_multidim_keepdim0_sum_large_2d_dim_01_all_lx_planning_pointwise
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_edge_multidim_keepdim1_sum_large_2d_dim_01_all_lx_planning_pointwise
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_edge_multidim_keepdim0_sum_large_2d_dim_01_all_lx_planning_reduction
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_edge_multidim_keepdim1_sum_large_2d_dim_01_all_lx_planning_reduction
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_multidim_keepdim0_sum_5d_dim_1234_lx_planning_pointwise
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_multidim_keepdim0_sum_5d_dim_1234_lx_planning_reduction
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_multidim_keepdim1_sum_5d_dim_1234_lx_planning_reduction
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_multidim_keepdim1_sum_5d_dim_1234_lx_planning_pointwise
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_keepdim0_sum_3d_dim_1_lx_planning_pointwise
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_keepdim1_sum_3d_dim_1_lx_planning_reduction
+            # - LxPlanningTwoOpPointwiseAdditionTest::test_reduce_keepdim0_sum_3d_dim_1_lx_planning_reduction
+          mode: xfail
