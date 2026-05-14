@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""IR-level pass to pad the reduction dimension K to a stick boundary for
+"""IR-level pass to pad the K (reduction) dimension to a stick boundary for
 BATCH_MATMUL_OP operations.  Runs in CustomPreSchedulingPasses immediately
 after insert_restickify, when every ComputedBuffer has a FixedTiledLayout.
 
-Both x and y are padded along their K dimension.  For each argument:
+Both x and y are padded along their K dimension to K_padded = next stick
+boundary.  For each argument:
   spyre.empty(padded_size)                         — uninitialised allocation
   spyre.constant(0.0)                              — scalar zero, generated on-device (cached)
   aten.expand(constant, pad_size)                  — broadcast to pad-region shape; free
@@ -34,6 +35,10 @@ original data.  pad_size equals padded_size with pad_size[dim] = pad_extent.
 spyre.constant is cached across all matmuls with the same (fill_value, device,
 dtype) key so it is lowered at most once per unique fill value and dtype,
 regardless of tensor shape or which dimension is padded.
+
+x and y are identified via device_coordinates: x is the input sticked on the
+reduction coord, y is the other.  This avoids positional assumptions and handles
+square matrices (M==K==N) correctly.
 
 x's effective size is derived from the output ranges ([batch..., M, K]) rather
 than from the underlying buffer's shape.  This handles cases where mm_to_bmm_pass
@@ -55,8 +60,16 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
+from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .pass_utils import concretize_expr, lower_pad_sequence, rebuild_computed_buffer
+from .pass_utils import (
+    concretize_expr,
+    device_coordinates,
+    host_coordinates,
+    lower_pad_sequence,
+    rebuild_computed_buffer,
+)
+from .views import matching_dim
 from torch_spyre._C import get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -181,6 +194,10 @@ def insert_padding_ir(operations: list[Operation]) -> None:
     Mutates ``operations`` in place.  All new buffers are inserted immediately
     before the matmul that consumes them to preserve topological order.
 
+    x and y are identified via device_coordinates: x is the input sticked on
+    the reduction coord, y is the other.  This avoids positional assumptions
+    and handles square matrices (M==K==N) correctly.
+
     A fill_cache is shared across all matmuls so that spyre.constant is lowered
     only once per unique (fill_value, device, dtype) combination.  All pad
     operations with the same fill value and dtype reuse the same constant node.
@@ -200,21 +217,45 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         if len(reads) != 2:  # noqa: PLR2004
             continue
 
-        # Identify x and y: x has K as its last dimension (reduction dim),
-        # y has K as its second-to-last dimension (N is y's last dim).
-        # For square matrices (M==K==N) both buffers look identical; in that
-        # case assign the first dep to x and the second to y.
-        k_val = concretize_expr(reduction.reduction_ranges[0])
-        x_dep, y_dep = None, None
+        # Identify x and y via device_coordinates.
+        # x is the input sticked on the reduction coord (hardware masks within-stick
+        # padding for x).  y is the other input; its K host dim is derived from the
+        # same reduction coord.  This avoids positional assumptions and handles
+        # square matrices (M==K==N) correctly.
+        # See propagate_layouts.py:400-406 for the same reduction-coord derivation.
+        write_dep = next(iter(rw.writes))
+        out_coords = host_coordinates(op.get_layout(), write_dep)
+
+        x_dep = None
+        y_dep = None
+        y_host_k_dim: int | None = None
         for dep in reads:
             buf = V.graph.get_buffer(dep.name)
             if buf is None:
                 continue
-            buf_last_dim = concretize_expr(buf.get_size()[-1])
-            if buf_last_dim == k_val and x_dep is None:
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                continue
+            h_coords = host_coordinates(layout, dep)
+            d_coords = device_coordinates(layout.device_layout, dep)
+            stick_expr = d_coords[-1]
+            reduction_coord = next(
+                (
+                    c
+                    for c in h_coords
+                    if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+                ),
+                None,
+            )
+            if reduction_coord is None:
+                continue
+            stick_dim = matching_dim(h_coords, stick_expr)
+            reduction_dim_host = matching_dim(h_coords, reduction_coord)
+            if stick_dim == reduction_dim_host:
                 x_dep = dep
-            elif y_dep is None:
+            else:
                 y_dep = dep
+                y_host_k_dim = reduction_dim_host
 
         if x_dep is None or y_dep is None:
             logger.warning(
@@ -235,6 +276,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         # the inner_fn accesses x through a view with more dims than x_buf
         # (e.g. when mm_to_bmm_pass wraps a 2D mm into a 3D bmm).
         output_ranges = [concretize_expr(s) for s in reduction.ranges]
+        k_val = concretize_expr(reduction.reduction_ranges[0])
         x_size = output_ranges[:-1] + [k_val]  # [batch..., M, K]
         dtype = x_buf.get_dtype()
         device = x_buf.get_device()
@@ -287,7 +329,10 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         # ensures the matmul reduction does not read uninitialised rows of y
         # when reduction_ranges is extended to k_padded.
         y_size = [concretize_expr(s) for s in y_buf.get_size()]
-        y_k_dim = len(y_size) - 2  # K is second-to-last in y for all mm/bmm variants
+        if y_host_k_dim is None:
+            y_k_dim = len(y_size) - 2
+        else:
+            y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
         y_padded_size[y_k_dim] = k_padded
         try:
