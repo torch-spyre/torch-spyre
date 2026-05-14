@@ -34,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import TOPK_OPS
+from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -602,6 +602,7 @@ def work_distribution_pass(
         reduction_dims,
         committed_splits,
     )
+
     apply_splits(op, splits, output_td)
 
     if logger.isEnabledFor(logging.DEBUG) and math.prod(splits.values()) > 1:
@@ -613,6 +614,95 @@ def work_distribution_pass(
         )
 
     warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
+
+
+_PT_ROWS = 8  # PT block rows per corelet
+
+
+def _try_k_fast_split(
+    it_space: dict[Symbol, Expr],
+    output_td: TensorDep,
+    min_splits: dict[Symbol, int] | None,
+    max_cores: int,
+) -> dict[Symbol, int] | None:
+    """Propose (1, n_split, k_split>1) for narrow-N small-M matmul shapes.
+
+    Caller (k_fast_division pass) gates on matmul + the feature flag.
+    Range thresholds derived from empirical hardware measurements.
+    """
+    dims = list(it_space.keys())
+    output_coord_vars = {v for e in output_td.device_coords for v in e.free_symbols}
+    reduction_dims = [d for d in dims if d not in output_coord_vars]
+    # k_fast emits an (m, n, k) split — only matmul's single K dim qualifies.
+    if len(reduction_dims) != 1:
+        return None
+    k_dim = reduction_dims[0]
+
+    output_dims = [d for d in dims if d in output_coord_vars]
+    # TODO: 2D matmul only. bmm has a B dim the planner already splits;
+    # folding it into m_dims would waste that lever. Needs a bmm-aware policy.
+    if len(output_dims) != 2:
+        return None
+    # Pick the larger of the two output dims to split across cores; "N" is
+    # convention (for the target shape M < N, max picks the conventional N).
+    n_dim = max(output_dims, key=lambda d: concretize_expr(it_space[d]))
+    m_dims = [d for d in output_dims if d != n_dim]
+
+    # k_fast's (1, n, k>1) shape can't sit on top of a split span_reduction
+    # already committed on K or an M dim — skip those.
+    # TODO: A span_reduction commit on K or an M dim is the minimum split that
+    #       gets the span under the limit, not necessarily the final one, so
+    #       cores may still be free after it. Returning None here hands the
+    #       whole op to the default planner instead of applying k_fast within
+    #       the cores span_reduction leaves available, leaving the k_fast
+    #       speedup on the table for those shapes.
+    if min_splits and (k_dim in min_splits or any(d in min_splits for d in m_dims)):
+        return None
+
+    M = math.prod(concretize_expr(it_space[d]) for d in m_dims) if m_dims else 1
+    N = concretize_expr(it_space[n_dim])
+    K = concretize_expr(it_space[k_dim])
+
+    elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
+    # iteration_space carries unpadded element counts; skip ragged N/K
+    # (e.g. N=99) that the k_fast splits can't divide cleanly.
+    if N % elems_per_stick != 0 or K % elems_per_stick != 0:
+        return None
+    n_sticks = N // elems_per_stick
+    k_sticks = K // elems_per_stick
+
+    # The gates below pick shapes where pure-M underfeeds the PT array but
+    # a (1, n, k) split keeps it busy.
+    rows_per_core = M / max_cores
+    # Skip M too small to give one row per core, and M large enough that
+    # pure-M already saturates PT — k_fast wins nothing either way.
+    if rows_per_core < 1 or rows_per_core > 2 * _PT_ROWS:
+        return None
+    # Moderate M with wide N already uses cores well — only apply k_fast
+    # when N is narrow enough that PT is starved.
+    if rows_per_core > _PT_ROWS / 2 and n_sticks >= max_cores:
+        return None
+    # Need enough K to give every core at least one stick after splitting.
+    if k_sticks < max_cores:
+        return None
+
+    # n_split must divide max_cores so k_split = max_cores // n_split is an
+    # integer. Any divisor works — no power-of-2 restriction.
+    candidates = sorted(
+        (int(n) for n in divisors(max_cores) if 1 < n < max_cores), reverse=True
+    )
+    for n_split in candidates:
+        if n_sticks % n_split != 0:
+            continue
+        k_split = max_cores // n_split
+        if k_sticks < k_split or k_sticks % k_split != 0:
+            continue
+        result: dict[Symbol, int] = {k_dim: k_split, n_dim: n_split}
+        for d in m_dims:
+            result[d] = 1
+        return result
+
+    return None
 
 
 def divide_pointwise_op(
@@ -682,13 +772,91 @@ def span_reduction(operations: list[Operation]) -> None:
             divide_reduction_op(op, args, max_cores, span_reduction_pass)
 
 
-def work_distribution(operations: list[Operation]) -> None:
-    """Pass 2: distribute remaining cores across ops to maximize parallelism."""
+def work_distribution(
+    operations: list[Operation], k_fast_ops: list[Operation] | None = None
+) -> None:
+    """Pass 3: distribute remaining cores across ops to maximize parallelism.
+
+    Ops in `k_fast_ops` were already divided by k_fast_division; they are
+    left untouched so every op is divided by exactly one of the two passes.
+    """
+    k_fast_ops = k_fast_ops or []
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
+        if op in k_fast_ops:
+            continue
         rw = op.get_read_writes()
         args = get_mem_deps_from_rw(rw)
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
         elif isinstance(op.data, Reduction):
             divide_reduction_op(op, args, max_cores, work_distribution_pass)
+
+
+def _k_fast_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
+    """Divide one matmul op with k_fast when the heuristic fires.
+
+    Runs between span_reduction and work_distribution. Reads span_reduction's
+    commits straight from op.op_it_space_splits — work_distribution has not run
+    yet, so it still holds the span-only subset. Returns True when k_fast
+    commits a split, so the caller can exclude the op from work_distribution.
+    """
+    if not isinstance(op.data, Reduction):
+        return False
+    if op.data.reduction_type != BATCH_MATMUL_OP:
+        return False
+
+    rw = op.get_read_writes()
+    args = get_mem_deps_from_rw(rw)
+    input_tds, output_td = collect_tensor_deps(op, args)
+    all_tds = input_tds + [output_td]
+
+    it_space = iteration_space_from_op(op)
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+
+    # op.op_it_space_splits holds span_reduction's commits here: span_reduction
+    # runs before this pass, and work_distribution — which would overwrite it —
+    # runs after and skips the ops k_fast claims.
+    if hasattr(op, "op_it_space_splits"):
+        write_index = next(iter(rw.writes)).index
+        read_index = next((d.index for d in rw.reads), write_index)
+        span_splits = apply_splits_from_index_coeff(
+            op.op_it_space_splits, write_index, read_index, it_space
+        )
+        span_committed = {s: v for s, v in span_splits.items() if v > 1}
+    else:
+        span_committed = {}
+
+    forced = _try_k_fast_split(it_space, output_td, span_committed, max_cores)
+    if forced is None:
+        return False
+
+    apply_splits(op, forced, output_td)
+    warn_if_per_core_overflow(all_tds, it_space, forced, op.get_name())
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"k_fast_division work_division {op.get_name()}: "
+            f"cores={math.prod(forced.values())}, "
+            f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"priorities=[], min_splits={span_committed}, "
+            f"op_it_space_splits={op.op_it_space_splits}"
+        )
+    return True
+
+
+def k_fast_division(operations: list[Operation]) -> list[Operation]:
+    """Pass 2 (optional): divide narrow-N small-M matmuls with k_fast.
+
+    Runs after span_reduction and before work_distribution. The
+    core_id_k_fast_emission feature-flag gate lives in passes.py; this pass
+    is only called when it is set. Returns the ops it committed a split for
+    so passes.py can exclude them from work_distribution — every op is
+    divided by exactly one of the two passes.
+    """
+    max_cores = _validate_max_cores()
+    k_fast_ops: list[Operation] = []
+    for op in _iter_computed_buffers(operations):
+        if _k_fast_divide_op(op, max_cores):
+            k_fast_ops.append(op)
+    return k_fast_ops
