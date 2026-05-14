@@ -25,12 +25,10 @@ boundary.  For each argument:
   overwrite(fill_buf, empty, [dim], [fill_offset]) — write zeros into pad region
   overwrite(orig,     empty, [dim], [0])           — copy original data at offset 0
 
-spyre.constant generates the fill value in-place on device with no host→device
-DMA.  aten.expand broadcasts the scalar to the full pad-region shape and
-aten.clone materialises it on-device.
-
-fill_offset = original_size[dim] so the pad region starts right after the
-original data.  pad_size equals padded_size with pad_size[dim] = pad_extent.
+fill_offset is original_size[dim] rounded down to the nearest stick boundary.
+This ensures the fill overwrite is stick-aligned; any elements between
+fill_offset and original_size[dim] that are over-zeroed are restored by the
+data overwrite, which always runs after the fill overwrite.
 
 spyre.constant is cached across all matmuls with the same (fill_value, device,
 dtype) key so it is lowered at most once per unique fill value and dtype,
@@ -222,7 +220,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         # padding for x).  y is the other input; its K host dim is derived from the
         # same reduction coord.  This avoids positional assumptions and handles
         # square matrices (M==K==N) correctly.
-        # See propagate_layouts.py:400-406 for the same reduction-coord derivation.
+        # See propagate_layouts.py for the same reduction-coord derivation.
         write_dep = next(iter(rw.writes))
         out_coords = host_coordinates(op.get_layout(), write_dep)
 
