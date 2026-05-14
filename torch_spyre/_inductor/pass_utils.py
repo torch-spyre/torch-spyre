@@ -449,53 +449,29 @@ def lower_pad_sequence(
 
     Allocates a padded buffer of ``padded_size``, fills the pad region with
     ``fill_value``, then copies the original data into offset 0 along ``dim``.
-
-    The pad region extent is ``padded_size[dim] - original_size[dim]`` where
-    ``original_size`` is read from ``arg_fx_node.meta["val"].shape``.
+    Only one dimension may differ between ``padded_size`` and the original shape.
 
     FX nodes created (in order):
-      1. spyre.empty(padded_size)                        — uninitialised allocation
-      2. spyre.constant(fill_value)                      — scalar constant, on-device (cached)
-      3. aten.expand(constant, pad_size)                 — broadcast to fill-region shape; free
-      4. aten.clone(expand)                              — on-device broadcast → fill buffer
+      1. spyre.empty(padded_size)                         — uninitialised allocation
+      2. spyre.constant(fill_value)                       — scalar constant, on-device (cached)
+      3. aten.expand(constant, pad_size)                  — broadcast to fill-region shape; free
+      4. aten.clone(expand)                               — on-device broadcast → fill buffer
       5. overwrite(fill_buf, empty, [dim], [fill_offset]) — write pad region
       6. overwrite(orig,     empty, [dim], [0])           — copy original data
 
-    ``pad_size`` equals ``padded_size`` with ``pad_size[dim] = pad_extent``
-    where ``pad_extent = padded_size[dim] - original_size[dim]``.
-    ``fill_offset = original_size[dim]``.
+    The fill offset is rounded down to the nearest stick boundary so the fill
+    overwrite is always stick-aligned.  Any elements between the aligned offset
+    and the true original size that are over-zeroed by the fill are restored by
+    overwrite_data, which always runs after overwrite_fill.
 
-    ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer.  The
-    padded allocation's ``SpyreTensorLayout`` is derived from the *core* host
-    dimensions that ``orig_stl`` was built from (``len(stride_map) - 1`` dims),
-    stripping any leading phantom batch-1 dims that ``mm_to_bmm_pass`` may have
-    added to ``padded_size``.  Passing the phantom dims to the
-    ``SpyreTensorLayout`` constructor produces a degenerate ``-1`` entry in
-    ``stride_map`` for the size-1 device dim, which causes
-    ``compute_coordinates`` to emit a constant nonzero stick offset and trips
-    ``normalize_coordinates``'s ``assert offset == 0``.  Building from the core
-    suffix avoids this.  The within-stick host dimension is identified from
-    ``orig_stl.stride_map[-1]`` and preserved in the padded STL so that
-    ``device_coordinates[-1]`` is identical for both the original and padded
-    buffers.  Raises ``RuntimeError`` if no stride in the view matches
-    ``stride_map[-1]``; this indicates a layout inconsistency that cannot be
-    corrected at padding time and should fail compilation.
-
-    The fill offset is rounded down to the nearest stick boundary.  When
-    ``original_size_dim`` is not a multiple of ``stick_size``, using the raw
-    fill offset would place the fill overwrite at a nonzero constant position
-    within the device stick dimension, which ``normalize_coordinates`` rejects.
-    Rounding down extends the zeroed region slightly (overwriting a few elements
-    that ``overwrite_data`` subsequently restores with correct values), but keeps
-    the fill overwrite stick-aligned.  ``overwrite_data`` always runs after
-    ``overwrite_fill``, so the valid data is never lost.
+    ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer and is used
+    to derive the padded buffer's device layout, preserving the within-stick host
+    dimension.  Raises ``RuntimeError`` if the within-stick dimension cannot be
+    determined from ``orig_stl``.
 
     ``fill_cache`` maps ``(fill_value, device, dtype)`` to an existing
-    ``spyre.constant`` FX node.  On a cache hit that node is reused and not
-    re-lowered.  All padding with the same fill value, device, and dtype shares
-    one constant node regardless of tensor shape or padded dimension.
-
-    ``insert_before`` is the FX node before which new nodes are inserted.
+    ``spyre.constant`` FX node so that padding ops sharing a fill value reuse
+    one on-device constant regardless of tensor shape or padded dimension.
 
     Returns ``(padded_buf, new_ops)`` where ``padded_buf`` is the allocated buffer
     and ``new_ops`` is the list of new IR operations in topological order.
@@ -613,10 +589,6 @@ def lower_pad_sequence(
     # aten.expand lowers to an ExpandView (no Buffer produced, no layout needed).
     # aten.clone lowers to a ComputedBuffer with FlexibleLayout → FixedTiledLayout.
     # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
-    #
-    # Important: layouts must be FixedTiledLayout (an Inductor Layout subclass), NOT
-    # bare SpyreTensorLayout.  Inductor's get_layout() raises NotImplementedError on
-    # SpyreTensorLayout; aten.expand's lowering calls get_layout() on its input.
 
     def _assign_layout(buf: Buffer) -> None:
         """Wrap the buffer's current FixedLayout in a FixedTiledLayout."""
