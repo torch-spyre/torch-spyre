@@ -505,20 +505,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # TODO
-        # ("test_sub_alpha", "test_binary_op_cpu"): {
-        #     "ops_dict": {
-        #         "sub_alpha_2": lambda a, b: torch.sub(a, b, alpha=2.0),
-        #         "sub_alpha_0.5": lambda a, b: torch.sub(a, b, alpha=0.5),
-        #         "sub_alpha_neg": lambda a, b: torch.sub(a, b, alpha=-1.0),
-        #     },
-        #     "param_sets": make_param_dict(
-        #         [
-        #             ((256,),) * 2,
-        #             ((67, 256),) * 2,
-        #         ]
-        #     ),
-        # },
+        ("test_sub_alpha", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "sub_alpha_2": lambda a, b: torch.sub(a, b, alpha=2.0),
+                "sub_alpha_0.5": lambda a, b: torch.sub(a, b, alpha=0.5),
+                "sub_alpha_neg": lambda a, b: torch.sub(a, b, alpha=-1.0),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                ]
+            ),
+        },
         (
             "test_alias_operands",
             "test_unary_op",
