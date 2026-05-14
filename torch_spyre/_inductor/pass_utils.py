@@ -451,8 +451,7 @@ def lower_pad_sequence(
     ``fill_value``, then copies the original data into offset 0 along ``dim``.
 
     The pad region extent is ``padded_size[dim] - original_size[dim]`` where
-    ``original_size`` is read from ``arg_fx_node.meta["val"].shape``.  This
-    works for any pad amount, not only one stick.
+    ``original_size`` is read from ``arg_fx_node.meta["val"].shape``.
 
     FX nodes created (in order):
       1. spyre.empty(padded_size)                        — uninitialised allocation
@@ -478,9 +477,9 @@ def lower_pad_sequence(
     suffix avoids this.  The within-stick host dimension is identified from
     ``orig_stl.stride_map[-1]`` and preserved in the padded STL so that
     ``device_coordinates[-1]`` is identical for both the original and padded
-    buffers.  Falls back to ``SpyreTensorLayout(core, dtype)`` only when no
-    stride in the view matches ``stride_map[-1]``, which should not occur in
-    practice.
+    buffers.  Raises ``RuntimeError`` if no stride in the view matches
+    ``stride_map[-1]``; this indicates a layout inconsistency that cannot be
+    corrected at padding time and should fail compilation.
 
     The fill offset is rounded down to the nearest stick boundary.  When
     ``original_size_dim`` is not a multiple of ``stick_size``, using the raw
@@ -513,7 +512,19 @@ def lower_pad_sequence(
     # Count operations before lowering so we can identify newly added ones.
     ops_before = len(graph_lowering.operations)
 
-    original_size_dim: int = arg_fx_node.meta["val"].shape[dim]
+    original_shape = list(arg_fx_node.meta["val"].shape)
+    assert len(padded_size) == len(original_shape), (
+        f"lower_pad_sequence: padded_size rank {len(padded_size)} != "
+        f"original rank {len(original_shape)}"
+    )
+    padded_dims = [
+        i for i in range(len(padded_size)) if padded_size[i] != original_shape[i]
+    ]
+    assert padded_dims == [dim], (
+        f"lower_pad_sequence: expected exactly dim={dim} to be padded, "
+        f"but padded_size={padded_size} differs from original={original_shape} at dims={padded_dims}"
+    )
+    original_size_dim: int = original_shape[dim]
     pad_extent = padded_size[dim] - original_size_dim
     assert pad_extent > 0, (
         f"lower_pad_sequence: pad_extent={pad_extent} for dim={dim}; "
@@ -525,8 +536,7 @@ def lower_pad_sequence(
     # nonzero constant in the stick device coordinate, which normalize_coordinates
     # rejects.  Round the fill region down to the nearest stick boundary so the
     # fill starts at a stick-aligned offset.  This may zero-fill a few extra
-    # elements that already have valid data from overwrite_data, but overwrite_data
-    # runs after overwrite_fill so the valid data is written on top.
+    # elements, but overwrite_data runs after overwrite_fill so the valid data is written on top.
     stick_size = get_elem_in_stick(dtype)
     fill_offset_aligned = (fill_offset // stick_size) * stick_size
     aligned_pad_extent = padded_size[dim] - fill_offset_aligned
@@ -644,18 +654,22 @@ def lower_pad_sequence(
     within_stick_dim_view = next(
         (i for i, s in enumerate(orig_host_stride) if int(s) == sm_last), None
     )
-    if within_stick_dim_view is not None:
-        # within_stick_dim in the core (strip n_phantom leading dims)
-        within_stick_dim_core = within_stick_dim_view - n_phantom
-        dim_order_core = [
-            i for i in range(len(padded_core)) if i != within_stick_dim_core
-        ] + [within_stick_dim_core]
-        core_stride = [1] * len(padded_core)
-        for i in range(len(padded_core) - 2, -1, -1):
-            core_stride[i] = core_stride[i + 1] * padded_core[i + 1]
-        padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
-    else:
-        padded_stl = SpyreTensorLayout(padded_core, dtype)
+    if within_stick_dim_view is None:
+        raise RuntimeError(
+            f"lower_pad_sequence: cannot determine within-stick host dimension for "
+            f"buffer {arg_fx_node.name!r}: orig_stl.stride_map[-1]={sm_last} not found "
+            f"in view strides {orig_host_stride}.  orig_stl={list(orig_stl.device_size)} "
+            f"stride_map={list(orig_stl.stride_map)}, padded_size={padded_size}"
+        )
+    # within_stick_dim in the core (strip n_phantom leading dims)
+    within_stick_dim_core = within_stick_dim_view - n_phantom
+    dim_order_core = [
+        i for i in range(len(padded_core)) if i != within_stick_dim_core
+    ] + [within_stick_dim_core]
+    core_stride = [1] * len(padded_core)
+    for i in range(len(padded_core) - 2, -1, -1):
+        core_stride[i] = core_stride[i + 1] * padded_core[i + 1]
+    padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
     host_layout = padded_buf.layout
     padded_buf.layout = FixedTiledLayout(
         host_layout.device,
