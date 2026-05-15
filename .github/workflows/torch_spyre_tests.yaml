@@ -82,6 +82,10 @@ jobs:
             config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
           - name: Inductor Scratchpad Use
             config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
+          - name: Inductor Dtype Scalars
+            config: torch_spyre_tests/inductor/test_dtype_scalars_config.yaml
+          - name: Inductor Cache
+            config: torch_spyre_tests/inductor/test_cache_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml

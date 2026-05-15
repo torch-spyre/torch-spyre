@@ -1,0 +1,78 @@
+# Enforcement: every test_*.py must have a config YAML *and* be registered
+# in the torch-spyre-tests.yml workflow matrix.
+#
+# Runs on:
+#   - Every push that touches a test file or the workflow matrix
+#   - Every PR to main
+#   - Manual dispatch (workflow_dispatch)
+#
+# The job fails and will block the merge -- if any test_*.py is uncovered.
+
+name: Enforce Test CI Coverage
+
+on:
+  push:
+    paths:
+      - tests/**/*.py
+      - tests/configs/**
+      - .github/workflows/torch-spyre-tests.yaml
+      - .github/workflows/check-test-ci-coverage.yaml
+    branches: [main]
+
+  pull_request:
+    branches: [main]
+    paths:
+      - tests/**/*.py
+      - tests/configs/**
+      - .github/workflows/torch-spyre-tests.yaml
+      - .github/workflows/check-test-ci-coverage.yml
+  merge_group:
+    types: [checks_requested]
+
+  # Allow maintainers to trigger this manually at any time
+  workflow_dispatch: null
+
+jobs:
+  coverage-check:
+    name: All test_*.py files wired into GHA CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----- Run the coverage check -----
+      - name: Check every test file has a config and is in the workflow matrix
+        shell: bash
+        run: |
+          bash tests/scripts/check_test_coverage.sh \
+            --workflows-dir .github/workflows \
+            --configs-root  tests/configs \
+            --tests    tests
+
+      # --- On failure: provide a helpful summary in the PR/GHA UI ----
+      - name: Show fix instructions on failure
+        if: failure()
+        shell: bash
+        run: |-
+          echo "::error title=Uncovered test files::One or more test_*.py files are not fully wired into CI."
+          echo ""
+          echo "Each uncovered file needs both of the following:"
+          echo ""
+          echo "  1. A torch-spyre config YAML somewhere under tests/configs/torch_spyre_tests that lists it"
+          echo "     under 'files:' with a 'path:' entry, e.g.:"
+          echo "       test_suite_config:"
+          echo "         files:"
+          echo "           - path: ${TORCH_DEVICE_ROOT}/tests/<path/to/test_file.py>"
+          echo "             unlisted_test_mode: mandatory_success"
+          echo ""
+          echo "     For standalone tests:  tests/configs/torch_spyre_tests[/subdir]/"
+          echo "     For module test suites: tests/configs/module_tests/path/to/yaml"
+          echo "                            (add as a secondary 'path:' entry)"
+          echo "     For model ops test suites: tests/configs/model_ops_tests/path/to/yaml"
+          echo ""
+          echo "  2. That config file referenced in a workflow matrix under .github/workflows/:"
+          echo "       - name: <Human Readable Name>"
+          echo "         config: <subdir>/<config_filename>.yaml"
+          echo ""
+          echo "  See the CI/CD guide: tests/docs/enabling_torch_spyre_cicd_tests.md"
