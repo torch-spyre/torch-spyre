@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import os
 from collections import defaultdict
 
 import torch
@@ -41,9 +40,6 @@ from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
 
 logger = get_inductor_logger("insert_restickify")
-
-# Populated by finalize_layouts when SPYRE_CAPTURE_RESTICKIFY_PLAN is set. For testing only.
-restickify_plan: dict = {}
 
 
 def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
@@ -218,7 +214,6 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
-    global restickify_plan
     """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
     V.graph.restickify_plan for insert_restickify.
 
@@ -356,5 +351,3 @@ def finalize_layouts(operations: list) -> None:
             logger.debug("\n".join(lines))
         else:
             logger.debug("restickify plan: (none)")
-    if os.getenv("SPYRE_CAPTURE_RESTICKIFY_PLAN"):
-        restickify_plan = dict(plan)
