@@ -13,7 +13,7 @@ name: Enforce Test CI Coverage
 on:
   push:
     paths:
-      - tests/**/*.py
+      - tests/**/test_*.py
       - tests/configs/**
       - .github/workflows/torch-spyre-tests.yaml
       - .github/workflows/check-test-ci-coverage.yaml
@@ -22,7 +22,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - tests/**/*.py
+      - tests/**/test_*.py
       - tests/configs/**
       - .github/workflows/torch-spyre-tests.yaml
       - .github/workflows/check-test-ci-coverage.yml
