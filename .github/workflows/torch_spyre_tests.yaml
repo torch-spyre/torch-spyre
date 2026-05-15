@@ -30,6 +30,11 @@ jobs:
   #
   # This is the only job that always runs — it is cheap compute 
   # and does not use spyre cards.
+  # Tests are skipped only when docs_only == 'true', which requires
+  # ALL changed files in the PR to match the docs_only filter
+  # (enforced via predicate-quantifier: 'every'). A mixed PR containing
+  # both a doc file and a non-doc file will correctly return docs_only=false
+  # and trigger tests.
   #
   # Filter rules:
   #   docs_only -- matches changes that should NOT trigger tests:
@@ -51,6 +56,7 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
+          predicate-quantifier: every    # ALL changed files must match for docs_only=true
           filters: |
             docs_only:
               - 'tests/docs/**'
