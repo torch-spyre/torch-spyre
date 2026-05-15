@@ -1951,6 +1951,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         ),
                     )
                 ),
+                "copy_": (
+                    lambda dim, index, x: (
+                        y := torch.split(x, x.size()[dim] // 3, dim=dim)[index],
+                        y.copy_(torch.ones_like(y))._base,
+                    )[-1]
+                ),
                 "chunk": (lambda dim, index, x: x.chunk(3, dim=dim)[index].clone()),
             },
             "param_sets": {
@@ -1980,6 +1986,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "add": lambda dim, x: torch.add(x.clone(), x),
                 "sum": lambda dim, x: torch.sum(x, dim=dim, keepdim=True),
                 "amax": lambda dim, x: torch.amax(x, dim=dim, keepdim=False),
+                "copy_": lambda dim, x: x.copy_(torch.ones_like(x))._base,
             },
             "param_sets": {
                 "1d0s0": (0, 0, cached_randn((192,), dtype=torch.float16)),
@@ -4067,7 +4074,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return op(dim, index, x)
 
-        self.compare_with_cpu(fn, x, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_slice_cpu(self, op, dim, index, x):
         def fn(x):
@@ -4080,7 +4087,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
 
-        self.compare_with_cpu(fn, x, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
