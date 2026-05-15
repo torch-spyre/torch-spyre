@@ -26,7 +26,7 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf
+      - spyre_pf_x1
       - linux
       - image_torch_spyre
     timeout-minutes: 720
@@ -76,12 +76,18 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
           - name: Inductor Logging
             config: torch_spyre_tests/inductor/test_logging_config.yaml
+          - name: Inductor Padding
+            config: torch_spyre_tests/inductor/test_padding_config.yaml
           - name: Inductor Restickify
             config: torch_spyre_tests/inductor/test_restickify_config.yaml
           - name: Inductor Scratchpad Patterns
             config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
           - name: Inductor Scratchpad Use
             config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
+          - name: Inductor Dtype Scalars
+            config: torch_spyre_tests/inductor/test_dtype_scalars_config.yaml
+          - name: Inductor Cache
+            config: torch_spyre_tests/inductor/test_cache_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
@@ -120,6 +126,7 @@ jobs:
 
       - name: Gather runner info
         run: |
+          echo "================================="
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           date
@@ -137,6 +144,7 @@ jobs:
           env | sort | grep AIU || true
           echo "--- repo listing ---"
           ls -lart "$CLONED_TORCH_SPYRE_DIR"
+          echo "================================="
 
       - name: Build torch-spyre
         run: |
