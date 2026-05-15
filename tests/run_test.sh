@@ -199,33 +199,53 @@ _find_sibling_with_sentinel() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Resolve and export TORCH_ROOT
+# 2. Resolve and export TORCH_ROOT (only when referenced in YAML paths)
 # ---------------------------------------------------------------------------
-echo "[spyre_run] Resolving TORCH_ROOT..."
-if [[ -n "${TORCH_ROOT:-}" && -d "$TORCH_ROOT" ]]; then
-    echo "[spyre_run]   already set: $TORCH_ROOT"
-else
-    TORCH_ROOT=""
+_check_torch_root_needed() {
+    grep -qE 'path:\s.*\$\{TORCH_ROOT\}' "$1" 2>/dev/null && return 0
+    if grep -E '^\s*(- )?path:\s' "$1" | grep -qE '\$\{TORCH_ROOT\}'; then
+        return 0
+    fi
+    return 1
+}
 
-    _found=$(python3 -c "
+if _check_torch_root_needed "$YAML_CONFIG"; then
+    _TORCH_ROOT_NEEDED=1
+    echo "[spyre_run]   YAML config references \${TORCH_ROOT} root — resolving..."
+else
+    _TORCH_ROOT_NEEDED=0
+    echo "[spyre_run]   YAML config does not reference \${TORCH_ROOT} — skipping resolution."
+fi
+
+if [[ $_TORCH_ROOT_NEEDED -eq 1 ]]; then
+    echo "[spyre_run] Resolving TORCH_ROOT..."
+    if [[ -n "${TORCH_ROOT:-}" && -d "$TORCH_ROOT" ]]; then
+        echo "[spyre_run]   already set: $TORCH_ROOT"
+    else
+        TORCH_ROOT=""
+
+        _found=$(python3 -c "
 import torch, os
 candidate = os.path.dirname(os.path.dirname(os.path.abspath(torch.__file__)))
 if os.path.isfile(os.path.join(candidate, 'test', 'test_binary_ufuncs.py')):
     print(candidate)
 " 2>/dev/null) || true
-    [[ -n "$_found" ]] && TORCH_ROOT="$_found"
+        [[ -n "$_found" ]] && TORCH_ROOT="$_found"
 
-    if [[ -z "$TORCH_ROOT" ]]; then
-        TORCH_ROOT=$(_find_sibling_with_sentinel "$YAML_DIR" "test/test_binary_ufuncs.py" 2>/dev/null) || true
-    fi
+        if [[ -z "$TORCH_ROOT" ]]; then
+            TORCH_ROOT=$(_find_sibling_with_sentinel "$YAML_DIR" "test/test_binary_ufuncs.py" 2>/dev/null) || true
+        fi
 
-    if [[ -z "$TORCH_ROOT" ]]; then
-        echo "ERROR: Could not locate PyTorch source root." >&2
-        echo "       Expected pytorch/ as a sibling of your torch-spyre repo, or" >&2
-        echo "       an editable install (pip install -e .)." >&2
-        echo "       Set TORCH_ROOT explicitly if the layout differs." >&2
-        exit 1
+        if [[ -z "$TORCH_ROOT" ]]; then
+            echo "ERROR: Could not locate PyTorch source root." >&2
+            echo "       Expected pytorch/ as a sibling of your torch-spyre repo, or" >&2
+            echo "       an editable install (pip install -e .)." >&2
+            echo "       Set TORCH_ROOT explicitly if the layout differs." >&2
+            exit 1
+        fi
     fi
+else
+    TORCH_ROOT="${TORCH_ROOT:-}"
 fi
 export TORCH_ROOT
 export PYTORCH_ROOT="$TORCH_ROOT"
