@@ -4,6 +4,8 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
   # Removing from CICD till the ops tests get matured
   # pull_request:
   #   branches: [main]

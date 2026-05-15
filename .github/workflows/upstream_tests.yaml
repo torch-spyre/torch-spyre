@@ -4,8 +4,12 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
   pull_request:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
   merge_group:
     types: [checks_requested]
 
