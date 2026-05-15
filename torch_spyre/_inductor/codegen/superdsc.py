@@ -326,7 +326,7 @@ def _create_sdsc_tensors(
             # No stick dim found in op - add one
             stick_dim = next(d for d in dims if d not in op_dim_order)
             dim_order = dim_order + [stick_dim]
-        if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
+        if op_spec.op == "layernormscale":
             reduced_dims = [stick_dim]
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
