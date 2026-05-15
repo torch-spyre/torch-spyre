@@ -65,7 +65,7 @@ from .pass_utils import (
     device_coordinates,
     host_coordinates,
     lower_pad_sequence,
-    rebuild_computed_buffer,
+    replace_computed_buffer_body,
 )
 from .views import matching_dim
 from torch_spyre._C import get_elem_in_stick
@@ -145,7 +145,7 @@ def _rebuild_matmul(
 
     Patches the Reduction's inner_fn to load from the padded buffers and updates
     reduction_ranges to k_padded, then delegates the ComputedBuffer reconstruction
-    and operations-list swap to rebuild_computed_buffer.
+    and operations-list swap to replace_computed_buffer_body.
 
     x_padded_buf must have ndim matching len(output_ranges) (all output dims
     except N plus K_padded) so indices [batch..., M, r_K] are valid.
@@ -182,7 +182,7 @@ def _rebuild_matmul(
     object.__setattr__(reduction, "inner_fn", new_inner_fn)
     object.__setattr__(reduction, "reduction_ranges", [sympy.Integer(k_padded)])
 
-    return rebuild_computed_buffer(op, reduction, operations)
+    return replace_computed_buffer_body(op, reduction, operations)
 
 
 def insert_padding_ir(operations: list[Operation]) -> None:

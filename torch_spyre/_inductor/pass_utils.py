@@ -401,17 +401,21 @@ def compute_restickify_needed(
     return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
 
 
-def rebuild_computed_buffer(
+def replace_computed_buffer_body(
     op: ComputedBuffer,
     new_data: Loops,
     operations: list[Operation],
 ) -> ComputedBuffer:
-    """Replace ``op`` in ``operations`` with a new ComputedBuffer sharing its layout.
+    """Replace the body (``data``) of a ``ComputedBuffer`` with ``new_data``.
 
-    Preserves all metadata fields required by downstream passes: ``operation_name``,
-    ``origins``, ``origin_node``, and the ``_split_size`` / ``_original_*`` fields
-    used by ``get_default_sizes_body``.  Clears the ``get_default_sizes_body`` cache
-    on the new buffer so stale size results from the old ``data`` are not reused.
+    ``ComputedBuffer`` is a frozen dataclass, so its ``data`` field cannot be
+    mutated in place.  This function constructs a new ``ComputedBuffer`` with
+    the updated body and swaps it into ``operations``, copying all metadata
+    fields that downstream passes depend on: ``operation_name``, ``origins``,
+    ``origin_node``, and the ``_split_size`` / ``_original_*`` fields used by
+    ``get_default_sizes_body``.  The ``get_default_sizes_body`` cache is
+    cleared on the new buffer so stale size results from the old body are not
+    reused.
 
     Returns the replacement ComputedBuffer.
     """
