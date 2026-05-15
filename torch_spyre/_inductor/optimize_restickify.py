@@ -39,21 +39,6 @@ INF = math.inf
 logger = get_inductor_logger("optimize_restickify")
 
 
-@dataclass(frozen=True)
-class LayoutKey:
-    """Hashable Python surrogate for SpyreTensorLayout, used as a dict/set key.
-
-    Will be removed once PR to make SpyreTensorLayout hashable is merged.
-    """
-
-    device_size: tuple[int, ...]
-    stride_map: tuple[int, ...]
-
-    @staticmethod
-    def from_stl(stl: SpyreTensorLayout) -> "LayoutKey":
-        return LayoutKey(tuple(stl.device_size), tuple(stl.stride_map))
-
-
 class EdgeCostMap:
     """Lazy cost table mapping (in_layout, target_layout) -> restick cost for one op input.
 
@@ -79,32 +64,20 @@ class EdgeCostMap:
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
         # _layout stores the target STL for the restickify, or None if no restickify is needed
-        self._cost: defaultdict[LayoutKey, dict[LayoutKey, float]] = defaultdict(dict)
-        self._layout: defaultdict[LayoutKey, dict[LayoutKey, Any]] = defaultdict(dict)
+        self._cost: defaultdict[SpyreTensorLayout, dict[SpyreTensorLayout, float]] = (
+            defaultdict(dict)
+        )
+        self._layout: defaultdict[SpyreTensorLayout, dict[SpyreTensorLayout, Any]] = (
+            defaultdict(dict)
+        )
 
     def _compute_and_cache_cost(
-        self, in_key: "LayoutKey", target_key: "LayoutKey"
+        self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> None:
-        """Populate _cost and _layout for (in_key, target_key).
+        """Populate _cost and _layout for (in_stl, target_stl).
 
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
-        in_stl = next(
-            (stl for stl in self._in_layouts if LayoutKey.from_stl(stl) == in_key),
-            None,
-        )
-        target_stl = next(
-            (
-                stl
-                for stl in self._target_layouts
-                if LayoutKey.from_stl(stl) == target_key
-            ),
-            None,
-        )
-        assert in_stl is not None, f"in_key {in_key} not found in in_layouts"
-        assert target_stl is not None, (
-            f"target_key {target_key} not found in target_layouts"
-        )
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep
         )
@@ -114,31 +87,24 @@ class EdgeCostMap:
             cost = INF  # infeasible restickify
         else:
             cost = float(math.prod(in_stl.device_size))
-        self._cost[in_key][target_key] = cost
-        self._layout[in_key][target_key] = tgt
+        self._cost[in_stl][target_stl] = cost
+        self._layout[in_stl][target_stl] = tgt
 
     def cost(
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> float:
         """Return the restick cost for (in_stl, target_stl), computing it on first access."""
-
-        # Remove conversions once STL is hashable
-        in_key = LayoutKey.from_stl(in_stl)
-        target_key = LayoutKey.from_stl(target_stl)
-
-        if target_key not in self._cost[in_key]:
-            self._compute_and_cache_cost(in_key, target_key)
-        return self._cost[in_key][target_key]
+        if target_stl not in self._cost[in_stl]:
+            self._compute_and_cache_cost(in_stl, target_stl)
+        return self._cost[in_stl][target_stl]
 
     def layout(
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> "SpyreTensorLayout | None":
         """Return target STL for restickifying in_stl to be compatible with target_stl, or None if no restickify needed."""
-        in_key = LayoutKey.from_stl(in_stl)
-        target_key = LayoutKey.from_stl(target_stl)
-        if target_key not in self._cost[in_key]:
-            self._compute_and_cache_cost(in_key, target_key)
-        return self._layout[in_key][target_key]
+        if target_stl not in self._cost[in_stl]:
+            self._compute_and_cache_cost(in_stl, target_stl)
+        return self._layout[in_stl][target_stl]
 
 
 class RestickNodeCost(abc.ABC):
@@ -212,7 +178,7 @@ class FixedInOutNode(RestickNodeCost):
     def cost(
         self, in_layouts: "list[SpyreTensorLayout]", out_stl: "SpyreTensorLayout"
     ) -> float:
-        if LayoutKey.from_stl(out_stl) != LayoutKey.from_stl(self.required_out_stl):
+        if out_stl != self.required_out_stl:
             return INF
         return sum(
             ec.cost(lk, rk)
