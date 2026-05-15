@@ -1359,6 +1359,7 @@ _run_pytest_isolated() {
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
+            echo "[spyre_run] Running serial test"
             # Regular pytest for non-distributed tests
             python3 -m pytest "$_base" "${_args[@]}"
             echo $? > "$_exit_tmp"
