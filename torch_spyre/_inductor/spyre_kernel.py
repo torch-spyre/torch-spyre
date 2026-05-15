@@ -451,6 +451,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+
+        # If the current reduction op carries a layout override for this buffer,
+        # use it so that both the index expression and stride_map use K_padded.
+        node_data = getattr(self.current_node.node, "data", None)
+        op_info = getattr(node_data, "op_info", {}) or {}
+        override = op_info.get("x_layout_override")
+        if override is not None:
+            override_name, override_layout = override
+            if override_name == name:
+                layout = override_layout
+
         if not layout.allocation:
             _ = self.args.input(name)
 
@@ -544,6 +555,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_info = {}
         if hasattr(self.current_node.node.data, "op_info"):  # type: ignore[union-attr]
             op_info.update(self.current_node.node.data.op_info)  # type: ignore[union-attr]
+        # x_layout_override is consumed by load() at codegen time; exclude from
+        # the serialized op_info so it doesn't appear in the generated kernel code.
+        op_info.pop("x_layout_override", None)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

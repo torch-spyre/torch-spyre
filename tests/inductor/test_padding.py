@@ -164,7 +164,7 @@ class TestInsertPaddingIR(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_mm_unaligned_k_pads(self) -> None:
-        """2D mm with K=67 (unaligned) — x and y are both padded before the matmul."""
+        """2D mm with K=67 (unaligned) — y is padded before the matmul; x is not."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         # 67 is not a multiple of stick_size (64), so padding should occur.
@@ -182,7 +182,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         mm = matmuls[0]
 
         # reduction_ranges is updated to K_padded so the hardware iterates
-        # r_K = 0..K_padded-1; the pad region of x and y is zero-filled.
+        # r_K = 0..K_padded-1; x's tail is handled by pt hardware masking.
         k_padded = ((67 + stick_size - 1) // stick_size) * stick_size
         reduction = mm.data
         assert isinstance(reduction, Reduction)
@@ -193,11 +193,11 @@ class TestInsertPaddingIR(unittest.TestCase):
             f"reduction_ranges should be K_padded={k_padded}, got {k_actual}",
         )
 
-        # 4 overwrite ops before the matmul: fill + copy for x, fill + copy for y.
+        # 2 overwrite ops before the matmul: fill + copy for y only.
         ops_before = self._ops_before(ops, mm)
         overwrites = self._overwrite_ops(ops_before)
         self.assertGreaterEqual(
-            len(overwrites), 4, "Expected at least 4 overwrite ops before matmul"
+            len(overwrites), 2, "Expected at least 2 overwrite ops before matmul"
         )
 
     def test_mm_aligned_k_no_padding(self) -> None:
@@ -229,7 +229,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(len(overwrites), 0, "Expected no overwrite ops for aligned K")
 
     def test_bmm_3d_unaligned_k_pads(self) -> None:
-        """3D bmm (B,M,K)×(B,K,N) with K=67 — both x and y are padded before bmm."""
+        """3D bmm (B,M,K)×(B,K,N) with K=67 — y is padded before bmm; x is not."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
@@ -253,10 +253,10 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         ops_before = self._ops_before(ops, mm)
         overwrites = self._overwrite_ops(ops_before)
-        self.assertGreaterEqual(len(overwrites), 4)
+        self.assertGreaterEqual(len(overwrites), 2)
 
     def test_bmm_3d_2d_unaligned_k_pads(self) -> None:
-        """3D×2D bmm: (B,M,K)×(K,N) with K=67 — both x and y are padded."""
+        """3D×2D bmm: (B,M,K)×(K,N) with K=67 — y is padded; x is not."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
@@ -280,11 +280,11 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         ops_before = self._ops_before(ops, mm)
         overwrites = self._overwrite_ops(ops_before)
-        # 4 overwrites: fill + copy for x, fill + copy for y.
-        self.assertGreaterEqual(len(overwrites), 4)
+        # 2 overwrites: fill + copy for y only.
+        self.assertGreaterEqual(len(overwrites), 2)
 
     def test_matmul_4d_unaligned_k_pads(self) -> None:
-        """4D matmul (B,H,M,K)×(B,H,K,N) with K=67 — both x and y are padded."""
+        """4D matmul (B,H,M,K)×(B,H,K,N) with K=67 — y is padded; x is not."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
@@ -307,10 +307,10 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         ops_before = self._ops_before(ops, mm)
         overwrites = self._overwrite_ops(ops_before)
-        self.assertGreaterEqual(len(overwrites), 4)
+        self.assertGreaterEqual(len(overwrites), 2)
 
     def test_einsum_mk_kn_mn_pads(self) -> None:
-        """einsum('mk,kn->mn') with K=67 — both x and y are padded to K_padded."""
+        """einsum('mk,kn->mn') with K=67 — y is padded to K_padded; x is not."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
@@ -389,12 +389,13 @@ class TestInsertPaddingIR(unittest.TestCase):
             "origin_node should not be None after _rebuild_matmul",
         )
 
-    def test_padded_buffer_sizes_x_and_y(self) -> None:
-        """Both x and y are padded; host K-dims are extended to k_padded.
+    def test_padded_buffer_sizes_y_only(self) -> None:
+        """Only y is padded; its host K-dim is extended to k_padded.
 
-        spyre.empty lowers to SpyreEmptyFallback.  Two SpyreEmptyFallback ops
-        appear before the matmul: one for x_padded with host size [B, M, K_padded]
-        and one for y_padded with host size [B, K_padded, N].
+        spyre.empty lowers to SpyreEmptyFallback.  Exactly one SpyreEmptyFallback
+        op appears before the matmul: y_padded with host size [B, K_padded, N].
+        x is not padded — neither allocated nor copied; it is consumed via its
+        original TensorBox and the pt hardware is intended to mask its K tail.
         """
 
         dtype = torch.float16
@@ -418,49 +419,91 @@ class TestInsertPaddingIR(unittest.TestCase):
         ops_before = self._ops_before(ops, mm)
 
         padded_empties = [op for op in ops_before if isinstance(op, SpyreEmptyFallback)]
-        # Both x and y are padded — exactly two SpyreEmptyFallback ops.
+        # Only y is padded — exactly one SpyreEmptyFallback op.
         self.assertEqual(
             len(padded_empties),
-            2,
-            f"Expected 2 padded buffers (x and y), found {len(padded_empties)}: "
+            1,
+            f"Expected 1 padded buffer (y only), found {len(padded_empties)}: "
             f"{[[int(s) for s in op.get_size()] for op in padded_empties]}",
         )
 
-        host_sizes = sorted([int(s) for s in op.get_size()] for op in padded_empties)
-        # x_padded: [B, M, K_padded]; y_padded: [B, K_padded, N].
-        self.assertIn(
-            [B, M, k_padded],
-            host_sizes,
-            f"x_padded size [B,M,K_padded]=[{B},{M},{k_padded}] not found in {host_sizes}",
-        )
-        self.assertIn(
+        # y_padded: [B, K_padded, N].
+        host_size = [int(s) for s in padded_empties[0].get_size()]
+        self.assertEqual(
+            host_size,
             [B, k_padded, N],
-            host_sizes,
-            f"y_padded size [B,K_padded,N]=[{B},{k_padded},{N}] not found in {host_sizes}",
+            f"y_padded size should be [{B},{k_padded},{N}], got {host_size}",
         )
 
-        # Each padded buffer's host K-dim must equal K_padded.
-        for empty in padded_empties:
-            host_size = [int(s) for s in empty.get_size()]
-            self.assertIn(
-                k_padded,
-                host_size,
-                f"k_padded={k_padded} not found in host_size={host_size}",
-            )
+    def test_x_layout_override_stride_map(self) -> None:
+        """The matmul's op_info carries an x_layout_override with K_padded as the M-row stride.
+
+        insert_padding_ir stores a (x_name, FixedTiledLayout) pair on the matmul's
+        op_info under "x_layout_override".  The FixedTiledLayout has K_padded as the
+        M-row host stride and an overlay SpyreTensorLayout (stride_map[M_dim]=K_padded).
+        SpyreKernel.load() uses this override so the index expression and stride_map
+        are consistent, preventing the spurious r_K//K overflow term.
+        """
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        K = 67
+        assert K % stick_size != 0
+        k_padded = ((K + stick_size - 1) // stick_size) * stick_size
+
+        x = torch.randn(55, K, dtype=dtype, device="spyre")
+        w = torch.randn(K, 128, dtype=dtype, device="spyre")
+
+        def fn(x, w):
+            return x @ w
+
+        ops = self.compile_and_capture(fn, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1)
+        mm = matmuls[0]
+
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        op_info = getattr(reduction, "op_info", None)
+        self.assertIsNotNone(op_info, "matmul op_info should not be None after padding")
+        override = op_info.get("x_layout_override")
+        self.assertIsNotNone(override, "op_info should contain 'x_layout_override'")
+        override_name, override_layout = override
+        self.assertIsInstance(override_name, str)
+        self.assertIsInstance(override_layout, FixedTiledLayout)
+
+        # stride_map should contain K_padded (the M-row stride).
+        stride_map = list(override_layout.device_layout.stride_map)
+        self.assertIn(
+            k_padded,
+            stride_map,
+            f"x_layout_override.device_layout.stride_map should contain K_padded={k_padded}; "
+            f"got {stride_map}",
+        )
+
+        # Host strides should use K_padded as the M-row stride.
+        host_stride = [int(s) for s in override_layout.stride]
+        self.assertIn(
+            k_padded,
+            host_stride,
+            f"x_layout_override.stride should contain K_padded={k_padded}; "
+            f"got {host_stride}",
+        )
 
     def test_padded_buffer_preserves_stick_dimension(self) -> None:
-        """Both padded buffers (x and y) preserve the original within-stick stride.
+        """y's padded buffer preserves the original within-stick stride.
 
-        ``lower_pad_sequence`` constructs each padded buffer's ``SpyreTensorLayout``
+        ``lower_pad_sequence`` constructs the padded buffer's ``SpyreTensorLayout``
         from the padded host size/stride so that ``device_coordinates[-1]`` (the
         stick coordinate expression) is identical for both the original and padded
-        buffers.  Concretely, ``stride_map[-1]`` must be 1 for every padded
+        buffers.  Concretely, ``stride_map[-1]`` must be 1 for the padded
         ``SpyreEmptyFallback``.
 
-        x is sticked on K (the reduction dim), y is sticked on N (the output dim).
-        Both have contiguous within-stick strides, so ``stride_map[-1] == 1``.
-        The test catches a regression that confused the stick dim (e.g. producing
-        ``stride_map[-1] == K_padded`` from a default layout with the wrong dim_order).
+        y is sticked on N (the output dim) with a contiguous within-stick stride,
+        so ``stride_map[-1] == 1``.  The test catches a regression that confused
+        the stick dim (e.g. producing ``stride_map[-1] == K_padded`` from a default
+        layout with the wrong dim_order).
         """
         from torch_spyre._inductor.ir import FixedTiledLayout
 
@@ -510,8 +553,8 @@ class TestInsertPaddingIR(unittest.TestCase):
                 ]
                 self.assertEqual(
                     len(padded_empties),
-                    2,
-                    f"{name}: expected exactly 2 padded buffers (x and y)",
+                    1,
+                    f"{name}: expected exactly 1 padded buffer (y only)",
                 )
 
                 for empty in padded_empties:

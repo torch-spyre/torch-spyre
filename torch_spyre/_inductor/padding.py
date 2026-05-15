@@ -16,8 +16,23 @@
 BATCH_MATMUL_OP operations.  Runs in CustomPreSchedulingPasses immediately
 after insert_restickify, when every ComputedBuffer has a FixedTiledLayout.
 
-Both x and y are padded along their K dimension to K_padded = next stick
-boundary.  For each argument:
+Only y is padded via a new allocation.  x uses its original buffer without
+any allocation or copy — the pt hardware unit masks within-stick K reads
+beyond the true K size.  reduction_ranges is set to K_padded so the hardware
+iterates r_K = 0..K_padded-1.
+
+x's inner_fn computes the flat index into x's original buffer using K_padded
+as the M-row stride (c_M*K_padded + c_K), then calls ops.load directly.
+SpyreKernel.load() detects a per-op layout override stored in
+op_info["x_layout_override"] and substitutes a FixedTiledLayout whose
+stride_map uses K_padded instead of K.  This makes the index expression and
+stride_map consistent, preventing the spurious r_K//K overflow term in the M
+coordinate that compute_coordinates would otherwise emit when r_K's range
+(K_padded) exceeds x's original M-row stride (K).  x's original buffer is
+untouched; no other consumer sees the padded strides.
+
+For y, the K (row/mb) dimension is not within-stick, so the hardware has no
+implicit masking.  y is padded to K_padded = next stick boundary:
   spyre.empty(padded_size)                         — uninitialised allocation
   spyre.constant(0.0)                              — scalar zero, generated on-device (cached)
   aten.expand(constant, pad_size)                  — broadcast to pad-region shape; free
@@ -55,12 +70,13 @@ from torch._inductor.ir import (
     Reduction,
     TensorBox,
 )
-from torch._inductor.virtualized import V
+from torch._inductor.virtualized import V, ops
 
 from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
+    _build_padded_stl,
     concretize_expr,
     device_coordinates,
     host_coordinates,
@@ -136,25 +152,30 @@ def _find_arg_fx_node(
 
 def _rebuild_matmul(
     op: ComputedBuffer,
-    x_padded_buf: Buffer,
+    x_name: str,
+    x_padded_host_stride: list[int],
     y_padded_buf: Buffer,
     k_padded: int,
     operations: list[Operation],
 ) -> ComputedBuffer:
     """Rebuild the matmul ComputedBuffer with padded loaders and updated reduction_ranges.
 
-    Patches the Reduction's inner_fn to load from the padded buffers and updates
-    reduction_ranges to k_padded, then delegates the ComputedBuffer reconstruction
-    and operations-list swap to replace_computed_buffer_body.
+    x is NOT padded — its original buffer is used directly.  The flat index for the
+    x load is computed using x_padded_host_stride (K_padded as the M-row stride) so
+    that SpyreKernel.load() receives a K_padded-based index.  SpyreKernel.load() reads
+    op_info["x_layout_override"] and uses the padded FixedTiledLayout for the
+    TensorAccess, ensuring compute_coordinates sees stride_map[M_dim]=K_padded —
+    consistent with the index — and produces clean device coordinates.
 
-    x_padded_buf must have ndim matching len(output_ranges) (all output dims
-    except N plus K_padded) so indices [batch..., M, r_K] are valid.
-    y_padded_buf must have the same ndim as the original y buffer.
+    reduction_ranges is set to K_padded so the hardware iterates r_K = 0..K_padded-1.
+    x's within-stick K tail (uninitialised storage past element K-1) is masked by
+    the pt hardware unit.
+
+    y_padded_buf is fully zero-filled in the K pad region.
     """
     reduction = op.data
     assert isinstance(reduction, Reduction)
 
-    x_padded_loader = x_padded_buf.make_loader()
     y_padded_loader = y_padded_buf.make_loader()
     # y's batch dims: y_ndim - 2 batch dims come first in y_index.
     y_ndim = len(y_padded_buf.get_size())
@@ -163,21 +184,25 @@ def _rebuild_matmul(
     def new_inner_fn(
         index,
         reduction_index,
-        _x_loader=x_padded_loader,
+        _x_name=x_name,
+        _x_stride=x_padded_host_stride,
         _y_loader=y_padded_loader,
         _y_batch_ndim=y_batch_ndim,
     ):
         # x: all output dims except the last (N), plus the reduction dim.
         # y: first y_batch_ndim batch dims, then reduction dim, then N (index[-1]).
         # Matches the lowering pattern for all mm/bmm variants:
-        #   mm (2D×2D):   x_loader([i_M, r_K]),       y_loader([r_K, i_N])
-        #   bmm (3D×3D):  x_loader([i_B, i_M, r_K]),  y_loader([i_B, r_K, i_N])
-        #   bmm (4D×4D):  x_loader([i_B,i_H,i_M,r_K]),y_loader([i_B,i_H,r_K,i_N])
-        #   bmm (3D×2D):  x_loader([i_B, i_M, r_K]),  y_loader([r_K, i_N])
-        #   einsum→bmm:   x_loader([i_B, i_M, r_K]),  y_loader([r_K, i_N])  (y 2D)
+        #   mm (2D×2D):   x_load([i_M, r_K]),       y_loader([r_K, i_N])
+        #   bmm (3D×3D):  x_load([i_B, i_M, r_K]),  y_loader([i_B, r_K, i_N])
+        #   bmm (4D×4D):  x_load([i_B,i_H,i_M,r_K]),y_loader([i_B,i_H,r_K,i_N])
+        #   bmm (3D×2D):  x_load([i_B, i_M, r_K]),  y_loader([r_K, i_N])
+        #   einsum→bmm:   x_load([i_B, i_M, r_K]),  y_loader([r_K, i_N])  (y 2D)
         x_index = list(index[:-1]) + list(reduction_index)
+        # Compute flat index using K_padded as M-row stride so the index is consistent
+        # with the op_info x_layout_override (stride_map[M_dim]=K_padded).
+        x_flat = sum(i * s for i, s in zip(x_index, _x_stride))
         y_index = list(index[:_y_batch_ndim]) + list(reduction_index) + [index[-1]]
-        return (_x_loader(x_index), _y_loader(y_index))
+        return (ops.load(_x_name, x_flat), _y_loader(y_index))
 
     object.__setattr__(reduction, "inner_fn", new_inner_fn)
     object.__setattr__(reduction, "reduction_ranges", [sympy.Integer(k_padded)])
@@ -187,9 +212,14 @@ def _rebuild_matmul(
 
 def insert_padding_ir(operations: list[Operation]) -> None:
     """
-    Pad the K (reduction) dimension of each BATCH_MATMUL_OP to a stick boundary.
+    Pad y's K dimension for each BATCH_MATMUL_OP to a stick boundary.
 
-    Mutates ``operations`` in place.  All new buffers are inserted immediately
+    x is not padded — the pt hardware masks x's within-stick K tail.
+    y's K is a row dimension with no hardware masking, so it is explicitly
+    zero-filled.  reduction_ranges is updated to K_padded so the hardware
+    iterates r_K = 0..K_padded-1.
+
+    Mutates ``operations`` in place.  New y-padding ops are inserted immediately
     before the matmul that consumes them to preserve topological order.
 
     x and y are identified via device_coordinates: x is the input sticked on
@@ -197,8 +227,7 @@ def insert_padding_ir(operations: list[Operation]) -> None:
     and handles square matrices (M==K==N) correctly.
 
     A fill_cache is shared across all matmuls so that spyre.constant is lowered
-    only once per unique (fill_value, device, dtype) combination.  All pad
-    operations with the same fill value and dtype reuse the same constant node.
+    only once per unique (fill_value, device, dtype) combination.
     """
     fill_cache: dict[tuple, torch.fx.Node] = {}
     for op in list(operations):
@@ -298,28 +327,53 @@ def insert_padding_ir(operations: list[Operation]) -> None:
         # minimising their live range.
         matmul_fx_node = next(iter(op.origins))
 
-        # --- Pad x: size=[batch..., M, K_padded] ---
-        # Look for the FX node with the expected pre-padded x size so that the
-        # padded clone has the right dimensionality for the inner_fn's loaders.
-        x_padded_size = x_size[:-1] + [k_padded]
+        # --- x: no allocation, no copy — layout override via op_info ---
+        # The pt hardware unit masks within-stick K reads beyond the true K size,
+        # so x's underlying storage is used as-is.  A FixedTiledLayout with
+        # K_padded as the M-row host stride is built and stored on the matmul's
+        # op_info under "x_layout_override".  SpyreKernel.load() reads this
+        # override so that (a) the index expression uses K_padded as the M-row
+        # stride, and (b) compute_coordinates sees stride_map[M_dim]=K_padded.
+        # Both are consistent, preventing the spurious r_K//K overflow term that
+        # would appear when r_K's range (K_padded) exceeds x's original M-row
+        # stride (K).
         x_fx_node = _find_arg_fx_node(x_name, expected_size=x_size)
 
         x_orig_stl = x_buf.get_layout().device_layout
-        x_padded_buf, x_new_ops = lower_pad_sequence(
+        x_overlay_host_size = list(x_size)
+        x_overlay_host_size[-1] = k_padded  # K is the last dim of x_size
+        x_overlay_stl = _build_padded_stl(
             x_fx_node,
-            padded_size=x_padded_size,
-            device=device,
-            dtype=dtype,
-            dim=len(x_padded_size) - 1,
-            insert_before=matmul_fx_node,
+            padded_size=x_overlay_host_size,
             orig_stl=x_orig_stl,
-            fill_cache=fill_cache,
+            dtype=dtype,
         )
 
+        # Row-major host strides for the padded x shape.
+        n = len(x_overlay_host_size)
+        x_padded_host_stride = [1] * n
+        for i in range(n - 2, -1, -1):
+            x_padded_host_stride[i] = (
+                x_padded_host_stride[i + 1] * x_overlay_host_size[i + 1]
+            )
+
+        x_padded_layout = FixedTiledLayout(
+            device,
+            dtype,
+            [sympy.Integer(s) for s in x_overlay_host_size],
+            [sympy.Integer(s) for s in x_padded_host_stride],
+            x_overlay_stl,
+        )
+        op_info = getattr(reduction, "op_info", None)
+        if op_info is None:
+            op_info = {}
+            object.__setattr__(reduction, "op_info", op_info)
+        op_info["x_layout_override"] = (x_name, x_padded_layout)
+
         # --- Pad y: size=[batch..., K_padded, N] ---
-        # y's K dimension is y's row (mb) dimension.  Padding it to K_padded
-        # ensures the matmul reduction does not read uninitialised rows of y
-        # when reduction_ranges is extended to k_padded.
+        # y's K is a row (mb) dimension, not the within-stick dim, so the hardware
+        # does not mask it.  Explicitly zero-fill rows K..K_padded-1 so the
+        # reduction over r_K = 0..K_padded-1 reads zero in the pad region.
         y_size = [concretize_expr(s) for s in y_buf.get_size()]
         if y_host_k_dim is None:
             y_k_dim = len(y_size) - 2
@@ -343,17 +397,17 @@ def insert_padding_ir(operations: list[Operation]) -> None:
 
         # --- Relocate new ops before the matmul ---
         # run_node appended them at the end of operations; move before op.
-        all_new_ops = x_new_ops + y_new_ops
-        for new_op in all_new_ops:
+        for new_op in y_new_ops:
             operations.remove(new_op)
         op_idx = operations.index(op)
-        for i, new_op in enumerate(all_new_ops):
+        for i, new_op in enumerate(y_new_ops):
             operations.insert(op_idx + i, new_op)
 
         # --- Rebuild matmul inner_fn and reduction_ranges ---
         _rebuild_matmul(
             op,
-            x_padded_buf,
+            x_name,
+            x_padded_host_stride,
             y_padded_buf,
             k_padded,
             operations,
