@@ -26,7 +26,7 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf
+      - spyre_pf_x1
       - linux
       - image_torch_spyre
     timeout-minutes: 720
@@ -124,6 +124,7 @@ jobs:
 
       - name: Gather runner info
         run: |
+          echo "================================="
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           date
@@ -141,6 +142,7 @@ jobs:
           env | sort | grep AIU || true
           echo "--- repo listing ---"
           ls -lart "$CLONED_TORCH_SPYRE_DIR"
+          echo "================================="
 
       - name: Build torch-spyre
         run: |
