@@ -32,16 +32,17 @@ jobs:
   # and does not use spyre cards.
   #
   # Filter rules:
-  #   src -- matches any file that should cause tests to run:
-  #     -- any file in the repo ('**')
-  #     -- except tests/docs/**  (pure documentation)
-  #     -- except **.md          (markdown files anywhere in the repo)
+  #   docs_only -- matches changes that should NOT trigger tests:
+  #     -- tests/docs/**  (test suite documentation)
+  #     -- docs/**        (repo-level documentation)
+  # Tests are skipped only when docs_only == 'true'.
+  # For every other change in the repo, tests run.
   # ---------------------------------------------------------------------------
   changes:
     name: Detect changed files
     runs-on: ubuntu-latest
     outputs:
-      should-run: ${{ steps.filter.outputs.src }}
+      docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,17 +52,15 @@ jobs:
         id: filter
         with:
           filters: |
-            src:
-              # Trigger tests for any file change in the repo except
-              # pure documentation under tests/docs/.
-              - '**'
-              - '!tests/docs/**'
-              - '!**.md'        # optionally exclude all markdown files
+            docs_only:
+              - 'tests/docs/**'
+              - 'docs/**'
   # ---------------------------------------------------------------------------
   # Job 2: test matrix
   #
-  # Only runs when `changes.should-run == 'true'`, i.e. when a relevant file
-  # was modified. For docs-only PRs this job is skipped entirely -- no hardware
+  # Only runs when `changes.docs_only == 'false'`, i.e. when something
+  # other than documentation was modified.
+  # For docs-only PRs this job is skipped entirely -- no hardware
   # runners are consumed.
   #
   # To add a new test suite, append an entry to the matrix below:
@@ -74,7 +73,7 @@ jobs:
     # Skip this job entirely if no test-relevant files were modified.
     # The fan-in job below handles the skipped case and still reports green
     # to satisfy the branch protection required check.
-    if: needs.changes.outputs.should-run == 'true'
+    if: needs.changes.outputs.docs_only == 'false'
     runs-on:
       - x86_64
       - spyre_pf_x1
