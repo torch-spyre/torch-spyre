@@ -213,6 +213,28 @@ def _(
     return torch.empty(size, dtype=dtype, device="spyre")
 
 
+@torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
+def spyre_empty(
+    size: Sequence[int],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    # Eager-mode simulation: allocate on CPU and move to the Spyre device.
+    # This is not a compute fallback — on hardware the compiled kernel receives
+    # a device allocation from SpyreAllocator with no host-side initialisation.
+    tmp = torch.empty(size, dtype=dtype, device="cpu")
+    return tmp.to(device)
+
+
+@spyre_empty.register_fake
+def _(
+    size: Sequence[int],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+):
+    return torch.empty(size, dtype=dtype, device="spyre")
+
+
 @torch.library.custom_op("spyre::logical_not", mutates_args=(), device_types="spyre")
 def logical_not(input: torch.Tensor) -> torch.Tensor:
     pass

@@ -76,6 +76,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
           - name: Inductor Logging
             config: torch_spyre_tests/inductor/test_logging_config.yaml
+          - name: Inductor Padding
+            config: torch_spyre_tests/inductor/test_padding_config.yaml
           - name: Inductor Restickify
             config: torch_spyre_tests/inductor/test_restickify_config.yaml
           - name: Inductor Scratchpad Patterns
