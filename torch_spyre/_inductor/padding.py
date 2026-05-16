@@ -196,11 +196,9 @@ def insert_padding_ir(operations: list[Operation]) -> None:
     the reduction coord, y is the other.  This avoids positional assumptions
     and handles square matrices (M==K==N) correctly.
 
-    A fill_cache is shared across all matmuls so that spyre.constant is lowered
-    only once per unique (fill_value, device, dtype) combination.  All pad
-    operations with the same fill value and dtype reuse the same constant node.
+    Deduplication of identical constants across multiple pad calls happens later
+    at the IR level via dedup_and_promote_constants.
     """
-    fill_cache: dict[tuple, torch.fx.Node] = {}
     for op in list(operations):
         if not isinstance(op, ComputedBuffer):
             continue
@@ -313,7 +311,6 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             dim=len(x_padded_size) - 1,
             insert_before=matmul_fx_node,
             orig_stl=x_orig_stl,
-            fill_cache=fill_cache,
         )
 
         # --- Pad y: size=[batch..., K_padded, N] ---
@@ -338,7 +335,6 @@ def insert_padding_ir(operations: list[Operation]) -> None:
             dim=y_k_dim,
             insert_before=matmul_fx_node,
             orig_stl=y_orig_stl,
-            fill_cache=fill_cache,
         )
 
         # --- Relocate new ops before the matmul ---
