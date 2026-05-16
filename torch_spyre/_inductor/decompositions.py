@@ -432,8 +432,7 @@ def spyre_rms_norm(
         )
 
     mean = torch.mean(input * input, dim=-1, keepdim=True)
-    eps_tensor = torch.ops.spyre.full((1,), eps, dtype=torch.float16, device="spyre")
-    rsqrt_inp = torch.rsqrt(mean + eps_tensor)
+    rsqrt_inp = torch.rsqrt(mean + eps)
     output = input * rsqrt_inp
     if weight is not None:
         output = output * weight
@@ -537,12 +536,8 @@ def spyre__sdpa_overrideable(
         scaling_factor = 1.0 / math.sqrt(query.shape[-1])
     scaling_factor = math.sqrt(scaling_factor)
 
-    # TODO (aviros): Figure why this broadcast doesn't work
-    scaling_factor_q = torch.full_like(query, scaling_factor)
-    scaling_factor_k = torch.full_like(key, scaling_factor)
-
-    query = query * scaling_factor_q
-    key = key * scaling_factor_k
+    query = query * scaling_factor
+    key = key * scaling_factor
 
     expansion = num_heads // num_kvheads
     if expansion != 1:
