@@ -245,7 +245,7 @@ jobs:
           CONFIG="${{ matrix.suite.config }}"
 
           echo "Running ${{ matrix.suite.name }} tests..."
-          bash tests/run_test.sh "tests/configs/${CONFIG}" -v
+          bash tests/run_test.sh "tests/configs/${CONFIG}" -v --capture=sys
           echo "${{ matrix.suite.name }} tests done"
 
   # ---------------------------------------------------------------------------
