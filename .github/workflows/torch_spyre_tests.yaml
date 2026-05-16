@@ -20,54 +20,62 @@ defaults:
 permissions:
   contents: read
   checks: write
+  pull-requests: read # so that gh pr view can fetch the file list
 
 jobs:
   # ---------------------------------------------------------------------------
   # Job 1: changes
   #
-  # Runs on every PR/push. Uses dorny/paths-filter to inspect which files
-  # were modified and sets the `should-run` output to 'true' or 'false'.
+  # Runs on every PR. Uses gh CLI to fetch the full list of changed files
+  # and checks if any file outside tests/docs/ or docs/ was modified.
   #
-  # This is the only job that always runs — it is cheap compute 
-  # and does not use spyre cards.
-  # Tests are skipped only when docs_only == 'true', which requires
-  # ALL changed files in the PR to match the docs_only filter
-  # (enforced via predicate-quantifier: 'every'). A mixed PR containing
-  # both a doc file and a non-doc file will correctly return docs_only=false
-  # and trigger tests.
-  #
-  # Filter rules:
-  #   docs_only -- matches changes that should NOT trigger tests:
-  #     -- tests/docs/**  (test suite documentation)
-  #     -- docs/**        (repo-level documentation)
-  # Tests are skipped only when docs_only == 'true'.
-  # For every other change in the repo, tests run.
+  # code_changed=true  --> non-doc files changed  --> run tests
+  # code_changed=false --> only doc files changed --> skip tests
   # ---------------------------------------------------------------------------
   changes:
     name: Detect changed files
     runs-on: ubuntu-latest
     outputs:
-      docs_only: ${{ steps.filter.outputs.docs_only }}
+      code_changed: ${{ steps.filter.outputs.code_changed }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Check which paths changed
-        uses: dorny/paths-filter@v3
         id: filter
-        with:
-          predicate-quantifier: every    # ALL changed files must match for docs_only=true
-          filters: |
-            docs_only:
-              - 'tests/docs/**'
-              - 'docs/**'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # On pull_request events, fetch the full list of changed files via
+          # the GitHub API. On push to main (e.g. post-merge), assume tests
+          # should always run since we don't have a PR number to query.
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            FILES=$(gh pr view ${{ github.event.pull_request.number }} \
+              --repo ${{ github.repository }} \
+              --json files --jq '.files[].path')
+          else
+            # push to main or tag -- always run tests
+            FILES="non-doc-change"
+          fi
+
+          echo "Changed files:"
+          echo "$FILES"
+
+          # Check if any changed file is outside the doc directories.
+          # tests/docs/ and docs/ are the only paths that should skip tests.
+          NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' || true)
+
+          if [[ -z "$NON_DOC" ]]; then
+            echo "Only doc files changed — skipping tests."
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Non-doc files changed — running tests."
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # ---------------------------------------------------------------------------
   # Job 2: test matrix
   #
-  # Only runs when `changes.docs_only == 'false'`, i.e. when something
-  # other than documentation was modified.
-  # For docs-only PRs this job is skipped entirely -- no hardware
-  # runners are consumed.
+  # Only runs when `changes.code_changed == 'true'`, i.e. when something
+  # other than documentation was modified. For docs-only PRs this job is
+  # skipped entirely -- no hardware runners are consumed.
   #
   # To add a new test suite, append an entry to the matrix below:
   #   - name: <human-readable label shown in the GHA UI>
@@ -79,7 +87,7 @@ jobs:
     # Skip this job entirely if no test-relevant files were modified.
     # The fan-in job below handles the skipped case and still reports green
     # to satisfy the branch protection required check.
-    if: needs.changes.outputs.docs_only == 'false'
+    if: needs.changes.outputs.code_changed == 'true'
     runs-on:
       - x86_64
       - spyre_pf_x1
