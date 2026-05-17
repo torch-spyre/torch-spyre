@@ -106,11 +106,12 @@ jobs:
           repo  = os.environ['GITHUB_REPOSITORY']
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
-              subprocess.run([
-                  "gh", "api",
-                  f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
-                  "--output", f"xml_artifacts/{a['name']}.zip"
-              ], check=True, env={**os.environ})
+              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
+                result = subprocess.run([
+                    "gh", "api",
+                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
+                ], check=True, env={**os.environ}, capture_output=True)
+                f.write(result.stdout)
               subprocess.run([
                   "unzip", "-o", f"xml_artifacts/{a['name']}.zip",
                   "-d", "xml_artifacts/"

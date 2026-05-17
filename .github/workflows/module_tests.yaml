@@ -30,7 +30,7 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf
+      - spyre_pf_x1
       - linux
       - image_torch_spyre
     timeout-minutes: 720
