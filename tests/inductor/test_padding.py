@@ -332,12 +332,13 @@ class TestInsertPaddingIR(unittest.TestCase):
         # reduction_ranges is updated to K_padded.
         self.assertEqual(int(reduction.reduction_ranges[0]), k_padded)
 
-    def test_fill_cache_shared_across_same_dtype(self) -> None:
-        """Two matmuls with the same shapes share the spyre.constant node via fill_cache.
+    def test_padding_constants_deduped(self) -> None:
+        """Two matmuls with the same shapes yield exactly one spyre.constant after dedup.
 
-        The fill_cache key is (fill_value, device, dtype).  Both x and y are padded per
-        matmul, but all pad operations use fill_value=0.0 and the same dtype, so exactly
-        one spyre.constant node is lowered and reused across all pad sequences.
+        Both matmuls pad x and y with fill_value=0.0 at the same dtype, so four
+        spyre.constant FX nodes are created (one per pad sequence) and lowered to four
+        SpyreConstantFallback IR ops.  dedup_and_promote_constants then merges them into
+        one canonical constant and moves it to the head of operations.
         """
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
@@ -354,13 +355,19 @@ class TestInsertPaddingIR(unittest.TestCase):
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 2, "Expected 2 matmul ops")
 
-        # With fill_cache, the single (0.0, device, float16) key is shared across
-        # all padding calls, so exactly 1 spyre.constant node is lowered total.
+        # dedup_and_promote_constants merges all (0.0, fp16, spyre) constants into one.
         constant_ops = self._constant_nodes(ops)
         self.assertEqual(
             len(constant_ops),
             1,
-            f"Expected 1 spyre.constant (cache shared across all padding), got {len(constant_ops)}",
+            f"Expected 1 spyre.constant after IR dedup, got {len(constant_ops)}",
+        )
+
+        # The surviving constant must be at the head of operations.
+        self.assertIs(
+            ops[0],
+            constant_ops[0],
+            "Expected the surviving spyre.constant to be the first operation",
         )
 
     def test_origin_node_set_on_rebuilt_matmul(self) -> None:

@@ -447,7 +447,6 @@ def lower_pad_sequence(
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout,
     fill_value: float = 0.0,
-    fill_cache: dict | None = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
 
@@ -457,7 +456,7 @@ def lower_pad_sequence(
 
     FX nodes created (in order):
       1. spyre.empty(padded_size)                         — uninitialised allocation
-      2. spyre.constant(fill_value)                       — scalar constant, on-device (cached)
+      2. spyre.constant(fill_value)                       — scalar constant, on-device
       3. aten.expand(constant, pad_size)                  — broadcast to fill-region shape; free
       4. aten.clone(expand)                               — on-device broadcast → fill buffer
       5. overwrite(fill_buf, empty, [dim], [fill_offset]) — write pad region
@@ -473,9 +472,8 @@ def lower_pad_sequence(
     dimension.  Raises ``RuntimeError`` if the within-stick dimension cannot be
     determined from ``orig_stl``.
 
-    ``fill_cache`` maps ``(fill_value, device, dtype)`` to an existing
-    ``spyre.constant`` FX node so that padding ops sharing a fill value reuse
-    one on-device constant regardless of tensor shape or padded dimension.
+    Deduplication of identical constants across multiple pad calls happens later
+    at the IR level via dedup_and_promote_constants.
 
     Returns ``(padded_buf, new_ops)`` where ``padded_buf`` is the allocated buffer
     and ``new_ops`` is the list of new IR operations in topological order.
@@ -526,9 +524,6 @@ def lower_pad_sequence(
     pad_size[dim] = aligned_pad_extent
     fill_offset = fill_offset_aligned
 
-    cache_key = (fill_value, device, dtype)
-    const_is_new = fill_cache is None or cache_key not in fill_cache
-
     with fx_graph.inserting_before(insert_before):
         # 1. Uninitialised padded buffer.
         empty_fx = fx_graph.create_node(
@@ -538,18 +533,13 @@ def lower_pad_sequence(
         )
         empty_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
 
-        # 2. Scalar constant — generated on-device, no DMA (reused if cached).
-        if fill_cache is not None and cache_key in fill_cache:
-            const_fx = fill_cache[cache_key]
-        else:
-            const_fx = fx_graph.create_node(
-                "call_function",
-                torch.ops.spyre.constant.default,
-                args=(fill_value, dtype, device),
-            )
-            const_fx.meta["val"] = fill_value
-            if fill_cache is not None:
-                fill_cache[cache_key] = const_fx
+        # 2. Scalar constant — generated on-device, no DMA.
+        const_fx = fx_graph.create_node(
+            "call_function",
+            torch.ops.spyre.constant.default,
+            args=(fill_value, dtype, device),
+        )
+        const_fx.meta["val"] = fill_value
 
         # 3. Broadcast to fill-region shape (ExpandView — no allocation).
         expand_fx = fx_graph.create_node(
@@ -687,14 +677,11 @@ def lower_pad_sequence(
     # immediately.  We do this for spyre.constant and aten.clone; overwrite ops
     # use MutationLayoutSHOULDREMOVE which we intentionally leave untouched.
 
-    if const_is_new:
-        const_tb = graph_lowering.run_node(const_fx)
-        graph_lowering.env[const_fx] = const_tb
-        const_buf = (
-            const_tb.data.data
-        )  # TensorBox -> StorageBox -> SpyreConstantFallback
-        assert isinstance(const_buf, SpyreConstantFallback)
-        _assign_layout(const_buf)
+    const_tb = graph_lowering.run_node(const_fx)
+    graph_lowering.env[const_fx] = const_tb
+    const_buf = const_tb.data.data  # TensorBox -> StorageBox -> SpyreConstantFallback
+    assert isinstance(const_buf, SpyreConstantFallback)
+    _assign_layout(const_buf)
 
     expand_tb = graph_lowering.run_node(expand_fx)
     graph_lowering.env[expand_fx] = expand_tb
@@ -722,12 +709,10 @@ def lower_pad_sequence(
     object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_data_fx)
 
     # Collect all newly added operations (appended at the end of graph.operations).
-    # Fresh path: spyre.empty(1) + spyre.constant(1) + clone(1) + overwrite×2(2) = 5.
-    # Cache-hit path: spyre.constant is reused, so spyre.empty(1) + clone(1) + overwrite×2(2) = 4.
+    # spyre.empty(1) + spyre.constant(1) + clone(1) + overwrite×2(2) = 5.
     new_ops = graph_lowering.operations[ops_before:]
-    expected = 4 if not const_is_new else 5
-    assert len(new_ops) >= expected, (
-        f"Expected at least {expected} new ops, got {len(new_ops)}"
+    assert len(new_ops) >= 5, (  # noqa: PLR2004
+        f"Expected at least 5 new ops, got {len(new_ops)}"
     )
 
     return padded_buf, list(new_ops)
