@@ -217,7 +217,9 @@ def parse_xml(xml_path: Path):
         "total_tests": len(raw_cases),
         "passed": counts.get("passed", 0),
         "failed": counts.get("failed", 0) + counts.get("error", 0),
-        "skipped": counts.get("skipped", 0) + counts.get("xfail", 0),
+        # "skipped": counts.get("skipped", 0) + counts.get("xfail", 0),
+        "skipped": counts.get("skipped", 0),
+        "xfail": counts.get("xfail", 0),
         "errors": counts.get("error", 0),
         "xpass": counts.get("xpass", 0),
         "duration_s": float(suite_attrs.get("time", 0) or 0),
@@ -248,7 +250,7 @@ def insert_run(client, run_id: str, run: dict, args):
         INSERT INTO test_runs
             (run_id, workflow, suite_name, filename, branch, commit_sha,
              gha_run_id, triggered_at, total_tests, passed, failed,
-             skipped, errors, xpass, duration_s)
+             skipped, xfail, errors, xpass, duration_s)
         VALUES
         """,
         [
@@ -265,6 +267,7 @@ def insert_run(client, run_id: str, run: dict, args):
                 "passed": run["passed"],
                 "failed": run["failed"],
                 "skipped": run["skipped"],
+                "xfail": run["xfail"],
                 "errors": run["errors"],
                 "xpass": run["xpass"],
                 "duration_s": run["duration_s"],
@@ -348,19 +351,63 @@ def main():
         if run is None:
             continue
 
+        # Deduplication check — skip if this exact GHA run + filename
+        # has already been ingested
+        existing = client.execute(
+            """
+            SELECT count() FROM test_runs
+            WHERE gha_run_id = %(gha_run_id)s
+            AND   filename   = %(filename)s
+            """,
+            {
+                "gha_run_id": int(args.run_id or 0),
+                "filename": run["filename"],
+            },
+        )
+        if existing[0][0] > 0:
+            print(f"  Already ingested — skipping {run['filename']}")
+            continue
+
         run_id = str(uuid.uuid4())
         print(
             f"  run_id={run_id}  tests={run['total_tests']}  "
             f"passed={run['passed']}  failed={run['failed']}  "
-            f"xpass={run['xpass']}  xfail={run['skipped'] - run['errors']}"
+            f"xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
         )
 
         insert_run(client, run_id, run, args)
-        insert_cases(client, run_id, cases, workflow=args.workflow)
-        insert_properties(client, run_id, cases)
+
+        existing_cases_after_run = client.execute(
+            """
+            SELECT count() FROM test_cases tc
+            INNER JOIN test_runs tr ON tc.run_id = tr.run_id
+            WHERE tr.gha_run_id = %(gha_run_id)s
+            AND   tr.filename   = %(filename)s
+            """,
+            {
+                "gha_run_id": int(args.run_id or 0),
+                "filename": run["filename"],
+            },
+        )
+        if existing_cases_after_run[0][0] > 0:
+            print("  Cases already exist — skipping case+property inserts")
+        else:
+            insert_cases(client, run_id, cases, workflow=args.workflow)
+            existing_props = client.execute(
+                "SELECT count() FROM run_properties WHERE run_id = %(run_id)s",
+                {"run_id": run_id},
+            )
+            if existing_props[0][0] > 0:
+                print("  Properties already exist — skipping property insert")
+            else:
+                insert_properties(client, run_id, cases)
+
+        # insert_cases(client, run_id, cases, workflow=args.workflow)
+        # insert_properties(client, run_id, cases)
         total_cases += len(cases)
         print(
-            f"  Inserted {len(cases)} test cases + {sum(len(c['properties']) for c in cases)} properties"
+            f"  Inserted {len(cases)} test cases + "
+            f"{sum(len(c['properties']) for c in cases)} properties"
         )
 
     print(f"\nDone. {len(xml_files)} file(s), {total_cases} total cases ingested.")
