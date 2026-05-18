@@ -47,7 +47,12 @@ from .pass_utils import (
 )
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
-from .op_spec import OpSpec, TensorArg
+from .op_spec import (
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    UnimplementedOp as OpSpecUnimplementedOp,
+)
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -371,7 +376,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def __init__(self) -> None:
         super().__init__()
-        self.op_specs: list[OpSpec | UnimplementedOp] = []
+        self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
 
     def __enter__(self) -> Self:
@@ -602,10 +607,14 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
+    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
+        """Replace the current op_specs list with a single LoopSpec of the given count."""
+        self.op_specs = [LoopSpec(count=count, body=self.op_specs)]
+
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
-        for op_spec in self.op_specs:
+        for op_spec in _iter_op_specs(self.op_specs):
             simplify_op_spec(op_spec)
 
         def sympy_str(x: sympy.Expr) -> str:
@@ -627,62 +636,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         buf = IndentedBuffer()
         buf.writeline("[")
         with buf.indent():
-            for op_spec in self.op_specs:
-                if logger.isEnabledFor(logging.DEBUG):
-                    if isinstance(op_spec, UnimplementedOp):
-                        logger.debug(f"op_spec: UnimplementedOp({op_spec.op})")
-                    else:
-                        logger.debug(
-                            f"op_spec: {op_spec.op}, is_reduction={op_spec.is_reduction}, "
-                            f"iteration_space={op_spec.iteration_space}, op_info={op_spec.op_info}"
-                        )
-
-                if isinstance(op_spec, UnimplementedOp):
-                    buf.writeline(f"UnimplementedOp(op='{op_spec.op}')")
-                else:
-                    buf.writeline("OpSpec(")
-                    with buf.indent():
-                        buf.writeline(f"op='{op_spec.op}',")
-                        buf.writeline(f"is_reduction={op_spec.is_reduction},")
-                        buf.writeline(
-                            "iteration_space={"
-                            + ", ".join(
-                                [
-                                    sympy_str(k)
-                                    + ": ("
-                                    + sympy_str(v[0])
-                                    + ", "
-                                    + str(v[1])
-                                    + ")"
-                                    for k, v in op_spec.iteration_space.items()
-                                ]
-                            )
-                            + "},"
-                        )
-                        buf.writeline(f"op_info={_serialize_value(op_spec.op_info)},")
-                        buf.writeline("args=[")
-                        with buf.indent():
-                            for arg in op_spec.args:
-                                buf.writeline("TensorArg(")
-                                with buf.indent():
-                                    buf.writeline(
-                                        f"is_input={arg.is_input}, arg_index={arg.arg_index}, device_dtype={arg.device_dtype},"
-                                    )
-                                    buf.writeline(f"device_size={arg.device_size},")
-                                    buf.writeline(
-                                        "device_coordinates=["
-                                        + ", ".join(
-                                            [
-                                                sympy_str(e)
-                                                for e in arg.device_coordinates
-                                            ]
-                                        )
-                                        + "],"
-                                    )
-                                    buf.writeline(f"allocation={arg.allocation!r},")
-                                buf.writeline("),")
-                        buf.writeline("]")
-                    buf.writeline("),")
+            _codegen_op_spec_list(self.op_specs, buf, sympy_str)
         buf.writeline("]")
         return buf.getvalue()
 
@@ -699,6 +653,81 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+
+def _iter_op_specs(specs):
+    """Yield every OpSpec in a (possibly nested) op-spec list, depth-first."""
+    for item in specs:
+        if isinstance(item, LoopSpec):
+            yield from _iter_op_specs(item.body)
+        elif isinstance(item, OpSpec):
+            yield item
+
+
+def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
+    """Emit Python source for a list of OpSpec / UnimplementedOp / LoopSpec entries."""
+    for op_spec in specs:
+        if isinstance(op_spec, LoopSpec):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"op_spec: LoopSpec(count={op_spec.count})")
+            buf.writeline("LoopSpec(")
+            with buf.indent():
+                buf.writeline(f"count={sympy_str(op_spec.count)},")
+                buf.writeline("body=[")
+                with buf.indent():
+                    _codegen_op_spec_list(op_spec.body, buf, sympy_str)
+                buf.writeline("],")
+            buf.writeline("),")
+        elif isinstance(op_spec, (UnimplementedOp, OpSpecUnimplementedOp)):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"op_spec: UnimplementedOp({op_spec.op})")
+            buf.writeline(f"UnimplementedOp(op='{op_spec.op}')")
+        else:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"op_spec: {op_spec.op}, is_reduction={op_spec.is_reduction}, "
+                    f"iteration_space={op_spec.iteration_space}, op_info={op_spec.op_info}"
+                )
+            buf.writeline("OpSpec(")
+            with buf.indent():
+                buf.writeline(f"op='{op_spec.op}',")
+                buf.writeline(f"is_reduction={op_spec.is_reduction},")
+                buf.writeline(
+                    "iteration_space={"
+                    + ", ".join(
+                        [
+                            sympy_str(k)
+                            + ": ("
+                            + sympy_str(v[0])
+                            + ", "
+                            + str(v[1])
+                            + ")"
+                            for k, v in op_spec.iteration_space.items()
+                        ]
+                    )
+                    + "},"
+                )
+                buf.writeline(f"op_info={_serialize_value(op_spec.op_info)},")
+                buf.writeline("args=[")
+                with buf.indent():
+                    for arg in op_spec.args:
+                        buf.writeline("TensorArg(")
+                        with buf.indent():
+                            buf.writeline(
+                                f"is_input={arg.is_input}, arg_index={arg.arg_index}, device_dtype={arg.device_dtype},"
+                            )
+                            buf.writeline(f"device_size={arg.device_size},")
+                            buf.writeline(
+                                "device_coordinates=["
+                                + ", ".join(
+                                    [sympy_str(e) for e in arg.device_coordinates]
+                                )
+                                + "],"
+                            )
+                            buf.writeline(f"allocation={arg.allocation!r},")
+                        buf.writeline("),")
+                buf.writeline("]")
+            buf.writeline("),")
 
 
 def simplify_op_spec(op_spec):

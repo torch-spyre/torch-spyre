@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import dataclasses
 from typing import Any, Sequence
 
@@ -67,6 +69,22 @@ class OpSpec:
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
+
+
+@dataclasses.dataclass
+class LoopSpec:
+    """A counted loop whose body is a sequence of ops, possibly nested.
+
+    Attributes:
+        count: Trip count of the loop. May be a symbolic shape expression.
+        body: The operations to execute each iteration. Each element may be
+            an OpSpec, UnimplementedOp, or a nested LoopSpec.
+    """
+
+    count: Expr
+    # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
+    # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
+    body: list[Any]
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
