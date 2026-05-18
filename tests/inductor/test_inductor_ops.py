@@ -2472,8 +2472,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "float32_true": (torch.tensor([2.71828], dtype=torch.float32),),
                 "float32_false": (torch.tensor([0.0], dtype=torch.float32),),
                 "negative_true": (torch.tensor([-1.0], dtype=torch.float32),),
-                "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),), 
-                "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),), 
+                "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),),
+                "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),),
                 "bool_true": (torch.tensor([True]),),
                 "bool_false": (torch.tensor([False]),),
                 "from_computation_true": (
