@@ -8,6 +8,7 @@ from enum import Enum
 import os
 from functools import wraps
 
+import torch
 from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._inductor.scratchpad import (
@@ -348,6 +349,10 @@ class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
 
 
 class TestExamplePattern(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def map_buffers(
         self,
         operations: list[Operation],

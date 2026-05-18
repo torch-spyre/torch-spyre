@@ -44,6 +44,10 @@ def _extract_all_tensors(output):
 class TestModuleCustom(TestCase):
     """Custom test cases for module validation with different execution modes and layouts."""
 
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     @modules(module_db)
     def test_eager_vs_compile(self, device, dtype, module_info, training):
         """Test eager mode vs compile mode, comparing CPU and Spyre outputs.
