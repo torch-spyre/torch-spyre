@@ -2469,11 +2469,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "float16_true": (torch.tensor([3.14], dtype=torch.float16),),
                 "float16_false": (torch.tensor([0.0], dtype=torch.float16),),
-                # "float32_true": (torch.tensor([2.71828], dtype=torch.float32),), # # TODO: FP32 will be supported soon
-                # "float32_true": (torch.tensor([0.0], dtype=torch.float32),), # # TODO: FP32 will be supported soon
-                # "negative_true": (torch.tensor([-1.0], dtype=torch.float32),), # TODO: FP32 will be supported soon
-                # "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),), # TODO: BF16 will be supported soon
-                # "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),), # TODO: BF16 will be supported soon
+                "float32_true": (torch.tensor([2.71828], dtype=torch.float32),),
+                "float32_false": (torch.tensor([0.0], dtype=torch.float32),),
+                "negative_true": (torch.tensor([-1.0], dtype=torch.float32),),
+                "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),), 
+                "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),), 
                 "bool_true": (torch.tensor([True]),),
                 "bool_false": (torch.tensor([False]),),
                 "from_computation_true": (
@@ -5539,7 +5539,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             def fn(t):
                 return torch.is_nonzero(t)
 
-            compare_with_cpu(fn, x, cpu_compile=False)
+            self.compare_with_cpu(fn, x, cpu_compile=False)
 
         elif len(args) == 2:
             x, y = args
@@ -5548,7 +5548,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 result = a * b
                 return torch.is_nonzero(result)
 
-            compare_with_cpu(fn, x, y, cpu_compile=False)
+            self.compare_with_cpu(fn, x, y, cpu_compile=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_is_nonzero_error_cases(self):
