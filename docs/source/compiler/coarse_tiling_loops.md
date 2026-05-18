@@ -446,6 +446,226 @@ Inductor FX graph cache key.  The `loop_group_id` and `loop_count`
 attributes are added in a pre-scheduling pass whose source files are
 already included in `CustomPreSchedulingPasses.uuid()`.
 
+## Implementation and testing plan
+
+The goal of this plan is a working prototype that is sufficient for PR
+#1984 (`chunk_large_tensors`) to be rewritten on top of it.  That pass
+currently avoids the loop IR entirely — it emits a flat sequence of
+`ComputedBuffer` + `Scatter` (overwrite) ops — and the prototype will
+provide the alternative: stamp the ops with loop-group attributes and let
+the loop IR carry the structure through to `bundle.mlir`.
+
+The plan is divided into four milestones.  Each builds on the previous
+and has an independent testability story.
+
+---
+
+### Milestone 1 — `LoopSpec` data structure and serialization
+
+**Scope**: `op_spec.py` and `spyre_kernel.py` only.  No scheduler
+changes, no IR pass changes, no `bundle.py` changes.
+
+**Work items**:
+
+1. Add `LoopSpec` to `op_spec.py`:
+
+   ```python
+   @dataclasses.dataclass
+   class LoopSpec:
+       count: sympy.Expr
+       body: list  # list[OpSpec | UnimplementedOp | LoopSpec]
+   ```
+
+2. Extend `SpyreKernel.codegen_kernel()` to serialize `LoopSpec`
+   recursively alongside the existing `OpSpec` / `UnimplementedOp`
+   branches.  The serialized form is a nested Python literal:
+
+   ```python
+   LoopSpec(
+       count=sympify('K'),
+       body=[
+           OpSpec(...),
+       ]
+   )
+   ```
+
+3. Fix the `arg_index` fixup loop to walk `LoopSpec.body` recursively
+   so that `TensorArg` objects inside loop bodies get correct kernel
+   argument indices.
+
+4. Add `SpyreKernel.wrap_op_specs_in_loop(count: sympy.Expr)` which
+   replaces `self.op_specs` with
+   `[LoopSpec(count=count, body=self.op_specs)]`.
+
+**Test**: Unit tests in `tests/inductor/test_loop_spec.py` that
+construct `LoopSpec` / `OpSpec` objects directly, call
+`codegen_kernel()` on a `SpyreKernel` with a manually assembled
+`op_specs` list that includes `LoopSpec` entries, and assert the
+serialized Python source round-trips correctly (i.e., `eval()` of the
+output reconstructs the original objects).  No compilation or hardware
+needed.
+
+---
+
+### Milestone 2 — `CountedLoopSchedulerNode` and post-fusion pass
+
+**Scope**: `scheduler.py` and `patches.py`.  No IR pass, no codegen
+changes beyond Milestone 1.
+
+**Work items**:
+
+1. Add `CountedLoopSchedulerNode(GroupedSchedulerNode)` to
+   `torch_spyre/_inductor/scheduler.py` as described in the design.
+
+2. Add `_build_loop_scheduler_nodes(nodes: list[BaseSchedulerNode])
+   -> list[BaseSchedulerNode]` in `scheduler.py`.  This is the
+   post-fusion pass body: scans for contiguous runs sharing a
+   `loop_group_id` path prefix, asserts consistency of `loop_count`,
+   and wraps each run in a `CountedLoopSchedulerNode`.  Handles
+   nesting by recursing on the stripped path.
+
+3. Register the pass in `patches.py` by setting
+   `config._post_fusion_custom_pass = _build_loop_scheduler_nodes`
+   alongside the existing `_update_scheduler` monkey-patch.
+
+4. Extend `SuperDSCScheduling.codegen_node()` with the
+   `isinstance(node, CountedLoopSchedulerNode)` branch and
+   `_codegen_counted_loop()` as designed.  At this milestone
+   `_codegen_counted_loop` calls `wrap_op_specs_in_loop` (Milestone 1)
+   and then falls through to the same `define_kernel` / `call_kernel`
+   path as today, so the serialized kernel source will contain a
+   `LoopSpec` literal but the bundle compiler does not yet consume it.
+
+**Test**: Unit tests in `tests/inductor/test_counted_loop_node.py`
+that construct a minimal `Scheduler` over a small set of
+`SchedulerNode`s whose underlying `ir.Operation` objects have been
+stamped with `loop_group_id` and `loop_count` attributes, run the
+post-fusion pass, and assert:
+
+- The output list contains a `CountedLoopSchedulerNode` in the right
+  position.
+- Its `loop_count` is correct.
+- Its `get_nodes()` returns the right constituent nodes.
+- Non-grouped nodes are passed through unchanged.
+- A non-contiguous group (dependency crossing a group boundary) raises
+  an error.
+- A two-level nested group produces a nested
+  `CountedLoopSchedulerNode`.
+
+These tests can be run without a Spyre device by constructing the IR
+objects directly.
+
+---
+
+### Milestone 3 — IR-level loop group stamping (`coarse_tile.py`)
+
+**Scope**: New file `torch_spyre/_inductor/coarse_tile.py` and a
+one-line addition to `passes.py`.
+
+**Work items**:
+
+1. Implement `coarse_tile(operations: list[Operation]) -> None`.
+
+   The function signature and pass placement are the same whether the
+   caller is a standalone coarse-tiling pass or a rewritten
+   `chunk_large_tensors`.  For the prototype, the implementation can be
+   minimal: accept a pre-computed `list[tuple[list[Operation], Expr]]`
+   (groups and their counts) as a parameter, and stamp the
+   `loop_group_id` path and `loop_count` attributes.  The
+   decision logic (which ops to group and what count to use) is
+   intentionally left to the caller for the prototype so that PR #1984
+   can supply its own grouping policy.
+
+2. Insert `coarse_tile(operations)` in `CustomPreSchedulingPasses`
+   after `insert_padding_ir` and before `span_reduction`, guarded by a
+   feature flag (`config.coarse_tiling`, default `False`) so it is
+   inert until callers opt in.
+
+3. Add `coarse_tile.py` to the `uuid()` file list in
+   `CustomPreSchedulingPasses` so the Inductor FX cache is invalidated
+   when the pass changes.
+
+**Connection to PR #1984**: `chunk_large_tensors._chunk_op()` currently
+produces a flat sequence of `ComputedBuffer` + `Scatter` ops.  Once
+Milestone 3 is in place, it can instead call `coarse_tile()` to stamp
+the ops it produces with the appropriate `loop_group_id` and
+`loop_count`, letting the loop IR carry the structure rather than
+relying on the flat scatter pattern.  The two approaches can coexist
+during transition: `chunk_large_tensors` can keep its current output
+while the loop-IR path is validated, then switch.
+
+**Test**: Integration tests in `tests/inductor/test_coarse_tile_pass.py`
+that construct a small `list[ir.Operation]`, call `coarse_tile()` with
+an explicit grouping, and assert:
+
+- Each op in a group has the correct `loop_group_id` path and
+  `loop_count`.
+- Ops outside any group have no `loop_group_id`.
+- Nested groups produce the correct path tuples.
+- The pass is a no-op when passed an empty grouping.
+
+No scheduler, no codegen, no hardware needed.
+
+---
+
+### Milestone 4 — `bundle.mlir` `scf.for` emission
+
+**Scope**: `bundle.py` only.
+
+**Work items**:
+
+1. Refactor `generate_bundle` to separate SDSC JSON compilation (the
+   flat `compile_op_spec` loop) from `bundle.mlir` emission.
+
+2. Add a recursive helper
+   `_emit_bundle_mlir(specs, indent, file, sdsc_files)` that walks
+   `list[OpSpec | LoopSpec]` depth-first:
+   - For each `OpSpec`: emit one `sdscbundle.sdsc_execute` line.
+   - For each `LoopSpec`: emit an `scf.for` block, recurse into
+     `body`, emit closing brace.
+   - Number SDSC JSON files in the depth-first traversal order.
+
+3. Emit the `arith.constant` and shape-value preamble for loop counts.
+   For the prototype, symbolic `loop_count` expressions are
+   concretized with `_concretize_for_sdsc` (already used in
+   `superdsc.py`) and emitted as `arith.constant`.  Dynamic/symbolic
+   emission (reading a runtime shape value) is a follow-up.
+
+**Test**: Unit tests in `tests/inductor/test_bundle_mlir.py` that call
+`generate_bundle` with a manually constructed `list[OpSpec | LoopSpec]`
+(using stub `OpSpec` objects with enough data to pass `compile_op_spec`)
+and assert the content of the generated `bundle.mlir`:
+
+- A flat list produces the existing `sdsc_execute` pattern.
+- A single `LoopSpec` wrapping two `OpSpec`s produces a single
+  `scf.for` with two `sdsc_execute` lines inside.
+- A nested `LoopSpec` produces nested `scf.for` blocks.
+- SDSC JSON files are numbered in depth-first order.
+
+---
+
+### Milestone ordering and PR #1984 integration point
+
+```
+M1 (LoopSpec serialization)
+  └─ M2 (CountedLoopSchedulerNode)
+       └─ M3 (coarse_tile pass)   ← PR #1984 can use this
+            └─ M4 (bundle.mlir scf.for)
+```
+
+PR #1984 needs Milestones 1–3 to be able to use the loop IR.
+Specifically, after M3 merges, `chunk_large_tensors` can:
+
+1. Compute its chunk grouping as it does today.
+2. Call `coarse_tile(operations, groups=[(chunk_ops, loop_count)])`
+   instead of inserting the `Scatter`/overwrite pattern.
+3. The rest of the pipeline (M2's post-fusion pass → M1's
+   `LoopSpec` serialization → M4's `scf.for`) handles the rest.
+
+M4 is needed for end-to-end hardware correctness but not for the
+pipeline integration test that validates the loop structure is correctly
+threaded through the scheduler and codegen stages.
+
 ## Rejected design alternatives
 
 ### Inductor's existing loop IR
