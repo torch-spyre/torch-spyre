@@ -99,9 +99,11 @@ For each operation, `work_distribution_pass`:
    symbols are renamed.
 2. Ranks the remaining dimensions (those not already committed by Pass 1) for
    additional core assignment (`prioritize_dimensions`): output dimensions
-   first by decreasing stick-adjusted size, reduction dimensions last. For
-   non-matmul reductions, reduction dimensions are excluded entirely due to a
-   known backend limitation.
+   first by decreasing stick-adjusted size, reduction dimensions last. At most
+   one reduction dimension is eligible for splitting — the one that maximises
+   `core_split(size, remaining_cores)` after output dimensions have absorbed
+   their share of cores. If Pass 1 already committed a reduction split, no
+   further reduction dimensions are eligible.
 3. Distributes all `max_cores` across committed and priority dimensions
    (`multi_dim_iteration_space_split`): first applies the committed splits as
    minimum requirements, then greedily assigns the largest valid divisor of
@@ -127,25 +129,24 @@ The iteration space is that of the output tensor. All output dimensions are
 candidates for splitting. There is no reduction dimension. Span-required
 splits are computed jointly over all input and output tensors.
 
-### Reduction Operations (non-matmul)
+### Reduction Operations
 
-Reduction dimensions are excluded from work division candidates due to a known
-backend limitation. Only output dimensions are split. Span-required splits are
-asserted to not involve reduction variables; if they do, the compiler raises an
-error.
+Output dimensions are split first, by decreasing size. After output dimensions
+have been assigned cores, at most one reduction dimension may also be split: the
+one whose size has the most useful divisors for the remaining core budget (i.e.
+maximises `core_split(size, remaining_cores)`). If Pass 1 already committed a
+reduction split to satisfy the span limit, no further reduction dimension is
+split in Pass 2.
 
-### Matrix Multiplication
+Span-required splits may include at most one reduction variable; if more than
+one reduction variable must be split to satisfy the 256 MB limit, the compiler
+raises an error.
 
-The iteration space covers the M (rows), K (reduction), and N (columns)
-dimensions. All three are candidates. The priority order after span-required
-splits is: output dimensions (M and N) by decreasing size, then K last. K is
-only split when M and N cannot utilize all available cores.
-
-### Batched Matrix Multiplication
-
-Same as matrix multiplication, with additional batch dimensions prepended.
-Batch dimensions appear as output dimensions and receive the highest priority
-(largest size first), followed by N, M, and finally K.
+For matrix multiplication the reduction dimension is K. Since all matrix
+multiply variants (mm, bmm) have exactly one K dimension, K is treated as any
+other reduction dimension: output dimensions (batch, M, N) take priority by
+decreasing size, and K is only split when the output dimensions cannot utilise
+all available cores.
 
 ## Configuration
 
@@ -160,7 +161,6 @@ values range from 1 (no parallelization) to 32 (maximum supported cores).
 - Dimensions must divide evenly by the slice count (no uneven splits)
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work division;
   `ExternKernel` and `FallbackKernel` nodes are skipped
-- Non-matmul reductions cannot split along the reduction dimension
 
 **Potential future enhancements:**
 

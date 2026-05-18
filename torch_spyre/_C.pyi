@@ -115,8 +115,8 @@ class DataFormats:
     def value(self) -> int: ...
 
 class SpyreTensorLayout:
-    __hash__: typing.ClassVar[None] = None  # type: ignore
-    def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore
+    def __hash__(self) -> int: ...
+    def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore[override]
     @typing.overload
     def __init__(
         self,

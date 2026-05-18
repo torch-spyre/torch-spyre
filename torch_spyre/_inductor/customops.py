@@ -190,7 +190,26 @@ def _(
     return input.new_empty(input.size())
 
 
-@torch.library.custom_op("spyre::full", mutates_args=(), device_types="spyre")
+# spyre::full is registered via the low-level Library API rather than
+# torch.library.custom_op because the latter dispatches through
+# python_dispatch.cpp's `redispatch_boxed` lambda, whose c_return event is
+# dropped by CPython's sys.setprofile when the lambda releases the GIL and
+# calls back into Python. With with_stack=True profilers the dropped c_return
+# corrupts post-processing of the outer pybind frame, attributing trace-end
+# timestamps to every spyre::full event. The Library API path is direct C
+# dispatch and pairs c_call/c_return correctly.
+#
+# Because spyre::full takes no Tensor arguments, BackendSelect cannot infer a
+# device-specific dispatch key, so the impl is registered on
+# CompositeExplicitAutograd which fires before BackendSelect for tensorless
+# schemas. The implementation routes by the `device` argument internally.
+_spyre_lib = torch.library.Library("spyre", "FRAGMENT")
+_spyre_lib.define(
+    "full(int[] size, Scalar fill_value, Device device, *, "
+    "ScalarType? dtype=None) -> Tensor"
+)
+
+
 def spyre_full(
     size: Sequence[int],
     fill_value: torch.types.Number,
@@ -203,10 +222,35 @@ def spyre_full(
     return tmp.to(device)
 
 
-@spyre_full.register_fake
-def _(
+def _spyre_full_meta(
     size: Sequence[int],
     fill_value: torch.types.Number,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    return torch.empty(size, dtype=dtype, device=device)
+
+
+_spyre_lib.impl("full", spyre_full, "CompositeExplicitAutograd")
+_spyre_lib.impl("full", _spyre_full_meta, "Meta")
+
+
+@torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
+def spyre_empty(
+    size: Sequence[int],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    # Eager-mode simulation: allocate on CPU and move to the Spyre device.
+    # This is not a compute fallback — on hardware the compiled kernel receives
+    # a device allocation from SpyreAllocator with no host-side initialisation.
+    tmp = torch.empty(size, dtype=dtype, device="cpu")
+    return tmp.to(device)
+
+
+@spyre_empty.register_fake
+def _(
+    size: Sequence[int],
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
 ):
@@ -393,6 +437,17 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
 #    Returns a scalar (0D) tensor matching the input dtype.
 #    """
 #    return input.new_empty([])
+
+
+@torch.library.custom_op("spyre::batched_matmul", mutates_args=(), device_types="spyre")
+def batched_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@batched_matmul.register_fake
+def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output_shape = list(x.shape[:-1]) + [y.shape[-1]]
+    return x.new_empty(output_shape)
 
 
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")

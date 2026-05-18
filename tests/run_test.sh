@@ -90,7 +90,7 @@ for _arg in "$@"; do
         _dir_yamls=()
         while IFS= read -r -d '' _f; do
             _dir_yamls+=("$(realpath "$_f")")
-        done < <(find "$(realpath "$_arg")" -maxdepth 1 \
+        done < <(find "$(realpath "$_arg")" \
                      \( -name '*.yaml' -o -name '*.yml' \) \
                      -type f -print0 | sort -z)
         if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
@@ -199,33 +199,53 @@ _find_sibling_with_sentinel() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Resolve and export TORCH_ROOT
+# 2. Resolve and export TORCH_ROOT (only when referenced in YAML paths)
 # ---------------------------------------------------------------------------
-echo "[spyre_run] Resolving TORCH_ROOT..."
-if [[ -n "${TORCH_ROOT:-}" && -d "$TORCH_ROOT" ]]; then
-    echo "[spyre_run]   already set: $TORCH_ROOT"
-else
-    TORCH_ROOT=""
+_check_torch_root_needed() {
+    grep -qE 'path:\s.*\$\{TORCH_ROOT\}' "$1" 2>/dev/null && return 0
+    if grep -E '^\s*(- )?path:\s' "$1" | grep -qE '\$\{TORCH_ROOT\}'; then
+        return 0
+    fi
+    return 1
+}
 
-    _found=$(python3 -c "
+if _check_torch_root_needed "$YAML_CONFIG"; then
+    _TORCH_ROOT_NEEDED=1
+    echo "[spyre_run]   YAML config references \${TORCH_ROOT} root — resolving..."
+else
+    _TORCH_ROOT_NEEDED=0
+    echo "[spyre_run]   YAML config does not reference \${TORCH_ROOT} — skipping resolution."
+fi
+
+if [[ $_TORCH_ROOT_NEEDED -eq 1 ]]; then
+    echo "[spyre_run] Resolving TORCH_ROOT..."
+    if [[ -n "${TORCH_ROOT:-}" && -d "$TORCH_ROOT" ]]; then
+        echo "[spyre_run]   already set: $TORCH_ROOT"
+    else
+        TORCH_ROOT=""
+
+        _found=$(python3 -c "
 import torch, os
 candidate = os.path.dirname(os.path.dirname(os.path.abspath(torch.__file__)))
 if os.path.isfile(os.path.join(candidate, 'test', 'test_binary_ufuncs.py')):
     print(candidate)
 " 2>/dev/null) || true
-    [[ -n "$_found" ]] && TORCH_ROOT="$_found"
+        [[ -n "$_found" ]] && TORCH_ROOT="$_found"
 
-    if [[ -z "$TORCH_ROOT" ]]; then
-        TORCH_ROOT=$(_find_sibling_with_sentinel "$YAML_DIR" "test/test_binary_ufuncs.py" 2>/dev/null) || true
-    fi
+        if [[ -z "$TORCH_ROOT" ]]; then
+            TORCH_ROOT=$(_find_sibling_with_sentinel "$YAML_DIR" "test/test_binary_ufuncs.py" 2>/dev/null) || true
+        fi
 
-    if [[ -z "$TORCH_ROOT" ]]; then
-        echo "ERROR: Could not locate PyTorch source root." >&2
-        echo "       Expected pytorch/ as a sibling of your torch-spyre repo, or" >&2
-        echo "       an editable install (pip install -e .)." >&2
-        echo "       Set TORCH_ROOT explicitly if the layout differs." >&2
-        exit 1
+        if [[ -z "$TORCH_ROOT" ]]; then
+            echo "ERROR: Could not locate PyTorch source root." >&2
+            echo "       Expected pytorch/ as a sibling of your torch-spyre repo, or" >&2
+            echo "       an editable install (pip install -e .)." >&2
+            echo "       Set TORCH_ROOT explicitly if the layout differs." >&2
+            exit 1
+        fi
     fi
+else
+    TORCH_ROOT="${TORCH_ROOT:-}"
 fi
 export TORCH_ROOT
 export PYTORCH_ROOT="$TORCH_ROOT"
@@ -1382,6 +1402,13 @@ _run_xdist_fallback() {
         echo "[spyre_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
     fi
 
+    # Propagate test failures from the xdist fallback run.
+    if [[ $_xexit -eq 1 ]]; then
+        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+    elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+        OVERALL_EXIT=$_xexit
+    fi
+
     # Inject XML tags into the shard produced by the xdist run.
     if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
         python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
@@ -1512,19 +1539,25 @@ for i in "${!RUN_FILES[@]}"; do
     # Exit code handling
     #
     #   0   = all tests passed
-    #   1   = tests ran, some failed/errored  (reported by pytest; non-fatal)
-    #   5   = no tests collected              (warning only)
+    #   1   = tests ran, some failed/errored  (propagated → OVERALL_EXIT=1)
+    #   5   = no tests collected              (warning only; does not fail run)
     #   127 = command not found (python3/pytest missing) — fatal
     #   128+= signal/abnormal termination    — retry with -n1 (xdist fallback)
     #         Common: 139 (SIGSEGV), 255 (C abort).  130 (Ctrl-C) breaks loop.
     # -----------------------------------------------------------------------
     case $_exit in
-        0|1|5)
-            # Normal pytest outcomes (tests ran, some may have failed/xpassed).
-            # Individual results are visible in pytest output; run_test.sh
-            # always exits 0 for these so CI sees the report rather than a
-            # blanket failure.  Signal exits (>= 128) are the only codes that
-            # trigger the xdist fallback and propagate a non-zero exit.
+        0)
+            # All tests passed.
+            ;;
+        1)
+            # Some tests failed or errored — pytest already reported them.
+            # Propagate so CI marks the job as failed when mandatory_success
+            # tests do not pass.
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            ;;
+        5)
+            # No tests collected — warn but do not fail the overall run.
+            echo "[spyre_run] WARNING: no tests collected for $original_file" >&2
             ;;
         127)
             echo "[spyre_run] FATAL: python3 or pytest not found (exit 127) for $original_file" >&2

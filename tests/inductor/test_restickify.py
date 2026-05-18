@@ -23,13 +23,15 @@
 # stick-aligned inputs that exercise the restickify path rather than fallback.
 
 import math
-import os
 
 import pytest
-import torch
+from unittest.mock import patch
 
-import torch_spyre._inductor.insert_restickify as _insert_restickify
+import torch
+from torch._inductor.virtualized import V
+
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
+from torch._inductor.exc import InductorError
 from utils_inductor import _compile_and_run, compare_with_cpu
 
 DEVICE = torch.device("spyre")
@@ -37,34 +39,44 @@ S = 128  # must be a multiple of 64
 T = 64  # side length for 4D tests (all dims equal)
 
 
-def _verify_cost(expected_cost):
-    if not _insert_restickify.restickify_plan:
-        # Cache hit — finalize_layouts did not run, plan was not captured. Skip cost check.
-        return
-    actual = sum(
+# -------- Helpers ---------- #
+def _compute_cost(restickify_plan):
+    assert restickify_plan is not None, "restickify_plan should not be None"
+    return sum(
         math.prod(int(s) for s in entry["target_layout"].size)
-        for entries in _insert_restickify.restickify_plan.values()
+        for entries in restickify_plan.values()
         for entry in entries
     )
-    assert actual == expected_cost, (
-        f"restickify cost: expected {expected_cost}, got {actual}"
-    )
+
+
+def _compile_and_run_plan_capture(fn, *args):
+    import torch_spyre._inductor.passes as _passes
+
+    captured = {}
+    finalize_layouts = _passes.finalize_layouts
+
+    def capturing_finalize_layouts(operations):
+        finalize_layouts(operations)
+        captured["plan"] = dict(V.graph.restickify_plan)
+
+    with patch.object(_passes, "finalize_layouts", capturing_finalize_layouts):
+        spyre_result = _compile_and_run(fn, args, DEVICE)
+
+    return spyre_result, captured.get("plan", {})
 
 
 def _compare(fn, *args, check_strides=True, optimal_cost=None, skip_correctness=False):
     """Run fn on Spyre, assert correctness against CPU, and optionally assert the restickify
-    plan has cost == optimal_cost. Restickify decisions and their cost normally remains inside
-    the compiler; the env var below instructs the compiler to stash it for us.
+    plan has cost == optimal_cost.
     """
-    if optimal_cost is not None:
-        _insert_restickify.restickify_plan = {}
-        os.environ["SPYRE_CAPTURE_RESTICKIFY_PLAN"] = "1"
-        try:
-            spyre_result = _compile_and_run(fn, args, DEVICE)
-        finally:
-            del os.environ["SPYRE_CAPTURE_RESTICKIFY_PLAN"]
-    else:
+    if optimal_cost is None:
         spyre_result = _compile_and_run(fn, args, DEVICE)
+    else:
+        spyre_result, plan = _compile_and_run_plan_capture(fn, *args)
+        actual_cost = _compute_cost(plan)
+        assert actual_cost == optimal_cost, (
+            f"restickify cost: expected {optimal_cost}, got {actual_cost}"
+        )
     if not skip_correctness:
         compare_with_cpu(fn, *args, target=spyre_result, run_eager=False)
     if check_strides:
@@ -72,8 +84,6 @@ def _compare(fn, *args, check_strides=True, optimal_cost=None, skip_correctness=
         assert cpu_result.stride() == spyre_result.stride(), (
             f"Stride mismatch: CPU {cpu_result.stride()} vs Spyre {spyre_result.stride()}"
         )
-    if optimal_cost is not None:
-        _verify_cost(optimal_cost)
 
 
 def _make_tensors(n, *shape):
@@ -483,8 +493,7 @@ def test_bmm_with_inplace_mutation():
         cache.copy_(x)
         return torch.bmm(cache, weight.t().unsqueeze(0).expand(B, -1, -1))
 
-    spyre_result = _compile_and_run(func, (x, weight, cache), DEVICE)
-    compare_with_cpu(func, x, weight, cache, target=spyre_result, run_eager=False)
+    _compare(func, x, weight, cache)
 
 
 # Optimizer correctness + optimality tests: verify both output values and
@@ -731,3 +740,40 @@ def test_opt_matmul_both_inputs_upstream_conflict():
         d,
         optimal_cost=2 * S * S,
     )
+
+
+# ------- Intentional failure -------------------
+
+
+def test_wrong_optimal_cost_fails():
+    """This tests checks if the optimal cost is mismatching so proper
+    assertion failure is detected"""
+
+    a, b, c, d, e = _make_tensors(5, S, S)
+
+    def func(a, b, c, d, e):
+        return (a + b.t() + c.t() + d.t()) @ e
+
+    correct_expected_cost = 2 * S * S
+
+    with pytest.raises(
+        AssertionError,
+        match=f"restickify cost: expected 0, got {correct_expected_cost}",
+    ):
+        _compare(func, a, b, c, d, e, optimal_cost=0)
+
+
+# ------- Unsupported stick configurations ---------
+
+
+def test_sparse_dense_pointwise_unsupported():
+    """a.sum(1) + b - pointwise of sparse and dense tensors not yet supported.
+
+    There is no restickify resolution for this configuration so we must catch this and report error
+    """
+    a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+    with pytest.raises(
+        InductorError, match="No mechanism to gather elements from multiple sticks"
+    ):
+        _compare(lambda a, b: a.sum(1) + b, a, b)

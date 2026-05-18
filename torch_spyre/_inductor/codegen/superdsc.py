@@ -30,6 +30,7 @@ from torch_spyre._inductor.constants import (
     SEGMENT_OFFSETS,
     TOPK_OPS,
 )
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
@@ -150,6 +151,48 @@ def _get_core_to_slice_mapping(
     return dim_to_expr
 
 
+def _k_fast_core_to_slice_mapping(
+    iteration_space, dim_splits: dict[Symbol, int], num_cores: int
+) -> dict[Symbol, Expr]:
+    """K-cohort-adjacent core-to-slice mapping for matmul.
+
+    Computed directly from the same `(iteration_space, dim_splits, num_cores)`
+    inputs as `_get_core_to_slice_mapping`, by treating the K (reduction) dim
+    as the innermost/fastest-varying axis along `core_id`. K-cohort members
+    (varying `i_k`, fixed `i_m, i_n`) then sit at adjacent physical core IDs,
+    so the PSUM ring reduction traverses 1 hop per output tile instead of
+    `m * n`.
+
+    Caller is responsible for the gating decision (matmul + k_fast flag + k>1).
+    """
+    dim_list = list(iteration_space.keys())
+    k_dim = dim_list[-1]
+    reordered = {k_dim: iteration_space[k_dim]}
+    for d in dim_list[:-1]:
+        reordered[d] = iteration_space[d]
+    return _get_core_to_slice_mapping(reordered, dim_splits, num_cores)
+
+
+def _should_use_k_fast_mapping(
+    is_matmul: bool, iteration_space, dim_splits: dict[Symbol, int]
+) -> bool:
+    """Decide whether the k_fast mapping should be used for this op.
+
+    Fires only when all three hold: this op is a matmul, the feature flag is
+    on, and the planner has chosen a K-split (k > 1). When k == 1 the k_fast
+    mapping is identical to the default, so we just use the default to keep
+    the code path explicit.
+    """
+    if not is_matmul:
+        return False
+    if not _spyre_config.core_id_k_fast_emission:
+        return False
+    dim_list = list(iteration_space.keys())
+    if len(dim_list) < 3:
+        return False
+    return dim_splits[dim_list[-1]] > 1
+
+
 def _get_mask_value(op: str) -> float:
     return float("-inf") if op == "max" else float("inf") if op == "min" else 0
 
@@ -230,10 +273,10 @@ def _get_padded_iteration_space(
         for idx, dim in enumerate(layout["dim_order"]):
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
-            dim_size = dev_size[idx] * layout["stick_size"]
-            if sdsc_iteration_space[dim] < dim_size:
-                padding[dim] = dim_size - sdsc_iteration_space[dim]
-                sdsc_iteration_space[dim] = dim_size
+            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
+            if unaligned > 0:
+                padding[dim] = layout["stick_size"] - unaligned
+                sdsc_iteration_space[dim] += padding[dim]
     return padding
 
 
@@ -315,7 +358,7 @@ def _create_sdsc_tensors(
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
-                strides[dim] = strides[dim] / dev_dim_size * it_dim_size
+                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
             max_dim_sizes[dim] = -1
 
@@ -454,6 +497,15 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
+    if _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
+        core_id_to_work_slice = _k_fast_core_to_slice_mapping(
+            sdsc_iteration_space, dim_splits, num_cores
+        )
+    else:
+        core_id_to_work_slice = _get_core_to_slice_mapping(
+            sdsc_iteration_space, dim_splits, num_cores
+        )
+
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
         execution_unit="pt" if is_matmul else "sfp",
@@ -464,9 +516,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         iteration_space=sdsc_iteration_space,
         num_cores=num_cores,
         work_slices=work_slices,
-        core_id_to_work_slice=_get_core_to_slice_mapping(
-            sdsc_iteration_space, dim_splits, num_cores
-        ),
+        core_id_to_work_slice=core_id_to_work_slice,
         padding=padding,
         layouts=layouts,
         args=args,
