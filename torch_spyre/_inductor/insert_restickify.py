@@ -28,6 +28,7 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
+    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -279,7 +280,10 @@ def finalize_layouts(operations: list) -> None:
     for op in operations:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             continue
-        target_layout = op.layout.target.get_layout()
+        target = op.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data  # Traverse view chain to underlying buffer
+        target_layout = target.get_layout()
         assert isinstance(target_layout, FixedTiledLayout), (
             f"mutation op {op.get_name()} target has no committed FixedTiledLayout"
         )
