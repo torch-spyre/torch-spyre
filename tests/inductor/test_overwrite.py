@@ -147,6 +147,38 @@ class TestOverwriteNonZeroDim(unittest.TestCase):
             )
 
 
+class TestOverwriteIssue1765(unittest.TestCase):
+    """Reproducer from torch-spyre#1765: sequential overwrites at
+    progressively increasing offsets accumulated divergence from the
+    CPU reference (max_diff growing 4.4 → 5.3 across iterations 0–9).
+    This is the multi-call manifestation of the dynamo specialize_int
+    bug — each call writes to the first call's offset instead of its
+    own, so the CPU-vs-Spyre diff at distinct positions compounds."""
+
+    def test_issue_1765_sequential_overwrites_4d_dim2(self):
+        torch.manual_seed(42)
+
+        cache = torch.randn(1, 8, 64, 128, dtype=DTYPE)
+        cache_sp = cache.to(DEVICE)
+        ref = cache.clone()
+
+        for i in range(10):
+            new_val = torch.randn(1, 8, 1, 128, dtype=DTYPE)
+            ref[:, :, i:i + 1, :] = new_val
+            torch.ops.spyre.overwrite(
+                input=new_val.to(DEVICE),
+                output=cache_sp,
+                dims=[2],
+                offsets=[i],
+            )
+
+        out = cache_sp.to("cpu")
+        max_diff = (ref - out).abs().max().item()
+        # fp16 round-trip noise is ~2e-3; the issue reports max_diff
+        # growing past 5.0 across iterations on the unfixed tree.
+        self.assertLess(max_diff, 0.01, f"max_diff={max_diff}")
+
+
 class TestOverwriteCpuFallback(unittest.TestCase):
     """Smoke check for the CPU kernel registration. The fix does not
     touch CPU behavior, but co-locating asserts the API contract is
