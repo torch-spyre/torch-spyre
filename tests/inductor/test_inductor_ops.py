@@ -426,6 +426,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 rand_type="xavier",
             ),
         },
+        ("test_matmul_noncontiguous", "test_mm_relaxed"): {
+            "ops_dict": {"matmul": torch.matmul},
+            "param_sets": {
+                "3d": (
+                    cached_xavier((128, 2, 128)).transpose(0, 1),
+                    cached_xavier((128, 2, 256)).transpose(0, 1),
+                ),
+                "4d": (
+                    cached_xavier((2, 8, 128, 128)),
+                    cached_xavier((2, 128, 8, 128)).transpose(1, 2),
+                ),
+            },
+        },
         ("test_large_matmul", "test_mm_relaxed"): {
             "ops_dict": {"matmul": torch.matmul},
             "param_sets": {
