@@ -19,6 +19,7 @@ overwrite() calls with varying offsets used to silently reuse the first
 call's compiled binary because dynamo's default specialize_int=False
 left int-list args un-guarded. See customops.py for the fix.
 """
+
 import unittest
 
 import torch
@@ -164,7 +165,7 @@ class TestOverwriteIssue1765(unittest.TestCase):
 
         for i in range(10):
             new_val = torch.randn(1, 8, 1, 128, dtype=DTYPE)
-            ref[:, :, i:i + 1, :] = new_val
+            ref[:, :, i : i + 1, :] = new_val
             torch.ops.spyre.overwrite(
                 input=new_val.to(DEVICE),
                 output=cache_sp,
@@ -213,7 +214,7 @@ class TestOverwriteFunctionalReinplace(unittest.TestCase):
             # overwrite_f per slot, returning new cache each time.
             for i in range(len(slots)):
                 cache = torch.ops.spyre.overwrite_f(
-                    tokens[i:i + 1], cache, [0], [slots[i]]
+                    tokens[i : i + 1], cache, [0], [slots[i]]
                 )
             return cache
 
