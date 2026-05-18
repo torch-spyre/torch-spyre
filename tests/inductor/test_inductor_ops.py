@@ -237,6 +237,8 @@ FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
+    torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
+
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
