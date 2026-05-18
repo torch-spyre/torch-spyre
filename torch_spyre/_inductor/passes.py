@@ -239,8 +239,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
-        propagate_real_dims(operations)
         propagate_spyre_tensor_layouts(operations)
+        propagate_real_dims(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)

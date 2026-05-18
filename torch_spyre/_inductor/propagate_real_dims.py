@@ -30,57 +30,108 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP
-
+from .views import compute_coordinates
 from torch.utils.weak import WeakTensorKeyDictionary
 
 logger = get_inductor_logger("propagate_real_dims")
 
-_real_dims = WeakTensorKeyDictionary()
+
+_real_dims = {}
+
+_real_tensor_dims = WeakTensorKeyDictionary()
 
 
-def annotate_real_dims(tensor, info):
+def declare_real_dim(name, size):
     """
-    Annotate device tensor with real dimensions
+    Declare a real dimension
     """
-    _real_dims[tensor] = info
+    _real_dims[name] = size
+
+
+def annotate_real_dims(tensor, real_dims):
+    """
+    Annotate tensor with real dimensions: [(name, size), ...]
+    """
+    _real_tensor_dims[tensor] = real_dims
     return tensor
 
 
-def _get_real_dims(dep):
-    return V.graph.get_buffer(dep.name).real_dims
+def _get_buffer(dep):
+    return V.graph.get_buffer(dep.name)
+
+
+def _compute_real_layout(real_dims):
+    """
+    Compute real size and stride based on real dims
+    """
+    size = []
+    stride = [1]
+    for s in reversed(real_dims):
+        stride.append(stride[-1] * _real_dims[s])
+        size.append(_real_dims[s])
+    return list(reversed(size)), list(reversed(stride[:-1]))
 
 
 def _matmul_real_dims(op, inputs):
-    # TODO use coordinates to find the real dims
+    """
+    Augment matmul with real ranges and output real dims
+    """
+    ranges0 = inputs[0].ranges
+    index0 = inputs[0].index
+    real_dims0 = _get_buffer(inputs[0]).real_dims
+    real_size0, real_stride0 = _compute_real_layout(real_dims0)
 
-    # the output dims
-    op.real_dims = [
-        _get_real_dims(inputs[0])[0],
-        _get_real_dims(inputs[1])[1],
-    ]
+    ranges1 = inputs[1].ranges
+    index1 = inputs[1].index
+    real_dims1 = _get_buffer(inputs[1]).real_dims
+    real_size1, real_stride1 = _compute_real_layout(real_dims1)
 
-    # the op dims
-    op.it_real_dims = [
-        _get_real_dims(inputs[0])[0],
-        _get_real_dims(inputs[0])[1],
-        _get_real_dims(inputs[1])[1],
-    ]
+    # compute coordinates based on real dims
+    real_coords0 = compute_coordinates(real_size0, real_stride0, ranges0, index0)
+    real_coords1 = compute_coordinates(real_size1, real_stride1, ranges1, index1)
+
+    # identify order of op dims
+    keys = ranges0.keys()
+    vars0 = index0.free_symbols
+    vars1 = index1.free_symbols
+    dim0 = next(iter(keys - vars1))
+    dim1 = next(iter(vars0 & vars1))
+    dim2 = next(iter(keys - vars0))
+
+    # match iteration variables to real dims
+    matches = {dim0: None, dim1: None, dim2: None}
+    for i, coord in enumerate(real_coords0):
+        if coord.is_symbol:
+            matches[next(iter(coord.free_symbols))] = real_dims0[i]
+    for i, coord in enumerate(real_coords1):
+        if coord.is_symbol:
+            matches[next(iter(coord.free_symbols))] = real_dims1[i]
+
+    # add output real dims
+    op.real_ranges = [matches[dim0], matches[dim1], matches[dim2]]
+
+    # add op real ranges
+    op.real_dims = [matches[dim0], matches[dim2]]
 
 
 def _compute_real_dims(op, inputs):
-    data = op.data
-
-    if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
+    """
+    Augment op with real ranges and output real dims
+    """
+    if isinstance(op.data, Reduction) and op.data.reduction_type == BATCH_MATMUL_OP:
         return _matmul_real_dims(op, inputs)
 
-    # TODO
-    op.real_dims = _get_real_dims(inputs[0])
-    op.it_real_dims = _get_real_dims(inputs[0])
+    # TODO handle other op types
+    op.real_ranges = _get_buffer(inputs[0]).real_dims
+    op.real_dims = _get_buffer(inputs[0]).real_dims
 
 
 def propagate_real_dims(
     operations: list[Operation],
 ) -> None:
+    """
+    Propagate real dims from inputs though graph
+    """
     if len(V.graph.graph_input_names) > 0:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
@@ -96,7 +147,7 @@ def propagate_real_dims(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                tb.real_dims = _real_dims.get(real_input)
+                tb.real_dims = _real_tensor_dims.get(real_input)
 
     it = iter(operations)
     for op in it:
@@ -118,10 +169,11 @@ def propagate_real_dims(
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 
-    # debug print
+    # debug
+
     print("OPS")
     for op in iter(operations):
-        print(op.get_operation_name(), op.it_real_dims)
+        print(op.get_operation_name(), op.real_ranges)
 
     print("TENSORS")
     for buf in V.graph.buffers:
