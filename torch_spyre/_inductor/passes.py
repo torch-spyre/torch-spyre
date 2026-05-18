@@ -29,7 +29,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
 
-from .padding import insert_padding_ir
+from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
@@ -42,6 +42,7 @@ from .propagate_layouts import (
 )
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import insert_restickify, finalize_layouts
+from .memory_planning import memory_planning
 from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
@@ -201,7 +202,7 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [spyre_fuse_nodes]
+        return [memory_planning, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):
@@ -228,7 +229,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
-        insert_padding_ir(operations)
+        insert_bmm_padding(operations)
         dedup_and_promote_constants(operations)
         span_reduction(operations)
         k_fast_ops = (
@@ -248,7 +249,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
-            inspect.getfile(insert_padding_ir),
+            inspect.getfile(insert_bmm_padding),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),
