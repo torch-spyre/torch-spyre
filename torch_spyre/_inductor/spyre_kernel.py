@@ -409,6 +409,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             elif arg.device_dtype not in [
                 DataFormats.IEEE_FP32,
                 DataFormats.SEN169_FP16,
+                DataFormats.IEEE_INT32,
             ]:
                 raise Unsupported(f"operation on {arg.device_dtype}")
 
