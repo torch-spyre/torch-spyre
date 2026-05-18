@@ -256,6 +256,8 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
     Replace constant arguments to any operation with spyre.constant node.
     Scalar constants are converted to size=1 tensor and passed to the corresponding
     operations which was consuming the scalar value at lowering.
+    Deduplication of identical constants happens later at the IR level via
+    dedup_and_promote_constants.
     """
 
     ops_support_list = [
@@ -266,48 +268,31 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
         torch.ops.aten.div.Tensor,
     ]
 
-    # Created node cache for scalar values, and reuse the node when
-    # the scalar found again.
-    const_node_map: dict[int | float, torch.fx.node.Node] = {}
-
     for node in graph.nodes:
         if node.target not in ops_support_list:
             continue
-        scalar_indexes = []
-        for i in range(len(node.args)):
-            in_arg = node.args[i]
-            if not isinstance(in_arg, torch.fx.node.Node):
-                if isinstance(in_arg, (int, float)):
-                    scalar_indexes.append(i)
-                else:
-                    logger.warning(f"Warning: unhandled node type {type(in_arg)}")
-
-        if len(scalar_indexes) > 0:
-            for idx in scalar_indexes:
-                scalar_val = node.args[idx]
-
-                with graph.inserting_before(node):
-                    if scalar_val in const_node_map:
-                        const_node = const_node_map[scalar_val]
-                    else:
-                        # Currently the dtype of the scalar tensor is set as same as the output dtype.
-                        # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
-                        # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
-                        dtype = torch.float16
-                        meta = node.meta.get("tensor_meta", None)
-                        if meta:
-                            dtype = meta.dtype
-                        node_name = "py_const"
-                        node_args = [scalar_val, dtype, torch.device("spyre")]
-                        const_node = graph.create_node(
-                            "call_function",
-                            torch.ops.spyre.constant.default,
-                            tuple(node_args),
-                            {},
-                            node_name,
-                            node.type,
-                        )
-                        const_node_map[scalar_val] = const_node
-                    node.update_arg(idx, const_node)
+        for idx, in_arg in enumerate(node.args):
+            if isinstance(in_arg, torch.fx.node.Node):
+                continue
+            if not isinstance(in_arg, (int, float)):
+                logger.warning(f"Warning: unhandled node type {type(in_arg)}")
+                continue
+            # Currently the dtype of the scalar tensor is set as same as the output dtype.
+            # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
+            # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
+            dtype = torch.float16
+            meta = node.meta.get("tensor_meta", None)
+            if meta:
+                dtype = meta.dtype
+            with graph.inserting_before(node):
+                const_node = graph.create_node(
+                    "call_function",
+                    torch.ops.spyre.constant.default,
+                    (in_arg, dtype, torch.device("spyre")),
+                    {},
+                    "py_const",
+                    node.type,
+                )
+            node.update_arg(idx, const_node)
 
     graph.lint()

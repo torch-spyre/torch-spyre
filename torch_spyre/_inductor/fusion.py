@@ -17,14 +17,20 @@ from torch._inductor.scheduler import (
     FusedSchedulerNode,
     SchedulerNode,
 )
-
+from torch._inductor.virtualized import V
+from torch._inductor.ir import FallbackKernel
 from torch_spyre._inductor.logging_utils import _get_env_bool
+from .ir import FixedTiledLayout
+from .constants import SEGMENT_OFFSETS
 
 # TODO: Temporary hook to easily disable
 _FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION", True)
 
-# Until https://github.com/torch-spyre/torch-spyre/issues/827 is completed.
-_MAX_BUNDLE_TENSORS = 6
+
+def _max_bundle_tensors() -> int:
+    # Until https://github.com/torch-spyre/torch-spyre/issues/827 is completed.
+    has_pool = getattr(V.graph, "pool_size", 0) > 0
+    return len(SEGMENT_OFFSETS) - (2 if has_pool else 1)
 
 
 def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
@@ -35,35 +41,53 @@ def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
     return None
 
 
+def _is_non_intermediate(name: str) -> bool:
+    buf = V.graph.get_buffer(name)
+    if buf is None or isinstance(buf, FallbackKernel):
+        return False
+    layout = buf.get_layout()
+    return isinstance(layout, FixedTiledLayout) and not layout.allocation
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
     Each kernel will be compiled into a single SuperDSC Bundle.
     Fusion is limited by the following constraints.
      1. We only want to fuse SchedulerNodes (ie, nodes that generate OpSpecs).
-     2. A SDSC Bundle can refer to at most 6 unique tensors (until we complete https://github.com/torch-spyre/torch-spyre/issues/827).
+     2. A SDSC Bundle can refer to at most 5 unique non-intermediate tensors
+        (graph inputs/outputs). Intermediates don't count toward this limit.
     """
     if not _FUSION_ENABLED or len(nodes) == 0:
         return nodes
 
+    max_tensors = _max_bundle_tensors()
     fused_nodes: list[BaseSchedulerNode] = []
     cur_nodes: list[SchedulerNode] = []
     cur_tensors: set[str] = set()
+    cur_non_intermediate_count: int = 0
 
     for n in nodes:
         if isinstance(n, SchedulerNode):
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
-            candidate = cur_tensors | n_tensors
-            if len(candidate) <= _MAX_BUNDLE_TENSORS:
+            new_tensors = n_tensors - cur_tensors
+            new_non_intermediate = sum(
+                1 for t in new_tensors if _is_non_intermediate(t)
+            )
+            if cur_non_intermediate_count + new_non_intermediate <= max_tensors:
                 # Ok to put in the current bundle
                 cur_nodes.append(n)
-                cur_tensors = candidate
+                cur_tensors |= n_tensors
+                cur_non_intermediate_count += new_non_intermediate
             else:
-                # Would be too many tensors in the Bundle; start a new one.
+                # Would be too many non-intermediate tensors; start a new bundle.
                 if fused := _make_fused(cur_nodes):
                     fused_nodes.append(fused)
                 cur_nodes = [n]
                 cur_tensors = n_tensors
+                cur_non_intermediate_count = sum(
+                    1 for t in n_tensors if _is_non_intermediate(t)
+                )
 
         else:
             # Other node types (eg Fallback nodes) force a bundle boundary.
@@ -72,6 +96,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             fused_nodes.append(n)
             cur_nodes = []
             cur_tensors = set()
+            cur_non_intermediate_count = 0
 
     if fused := _make_fused(cur_nodes):
         fused_nodes.append(fused)

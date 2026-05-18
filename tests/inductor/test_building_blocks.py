@@ -21,7 +21,9 @@ from utils_inductor import compare_with_cpu, compare_with_pytorch
 
 
 class TestBuildingBlocks(unittest.TestCase):
-    torch.manual_seed(0xAFFE)
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
 
     def test_softplus(self):
         # beta * x >= threshold ? x : (log(1 + exp(-abs(beta * x)) + relu(beta * x)

@@ -29,6 +29,9 @@ SEGMENT_OFFSETS = [
     0x1800000000,
 ]
 
+INTERMEDIATES_SEGMENT = 0x0
+SEGMENT_SIZE = 0x400000000
+
 SPYRE_FP32_OPS = [
     "add",
     "sub",
@@ -60,4 +63,4 @@ MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
-MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+MATMUL_DIM_LABELS = ["x", "mb", "y", "ki", "kj", "out", "in"]
