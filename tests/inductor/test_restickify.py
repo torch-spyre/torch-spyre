@@ -773,5 +773,7 @@ def test_sparse_dense_pointwise_unsupported():
     """
     a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
     b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
-    with pytest.raises(InductorError, match="NotImplementedError"):
+    with pytest.raises(
+        InductorError, match="No mechanism to gather elements from multiple sticks"
+    ):
         _compare(lambda a, b: a.sum(1) + b, a, b)

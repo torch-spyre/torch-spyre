@@ -20,6 +20,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
+import sympy
+
 from . import config
 from .logging_utils import get_inductor_logger
 
@@ -130,6 +132,17 @@ class RestickNodeCost(abc.ABC):
         """Return (edge_cost, required_input_stl) pairs for finalize_layouts to schedule restickifies."""
         ...
 
+    def first_blocking_edge(self, out_stl: "SpyreTensorLayout") -> "EdgeCostMap | None":
+        """Return the first EdgeCostMap that has at least one input STL with infinite cost against out_stl.
+
+        Only the first blocking edge is returned. For ops with multiple inputs, additional
+        blocking edges are not reported.
+        """
+        for ec in self.edge_costs:
+            if any(ec.cost(in_stl, out_stl) == INF for in_stl in ec._in_layouts):
+                return ec
+        return None
+
 
 class AllSameNode(RestickNodeCost):
     """Cost node for ops that require all inputs and the output to be stick compatible (eg pointwise ops)."""
@@ -209,38 +222,76 @@ class AnyInNode(RestickNodeCost):
         return []
 
 
-def _no_feasible_layout_error(op, deps: list, in_layouts: list) -> NotImplementedError:
+def _stick_incompatibility_reason(
+    in_stick: "sympy.Expr",
+    out_stick: "sympy.Expr",
+) -> "str | None":
+    """Return a human-readable reason why two tensors are stick-incompatible, or None."""
+    in_zero = in_stick == sympy.S.Zero
+    out_zero = out_stick == sympy.S.Zero
+    if in_zero and not out_zero:
+        return "No mechanism to gather elements from multiple sticks into single stick"
+    if out_zero and not in_zero:
+        return "No mechanism to scatter elements from one stick to multiple sticks"
+    return None
+
+
+def _fmt_buf(layout: Any, dep: "MemoryDep") -> str:
+    h_coords = host_coordinates(layout, dep)
+    return (
+        f"size={list(layout.size)}  stride={list(layout.stride)}  h_coords={h_coords}"
+    )
+
+
+def _fmt_stl(d_coords: Any, stl: "SpyreTensorLayout") -> str:
+    return (
+        f"device_size={list(stl.device_size)}  stride_map={list(stl.stride_map)}"
+        f"  dtype={stl.device_dtype}  d_coords={d_coords}"
+    )
+
+
+def _no_feasible_layout_error(op) -> NotImplementedError:
     """Build and return a NotImplementedError describing why no output layout was feasible."""
     node_type = type(getattr(op, "data", op)).__name__
     out_layout = op.get_layout()
     out_dep = next(iter(op.get_read_writes().writes))
-    out_h_coords = host_coordinates(out_layout, out_dep)
+    edge_costs = op.restick_cost_fn.edge_costs
+
     lines = [
-        f"Stick incompatibility for op {op.get_name()} ({node_type}) has no resolution mechanism",
-        "  Output:",
-        f"    host  size={list(out_layout.size)}  stride={list(out_layout.stride)}",
-        f"    host_coordinates: {out_h_coords}",
-        f"  Inputs ({len(deps)}):",
+        f"{op.get_name()} ({node_type}): no mechanism to resolve stick incompatibility",
+        "  Inputs:",
+        "",
     ]
-    for dep, stl in zip(deps, in_layouts):
-        host_layout = V.graph.get_buffer(dep.name).get_layout()
-        h_coords = host_coordinates(host_layout, dep)
-        d_coords = device_coordinates(stl, dep)
-        lines += [
-            f"    {dep.name}:",
-            f"      host  size={list(host_layout.size)}  stride={list(host_layout.stride)}",
-            f"      host_coordinates: {h_coords}",
-            f"      device  device_size={list(stl.device_size)}  stride_map={list(stl.stride_map)}  dtype={stl.device_dtype}",
-            f"      device_coordinates: {d_coords}",
-        ]
-    lines.append(f"  Candidate output layouts ({len(op.layouts)}) — all infeasible:")
+    for ec in edge_costs:
+        host_layout = V.graph.get_buffer(ec.dep.name).get_layout()
+        lines.append(f"    {ec.dep.name}:  {_fmt_buf(host_layout, ec.dep)}")
+        for j, stl in enumerate(ec._in_layouts):
+            lines.append(
+                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep), stl)}"
+            )
+        lines.append("")
+
+    lines.append(f"  Output:  {_fmt_buf(out_layout, out_dep)}")
+    for i, stl in enumerate(op.layouts):
+        lines.append(f"    STL {i}:  {_fmt_stl(device_coordinates(stl, out_dep), stl)}")
+
+    analysis = []
     for i, candidate_stl in enumerate(op.layouts):
-        out_d_coords = device_coordinates(candidate_stl, out_dep)
-        lines += [
-            f"    [{i}]",
-            f"      device  device_size={list(candidate_stl.device_size)}  stride_map={list(candidate_stl.stride_map)}  dtype={candidate_stl.device_dtype}",
-            f"      device_coordinates: {out_d_coords}",
-        ]
+        blocking_ec = op.restick_cost_fn.first_blocking_edge(candidate_stl)
+        if blocking_ec is None:
+            analysis.append(f"    STL {i}: no blocking input identified")
+        else:
+            out_stick = device_coordinates(candidate_stl, out_dep)[-1]
+            for j, in_stl in enumerate(blocking_ec._in_layouts):
+                if blocking_ec.cost(in_stl, candidate_stl) == INF:
+                    in_stick = device_coordinates(in_stl, blocking_ec.dep)[-1]
+                    reason = _stick_incompatibility_reason(in_stick, out_stick)
+                    reason_str = f": {reason}" if reason else ""
+                    analysis.append(
+                        f"    {blocking_ec.dep.name} STL {j} --> Out STL {i}{reason_str}"
+                    )
+    lines += ["", "  Problem:"]
+    lines += analysis if analysis else ["    No automated triage available"]
     return NotImplementedError("\n".join(lines))
 
 
@@ -300,10 +351,7 @@ def greedy_local_min_cost(operations: list) -> None:
                 out_stl = candidate_stl
 
         if out_stl is None:
-            err_deps = [
-                d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
-            ]
-            raise _no_feasible_layout_error(op, err_deps, in_layouts)
+            raise _no_feasible_layout_error(op)
 
         op.committed_stl = out_stl
 
@@ -427,14 +475,10 @@ def beam_global_min_cost(operations: list) -> None:
                         )
                     )
 
-        # Capture one state's in_layouts before clearing, for error diagnostics.
-        last_in_layouts = [
-            frontier.input_stl(frontier.states[-1], dep.name) for dep in deps
-        ]
         frontier.states = next_states
         frontier.trim()
         if not frontier.states:
-            raise _no_feasible_layout_error(op, deps, last_in_layouts)
+            raise _no_feasible_layout_error(op)
         max_states = max(max_states, len(frontier.states))
         if logger.isEnabledFor(logging.DEBUG):
             lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]
