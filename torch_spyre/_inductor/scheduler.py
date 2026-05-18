@@ -14,6 +14,8 @@
 
 from typing import Sequence, Union
 
+import sympy
+
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import (
     get_kernel_metadata,
@@ -24,6 +26,7 @@ from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
     FusedSchedulerNode,
+    GroupedSchedulerNode,
     SchedulerNode,
 )
 from torch._inductor.virtualized import V
@@ -32,6 +35,161 @@ from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
 from .pass_utils import iteration_space
+from .logging_utils import get_inductor_logger
+from .op_spec import LoopSpec
+
+logger = get_inductor_logger("scheduler")
+
+
+class CountedLoopSchedulerNode(GroupedSchedulerNode):
+    """A group of SchedulerNodes to be executed inside a counted outer loop.
+
+    Produced by build_loop_scheduler_nodes from SchedulerNodes whose
+    underlying ir.Operation has been stamped with loop_group_id and
+    loop_count attributes by the coarse-tiling IR pass.
+
+    loop_count is the trip count of the loop that directly contains this
+    group's operations.  For nested loops, the snodes may themselves
+    contain CountedLoopSchedulerNodes.
+    """
+
+    loop_count: sympy.Expr
+
+    def __init__(
+        self,
+        scheduler,
+        snodes: list[BaseSchedulerNode],
+        loop_count: sympy.Expr,
+    ) -> None:
+        super().__init__(scheduler, snodes)
+        self.loop_count = loop_count
+
+    @classmethod
+    def create(  # type: ignore[override]
+        cls,
+        snodes: list[BaseSchedulerNode],
+        loop_count: sympy.Expr,
+    ) -> "CountedLoopSchedulerNode":
+        scheduler = snodes[0].scheduler
+        assert all(node.scheduler is scheduler for node in snodes)
+        grouped = cls(scheduler, snodes, loop_count)
+        for snode in snodes:
+            scheduler.name_to_fused_node[snode.get_name()] = grouped
+        scheduler.name_to_fused_node[grouped.get_name()] = grouped
+        return grouped
+
+    @classmethod
+    def can_fuse(cls, producer: BaseSchedulerNode, consumer: BaseSchedulerNode) -> bool:
+        return False
+
+
+def _loop_group_id(node: BaseSchedulerNode):
+    """Return the loop_group_id of the ir.Operation inside node, or None."""
+    for snode in node.get_nodes():
+        if isinstance(snode, SchedulerNode) and snode.node is not None:
+            gid = getattr(snode.node, "loop_group_id", None)
+            if gid is not None:
+                return gid
+    return None
+
+
+def _loop_count(node: BaseSchedulerNode) -> sympy.Expr:
+    """Return the loop_count of the ir.Operation inside node."""
+    for snode in node.get_nodes():
+        if isinstance(snode, SchedulerNode) and snode.node is not None:
+            count = getattr(snode.node, "loop_count", None)
+            if count is not None:
+                return count
+    raise AssertionError(f"Node {node.get_name()} has loop_group_id but no loop_count")
+
+
+def _build_loop_group(
+    nodes: list[BaseSchedulerNode], depth: int
+) -> list[BaseSchedulerNode]:
+    """Recursively wrap contiguous runs sharing a loop_group_id into CountedLoopSchedulerNodes.
+
+    depth is the nesting level being processed (0 = outermost).  Each node's
+    loop_group_id is a tuple; we group on element [depth].
+    """
+    result: list[BaseSchedulerNode] = []
+    i = 0
+    while i < len(nodes):
+        node = nodes[i]
+        gid = _loop_group_id(node)
+        if gid is None or len(gid) <= depth:
+            result.append(node)
+            i += 1
+            continue
+
+        outer_key = gid[depth]
+        # loop_count for this level comes from nodes directly at this depth
+        # (path length == depth + 1).  Deeper nodes have their own counts.
+        count = _loop_count(node) if len(gid) == depth + 1 else None
+        run = [node]
+        i += 1
+        while i < len(nodes):
+            next_gid = _loop_group_id(nodes[i])
+            if (
+                next_gid is None
+                or len(next_gid) <= depth
+                or next_gid[depth] != outer_key
+            ):
+                break
+            if len(next_gid) == depth + 1:
+                next_count = _loop_count(nodes[i])
+                if count is None:
+                    count = next_count
+                else:
+                    assert next_count == count, (
+                        f"Loop group {outer_key} has inconsistent loop_count: "
+                        f"{count} vs {next_count}"
+                    )
+            run.append(nodes[i])
+            i += 1
+        assert count is not None, (
+            f"Loop group {outer_key} has no direct members at depth {depth}"
+        )
+
+        # Recursively wrap any deeper nesting within this run.
+        inner = _build_loop_group(run, depth + 1)
+        result.append(CountedLoopSchedulerNode.create(inner, count))
+
+    return result
+
+
+def build_loop_scheduler_nodes(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Post-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
+
+    Reads loop_group_id and loop_count attributes stamped on ir.Operation
+    objects by the coarse-tiling IR pass.  Nodes without these attributes
+    are passed through unchanged.
+
+    loop_group_id is a tuple of ints encoding the nesting path, e.g.
+    (0,) for an outermost group, (0, 1) for a nested group inside group 0.
+    Nodes sharing the same outermost key must be contiguous; a gap indicates
+    a data-flow dependency crossing the group boundary, which is a bug in
+    the tiling pass.
+    """
+    result = _build_loop_group(nodes, depth=0)
+
+    # Verify contiguity: no loop_group_id should appear in two separate runs.
+    seen: dict[tuple, str] = {}
+    for node in result:
+        if isinstance(node, CountedLoopSchedulerNode):
+            gid = _loop_group_id(node.get_nodes()[0])
+            if gid is not None:
+                key = gid[0:1]
+                name = node.get_name()
+                if key in seen and seen[key] != name:
+                    raise RuntimeError(
+                        f"Loop group {key} is not contiguous in the scheduler node list. "
+                        "This indicates a data-flow dependency crossing a loop group boundary."
+                    )
+                seen[key] = name
+
+    return result
 
 
 class SuperDSCScheduling(BaseScheduling):
@@ -88,10 +246,16 @@ class SuperDSCScheduling(BaseScheduling):
                 raise RuntimeError(f"Unexpected node type: {type(node)}")
         return node_schedule
 
-    def codegen_node(self, node: Union[FusedSchedulerNode, SchedulerNode]) -> None:
+    def codegen_node(
+        self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
+    ) -> None:
         """
         Generate a kernel given a list of pre-fused nodes.
         """
+        if isinstance(node, CountedLoopSchedulerNode):
+            self._codegen_counted_loop(node)
+            return
+
         assert self.scheduler
         nodes = [
             node
@@ -130,6 +294,100 @@ class SuperDSCScheduling(BaseScheduling):
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
         self.free_buffers_in_scheduler()
+
+    def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
+        """Generate a kernel for a counted loop group."""
+        assert self.scheduler
+        inner_nodes = [
+            n
+            for n in node.get_nodes()
+            if n.get_name() not in self.scheduler.removed_ops
+        ]
+        if len(inner_nodes) == 0:
+            return
+
+        # Each snode in the group may itself be a CountedLoopSchedulerNode
+        # (nested loop) or a plain SchedulerNode.  Drive them all into the
+        # same SpyreKernel so their OpSpecs land in one op_specs list.
+        kernel = SpyreKernel()
+        all_schedule_nodes: list[SchedulerNode] = []
+        with kernel:
+            for inner in inner_nodes:
+                if isinstance(inner, CountedLoopSchedulerNode):
+                    # Recurse: codegen the inner loop into the same kernel,
+                    # which will call wrap_op_specs_in_loop on the inner body.
+                    # We temporarily redirect codegen to this kernel.
+                    self._codegen_loop_body(inner, kernel, all_schedule_nodes)
+                else:
+                    sched = self.generate_node_schedule([inner])
+                    all_schedule_nodes.extend(sched)
+                    for snode in sched:
+                        var_ranges = iteration_space(snode)
+                        vs = list(var_ranges.keys())
+                        index_vars = [
+                            vs[: len(snode._body.iter_vars)],
+                            vs[len(snode._body.iter_vars) :],
+                        ]
+                        snode.codegen(index_vars)
+
+        kernel.wrap_op_specs_in_loop(node.loop_count)
+
+        with V.set_kernel_handler(kernel):
+            src_code = kernel.codegen_kernel()
+        kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
+        kernel.kernel_name = kernel_name
+        kernel.code_hash = code_hash(src_code)
+
+        with V.set_kernel_handler(kernel):
+            for snode in all_schedule_nodes:
+                snode.mark_run()
+
+        self.codegen_comment(all_schedule_nodes, kernel_name)
+        kernel.call_kernel(kernel.kernel_name)
+
+        V.graph.removed_buffers |= kernel.removed_buffers
+        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+        self.free_buffers_in_scheduler()
+
+    def _codegen_loop_body(
+        self,
+        node: CountedLoopSchedulerNode,
+        kernel: SpyreKernel,
+        all_schedule_nodes: list[SchedulerNode],
+    ) -> None:
+        """Codegen the body of a nested CountedLoopSchedulerNode into an existing kernel.
+
+        The inner ops are added to the kernel's op_specs list, then wrapped
+        in a LoopSpec for the inner loop count.  Called from
+        _codegen_counted_loop to handle nesting without creating a separate kernel.
+        """
+        assert self.scheduler
+        inner_nodes = [
+            n
+            for n in node.get_nodes()
+            if n.get_name() not in self.scheduler.removed_ops
+        ]
+        body_start = len(kernel.op_specs)
+        for inner in inner_nodes:
+            if isinstance(inner, CountedLoopSchedulerNode):
+                self._codegen_loop_body(inner, kernel, all_schedule_nodes)
+            else:
+                sched = self.generate_node_schedule([inner])
+                all_schedule_nodes.extend(sched)
+                for snode in sched:
+                    var_ranges = iteration_space(snode)
+                    vs = list(var_ranges.keys())
+                    index_vars = [
+                        vs[: len(snode._body.iter_vars)],
+                        vs[len(snode._body.iter_vars) :],
+                    ]
+                    snode.codegen(index_vars)
+
+        # Wrap only the newly-added op_specs entries in this inner LoopSpec.
+        body = kernel.op_specs[body_start:]
+        kernel.op_specs = kernel.op_specs[:body_start]
+        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """
