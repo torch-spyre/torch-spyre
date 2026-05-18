@@ -429,6 +429,85 @@ def _ref_arg(op_spec):
     return op_spec.args[-1]
 
 
+def _extend_matmul_k_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Extend sdsc_iteration_space[K] to K_padded for matmul ops.
+
+    The IR-level padding pass pads y's device_size to K_padded rows but keeps
+    the host iteration space (and op_spec.iteration_space) at K.  This function
+    reads K_padded from y's device_size and updates sdsc_iteration_space[K_sym]
+    before _create_sdsc_tensors runs.
+
+    With sdsc_iteration_space[K_sym] = K_padded:
+    - y's dev_dim_size for K == it_dim_size → backGap branch never fires for y.
+    - Strides are computed against K_padded → correct for K_padded-extended iteration.
+    - _get_padded_iteration_space becomes a no-op for K (already aligned).
+
+    K is identified as the symbol that appears in y's (non-stick) device_coordinates
+    but NOT in the output's device_coordinates.  This is the reduction symbol and is
+    layout-position agnostic: it works regardless of how MATMUL_DIM_LABELS maps the
+    iteration symbols for this particular ndim.
+    """
+    # y is always args[1]; output is always args[-1] for matmul.
+    y_arg = op_spec.args[1]
+    out_arg = op_spec.args[-1]
+
+    # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
+    y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
+    # y_stick_dim is the within-stick symbol; the remaining dims include K.
+    y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
+
+    # Collect all symbols in the output's device_coordinates.
+    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
+    out_syms: set = set(out_dim_order)
+
+    # K is in y but not in the output (it's reduced).
+    k_candidates = y_non_stick_syms - out_syms
+    if not k_candidates:
+        logger.warning(
+            "_extend_matmul_k_to_padded: could not identify K symbol "
+            "(y_non_stick=%s, out_syms=%s), skipping",
+            y_non_stick_syms,
+            out_syms,
+        )
+        return
+    k_sym = next(iter(k_candidates))
+
+    if k_sym not in sdsc_iteration_space:
+        logger.warning(
+            "_extend_matmul_k_to_padded: K symbol %s not in sdsc_iteration_space %s, skipping",
+            k_sym,
+            list(sdsc_iteration_space.keys()),
+        )
+        return
+
+    # Find K_padded from y's device_size using the same stride_idx formula as
+    # _create_sdsc_tensors: dev_dim_size = device_size[-stride_idx - 2]
+    # where stride_idx is the position of k_sym in y_dim_order.
+    # y has no reduced dims, so stride_dim_order == y_dim_order, and k_sym is
+    # guaranteed to be present (it was just found in y_non_stick_syms ⊆ y_dim_order).
+    stride_idx = y_dim_order.index(k_sym)
+    dev_dim_idx = -stride_idx - 2
+    k_padded = int(y_arg.device_size[dev_dim_idx])
+
+    k_current = sdsc_iteration_space[k_sym]
+    if k_padded > k_current:
+        logger.debug(
+            "_extend_matmul_k_to_padded: extending K %d -> %d "
+            "(sym=%s, y device_size[%d]=%d, stride_idx=%d)",
+            k_current,
+            k_padded,
+            k_sym,
+            dev_dim_idx,
+            k_padded,
+            stride_idx,
+        )
+        sdsc_iteration_space[k_sym] = k_padded
+
+
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -465,6 +544,9 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
+
+    if is_matmul:
+        _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
