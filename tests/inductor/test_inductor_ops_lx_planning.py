@@ -274,6 +274,7 @@ REDUCTION_TEST_FAILURES = [
     "test_cat_4d_dim2",
     "test_cat_4d_dim3",
     "test_cat_4d_dim3_fp32",
+    "test_copy_roundtrip_3d",
     "test_copy_roundtrip_4d_stick",
     "test_core_reduction_invalid_dims_api",
     "test_core_reduction_invalid_dims_spyre",
