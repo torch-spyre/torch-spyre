@@ -42,6 +42,7 @@ from .propagate_layouts import (
 )
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import insert_restickify, finalize_layouts
+from .memory_planning import memory_planning
 from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
@@ -201,7 +202,7 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [spyre_fuse_nodes]
+        return [memory_planning, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):

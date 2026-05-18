@@ -27,7 +27,6 @@ from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
-    SEGMENT_OFFSETS,
     TOPK_OPS,
 )
 from torch_spyre._inductor import config as _spyre_config
@@ -309,7 +308,6 @@ def _create_sdsc_tensors(
     adjusted_output_size = op_spec.args[-1].device_size.copy()
     sdsc_args: list[SDSCArgs] = []
     for arg in op_spec.args:
-        addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
@@ -379,7 +377,11 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address=addr if not arg.allocation else arg.allocation["lx"],
+                start_address=arg.allocation.get("pool")
+                if "pool" in arg.allocation
+                else arg.allocation.get("lx")
+                if "lx" in arg.allocation
+                else arg.allocation.get("hbm"),
                 backGap=backGap,
             )
         )
