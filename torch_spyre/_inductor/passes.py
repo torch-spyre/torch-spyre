@@ -29,7 +29,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
 
-from .padding import insert_padding_ir
+from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
@@ -228,7 +228,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
-        insert_padding_ir(operations)
+        insert_bmm_padding(operations)
         dedup_and_promote_constants(operations)
         span_reduction(operations)
         k_fast_ops = (
@@ -248,7 +248,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
-            inspect.getfile(insert_padding_ir),
+            inspect.getfile(insert_bmm_padding),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),
