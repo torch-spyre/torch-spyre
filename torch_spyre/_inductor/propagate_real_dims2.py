@@ -88,6 +88,14 @@ def coords_to_real_dims(coords: list, rdims: dict) -> list:
     return [rdims[_lone_sym(c)] for c in coords if c.free_symbols]
 
 
+def get_input_real_dims(inputs: list) -> dict:
+    """Merge loop-var → real-dim-name dicts from all inputs."""
+    rdims = {}
+    for inp in inputs:
+        rdims.update(compute_input_real_dims(inp))
+    return rdims
+
+
 def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
     """Return the reduction loop variable: the input coord absent from the output."""
     in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep)
@@ -99,23 +107,21 @@ def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
 
 
 def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
-    # Part 1: compute input real dims (generic, op-agnostic, focus on handling views)
-    rdims_0 = compute_input_real_dims(inputs[0])
-    rdims_1 = compute_input_real_dims(inputs[1])
+    # Part 1: compute input real dims (generic, op-agnostic)
+    rdims = get_input_real_dims(inputs)
 
     # Part 2: matmul dimension mapping
-    rdims = {**rdims_0, **rdims_1}
     out_coords = op_out_coords(op)
     reduction_var = get_reduction_dim(inputs[0], out_coords)
-
     op.real_dims = coords_to_real_dims(out_coords, rdims)
     op.real_ranges = op.real_dims + [rdims[reduction_var]]
 
 
 def _pointwise_real_dims(op, inputs):
-    rdims = {}
-    for inp in inputs:
-        rdims.update(compute_input_real_dims(inp))
+    # Part 1: compute input real dims (generic, op-agnostic)
+    rdims = get_input_real_dims(inputs)
+
+    # Part 2: pointwise dimension mapping 
     out_coords = op_out_coords(op)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
     op.real_ranges = op.real_dims
