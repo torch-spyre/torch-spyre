@@ -712,7 +712,12 @@ def generate_unified_yaml_config(
                             ],
                             "mode": "mandatory_success",
                             "tags": [f"model__{model_name}", "custom_tests"],
-                            "edits": {"modules": {"include": module_entries}},
+                            "edits": {
+                                "modules": {"include": module_entries},
+                                "dtypes": {
+                                    "include": [{"name": "float32"}],
+                                },
+                            },
                         }
                     ],
                 },

@@ -319,6 +319,9 @@ test_suite_config:
           edits:
             modules:
               include: *id001
+            dtypes:
+              include:
+                - name: float32
   global:
     supported_dtypes:
       - name: float16
