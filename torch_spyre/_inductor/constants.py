@@ -54,7 +54,6 @@ SPYRE_FP32_OPS = [
     "floor",
 ]
 
-
 TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
