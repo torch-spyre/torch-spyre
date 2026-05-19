@@ -107,7 +107,6 @@ def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
 
 
 def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
-    # Part 1: compute input real dims (generic, op-agnostic)
     rdims = get_input_real_dims(inputs)
 
     # Part 2: matmul dimension mapping
@@ -118,7 +117,6 @@ def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
 
 
 def _pointwise_real_dims(op, inputs):
-    # Part 1: compute input real dims (generic, op-agnostic)
     rdims = get_input_real_dims(inputs)
 
     # Part 2: pointwise dimension mapping 
