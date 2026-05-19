@@ -89,7 +89,10 @@ def coords_to_real_dims(coords: list, rdims: dict) -> list:
 
 
 def get_input_real_dims(inputs: list) -> dict:
-    """Merge loop-var → real-dim-name dicts from all inputs."""
+    """
+    Manage real_dims for all inputs, mapping dims from upstream node to this node.
+    Must handle views, etc.
+    """
     rdims = {}
     for inp in inputs:
         rdims.update(compute_input_real_dims(inp))
