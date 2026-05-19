@@ -38,7 +38,7 @@ SPYRE_FP32_OPS = [
     "mul",
     "where",
     "realdiv",
-    "relu",
+    "relufwd",
     "reciprocal",
     "layernormscale",
     "abs",
@@ -52,6 +52,8 @@ SPYRE_FP32_OPS = [
     "topkvalue",
     "topkindex",
     "floor",
+    "maximum",
+    "minimum",
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}
