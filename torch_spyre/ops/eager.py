@@ -34,9 +34,11 @@ def compile_once(op, **compile_kwargs):
         def wrapper(*args, **kwargs):
             nonlocal compiled
             nonlocal op
+            if isinstance(op, str):
+                op = operator.attrgetter(op)(torch.ops)
+            if torch.compiler.is_compiling():
+                return op(*args, **kwargs)
             if compiled is None:
-                if isinstance(op, str):
-                    op = operator.attrgetter(op)(torch.ops)
                 compiled = torch.compile(op, **compile_kwargs)
             return fn(*args, compiled=compiled, **kwargs)
 
