@@ -553,9 +553,7 @@ class TestSpyre(TestCase):
         # _TestMROCheckPRIVATEUSE1 (PT <=2.10) or _TestMROCheckSPYRE (PT 2.11+)
         expected_names = ("_TestMROCheckPRIVATEUSE1", "_TestMROCheckSPYRE")
         found = [n for n in expected_names if n in ns]
-        assert found, (
-            f"Expected one of {expected_names} in namespace, got {list(ns)}"
-        )
+        assert found, f"Expected one of {expected_names} in namespace, got {list(ns)}"
 
         # The generated class should be instantiable (valid MRO)
         cls = ns[found[0]]
