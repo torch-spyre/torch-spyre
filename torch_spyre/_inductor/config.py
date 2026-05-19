@@ -14,6 +14,7 @@
 
 import os
 import sys
+from typing import Callable, Optional
 
 from torch.utils._config_module import install_config_module
 
@@ -39,5 +40,13 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
+
+coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
+
+# Optional callable injected by callers to compute coarse-tiling groups.
+# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr]]
+# When None and coarse_tiling is True, coarse_tile() is called with groups=[]
+# (a no-op useful for testing the pipeline without real group detection).
+coarse_tiling_groups_fn: Optional[Callable] = None
 
 install_config_module(sys.modules[__name__])

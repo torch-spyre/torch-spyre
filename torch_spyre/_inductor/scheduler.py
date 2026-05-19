@@ -26,7 +26,6 @@ from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
     FusedSchedulerNode,
-    GroupedSchedulerNode,
     SchedulerNode,
 )
 from torch._inductor.virtualized import V
@@ -41,7 +40,7 @@ from .op_spec import LoopSpec
 logger = get_inductor_logger("scheduler")
 
 
-class CountedLoopSchedulerNode(GroupedSchedulerNode):
+class CountedLoopSchedulerNode(FusedSchedulerNode):
     """A group of SchedulerNodes to be executed inside a counted outer loop.
 
     Produced by build_loop_scheduler_nodes from SchedulerNodes whose
@@ -77,6 +76,10 @@ class CountedLoopSchedulerNode(GroupedSchedulerNode):
             scheduler.name_to_fused_node[snode.get_name()] = grouped
         scheduler.name_to_fused_node[grouped.get_name()] = grouped
         return grouped
+
+    def unpack(self) -> list[BaseSchedulerNode]:
+        # CountedLoopSchedulerNode is an atomic codegen unit; do not unpack.
+        return [self]
 
     @classmethod
     def can_fuse(cls, producer: BaseSchedulerNode, consumer: BaseSchedulerNode) -> bool:
@@ -171,6 +174,10 @@ def build_loop_scheduler_nodes(
     Nodes sharing the same outermost key must be contiguous; a gap indicates
     a data-flow dependency crossing the group boundary, which is a bug in
     the tiling pass.
+
+    This pass runs before spyre_fuse_nodes so that CountedLoopSchedulerNodes
+    are already formed before fusion; CountedLoopSchedulerNode.can_fuse returns
+    False, which prevents the loop groups from being merged by the fusion pass.
     """
     result = _build_loop_group(nodes, depth=0)
 
@@ -233,7 +240,7 @@ class SuperDSCScheduling(BaseScheduling):
         # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
-    def generate_node_schedule(self, nodes: Sequence[SchedulerNode]):
+    def generate_node_schedule(self, nodes: Sequence[BaseSchedulerNode]):
         node_schedule: list[SchedulerNode] = []
         done = OrderedSet[BaseSchedulerNode]()
         for node in nodes:
@@ -242,6 +249,11 @@ class SuperDSCScheduling(BaseScheduling):
             done.add(node)
             if isinstance(node, SchedulerNode):
                 node_schedule.append(node)
+            elif isinstance(node, FusedSchedulerNode):
+                for inner in node.get_nodes():
+                    if inner not in done and isinstance(inner, SchedulerNode):
+                        done.add(inner)
+                        node_schedule.append(inner)
             else:
                 raise RuntimeError(f"Unexpected node type: {type(node)}")
         return node_schedule

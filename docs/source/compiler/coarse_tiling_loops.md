@@ -29,16 +29,19 @@ The design has three layers that correspond to the three pipeline stages
 above.
 
 ```
-Pre-scheduling IR pass
+Pre-scheduling IR pass  (CustomPreSchedulingPasses)
   └─ stamps loop_group_id + loop_count on each ir.Operation
   └─ rewrites each op's ranges (divides the tiled dimension by K)
 
   ↓  Inductor Scheduler wraps each ir.Operation → SchedulerNode
-  ↓  _post_fusion_custom_pass fires
+  ↓  CustomPostFusionPasses fires
 
-Post-fusion scheduler pass
+Post-fusion scheduler pass  (build_loop_scheduler_nodes)
+  └─ runs BEFORE spyre_fuse_nodes
   └─ scans list[BaseSchedulerNode] for runs sharing a loop_group_id
   └─ wraps each run in a CountedLoopSchedulerNode(count=K, snodes=[...])
+  └─ spyre_fuse_nodes runs after; CountedLoopSchedulerNode.can_fuse=False
+     prevents cross-group merging
 
   ↓  Scheduler calls SuperDSCScheduling.codegen_node()
 
@@ -59,12 +62,15 @@ attached with `setattr`; no Inductor base class is modified.
 
 | Attribute | Type | Meaning |
 |---|---|---|
-| `loop_group_id` | `int` | Opaque integer identifying which loop group this op belongs to. All ops with the same id form the body of one counted loop. |
-| `loop_count` | `sympy.Expr` | Trip count of the outer loop. Must be identical for every op sharing a `loop_group_id`. |
+| `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. All ops sharing the same tuple form the body of one counted loop at that depth. |
+| `loop_count` | `sympy.Expr` | Trip count of the innermost loop that directly contains this op. Must be identical for every op sharing a `loop_group_id`. |
 
 The pass also **rewrites the op's iteration ranges**: the dimension being
 tiled is divided by `loop_count` so that each inner `OpSpec` describes only
 the work done per loop iteration, not the full iteration space.
+
+`loop_group_id` is a tuple rather than a flat integer to support nested
+loops.  See "Nested loops and the `loop_group_id` tree" below.
 
 ### Why these two attributes are sufficient
 
@@ -74,14 +80,70 @@ a separate side table.  The `loop_group_id` is the join key; it does not
 need to carry any other information because the reduced iteration space is
 already embedded in the op's `ranges`.
 
+### `Loops` is a frozen dataclass
+
+Inductor's `ir.Loops` (the base of `Pointwise` and `Reduction`) is
+declared `@ir_dataclass(frozen=True)`, so `data.ranges = x` raises
+`FrozenInstanceError`.  The tiling pass uses `object.__setattr__` to
+bypass this:
+
+```python
+object.__setattr__(data, "ranges", ranges)
+```
+
+### Public API: `coarse_tile()`
+
+```python
+def coarse_tile(
+    operations: list[Operation],
+    groups: list[tuple[list[Operation], Expr]],
+    *,
+    tiled_dims: int | None = None,
+) -> None:
+```
+
+`groups` is a pre-computed list of `(ops, loop_count)` pairs supplied by
+the caller (e.g., `config.coarse_tiling_groups_fn`).  Each `ops` list must
+be a contiguous sub-sequence of `operations`; a gap indicates a data-flow
+dependency crossing the group boundary and raises `RuntimeError`.
+
+`tiled_dims` controls how many leading iteration-space dimensions are
+divided by `loop_count`.  `None` (the default) divides only the single
+outermost dimension.
+
+### Feature flag and groups callable
+
+```python
+# config.py
+coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
+coarse_tiling_groups_fn = None  # (list[Operation]) -> list[tuple[list[Operation], Expr]]
+```
+
+`coarse_tiling_groups_fn` is an optional callable that receives the full
+operations list and returns the groups.  It must be a **module-level named
+function**, not a lambda, because Inductor's FX graph cache pickles the
+config values.
+
 ### Placement in `CustomPreSchedulingPasses`
 
-The coarse-tiling pass runs after `insert_padding_ir` and before
+The coarse-tiling pass runs after layout finalization and before
 `span_reduction`:
 
 ```python
-insert_padding_ir(operations)
-coarse_tile(operations)          # new pass
+deadcode_elimination(operations)
+propagate_spyre_tensor_layouts(operations)
+optimize_restickify_locations(operations)
+finalize_layouts(operations)
+insert_restickify(operations)
+insert_bmm_padding(operations)
+dedup_and_promote_constants(operations)
+if config.coarse_tiling:
+    groups = (
+        config.coarse_tiling_groups_fn(operations)
+        if config.coarse_tiling_groups_fn is not None
+        else []
+    )
+    coarse_tile(operations, groups=groups)
 span_reduction(operations)
 k_fast_ops = (
     k_fast_division(operations) if config.core_id_k_fast_emission else []
@@ -91,15 +153,13 @@ if config.lx_planning:
     scratchpad_planning(operations)
 ```
 
-This ordering is required by two constraints that pull in opposite
-directions:
+This ordering is required by two constraints:
 
 **Must run after stickify and padding.**  `propagate_spyre_tensor_layouts`,
-`insert_restickify`, and `insert_padding_ir` establish the final tiled
-memory layout for each tensor.  The tiling pass inspects tensor shapes and
-strides to decide which dimension to split and by how much; it must see
-the post-stickify, post-padding shapes or it will split on the wrong
-dimension or produce a non-stick-aligned inner size.
+`insert_restickify`, and `insert_bmm_padding` establish the final tiled
+memory layout for each tensor.  The tiling pass must see the post-stickify,
+post-padding shapes or it will split on the wrong dimension or produce a
+non-stick-aligned inner size.
 
 **Must run before `work_distribution`.**  `work_distribution` stamps
 `op_it_space_splits` on each `ir.Operation` to assign per-core work
@@ -121,20 +181,24 @@ allocation depends on the final (reduced) iteration space.
 
 `CountedLoopSchedulerNode` lives in
 `torch_spyre/_inductor/scheduler.py` alongside `SuperDSCScheduling`.
-It subclasses Inductor's `GroupedSchedulerNode`:
+It subclasses Inductor's `FusedSchedulerNode`:
 
 ```python
-class CountedLoopSchedulerNode(GroupedSchedulerNode):
+class CountedLoopSchedulerNode(FusedSchedulerNode):
     loop_count: sympy.Expr
 
     def __init__(
         self,
-        scheduler: Scheduler,
+        scheduler,
         snodes: list[BaseSchedulerNode],
         loop_count: sympy.Expr,
     ) -> None:
         super().__init__(scheduler, snodes)
         self.loop_count = loop_count
+
+    def unpack(self) -> list[BaseSchedulerNode]:
+        # CountedLoopSchedulerNode is an atomic codegen unit; do not unpack.
+        return [self]
 
     @classmethod
     def can_fuse(
@@ -145,66 +209,82 @@ class CountedLoopSchedulerNode(GroupedSchedulerNode):
         return False
 ```
 
-Everything else (`get_nodes`, `get_outputs`, `get_name`, dependency
-merging) is inherited from `GroupedSchedulerNode` unchanged.
-`can_fuse` returns `False` — a loop group is atomic; nothing can be
-fused into it from outside.
+`unpack()` returns `[self]` to prevent Inductor's
+`Scheduler.process_grouped_nodes()` from dissolving the node back into its
+constituent `SchedulerNode`s before codegen.  `can_fuse` returns `False`
+— a loop group is atomic; nothing can be fused into it from outside.
 
-### Why `GroupedSchedulerNode` is the right base
+### Why `FusedSchedulerNode` is the right base
 
-`GroupedSchedulerNode` already:
+`CountedLoopSchedulerNode` subclasses `FusedSchedulerNode` rather than
+`GroupedSchedulerNode` for two reasons:
 
-- Merges `unmet_dependencies` across all constituent nodes so the
-  scheduler respects data-flow ordering.
-- Sets `min_order` / `max_order` to prevent interleaving.
-- Registers all constituent names in `scheduler.name_to_fused_node` so
-  lookups work correctly.
-- Exposes `get_nodes()` which `codegen_node` already iterates over.
+1. **Dispatch**: `Scheduler._codegen` only dispatches
+   `FusedSchedulerNode | SchedulerNode` to `codegen_node()`.  A
+   `GroupedSchedulerNode` subclass falls through to
+   `assert isinstance(node, NopKernelSchedulerNode)` and crashes.
 
-None of this needs to be reimplemented.  The only thing `CountedLoopSchedulerNode`
-adds is `loop_count`.
+2. **Unpack control**: `GroupedSchedulerNode` is unconditionally unpacked
+   by `Scheduler.process_grouped_nodes()` at the start of codegen.
+   `FusedSchedulerNode` is not subject to that unpack, so overriding
+   `unpack()` is sufficient to keep the node intact.
 
-### The post-fusion pass
+`FusedSchedulerNode` already merges `unmet_dependencies` across all
+constituent nodes, exposes `get_nodes()`, and registers all constituent
+names in `scheduler.name_to_fused_node`.  Nothing needs to be
+reimplemented.
 
-The post-fusion hook (`config._post_fusion_custom_pass`) is the correct
-injection point.  It fires after Inductor's own fusion has completed but
-before codegen begins, and it receives and returns
-`list[BaseSchedulerNode]`.  Spyre sets this hook in `patches.py` alongside
-the existing `_update_scheduler` monkey-patch.
+### The post-fusion pass and ordering
 
-The pass algorithm:
+`CountedLoopSchedulerNode`s are created by `build_loop_scheduler_nodes`,
+which is registered as the first pass in `CustomPostFusionPasses`:
+
+```python
+class CustomPostFusionPasses(CustomNodePassBase):
+    def get_passes(self):
+        return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
+```
+
+**`build_loop_scheduler_nodes` must run before `spyre_fuse_nodes`.**
+If `spyre_fuse_nodes` ran first, it could merge `SchedulerNode`s from
+different loop groups into a single `FusedSchedulerNode`.  The loop-group
+pass would then see one fused node spanning multiple groups rather than
+the individual nodes with distinct `loop_group_id`s, and would wrap both
+groups in a single `CountedLoopSchedulerNode` with a single `loop_count`.
+Running loop grouping first ensures each group is already wrapped and
+opaque before `spyre_fuse_nodes` runs.  `can_fuse = False` then prevents
+`spyre_fuse_nodes` from merging across group boundaries.
+
+### The grouping algorithm
+
+`build_loop_scheduler_nodes` scans the flat node list and groups
+contiguous runs sharing the same outermost `loop_group_id` key:
 
 ```
 result = []
 i = 0
 while i < len(nodes):
     node = nodes[i]
-    snode = node  # may be a plain SchedulerNode
-    gid = getattr(snode.node, "loop_group_id", None)  # snode.node is ir.Operation
+    gid = _loop_group_id(node)   # reads loop_group_id from the inner ir.Operation
     if gid is None:
         result.append(node)
         i += 1
         continue
-    # collect the run of nodes sharing this gid
-    run = [node]
-    loop_count = snode.node.loop_count
-    i += 1
-    while i < len(nodes):
-        next_node = nodes[i]
-        if getattr(next_node.node, "loop_group_id", None) != gid:
-            break
-        run.append(next_node)
-        i += 1
-    result.append(CountedLoopSchedulerNode.create(run, loop_count))
+    outer_key = gid[0]
+    run = [node]; i += 1
+    while i < len(nodes) and _loop_group_id(nodes[i])[0] == outer_key:
+        run.append(nodes[i]); i += 1
+    # Recursively wrap deeper nesting within this run.
+    inner = _build_loop_group(run, depth=1)
+    result.append(CountedLoopSchedulerNode.create(inner, loop_count))
 return result
 ```
 
-Key invariant: because the pre-scheduling pass runs in topological order and
-the scheduler's topological sort preserves that order, a loop group's
+Key invariant: because the pre-scheduling pass runs in topological order
+and the scheduler's topological sort preserves that order, a loop group's
 `SchedulerNode`s will be contiguous in the post-fusion node list.  If they
 are not contiguous it means a data-flow constraint separates them, which is a
-bug in the tiling pass (it tiled ops that have an inter-op dependency that
-crosses the group boundary).  The post-fusion pass asserts contiguity.
+bug in the tiling pass.  The post-fusion pass asserts contiguity.
 
 ## Layer 3 — `LoopSpec` and codegen
 
@@ -223,10 +303,7 @@ because it has no `iteration_space`, `args`, or `op_info` of its own — those
 belong to the inner `OpSpec`s.
 
 The `body` type is recursive: a `LoopSpec` body may itself contain
-`LoopSpec` entries, representing nested counted loops.  Python's type
-system requires a forward reference or a `TYPE_CHECKING` guard for the
-self-referential annotation; in practice a `list[Any]` with a runtime
-`isinstance` check is sufficient.
+`LoopSpec` entries, representing nested counted loops.
 
 ### Nested loops and the `loop_group_id` tree
 
@@ -271,10 +348,9 @@ by Inductor fusion: `can_fuse` returns `False` on
 absorb part of a loop group.
 
 In `bundle.py`, `generate_bundle` iterates the flat `list[OpSpec]`
-emitted by `codegen_kernel()`.  When it encounters a `LoopSpec` it must
-emit SDSC JSON files for each `OpSpec` in the body (recursively) and
-wrap those executions in an `scf.for` in `bundle.mlir`, as described
-below.
+emitted by `codegen_kernel()`.  When it encounters a `LoopSpec` it
+emits SDSC JSON files for each `OpSpec` in the body (recursively) and
+wraps those executions in an `scf.for` in `bundle.mlir`.
 
 ### Changes to `SuperDSCScheduling.codegen_node()`
 
@@ -297,47 +373,44 @@ def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
         n for n in node.get_nodes()
         if n.get_name() not in self.scheduler.removed_ops
     ]
-    node_schedule = self.generate_node_schedule(inner_nodes)
     kernel = SpyreKernel()
+    all_schedule_nodes = []
     with kernel:
-        for snode in node_schedule:
-            var_ranges = iteration_space(snode)
-            vars = list(var_ranges.keys())
-            index_vars = [
-                vars[: len(snode._body.iter_vars)],
-                vars[len(snode._body.iter_vars) :],
-            ]
-            snode.codegen(index_vars)
+        for inner in inner_nodes:
+            if isinstance(inner, CountedLoopSchedulerNode):
+                self._codegen_loop_body(inner, kernel, all_schedule_nodes)
+            else:
+                sched = self.generate_node_schedule([inner])
+                all_schedule_nodes.extend(sched)
+                for snode in sched:
+                    var_ranges = iteration_space(snode)
+                    vs = list(var_ranges.keys())
+                    index_vars = [vs[:len(snode._body.iter_vars)],
+                                  vs[len(snode._body.iter_vars):]]
+                    snode.codegen(index_vars)
 
     # Wrap the collected inner specs in a LoopSpec
     kernel.wrap_op_specs_in_loop(node.loop_count)
 
     with V.set_kernel_handler(kernel):
         src_code = kernel.codegen_kernel()
-    kernel_name = self.define_kernel(src_code, node_schedule, kernel)
-    kernel.kernel_name = kernel_name
-    kernel.code_hash = code_hash(src_code)
-
-    with V.set_kernel_handler(kernel):
-        for snode in node_schedule:
-            snode.mark_run()
-
-    self.codegen_comment(node_schedule, kernel_name)
-    kernel.call_kernel(kernel.kernel_name)
-
-    V.graph.removed_buffers |= kernel.removed_buffers
-    V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
-    self.free_buffers_in_scheduler()
+    kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
+    ...
 ```
+
+`_codegen_loop_body` handles nested `CountedLoopSchedulerNode`s: it
+codegens the body ops into the existing kernel, then wraps only the newly
+added `op_specs` entries in an inner `LoopSpec`.  The outer
+`_codegen_counted_loop` then wraps everything in the outer `LoopSpec` via
+`wrap_op_specs_in_loop`.
 
 `SpyreKernel.wrap_op_specs_in_loop(count)` replaces the flat `self.op_specs`
 list with `[LoopSpec(count=count, body=self.op_specs)]`.
 
-For nested `CountedLoopSchedulerNode`s the inner node's `codegen_node()`
-call produces an inner `LoopSpec`; the outer `wrap_op_specs_in_loop` then
-wraps that `LoopSpec` (along with any sibling `OpSpec`s) into the outer
-`LoopSpec`.  No special handling is needed: the recursion falls out
-naturally from the `CountedLoopSchedulerNode` tree structure.
+`generate_node_schedule` handles `FusedSchedulerNode`s that may appear
+among the inner nodes (e.g. from earlier passes that fused nodes within
+the same loop group) by flattening them into their constituent
+`SchedulerNode`s.
 
 ### Serialization in `codegen_kernel()`
 
@@ -359,6 +432,9 @@ LoopSpec(
 )
 ```
 
+The generated Python wrapper imports `LoopSpec` from `op_spec.py` so the
+serialized source is re-loadable from the Inductor cache.
+
 The `arg_index` fixup loop (which maps tensor names to kernel argument
 positions) runs before serialization.  It must walk the `LoopSpec` tree
 recursively to find all `TensorArg` objects inside nested bodies, not
@@ -366,51 +442,48 @@ just the top-level `self.op_specs` list.
 
 ### `bundle.mlir` generation for loops
 
-`generate_bundle` in `bundle.py` currently emits one
+`generate_bundle` in `bundle.py` emits one
 `sdscbundle.sdsc_execute` line per `OpSpec`.  When a `LoopSpec` is
-present it must instead emit an `scf.for` block in `bundle.mlir`
-wrapping the execute calls for the body ops.
+present it emits an `scf.for` block in `bundle.mlir` wrapping the
+execute calls for the body ops.
 
 The loop induction variable is an `index` type running from `0` to
-`count` with step `1`.  Because `count` may be a symbolic shape, it is
-passed as an MLIR `index` value materialized from the kernel's dynamic
-shape arguments.  The concrete shape value is available at runtime via
-the same mechanism used to pass dynamic tensor sizes to the Spyre
-runtime.
+`count` with step `1`.  For the current prototype, `count` must be a
+concrete integer; symbolic loop counts raise `NotImplementedError`.
 
-Sketch of the emitted MLIR for a single-level loop with two body ops:
+Emitted MLIR for a single-level loop with one body op:
 
 ```mlir
-func.func @sdsc_bundle() {
-  %c0 = arith.constant 0 : index
-  %c1 = arith.constant 1 : index
-  %K  = <runtime shape value for loop count>
-  scf.for %iv = %c0 to %K step %c1 {
-    sdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}
-    sdscbundle.sdsc_execute () {sdsc_filename="sdsc_1.json"}
-  }
-  return
-}
-```
-
-For nested loops, `scf.for` blocks are nested in the same way:
-
-```mlir
-scf.for %iv0 = %c0 to %K step %c1 {
-  sdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}
-  scf.for %iv1 = %c0 to %J step %c1 {
-    sdscbundle.sdsc_execute () {sdsc_filename="sdsc_1.json"}
+module {
+  func.func @sdsc_bundle() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %loop_bound_0 = arith.constant 4 : index
+    scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
+      sdscbundle.sdsc_execute () {sdsc_filename="sdsc_a_0.json"}
+    }
+    return
   }
 }
 ```
 
-`generate_bundle` is refactored to walk the `list[OpSpec | LoopSpec]`
-recursively, maintaining an indentation level and a flat list of
-`SDSCSpec`s to compile.  The SDSC JSON files are numbered in
-depth-first order across all nesting levels.
+For nested loops, `scf.for` blocks are nested and induction variables are
+numbered sequentially (`%i_0`, `%i_1`, ...):
 
-The `sdsc_execute` attributes referencing filenames are unchanged; only
-the surrounding control flow structure in `bundle.mlir` is new.
+```mlir
+%loop_bound_0 = arith.constant 4 : index
+%loop_bound_1 = arith.constant 8 : index
+scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
+  sdscbundle.sdsc_execute () {sdsc_filename="sdsc_a_0.json"}
+  scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
+    sdscbundle.sdsc_execute () {sdsc_filename="sdsc_a_1.json"}
+  }
+}
+```
+
+`generate_bundle` walks the `list[OpSpec | LoopSpec]` recursively,
+maintaining an indentation level and a counter for SDSC JSON filenames.
+The filenames are assigned in depth-first traversal order.
 
 ## Files changed
 
@@ -418,253 +491,71 @@ the surrounding control flow structure in `bundle.mlir` is new.
 |---|---|
 | `torch_spyre/_inductor/op_spec.py` | Add `LoopSpec` dataclass (recursive body type) |
 | `torch_spyre/_inductor/spyre_kernel.py` | Add `SpyreKernel.wrap_op_specs_in_loop()`; extend `codegen_kernel()` to serialize `LoopSpec` recursively; fix `arg_index` fixup to walk nested bodies |
-| `torch_spyre/_inductor/scheduler.py` | Add `CountedLoopSchedulerNode`; add `_codegen_counted_loop()` to `SuperDSCScheduling` |
-| `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call in `CustomPreSchedulingPasses.__call__()` |
-| `torch_spyre/_inductor/patches.py` | Register `_post_fusion_custom_pass` hook alongside existing `_update_scheduler` patch |
-| `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations)` pass; stamps tuple `loop_group_id` paths and `loop_count` on ops, rewrites `ranges` |
+| `torch_spyre/_inductor/scheduler.py` | Add `CountedLoopSchedulerNode(FusedSchedulerNode)` with `unpack()` override; add `build_loop_scheduler_nodes` and `_codegen_counted_loop`/`_codegen_loop_body` to `SuperDSCScheduling` |
+| `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call in `CustomPreSchedulingPasses`; reorder `CustomPostFusionPasses` to `[memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]` |
+| `torch_spyre/_inductor/config.py` | Add `coarse_tiling: bool` flag and `coarse_tiling_groups_fn` callable |
+| `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps tuple `loop_group_id` paths and `loop_count` on ops, rewrites `ranges` via `object.__setattr__` |
+| `torch_spyre/_inductor/wrapper.py` | Add `LoopSpec` to the generated wrapper's import line |
 | `torch_spyre/_inductor/codegen/bundle.py` | Extend `generate_bundle()` to walk `LoopSpec` tree and emit `scf.for` in `bundle.mlir`; number SDSC JSON files in depth-first order |
-| `tests/inductor/test_coarse_tiling.py` | New file: tests for the end-to-end tiling pipeline including nested loops |
+| `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; `_find_unimplemented` recurses into `LoopSpec.body` |
+| `tests/inductor/test_coarse_tile_pass.py` | Unit tests for `coarse_tile()` IR pass (16 tests) |
+| `tests/inductor/test_bundle_loop.py` | Unit tests for `generate_bundle` with `LoopSpec` including MLIR snapshot tests (27 tests) |
+| `tests/inductor/test_counted_loop_node.py` | Unit tests for `build_loop_scheduler_nodes` (8 tests) |
+| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, bundle interception (5 tests) |
 
 ## Invariants and failure modes
 
 **Contiguity invariant**: all `SchedulerNode`s sharing a `loop_group_id`
 must be contiguous after the scheduler's topological sort.  If the tiling
 pass stamps ops that have a data dependency crossing the group boundary,
-the post-fusion pass will detect a non-contiguous run and raise an error.
+the post-fusion pass will detect a non-contiguous run and raise a
+`RuntimeError`.
 
 **Consistent `loop_count`**: all ops in a group must agree on `loop_count`.
 The post-fusion pass asserts this.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
 before `span_reduction`, `k_fast_division`, `work_distribution`, and
-`scratchpad_planning`.  All of these downstream passes must see the
-reduced (per-iteration) ranges, not the full pre-tiling iteration space.
-See "Placement in `CustomPreSchedulingPasses`" for the full rationale.
+`scratchpad_planning`.  `build_loop_scheduler_nodes` must run before
+`spyre_fuse_nodes` in `CustomPostFusionPasses` — see the ordering
+rationale above.
 
-**Cache invalidation**: `CountedLoopSchedulerNode` does not affect the
-Inductor FX graph cache key.  The `loop_group_id` and `loop_count`
-attributes are added in a pre-scheduling pass whose source files are
-already included in `CustomPreSchedulingPasses.uuid()`.
+**Cache invalidation**: `coarse_tile.py` is included in
+`CustomPreSchedulingPasses.uuid()` so the Inductor FX cache is
+invalidated when the pass changes.  The `coarse_tiling_groups_fn` must be
+a module-level named function (not a lambda) for Inductor's cache
+pickling to work.
 
-## Implementation and testing plan
+## Implementation milestones
 
-The goal of this plan is a working prototype that is sufficient for PR
-#1984 (`chunk_large_tensors`) to be rewritten on top of it.  That pass
-currently avoids the loop IR entirely — it emits a flat sequence of
-`ComputedBuffer` + `Scatter` (overwrite) ops — and the prototype will
-provide the alternative: stamp the ops with loop-group attributes and let
-the loop IR carry the structure through to `bundle.mlir`.
+All four milestones have been implemented.
 
-The plan is divided into four milestones.  Each builds on the previous
-and has an independent testability story.
+### Milestone 1 — `LoopSpec` data structure and serialization ✓
 
----
+Added `LoopSpec` to `op_spec.py`, extended `SpyreKernel.codegen_kernel()`
+to serialize `LoopSpec` recursively, fixed the `arg_index` fixup to walk
+nested bodies, and added `wrap_op_specs_in_loop()`.
 
-### Milestone 1 — `LoopSpec` data structure and serialization
+### Milestone 2 — `CountedLoopSchedulerNode` and post-fusion pass ✓
 
-**Scope**: `op_spec.py` and `spyre_kernel.py` only.  No scheduler
-changes, no IR pass changes, no `bundle.py` changes.
+Added `CountedLoopSchedulerNode(FusedSchedulerNode)` with `unpack()` and
+`can_fuse()` overrides; implemented `build_loop_scheduler_nodes` and
+registered it in `CustomPostFusionPasses` before `spyre_fuse_nodes`.
+Extended `SuperDSCScheduling.codegen_node()` with `_codegen_counted_loop`
+and `_codegen_loop_body`.
 
-**Work items**:
+### Milestone 3 — IR-level loop group stamping (`coarse_tile.py`) ✓
 
-1. Add `LoopSpec` to `op_spec.py`:
+Implemented `coarse_tile(operations, groups)` with contiguity validation
+and `object.__setattr__`-based range mutation.  Added `coarse_tiling` flag
+and `coarse_tiling_groups_fn` config knob.
 
-   ```python
-   @dataclasses.dataclass
-   class LoopSpec:
-       count: sympy.Expr
-       body: list  # list[OpSpec | UnimplementedOp | LoopSpec]
-   ```
+### Milestone 4 — `bundle.mlir` `scf.for` emission ✓
 
-2. Extend `SpyreKernel.codegen_kernel()` to serialize `LoopSpec`
-   recursively alongside the existing `OpSpec` / `UnimplementedOp`
-   branches.  The serialized form is a nested Python literal:
-
-   ```python
-   LoopSpec(
-       count=sympify('K'),
-       body=[
-           OpSpec(...),
-       ]
-   )
-   ```
-
-3. Fix the `arg_index` fixup loop to walk `LoopSpec.body` recursively
-   so that `TensorArg` objects inside loop bodies get correct kernel
-   argument indices.
-
-4. Add `SpyreKernel.wrap_op_specs_in_loop(count: sympy.Expr)` which
-   replaces `self.op_specs` with
-   `[LoopSpec(count=count, body=self.op_specs)]`.
-
-**Test**: Unit tests in `tests/inductor/test_loop_spec.py` that
-construct `LoopSpec` / `OpSpec` objects directly, call
-`codegen_kernel()` on a `SpyreKernel` with a manually assembled
-`op_specs` list that includes `LoopSpec` entries, and assert the
-serialized Python source round-trips correctly (i.e., `eval()` of the
-output reconstructs the original objects).  No compilation or hardware
-needed.
-
----
-
-### Milestone 2 — `CountedLoopSchedulerNode` and post-fusion pass
-
-**Scope**: `scheduler.py` and `patches.py`.  No IR pass, no codegen
-changes beyond Milestone 1.
-
-**Work items**:
-
-1. Add `CountedLoopSchedulerNode(GroupedSchedulerNode)` to
-   `torch_spyre/_inductor/scheduler.py` as described in the design.
-
-2. Add `_build_loop_scheduler_nodes(nodes: list[BaseSchedulerNode])
-   -> list[BaseSchedulerNode]` in `scheduler.py`.  This is the
-   post-fusion pass body: scans for contiguous runs sharing a
-   `loop_group_id` path prefix, asserts consistency of `loop_count`,
-   and wraps each run in a `CountedLoopSchedulerNode`.  Handles
-   nesting by recursing on the stripped path.
-
-3. Register the pass in `patches.py` by setting
-   `config._post_fusion_custom_pass = _build_loop_scheduler_nodes`
-   alongside the existing `_update_scheduler` monkey-patch.
-
-4. Extend `SuperDSCScheduling.codegen_node()` with the
-   `isinstance(node, CountedLoopSchedulerNode)` branch and
-   `_codegen_counted_loop()` as designed.  At this milestone
-   `_codegen_counted_loop` calls `wrap_op_specs_in_loop` (Milestone 1)
-   and then falls through to the same `define_kernel` / `call_kernel`
-   path as today, so the serialized kernel source will contain a
-   `LoopSpec` literal but the bundle compiler does not yet consume it.
-
-**Test**: Unit tests in `tests/inductor/test_counted_loop_node.py`
-that construct a minimal `Scheduler` over a small set of
-`SchedulerNode`s whose underlying `ir.Operation` objects have been
-stamped with `loop_group_id` and `loop_count` attributes, run the
-post-fusion pass, and assert:
-
-- The output list contains a `CountedLoopSchedulerNode` in the right
-  position.
-- Its `loop_count` is correct.
-- Its `get_nodes()` returns the right constituent nodes.
-- Non-grouped nodes are passed through unchanged.
-- A non-contiguous group (dependency crossing a group boundary) raises
-  an error.
-- A two-level nested group produces a nested
-  `CountedLoopSchedulerNode`.
-
-These tests can be run without a Spyre device by constructing the IR
-objects directly.
-
----
-
-### Milestone 3 — IR-level loop group stamping (`coarse_tile.py`)
-
-**Scope**: New file `torch_spyre/_inductor/coarse_tile.py` and a
-one-line addition to `passes.py`.
-
-**Work items**:
-
-1. Implement `coarse_tile(operations: list[Operation]) -> None`.
-
-   The function signature and pass placement are the same whether the
-   caller is a standalone coarse-tiling pass or a rewritten
-   `chunk_large_tensors`.  For the prototype, the implementation can be
-   minimal: accept a pre-computed `list[tuple[list[Operation], Expr]]`
-   (groups and their counts) as a parameter, and stamp the
-   `loop_group_id` path and `loop_count` attributes.  The
-   decision logic (which ops to group and what count to use) is
-   intentionally left to the caller for the prototype so that PR #1984
-   can supply its own grouping policy.
-
-2. Insert `coarse_tile(operations)` in `CustomPreSchedulingPasses`
-   after `insert_padding_ir` and before `span_reduction`, guarded by a
-   feature flag (`config.coarse_tiling`, default `False`) so it is
-   inert until callers opt in.
-
-3. Add `coarse_tile.py` to the `uuid()` file list in
-   `CustomPreSchedulingPasses` so the Inductor FX cache is invalidated
-   when the pass changes.
-
-**Connection to PR #1984**: `chunk_large_tensors._chunk_op()` currently
-produces a flat sequence of `ComputedBuffer` + `Scatter` ops.  Once
-Milestone 3 is in place, it can instead call `coarse_tile()` to stamp
-the ops it produces with the appropriate `loop_group_id` and
-`loop_count`, letting the loop IR carry the structure rather than
-relying on the flat scatter pattern.  The two approaches can coexist
-during transition: `chunk_large_tensors` can keep its current output
-while the loop-IR path is validated, then switch.
-
-**Test**: Integration tests in `tests/inductor/test_coarse_tile_pass.py`
-that construct a small `list[ir.Operation]`, call `coarse_tile()` with
-an explicit grouping, and assert:
-
-- Each op in a group has the correct `loop_group_id` path and
-  `loop_count`.
-- Ops outside any group have no `loop_group_id`.
-- Nested groups produce the correct path tuples.
-- The pass is a no-op when passed an empty grouping.
-
-No scheduler, no codegen, no hardware needed.
-
----
-
-### Milestone 4 — `bundle.mlir` `scf.for` emission
-
-**Scope**: `bundle.py` only.
-
-**Work items**:
-
-1. Refactor `generate_bundle` to separate SDSC JSON compilation (the
-   flat `compile_op_spec` loop) from `bundle.mlir` emission.
-
-2. Add a recursive helper
-   `_emit_bundle_mlir(specs, indent, file, sdsc_files)` that walks
-   `list[OpSpec | LoopSpec]` depth-first:
-   - For each `OpSpec`: emit one `sdscbundle.sdsc_execute` line.
-   - For each `LoopSpec`: emit an `scf.for` block, recurse into
-     `body`, emit closing brace.
-   - Number SDSC JSON files in the depth-first traversal order.
-
-3. Emit the `arith.constant` and shape-value preamble for loop counts.
-   For the prototype, symbolic `loop_count` expressions are
-   concretized with `_concretize_for_sdsc` (already used in
-   `superdsc.py`) and emitted as `arith.constant`.  Dynamic/symbolic
-   emission (reading a runtime shape value) is a follow-up.
-
-**Test**: Unit tests in `tests/inductor/test_bundle_mlir.py` that call
-`generate_bundle` with a manually constructed `list[OpSpec | LoopSpec]`
-(using stub `OpSpec` objects with enough data to pass `compile_op_spec`)
-and assert the content of the generated `bundle.mlir`:
-
-- A flat list produces the existing `sdsc_execute` pattern.
-- A single `LoopSpec` wrapping two `OpSpec`s produces a single
-  `scf.for` with two `sdsc_execute` lines inside.
-- A nested `LoopSpec` produces nested `scf.for` blocks.
-- SDSC JSON files are numbered in depth-first order.
-
----
-
-### Milestone ordering and PR #1984 integration point
-
-```
-M1 (LoopSpec serialization)
-  └─ M2 (CountedLoopSchedulerNode)
-       └─ M3 (coarse_tile pass)   ← PR #1984 can use this
-            └─ M4 (bundle.mlir scf.for)
-```
-
-PR #1984 needs Milestones 1–3 to be able to use the loop IR.
-Specifically, after M3 merges, `chunk_large_tensors` can:
-
-1. Compute its chunk grouping as it does today.
-2. Call `coarse_tile(operations, groups=[(chunk_ops, loop_count)])`
-   instead of inserting the `Scatter`/overwrite pattern.
-3. The rest of the pipeline (M2's post-fusion pass → M1's
-   `LoopSpec` serialization → M4's `scf.for`) handles the rest.
-
-M4 is needed for end-to-end hardware correctness but not for the
-pipeline integration test that validates the loop structure is correctly
-threaded through the scheduler and codegen stages.
+Refactored `generate_bundle` to walk the `list[OpSpec | LoopSpec]` tree
+recursively and emit `scf.for` blocks in `bundle.mlir`.  Concrete integer
+loop counts are emitted as `arith.constant`; symbolic counts are not yet
+supported.
 
 ## Rejected design alternatives
 
@@ -686,10 +577,12 @@ appropriate for the counted, coarse-tiling use case.
 **`GroupedSchedulerNode`** (`torch/_inductor/scheduler.py`).  Groups a
 sequence of `SchedulerNode`s so the scheduler cannot interleave other
 nodes between them.  This is a pure scheduling constraint: it carries no
-loop count, does not rewrite iteration spaces, and is unpacked back to a
-flat list at codegen time.  It is nevertheless useful as the *base class*
-for `CountedLoopSchedulerNode` because it already implements dependency
-merging, ordering constraints, and `name_to_fused_node` bookkeeping.
+loop count, does not rewrite iteration spaces, and is **unconditionally
+unpacked** by `Scheduler.process_grouped_nodes()` before codegen.  It also
+does not appear in the `FusedSchedulerNode | SchedulerNode` isinstance
+check in `Scheduler._codegen`, so a subclass of `GroupedSchedulerNode`
+would not be dispatched to `codegen_node()` at all.  These limitations
+make `FusedSchedulerNode` the correct base instead.
 
 **`codegen.cpp.LoopLevel` / `LoopNest`** (`torch/_inductor/codegen/cpp.py`).
 Codegen-time loop structures used by the C++ backend to emit nested
@@ -761,3 +654,6 @@ codegen time.
   loop do not currently use the induction variable; each iteration executes
   identically on a different slice of the data determined by the reduced
   iteration space).
+- Symbolic loop counts in `bundle.mlir` (currently raises
+  `NotImplementedError`; requires runtime shape plumbing into the MLIR
+  function signature).
