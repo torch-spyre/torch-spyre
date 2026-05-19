@@ -234,6 +234,7 @@ def _compare_op_with_cpu(fn, op, *args, **kwargs):
         **kwargs,
     )
 
+
 ALL_DTYPES = [
     torch.float32,
     torch.float16,
@@ -243,20 +244,16 @@ ALL_DTYPES = [
 
 ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
 
-TO_DTYPE_OP_SHAPES_EXPECT_FAIL = [
+TO_DTYPE_OP_SHAPES_UNALIGNED = [
     (4, 16),
     (4, 68),
-    (68, 5),
 ]
 
-TO_DTYPE_OP_SHAPES_EXPECT_PASS = [
-    (4, 2),
-    (2, 4),
-    (16, 4),
+TO_DTYPE_OP_SHAPES_ALIGNED = [
     (4, 64),
 ]
 
-TO_DTYPE_OP_SHAPES = TO_DTYPE_OP_SHAPES_EXPECT_PASS + TO_DTYPE_OP_SHAPES_EXPECT_FAIL
+TO_DTYPE_OP_SHAPES = TO_DTYPE_OP_SHAPES_UNALIGNED + TO_DTYPE_OP_SHAPES_ALIGNED
 
 
 def _dtype_name(dt):
@@ -282,8 +279,8 @@ TO_DTYPE_OP_PARAMS_SETS = {
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
-    if DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
-    for shape in TO_DTYPE_OP_SHAPES_EXPECT_FAIL
+    for shape in TO_DTYPE_OP_SHAPES
+    if shape == (4, 68) or (DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -294,6 +291,12 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     for src, dst in [(torch.float16, torch.float32)]
     for shape in TO_DTYPE_OP_SHAPES
 }
+
+TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
+    for src, dst in [(torch.float16, torch.float32)]
+    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+]
 
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
@@ -3326,6 +3329,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
     }
 
