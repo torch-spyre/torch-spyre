@@ -64,6 +64,7 @@ DTYPE_STR_MAP: Dict[str, torch.dtype] = {
     "complex64": torch.complex64,
     "complex128": torch.complex128,
     "bool": torch.bool,
+    "half": torch.half,
 }
 
 DTYPE_NAMES_ORDERED = sorted(DTYPE_STR_MAP.keys(), key=len, reverse=True)
@@ -73,14 +74,14 @@ DTYPE_NAMES_ORDERED = sorted(DTYPE_STR_MAP.keys(), key=len, reverse=True)
 # ------------------------------
 
 ENV_TEST_CONFIG = "PYTORCH_TEST_CONFIG"
-ENV_PYTORCH_ROOT = "PYTORCH_ROOT"
-ENV_TORCH_SPYRE_ROOT = "TORCH_SPYRE_ROOT"
+ENV_TORCH_ROOT = "TORCH_ROOT"
+ENV_TORCH_DEVICE_ROOT = "TORCH_DEVICE_ROOT"
 
 # -------------------------------------
 # rel_path tokens -> env var names
 # -------------------------------------
 
 REL_PATH_TOKENS = (
-    ("${PYTORCH}", ENV_PYTORCH_ROOT),
-    ("${TORCH_SPYRE}", ENV_TORCH_SPYRE_ROOT),
+    ("${TORCH_ROOT}", ENV_TORCH_ROOT),
+    ("${TORCH_DEVICE_ROOT}", ENV_TORCH_DEVICE_ROOT),
 )

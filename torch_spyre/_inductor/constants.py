@@ -14,7 +14,6 @@
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
-MATMUL_REDUCTION_OP = "matmul"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
 DEVICE_NAME = "spyre"
@@ -29,6 +28,9 @@ SEGMENT_OFFSETS = [
     0x1400000000,
     0x1800000000,
 ]
+
+INTERMEDIATES_SEGMENT = 0x0
+SEGMENT_SIZE = 0x400000000
 
 SPYRE_FP32_OPS = [
     "add",
@@ -46,13 +48,19 @@ SPYRE_FP32_OPS = [
     "exx2",
     "layernormnorm",
     "identity",
+    "overwrite",
+    "topkvalue",
+    "topkindex",
+    "floor",
 ]
 
-LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
+TOPK_OPS = {"topkvalue", "topkindex"}
+
+LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 
 
 # Populate more valid labels from deeptools here if needed
-INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j"]
+INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
-MATMUL_DIM_LABELS = ["y", "x", "mb", "out", "in"]
+MATMUL_DIM_LABELS = ["x", "mb", "y", "ki", "kj", "out", "in"]

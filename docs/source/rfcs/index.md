@@ -25,7 +25,7 @@ and submit a pull request.
 
 ### RFC 0047 — Tensors with Device-Specific Layouts
 
-Defines the Spyre tiled tensor layout model: `device_size`, `dim_map`, and the
+Defines the Spyre tiled tensor layout model: `device_size`, `stride_map`, and the
 stick abstraction. Motivates why PyTorch's single-stride-per-dimension layout
 cannot represent tiled tensors, and specifies the `SpyreTensorLayout` data
 structure that maps between PyTorch coordinates and Spyre device memory.
@@ -56,14 +56,15 @@ integration via `REGISTER_PRIVATEUSE1_PROFILER`, dual-memory profiling (DDR
 and scratchpad), AIU SMI for device monitoring, IR instrumentation-based
 fine-grained profiling, and the Holistic Trace Analyser for Spyre.
 
-See also: [Profiling](../user_guide/profiling.md)
+See also: [Profiling](../user_guide/profiling/index.md)
 
 ### RFC 0682 — Kernel Tile Intermediate Representation (KTIR)
 
 Defines the Kernel Tile IR — an MLIR-based data-parallel intermediate
 representation that replaces SuperDSC bundles as the target for the
 Torch-Spyre compiler back-end. KTIR expresses tile-level operations,
-scratchpad allocation, and DMA transfers in a hardware-independent form
-that is then lowered to device-specific code by the DeepTools back-end.
+scratchpad allocation, and the load/store traffic between device
+memory and scratchpad in a hardware-independent form that DeepTools
+then lowers to device-specific code.
 
 See also: [Compiler Backend](../compiler/backend.md)

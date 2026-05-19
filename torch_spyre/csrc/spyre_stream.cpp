@@ -19,12 +19,18 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <cstddef>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "flex/flex.hpp"
 #include "logging.h"
 #include "module.h"
+#include "spyre_allocator.h"
+#include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
 
@@ -48,8 +54,8 @@ struct StreamPool {
   std::unordered_map<c10::DeviceIndex, size_t> next_low_priority_idx;
   std::unordered_map<c10::DeviceIndex, size_t> next_high_priority_idx;
 
-  // Mapping from c10::StreamId to flex::StreamHandle
-  std::unordered_map<c10::StreamId, flex::StreamHandle> stream_handle_map;
+  // Mapping from c10::StreamId to flex::RuntimeStream*
+  std::unordered_map<c10::StreamId, flex::RuntimeStream*> stream_handle_map;
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
@@ -75,7 +81,8 @@ constexpr int kHighPriorityStreamsPerDevice = 32;
 
 // Constructor
 SpyreStream::SpyreStream()
-    : stream_(getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, 0))
+    : stream_(getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1,
+                                           SpyreGuardImpl::tls_idx))
                   .unwrap()) {}
 SpyreStream::SpyreStream(c10::Stream stream) : stream_(stream) {
   TORCH_CHECK(stream_.device_type() == c10::DeviceType::PrivateUse1,
@@ -106,9 +113,8 @@ bool SpyreStream::query() const {
   DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
             device().index());
 
-  auto runtime = GlobalRuntime::get();
-  flex::StreamHandle handle = get_flex_handle();
-  return runtime->queryStream(handle);
+  flex::RuntimeStream* handle = getRuntimeHandle();
+  return handle->query();
 }
 
 void SpyreStream::synchronize() const {
@@ -117,44 +123,132 @@ void SpyreStream::synchronize() const {
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             device().index());
 
-  auto runtime = GlobalRuntime::get();
-  flex::StreamHandle handle = get_flex_handle();
-  runtime->synchronizeStream(handle);
+  flex::RuntimeStream* handle = getRuntimeHandle();
+  handle->synchronize();
 }
 
 c10::Stream SpyreStream::unwrap() const {
   return stream_;
 }
 
-void SpyreStream::copy_async(const at::Tensor& src,
-                             const at::Tensor& dst) const {
-  // TODO(tmhoangt): place-holder to be implemented in the next PR
+void SpyreStream::copyProgramAsync(
+    void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
+  // NOTE: the assumption is that the size of the program match the size of
+  // device_address
+  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
 }
 
-flex::StreamHandle SpyreStream::get_flex_handle() const {
+void SpyreStream::copyAsync(const at::Tensor& src,
+                            const at::Tensor& dst) const {
+  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
+  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+
+  // TODO(tmhoangt): add type conversion node
+  // Type checking - no type conversion support yet
+  TORCH_CHECK(
+      src.scalar_type() == dst.scalar_type(),
+      "Spyre backend does not support type conversion yet during copy.");
+
+  // Determine copy direction
+  bool host2device = src.is_cpu() && dst.is_privateuseone();
+  bool device2host = src.is_privateuseone() && dst.is_cpu();
+
+  const at::Tensor* dev_tensor = host2device ? &dst : &src;
+  const at::Tensor* cpu_tensor = host2device ? &src : &dst;
+
+  if (host2device || device2host) {
+    // Host-to-device or device-to-host copy
+    void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
+
+    // Get SpyreTensorLayout using the public API
+    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
+
+    // Extract device allocation from Spyre tensor storage
+    auto* spyre_impl =
+        static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
+    auto& storage = spyre_impl->storage();
+    auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
+
+    DataConversionInfo dci = generate_dci(
+        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+
+    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+
+  } else {
+    TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
+                " dst on ", dst.device());
+  }
+}
+
+flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
+  if (flex_handle_ != nullptr) {
+    return flex_handle_;
+  }
+  flex_handle_ = resolveRuntimeHandle();
+  return flex_handle_;
+}
+
+flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
 
-  // Look up the flex handle using this stream's ID
   auto it = pool.stream_handle_map.find(id());
-
-  if (it != pool.stream_handle_map.end()) {
-    return it->second;
-  }
-
-  // Default stream (ID 0) returns nullptr
-  return flex::DEFAULT_STREAM;
+  TORCH_CHECK(it != pool.stream_handle_map.end(),
+              "SpyreStream: no flex handle for stream id ", id(),
+              " — was the stream pool initialized for this device?");
+  return it->second;
 }
 
-void SpyreStream::copy_async_impl(
-    void* cpu_ptr, flex::DeviceMemoryAllocationPtr& device_allocation,
-    int device_id, const DataConversionInfo& dci, bool host2device) const {
-  // TODO(tmhoangt): place-holder to be implemented in the next PR
+void SpyreStream::copyAsyncImpl(void* cpu_ptr,
+                                const flex::CompositeAddress* device_address,
+                                const DataConversionInfo* dci,
+                                bool host2device) const {
+  // Wrap dci in shared_ptr for flex API
+  auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
+
+  // Get the flex runtime stream handle
+  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+
+  // Create and launch operation
+  if (host2device) {
+    flex::RuntimeOperationH2D op(cpu_ptr, device_address, dci_ptr);
+    flex_stream->launchOperation(op);
+  } else {
+    flex::RuntimeOperationD2H op(device_address, cpu_ptr, dci_ptr);
+    flex_stream->launchOperation(op);
+  }
+}
+
+void SpyreStream::executeProgramAsync(
+    const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
+  // NOTE: Maybe it's better/faster if we know the exact number of arguments
+  // as it is tracked inside KerntlArtifacts
+  std::vector<const flex::CompositeAddress*> tensor_allocs;
+  for (size_t i = 0; i < args.size(); ++i) {
+    auto* ctx = static_cast<SharedOwnerCtx*>(
+        args[i].storage().data_ptr().get_context());
+    tensor_allocs.push_back(&ctx->composite_addr);
+  }
+
+  // Program
+  auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
+  flex::RuntimeOperationCompute compute_op(
+      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
+
+  // Get the flex runtime stream handle
+  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+  flex_stream->launchOperation(compute_op);
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
+
+  // Register the default stream (ID 0) using the concrete flex handle.
+  // This ensures getRuntimeHandle() resolves stream 0 to the real RuntimeStream
+  // instance owned by RuntimeContext.
+  auto runtime = GlobalRuntime::get();
+  pool.stream_handle_map[0] = runtime->getDefaultStream();
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
@@ -180,14 +274,15 @@ void initializeStreamPool(c10::DeviceIndex device_index) {
 
 SpyreStream getDefaultStream(c10::Device device) {
   if (device.index() == -1) {
-    device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
   }
+  initializeStreamPool(device.index());
   return SpyreStream(c10::Stream(c10::Stream::DEFAULT, device));
 }
 
 SpyreStream getCurrentStream(c10::Device device) {
   if (device.index() == -1) {
-    device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
   }
 
   auto it = current_streams.find(device.index());
@@ -207,7 +302,7 @@ SpyreStream setCurrentStream(SpyreStream stream) {
 
 SpyreStream getStreamFromPool(c10::Device device, int priority) {
   if (device.index() == -1) {
-    device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
   }
 
   // Ensure runtime is initialized before creating streams
@@ -240,8 +335,8 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   // Create corresponding flex stream handle (if not exists)
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
-    flex::StreamHandle flex_handle =
-        runtime->createStream(device.index(), priority);
+    flex::RuntimeStream* flex_handle =
+        runtime->createStream(runtime->toPriority(priority));
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
@@ -251,17 +346,20 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
 void synchronizeDevice(c10::optional<c10::Device> device) {
   auto sync_one_device = [](c10::Device dev) {
     if (dev.index() == -1) {
-      dev = c10::Device(c10::DeviceType::PrivateUse1, 0);
+      dev = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
     }
     const auto device_index = dev.index();
 
-    std::vector<flex::StreamHandle> handles_to_sync;
+    std::vector<flex::RuntimeStream*> handles_to_sync;
     {
       auto& pool = getStreamPool();
       std::lock_guard<std::mutex> lock(pool.mutex);
 
-      // Default stream is always present
-      handles_to_sync.push_back(flex::DEFAULT_STREAM);
+      // Default stream (ID 0) is always present when the pool is initialized
+      auto default_it = pool.stream_handle_map.find(0);
+      if (default_it != pool.stream_handle_map.end()) {
+        handles_to_sync.push_back(default_it->second);
+      }
 
       auto collect = [&](auto& stream_map) {
         auto it = stream_map.find(device_index);
@@ -280,16 +378,14 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
     auto runtime = GlobalRuntime::get();
     c10::DeviceGuard guard(dev);
     for (auto handle : handles_to_sync) {
-      runtime->synchronizeStream(handle);
+      handle->synchronize();
     }
   };
   if (device.has_value()) {
     sync_one_device(device.value());
   } else {
-    // Synchronize all devices
-    for (int i = 0; i < device_count(); ++i) {
-      sync_one_device(c10::Device(c10::DeviceType::PrivateUse1, i));
-    }
+    sync_one_device(
+        c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
   }
 }
 

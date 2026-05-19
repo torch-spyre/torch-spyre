@@ -15,6 +15,7 @@
  */
 #include "spyre_allocator.h"
 
+#include <memory>
 #include <utility>
 
 #include "logging.h"
@@ -25,12 +26,17 @@
 namespace spyre {
 
 SpyreAllocator::SpyreAllocator() = default;
+c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
+c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
+    true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
 
-flex::DeviceMemoryAllocatorPtr SpyreAllocator::getAllocator(
-    unsigned int dev_id) {
-  return GlobalRuntime::get()
-      ->GetDeviceHandle(dev_id)
-      ->GetDeviceMemoryAllocator();
+std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
+  // FlexAllocator is owned by RuntimeContext (one per device per process).
+  // RuntimeContext::getAllocator() returns shared_ptr<const FlexAllocator>;
+  // we const_cast to shared_ptr<FlexAllocator> because allocate()/deallocate()
+  // are non-const (internally mutex-protected and thread-safe).
+  auto const_alloc = flex::getFlexRuntimeContext()->getAllocator();
+  return std::const_pointer_cast<flex::FlexAllocator>(const_alloc);
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
@@ -49,12 +55,70 @@ void SpyreAllocator::recordStream(const c10::DataPtr& ptr, c10::Stream stream) {
 
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
     c10::DeviceIndex device) {
-  return {};
+  return stats_;
 }
 
-void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {}
+void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
+  c10::CachingAllocator::for_each_selected_stat_type(
+      stat_types, [&](size_t stat_type) {
+        stats_.allocated_bytes[stat_type].reset_accumulated();
+        stats_.allocation[stat_type].reset_accumulated();
+      });
+}
 
-void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {}
+void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {
+  c10::CachingAllocator::for_each_selected_stat_type(
+      stat_types, [&](size_t stat_type) {
+        stats_.allocated_bytes[stat_type].reset_peak();
+        stats_.allocation[stat_type].reset_peak();
+      });
+}
+
+void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id) {
+  c10::CachingAllocator::for_each_selected_stat_type(
+      stat_types, [&](size_t stat_type) {
+        stats_.allocation[stat_type].increase(1);
+        stats_.allocated_bytes[stat_type].increase(nbytes);
+      });
+
+  c10::Device curr_device =
+      c10::Device(c10::DeviceType::PrivateUse1, device_id);
+  c10::reportMemoryUsageToProfiler(
+      data,
+      nbytes,  // alloc_size
+      stats_
+          .allocated_bytes[static_cast<size_t>(
+              c10::CachingAllocator::StatType::AGGREGATE)]
+          .current,  // total_allocated
+      stats_
+          .allocated_bytes[static_cast<size_t>(
+              c10::CachingAllocator::StatType::AGGREGATE)]
+          .current,  // total_reserved (currently same as total_allocated)
+      curr_device);
+}
+
+void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
+  c10::CachingAllocator::for_each_selected_stat_type(
+      stat_types, [&](size_t stat_type) {
+        stats_.allocation[stat_type].decrease(1);
+        stats_.allocated_bytes[stat_type].decrease(nbytes);
+      });
+
+  c10::Device curr_device =
+      c10::Device(c10::DeviceType::PrivateUse1, device_id);
+  c10::reportMemoryUsageToProfiler(
+      data,
+      -nbytes,  // alloc_size
+      stats_
+          .allocated_bytes[static_cast<size_t>(
+              c10::CachingAllocator::StatType::AGGREGATE)]
+          .current,  // total_allocated
+      stats_
+          .allocated_bytes[static_cast<size_t>(
+              c10::CachingAllocator::StatType::AGGREGATE)]
+          .current,  // total_reserved (currently same as total_allocated)
+      curr_device);
+}
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   c10::Device curr_device =
@@ -66,15 +130,25 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
-  auto allocator = getAllocator(device_id);
-  flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-  // NOTE: last argument should be set to 0
-  allocator->TryAllocate(&data, nbytes, 0);
-  TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-  auto* ctx = new SharedOwnerCtx{std::move(data), device_id};
+  // Get shared_ptr to keep FlexAllocator alive during operations
+  auto flex_alloc = getFlexAllocator();
+
+  // Allocate first-class raw storage via CompositeAddress.
+  flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
+
+  // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
+  // allocation may be larger than the requested nbytes. Use total_size() for
+  // accurate memory profiling.
+  size_t actual_nbytes = composite_addr.total_size();
+
+  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id);
   void* ctx_void = static_cast<void*>(ctx);
 
-  void* data_void = static_cast<void*>(ctx->owner.get());
+  // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.
+  // This pointer is never dereferenced — it serves only as a unique token for
+  // memory profiling (recordAlloc/recordRelease).
+  void* data_void = static_cast<void*>(ctx);
+  recordAlloc(actual_nbytes, data_void, device_id);
 
   auto data_ptr_result =
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
@@ -87,6 +161,10 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
     return;
   }
   auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
+  size_t nbytes = ctx->composite_addr.total_size();
+
+  SpyreAllocator::instance().recordRelease(nbytes, static_cast<void*>(ctx),
+                                           ctx->device_id);
   delete ctx;
 }
 

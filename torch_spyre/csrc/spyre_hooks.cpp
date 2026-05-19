@@ -19,6 +19,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "spyre_device_enum.h"
+
 namespace py = pybind11;
 
 namespace spyre {
@@ -55,6 +57,7 @@ PYBIND11_MODULE(_hooks, m) {
   at::RegisterPrivateUse1HooksInterface(hooks);
   m.doc() =
       "Spyre bootstrap: registers PrivateUse1 hooks only (no heavy init).";
+  m.def("device_count", &spyre::getVisibleDeviceCount);
 }
 
 c10::Device current_device = c10::Device(c10::DeviceType::PrivateUse1, 0);
@@ -80,7 +83,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    */
   c10::Device exchangeDevice(c10::Device d) const override {
     TORCH_INTERNAL_ASSERT(d.is_privateuseone());
-    py::gil_scoped_acquire acquire;
     auto old_device_index = current_device.index();
     return c10::Device(static_type, old_device_index);
   }
@@ -89,8 +91,7 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * Get the current device.
    */
   c10::Device getDevice() const override {
-    py::gil_scoped_acquire acquire;
-    return c10::Device(static_type, 0);
+    return current_device;
   }
 
   /**
@@ -98,7 +99,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    */
   void setDevice(c10::Device d) const override {
     TORCH_INTERNAL_ASSERT(d.is_privateuseone());
-    py::gil_scoped_acquire acquire;
     current_device = c10::Device(static_type, d.index());
   }
 
@@ -107,7 +107,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * (so, e.g., this can be called from a destructor).
    */
   void uncheckedSetDevice(c10::Device d) const noexcept override {
-    py::gil_scoped_acquire acquire;
     current_device = c10::Device(static_type, d.index());
   }
 
@@ -115,7 +114,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * Get the current stream for a given device.
    */
   c10::Stream getStream(c10::Device d) const noexcept override {
-    py::gil_scoped_acquire acquire;
     // FIXME: This is just assuming 0 - ControlBlockStream
     return c10::Stream(c10::Stream::UNSAFE, current_device, 0);
   }
@@ -124,7 +122,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * Get the default stream for a given device.
    */
   c10::Stream getDefaultStream(c10::Device d) const override {
-    py::gil_scoped_acquire acquire;
     // FIXME: This is just assuming 0 - ControlBlockStream
     return c10::Stream(c10::Stream::UNSAFE, current_device, 0);
   }
@@ -134,7 +131,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    */
   c10::Stream getStreamFromGlobalPool(
       c10::Device d, bool isHighPriority = false) const override {
-    py::gil_scoped_acquire acquire;
     // FIXME: This is just assuming 0 - ControlBlockStream
     return c10::Stream(c10::Stream::UNSAFE, current_device, 0);
   }
@@ -145,7 +141,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * the lifetime of the stream.
    */
   c10::Stream getNewStream(c10::Device d, int priority = 0) const override {
-    py::gil_scoped_acquire acquire;
     return c10::Stream(c10::Stream::UNSAFE, current_device, 0);
   }
 
@@ -155,7 +150,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * to set the current device to match the device of this stream.
    */
   c10::Stream exchangeStream(c10::Stream s) const noexcept override {
-    py::gil_scoped_acquire acquire;
     return c10::Stream(c10::Stream::UNSAFE, current_device, 0);
   }
 
@@ -164,7 +158,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    */
   void destroyEvent(void* event, const c10::DeviceIndex device_index)
       const noexcept override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
   }
 
@@ -177,7 +170,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
   void record(void** event, const c10::Stream& stream,
               const c10::DeviceIndex device_index,
               const c10::EventFlag flag) const override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
   }
 
@@ -190,7 +182,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * additional commands until that version of the event is marked as recorded.
    */
   void block(void* event, const c10::Stream& stream) const override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
   }
 
@@ -201,7 +192,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * Returns false otherwise.
    */
   bool queryEvent(void* event) const override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
     return false;
   }
@@ -212,15 +202,13 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * you should report that there are zero available devices.
    */
   c10::DeviceIndex deviceCount() const noexcept override {
-    py::gil_scoped_acquire acquire;
-    return c10::DeviceIndex(1);
+    return c10::DeviceIndex(spyre::getVisibleDeviceCount());
   }
   /**
    * Return true if all the work previously enqueued on the stream for
    * asynchronous execution has completed running on the device.
    */
   bool queryStream(const c10::Stream& stream) const override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
     return true;
   }
@@ -230,7 +218,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * enqueued on the stream has completed running on the device.
    */
   virtual void synchronizeStream(const c10::Stream& stream) const {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
   }
 
@@ -239,7 +226,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    * recorded on the event has completed running on the device.
    */
   void synchronizeEvent(void* event) const override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
   }
 
@@ -250,7 +236,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    */
   void recordDataPtrOnStream(const c10::DataPtr& data_ptr,
                              const c10::Stream& stream) const override {
-    py::gil_scoped_acquire acquire;
     // not implemented on spyre - do nothing
   }
 
@@ -259,7 +244,6 @@ struct SpyreGuardImpl final : public c10::impl::DeviceGuardImplInterface {
    */
   double elapsedTime(void* event1, void* event2,
                      const c10::DeviceIndex device_index) const override {
-    py::gil_scoped_acquire acquire;
     return 0.0;
   }
 };

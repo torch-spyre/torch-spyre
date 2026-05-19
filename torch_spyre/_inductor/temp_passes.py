@@ -14,7 +14,6 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-from typing import cast
 import torch
 from torch._inductor.pattern_matcher import (
     Arg,
@@ -23,31 +22,11 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
+from .logging_utils import get_inductor_logger
 
 aten = torch.ops.aten
 
-
-def relayout_linear_weights(graph: torch.fx.Graph) -> None:
-    """
-    Transpose and realize nn.Linear weights so that they are compatible
-    with the backend compiler as it is today. In the future, this pass
-    should be eliminated for performance reasons when possible.
-    """
-
-    for node in graph.nodes:
-        if node.op == "call_function" and node.target == aten.mm.default:
-            input_t, kernel_t = node.args
-            input_t = cast(torch.fx.Node, input_t)
-            kernel_t = cast(torch.fx.Node, kernel_t)
-            if not kernel_t.meta["val"].is_contiguous():
-                with graph.inserting_before(node):
-                    contiguous_node = graph.call_function(
-                        aten.clone.default,
-                        args=(kernel_t,),
-                        kwargs={"memory_format": torch.contiguous_format},
-                    )
-                    node.update_arg(1, contiguous_node)
-
+logger = get_inductor_logger("work_division")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -148,9 +127,15 @@ def _unflatten_mm_to_bmm(
             expanded_shape, dtype=rhs_dtype, device="meta"
         )
 
-        # Replace mm with bmm
+        # Use spyre.batched_matmul for >3D to avoid FakeTensorUpdater crash
+        # (aten.bmm requires exactly 3D inputs)
+        target = (
+            torch.ops.spyre.batched_matmul.default
+            if len(output_shape) > 3
+            else aten.bmm.default
+        )
         bmm_node = graph.call_function(
-            aten.bmm.default,
+            target,
             args=(lhs_input, expanded),
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
@@ -236,15 +221,20 @@ def _unflatten_bmm_batch_dims(
     lhs_orig = lhs_reshape.args[0]  # the expand or original tensor
     rhs_orig = rhs_reshape.args[0]
 
-    # Update bmm to take the higher-dimensional inputs directly
-    node.args = (lhs_orig, rhs_orig)
+    # Replace the 3D bmm with a spyre.batched_matmul that accepts N-D inputs.
+    # Using aten.bmm.default with >3D args would crash FakeTensorUpdater.
+    with graph.inserting_before(node):
+        matmul_node = graph.call_function(
+            torch.ops.spyre.batched_matmul.default,
+            args=(lhs_orig, rhs_orig),
+        )
+        matmul_node.meta["val"] = output_view.meta["val"]
 
-    # Update bmm output shape metadata
-    node.meta["val"] = node.meta["val"].new_empty(output_shape)
-
-    # Replace all uses of the output view with the bmm itself
-    output_view.replace_all_uses_with(node)
+    # Replace all uses of the output view with the new matmul
+    output_view.replace_all_uses_with(matmul_node)
+    node.replace_all_uses_with(matmul_node)
     graph.erase_node(output_view)
+    graph.erase_node(node)
 
     # Clean up dead reshape nodes
     for reshape_node in (lhs_reshape, rhs_reshape):
@@ -261,11 +251,13 @@ def _unflatten_bmm_batch_dims(
                 graph.erase_node(expand_node)
 
 
-def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
+def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
     """
-    Replace constant arguments to any operation with tensor.
-    Scalars are converted to size=1 tensor and passed to the corresponding
-    operations which was consuming the scalar value.
+    Replace constant arguments to any operation with spyre.constant node.
+    Scalar constants are converted to size=1 tensor and passed to the corresponding
+    operations which was consuming the scalar value at lowering.
+    Deduplication of identical constants happens later at the IR level via
+    dedup_and_promote_constants.
     """
 
     ops_support_list = [
@@ -276,39 +268,31 @@ def replace_scalar_with_tensor(graph: torch.fx.Graph) -> None:
         torch.ops.aten.div.Tensor,
     ]
 
-    # Created node cache for scalar values, and reuse the node when
-    # the scalar found again.
-    const_node_map: dict[int | float, torch.fx.node.Node] = {}
-
     for node in graph.nodes:
         if node.target not in ops_support_list:
             continue
-        scalar_indexes = []
-        for i in range(len(node.args)):
-            in_arg = node.args[i]
-            if not isinstance(in_arg, torch.fx.node.Node):
-                if isinstance(in_arg, (int, float)):
-                    scalar_indexes.append(i)
-                else:
-                    print(f"Warning: unhandled node type {type(in_arg)}")
-
-        if len(scalar_indexes) > 0:
+        for idx, in_arg in enumerate(node.args):
+            if isinstance(in_arg, torch.fx.node.Node):
+                continue
+            if not isinstance(in_arg, (int, float)):
+                logger.warning(f"Warning: unhandled node type {type(in_arg)}")
+                continue
+            # Currently the dtype of the scalar tensor is set as same as the output dtype.
+            # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
+            # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
+            dtype = torch.float16
+            meta = node.meta.get("tensor_meta", None)
+            if meta:
+                dtype = meta.dtype
             with graph.inserting_before(node):
-                for idx in scalar_indexes:
-                    scalar_val = node.args[idx]
-                    if scalar_val in const_node_map:
-                        full_node = const_node_map[scalar_val]
-                    else:
-                        # Currently the dtype of the scalar tensor is set as same as the output dtype.
-                        # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
-                        # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
-                        dtype = torch.float16
-                        meta = node.meta.get("tensor_meta", None)
-                        if meta:
-                            dtype = meta.dtype
-                        full_node = graph.call_function(
-                            torch.ops.spyre.full.default,
-                            args=((1,), scalar_val, torch.device("spyre"), dtype),
-                        )
-                        const_node_map[scalar_val] = full_node
-                    node.update_arg(idx, full_node)
+                const_node = graph.create_node(
+                    "call_function",
+                    torch.ops.spyre.constant.default,
+                    (in_arg, dtype, torch.device("spyre")),
+                    {},
+                    "py_const",
+                    node.type,
+                )
+            node.update_arg(idx, const_node)
+
+    graph.lint()

@@ -21,7 +21,9 @@ from utils_inductor import compare_with_cpu, compare_with_pytorch
 
 
 class TestBuildingBlocks(unittest.TestCase):
-    torch.manual_seed(0xAFFE)
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
 
     def test_softplus(self):
         # beta * x >= threshold ? x : (log(1 + exp(-abs(beta * x)) + relu(beta * x)
@@ -105,6 +107,7 @@ class TestBuildingBlocks(unittest.TestCase):
             gate_proj_weight,
             up_proj_weight,
             down_proj_weight,
+            cpu_compile=True,
         )
 
     def test_rms_norm(self):
@@ -150,4 +153,4 @@ class TestBuildingBlocks(unittest.TestCase):
         compare_with_pytorch(rms_norm, pytorch_fn, *args)
 
         # Compare with cpu implementation
-        compare_with_cpu(rms_norm, *args)
+        compare_with_cpu(rms_norm, *args, cpu_compile=True)

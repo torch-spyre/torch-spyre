@@ -21,8 +21,8 @@ def core_idx_to_slice_offset(
     arg,
     wk_slice: dict,
     work_slices: dict,
-    offset: int,
 ) -> int:
+    offset = sum(arg.offsets.values())
     for dim, stride in arg.strides.items():
         if str(dim) in wk_slice and arg.scales[dim] > 0:
             offset += wk_slice[str(dim)] * stride // work_slices[dim]
@@ -205,7 +205,7 @@ def gen_coord_info_value(
     )
 
 
-def generate_sdsc(sdsc_spec):
+def generate_sdsc(idx, sdsc_spec):
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
         str(c): {
@@ -215,7 +215,7 @@ def generate_sdsc(sdsc_spec):
         for c in range(sdsc_spec.num_cores)
     }
     return {
-        sdsc_spec.opfunc: {
+        f"{idx}_{sdsc_spec.opfunc}": {
             "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
             "sdscFolds_": {
                 "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
@@ -285,10 +285,12 @@ def generate_sdsc(sdsc_spec):
                         "scheduleTree_": [
                             {
                                 "nodeType_": "allocate",
-                                "name_": f"allocate-Tensor{i}_{'hbm' if not tensor.allocation else 'lx'}",
+                                "name_": f"allocate-Tensor{i}_{'lx' if 'lx' in tensor.allocation else 'hbm'}",
                                 "prev_": "",
                                 "ldsIdx_": i,
-                                "component_": "hbm" if not tensor.allocation else "lx",
+                                "component_": "lx"
+                                if "lx" in tensor.allocation
+                                else "hbm",
                                 "layoutDimOrder_": [
                                     str(dim)
                                     for dim in sdsc_spec.layouts[tensor.layout][
@@ -322,11 +324,13 @@ def generate_sdsc(sdsc_spec):
                                                 tensor,
                                                 core_id_to_wk_slice[str(c)],
                                                 sdsc_spec.work_slices,
-                                                offset=tensor.offset,
                                             )
                                             * num_bytes(tensor.data_format)
                                         )
+                                        if "lx" not in tensor.allocation
+                                        else str(tensor.start_address)
                                         for c in range(sdsc_spec.num_cores)
+                                        #  lx addr is baked into tensor.start_addr already
                                     },
                                 },
                                 **(
@@ -387,7 +391,7 @@ def generate_sdsc(sdsc_spec):
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
                                 }
-                                if not tensor.allocation
+                                if "lx" not in tensor.allocation
                                 else {"lx": {"isPresent": 1}},
                             }
                             for i, tensor in enumerate(sdsc_spec.args)

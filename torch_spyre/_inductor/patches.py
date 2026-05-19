@@ -15,6 +15,7 @@
 from contextlib import contextmanager
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from typing import Callable, Optional
@@ -72,36 +73,30 @@ def enable_spyre_context(
     import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.choices import SpyreHeuristics
     from torch_spyre._inductor.passes import (
+        CustomPreGradPasses,
         CustomPrePasses,
         CustomPostPasses,
-        scheduler_passes,
-        _maybe_run_scheduler_pass,
+        CustomPreFusionPasses,
+        CustomPostFusionPasses,
+        CustomPreSchedulingPasses,
     )
 
     # *) Inductor config tweaks (saved/restored)
-    import torch._inductor.config as inductor_config
-
-    saved_config = {
-        "split_reductions": inductor_config.split_reductions,
-        "benchmark_harness": inductor_config.benchmark_harness,
-        "post_grad_custom_pre_pass": inductor_config.post_grad_custom_pre_pass,
-        "post_grad_custom_post_pass": inductor_config.post_grad_custom_post_pass,
-        "_pre_fusion_custom_pass": inductor_config._pre_fusion_custom_pass,
-        "unroll_reductions_threshold": inductor_config.unroll_reductions_threshold,
-        "permute_fusion": inductor_config.permute_fusion,
+    new_config = {
+        "split_reductions": False,
+        "benchmark_harness": False,
+        "pre_grad_custom_pass": CustomPreGradPasses(),
+        "post_grad_custom_pre_pass": CustomPrePasses(),
+        "post_grad_custom_post_pass": CustomPostPasses(),
+        "_pre_fusion_custom_pass": CustomPreFusionPasses(),
+        "_post_fusion_custom_pass": CustomPostFusionPasses(),
+        # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
+        # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
+        "unroll_reductions_threshold": 1,
+        # Disable fusing of mm + permute/transpose for now.
+        "permute_fusion": False,
+        "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
     }
-    inductor_config.split_reductions = False
-    inductor_config.benchmark_harness = False
-    inductor_config.post_grad_custom_pre_pass = CustomPrePasses()
-    inductor_config.post_grad_custom_post_pass = CustomPostPasses()
-    inductor_config._pre_fusion_custom_pass = lambda nodes: _maybe_run_scheduler_pass(
-        scheduler_passes, nodes
-    )
-    # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
-    # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
-    inductor_config.unroll_reductions_threshold = 1
-    # Disable fusing of mm + permute/transpose for now.
-    inductor_config.permute_fusion = False
 
     from torch._inductor.ir import Loops
 
@@ -115,18 +110,29 @@ def enable_spyre_context(
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
+    # Inject the pre_scheduling_passes before the Scheduler is constructed,
+    # allowing the passes to modify the graph IR (buffers, inputs, constants).
+    old_update_scheduler = GraphLowering._update_scheduler
+
+    _pre_scheduling_pass = CustomPreSchedulingPasses()
+
+    def _spyre_update_scheduler(self: GraphLowering) -> None:
+        _pre_scheduling_pass(self.operations)
+        old_update_scheduler(self)
+
+    GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
+
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
         enable_spyre_decompositions(decomps=decomps) as spyre_context_decompositions,
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
+        torch._inductor.config.patch(new_config),
     ):
         try:
             yield spyre_context_decompositions
         finally:
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
-            # restore configs
-            for k, v in saved_config.items():
-                setattr(inductor_config, k, v)
+            GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]

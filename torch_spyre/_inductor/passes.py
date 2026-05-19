@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import inspect
-import os
+import io
+import logging
 from typing import Optional, Any, Callable, List
+from abc import abstractmethod
 
 import torch
 import torch.fx.graph
@@ -22,18 +24,57 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from .logging_utils import get_inductor_logger
+
+from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
-    relayout_linear_weights,
-    replace_scalar_with_tensor,
+    convert_constant_with_graph_node,
 )
-from .stickify import propagate_spyre_tensor_layouts
-from .core_division import core_division_planning
+from . import config
+from .propagate_layouts import (
+    propagate_mutation_layouts,
+    propagate_spyre_tensor_layouts,
+)
+from .optimize_restickify import optimize_restickify_locations
+from .insert_restickify import insert_restickify, finalize_layouts
+from .memory_planning import memory_planning
+from .work_division import span_reduction, work_distribution, k_fast_division
+from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad import scratchpad_planning
+from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
+from .deadcode_elimination import deadcode_elimination
+from .dedup_constants import dedup_and_promote_constants
+
+
+logger = get_inductor_logger("passes")
+
+
+def _format_operations(operations: list[Operation]) -> str:
+    buf = io.StringIO()
+    for op in operations:
+        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
+        if isinstance(op, ComputedBuffer):
+            buf.write(f"\n  layout={op.layout}")
+            if allocation := getattr(op.layout, "allocation", None):
+                buf.write(f"\n  allocation={allocation}")
+            if splits := getattr(op, "op_it_space_splits", None):
+                rw = op.get_read_writes()
+                write_index = next(iter(rw.writes)).index
+                read_index = next((d.index for d in rw.reads), write_index)
+                it_space = iteration_space_from_op(op)
+                readable_splits = apply_splits_from_index_coeff(
+                    splits, write_index, read_index, it_space
+                )
+                buf.write(f"\n  op_it_space_splits={readable_splits}")
+            buf.write(f"\n  {op.data}")
+        buf.write("\n\n")
+    return buf.getvalue()
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -46,6 +87,19 @@ def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
 
     if has_spyre_device:
         return pass_fn(graph)
+
+
+class CustomPreGradPasses:
+    """
+    This inductor extension point enables Spyre-specific passes to run on the
+    pre-grad FX graph.
+    """
+
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
+
+    def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        for p in self.passes:
+            p(graph)
 
 
 class CustomPrePasses(CustomGraphPass):
@@ -65,7 +119,8 @@ class CustomPrePasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPrePasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 class CustomPostPasses(CustomGraphPass):
@@ -78,8 +133,7 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
-        replace_scalar_with_tensor,
-        relayout_linear_weights,
+        convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
     ]
@@ -90,7 +144,8 @@ class CustomPostPasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPostPasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 def _maybe_run_scheduler_pass(
@@ -107,17 +162,97 @@ def _maybe_run_scheduler_pass(
     return nodes
 
 
-def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+class CustomNodePassBase(CustomGraphPass):
+    def __call__(self, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+        for _pass in self.get_passes():
+            nodes = _maybe_run_scheduler_pass(_pass, nodes)
+        return nodes
+
+    @abstractmethod
+    def get_passes(
+        self,
+    ) -> list[Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]]:
+        pass
+
+    def uuid(self) -> Optional[Any]:
+        files = [inspect.getfile(c) for c in self.get_passes()]
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
+
+
+class CustomPreFusionPasses(CustomNodePassBase):
     """
     This inductor extension point enables Spyre-specific passes to run over
-    the graph of LoopLevelIR nodes immediately before fusion is applied.
+    the graph of LoopLevelIR nodes immediately before Inductor's fusion pass runs.
 
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
 
-    nodes = propagate_spyre_tensor_layouts(nodes)
-    nodes = core_division_planning(nodes)
-    if os.environ.get("LX_PLANNING", "0") == "1":
-        nodes = scratchpad_planning(nodes)
-    return nodes
+    def get_passes(self):
+        return [propagate_mutation_layouts]
+
+
+class CustomPostFusionPasses(CustomNodePassBase):
+    """
+    This inductor extension point enables Spyre-specific passes to run over
+    the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
+
+    The list of nodes is guarenteed by the caller to be in topological order.
+    The returned list of nodes must also be in topological order.
+    """
+
+    def get_passes(self):
+        return [memory_planning, spyre_fuse_nodes]
+
+
+class CustomPreSchedulingPasses(CustomGraphPass):
+    """
+    Spyre-specific passes that run on IR operations immediately before the
+    Scheduler is constructed (via the _update_scheduler monkey-patch).
+
+    Operations are in topological order (guaranteed by GraphLowering).
+    """
+
+    def __call__(self, operations: list[Operation]) -> None:
+        has_spyre_device = any(
+            op.get_device() is not None and op.get_device().type == DEVICE_NAME
+            for op in operations
+        )
+        if not has_spyre_device:
+            return
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
+
+        deadcode_elimination(operations)
+        propagate_spyre_tensor_layouts(operations)
+        optimize_restickify_locations(operations)
+        finalize_layouts(operations)
+        insert_restickify(operations)
+        insert_bmm_padding(operations)
+        dedup_and_promote_constants(operations)
+        span_reduction(operations)
+        k_fast_ops = (
+            k_fast_division(operations) if config.core_id_k_fast_emission else []
+        )
+        work_distribution(operations, k_fast_ops)
+        if config.lx_planning:
+            scratchpad_planning(operations)
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
+
+    def uuid(self) -> Optional[Any]:
+        files = [
+            inspect.getfile(deadcode_elimination),
+            inspect.getfile(dedup_and_promote_constants),
+            inspect.getfile(propagate_spyre_tensor_layouts),
+            inspect.getfile(optimize_restickify_locations),
+            inspect.getfile(insert_restickify),
+            inspect.getfile(insert_bmm_padding),
+            inspect.getfile(span_reduction),
+            inspect.getfile(work_distribution),
+            inspect.getfile(k_fast_division),
+            inspect.getfile(scratchpad_planning),
+        ]
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))

@@ -26,6 +26,14 @@ from torch._inductor.ir import (
 )
 from torch_spyre._C import SpyreTensorLayout
 
+from torch._inductor.codegen.wrapper import (
+    PythonWrapperCodegen,
+)
+from torch._inductor.virtualized import V
+import sympy
+from torch.utils._ordered_set import OrderedSet
+import torch._inductor.ir as ir
+
 
 @ir_dataclass
 class SpyreReduction(Reduction):
@@ -96,3 +104,80 @@ class FixedTiledLayout(FixedLayout):
         )
 
     __repr__ = __str__
+
+
+class SpyreConstantFallback(ir.ExternKernel):
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        wrapper.generate_const_tensor_fallback(self)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self, op_overload: torch._ops.OpOverload, value, dtype, device
+    ) -> None:
+        cpp_kernel_name = "aoti_torch_constant"
+        layout = FixedLayout(device, dtype, [1], [1])
+        super().__init__(
+            None,
+            layout,
+            [],
+            (value,),
+            python_kernel_name="torch.ops.spyre.constant",
+            cpp_kernel_name=cpp_kernel_name,
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
+class SpyreEmptyFallback(ir.ExternKernel):
+    """IR node for spyre.empty — emits spyre_empty_with_layout via make_buffer_allocation.
+
+    should_allocate() returns True so the wrapper calls make_buffer_allocation.
+    SpyrePythonWrapperCodegen.make_buffer_allocation emits
+    spyre_empty_with_layout(size, stride, dtype, device_layout) when the layout is
+    a FixedTiledLayout; the placeholder FixedLayout set at construction time must be
+    replaced with a FixedTiledLayout before codegen runs (lower_pad_sequence does
+    this immediately after calling run_node).  If the layout is never upgraded the
+    wrapper falls back to the generic CPU allocator, which is incorrect on Spyre.
+    codegen() is a no-op because the allocation IS the result — there is no
+    separate kernel call.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        pass
+
+    def should_allocate(self) -> bool:
+        return True
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        size: list[Expr],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        stride = ir.FlexibleLayout.contiguous_strides(size)
+        layout = FixedLayout(device, dtype, size, stride)
+        super().__init__(
+            None,
+            layout,
+            [],
+            (),
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)

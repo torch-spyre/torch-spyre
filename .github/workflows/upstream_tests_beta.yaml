@@ -1,0 +1,137 @@
+name: upstream-pytorch-tests-beta
+
+on:
+  # Run automatically on every merge to main
+  push:
+    branches: [main]
+    paths-ignore:
+      - tests/docs/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  upstream-tests:
+    name: ${{ matrix.suite.name }}
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 720
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
+
+    # ---------------------------------------------------------------------------
+    # To add a new upstream test suite, append an entry here:
+    #   - name: <human-readable label shown in the GHA UI>
+    #     config: <filename inside tests/configs/>
+    # ---------------------------------------------------------------------------
+    strategy:
+      fail-fast: false   # run all suites even if one fails
+      matrix:
+        suite:
+          - name: Binary ops
+            config: test_binary_ufuncs.yaml
+          - name: Indexing
+            config: test_indexing.yaml
+          - name: Linear algebra
+            config: test_linalg.yaml
+          - name: NeuralNet test embedding
+            config: test_nn_test_embedding.yaml
+          - name: NeuralNet lazy modules
+            config: test_nn_test_lazy_modules.yaml
+          - name: NeuralNet pooling
+            config: test_nn_test_pooling.yaml
+          - name: Reductions
+            config: test_reductions.yaml
+          - name: Shape ops
+            config: test_shape_ops.yaml
+          - name: Tensor creation ops
+            config: test_tensor_creation_ops.yaml
+          - name: Torch
+            config: test_torch.yaml
+          - name: Unary ops
+            config: test_unary_ufuncs.yaml
+
+    steps:
+      - name: Checkout branch/commit in pre-cloned torch-spyre
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          # The pre-cloned repo may be owned by a different user than the
+          # runner process; mark all directories as safe to avoid git's
+          # "dubious ownership" error (covers the repo and any submodules).
+          git config --global --add safe.directory '*'
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          TARGET_SHA="${GITHUB_SHA}"
+          TARGET_REF="${GITHUB_REF}"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git log -1 --oneline
+
+      - name: Gather runner info
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          date
+          pwd
+          whoami
+          id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          echo "TORCH_ROOT $TORCH_ROOT"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+
+      - name: Build torch-spyre
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+          uv sync \
+            --verbose \
+            --all-extras \
+            --active \
+            --inexact \
+            --reinstall-package torch-spyre
+          uv pip show torch
+          uv pip freeze
+
+      - name: Run ${{ matrix.suite.name }} upstream beta test suite
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+          echo 'Running ${{ matrix.suite.name }} upstream tests...'
+          bash tests/run_test.sh "tests/configs/upstream_tests_beta/${{ matrix.suite.config }}" -v
+          echo '${{ matrix.suite.name }} upstream tests done'

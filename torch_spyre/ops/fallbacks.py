@@ -49,6 +49,9 @@ import os
 import warnings
 
 import torch
+from torch._ops import OpOverload, OpOverloadPacket
+
+from typing import Union
 
 aten = torch._ops.ops.aten
 
@@ -76,6 +79,23 @@ def warn_fallback(op, fallback_device="cpu"):
         category=FallbackWarning,
         skip_file_prefixes=_warn_skips,
     )
+
+
+def _get_op_overloads(
+    ops: Union[OpOverloadPacket, OpOverload, list[Union[OpOverload, OpOverloadPacket]]],
+) -> list[OpOverload]:
+    result = []
+    if isinstance(ops, list):
+        for op in ops:
+            result.extend(_get_op_overloads(op))
+        return result
+
+    if isinstance(ops, OpOverloadPacket):
+        result.extend([getattr(ops, op) for op in ops.overloads()])
+    else:
+        result.append(ops)
+
+    return result
 
 
 def register_fallback(ops, device="cpu"):
@@ -179,7 +199,17 @@ def register_fallback(ops, device="cpu"):
             return out
 
         # Otherwise, return result moved to the target Spyre device
-        return fallback_result.to(spyre_device)
+        # Handle both single tensor and tuple/list of tensors
+        def _move_to_spyre(result):
+            if isinstance(result, (tuple, list)):
+                # Handle tuple/list of tensors (e.g., torch.max returns (values, indices))
+                moved = [_move_to_spyre(item) for item in result]
+                # Preserve the original type (tuple or list)
+                return type(result)(moved)
+
+            return result.to(spyre_device)
+
+        return _move_to_spyre(fallback_result)
 
     def _decorator(fn):
         for op in ops:
@@ -197,78 +227,63 @@ def register_fallback(ops, device="cpu"):
     return _decorator
 
 
+def register_fallback_default(ops):
+    for op in _get_op_overloads(ops):
+        register_fallback([op])(op)
+
+
 #  CPU-fallback eager operators
 
-
-@register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
-def spyre__arange(*args, **kwargs):
-    return torch.arange(*args, **kwargs)
-
-
-@register_fallback([aten.arange.out, aten.arange.start_out])
-def spyre__arange_out(*args, out, **kwargs):
-    kwargs.update({"device": "cpu", "dtype": out.dtype, "layout": out.layout})
-    return torch.arange(*args, **kwargs)
-
-
-@register_fallback([aten.sin.default, aten.sin.out])
-def spyre__sin(input, **kwargs):
-    return torch.sin(input, **kwargs)
-
-
-@register_fallback([aten.cos.default, aten.cos.out])
-def spyre__cos(input, **kwargs):
-    return torch.cos(input, **kwargs)
+register_fallback_default(
+    [
+        aten.cumsum,
+        aten.repeat.out,
+        aten.arange,
+        aten.sin,
+        aten.cos,
+        aten.embedding.default,
+        aten.isin,
+        aten.tril,
+        aten.triu,
+        aten.bitwise_xor.Tensor,
+        aten.bitwise_xor.Tensor_out,
+        aten.bitwise_or.Tensor,
+        aten.bitwise_or.Tensor_out,
+        aten.argmax.default,
+        aten.argmin.default,
+    ]
+)
 
 
 # Manually append to fallback_ops: register_fallback cannot be used here because
 # normal_ is an in-place op — register_fallback is designed for out-of-place ops
 # and would leave the original Spyre tensor unfilled.
-# The kernel itself is registered in ops.py (and therefore codegen_ops.py).
+# The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
 
 
-@register_fallback([aten.embedding.default])
-def spyre__embedding(
-    weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False
-):
+@register_fallback(["spyre::max_dim_int64_fallback"])
+def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
     """
-    Fallback for torch.nn.functional.embedding.
-
-    Embedding requires indirect indexing (weight[indices]), which is not
-    supported by Spyre's current pointwise operation framework.
+    CPU fallback for torch.max(input, dim) when input is int64.
     """
-    # TODO: Remove this fallback once we enable gather/scatter ops on spyre
-    return aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse)
+    return torch.max(input, dim=dim, keepdim=keepdim, **kwargs)
 
 
-@register_fallback(
-    [
-        aten.isin.Tensor_Tensor,
-        aten.isin.Tensor_Tensor_out,
-        aten.isin.Tensor_Scalar,
-        aten.isin.Tensor_Scalar_out,
-        aten.isin.Scalar_Tensor,
-        aten.isin.Scalar_Tensor_out,
-    ]
-)
-def spyre__isin(
-    elements, test_elements, *, assume_unique=False, invert=False, **kwargs
-):
+@register_fallback(["spyre::min_dim_int64_fallback"])
+def spyre__min_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
     """
-    Fallback for torch.isin on Spyre.
-
+    CPU fallback for torch.min(input, dim) when input is int64.
     """
-    return torch.isin(
-        elements, test_elements, assume_unique=assume_unique, invert=invert, **kwargs
-    )
+    return torch.min(input, dim=dim, keepdim=keepdim, **kwargs)
 
 
-@register_fallback([aten.tril.default, aten.tril.out])
-def spyre__tril(input, diagonal=0, **kwargs):
-    return torch.tril(input, diagonal, **kwargs)
+@register_fallback(["spyre::max_default_int64_fallback"])
+def spyre__max_default_int64_fallback(input, **kwargs):
+    """
+    CPU fallback for torch.max(input) when input is int64.
 
-
-@register_fallback([aten.triu.default, aten.triu.out])
-def spyre__triu(input, diagonal=0, **kwargs):
-    return torch.triu(input, diagonal, **kwargs)
+    Returns a scalar (0D) tensor containing the maximum value.
+    This avoids recursive decomposition by directly calling torch.max on CPU.
+    """
+    return torch.max(input, **kwargs)

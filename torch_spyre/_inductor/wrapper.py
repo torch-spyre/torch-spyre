@@ -21,10 +21,12 @@ from torch._inductor.codegen.wrapper import (
     SubgraphPythonWrapperCodegen,
 )
 from torch._inductor.ir import GraphPartitionSignature
+from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
-from .stickify import FixedTiledLayout
+from .ir import FixedTiledLayout
+from .constants import SEGMENT_SIZE
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
@@ -54,7 +56,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.imports.splice(
             """
                 from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp
+                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, spyre_constant_tensor
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
                 import subprocess
@@ -69,6 +71,41 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         )
         self.header.writeline("del async_compile")
         self.header.writeline("async_compile = SpyreAsyncCompile()")
+
+    def generate(self, is_inference):
+        """Override to add pool allocation/deallocation around kernel calls."""
+        result_tuple = super().generate(is_inference)
+        wrapper_value_with_linemap, kernel_decls = result_tuple
+
+        pool_size = getattr(V.graph, "pool_size", 0)
+        if pool_size > 0:
+            wrapper_str = str(wrapper_value_with_linemap.value)
+
+            # Inject pool allocation before kernel calls and cleanup before return.
+            lines = wrapper_str.split("\n")
+
+            # Add `del _pool` before `return (` statement.
+            for i in range(len(lines) - 1, -1, -1):
+                line = lines[i].strip()
+                if line.startswith("return ("):
+                    indent = len(lines[i]) - len(lines[i].lstrip())
+                    lines.insert(i, " " * indent + "del _pool")
+                    break
+
+            # Add pool allocation before first kernel call (`.run(`).
+            pool_alloc_code = self.allocate_pool()
+            for i, line in enumerate(lines):
+                if ".run(" in line:
+                    indent = len(line) - len(line.lstrip())
+                    lines.insert(i, " " * indent + pool_alloc_code)
+                    break
+
+            wrapper_str = "\n".join(lines)
+            wrapper_value_with_linemap = ValueWithLineMap(
+                value=wrapper_str, line_map=wrapper_value_with_linemap.line_map
+            )
+
+        return (wrapper_value_with_linemap, kernel_decls)
 
     def make_buffer_allocation(self, buffer: BufferLike):
         layout = buffer.get_layout()
@@ -89,6 +126,14 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
         return out
 
+    def generate_const_tensor_fallback(self, node):
+        value = node.constant_args[0]
+        dtype = node.layout.dtype
+        device = node.layout.device
+        self.writeline(
+            f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
+        )
+
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
@@ -103,6 +148,17 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         new_stl = new.get_layout().device_layout
         reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
+
+    def allocate_pool(self):
+        """Allocate the intermediate pool."""
+        pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
+        pool_size_sticks = (pool_size_bytes + 127) // 128
+        return (
+            f"_pool = spyre_empty_with_layout("
+            f"({pool_size_sticks},), (1,), "
+            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_sticks}, 1, 1], "
+            f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
+        )
 
 
 def noop_simplify_loops_impl(

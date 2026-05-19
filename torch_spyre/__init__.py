@@ -16,7 +16,11 @@ import os
 import threading
 import types
 import importlib
+
 from .constants import DEVICE_NAME
+
+from . import memory
+from . import profiler
 
 _runtime_init_lock = threading.Lock()
 
@@ -25,6 +29,7 @@ class _SpyreImpl:
     def __init__(self):
         self._initialized = False
         self._in_bad_fork = False
+        self._pending_device_idx = None
 
         # When spawning a supprocess from inductor, ensure that IS_INDUCTOR_SPAWNED_SUBPROCESS=1
         # This will avoid additional initialization when processes are spawned from torch inductor (This happens in Triton pathway)
@@ -54,6 +59,10 @@ class _SpyreImpl:
             # Load the C++ Module
             # put any light, once-per-process setup here
             self._C = importlib.import_module("torch_spyre._C")
+            # Apply pending device index before runtime init
+            pending = self._pending_device_idx
+            if pending is not None:
+                self._C.set_device(pending)
             # this will create the allocator
             self._C.start_runtime()
             self._initialized = True
@@ -100,24 +109,26 @@ class _SpyreImpl:
         if self._is_in_bad_fork():
             return True
         else:
-            return not hasattr(self, "_C") or (
-                self._C is not None and getattr(self._C, "is_available", lambda: True)()
-            )
+            return self.device_count() > 0
 
     def is_initialized(self):
         return self._initialized and not self._is_in_bad_fork()
 
     def device_count(self) -> int:
-        # TODO(tmhoangt) - invoke the right API to return
-        return 1
+        from . import _hooks
+
+        return _hooks.device_count()
 
     def current_device(self) -> int:
         return getattr(self._C, "current_device", lambda: 0)()
 
     def set_device(self, idx: int) -> None:
-        fn = getattr(self._C, "set_device", None)
-        if fn:
-            fn(int(idx))
+        self._pending_device_idx = int(idx)
+        # If runtime is already initialized, also set it on the C++ side.
+        if self._initialized:
+            fn = getattr(self._C, "set_device", None)
+            if fn:
+                fn(int(idx))
 
     def _mark_after_fork(self):
         self._initialized = True
@@ -142,6 +153,11 @@ def make_spyre_module() -> types.ModuleType:
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
+    mod.memory = memory
+
+    import torch  # noqa: E402
+
+    mod.get_amp_supported_dtype = lambda: [torch.float16, torch.bfloat16]
 
     # Optional: forward unknown attrs to the impl or _C for convenience
     def __getattr__(name):
@@ -210,7 +226,7 @@ def _autoload():
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
-    import torch_spyre.codegen_ops  # noqa: F401
+    import torch_spyre.ops.eager  # noqa: F401
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()
@@ -223,8 +239,25 @@ def _autoload():
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
 
+    _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
+
+    def _patched_isAllocatorInitialized():
+        try:
+            return _orig_isAllocatorInitialized()
+        except RuntimeError as e:
+            if "not a DeviceAllocator" in str(e):
+                return False
+            raise
+            return False
+
+    torch._C._accelerator_isAllocatorInitialized = _patched_isAllocatorInitialized
+
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
+
+
+if not profiler.is_available():
+    profiler = None

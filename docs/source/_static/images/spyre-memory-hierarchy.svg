@@ -1,49 +1,50 @@
-<svg viewBox="0 0 530 240" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
-  <rect width="530" height="240" fill="#f8f9fa" rx="8"/>
-  <text x="265" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#222">Spyre Memory Hierarchy</text>
+<svg viewBox="0 0 560 260" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+  <rect width="560" height="260" fill="#f8f9fa" rx="8"/>
+  <text x="280" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#222">Spyre Memory Hierarchy</text>
 
   <!-- Host box -->
-  <rect x="20" y="50" width="100" height="50" rx="6" fill="#e0e7ff" stroke="#4f46e5" stroke-width="1.5"/>
-  <text x="70" y="72" text-anchor="middle" font-weight="bold" fill="#3730a3">Host CPU</text>
-  <text x="70" y="88" text-anchor="middle" font-size="10" fill="#3730a3">(IBM Z / Power)</text>
+  <rect x="20" y="65" width="110" height="50" rx="6" fill="#e0e7ff" stroke="#4f46e5" stroke-width="1.5"/>
+  <text x="75" y="87" text-anchor="middle" font-weight="bold" fill="#3730a3">Host CPU</text>
+  <text x="75" y="103" text-anchor="middle" font-size="10" fill="#3730a3">(IBM Z / Power)</text>
 
-  <!-- PCIe arrow -->
-  <line x1="120" y1="70" x2="165" y2="70" stroke="#6b7280" stroke-width="2" marker-end="url(#ga)"/>
-  <line x1="165" y1="80" x2="120" y2="80" stroke="#6b7280" stroke-width="2" marker-end="url(#ga)"/>
-  <text x="142" y="63" text-anchor="middle" font-size="9" fill="#6b7280">PCIe</text>
+  <!-- PCIe / DMA arrow (host <-> LPDDR5) -->
+  <line x1="130" y1="85" x2="185" y2="85" stroke="#6b7280" stroke-width="2" marker-end="url(#ga)"/>
+  <line x1="185" y1="95" x2="130" y2="95" stroke="#6b7280" stroke-width="2" marker-end="url(#ga)"/>
+  <text x="157" y="78" text-anchor="middle" font-size="9" fill="#6b7280">PCIe</text>
+  <text x="157" y="111" text-anchor="middle" font-size="9" fill="#6b7280">(DMA)</text>
 
   <!-- Spyre Card boundary -->
-  <rect x="160" y="35" width="350" height="190" rx="10" fill="none" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6,3"/>
-  <text x="505" y="52" text-anchor="end" font-size="10" fill="#9ca3af">Spyre Card</text>
+  <rect x="180" y="50" width="360" height="200" rx="10" fill="none" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="535" y="67" text-anchor="end" font-size="10" fill="#9ca3af">Spyre Card</text>
 
   <!-- Off-chip Memory box -->
-  <rect x="170" y="50" width="175" height="50" rx="6" fill="#fce7f3" stroke="#db2777" stroke-width="1.5"/>
-  <text x="257" y="70" text-anchor="middle" font-weight="bold" fill="#9d174d">Off-chip Memory (DDR/HBM)</text>
-  <text x="257" y="86" text-anchor="middle" font-size="10" fill="#9d174d">Up to 128 GB</text>
+  <rect x="190" y="65" width="175" height="50" rx="6" fill="#fce7f3" stroke="#db2777" stroke-width="1.5"/>
+  <text x="277" y="85" text-anchor="middle" font-weight="bold" fill="#9d174d">Off-chip Memory (LPDDR5)</text>
+  <text x="277" y="101" text-anchor="middle" font-size="10" fill="#9d174d">Up to 128 GB</text>
 
-  <!-- DMA arrow -->
-  <line x1="257" y1="100" x2="257" y2="135" stroke="#db2777" stroke-width="2" marker-end="url(#pa)"/>
-  <line x1="267" y1="135" x2="267" y2="100" stroke="#db2777" stroke-width="2" marker-end="url(#pa)"/>
-  <text x="290" y="122" font-size="9" fill="#db2777">DMA (DCI)</text>
+  <!-- LPDDR5 <-> LX arrow (compiler-emitted load/store; not DMA) -->
+  <line x1="277" y1="115" x2="277" y2="150" stroke="#db2777" stroke-width="2" marker-end="url(#pa)"/>
+  <line x1="287" y1="150" x2="287" y2="115" stroke="#db2777" stroke-width="2" marker-end="url(#pa)"/>
+  <text x="312" y="137" font-size="9" fill="#db2777">load/store</text>
 
   <!-- LX Scratchpad -->
-  <rect x="192" y="135" width="130" height="50" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.5"/>
-  <text x="257" y="155" text-anchor="middle" font-weight="bold" fill="#065f46">LX Scratchpad</text>
-  <text x="257" y="171" text-anchor="middle" font-size="10" fill="#065f46">Fast on-core SRAM</text>
+  <rect x="212" y="150" width="130" height="50" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.5"/>
+  <text x="277" y="170" text-anchor="middle" font-weight="bold" fill="#065f46">LX Scratchpad</text>
+  <text x="277" y="186" text-anchor="middle" font-size="10" fill="#065f46">Fast on-core SRAM</text>
 
   <!-- Arrow to compute -->
-  <line x1="322" y1="155" x2="365" y2="155" stroke="#10b981" stroke-width="2" marker-end="url(#g3a)"/>
-  <line x1="365" y1="165" x2="322" y2="165" stroke="#10b981" stroke-width="2" marker-end="url(#g3a)"/>
+  <line x1="342" y1="170" x2="385" y2="170" stroke="#10b981" stroke-width="2" marker-end="url(#g3a)"/>
+  <line x1="385" y1="180" x2="342" y2="180" stroke="#10b981" stroke-width="2" marker-end="url(#g3a)"/>
 
   <!-- Core / Compute -->
-  <rect x="365" y="110" width="130" height="100" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
-  <text x="430" y="132" text-anchor="middle" font-weight="bold" fill="#92400e">Core (x32)</text>
-  <rect x="380" y="140" width="100" height="25" rx="4" fill="#fde68a" stroke="#d97706"/>
-  <text x="430" y="157" text-anchor="middle" font-size="10" fill="#78350f">PT Array</text>
-  <rect x="380" y="172" width="45" height="25" rx="4" fill="#fde68a" stroke="#d97706"/>
-  <text x="402" y="189" text-anchor="middle" font-size="10" fill="#78350f">PE</text>
-  <rect x="433" y="172" width="45" height="25" rx="4" fill="#fde68a" stroke="#d97706"/>
-  <text x="455" y="189" text-anchor="middle" font-size="10" fill="#78350f">SFP</text>
+  <rect x="385" y="125" width="130" height="100" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="450" y="147" text-anchor="middle" font-weight="bold" fill="#92400e">Core (x32)</text>
+  <rect x="400" y="155" width="100" height="25" rx="4" fill="#fde68a" stroke="#d97706"/>
+  <text x="450" y="172" text-anchor="middle" font-size="10" fill="#78350f">PT Array</text>
+  <rect x="400" y="187" width="45" height="25" rx="4" fill="#fde68a" stroke="#d97706"/>
+  <text x="422" y="204" text-anchor="middle" font-size="10" fill="#78350f">PE</text>
+  <rect x="453" y="187" width="45" height="25" rx="4" fill="#fde68a" stroke="#d97706"/>
+  <text x="475" y="204" text-anchor="middle" font-size="10" fill="#78350f">SFP</text>
 
   <defs>
     <marker id="ga" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#6b7280"/></marker>

@@ -25,7 +25,7 @@ executable programs binaries.
 
 The Torch-Spyre front-end compilation stack. PyTorch programs pass through Dynamo to produce an FX graph, which Inductor lowers to LoopLevel IR.
 The SpyreKernel code generator compiles LoopLevel IR into an OpSpec that is in turn used to generates SDSC specifications
-that are the input to the backend-compiler. In a future version, we intend to replace SDSCs with a purely MLIR-based interface that includes a new [KTIR](https://github.com/torch-spyre/RFCs/tree/main/0682-KtirSpec) MLIR dialect.
+that are the input to the backend-compiler. In a future version, we intend to replace SDSCs with a purely MLIR-based interface that includes a new [KTIR](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) MLIR dialect.
 :::
 
 # Background
@@ -73,8 +73,8 @@ Some key entry points to the front-end compiler are:
 + [\_\_init\_\_.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/__init__.py) registers the compiler and customizes the configuration of Inductor.
 + [decompositions.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/decompositions.py) is where we add Spyre-specific decompositions of existing high-level ATen operations.
 + [customops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/customops.py) is where we define new Spyre-specific operations.
-+ [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) is where we add Spyre-specific compiler passes into the three exported
-extension points of Inductor. It supports adding passes to both the FX Graph and LoopLevelIR stages of compilation.
++ [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) is where Spyre-specific compiler passes plug into Inductor's five exported extension points: `CustomPreGradPasses`, `CustomPrePasses`, `CustomPostPasses`, `CustomPreFusionPasses`, and `CustomPostFusionPasses`. A sixth hook, `CustomPreSchedulingPasses`, fires just before the scheduler is built. It is not an upstream Inductor extension point yet; Torch-Spyre monkey-patches `GraphLowering._update_scheduler` to invoke it (see [patches.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)), and we plan to propose it upstream. Both FX Graph and LoopLevelIR stages are supported.
++ [wrapper.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wrapper.py) defines `SpyrePythonWrapperCodegen`, the host-code generator that emits the Python wrapper around device kernels.
 + [spyre_kernel.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/spyre_kernel.py) defines our compilation from LoopLevelIR into `OpSpec`, our
 high-level description of a single operation to be performed on the device.
 + [codegen](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/) defines the compilation from an `OpSpec` into a lower-level SuperDSC json file which is the input to the backend compiler.
