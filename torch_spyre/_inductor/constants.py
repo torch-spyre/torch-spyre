@@ -36,7 +36,7 @@ SPYRE_FP32_OPS = [
     "mul",
     "where",
     "realdiv",
-    "relu",
+    "relufwd",
     "reciprocal",
     "layernormscale",
     "abs",
