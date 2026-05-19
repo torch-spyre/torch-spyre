@@ -53,7 +53,7 @@ test = [
     "pydantic",             # needed by test framework to support pydantic models for config
     "pytest-xdist",         # -n1 worker isolation for segfault resilience
 #    "torch_sendnn",        # must be installed manually
-    "transformers~=4.57.1"
+    "transformers~=5.3.0"
 ]
 lint = [
     "mypy~=1.13.0",
