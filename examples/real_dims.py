@@ -1,8 +1,12 @@
 import torch
-from torch_spyre._inductor.propagate_real_dims import (
-    declare_real_dim,
-    annotate_real_dims,
-)
+import torch_spyre._inductor.passes as passes
+
+# import torch_spyre._inductor.propagate_real_dims as prd
+import torch_spyre._inductor.propagate_real_dims2 as prd
+
+passes.propagate_real_dims = prd.propagate_real_dims
+declare_real_dim = prd.declare_real_dim
+annotate_real_dims = prd.annotate_real_dims
 
 torch.manual_seed(0xAFFE)
 
