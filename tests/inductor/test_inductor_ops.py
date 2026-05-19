@@ -5539,7 +5539,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             def fn(t):
                 return torch.is_nonzero(t)
 
-            self.compare_with_cpu(fn, x, cpu_compile=False)
+            self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
         elif len(args) == 2:
             x, y = args
@@ -5548,7 +5548,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 result = a * b
                 return torch.is_nonzero(result)
 
-            self.compare_with_cpu(fn, x, y, cpu_compile=False)
+            self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_is_nonzero_error_cases(self):
