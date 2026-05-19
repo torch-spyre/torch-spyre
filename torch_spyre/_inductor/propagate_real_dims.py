@@ -80,7 +80,7 @@ def _matmul_real_dims(op, inputs):
     index0 = inputs[0].index
     real_dims0 = _get_buffer(inputs[0]).real_dims
     real_size0, real_stride0 = _compute_real_layout(real_dims0)
-
+ 
     ranges1 = inputs[1].ranges
     index1 = inputs[1].index
     real_dims1 = _get_buffer(inputs[1]).real_dims

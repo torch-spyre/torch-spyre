@@ -32,7 +32,7 @@ from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP
 from .pass_utils import host_coordinates
-from .views import matching_dim
+from .views import matching_dim, compute_coordinates
 from torch.utils.weak import WeakTensorKeyDictionary
 
 logger = get_inductor_logger("propagate_real_dims")
@@ -67,14 +67,31 @@ def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
     return next(iter(coord.free_symbols))
 
 
+def _compute_real_layout(real_dims):
+    """Compute real size and stride from declared real dim sizes."""
+    size = []
+    stride = [1]
+    for s in reversed(real_dims):
+        stride.append(stride[-1] * _real_dims[s])
+        size.append(_real_dims[s])
+    return list(reversed(size)), list(reversed(stride[:-1]))
+
+
 def compute_input_real_dims(dep: MemoryDep) -> dict:
-    """Map loop vars to real dim names for a single input dep."""
+    """Map loop vars to real dim names for a single input dep, using real-space coords."""
     buf = _get_buffer(dep)
-    coords = host_coordinates(buf.get_layout(), dep)
+    real_size, real_stride = _compute_real_layout(buf.real_dims)
+    coords = compute_coordinates(real_size, real_stride, dep.ranges, dep.index)
+    # build stride → name lookup
+    stride_map = {s: n for s, n in zip(real_stride, buf.real_dims)}
+    # print(f"  compute_input_real_dims: dep={dep.name} real_dims={buf.real_dims}")
+    # print(f"    coords={coords} stride_map={stride_map}")
     result = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:
-            result[_lone_sym(coord)] = buf.real_dims[i]
+            sym = _lone_sym(coord)
+            result.setdefault(sym, []).append(buf.real_dims[i])
+            # print(f"    coord={coord} sym={sym} -> {buf.real_dims[i]}")
     return result
 
 
@@ -85,7 +102,11 @@ def op_out_coords(op: ComputedBuffer) -> list:
 
 def coords_to_real_dims(coords: list, rdims: dict) -> list:
     """Map coordinate expressions to real dim names via their loop variable."""
-    return [rdims[_lone_sym(c)] for c in coords if c.free_symbols]
+    result = []
+    for c in coords:
+        if c.free_symbols:
+            result.extend(rdims[_lone_sym(c)])
+    return result
 
 
 def get_input_real_dims(inputs: list) -> dict:
@@ -119,17 +140,19 @@ def _reduction_real_dims(op, inputs):
     out_coords = op_out_coords(op)
     reduction_var = get_reduction_dim(inputs[0], out_coords)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
-    op.real_ranges = op.real_dims + [rdims[reduction_var]]
+    op.real_ranges = op.real_dims + rdims[reduction_var]
+    op.rdims = rdims
 
 
 def _pointwise_real_dims(op, inputs):
-
+    # Part 1: compute input real dims (generic, op-agnostic)
     rdims = get_input_real_dims(inputs)
 
     # Part 2: pointwise dimension mapping (no reduction)
     out_coords = op_out_coords(op)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
     op.real_ranges = op.real_dims
+    op.rdims = rdims
 
 
 def _compute_real_dims(op, inputs):
@@ -190,7 +213,7 @@ def propagate_real_dims(
 
     print("OPS")
     for op in iter(operations):
-        print(op.get_operation_name(), op.real_ranges)
+        print(op.get_operation_name(), op.real_ranges, op.rdims)
 
     print("TENSORS")
     for buf in V.graph.buffers:

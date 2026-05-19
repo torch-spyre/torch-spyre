@@ -10,27 +10,11 @@ annotate_real_dims = prd.annotate_real_dims
 
 torch.manual_seed(0xAFFE)
 
-
-"""
-OUTPUT PRODUCED:
-
-OPS
-op0 ['a', 'c', 'b']
-op1 ['a', 'd', 'c']
-op2 ['a', 'd']
-op3 ['d', 'a']
-TENSORS
-buf0 ['a', 'c']
-buf1 ['a', 'd']
-buf2 ['a', 'd']
-buf3 ['d']
-"""
-
-
-x = torch.rand(64, 128, dtype=torch.float16) * 0.01
-y = torch.rand(128, 256, dtype=torch.float16) * 0.01
-w = torch.rand(256, 64, dtype=torch.float16) * 0.01
-z = torch.rand(64, 64, dtype=torch.float16) * 0.01
+A, B, C, D = 64, 128, 256, 64
+x = torch.rand(A, B, dtype=torch.float16) * 0.01
+y = torch.rand(B, C, dtype=torch.float16) * 0.01
+w = torch.rand(C, D, dtype=torch.float16) * 0.01
+z = torch.rand(A, D, dtype=torch.float16) * 0.01
 
 
 def f(x, y, w, z):
@@ -43,15 +27,15 @@ y_dev = y.to("spyre")
 w_dev = w.to("spyre")
 z_dev = z.to("spyre")
 
-declare_real_dim("a", 64)
-declare_real_dim("b", 128)
-declare_real_dim("c", 256)
-declare_real_dim("d", 64)
+declare_real_dim("A", A)
+declare_real_dim("B", B)
+declare_real_dim("C", C)
+declare_real_dim("D", D)
 
-annotate_real_dims(x_dev, ["a", "b"])
-annotate_real_dims(y_dev, ["b", "c"])
-annotate_real_dims(w_dev, ["c", "d"])
-annotate_real_dims(z_dev, ["a", "d"])
+annotate_real_dims(x_dev, ["A", "B"])
+annotate_real_dims(y_dev, ["B", "C"])
+annotate_real_dims(w_dev, ["C", "D"])
+annotate_real_dims(z_dev, ["A", "D"])
 
 result = torch.compile(f)(x_dev, y_dev, w_dev, z_dev).cpu()
 
