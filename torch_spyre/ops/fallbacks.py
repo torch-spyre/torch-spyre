@@ -250,6 +250,7 @@ register_fallback_default(
         aten.bitwise_or.Tensor,
         aten.bitwise_or.Tensor_out,
         aten.argmax.default,
+        aten.argmin.default,
     ]
 )
 
@@ -267,6 +268,14 @@ def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
     CPU fallback for torch.max(input, dim) when input is int64.
     """
     return torch.max(input, dim=dim, keepdim=keepdim, **kwargs)
+
+
+@register_fallback(["spyre::min_dim_int64_fallback"])
+def spyre__min_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
+    """
+    CPU fallback for torch.min(input, dim) when input is int64.
+    """
+    return torch.min(input, dim=dim, keepdim=keepdim, **kwargs)
 
 
 @register_fallback(["spyre::max_default_int64_fallback"])

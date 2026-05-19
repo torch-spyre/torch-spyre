@@ -636,6 +636,23 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.max((values, indices))
 
 
+@register_spyre_decomposition([torch.ops.aten.min.dim])
+def spyre_min_dim_decomp(input, dim, keepdim=False):
+    """
+    Decompose torch.min(input, dim) with conditional CPU fallback for int64.
+
+    Mirrors spyre_max_dim_decomp: int64 inputs go through a CPU-fallback custom
+    op; other dtypes are decomposed into amin (Spyre-native) and argmin (CPU
+    fallback). Returns a named tuple (values, indices) as expected by torch.min.
+    """
+    if input.dtype == torch.int64:
+        return torch.ops.spyre.min_dim_int64_fallback(input, dim, keepdim)
+    else:
+        values = torch.ops.aten.amin(input, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmin(input, dim=dim, keepdim=keepdim)
+        return torch.return_types.min((values, indices))
+
+
 @register_spyre_decomposition([torch.ops.aten.cat.default])
 def decompose_cat(
     tensors: list[torch.Tensor],
