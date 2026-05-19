@@ -80,21 +80,18 @@ def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
 
 def compute_input_real_dims(dep: MemoryDep) -> dict:
     """Map loop vars to real dim names for a single input dep."""
-    buf_real_dims = _get_buffer(dep).real_dims
-    real_size, real_stride = _compute_real_layout(buf_real_dims)
-    coords = compute_coordinates(real_size, real_stride, dep.ranges, dep.index)
+    buf = _get_buffer(dep)
+    coords = host_coordinates(buf.get_layout(), dep)
     result = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:
-            result[_lone_sym(coord)] = buf_real_dims[i]
+            result[_lone_sym(coord)] = buf.real_dims[i]
     return result
 
 
 def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
     """Return the reduction loop variable: the input coord absent from the output."""
-    buf_real_dims = _get_buffer(dep).real_dims
-    real_size, real_stride = _compute_real_layout(buf_real_dims)
-    in_coords = compute_coordinates(real_size, real_stride, dep.ranges, dep.index)
+    in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep)
     reduction_coord = next(
         c for c in in_coords
         if c.free_symbols and matching_dim(out_coords, c) is None
