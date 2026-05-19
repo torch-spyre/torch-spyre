@@ -48,6 +48,8 @@ POINTWISE_BINARY_OPS_DICT = {
     "mul": torch.mul,
     "sub": torch.sub,
     "div": torch.div,
+    "minimum": torch.minimum,
+    "maximum": torch.maximum,
 }
 
 CORE_REDUCTION_OPS_DICT = {

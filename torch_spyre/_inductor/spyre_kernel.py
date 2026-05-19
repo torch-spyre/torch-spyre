@@ -209,6 +209,14 @@ class SpyreOpFuncs:
         return PointwiseOp("lesserthan", [a, b])
 
     @staticmethod
+    def maximum(a, b):
+        return PointwiseOp("maximum", [a, b])
+
+    @staticmethod
+    def minimum(a, b):
+        return PointwiseOp("minimum", [a, b])
+
+    @staticmethod
     def mul(a, b):
         return PointwiseOp("mul", [a, b])
 
