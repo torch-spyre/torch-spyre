@@ -10,14 +10,31 @@ annotate_real_dims = prd.annotate_real_dims
 
 torch.manual_seed(0xAFFE)
 
-x = torch.rand(64, 128, dtype=torch.float16)
-y = torch.rand(128, 256, dtype=torch.float16)
-w = torch.rand(256, 64, dtype=torch.float16)
-z = torch.rand(64, 64, dtype=torch.float16)
+
+"""
+OUTPUT PRODUCED:
+
+OPS
+op0 ['a', 'c', 'b']
+op1 ['a', 'd', 'c']
+op2 ['a', 'd']
+op3 ['d', 'a']
+TENSORS
+buf0 ['a', 'c']
+buf1 ['a', 'd']
+buf2 ['a', 'd']
+buf3 ['d']
+"""
+
+
+x = torch.rand(64, 128, dtype=torch.float16) * 0.01
+y = torch.rand(128, 256, dtype=torch.float16) * 0.01
+w = torch.rand(256, 64, dtype=torch.float16) * 0.01
+z = torch.rand(64, 64, dtype=torch.float16) * 0.01
 
 
 def f(x, y, w, z):
-    return x @ y @ w + z
+    return (x @ y @ w + z).sum(0)
 
 
 r = f(x, y, w, z)

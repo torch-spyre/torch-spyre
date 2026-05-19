@@ -109,10 +109,13 @@ def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
     return _lone_sym(reduction_coord)
 
 
-def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
+def _reduction_real_dims(op, inputs):
+    """
+    Works for single input reductions and matmul
+    """
     rdims = get_input_real_dims(inputs)
 
-    # Part 2: matmul dimension mapping
+    # Part 2: reduction dimension mapping
     out_coords = op_out_coords(op)
     reduction_var = get_reduction_dim(inputs[0], out_coords)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
@@ -120,9 +123,10 @@ def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
 
 
 def _pointwise_real_dims(op, inputs):
+
     rdims = get_input_real_dims(inputs)
 
-    # Part 2: pointwise dimension mapping 
+    # Part 2: pointwise dimension mapping (no reduction)
     out_coords = op_out_coords(op)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
     op.real_ranges = op.real_dims
@@ -132,8 +136,8 @@ def _compute_real_dims(op, inputs):
     """
     Augment op with real ranges and output real dims
     """
-    if isinstance(op.data, Reduction) and op.data.reduction_type == BATCH_MATMUL_OP:
-        return _matmul_real_dims(op, inputs)
+    if isinstance(op.data, Reduction):
+        return _reduction_real_dims(op, inputs)
     if isinstance(op.data, Pointwise):
         return _pointwise_real_dims(op, inputs)
     raise NotImplementedError(f"real dims not implemented for {type(op.data)}")
