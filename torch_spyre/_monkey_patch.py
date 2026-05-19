@@ -216,10 +216,13 @@ def _patch_tensor_for_spyre():
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
         tensor_guard_manager = self.get_guard_manager(guard)
-        guard_fn = lambda x: (
-            x.device.type != DEVICE_NAME
-            or x.device_tensor_layout() == expected_layout
-        )
+
+        def guard_fn(x):
+            return (
+                x.device.type != DEVICE_NAME
+                or x.device_tensor_layout() == expected_layout
+            )
+
         guard_msg = [f"SpyreTensorLayout({guard.name}) == {expected_layout}"]
         try:
             tensor_guard_manager.add_lambda_guard(
