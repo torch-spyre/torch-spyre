@@ -20,7 +20,6 @@ from typing_extensions import ParamSpec
 import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
-import warnings
 
 from .constants import DEVICE_NAME
 from .errors import Unsupported
