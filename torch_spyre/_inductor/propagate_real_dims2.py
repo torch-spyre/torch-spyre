@@ -78,6 +78,11 @@ def compute_input_real_dims(dep: MemoryDep) -> dict:
     return result
 
 
+def op_out_coords(op: ComputedBuffer) -> list:
+    output_dep = next(iter(op.get_read_writes().writes))
+    return host_coordinates(op.get_layout(), output_dep)
+
+
 def coords_to_real_dims(coords: list, rdims: dict) -> list:
     """Map coordinate expressions to real dim names via their loop variable."""
     return [rdims[_lone_sym(c)] for c in coords if c.free_symbols]
@@ -100,12 +105,20 @@ def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
 
     # Part 2: matmul dimension mapping
     rdims = {**rdims_0, **rdims_1}
-    output_dep = next(iter(op.get_read_writes().writes))
-    out_coords = host_coordinates(op.get_layout(), output_dep)
+    out_coords = op_out_coords(op)
     reduction_var = get_reduction_dim(inputs[0], out_coords)
 
     op.real_dims = coords_to_real_dims(out_coords, rdims)
     op.real_ranges = op.real_dims + [rdims[reduction_var]]
+
+
+def _pointwise_real_dims(op, inputs):
+    rdims = {}
+    for inp in inputs:
+        rdims.update(compute_input_real_dims(inp))
+    out_coords = op_out_coords(op)
+    op.real_dims = coords_to_real_dims(out_coords, rdims)
+    op.real_ranges = op.real_dims
 
 
 def _compute_real_dims(op, inputs):
@@ -114,10 +127,9 @@ def _compute_real_dims(op, inputs):
     """
     if isinstance(op.data, Reduction) and op.data.reduction_type == BATCH_MATMUL_OP:
         return _matmul_real_dims(op, inputs)
-
-    # TODO handle other op types
-    op.real_ranges = _get_buffer(inputs[0]).real_dims
-    op.real_dims = _get_buffer(inputs[0]).real_dims
+    if isinstance(op.data, Pointwise):
+        return _pointwise_real_dims(op, inputs)
+    raise NotImplementedError(f"real dims not implemented for {type(op.data)}")
 
 
 def propagate_real_dims(
