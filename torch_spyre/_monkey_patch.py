@@ -225,9 +225,7 @@ def _patch_tensor_for_spyre():
 
         guard_msg = [f"SpyreTensorLayout({guard.name}) == {expected_layout}"]
         try:
-            tensor_guard_manager.add_lambda_guard(
-                guard_fn, guard_msg, guard.user_stack
-            )
+            tensor_guard_manager.add_lambda_guard(guard_fn, guard_msg, guard.user_stack)
         except TypeError:
             tensor_guard_manager.add_lambda_guard(guard_fn, guard_msg)
 
