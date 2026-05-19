@@ -251,6 +251,8 @@ TO_DTYPE_OP_SHAPES_UNALIGNED = [
 
 TO_DTYPE_OP_SHAPES_ALIGNED = [
     (4, 64),
+    (4, 8, 128),
+    (2, 4, 8, 64),
 ]
 
 TO_DTYPE_OP_SHAPES = TO_DTYPE_OP_SHAPES_UNALIGNED + TO_DTYPE_OP_SHAPES_ALIGNED
@@ -280,7 +282,11 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if shape == (4, 68) or (DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+    or (
+        (src, dst) == (torch.float16, torch.bool)
+        and tuple(shape) in [(4, 8, 128), (2, 4, 8, 64)]
+    )
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
