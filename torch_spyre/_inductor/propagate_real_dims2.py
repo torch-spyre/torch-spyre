@@ -32,7 +32,7 @@ from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP
 from .pass_utils import host_coordinates
-from .views import compute_coordinates, matching_dim
+from .views import matching_dim
 from torch.utils.weak import WeakTensorKeyDictionary
 
 logger = get_inductor_logger("propagate_real_dims")
@@ -62,17 +62,6 @@ def _get_buffer(dep):
     return V.graph.get_buffer(dep.name)
 
 
-def _compute_real_layout(real_dims):
-    """
-    Compute real size and stride based on real dims
-    """
-    size = []
-    stride = [1]
-    for s in reversed(real_dims):
-        stride.append(stride[-1] * _real_dims[s])
-        size.append(_real_dims[s])
-    return list(reversed(size)), list(reversed(stride[:-1]))
-
 
 def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
     return next(iter(coord.free_symbols))
@@ -87,6 +76,11 @@ def compute_input_real_dims(dep: MemoryDep) -> dict:
         if coord.free_symbols:
             result[_lone_sym(coord)] = buf.real_dims[i]
     return result
+
+
+def coords_to_real_dims(coords: list, rdims: dict) -> list:
+    """Map coordinate expressions to real dim names via their loop variable."""
+    return [rdims[_lone_sym(c)] for c in coords if c.free_symbols]
 
 
 def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
@@ -110,7 +104,7 @@ def _matmul_real_dims(op: ComputedBuffer, inputs: list) -> None:
     out_coords = host_coordinates(op.get_layout(), output_dep)
     reduction_var = get_reduction_dim(inputs[0], out_coords)
 
-    op.real_dims = [rdims[_lone_sym(c)] for c in out_coords if c.free_symbols]
+    op.real_dims = coords_to_real_dims(out_coords, rdims)
     op.real_ranges = op.real_dims + [rdims[reduction_var]]
 
 
