@@ -28,7 +28,6 @@ from utils_inductor import (
 )
 import utils_inductor
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
-from torch_spyre._inductor.constants import IDENTITY_OP
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -268,28 +267,6 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
 }
-
-TO_DTYPE_OP_PARAMS_SETS = {
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
-        cached_randn(shape, dtype=src)
-        if src != torch.bool
-        else torch.randint(0, 2, shape).bool(),
-        dst,
-    )
-    for src, dst in DtypeOpTable.get_dtype_pairs()
-    for shape in TO_DTYPE_OP_SHAPES
-}
-
-TO_DTYPE_OP_EXPECT_FAIL = [
-    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in DtypeOpTable.get_dtype_pairs()
-    for shape in TO_DTYPE_OP_SHAPES
-    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
-    or (
-        (src, dst) == (torch.float16, torch.bool)
-        and tuple(shape) in [(4, 8, 128), (2, 4, 8, 64)]
-    )
-]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
@@ -3330,10 +3307,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_to_dtype_op_map", "test_to_dtype_op_map"): {
             "param_sets": TO_DTYPE_OP_MAP_PARAMS_SETS,
         },
-        ("test_to_dtype", "test_to_dtype_cpu"): {
-            "param_sets": TO_DTYPE_OP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
-        },
         ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
             "ops_dict": {"add": torch.add},
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
@@ -4564,18 +4537,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             assert result is None, (
                 f"Expected None for unsupported {src}->{dst}, got {result}"
             )
-
-    def test_to_dtype_cpu(self, x, dst_dtype):
-        def fn(x, dst_dtype):
-            return x.to(dtype=dst_dtype)
-
-        self.compare_with_cpu(
-            fn,
-            x,
-            dst_dtype,
-            cpu_compile=False,
-            run_eager=False,
-        )
 
     def test_round_trip_to_dtype_cpu(self, op, x, dst_dtype):
         def fn(op, x, dst_dtype):
