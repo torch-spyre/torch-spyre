@@ -660,3 +660,6 @@ class TestSpyre(TestCase):
 
 if __name__ == "__main__":
     run_tests()
+
+
+echo "# edited by PR test" 
