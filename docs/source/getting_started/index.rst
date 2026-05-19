@@ -1,11 +1,12 @@
 Getting Started
 ===============
 
-This section walks you through installing Torch-Spyre and running your
-first PyTorch model on the Spyre device.
+This section introduces Torch-Spyre, walks you through installing it, and
+shows how to run your first PyTorch model on the Spyre device.
 
 .. toctree::
    :maxdepth: 2
 
+   how_torch_spyre_works
    installation
    quickstart

@@ -23,6 +23,36 @@ from typing import Set, Optional
 import torch
 
 
+def _extract_base_module_name(name: str) -> str:
+    """Extract base module name by stripping YAML-generated suffixes.
+
+    Strips suffixes like:
+    - _93b52f93 (8-char hex hash)
+    - _4096 (numeric identifier)
+    - _layer0 (layer identifier)
+
+    Examples:
+        GraniteRotaryEmbedding_93b52f93 -> GraniteRotaryEmbedding
+        GraniteRMSNorm_4096 -> GraniteRMSNorm
+        GraniteDecoderLayer_layer0 -> GraniteDecoderLayer
+
+    Args:
+        name: YAML module name with potential suffix
+
+    Returns:
+        Base module name without suffix
+    """
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2:
+        base_name, suffix = parts
+        # Check if suffix looks like a hash (hex) or number or "layerN"
+        if suffix.replace("layer", "").isdigit() or all(
+            c in "0123456789abcdef" for c in suffix
+        ):
+            return base_name
+    return name
+
+
 class _OOTOnlyOnPatcher:
     """Patches @onlyOn decorated test methods to also allow privateuse1.
 
@@ -333,25 +363,53 @@ class _OOTModuleListPatcher:
         # inject edits.modules.include
         if self._included_modules:
             existing_names = {m.name for m in self._modules_instance.module_info_list}
-            for name in self._included_modules:
-                # YAML may use "torch.nn.X" but module_db keys use "nn.X"
-                short_name = name.removeprefix("torch.")
-                mod_info = module_db_by_name.get(short_name) or module_db_by_name.get(
-                    name
-                )
-                if mod_info is not None and mod_info.name not in existing_names:
-                    self._modules_instance.module_info_list.append(mod_info)
 
-        # filter to global.supported_modules
-        # included_modules will exist even if not in supported_modules
-        if self._supported_modules is not None:
+            # Extract base names from YAML names (strip suffixes)
+            included_base_names = {
+                _extract_base_module_name(name) for name in self._included_modules
+            }
+
+            # Try to find modules in module_db by base name
+            for base_name in included_base_names:
+                # Try exact match first
+                mod_info = module_db_by_name.get(base_name)
+                if mod_info is None:
+                    # Try with torch. prefix
+                    mod_info = module_db_by_name.get(f"torch.{base_name}")
+                if mod_info is None:
+                    # Try without nn. prefix
+                    short_name = base_name.removeprefix("torch.")
+                    mod_info = module_db_by_name.get(short_name)
+
+                if mod_info is not None:
+                    if mod_info.name not in existing_names:
+                        self._modules_instance.module_info_list.append(mod_info)
+
+        # filter to global.supported_modules OR included_modules
+        # If we have included_modules but no supported_modules, filter to ONLY included_modules
+        # This allows per-test module selection via edits.modules.include
+        if self._supported_modules is not None or self._included_modules:
+            # Extract base module names from included_modules (strip suffixes like _93b52f93)
+            # YAML names: GraniteRotaryEmbedding_93b52f93
+            # ModuleInfo.name: GraniteRotaryEmbedding
+            included_base_names = {
+                _extract_base_module_name(name) for name in self._included_modules
+            }
+
             filtered = [
                 m
                 for m in self._modules_instance.module_info_list
-                if m.name in self._supported_modules
-                or m.name in self._included_modules
-                or f"torch.{m.name}" in self._supported_modules
-                or f"torch.{m.name}" in self._included_modules
+                if (
+                    self._supported_modules is not None
+                    and m.name in self._supported_modules
+                )
+                or m.name in included_base_names  # Use base names for matching
+                or (
+                    self._supported_modules is not None
+                    and f"torch.{m.name}" in self._supported_modules
+                )
+                or f"torch.{m.name}"
+                in included_base_names  # Use base names for matching
             ]
             if filtered:
                 self._modules_instance.module_info_list[:] = filtered

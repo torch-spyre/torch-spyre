@@ -213,7 +213,9 @@ class ScratchPadAllocator:
     # TODO add defrag mechanism to allocator later
 
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
-        return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+        return config.allow_all_ops_in_lx_planning or any(
+            op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE
+        )
 
     def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
         return any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
@@ -305,7 +307,17 @@ class GreedyAllocationStrategy(AllocationStrategy):
 
         # 2. Try to allocate as many buffers on LX as we can. If successful, lx info (addr)
         #    will be added to buffer.FixedTiledLayout and used in generate_sdsc() later.
-        org_op_name = op.origin_node.target._opname
+        # Synthetic ComputedBuffers (e.g. the second output of topk, weight-relayout
+        # buffers from temp_passes) have origin_node=None. Use "" so the LX-reuse and
+        # LX-inplace allowlist substring checks both fall through to False — synthetic
+        # buffers are conservatively kept off the scratchpad.
+        target = getattr(getattr(op, "origin_node", None), "target", None)
+        org_op_name = (
+            getattr(target, "_opname", None)
+            or getattr(target, "__name__", None)
+            or getattr(target, "name", None)
+            or str(target)
+        )
         self.alloc.try_allocate(mem_usage, idx, org_op_name)
 
     def buf_analysis(self, operations: list[Operation]):

@@ -285,6 +285,10 @@ seen_case_keys: Set = set()
 
 
 class TestSpyreModelOps(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     @ops(model_ops_db)
     def test_model_ops_db(self, device: str, dtype: torch.dtype, op: ModelOpInfo):
         pytestconfig = shared_config._PYTEST_CONFIG

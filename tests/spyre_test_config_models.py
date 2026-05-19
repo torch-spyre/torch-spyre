@@ -261,7 +261,85 @@ class InputTensorSpec(BaseModel):
         return _resolve_dtype_str(self.dtype)
 
     def build(self, *, seed: Optional[int]) -> torch.Tensor:
-        """Build and return a CPU tensor according to this spec."""
+        """Build and return a CPU tensor according to this spec.
+
+        Uses PyTorch's upstream make_tensor utility for consistency with
+        upstream test patterns.
+        """
+        try:
+            from torch.testing._internal.common_utils import make_tensor
+        except ImportError:
+            # Fallback to direct torch functions if make_tensor not available
+            return self._build_fallback(seed=seed)
+
+        shape = list(self.shape)
+        dtype = self.resolved_dtype()
+        init = self.init
+        ia = self.init_args
+
+        # Special cases that don't use make_tensor
+        if init == "file":
+            return self._load_from_file()
+        elif init == "arange":
+            return torch.arange(shape[0], dtype=dtype)
+        elif init == "eye":
+            return torch.eye(shape[0], dtype=dtype)
+        elif init == "full":
+            return torch.full(shape, ia.fill_value, dtype=dtype)
+        elif init == "zeros":
+            return torch.zeros(shape, dtype=dtype)
+        elif init == "ones":
+            return torch.ones(shape, dtype=dtype)
+
+        # Use make_tensor for random tensors (rand, randn, randint)
+        # make_tensor signature: make_tensor(*shape, dtype, device, low, high, requires_grad, noncontiguous, exclude_zero, memory_format)
+        with torch.random.fork_rng(devices=[]):
+            if seed is not None:
+                torch.manual_seed(int(seed))
+
+            if init == "rand":
+                # rand uses uniform [0, 1), map to make_tensor with low=0, high=1
+                t = make_tensor(*shape, dtype=dtype, device="cpu", low=0.0, high=1.0)
+            elif init == "randn":
+                # randn uses normal distribution, make_tensor defaults to this
+                t = make_tensor(*shape, dtype=dtype, device="cpu")
+            elif init == "randint":
+                # randint needs explicit low/high
+                t = make_tensor(
+                    *shape, dtype=dtype, device="cpu", low=ia.low, high=ia.high
+                )
+            else:
+                raise ValueError(f"Unknown init strategy: {init!r}")
+
+        # Handle custom stride/storage_offset
+        if self.stride is not None or self.storage_offset != 0:
+            stride = self.stride if self.stride is not None else list(t.stride())
+            offset = self.storage_offset
+            needed = offset + (
+                sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
+            )
+            backing = torch.empty(needed, dtype=dtype)
+            t = torch.as_strided(backing, shape, stride, offset)
+            with torch.no_grad():
+                if init == "rand":
+                    t.copy_(
+                        make_tensor(
+                            *shape, dtype=dtype, device="cpu", low=0.0, high=1.0
+                        )
+                    )
+                elif init == "randn":
+                    t.copy_(make_tensor(*shape, dtype=dtype, device="cpu"))
+                elif init == "randint":
+                    t.copy_(
+                        make_tensor(
+                            *shape, dtype=dtype, device="cpu", low=ia.low, high=ia.high
+                        )
+                    )
+
+        return t
+
+    def _build_fallback(self, *, seed: Optional[int]) -> torch.Tensor:
+        """Fallback tensor builder when make_tensor is not available."""
         shape = list(self.shape)
         dtype = self.resolved_dtype()
         init = self.init
@@ -392,7 +470,16 @@ InputArg = Union[InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy]
 
 
 def _parse_input_arg(raw: Any) -> InputArg:
-    """Parse one element of edits.inputs.args into the correct InputArg variant."""
+    """Parse one element of edits.inputs.args into the correct InputArg variant.
+
+    Handles both:
+    - Fresh dict parsing (first YAML load)
+    - Already-parsed InputArg objects (from YAML anchor reuse like *id001)
+    """
+    # Handle already-parsed InputArg objects (from YAML anchors/aliases)
+    if isinstance(raw, (InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy)):
+        return raw
+
     if not isinstance(raw, dict):
         raise ValueError(f"Each args element must be a dict, got {type(raw)}")
     keys = set(raw.keys())
@@ -532,11 +619,93 @@ class NamedItem(BaseModel):
 
 
 class ModulesNamedItem(BaseModel):
-    """A named item in an include list in a module"""
+    """A named item in an include list in a module.
+
+    Supports two input specifications:
+    - constructor_inputs: Args/kwargs for module.__init__()
+    - forward_inputs: Args/kwargs for module.forward() (single or list for multiple invocations)
+    """
 
     name: str
+    module_path: Optional[str] = None  # Full import path (e.g., "torch.nn.Linear")
     description: Optional[str] = None
-    sample_inputs_func: InputsEdits = InputsEdits()
+    sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
+    constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
+    forward_inputs: Optional[Union[InputsEdits, List[InputsEdits]]] = (
+        None  # New: explicit forward inputs (single or list)
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_forward_inputs(cls, values: Any) -> Any:
+        """Parse forward_inputs to handle both dict and list formats."""
+        if isinstance(values, dict) and "forward_inputs" in values:
+            forward_inputs = values["forward_inputs"]
+            # If it's a list of dicts, parse each one as InputsEdits
+            if isinstance(forward_inputs, list):
+                parsed_list = []
+                for item in forward_inputs:
+                    if isinstance(item, dict):
+                        # Parse each dict as InputsEdits
+                        parsed_list.append(InputsEdits.model_validate(item))
+                    else:
+                        parsed_list.append(item)
+                values["forward_inputs"] = parsed_list
+        return values
+
+    def build_module_input(
+        self,
+        *,
+        seed: Optional[int],
+        test_device: Optional[torch.device],
+        FunctionInput,
+        ModuleInput,
+    ) -> Any:
+        """Build a ModuleInput from the config inputs.
+
+        Follows PyTorch's upstream module_inputs_func signature:
+        module_inputs_func(module_info, device, dtype, requires_grad, training, **kwargs) -> list[ModuleInput]
+
+        Returns a ModuleInput with:
+        - constructor_input: FunctionInput with args/kwargs for module.__init__()
+        - forward_input: FunctionInput with args/kwargs for module.forward()
+
+        FunctionInput and ModuleInput are passed in as arguments to avoid importing
+        torch.testing internals into this models file.
+        """
+        # Build constructor inputs
+        constructor_spec = self.constructor_inputs or InputsEdits()
+        constructor_args = constructor_spec.build_cpu_args(
+            seed=seed,
+            op_name=self.name,
+            test_device=test_device,
+        )
+        constructor_kwargs = constructor_spec.resolved_kwargs(test_device=test_device)
+        constructor_input = FunctionInput(*constructor_args, **constructor_kwargs)
+
+        # Build forward inputs (prefer forward_inputs, fallback to sample_inputs_func for backward compat)
+        forward_spec = self.forward_inputs or self.sample_inputs_func
+
+        # Handle list format (multiple invocations) - return first one for backward compat
+        # The full list handling is done in create_module_inputs_func_from_yaml
+        if isinstance(forward_spec, list):
+            if forward_spec:
+                forward_spec = forward_spec[0]  # Use first invocation
+            else:
+                forward_spec = InputsEdits()  # Empty if list is empty
+
+        forward_args = forward_spec.build_cpu_args(
+            seed=(None if seed is None else seed + 10000),  # Different seed for forward
+            op_name=self.name,
+            test_device=test_device,
+        )
+        forward_kwargs = forward_spec.resolved_kwargs(test_device=test_device)
+        forward_input = FunctionInput(*forward_args, **forward_kwargs)
+
+        return ModuleInput(
+            constructor_input=constructor_input,
+            forward_input=forward_input,
+        )
 
 
 class OpsNamedItem(BaseModel):
@@ -802,11 +971,18 @@ class SupportedOpConfig(BaseModel):
 
 
 class SupportedModuleConfig(BaseModel):
-    """Model for storing supported modules config: name, force_xfail."""
+    """Model for storing supported modules config: name, force_xfail, dtypes.
+
+    Supports inline input specification via constructor_inputs and forward_inputs.
+    """
 
     name: str
     force_xfail: bool = False
     dtypes: List[SupportedOpDtypeConfig] = []
+    constructor_inputs: Optional[InputsEdits] = None  # Inline constructor inputs
+    forward_inputs: Optional[Union[InputsEdits, List[InputsEdits]]] = (
+        None  # Inline forward inputs (single or list)
+    )
 
     def get_name(self) -> str:
         return self.name
@@ -815,6 +991,19 @@ class SupportedModuleConfig(BaseModel):
         if not self.dtypes:
             return None
         return {d.resolved_dtype() for d in self.dtypes}
+
+    def has_inline_inputs(self) -> bool:
+        """Check if this config has inline input specifications."""
+        has_constructor = (
+            self.constructor_inputs is not None and self.constructor_inputs.has_inputs()
+        )
+        has_forward = False
+        if self.forward_inputs is not None:
+            if isinstance(self.forward_inputs, list):
+                has_forward = any(inp.has_inputs() for inp in self.forward_inputs)
+            else:
+                has_forward = self.forward_inputs.has_inputs()
+        return has_constructor or has_forward
 
 
 class InputConfig(BaseModel):

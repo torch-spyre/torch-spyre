@@ -432,8 +432,7 @@ def spyre_rms_norm(
         )
 
     mean = torch.mean(input * input, dim=-1, keepdim=True)
-    eps_tensor = torch.ops.spyre.full((1,), eps, dtype=torch.float16, device="spyre")
-    rsqrt_inp = torch.rsqrt(mean + eps_tensor)
+    rsqrt_inp = torch.rsqrt(mean + eps)
     output = input * rsqrt_inp
     if weight is not None:
         output = output * weight
@@ -537,12 +536,8 @@ def spyre__sdpa_overrideable(
         scaling_factor = 1.0 / math.sqrt(query.shape[-1])
     scaling_factor = math.sqrt(scaling_factor)
 
-    # TODO (aviros): Figure why this broadcast doesn't work
-    scaling_factor_q = torch.full_like(query, scaling_factor)
-    scaling_factor_k = torch.full_like(key, scaling_factor)
-
-    query = query * scaling_factor_q
-    key = key * scaling_factor_k
+    query = query * scaling_factor
+    key = key * scaling_factor
 
     expansion = num_heads // num_kvheads
     if expansion != 1:
@@ -639,6 +634,23 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
         indices = torch.ops.aten.argmax(input, dim=dim, keepdim=keepdim)
         return torch.return_types.max((values, indices))
+
+
+@register_spyre_decomposition([torch.ops.aten.min.dim])
+def spyre_min_dim_decomp(input, dim, keepdim=False):
+    """
+    Decompose torch.min(input, dim) with conditional CPU fallback for int64.
+
+    Mirrors spyre_max_dim_decomp: int64 inputs go through a CPU-fallback custom
+    op; other dtypes are decomposed into amin (Spyre-native) and argmin (CPU
+    fallback). Returns a named tuple (values, indices) as expected by torch.min.
+    """
+    if input.dtype == torch.int64:
+        return torch.ops.spyre.min_dim_int64_fallback(input, dim, keepdim)
+    else:
+        values = torch.ops.aten.amin(input, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmin(input, dim=dim, keepdim=keepdim)
+        return torch.return_types.min((values, indices))
 
 
 @register_spyre_decomposition([torch.ops.aten.cat.default])

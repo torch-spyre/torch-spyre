@@ -315,18 +315,35 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
+    # Files ignored for plain `pytest` runs (known failures outside `make tests`)
+    # When run via run_test.sh / make tests, PYTORCH_TEST_CONFIG is set so skip the ignore.
+    ignored_files = set()
+    if not os.environ.get("PYTORCH_TEST_CONFIG"):
+        ignored_files = {
+            "tests/test_modules_custom.py",
+        }
+
     selected_models = config.getoption("--model") or []
     if not selected_models:
-        return  # normal behavior
+        # Still deselect ignored files even without --model
+        deselect = [
+            i for i in items if any(i.nodeid.startswith(f) for f in ignored_files)
+        ]
+        if deselect:
+            config.hook.pytest_deselected(items=deselect)
+            items[:] = [i for i in items if i not in deselect]
+        return
 
     # Keep only model-yaml runner tests
     keep = []
     deselect = []
 
     for item in items:
+        if any(item.nodeid.startswith(f) for f in ignored_files):
+            deselect.append(item)
         # item.nodeid includes the file path, e.g. "tests/models/test_model_ops.py::test_model_ops[...]"
         # if "tests/models/test_model_ops.py::" in item.nodeid:
-        if "tests/models/test_model_ops" in item.nodeid:
+        elif "tests/models/test_model_ops" in item.nodeid:
             keep.append(item)
         else:
             deselect.append(item)

@@ -11,6 +11,13 @@ test_suite_config:
             - TestOldViewOps::test_contiguous
             - TestOldViewOps::test_resize_as_preserves_strides
           mode: mandatory_success
+        #######################################################################
+        #### New test added in pytorch 2.11 which is failing - hence xfail ####
+        #######################################################################
+        - names:
+            - TestViewOps::test_maybe_view_chunk_cat
+          mode: xfail
+        #######################################################################
         - names: # Tests that pass with extra dtypes allowed
             - TestViewOps::test_conj_self
           mode: mandatory_success
