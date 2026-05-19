@@ -134,7 +134,8 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   auto flex_alloc = getFlexAllocator();
 
   // Allocate first-class raw storage via CompositeAddress.
-  flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
+  flex::CompositeAddress composite_addr =
+      flex_alloc->allocate(nbytes, flex::AllocationDirective{});
 
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
