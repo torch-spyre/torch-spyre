@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
+import logging
 from collections import defaultdict
+
+import torch
 
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
@@ -26,6 +28,7 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
+    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -240,7 +243,7 @@ def finalize_layouts(operations: list) -> None:
             input_buf.layout = _fixed_tiled(input_buf.layout, stl)
             del tensor_box.layouts
 
-    restickify_plan: dict = defaultdict(list)
+    plan: dict = defaultdict(list)
 
     for op in operations:
         cost_fn = getattr(op, "restick_cost_fn", None)
@@ -271,13 +274,16 @@ def finalize_layouts(operations: list) -> None:
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
             )
-            _record_restickify(op, edge.dep.name, restick_target, restickify_plan)
+            _record_restickify(op, edge.dep.name, restick_target, plan)
 
     # Handle mutation ops: check if their inputs need restickifying to match target buffer's stick.
     for op in operations:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             continue
-        target_layout = op.layout.target.get_layout()
+        target = op.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data  # Traverse view chain to underlying buffer
+        target_layout = target.get_layout()
         assert isinstance(target_layout, FixedTiledLayout), (
             f"mutation op {op.get_name()} target has no committed FixedTiledLayout"
         )
@@ -312,6 +318,40 @@ def finalize_layouts(operations: list) -> None:
                 f"Injecting restickify on {op.get_name()} input {dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
             )
-            _record_restickify(op, dep.name, restick_target, restickify_plan)
+            _record_restickify(op, dep.name, restick_target, plan)
 
-    V.graph.restickify_plan = restickify_plan
+    V.graph.restickify_plan = plan
+    if logger.isEnabledFor(logging.DEBUG):
+        if plan:
+            lines = ["restickify plan:"]
+            for op_name, resticks in plan.items():
+                consumer = V.graph.get_buffer(op_name)
+                if isinstance(consumer, ComputedBuffer) and hasattr(
+                    consumer.data, "reduction_type"
+                ):
+                    op_kind = f"reduction:{consumer.data.reduction_type}"
+                elif isinstance(consumer, ComputedBuffer):
+                    op_kind = "pointwise"
+                else:
+                    op_kind = type(consumer).__name__
+                for r in resticks:
+                    tgt = r["target_layout"]
+                    arg_name = r["arg_name"]
+                    arg_buf = V.graph.get_buffer(arg_name)
+                    if (
+                        isinstance(arg_buf, TensorBox)
+                        and isinstance(arg_buf.data, StorageBox)
+                        and isinstance(arg_buf.data.data, InputBuffer)
+                    ):
+                        buf_kind = "graph_input"
+                    elif isinstance(arg_buf, ComputedBuffer):
+                        buf_kind = "computed"
+                    else:
+                        buf_kind = type(arg_buf).__name__
+                    lines.append(
+                        f"  restickify {arg_name} ({buf_kind}) -> {op_name} ({op_kind})"
+                        f"  stride_map={list(tgt.device_layout.stride_map)}"
+                    )
+            logger.debug("\n".join(lines))
+        else:
+            logger.debug("restickify plan: (none)")

@@ -1,0 +1,182 @@
+name: model-ops-tests
+
+on:
+  # Run automatically on every merge to main
+  push:
+    branches: [main]
+    paths-ignore:
+      - tests/docs/**
+  # Removing from CICD till the ops tests get matured
+  # pull_request:
+  #   branches: [main]
+  # merge_group:
+  #   types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  model-ops-tests:
+    name: ${{ matrix.suite.name }}
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 720
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
+
+    # ---------------------------------------------------------------------------
+    # To add a new model ops test suite, append an entry here:
+    #   - name: <human-readable label shown in the GHA UI>
+    #     config: <filename inside tests/configs/model_ops_tests/>
+    #
+    # The JUnit XML report is automatically named after the config file, e.g.:
+    #   granite_4.0_h_tiny_spyre.yaml  ->  granite_4.0_h_tiny_spyre.xml
+    # ---------------------------------------------------------------------------
+    strategy:
+      fail-fast: false   # run all suites even if one fails
+      matrix:
+        suite:
+          - name: GPT OSS 20B
+            config: gpt_oss_20b_spyre.yaml
+          - name: Granite 3.3 8B Instruct FMS
+            config: granite_3.3_8b_instruct_fms_spyre.yaml
+          - name: Granite 3.3 8B Instruct
+            config: granite_3.3_8b_instruct_spyre.yaml
+          # - name: Granite 4.0 H Tiny   # omitted for now
+          #   config: granite_4.0_h_tiny_spyre.yaml
+          - name: Meta Llama 3.1 8B Instruct
+            config: meta_llama_3.1_8b_instruct_spyre.yaml
+          - name: Ministral 3 14B Instruct 2512
+            config: ministral_3_14B_Instruct_2512_spyre.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: mistral_small_3.2_24B_instruct_2506_spyre.yaml
+
+    steps:
+      - name: Checkout branch/commit in pre-cloned torch-spyre
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          # The pre-cloned repo may be owned by a different user than the
+          # runner process; mark all directories as safe to avoid git's
+          # "dubious ownership" error (covers the repo and any submodules).
+          git config --global --add safe.directory '*'
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          TARGET_SHA="${GITHUB_SHA}"
+          TARGET_REF="${GITHUB_REF}"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git log -1 --oneline
+
+      - name: Gather runner info
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          date
+          pwd
+          whoami
+          id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          echo "TORCH_ROOT $TORCH_ROOT"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+          echo "--- env ---"
+          env | sort
+          echo "--- AIU env ---"
+          env | sort | grep AIU || true
+          echo "--- repo listing ---"
+          ls -lart "$CLONED_TORCH_SPYRE_DIR"
+
+      - name: Build torch-spyre
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+          # uv sync reconciles the .venv against pyproject.toml + uv.lock,
+          # so torch is reinstalled only when the resolved version or source
+          # differs from what's already installed (e.g., a PR bumps the
+          # torch~=2.10.0 constraint, or the pre-baked venv has a torch from
+          # a different index than the pytorch-cpu source in uv.lock).
+          # --reinstall-package torch-spyre: always rebuild torch-spyre from
+          #   the freshly-checked-out sources.
+          uv sync \
+            --verbose \
+            --all-extras \
+            --active \
+            --inexact \
+            --reinstall-package torch-spyre
+          # Print the resolved torch install for log visibility.
+          uv pip show torch
+          uv pip freeze
+
+      - name: Run ${{ matrix.suite.name }} model ops test suite
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
+          # Derive the XML report name from the config filename
+          # Example:
+          #   granite_3.3_8b_instruct_spyre.yaml  ->  granite_3.3_8b_instruct_spyre.xml
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="${CONFIG%.yaml}.xml"
+          REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
+
+          echo "Running ${{ matrix.suite.name }} model ops tests..."
+          bash tests/run_test.sh "tests/configs/model_ops_tests/${CONFIG}" -v --junit-xml="${REPORT_PATH}"
+          echo "${{ matrix.suite.name }} model ops tests done"
+
+          # Expose report path/name to subsequent steps via GITHUB_ENV
+          echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------------
+      # Upload the JUnit XML as a GHA artifact so it can be downloaded and
+      # ingested by the Spyre dashboard.
+      #
+      # if: always() ensures the report is uploaded even when tests fail —
+      # a failed run is exactly when you most want the dashboard to show results.
+      #
+      # Artifact name matches the report filename so multiple matrix jobs don't
+      # overwrite each other (each config produces a distinct name).
+      # ---------------------------------------------------------------------------
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn (not fail) if pytest itself crashed
+          retention-days: 10

@@ -15,36 +15,90 @@ permissions:
 jobs:
   test:
     name: Run Spyre unit tests - complete version
-    # runs-on: official-aiu-x86-64-arc-runner-set-v1
-    # runs-on: official-aiu-x86-64-arc-runner-set-v2
-    runs-on: official-aiu-x86-64-arc-runner-set-v3
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
     # increase timeout to 12 hours
     timeout-minutes: 720
-    # env: {}
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: get some info
+      - name: Checkout branch/commit in pre-cloned torch-spyre
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
-          echo 'gather info start'
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          # The pre-cloned repo may be owned by a different user than the
+          # runner process; mark all directories as safe to avoid git's
+          # "dubious ownership" error (covers the repo and any submodules).
+          git config --global --add safe.directory '*'
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          TARGET_SHA="${GITHUB_SHA}"
+          TARGET_REF="${GITHUB_REF}"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git log -1 --oneline
+
+      - name: Gather runner info
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          date
           pwd
-          ls -la
           whoami
           id
           echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
           echo "PATH $PATH"
           echo "HOME $HOME"
+          echo "TORCH_ROOT $TORCH_ROOT"
           python3 --version
           python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
-      - name: Install the torch-spyre package and dependencies
+
+      - name: Build torch-spyre
         run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          # avoid the extra step required by --no-build-isolation
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+          # uv sync reconciles the .venv against pyproject.toml + uv.lock,
+          # so torch is reinstalled only when the resolved version or source
+          # differs from what's already installed.
+          # --reinstall-package torch-spyre: always rebuild torch-spyre from
+          #   the freshly-checked-out sources.
+          uv sync \
+            --verbose \
+            --all-extras \
+            --active \
+            --inexact \
+            --reinstall-package torch-spyre
+          uv pip show torch
+          uv pip freeze
+
       - name: Run unit tests
         run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
           echo 'Run unit tests start'
           pytest tests/ --cpu-compile -vvv -s || EXIT_CODE=$?
           EXIT_CODE=${EXIT_CODE:-0}

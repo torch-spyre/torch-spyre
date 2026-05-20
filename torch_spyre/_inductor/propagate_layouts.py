@@ -167,6 +167,7 @@ def _single_arg_op_layout(
             out_coords = host_coordinates(output, output_dep)
             if (
                 in_coords == out_coords
+                and in_layout.size == output.size
                 and dep.index == output_dep.index
                 and same_device_size(in_layout.dtype, output.dtype)
             ):
@@ -346,6 +347,7 @@ def _multi_arg_pointwise_layouts(
         for arg, arg_coors in zip(args, in_coords):
             if (
                 arg_coors != out_coords
+                or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
                 or not same_device_size(arg.layout.dtype, output.dtype)
             ):
@@ -545,6 +547,7 @@ def propagate_spyre_tensor_layouts(
     for op in it:
         if op.is_no_op():
             op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
@@ -553,7 +556,10 @@ def propagate_spyre_tensor_layouts(
             output_dep = next(iter(rw.writes))
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
-            if isinstance(op.data, (Pointwise, Reduction)):
+            if not args:
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
+            elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
@@ -562,6 +568,7 @@ def propagate_spyre_tensor_layouts(
             if not isinstance(op, MultiOutput):
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreConstantFallback):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()

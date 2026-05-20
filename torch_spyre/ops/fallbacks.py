@@ -229,7 +229,7 @@ def register_fallback(ops, device="cpu"):
 
 def register_fallback_default(ops):
     for op in _get_op_overloads(ops):
-        register_fallback([op.name()])(op)
+        register_fallback([op])(op)
 
 
 #  CPU-fallback eager operators
@@ -238,29 +238,21 @@ register_fallback_default(
     [
         aten.cumsum,
         aten.repeat.out,
+        aten.arange,
+        aten.sin,
+        aten.cos,
+        aten.embedding.default,
+        aten.isin,
+        aten.tril,
+        aten.triu,
+        aten.bitwise_xor.Tensor,
+        aten.bitwise_xor.Tensor_out,
+        aten.bitwise_or.Tensor,
+        aten.bitwise_or.Tensor_out,
+        aten.argmax.default,
+        aten.argmin.default,
     ]
 )
-
-
-@register_fallback([aten.arange.default, aten.arange.start, aten.arange.start_step])
-def spyre__arange(*args, **kwargs):
-    return torch.arange(*args, **kwargs)
-
-
-@register_fallback([aten.arange.out, aten.arange.start_out])
-def spyre__arange_out(*args, out, **kwargs):
-    kwargs.update({"device": "cpu", "dtype": out.dtype, "layout": out.layout})
-    return torch.arange(*args, **kwargs)
-
-
-@register_fallback([aten.sin.default, aten.sin.out])
-def spyre__sin(input, **kwargs):
-    return torch.sin(input, **kwargs)
-
-
-@register_fallback([aten.cos.default, aten.cos.out])
-def spyre__cos(input, **kwargs):
-    return torch.cos(input, **kwargs)
 
 
 # Manually append to fallback_ops: register_fallback cannot be used here because
@@ -342,6 +334,14 @@ def spyre__max_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
     CPU fallback for torch.max(input, dim) when input is int64.
     """
     return torch.max(input, dim=dim, keepdim=keepdim, **kwargs)
+
+
+@register_fallback(["spyre::min_dim_int64_fallback"])
+def spyre__min_dim_int64_fallback(input, dim, keepdim=False, **kwargs):
+    """
+    CPU fallback for torch.min(input, dim) when input is int64.
+    """
+    return torch.min(input, dim=dim, keepdim=keepdim, **kwargs)
 
 
 @register_fallback(["spyre::max_default_int64_fallback"])

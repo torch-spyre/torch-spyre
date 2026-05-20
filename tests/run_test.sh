@@ -37,6 +37,20 @@
 # does not emit marker <properties> for unittest.TestCase items even with
 # junit_family=xunit2 -- which seems to be a pytest limitation.
 
+# Segfault resilience
+# -------------------
+# If a file-level pytest run exits with any signal (exit >= 128, e.g. SIGSEGV/139
+# or C-level abort/255), the file is automatically retried with "-n1" via
+# pytest-xdist.  xdist spawns each test in a worker subprocess; when a worker
+# crashes the xdist controller catches the worker death, records that test as
+# ERROR, and continues with the remaining tests.
+#
+# --collect-only is NOT used as the fallback strategy: the process that crashes
+# during test execution often also crashes during collection, yielding zero IDs.
+# xdist's forking model sidesteps this entirely — collection runs in the
+# controller (which stays alive) and execution runs in workers (which can crash
+# safely).  Requires pytest-xdist: pip install pytest-xdist.
+
 set -euo pipefail
 
 
@@ -76,7 +90,7 @@ for _arg in "$@"; do
         _dir_yamls=()
         while IFS= read -r -d '' _f; do
             _dir_yamls+=("$(realpath "$_f")")
-        done < <(find "$(realpath "$_arg")" -maxdepth 1 \
+        done < <(find "$(realpath "$_arg")" \
                      \( -name '*.yaml' -o -name '*.yml' \) \
                      -type f -print0 | sort -z)
         if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
@@ -185,33 +199,53 @@ _find_sibling_with_sentinel() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Resolve and export TORCH_ROOT
+# 2. Resolve and export TORCH_ROOT (only when referenced in YAML paths)
 # ---------------------------------------------------------------------------
-echo "[spyre_run] Resolving TORCH_ROOT..."
-if [[ -n "${TORCH_ROOT:-}" && -d "$TORCH_ROOT" ]]; then
-    echo "[spyre_run]   already set: $TORCH_ROOT"
-else
-    TORCH_ROOT=""
+_check_torch_root_needed() {
+    grep -qE 'path:\s.*\$\{TORCH_ROOT\}' "$1" 2>/dev/null && return 0
+    if grep -E '^\s*(- )?path:\s' "$1" | grep -qE '\$\{TORCH_ROOT\}'; then
+        return 0
+    fi
+    return 1
+}
 
-    _found=$(python3 -c "
+if _check_torch_root_needed "$YAML_CONFIG"; then
+    _TORCH_ROOT_NEEDED=1
+    echo "[spyre_run]   YAML config references \${TORCH_ROOT} root — resolving..."
+else
+    _TORCH_ROOT_NEEDED=0
+    echo "[spyre_run]   YAML config does not reference \${TORCH_ROOT} — skipping resolution."
+fi
+
+if [[ $_TORCH_ROOT_NEEDED -eq 1 ]]; then
+    echo "[spyre_run] Resolving TORCH_ROOT..."
+    if [[ -n "${TORCH_ROOT:-}" && -d "$TORCH_ROOT" ]]; then
+        echo "[spyre_run]   already set: $TORCH_ROOT"
+    else
+        TORCH_ROOT=""
+
+        _found=$(python3 -c "
 import torch, os
 candidate = os.path.dirname(os.path.dirname(os.path.abspath(torch.__file__)))
 if os.path.isfile(os.path.join(candidate, 'test', 'test_binary_ufuncs.py')):
     print(candidate)
 " 2>/dev/null) || true
-    [[ -n "$_found" ]] && TORCH_ROOT="$_found"
+        [[ -n "$_found" ]] && TORCH_ROOT="$_found"
 
-    if [[ -z "$TORCH_ROOT" ]]; then
-        TORCH_ROOT=$(_find_sibling_with_sentinel "$YAML_DIR" "test/test_binary_ufuncs.py" 2>/dev/null) || true
-    fi
+        if [[ -z "$TORCH_ROOT" ]]; then
+            TORCH_ROOT=$(_find_sibling_with_sentinel "$YAML_DIR" "test/test_binary_ufuncs.py" 2>/dev/null) || true
+        fi
 
-    if [[ -z "$TORCH_ROOT" ]]; then
-        echo "ERROR: Could not locate PyTorch source root." >&2
-        echo "       Expected pytorch/ as a sibling of your torch-spyre repo, or" >&2
-        echo "       an editable install (pip install -e .)." >&2
-        echo "       Set TORCH_ROOT explicitly if the layout differs." >&2
-        exit 1
+        if [[ -z "$TORCH_ROOT" ]]; then
+            echo "ERROR: Could not locate PyTorch source root." >&2
+            echo "       Expected pytorch/ as a sibling of your torch-spyre repo, or" >&2
+            echo "       an editable install (pip install -e .)." >&2
+            echo "       Set TORCH_ROOT explicitly if the layout differs." >&2
+            exit 1
+        fi
     fi
+else
+    TORCH_ROOT="${TORCH_ROOT:-}"
 fi
 export TORCH_ROOT
 export PYTORCH_ROOT="$TORCH_ROOT"
@@ -404,16 +438,79 @@ _ANALYZER_PY='
 import ast, sys, json
 from pathlib import Path
 
-def class_methods_info(classdef):
-    """Return (has_device_method, [all_test_method_names]) for a ClassDef."""
+def _get_parametrize_names(tree):
+    """Return the set of names assigned from parametrize(...) calls at module level.
+
+    Handles patterns like:
+        parametrize_unary_ufuncs = parametrize("ufunc", [np.sin])
+        parametrize_casting = parametrize("casting", [...])
+
+    These names are used as decorators (@parametrize_unary_ufuncs) and must be
+    treated identically to @parametrize when determining if a class is pure-parametrize.
+    """
+    parametrize_names = {"parametrize"}  # always include the base name
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            # Look for: name = parametrize(...) or name = parametrize_something(...)
+            if isinstance(node.value, ast.Call):
+                fn = node.value.func
+                fn_name = ""
+                if isinstance(fn, ast.Name):        fn_name = fn.id
+                elif isinstance(fn, ast.Attribute): fn_name = fn.attr
+                if fn_name == "parametrize":
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            parametrize_names.add(target.id)
+    return parametrize_names
+
+
+def class_methods_info(classdef, parametrize_names):
+    """Return (has_device, all_test_methods_parametrized, [method_names]) for a ClassDef.
+
+    has_device                    -- any test method has a `device` parameter
+    all_test_methods_parametrized -- True only when EVERY test method carries a
+                                     @parametrize decorator (or a variable assigned
+                                     from parametrize(...)). Used to distinguish
+                                     pure instantiate_parametrized_tests classes
+                                     (e.g. TestUnaryUfuncs — all methods @parametrize)
+                                     from mixed classes (e.g. TestProfiler — only some
+                                     methods @parametrize). Pure classes must not be
+                                     injected into instantiate_device_type_tests().
+    """
     methods = []
     has_device = False
+    parametrized_count = 0
     for node in ast.walk(classdef):
         if isinstance(node, ast.FunctionDef) and node.name.startswith("test"):
             if any(a.arg == "device" for a in node.args.args):
                 has_device = True
             methods.append(node.name)
-    return has_device, methods
+            # Scan ALL decorators on this method to find if any is @parametrize
+            # or a variable assigned from parametrize(...) (e.g. parametrize_unary_ufuncs).
+            # Do not break early — a method may have @skip as outermost decorator
+            # followed by @parametrize, and we must not miss the @parametrize.
+            method_has_parametrize = False
+            for dec in node.decorator_list:
+                dec_name = ""
+                if isinstance(dec, ast.Name):
+                    dec_name = dec.id
+                elif isinstance(dec, ast.Attribute):
+                    dec_name = dec.attr
+                elif isinstance(dec, ast.Call):
+                    fn = dec.func
+                    if isinstance(fn, ast.Name):        dec_name = fn.id
+                    elif isinstance(fn, ast.Attribute): dec_name = fn.attr
+                if dec_name in parametrize_names:
+                    method_has_parametrize = True
+                    break
+            if method_has_parametrize:
+                parametrized_count += 1
+    # True only when ALL test methods use @parametrize (or a parametrize alias) —
+    # indicates this class belongs to instantiate_parametrized_tests, not
+    # instantiate_device_type_tests. Mixed classes (some @parametrize, some plain)
+    # like TestProfiler are NOT treated as parametrize-only and must still be injected.
+    all_parametrized = bool(methods) and (parametrized_count == len(methods))
+    return has_device, all_parametrized, methods
 
 def _call_has_only_for_kwarg(call_node):
     """Return True if the Call node has an `only_for` keyword argument."""
@@ -428,19 +525,80 @@ def analyze(path):
         tree = ast.parse(source, filename=path)
     except SyntaxError as e:
         print(json.dumps({"error": f"SyntaxError: {e}"})); return
+    
+    # Pre-scan for names assigned from parametrize(...) calls (e.g. parametrize_unary_ufuncs).
+    # These are used as decorators and must be recognised as equivalent to @parametrize.
+    parametrize_names = _get_parametrize_names(tree)
+
 
     # ALL TestCase subclasses in this file
     all_classes = {}   # name -> has_device_method
-    for node in ast.walk(tree):
+    # class_level_parametrized_pure: classes with @instantiate_parametrized_tests
+    # decorator where ALL test methods are also @parametrize-decorated.
+    # These are pure parametrize classes (e.g. TestUnaryUfuncs, TestBinaryUfuncs)
+    # that must never be injected into instantiate_device_type_tests() — their
+    # @parametrize args (e.g. np.sin) are not torch.dtype objects and would crash
+    # upstream dtype_name(). Kept in fully_handled so they are excluded from injection.
+    class_level_parametrized_pure = set()
+    # class_level_parametrized_mixed: classes with @instantiate_parametrized_tests
+    # decorator where only SOME test methods are @parametrize-decorated (e.g. TestProfiler).
+    # These still need injection into instantiate_device_type_tests() so TorchTestBase
+    # can gate them via the YAML config, AND need cleanup so the raw star-imported
+    # instance is not collected by pytest as a plain TestCase.
+    class_level_parametrized_mixed = set()
+    for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 base_name = ""
                 if isinstance(base, ast.Name):        base_name = base.id
                 elif isinstance(base, ast.Attribute): base_name = base.attr
                 if "TestCase" in base_name or base_name.endswith("TestBase"):
-                    has_device, _ = class_methods_info(node)
+                    has_device, all_parametrized, _ = class_methods_info(node, parametrize_names)
                     all_classes[node.name] = has_device
+                    # Check for @instantiate_parametrized_tests as a class decorator.
+                    for dec in node.decorator_list:
+                        dec_name = ""
+                        if isinstance(dec, ast.Name):
+                            dec_name = dec.id
+                        elif isinstance(dec, ast.Attribute):
+                            dec_name = dec.attr
+                        elif isinstance(dec, ast.Call):
+                            fn = dec.func
+                            if isinstance(fn, ast.Name):        dec_name = fn.id
+                            elif isinstance(fn, ast.Attribute): dec_name = fn.attr
+                        if dec_name == "instantiate_parametrized_tests":
+                            if all_parametrized:
+                                class_level_parametrized_pure.add(node.name)
+                            else:
+                                # Mixed class: needs injection only if this is an
+                                # upstream PyTorch file (under TORCH_ROOT). For
+                                # OOT-native files (under TORCH_DEVICE_ROOT),
+                                # @instantiate_parametrized_tests is sufficient
+                                # and injection into instantiate_device_type_tests
+                                # would produce unwanted device-type subclasses.
+                                import os as _os
+                                torch_root = _os.environ.get("TORCH_ROOT", "")
+                                torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+                                is_upstream = (
+                                    torch_root
+                                    and _os.path.abspath(path).startswith(
+                                        _os.path.abspath(torch_root)
+                                    )
+                                )
+                                is_oot = (
+                                    torch_device_root
+                                    and _os.path.abspath(path).startswith(
+                                        _os.path.abspath(torch_device_root)
+                                    )
+                                )
+                                if is_upstream and not is_oot:
+                                    class_level_parametrized_mixed.add(node.name)
+                                else:
+                                    # OOT-native mixed class: fully handled by
+                                    # @instantiate_parametrized_tests, no injection needed.
+                                    class_level_parametrized_pure.add(node.name)
                     break
+
     # Classify instantiate_device_type_tests() calls:
     #   without only_for  -> fully open, framework already controls all devices
     #   with    only_for  -> restricted; spyre/privateuse1 likely excluded
@@ -448,41 +606,62 @@ def analyze(path):
     device_type_restricted = set()   # has only_for kwarg
     parametrized_instantiated = set()
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        fname = ""
-        if isinstance(func, ast.Name):        fname = func.id
-        elif isinstance(func, ast.Attribute): fname = func.attr
+    for stmt in ast.iter_child_nodes(tree):
+        if isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue  # skip class and function bodies — only module-level calls
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            fname = ""
+            if isinstance(func, ast.Name):        fname = func.id
+            elif isinstance(func, ast.Attribute): fname = func.attr
 
-        if fname == "instantiate_device_type_tests" and node.args:
-            arg = node.args[0]
-            if isinstance(arg, ast.Name):
-                cls_name = arg.id
-                if _call_has_only_for_kwarg(node):
-                    device_type_restricted.add(cls_name)
-                else:
-                    device_type_open.add(cls_name)
-        elif fname == "instantiate_parametrized_tests" and node.args:
-            arg = node.args[0]
-            if isinstance(arg, ast.Name):
-                parametrized_instantiated.add(arg.id)
+            if fname == "instantiate_device_type_tests" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Name):
+                    cls_name = arg.id
+                    if _call_has_only_for_kwarg(node):
+                        device_type_restricted.add(cls_name)
+                    else:
+                        device_type_open.add(cls_name)
+            elif fname == "instantiate_parametrized_tests" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Name):
+                    parametrized_instantiated.add(arg.id)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already
     # covers all devices including spyre.
     device_type_restricted -= device_type_open
-    
-    # "Fully handled" = open device_type + parametrized
+
+    # "Fully handled" = open device_type + parametrized (standalone call form)
+    #                 + class_level_parametrized_pure (decorator form, all methods @parametrize).
+    # class_level_parametrized_mixed is intentionally excluded: those classes still
+    # need injection into instantiate_device_type_tests() so TorchTestBase can gate
+    # them via the YAML config (they land in uncontrolled below).
     # (restricted is NOT fully handled for spyre)
-    fully_handled = device_type_open | parametrized_instantiated
+    fully_handled = device_type_open | parametrized_instantiated | class_level_parametrized_pure
 
     # uncontrolled: never passed to any instantiate_* call
     uncontrolled = sorted(set(all_classes) - fully_handled - device_type_restricted)
 
     # needs_injection: everything the wrapper must re-inject
     needs_injection = sorted(set(uncontrolled) | device_type_restricted)
+
+    # needs_cleanup: classes whose original name survives the star-import in the
+    # wrapper globals() and would be collected by pytest as a plain TestCase,
+    # bypassing TorchTestBase._should_run() entirely. This causes YAML mode:skip
+    # entries to be ignored and the raw test body to execute (potentially hitting
+    # hardware or crashing). Two sources:
+    #   1. uncontrolled classes: injected fresh; star-import leaves original in globals.
+    #   2. class_level_parametrized_mixed classes: @instantiate_parametrized_tests
+    #      decorator leaves the class in globals() after the star-import just like
+    #      uncontrolled classes; they are injected (via uncontrolled above) and need
+    #      cleanup so pytest does not also collect the raw star-imported instance.
+    # Restricted classes are NOT in this set — their name is already removed
+    # from globals() by the upstream only_for instantiate_device_type_tests call.
+    needs_cleanup = sorted(set(uncontrolled) | class_level_parametrized_mixed)
 
     # Plain classes (no device arg in any test method) within needs_injection
     plain_no_device = sorted(
@@ -496,6 +675,7 @@ def analyze(path):
         "parametrized":           sorted(parametrized_instantiated),
         "uncontrolled":           uncontrolled,
         "needs_injection":        needs_injection,
+        "needs_cleanup":          needs_cleanup,
         "plain_no_device":        plain_no_device,
     }))
 
@@ -564,6 +744,8 @@ trap _cleanup_wrappers EXIT
 
 # generate_wrapper_if_needed <test_file>
 # Sets global _RUN_FILE to the path pytest should actually run.
+# generate_wrapper_if_needed <test_file>
+# Sets global _RUN_FILE to the path pytest should actually run.
 _RUN_FILE=""
 generate_wrapper_if_needed() {
     local test_file="$1"
@@ -584,7 +766,7 @@ import json,sys; d=json.load(sys.stdin); print(d.get('error',''))
         return 0
     fi
 
-    local needs_injection_str plain_str restricted_str uncontrolled_str
+    local needs_injection_str plain_str restricted_str uncontrolled_str cleanup_str
     needs_injection_str=$(echo "$result" | python3 -c "
 import json,sys; d=json.load(sys.stdin); print(' '.join(d['needs_injection']))
 ")
@@ -596,6 +778,9 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['device_type_restricte
 ")
     uncontrolled_str=$(echo "$result" | python3 -c "
 import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
+")
+    cleanup_str=$(echo "$result" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(' '.join(d['needs_cleanup']))
 ")
 
     if [[ -z "$needs_injection_str" ]]; then
@@ -609,6 +794,8 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['uncontrolled']))
     [[ -n "$restricted_str" ]] && read -r -a RESTRICTED_CLASSES <<< "$restricted_str"
     local -a UNCONTROLLED_CLASSES=()
     [[ -n "$uncontrolled_str" ]] && read -r -a UNCONTROLLED_CLASSES <<< "$uncontrolled_str"
+    local -a CLEANUP_CLASSES=()
+    [[ -n "$cleanup_str" ]] && read -r -a CLEANUP_CLASSES <<< "$cleanup_str"
     # Warn about plain classes -- they are safe only when YAML skips them.
     if [[ ${#PLAIN_CLASSES[@]} -gt 0 ]]; then
         echo "[spyre_run] NOTE: the following classes have no 'device' arg in their"
@@ -656,6 +843,27 @@ _instantiate(_cls_${cls}, globals())
 _restore_staticmethods(_cls_${cls}, globals())
 "
     done
+
+    # ---------------------------------------------------------------------------
+    # Build cleanup block: delete injected uncontrolled classes from wrapper
+    # globals() after injection so pytest only sees the OOT-controlled
+    # device-type subclass (e.g. TestProfilerPRIVATEUSE1), not the raw
+    # star-imported TestCase (e.g. TestProfiler) which would bypass
+    # TorchTestBase._should_run() and ignore YAML mode:skip entries entirely.
+    # Only uncontrolled classes need this — restricted classes are already
+    # removed from globals() by the upstream only_for call.
+    # ---------------------------------------------------------------------------
+    local cleanup_block=""
+    for cls in "${CLEANUP_CLASSES[@]}"; do
+        cleanup_block+="
+# Remove original class from wrapper scope — pytest must only collect the
+# OOT-controlled device-type subclass generated above, not the raw TestCase
+# left in globals() by the star-import.
+if '${cls}' in globals():
+    del globals()['${cls}']
+"
+    done
+
     # Separate quoted lists for restricted vs uncontrolled classes --
     # each is retrieved differently from the private module.
     local quoted_restricted_list=""
@@ -833,6 +1041,17 @@ def _restore_staticmethods(original_cls, scope):
 # instantiate_device_type_tests unwrapped during member copying.
 #
 ${injection_block}
+
+# ---------------------------------------------------------------------------
+# Cleanup: remove original uncontrolled class names from wrapper globals()
+# so pytest does not collect them as plain TestCase instances in addition to
+# the OOT-controlled device-type subclasses generated above. Without this,
+# the raw star-imported class (e.g. TestProfiler) would be collected and run
+# directly, bypassing TorchTestBase._should_run() and ignoring YAML mode:skip.
+# Restricted classes are excluded here — the upstream only_for call already
+# removed them from globals() before the star-import.
+# ---------------------------------------------------------------------------
+${cleanup_block}
 
 WRAPPER_EOF
 
@@ -1097,6 +1316,105 @@ Path(out_path).write_text(merged)
 print(f"[spyre_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
+# ---------------------------------------------------------------------------
+# _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> [pytest_args...]
+#
+# Runs a single pytest invocation inside a subshell that is fully isolated
+# from the parent process's errexit/pipefail settings.  The real pytest exit
+# code is written to <exit_tmp> so the caller can read it even when the
+# subshell itself exits non-zero.  The subshell's stdout/stderr are NOT
+# redirected so output streams to the terminal as usual.
+#
+# Returns 0 always; caller reads <exit_tmp> for the real exit code.
+# ---------------------------------------------------------------------------
+_run_pytest_isolated() {
+    local _dir="$1" _base="$2" _exit_tmp="$3"
+    shift 3
+    local _args=("$@")
+    (
+        set +euo pipefail
+        cd "$_dir"
+        python3 -m pytest "$_base" "${_args[@]}"
+        echo $? > "$_exit_tmp"
+    ) || true
+}
+
+# ---------------------------------------------------------------------------
+# _run_xdist_fallback <run_dir> <run_basename> <original_file>
+#                     <exit_tmp> <shard_xml> [pytest_args...]
+#
+# Called when a file-level pytest run exits with a signal (exit >= 128, most
+# commonly SIGSEGV or exit 255 from a C-level abort).
+#
+# Re-runs the same file with "-n1" (pytest-xdist, 1 worker subprocess).
+# xdist spawns each test in a worker process; when a worker crashes the
+# xdist controller catches the worker death, marks that test as ERROR, and
+# continues with the remaining tests
+#
+#   The process that segfaults during test execution is often the same Python
+#   interpreter that would run --collect-only, so collection itself crashes
+#   and yields zero IDs.  xdist's forking model sidesteps this entirely.
+#
+# Arguments:
+#   $1  run_dir       -- directory to cd into for pytest
+#   $2  run_basename  -- pytest target (wrapper or original filename)
+#   $3  original_file -- original source path (logging only)
+#   $4  exit_tmp      -- temp file path for exit code (reused from caller)
+#   $5  shard_xml     -- destination XML path (empty if no --junit-xml)
+#   rest              -- extra pytest args (already stripped of --junit-xml)
+#
+# Side-effects:
+#   - Updates global OVERALL_EXIT.
+#   - Injects XML tags into shard_xml when present.
+# ---------------------------------------------------------------------------
+_run_xdist_fallback() {
+    local _dir="$1" _base="$2" _orig="$3" _exit_tmp="$4" _shard_xml="$5"
+    shift 5
+    local _extra=("$@")
+
+    echo ""
+    echo "[spyre_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
+    echo "[spyre_run]     File: $_orig"
+    echo "[spyre_run]     Each test runs in its own worker; crashes are contained."
+    echo ""
+
+    # Check pytest-xdist is available before proceeding.
+    if ! python3 -m pytest --co -q --no-header -p xdist /dev/null &>/dev/null 2>&1; then
+        if ! python3 -c "import xdist" 2>/dev/null; then
+            echo "[spyre_run] WARNING: pytest-xdist not installed — cannot use -n1 fallback." >&2
+            echo "[spyre_run]          Install with: pip install pytest-xdist" >&2
+            echo "[spyre_run]          Skipping remaining tests in: $_orig" >&2
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            return
+        fi
+    fi
+
+    local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
+    [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
+
+    _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "${_xdist_args[@]}"
+
+    local _xexit=139
+    if [[ -f "$_exit_tmp" ]]; then
+        _xexit=$(< "$_exit_tmp")
+        rm -f "$_exit_tmp"
+    else
+        echo "[spyre_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
+    fi
+
+    # Propagate test failures from the xdist fallback run.
+    if [[ $_xexit -eq 1 ]]; then
+        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+    elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+        OVERALL_EXIT=$_xexit
+    fi
+
+    # Inject XML tags into the shard produced by the xdist run.
+    if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
+        python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+    fi
+}
+
 for i in "${!RUN_FILES[@]}"; do
     run_file="${RUN_FILES[$i]}"
     original_file="${TEST_FILES[$i]}"
@@ -1178,54 +1496,107 @@ for i in "${!RUN_FILES[@]}"; do
             _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
         fi
     fi
-    _exit=0
-    (
-        cd "$run_dir"
-        python3 -m pytest "$run_basename" "${_FILE_PYTEST_ARGS[@]}"
-        echo $? > "/tmp/_spyre_pytest_exit_$$.tmp"
-    ) || true
 
-    # Read the real pytest exit code written from inside the subshell.
-    # If the file doesn't exist the subshell died before writing it
-    # (e.g. segfault, OOM kill) --  treat that as fatal (139 = SIGSEGV).
-    if [[ -f "/tmp/_spyre_pytest_exit_$$.tmp" ]]; then
-        _exit=$(< "/tmp/_spyre_pytest_exit_$$.tmp")
-        rm -f "/tmp/_spyre_pytest_exit_$$.tmp"
+    # -----------------------------------------------------------------------
+    # Run pytest for this file.
+    #
+    # SPYRE_TEST_FILE is exported so xdist worker processes can determine
+    # the current test file during collection.  Workers inherit the parent
+    # environment but receive an empty sys.argv[], and PYTEST_CURRENT_TEST
+    # is only set during execution (not collection), so this env var is the
+    # only reliable source for resolve_current_file() in all scenarios.
+    # spyre_test_parsing.py strips the __oot_wrapper suffix automatically.
+    #
+    # The exit code is written to a temp file from inside the subshell so it
+    # survives even when the process exits abnormally (SIGSEGV, OOM, etc.).
+    # Using a PID-namespaced temp file prevents collisions across parallel
+    # invocations of run_test.sh.
+    # -----------------------------------------------------------------------
+    export SPYRE_TEST_FILE="$run_file"
+
+    _EXIT_TMP="/tmp/_spyre_pytest_exit_${$}_${i}.tmp"
+    _exit=0
+
+    _run_pytest_isolated "$run_dir" "$run_basename" "$_EXIT_TMP" "${_FILE_PYTEST_ARGS[@]}"
+
+    if [[ -f "$_EXIT_TMP" ]]; then
+        _exit=$(< "$_EXIT_TMP")
+        rm -f "$_EXIT_TMP"
     else
+        # Subshell died before writing the exit code (segfault, OOM, SIGKILL).
         _exit=139
         echo "[spyre_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
     fi
 
     # Post-process XML to inject YAML tags as <properties>.
-    if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" ]]; then
+    # Only do this for a clean or test-failure run (not for signal exits that
+    # triggered the fallback path below, which handles XML injection itself).
+    if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -lt 128 ]]; then
         python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
     fi
 
-    # Distinguish fatal errors from normal pytest outcomes:
+    # -----------------------------------------------------------------------
+    # Exit code handling
+    #
     #   0   = all tests passed
-    #   1   = tests ran, some failed/errored  (non-fatal, already reported by pytest)
-    #   5   = no tests collected              (warning only)
-    #   127 = command not found (python3/pytest missing)
-    #   130 = SIGINT (Ctrl-C)
-    #   139 = SIGSEGV / killed before writing exit code
+    #   1   = tests ran, some failed/errored  (propagated → OVERALL_EXIT=1)
+    #   5   = no tests collected              (warning only; does not fail run)
+    #   127 = command not found (python3/pytest missing) — fatal
+    #   128+= signal/abnormal termination    — retry with -n1 (xdist fallback)
+    #         Common: 139 (SIGSEGV), 255 (C abort).  130 (Ctrl-C) breaks loop.
+    # -----------------------------------------------------------------------
     case $_exit in
-        0|1|5)
+        0)
+            # All tests passed.
+            ;;
+        1)
+            # Some tests failed or errored — pytest already reported them.
+            # Propagate so CI marks the job as failed when mandatory_success
+            # tests do not pass.
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            ;;
+        5)
+            # No tests collected — warn but do not fail the overall run.
+            echo "[spyre_run] WARNING: no tests collected for $original_file" >&2
             ;;
         127)
             echo "[spyre_run] FATAL: python3 or pytest not found (exit 127) for $original_file" >&2
             OVERALL_EXIT=$_exit
             ;;
         130)
-            echo "[spyre_run] FATAL: interrupted (exit 130) for $original_file" >&2
+            echo "[spyre_run] FATAL: interrupted (exit 130) — aborting run." >&2
             OVERALL_EXIT=$_exit
-            ;;
-        139)
-            echo "[spyre_run] FATAL: segfault (exit 139) for $original_file" >&2
-            OVERALL_EXIT=$_exit
+            # Propagate immediately; no point continuing after Ctrl-C.
+            break
             ;;
         *)
-            echo "[spyre_run] WARNING: pytest exited with code $_exit for $original_file" >&2
-            OVERALL_EXIT=$_exit
+            # Exit >= 128 (excluding 130): signal termination — most likely SIGSEGV
+            # (139) or a C-level abort (255).  Re-run the same file with -n1 so
+            # pytest-xdist spawns each test in a worker subprocess; a crashing
+            # worker is caught by the xdist controller and the remaining tests
+            # continue.  --collect-only is not used: the same process that crashes
+            # during execution often also crashes during collection.
+            echo "[spyre_run] WARNING: pytest exited with signal (code $_exit) for $original_file" >&2
+
+            # Strip --junit-xml from _FILE_PYTEST_ARGS; _run_xdist_fallback
+            # re-adds _SHARD_XML itself so it owns the XML output path.
+            _FALLBACK_ARGS=()
+            _skip_xml=0
+            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
+                if [[ $_skip_xml -eq 1 ]]; then _skip_xml=0; continue; fi
+                case "$_a" in
+                    --junit-xml=*) ;;
+                    --junit-xml)   _skip_xml=1 ;;
+                    *)             _FALLBACK_ARGS+=("$_a") ;;
+                esac
+            done
+
+            _run_xdist_fallback \
+                "$run_dir" "$run_basename" "$original_file" \
+                "$_EXIT_TMP" "$_SHARD_XML" \
+                "${_FALLBACK_ARGS[@]+"${_FALLBACK_ARGS[@]}"}"
+
+            # OVERALL_EXIT updated inside _run_xdist_fallback.
             ;;
     esac
 done

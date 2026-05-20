@@ -45,7 +45,17 @@ Check off each item as you complete it.
 - [ ] Add op name constant to `torch_spyre/_inductor/constants.py`
   if used across files
 
-## 4. Write Tests
+## 4. Verify Against Target Model Parameters
+
+Run before writing unit tests: real model parameters often reveal issues
+that synthetic tests miss.
+
+- [ ] Run `pytest -c pytest_models.ini tests/models/test_model_ops.py -k <op_name>`
+  where `<op_name>` is the torch op name that is replaced `.` with `_`.
+  (e.g. `torch.add` -> `torch_add`)
+- [ ] All tests pass, or failures are in already-known unsupported features.
+
+## 5. Write Tests
 
 - [ ] Add compiled-path test in `tests/_inductor/test_inductor_ops.py`
   - [ ] Use `compare_with_cpu()` or `compare()` from `utils_inductor`
@@ -56,7 +66,7 @@ Check off each item as you complete it.
 - [ ] Add building-block test in `tests/_inductor/test_building_blocks.py`
   (if op is part of a larger module like LayerNorm)
 
-## 5. Final Checks
+## 6. Final Checks
 
 - [ ] Run `pre-commit run --all-files`
 - [ ] Run `python3 -m pytest tests/_inductor/test_inductor_ops.py` (at
@@ -65,7 +75,7 @@ Check off each item as you complete it.
 - [ ] Use `import regex` not `import re` in any new Python files
 - [ ] Sign off commit: `git commit -s`
 
-## 6. Fallback (if needed)
+## 7. Fallback (if needed)
 
 - [ ] Register CPU fallback in `torch_spyre/fallbacks.py` if the op
   cannot run on Spyre in some configurations

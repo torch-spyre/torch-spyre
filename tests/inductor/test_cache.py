@@ -19,6 +19,10 @@ from torch._dynamo.utils import counters
 
 
 class TestCache(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_cache(self):
         counters.clear()
         a = torch.randn((64, 64)).to("spyre")

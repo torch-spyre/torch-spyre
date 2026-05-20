@@ -1,0 +1,156 @@
+name: push-to-clickhouse
+
+# Runs automatically after module-tests,upstream-tests completes etc.
+# Also supports manual dispatch for re-ingesting a specific run.
+on:
+  workflow_run:
+    workflows:
+      - module-tests
+      - upstream-pytorch-tests
+      # to add more workflows
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      gha_run_id:
+        description: GHA run ID to re-ingest (leave blank to skip)
+        required: false
+        default: ''
+      workflow_name:
+        description: Workflow name (module-tests | upstream-tests)
+        required: false
+        default: upstream-pytorch-tests
+
+concurrency:
+  # Allow at most one ingest per triggering run (re-runs queue behind)
+  group: ingest-${{ github.event.workflow_run.id || inputs.gha_run_id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read   # needed to download artifacts from the triggering run
+
+jobs:
+  ingest:
+    name: Ingest XML -> ClickHouse
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip if the triggering workflow was cancelled (but ingest failures are fine)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion != 'cancelled'
+
+    env:
+      # ---------------------------------------------------------------------------
+      # Set these secrets in your repo / org settings:
+      #   CLICKHOUSE_HOST   e.g. clickhouse.internal.example.com
+      #   CLICKHOUSE_PORT   e.g. 8123  (HTTP interface)
+      #   CLICKHOUSE_USER   e.g. spyre_writer
+      #   CLICKHOUSE_PASS   the password
+      #   CLICKHOUSE_DB     e.g. spyre
+      # ---------------------------------------------------------------------------
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+
+      # Metadata about the triggering run
+      TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
+      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      TRIGGERING_AT: ${{ github.event.workflow_run.created_at || '' }}
+
+    steps:
+      - name: Checkout (for the ingest script)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/scripts/ingest_xml.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install requests clickhouse-driver lxml
+
+      # ---------------------------------------------------------------------------
+      # Download all XML artifacts produced by the triggering run.
+      # Each matrix job uploads one artifact named after its config file, e.g.
+      #   granite_3_3_8b_instruct_spyre.xml
+      #   test_view_ops_config.xml
+      # ---------------------------------------------------------------------------
+      - name: List artifacts from triggering run
+        id: list-artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARTIFACTS=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]')
+          echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
+          echo "Found artifacts:"
+          echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
+
+      - name: Download XML artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p xml_artifacts
+          export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
+          python3 <<'PYEOF'
+          import json, os, subprocess, sys
+          artifacts = json.loads(os.environ['ARTIFACTS'])
+          repo  = os.environ['GITHUB_REPOSITORY']
+          for a in artifacts:
+              print(f"Downloading: {a['name']} (id={a['id']})")
+              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
+                result = subprocess.run([
+                    "gh", "api",
+                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
+                ], check=True, env={**os.environ}, capture_output=True)
+                f.write(result.stdout)
+              subprocess.run([
+                  "unzip", "-o", f"xml_artifacts/{a['name']}.zip",
+                  "-d", "xml_artifacts/"
+              ], check=True)
+          PYEOF
+          echo "Downloaded XML files:"
+          find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
+
+      # ---------------------------------------------------------------------------
+      # Parse each XML file and insert rows into ClickHouse.
+      # The Python script is in .github/scripts/ingest_xml.py (see below).
+      # ---------------------------------------------------------------------------
+      - name: Ingest XML files into ClickHouse
+        run: |
+          python3 .github/scripts/ingest_xml.py \
+            --xml-dir xml_artifacts \
+            --workflow "${TRIGGERING_WORKFLOW}" \
+            --branch   "${TRIGGERING_BRANCH}" \
+            --sha      "${TRIGGERING_SHA}" \
+            --run-id   "${TRIGGERING_RUN_ID}" \
+            --triggered-at "${TRIGGERING_AT}"
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+
+      - name: Summary
+        if: always()
+        run: |-
+          XML_COUNT=$(find xml_artifacts -name "*.xml" 2>/dev/null | wc -l || echo 0)
+          {
+            echo "### ClickHouse Ingest Summary"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
+            echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
+            echo "| Branch              | ${TRIGGERING_BRANCH} |"
+            echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
+            echo "| XML files ingested  | ${XML_COUNT} |"
+          } >> "$GITHUB_STEP_SUMMARY"

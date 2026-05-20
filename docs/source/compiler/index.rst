@@ -21,3 +21,4 @@ The pipeline consists of two compilers:
    work_division_planning
    adding_operations
    op_enablement
+   scratchpad_planning

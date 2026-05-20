@@ -1,0 +1,2029 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/models/test_model_ops_v2.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestSpyreModelOps::test_model_ops_db
+          mode: mandatory_success
+          tags:
+            - model__Meta-Llama-3.1-8B-Instruct
+            - constant
+          edits:
+            ops:
+              include:
+                - name: torch.nn.functional.embedding
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L395 in forward,
+                    code: inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12]
+                          stride: [12, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [128256, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L125 in forward,
+                    code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [64]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (None, slice(None, None, None), None)
+
+                - name: torch.float
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L125 in forward,
+                    code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L125 in forward,
+                    code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: -1
+                      - value: 1
+
+                - name: torch.to
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L125 in forward,
+                    code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: cuda:0
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L126 in forward,
+                    code: position_ids_expanded = position_ids[:, None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12]
+                          stride: [12, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+
+                - name: torch.float
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L126 in forward,
+                    code: position_ids_expanded = position_ids[:, None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12]
+                          stride: [12, 12, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+
+                - name: torch.float
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12]
+                          stride: [12, 12, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.matmul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12]
+                          stride: [12, 12, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 12]
+                          stride: [768, 12, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L131 in forward,
+                    code: emb = torch.cat((freqs, freqs), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 12, 64]
+                            stride: [768, 1, 12]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 12, 64]
+                            stride: [768, 1, 12]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.cos
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L132 in forward,
+                    code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 128]
+                          stride: [1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L132 in forward,
+                    code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 128]
+                          stride: [1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+
+                - name: torch.sin
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L133 in forward,
+                    code: sin = emb.sin() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 128]
+                          stride: [1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.to
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L135 in forward,
+                    code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 128]
+                          stride: [1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dtype: torch.float16
+
+                - name: torch._C._log_api_usage_once
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L421 in forward,
+                    code: for decoder_layer in self.layers[: self.config.num_hidden_layers]:'
+                  sample_inputs_func:
+                    args:
+                      - value: python.nn_module
+
+                - name: torch.to
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L64 in forward,
+                    code: hidden_states = hidden_states.to(torch.float32)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.float32
+
+                - name: torch.pow
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L65 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+
+                - name: torch.mean
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L65 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                    kwargs:
+                      keepdim: true
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L66 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 1]
+                          stride: [12, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+
+                - name: torch.rsqrt
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L66 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 1]
+                          stride: [12, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L66 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 12, 1]
+                          stride: [12, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.to
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L67 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L67 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 12, -1, 128)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 32, 128]
+                          stride: [49152, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 1024]
+                          stride: [12288, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 12, -1, 128)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 8, 128]
+                          stride: [12288, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L164 in apply_rotary_pos_emb,
+                    code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 128]
+                          stride: [1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L166 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12, 128]
+                          stride: [1536, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L140 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+
+                - name: torch.neg
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 64]
+                          stride: [49152, 128, 4096, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 12, 64]
+                            stride: [24576, 64, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 12, 64]
+                            stride: [49152, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L166 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12, 128]
+                          stride: [1536, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L166 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L167 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 12, 128]
+                          stride: [12288, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12, 128]
+                          stride: [1536, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L140 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 12, 128]
+                          stride: [12288, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+
+                - name: torch.neg
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 12, 64]
+                          stride: [12288, 128, 1024, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 12, 64]
+                            stride: [6144, 64, 512, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 12, 64]
+                            stride: [12288, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L167 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 12, 128]
+                          stride: [12288, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12, 128]
+                          stride: [1536, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L167 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 12, 128]
+                          stride: [12288, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 12, 128]
+                          stride: [12288, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.zeros
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L290 in lazy_initialization, code:
+                    self.keys = torch.zeros('
+                  sample_inputs_func:
+                    args:
+                      - value: (1, 8, 2048, 128)
+                    kwargs:
+                      dtype: torch.float16
+                      device: cuda:0
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L340 in update, code: self.keys.index_copy_(2,
+                    cache_position, key_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [12]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 12, 128]
+                          stride: [12288, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
+
+                - name: torch.Tensor.expand
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 2048, 128]
+                          stride: [2097152, 262144, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 8
+                      - value: 4
+                      - value: 2048
+                      - value: 128
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv,
+                    code: return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 4, 2048, 128]
+                          stride: [2097152, 262144, 0, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 32, 2048, 128)
+
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                    code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.08838834764831845
+                      is_causal: false
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 12, 128]
+                          stride: [49152, 1536, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.Tensor.contiguous
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 32, 128]
+                          stride: [49152, 128, 1536, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L290 in forward,
+                    code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 32, 128]
+                          stride: [49152, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 12, -1)
+
+                - name: torch.Tensor.contiguous
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L290 in forward,
+                    code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L330 in forward,
+                    code: hidden_states = residual + hidden_states'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [14336, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.nn.functional.silu
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 14336]
+                          stride: [172032, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 14336]
+                          stride: [172032, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 12, 14336]
+                          stride: [172032, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 14336]
+                          stride: [172032, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 14336]
+                          stride: [14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L501 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 12, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L501 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [49152, 4096, 1]
+                          storage_offset: 45056
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [128256, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                # ── Decode pass (sequence length = 1) ────────────────────────
+
+                - name: torch.nn.functional.embedding
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L395 in forward,
+                    code: inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [128256, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L126 in forward,
+                    code: position_ids_expanded = position_ids[:, None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+
+                - name: torch.float
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L126 in forward,
+                    code: position_ids_expanded = position_ids[:, None, :].float()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+
+                - name: torch.float
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.matmul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L131 in forward,
+                    code: emb = torch.cat((freqs, freqs), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.cos
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L132 in forward,
+                    code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L132 in forward,
+                    code: cos = emb.cos() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+
+                - name: torch.sin
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L133 in forward,
+                    code: sin = emb.sin() * self.attention_scaling'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.to
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L135 in forward,
+                    code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dtype: torch.float16
+
+                - name: torch.to
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L64 in forward,
+                    code: hidden_states = hidden_states.to(torch.float32)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.float32
+
+                - name: torch.pow
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L65 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+
+                - name: torch.mean
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L65 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                    kwargs:
+                      keepdim: true
+
+                - name: torch.add
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L66 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+
+                - name: torch.rsqrt
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L66 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L66 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.to
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L67 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L67 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 128)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.Tensor.view
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1024]
+                          stride: [1024, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 128)
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 8, 128]
+                          stride: [1024, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.unsqueeze
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L164 in apply_rotary_pos_emb,
+                    code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L166 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L140 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+
+                - name: torch.neg
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 64]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 1, 64]
+                            stride: [2048, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 1, 64]
+                            stride: [4096, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L166 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L166 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L167 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L140 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+
+                - name: torch.neg
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.cat
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L142 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 1, 64]
+                            stride: [512, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 1, 64]
+                            stride: [1024, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L167 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.add
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L167 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L340 in update, code: self.keys.index_copy_(2,
+                    cache_position, key_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.index_copy_
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L341 in update, code: self.values.index_copy_(2,
+                    cache_position, value_states)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                    code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.08838834764831845
+                      is_causal: false
+
+                - name: torch.transpose
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+
+                - name: torch.Tensor.contiguous
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.reshape
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L290 in forward,
+                    code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1)
+
+                - name: torch.Tensor.contiguous
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L290 in forward,
+                    code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L291 in forward,
+                    code: attn_output = self.o_proj(attn_output)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.add
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L330 in forward,
+                    code: hidden_states = residual + hidden_states'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [14336, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.nn.functional.silu
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 14336]
+                          stride: [14336, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.mul
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 14336]
+                          stride: [14336, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 14336]
+                          stride: [14336, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 14336]
+                          stride: [14336, 14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 14336]
+                          stride: [14336, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+                - name: torch.getitem
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L501 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+
+                - name: torch.nn.functional.linear
+                  tags: [constant]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L501 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [128256, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+
+  global:
+    supported_dtypes:
+      - name: float16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+    input_config:
+      seed: 123
