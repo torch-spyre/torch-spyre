@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,5 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-DEVICE_NAME = "spyre"
-DISTRIBUTED_BACKEND_NAME = "spyreccl"
+import torch.distributed as dist
+from torch.testing._internal.common_utils import run_tests, TestCase
+
+
+class TestSpyreCCLBackend(TestCase):
+    def test_spyreccl_device_to_backend(self) -> None:
+        # Make sure the module has been loaded
+        assert dist.distributed_c10d.is_backend_available("spyreccl")
+        # Make sure the module is the default for the spyre device
+        assert "spyreccl" == dist.get_default_backend_for_device("spyre")
+
+
+if __name__ == "__main__":
+    run_tests()
