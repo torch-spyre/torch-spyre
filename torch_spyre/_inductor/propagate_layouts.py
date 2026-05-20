@@ -556,7 +556,10 @@ def propagate_spyre_tensor_layouts(
             output_dep = next(iter(rw.writes))
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
-            if isinstance(op.data, (Pointwise, Reduction)):
+            if not args:
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
+            elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
