@@ -102,6 +102,15 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
 
+    def test_empty_factory_accepts_size_keyword(self):
+        self.assertTrue(getattr(torch.Tensor, "_spyre_tensor_patched", False))
+
+        a = torch.empty(size=(2, 3), device="cpu", dtype=torch.float16)
+
+        self.assertEqual(tuple(a.shape), (2, 3))
+        self.assertEqual(a.device.type, "cpu")
+        self.assertEqual(a.dtype, torch.float16)
+
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)
         self.assertEqual(a.device.type, "spyre")
