@@ -103,6 +103,10 @@ class TestSpyre(TestCase):
         self.assertTrue(a_cpu.eq(3.5).all())
 
     def test_empty_factory_in_device_context(self):
+        # The error only repros if at least one allocation
+        # has already happened
+        _ = torch.empty(64, dtype=torch.float16, device="spyre")
+
         with torch.device("spyre"):
             a = torch.empty(50, dtype=torch.float16)
         self.assertEqual(a.device.type, "spyre")
