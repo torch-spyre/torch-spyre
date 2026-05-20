@@ -443,6 +443,13 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
               "Pin memory can only be on CPU");
   TORCH_CHECK(spyre::is_supported_dtype(dtype),
               "Spyre backend does not support dtype ", dtype);
+  const auto memory_format =
+      memory_format_opt.value_or(c10::MemoryFormat::Contiguous);
+  TORCH_CHECK(
+      memory_format == c10::MemoryFormat::Contiguous ||
+          memory_format == c10::MemoryFormat::Preserve,
+      "Spyre backend only supports contiguous memory format, got: ",
+      memory_format);
   const c10::DeviceGuard device_guard(device);
 
   auto device_layout = SpyreTensorLayout(size.vec(), dtype);
