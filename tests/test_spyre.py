@@ -660,4 +660,3 @@ class TestSpyre(TestCase):
 
 if __name__ == "__main__":
     run_tests()
-git add .github/scripts/edited_by_pr.py .github/workflows/edited_by_pr.yml
