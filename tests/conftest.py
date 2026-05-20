@@ -19,6 +19,38 @@ import pytest
 
 
 import shared_config
+from spyre_test_utilities import _RUNTIME_TAGS
+
+
+# Attaches per-test tags to the pytest report object after each test call.
+# Tags come from _RUNTIME_TAGS (set by print_test_tags_oot during test execution,
+# includes per-occurrence op tags) with fallback to _spyre_method_tags
+# (set at collection time, includes test-level + dynamic op__/dtype__ markers).
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if call.when == "call":
+        method_name = getattr(item, "originalname", None) or item.name
+        tags = _RUNTIME_TAGS.get(method_name, [])
+        if not tags:
+            fn = getattr(item, "function", None) or getattr(item, "obj", None)
+            tags = getattr(fn, "_spyre_method_tags", [])
+        if tags:
+            # Store on report for use in logreport hook
+            rep._spyre_tags = tags
+
+
+# Prints [TAGS = ...] for every test alongside the result line.
+# Uses os.write(1, ...) to write directly to stdout fd, bypassing pytest's output
+# capture visible without -s. Fires after pytest_runtest_makereport so tags
+# are already attached to the report.
+def pytest_runtest_logreport(report):
+    if report.when == "call":
+        tags = getattr(report, "_spyre_tags", None)
+        if tags:
+            # Write directly to terminal
+            os.write(1, f"  [TAGS = {' '.join(tags)}]\n".encode())
 
 
 def _get_case_marks(case: dict) -> set[str]:
@@ -315,18 +347,35 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
+    # Files ignored for plain `pytest` runs (known failures outside `make tests`)
+    # When run via run_test.sh / make tests, PYTORCH_TEST_CONFIG is set so skip the ignore.
+    ignored_files = set()
+    if not os.environ.get("PYTORCH_TEST_CONFIG"):
+        ignored_files = {
+            "tests/test_modules_custom.py",
+        }
+
     selected_models = config.getoption("--model") or []
     if not selected_models:
-        return  # normal behavior
+        # Still deselect ignored files even without --model
+        deselect = [
+            i for i in items if any(i.nodeid.startswith(f) for f in ignored_files)
+        ]
+        if deselect:
+            config.hook.pytest_deselected(items=deselect)
+            items[:] = [i for i in items if i not in deselect]
+        return
 
     # Keep only model-yaml runner tests
     keep = []
     deselect = []
 
     for item in items:
+        if any(item.nodeid.startswith(f) for f in ignored_files):
+            deselect.append(item)
         # item.nodeid includes the file path, e.g. "tests/models/test_model_ops.py::test_model_ops[...]"
         # if "tests/models/test_model_ops.py::" in item.nodeid:
-        if "tests/models/test_model_ops" in item.nodeid:
+        elif "tests/models/test_model_ops" in item.nodeid:
             keep.append(item)
         else:
             deselect.append(item)

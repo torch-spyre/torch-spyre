@@ -23,6 +23,35 @@ except ImportError as _yaml_err:  # pragma: no cover
     ) from _yaml_err
 
 
+"""
+Utility for printing per-test tags at run time alongside PASS/FAIL output.
+"""
+
+# To store method_name -> full tag list set during test execution
+_RUNTIME_TAGS: Dict[str, List[str]] = {}
+
+
+def print_test_tags_oot(test_instance, op_tags: List[str] = []) -> None:
+    """Print [TAGS = ...] for a test method at run time.
+
+    Combines method-level tags (test-level + dynamic op__/dtype__/module__) stored
+    at collection time with per-op tags available only at run time.
+
+    Usage in a test method:
+        from spyre_test_utilities import print_test_tags_oot
+        print_test_tags_oot(self, op_tags=op.op_tags)
+    """
+    method_name = test_instance._testMethodName
+    _method_fn = getattr(test_instance.__class__, method_name, None)
+    _method_tags = getattr(_method_fn, "_spyre_method_tags", [])
+    _per_op_tags = [t for t in op_tags if t not in set(_method_tags)]
+    _all_tags = _method_tags + _per_op_tags
+    # Store for pytest_runtest_makereport hook to work without -s
+    _RUNTIME_TAGS[method_name] = _all_tags
+    # Also write directly to stderr (visible with -s)
+    os.write(2, f"[TAGS = {' '.join(_all_tags)}]\n".encode())
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

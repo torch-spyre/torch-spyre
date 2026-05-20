@@ -183,7 +183,10 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
 
   arts.program_size = arts.init_bin.size();
   auto& allocator = SpyreAllocator::instance();
-  arts.device_alloc = std::move(allocator.allocate(arts.program_size));
+  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
+                                      std::nullopt);
+  arts.device_alloc =
+      std::move(allocator.allocate(arts.program_size, directive));
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
   TORCH_CHECK(arts.program_size <= ctx->composite_addr.total_size(),
               "Program size (", arts.program_size,

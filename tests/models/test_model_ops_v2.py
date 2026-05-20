@@ -38,6 +38,7 @@ from spyre_test_config_models import (
     TestEntry,
 )
 from spyre_test_parsing import load_yaml_config, resolve_current_file
+from spyre_test_utilities import print_test_tags_oot
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +292,8 @@ class TestSpyreModelOps(TestCase):
 
     @ops(model_ops_db)
     def test_model_ops_db(self, device: str, dtype: torch.dtype, op: ModelOpInfo):
+        # Usage: call `print_test_tags()` from our framework to print tags assosiated per method
+        print_test_tags_oot(self, op_tags=op.op_tags)
         pytestconfig = shared_config._PYTEST_CONFIG
         assert pytestconfig is not None, (
             "shared_config._PYTEST_CONFIG is None — "

@@ -46,3 +46,4 @@
 /.pre-commit-config.yaml  @ashokponkumar @jabostian
 /pytest.ini               @ashokponkumar @jabostian
 /pytest_models.ini        @ashokponkumar @jabostian
+/Makefile                 @ashokponkumar @jabostian

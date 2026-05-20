@@ -452,6 +452,12 @@ def spyre_layer_norm(
             f"spyre_layer_norm: only supports spyre device with normalized_shape of length 1, "
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
+    # F.layer_norm treats weight=None as identity and bias=None as zero;
+    # spyre.layernormnorm doesn't handle missing args, so substitute defaults.
+    if weight is None:
+        weight = input.new_ones(normalized_shape)
+    if bias is None:
+        bias = input.new_zeros(normalized_shape)
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
@@ -634,6 +640,23 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
         indices = torch.ops.aten.argmax(input, dim=dim, keepdim=keepdim)
         return torch.return_types.max((values, indices))
+
+
+@register_spyre_decomposition([torch.ops.aten.min.dim])
+def spyre_min_dim_decomp(input, dim, keepdim=False):
+    """
+    Decompose torch.min(input, dim) with conditional CPU fallback for int64.
+
+    Mirrors spyre_max_dim_decomp: int64 inputs go through a CPU-fallback custom
+    op; other dtypes are decomposed into amin (Spyre-native) and argmin (CPU
+    fallback). Returns a named tuple (values, indices) as expected by torch.min.
+    """
+    if input.dtype == torch.int64:
+        return torch.ops.spyre.min_dim_int64_fallback(input, dim, keepdim)
+    else:
+        values = torch.ops.aten.amin(input, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmin(input, dim=dim, keepdim=keepdim)
+        return torch.return_types.min((values, indices))
 
 
 @register_spyre_decomposition([torch.ops.aten.cat.default])

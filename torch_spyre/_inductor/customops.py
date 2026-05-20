@@ -415,6 +415,38 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
     return (values, indices)
 
 
+@torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
+def min_dim_int64_fallback(
+    input: torch.Tensor, dim: int, keepdim: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    CPU fallback for torch.min(input, dim) when input is int64.
+    This custom op will be registered with a CPU fallback in fallbacks.py.
+    Returns a tuple (values, indices) as expected by torch.min.
+    """
+    raise RuntimeError(
+        "spyre::min_dim_int64_fallback should be handled by CPU fallback registration"
+    )
+
+
+@min_dim_int64_fallback.register_fake
+def _(input: torch.Tensor, dim: int, keepdim: bool = False):
+    """
+    Fake implementation for shape inference.
+    Returns the expected output shapes for torch.min(input, dim, keepdim).
+    """
+    if keepdim:
+        output_shape = list(input.size())
+        output_shape[dim] = 1
+    else:
+        output_shape = list(input.size())
+        output_shape.pop(dim)
+
+    values = input.new_empty(output_shape)
+    indices = torch.empty(output_shape, dtype=torch.int64, device=input.device)
+    return (values, indices)
+
+
 ## TODO (imaihal): This needs scalar tensor support from Spyre to CPU. issues #1172
 #
 # @torch.library.custom_op("spyre::max_default_int64_fallback", mutates_args=())
