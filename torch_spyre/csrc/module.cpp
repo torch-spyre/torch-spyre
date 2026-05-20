@@ -32,6 +32,13 @@
 #include <vector>
 
 #include "job_plan.h"
+
+#ifdef USE_SPYRE_CCL
+#include <pybind11/chrono.h>
+
+#include "distributed/spyre_ccl.hpp"
+#endif
+
 #include "logging.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
@@ -327,6 +334,12 @@ PYBIND11_MODULE(_C, m) {
       "    stream (SpyreStream, optional): Stream to use for initialization "
       "transfers.\n"
       "        If None, uses the current stream. Defaults to None.");
+
+#ifdef USE_SPYRE_CCL
+  // Spyre CCL distributed backend
+  m.def("createSpyreCCLBackend", &c10d::SpyreCCLBackend::createSpyreCCLBackend,
+        "Create the Spyre Collective Library Backend object");
+#endif
 
   py::class_<spyre::JobPlan>(m, "JobPlan")
       .def(
