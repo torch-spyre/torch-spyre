@@ -117,16 +117,34 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
+def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+    is_supported_mod = (
+        isinstance(stick_expr, sympy.Mod)
+        and len(stick_expr.args[0].free_symbols) == 1
+        and stick_expr.args[1] == elems_per_stick
+    )
+    is_bare_var = stick_expr.is_symbol
+    is_zero = stick_expr == sympy.S.Zero
+    if not (is_supported_mod or is_bare_var or is_zero):
+        raise Unsupported(
+            f"Unexpected stick expression {stick_expr!r}: expected "
+            f"Mod(var, {elems_per_stick}), a bare variable, or 0"
+        )
+
+
 def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(
+    coords = compute_coordinates(
         stl.device_size,
         stl.stride_map,
         dep.ranges,
         index,
     )
+    _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
+    return coords
 
 
 def iter_var_id(stick_expr) -> int:

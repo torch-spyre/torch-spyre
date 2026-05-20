@@ -60,6 +60,7 @@ from .views import matching_dim
 
 logger = get_inductor_logger("propagate_layouts")
 
+prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
@@ -145,6 +146,38 @@ def _single_arg_op_layout(
 
         case spyreop.overwrite.default:
             return SpyreTensorLayout(output.size, output.dtype)
+
+        case prims.convert_element_type.default:
+            # Type conversion may require padding when input has padding due to stick
+            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
+            # which becomes 64 FP32 elements when converted. We need to reflect this
+            # in the output host size so the constructor creates the correct device layout.
+
+            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+            stick_dim_size = in_layout.size[-1]
+            unaligned = stick_dim_size % in_elems_per_stick
+
+            if unaligned > 0:
+                outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
+                outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
+                c_size = outer_sizes + [in_elems_per_stick]
+                c_stride = outer_strides + [1]
+
+                return SpyreTensorLayout(
+                    c_size,
+                    c_stride,
+                    output.dtype,
+                    list(range(len(c_size))),
+                )
+
+            c_size = [concretize_expr(s) for s in output.size]
+            c_stride = [concretize_expr(s) for s in output.stride]
+            return SpyreTensorLayout(
+                c_size,
+                c_stride,
+                output.dtype,
+                list(range(len(c_size))),
+            )
 
         case _:
             in_coords = host_coordinates(in_layout, dep)
