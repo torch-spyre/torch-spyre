@@ -33,6 +33,10 @@ def _patch_tensor_for_spyre():
     if getattr(torch.Tensor, "_spyre_tensor_patched", False):
         return
 
+    from torch.utils._device import _device_constructors
+
+    _device_constructors()  # warm the cache with the original torch.empty
+
     orig_repr = torch.Tensor.__repr__
     orig_to = torch.Tensor.to
     orig_empty = torch.empty
@@ -159,16 +163,17 @@ def _patch_tensor_for_spyre():
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided
-            return orig_empty(
-                *args,
+            kwargs = dict(
                 out=out,
                 dtype=dtype,
                 layout=layout,
-                device=device,
                 requires_grad=requires_grad,
                 pin_memory=pin_memory,
                 memory_format=memory_format,
             )
+            if device is not None:
+                kwargs["device"] = device
+            return orig_empty(*args, **kwargs)
         else:
             # layout_opt is omitted; c10::Layout has no pybind11 type caster,
             # so py_empty_with_layout drops that parameter and always uses

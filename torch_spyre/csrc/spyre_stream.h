@@ -84,6 +84,16 @@ SpyreStream getDefaultStream(
     c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
 
 /**
+ * Get the Flex-level default stream for a device.
+ * The default stream is stream ID 0 and is always available.
+ *
+ * @param device Device to get default stream for
+ * @return The default Flex RuntimeStream (stream ID 0)
+ */
+flex::RuntimeStream* getDefaultStreamRuntimeHandle(
+    c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+/**
  * Get the current stream for a device (thread-local).
  * Each thread maintains its own current stream per device.
  *
