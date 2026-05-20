@@ -8,7 +8,6 @@ import json
 from typing import Dict, List, Optional, Set
 import warnings
 
-
 import pytest  # type: ignore
 import torch
 
@@ -447,8 +446,10 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # print tags to stderr
         entry = cls.TEST_ENTRIES.get(name)
         tags = entry.tags if entry is not None else []
-        # Collect op-level tags from all OpsNamedItem entries in this TestEntry
-        # and union them with test-level tags so pytest -m works for both levels.
+        # test-level tags only — used for method_tags assembly
+        all_tags = tags
+
+        # Collect op-level tags for collection-time summary print ONLY
         op_tags: List[str] = []
         if entry is not None:
             seen_op_tags: set = set()
@@ -458,20 +459,23 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                         seen_op_tags.add(t)
                         op_tags.append(t)
 
-        # Union: test-level tags + op-level tags (deduplicated)
-        all_tags = tags + [t for t in op_tags if t not in set(tags)]
-        if all_tags:
+        # Print summary at collection time
+        summary_tags = tags + [t for t in op_tags if t not in set(tags)]
+        if summary_tags:
             if generic_cls is not None:
                 os.write(
                     2,
                     f"[OOTDeviceTestBase] {generic_cls.__name__}::{name} "
-                    f"tags: [{', '.join(all_tags)}]\n".encode(),
+                    f"tags: [{', '.join(summary_tags)}]\n".encode(),
                 )
             else:
                 _log_warning(
-                    f"Test '{name}' has tags {all_tags} but generic_cls is None, "
+                    f"Test '{name}' has tags {summary_tags} but generic_cls is None, "
                     f"cannot print tag information"
                 )
+
+        # Store test-level tags only — op-level tags added per-occurrence at run time
+        cls._TEST_LEVEL_TAGS = list(tags)
 
         # op list filtering
         supported_ops = cls._get_supported_ops()
@@ -628,12 +632,19 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                     }
                 )
 
-            method_tags = all_tags + [t for t in dynamic_tags if t not in set(all_tags)]
+            seen = set(all_tags)
+            method_tags = list(all_tags)
+            for t in dynamic_tags:
+                if t not in seen:
+                    seen.add(t)
+                    method_tags.append(t)
 
             # apply all tags (YAML + dynamic) as marks
             if method_tags:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
+                    # Store BEFORE marking so the attribute is on the base function
+                    existing_fn._spyre_method_tags = method_tags
                     marked_fn = existing_fn
                     for tag in method_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)

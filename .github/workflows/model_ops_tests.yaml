@@ -4,6 +4,8 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
   # Removing from CICD till the ops tests get matured
   # pull_request:
   #   branches: [main]
@@ -25,10 +27,9 @@ permissions:
 jobs:
   model-ops-tests:
     name: ${{ matrix.suite.name }}
-    # runs-on: official-aiu-x86-64-arc-runner-set-v3
     runs-on:
       - x86_64
-      - spyre_pf
+      - spyre_pf_x1
       - linux
       - image_torch_spyre
     timeout-minutes: 720
@@ -40,6 +41,9 @@ jobs:
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
 
     # ---------------------------------------------------------------------------
     # To add a new model ops test suite, append an entry here:
@@ -69,81 +73,35 @@ jobs:
             config: mistral_small_3.2_24B_instruct_2506_spyre.yaml
 
     steps:
-      - name: Checkout torch-spyre repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          path: torch-spyre
-
-      # ---------------------------------------------------------------------------
-      # Derive the PyTorch release branch from pyproject.toml so there is a
-      # single source of truth — no hardcoded version in this workflow.
-      #
-      # pyproject.toml declares:  torch~=2.11.0
-      # This step extracts "2.11.0", strips the patch -> "2.11", and builds
-      # the branch name "release/2.11".
-      # ---------------------------------------------------------------------------
-      - name: Derive PyTorch release branch from pyproject.toml
-        id: pytorch-branch
-        working-directory: torch-spyre
+      - name: Checkout branch/commit in pre-cloned torch-spyre
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
-          VERSION=$(python3 - <<'PYEOF'
-          import tomllib
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          # The pre-cloned repo may be owned by a different user than the
+          # runner process; mark all directories as safe to avoid git's
+          # "dubious ownership" error (covers the repo and any submodules).
+          git config --global --add safe.directory '*'
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          TARGET_SHA="${GITHUB_SHA}"
+          TARGET_REF="${GITHUB_REF}"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git log -1 --oneline
 
-          with open("pyproject.toml", "rb") as f:
-              data = tomllib.load(f)
-
-          requires = data.get('build-system', {}).get('requires', [])
-          torch_dep = next(x for x in requires if x.startswith('torch'))
-          version = torch_dep.removeprefix('torch~=')   # e.g. "2.11.0"
-          print('.'.join(version.split('.')[:2]))        # --> "2.11"
-          PYEOF
-          )
-          BRANCH="release/${VERSION}"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Derived PyTorch branch: $BRANCH"
-
-      # ---------------------------------------------------------------------------
-      # PyTorch source caching
-      #
-      # Cloning pytorch/pytorch with all submodules is expensive.
-      # We cache the entire checkout keyed on the latest commit SHA of the branch
-      # so the clone only happens when the branch actually updates upstream.
-      #
-      # Cache hit  --> restore from cache, skip checkout (saves several minutes)
-      # Cache miss --> full clone + submodules, then save to cache for next run
-      # ---------------------------------------------------------------------------
-      - name: Get latest commit SHA of PyTorch branch
-        id: pytorch-sha
+      - name: Gather runner info
         run: |
-          BRANCH="${{ steps.pytorch-branch.outputs.branch }}"
-          SHA=$(git ls-remote https://github.com/pytorch/pytorch.git "refs/heads/${BRANCH}" | cut -f1)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "PyTorch ${BRANCH} HEAD: $SHA"
-
-      - name: Restore PyTorch source from cache
-        id: pytorch-cache
-        uses: actions/cache@v4
-        with:
-          path: pytorch
-          key: pytorch-${{ steps.pytorch-branch.outputs.branch }}-${{ steps.pytorch-sha.outputs.sha }}
-
-      - name: Checkout PyTorch source
-        if: steps.pytorch-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: pytorch/pytorch
-          ref: ${{ steps.pytorch-branch.outputs.branch }}
-          submodules: recursive
-          path: pytorch
-
-      - name: Set TORCH_ROOT
-        run: echo "TORCH_ROOT=$GITHUB_WORKSPACE/pytorch" >> "$GITHUB_ENV"
-
-      - name: Gather environment info
-        run: |
-          echo 'gather info start'
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          date
           pwd
-          ls -la
           whoami
           id
           echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
@@ -152,30 +110,52 @@ jobs:
           echo "TORCH_ROOT $TORCH_ROOT"
           python3 --version
           python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
+          echo "--- env ---"
+          env | sort
+          echo "--- AIU env ---"
+          env | sort | grep AIU || true
+          echo "--- repo listing ---"
+          ls -lart "$CLONED_TORCH_SPYRE_DIR"
 
-      - name: Install torch-spyre package and dependencies
-        working-directory: torch-spyre
+      - name: Build torch-spyre
         run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-          echo "VENV_PATH=${GITHUB_WORKSPACE}/torch-spyre/.venv" >> "$GITHUB_ENV"
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+          # uv sync reconciles the .venv against pyproject.toml + uv.lock,
+          # so torch is reinstalled only when the resolved version or source
+          # differs from what's already installed (e.g., a PR bumps the
+          # torch~=2.10.0 constraint, or the pre-baked venv has a torch from
+          # a different index than the pytorch-cpu source in uv.lock).
+          # --reinstall-package torch-spyre: always rebuild torch-spyre from
+          #   the freshly-checked-out sources.
+          uv sync \
+            --verbose \
+            --all-extras \
+            --active \
+            --inexact \
+            --reinstall-package torch-spyre
+          # Print the resolved torch install for log visibility.
+          uv pip show torch
+          uv pip freeze
 
       - name: Run ${{ matrix.suite.name }} model ops test suite
-        working-directory: torch-spyre/tests
         run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
           # Derive the XML report name from the config filename
           # Example:
           #   granite_3.3_8b_instruct_spyre.yaml  ->  granite_3.3_8b_instruct_spyre.xml
-
-          source "${VENV_PATH}/bin/activate"
           CONFIG="${{ matrix.suite.config }}"
           REPORT_NAME="${CONFIG%.yaml}.xml"
           REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
 
           echo "Running ${{ matrix.suite.name }} model ops tests..."
-          bash run_test.sh configs/model_ops_tests/${CONFIG} -v --junit-xml="${REPORT_PATH}"
+          bash tests/run_test.sh "tests/configs/model_ops_tests/${CONFIG}" -v --junit-xml="${REPORT_PATH}"
           echo "${{ matrix.suite.name }} model ops tests done"
 
           # Expose report path/name to subsequent steps via GITHUB_ENV

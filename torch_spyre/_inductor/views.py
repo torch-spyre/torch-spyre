@@ -394,10 +394,10 @@ def align_tensors(
     for i, terms in enumerate(all_terms):
         for num, den, var, mod, dim_size, offset in [astuple(term) for term in terms]:
             if var is not None:
-                if den != stick_size[-1] or var != stick_dim[i]:
+                if den != stick_size[i] or var != stick_dim[i]:
                     # add den to splits unless stick dim and stick size
                     splits[var].add(den)
-                if mod != stick_size[-1] or var != stick_dim[i]:
+                if mod != stick_size[i] or var != stick_dim[i]:
                     # add mod to splits unless stick dim and stick size
                     splits[var].add(mod)
 

@@ -280,6 +280,21 @@ SpyreStream getDefaultStream(c10::Device device) {
   return SpyreStream(c10::Stream(c10::Stream::DEFAULT, device));
 }
 
+flex::RuntimeStream* getDefaultStreamRuntimeHandle(c10::Device device) {
+  if (device.index() == -1) {
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
+  }
+  initializeStreamPool(device.index());
+
+  auto& pool = getStreamPool();
+  std::lock_guard<std::mutex> lock(pool.mutex);
+  auto it = pool.stream_handle_map.find(0);
+  TORCH_CHECK(it != pool.stream_handle_map.end(),
+              "Default stream handle not initialized for device ",
+              device.index());
+  return it->second;
+}
+
 SpyreStream getCurrentStream(c10::Device device) {
   if (device.index() == -1) {
     device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);

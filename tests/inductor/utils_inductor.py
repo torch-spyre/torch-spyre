@@ -593,6 +593,7 @@ def compare_with_cpu(
     run_eager=True,
     run_compile=True,
     source_check=None,
+    clone_inputs=False,
 ):
     """Compare Spyre execution against CPU for one or both Spyre execution paths.
 
@@ -618,7 +619,12 @@ def compare_with_cpu(
         # if this env var is set at all, it gets marked as true
         cpu_compile = bool(os.getenv("TEST_COMPARE_CPU_COMPILE"))
 
-    cpu_result = fn(*args)
+    def get_args():
+        if not clone_inputs:
+            return args
+        return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
+
+    cpu_result = fn(*get_args())
 
     # Order: compiled first, then eager (matches prior [True, False] when both on).
     modes = tuple(
@@ -636,7 +642,7 @@ def compare_with_cpu(
             if target is not None
             else _compile_and_run(
                 fn,
-                args,
+                get_args(),
                 DEVICE,
                 needs_device=needs_device,
                 compile=compiled,
@@ -650,7 +656,7 @@ def compare_with_cpu(
 
         if cpu_compile:
             cpu_other_result = _compile_and_run(
-                fn, args, "cpu", needs_device=needs_device, compile=compiled
+                fn, get_args(), "cpu", needs_device=needs_device, compile=compiled
             )
             _assert_results_close(
                 spyre_result,
@@ -691,6 +697,16 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None): 
                 new_test = skip_func(new_test)
 
             setattr(other_cls, f"{name}_{suffix}", new_test)
+
+    # Copy helper routines that copied tests may call on self.
+    for name in dir(my_cls):
+        value = getattr(my_cls, name)
+        if (
+            name.startswith("_get_")
+            and callable(value)
+            and not hasattr(other_cls, name)
+        ):
+            setattr(other_cls, name, value)
 
     # Special case convenience routine
     if hasattr(my_cls, "is_dtype_supported"):

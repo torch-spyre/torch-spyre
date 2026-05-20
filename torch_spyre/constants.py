@@ -13,3 +13,4 @@
 # limitations under the License.
 
 DEVICE_NAME = "spyre"
+DISTRIBUTED_BACKEND_NAME = "spyreccl"

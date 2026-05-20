@@ -23,6 +23,8 @@ class TestSpyreStream(TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
+        super().setUp()
+        torch.manual_seed(0xAFFE)
         self.device = torch.device("spyre")
 
     def test_legacy_stream_creation_with_device(self):
@@ -233,6 +235,8 @@ class TestStreamCompatibility(TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
+        super().setUp()
+        torch.manual_seed(0xAFFE)
         self.device = torch.device("spyre")
 
     def test_legacy_and_modern_interop(self):

@@ -17,7 +17,7 @@ import dataclasses
 import math
 import itertools
 from sympy import Expr, Symbol, divisors
-from .ir import SpyreConstantFallback
+from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 import torch
 from torch._inductor.ir import (
@@ -751,8 +751,8 @@ def _iter_computed_buffers(operations: list[Operation]):
                 raise RuntimeError("FallbackKernel must be followed by MultiOutput")
             # Work division not supported on fallback kernels
         elif isinstance(op, ExternKernel):
-            if isinstance(op, SpyreConstantFallback):
-                # Work division not supported on SpyreConstantFallback kernel
+            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback)):
+                # Work division not supported on allocation/constant kernels
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")

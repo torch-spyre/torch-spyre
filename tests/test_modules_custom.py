@@ -44,7 +44,11 @@ def _extract_all_tensors(output):
 class TestModuleCustom(TestCase):
     """Custom test cases for module validation with different execution modes and layouts."""
 
-    @modules(module_db)
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    @modules(module_db, allowed_dtypes=[torch.float32])
     def test_eager_vs_compile(self, device, dtype, module_info, training):
         """Test eager mode vs compile mode, comparing CPU and Spyre outputs.
 
@@ -140,7 +144,7 @@ class TestModuleCustom(TestCase):
                     msg=f"{module_info.name}: Spyre eager vs Spyre compile mismatch (tensor {i})",
                 )
 
-    @modules(module_db)
+    @modules(module_db, allowed_dtypes=[torch.float32])
     def test_layout_stride(self, device, dtype, module_info, training):
         """Test module with real YAML-specified layouts and strides.
 

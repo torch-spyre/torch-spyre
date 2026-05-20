@@ -20,6 +20,7 @@ import sys
 from typing import Optional
 
 import pytest
+import torch
 
 
 def get_device_count_in_subprocess(env_vars: Optional[dict] = None) -> int:
@@ -60,6 +61,9 @@ print(torch.spyre.device_count())
 
 class TestDeviceEnumEnvVars:
     """Test environment variable handling for device enumeration."""
+
+    def setup_method(self, method):
+        torch.manual_seed(0xAFFE)
 
     def test_no_env_vars(self):
         """Test No env vars → returns total devices."""

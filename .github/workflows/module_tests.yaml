@@ -4,8 +4,12 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
   pull_request:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
   merge_group:
     types: [checks_requested]
 
@@ -26,7 +30,7 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf
+      - spyre_pf_x1
       - linux
       - image_torch_spyre
     timeout-minutes: 720
