@@ -121,6 +121,13 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
+  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
+                                      std::nullopt);
+  return SpyreAllocator::allocate(nbytes, directive);
+}
+
+c10::DataPtr SpyreAllocator::allocate(
+    size_t nbytes, const flex::AllocationDirective& directive) {
   c10::Device curr_device =
       c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
 
@@ -134,7 +141,8 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   auto flex_alloc = getFlexAllocator();
 
   // Allocate first-class raw storage via CompositeAddress.
-  flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
+  flex::CompositeAddress composite_addr =
+      flex_alloc->allocate(nbytes, directive);
 
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
