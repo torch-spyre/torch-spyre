@@ -102,6 +102,11 @@ class TestSpyre(TestCase):
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
 
+    def test_empty_factory_in_device_context(self):
+        with torch.device("spyre"):
+            a = torch.empty(50, dtype=torch.float16)
+        self.assertEqual(a.device.type, "spyre")
+
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)
         self.assertEqual(a.device.type, "spyre")
