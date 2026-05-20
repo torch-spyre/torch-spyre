@@ -105,7 +105,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
+      matrix: #create parrallet small jobs
         suite:
           - name: Test Device Enum
             config: torch_spyre_tests/test_device_enum_config.yaml
@@ -245,8 +245,14 @@ jobs:
           CONFIG="${{ matrix.suite.config }}"
 
           echo "Running ${{ matrix.suite.name }} tests..."
+          START_TIME=$(date +%s)
           bash tests/run_test.sh "tests/configs/${CONFIG}" -v --capture=sys
+          EXIT_CODE=$?
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
           echo "${{ matrix.suite.name }} tests done"
+          echo "Suite ${CONFIG} finished in ${ELAPSED} second(s)."
+          exit $EXIT_CODE
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)

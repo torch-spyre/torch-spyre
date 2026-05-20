@@ -165,12 +165,18 @@ jobs:
           REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
 
           echo "Running ${{ matrix.suite.name }} model ops tests..."
+          START_TIME=$(date +%s)
           bash run_test.sh configs/module_tests/${CONFIG} -v --junit-xml="${REPORT_PATH}"
+          EXIT_CODE=$?
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
           echo "${{ matrix.suite.name }} module tests done"
+          echo "Suite ${CONFIG} finished in ${ELAPSED} second(s)."
 
           # Expose report path/name to subsequent steps via GITHUB_ENV
           echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          exit $EXIT_CODE
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and
