@@ -31,7 +31,9 @@
 #include <string>
 #include <vector>
 
+#include "job_plan.h"
 #include "logging.h"
+#include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
 #include "spyre_guard.h"
@@ -310,4 +312,60 @@ PYBIND11_MODULE(_C, m) {
         .index();
   });
   m.def("device_count", &spyre::device_count);
+
+  // PrepareKernel and JobPlan bindings
+  m.def(
+      "prepare_kernel",
+      [](const std::string& spyrecode_dir,
+         const spyre::SpyreStream* stream) -> std::unique_ptr<spyre::JobPlan> {
+        return spyre::prepareKernel(spyrecode_dir, stream);
+      },
+      py::arg("spyrecode_dir"), py::arg("stream") = nullptr,
+      "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
+      "Args:\n"
+      "    spyrecode_dir (str): Path to the SpyreCode directory\n"
+      "    stream (SpyreStream, optional): Stream to use for initialization "
+      "transfers.\n"
+      "        If None, uses the current stream. Defaults to None.");
+
+  py::class_<spyre::JobPlan>(m, "JobPlan")
+      .def(
+          "num_steps",
+          [](const spyre::JobPlan& plan) { return plan.steps.size(); },
+          "Get the number of steps in the JobPlan")
+      .def(
+          "job_allocation_size",
+          [](const spyre::JobPlan& plan) {
+            return plan.job_allocation.total_size();
+          },
+          "Get the size of the job allocation")
+      .def(
+          "get_step_type",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto& step = plan.steps[idx];
+            if (dynamic_cast<const spyre::JobPlanStepH2D*>(step.get())) {
+              return "H2D";
+            } else if (dynamic_cast<const spyre::JobPlanStepD2H*>(step.get())) {
+              return "D2H";
+            } else if (dynamic_cast<const spyre::JobPlanStepCompute*>(
+                           step.get())) {
+              return "Compute";
+            } else if (dynamic_cast<const spyre::JobPlanStepHostCompute*>(
+                           step.get())) {
+              return "HostCompute";
+            } else {
+              return "Unknown";
+            }
+          },
+          py::arg("idx"), "Get the type of step at the given index")
+      .def("__repr__", [](const spyre::JobPlan& plan) {
+        return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
+               " job_allocation_size=" +
+               std::to_string(plan.job_allocation.total_size()) +
+               " expected_inputs=" +
+               std::to_string(plan.expected_input_shapes.size()) +
+               " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
+               ">";
+      });
 }

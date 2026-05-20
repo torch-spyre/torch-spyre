@@ -1811,6 +1811,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128), dtype=torch.float16),  # weight
                     torch.zeros([128], dtype=torch.float16),  # bias
                 ),
+                "2d_transposed": (
+                    cached_randn((128, 256), dtype=torch.float16).transpose(0, 1),
+                    cached_randn((128), dtype=torch.float16),
+                    torch.zeros([128], dtype=torch.float16),
+                ),
             },
         },
         ("test_rmsnorm", "test_rmsnorm_cpu"): {
@@ -3339,9 +3344,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
         # - torch.eq, torch.ge, torch.gt, torch.lt: work eagerly
-        # - torch.ne, torch.le: aten::ne.Tensor_out / aten::le.Tensor_out not registered
+        # - torch.le: aten::le.Tensor_out not registered
         # - torch.matmul: numerical divergence (close=False) in eager 2d case
-        eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt)
+        eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt, torch.ne)
         self.compare_with_cpu(op, x, y, run_eager=eager_supported)
 
     def test_linear_fn(self, x, weight, bias):

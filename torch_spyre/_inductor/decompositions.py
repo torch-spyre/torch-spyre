@@ -452,6 +452,12 @@ def spyre_layer_norm(
             f"spyre_layer_norm: only supports spyre device with normalized_shape of length 1, "
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
+    # F.layer_norm treats weight=None as identity and bias=None as zero;
+    # spyre.layernormnorm doesn't handle missing args, so substitute defaults.
+    if weight is None:
+        weight = input.new_ones(normalized_shape)
+    if bias is None:
+        bias = input.new_zeros(normalized_shape)
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
