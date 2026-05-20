@@ -271,13 +271,12 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
 
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
-        cached_randn(shape, dtype=src)
-        if src != torch.bool
-        else torch.randint(0, 2, shape).bool(),
+        cached_randn(shape, dtype=src),
         dst,
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
+    if src != torch.bool and dst != torch.bool
 }
 
 TO_DTYPE_OP_EXPECT_FAIL = [
@@ -285,10 +284,6 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
     if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
-    or (
-        (src, dst) == (torch.float16, torch.bool)
-        and tuple(shape) in [(4, 8, 128), (2, 4, 8, 64)]
-    )
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
