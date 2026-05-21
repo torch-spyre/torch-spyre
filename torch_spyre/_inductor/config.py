@@ -44,9 +44,12 @@ core_id_k_fast_emission: bool = (
 coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
 
 # Optional callable injected by callers to compute coarse-tiling groups.
-# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr]]
+# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr[, int|None]]]
+# Each tuple is (ops, loop_count) or (ops, loop_count, tiled_dims).
+# tiled_dims overrides the default per-group (None = tile outermost dim only).
 # When None and coarse_tiling is True, coarse_tile() is called with groups=[]
 # (a no-op useful for testing the pipeline without real group detection).
+# Must be a module-level named function (not a lambda) for Inductor cache pickling.
 coarse_tiling_groups_fn: Optional[Callable] = None
 
 install_config_module(sys.modules[__name__])

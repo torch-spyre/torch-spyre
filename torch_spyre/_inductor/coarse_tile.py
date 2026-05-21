@@ -28,21 +28,23 @@ A ``loop_group_id`` tuple encodes the nesting path:
 ``loop_count`` is always the trip count of the *innermost* loop that directly
 contains the operation, i.e. the loop whose body the operation lives in.
 
-Usage (prototype API)::
+Usage::
 
     coarse_tile(
         operations,
         groups=[
-            ([op_a, op_b], count_k),      # group 0, single level
-            ([op_c], count_m),             # group 1, single level
+            ([op_a, op_b], count_k),         # group 0: tile outermost dim (default)
+            ([op_c], count_m, 1),             # group 1: tile dim 1 specifically
         ],
-        tiled_dims=None,   # None → tile the outermost dimension of each op
     )
 
-``groups`` is a list of ``(ops, loop_count)`` pairs.  Each ``ops`` list must be
-a contiguous sub-sequence of ``operations`` (a gap would indicate a data-flow
-dependency crossing the group boundary).  Nested groups are not yet exposed by
-this prototype API but the stamped attributes support them.
+``groups`` is a list of ``(ops, loop_count[, tiled_dims])`` tuples.  Each
+``ops`` list must be a contiguous sub-sequence of ``operations`` (a gap would
+indicate a data-flow dependency crossing the group boundary).  The optional
+third element ``tiled_dims`` overrides the ``tiled_dims`` keyword argument for
+that group, allowing different groups to tile different iteration-space
+dimensions.  Nested groups are not yet exposed by this API but the stamped
+attributes support them.
 """
 
 from __future__ import annotations
@@ -65,7 +67,7 @@ logger = get_inductor_logger("coarse_tile")
 
 def coarse_tile(
     operations: list[Operation],
-    groups: list[tuple[list[Operation], Expr]],
+    groups: list[tuple],
     *,
     tiled_dims: int | None = None,
 ) -> None:
@@ -77,21 +79,26 @@ def coarse_tile(
         The full ordered list of IR operations (as seen by
         CustomPreSchedulingPasses).  Not modified; used only for validation.
     groups:
-        Sequence of ``(ops, loop_count)`` pairs.  Each ``ops`` is a list of
-        ``ComputedBuffer`` operations that belong to the same outermost loop
-        group.  ``loop_count`` is the trip count (may be symbolic).
+        Sequence of ``(ops, loop_count[, tiled_dims])`` tuples.  Each ``ops``
+        is a list of ``ComputedBuffer`` operations that belong to the same
+        outermost loop group.  ``loop_count`` is the trip count (may be
+        symbolic).  The optional third element overrides the ``tiled_dims``
+        keyword argument for that specific group, allowing different groups to
+        tile different iteration-space dimensions.
     tiled_dims:
-        Number of leading iteration-space dimensions to leave *inside* the
-        loop body (i.e. the dimensions whose ranges are divided by
-        ``loop_count``).  ``None`` means tile the single outermost dimension.
+        Default number of leading iteration-space dimensions to divide by
+        ``loop_count``.  ``None`` means tile only the single outermost
+        dimension.  Overridden per-group by a third tuple element.
     """
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
     }
 
-    for group_idx, (group_ops, loop_count) in enumerate(groups):
+    for group_idx, group in enumerate(groups):
+        group_ops, loop_count = group[0], group[1]
+        group_tiled_dims = group[2] if len(group) > 2 else tiled_dims
         group_id: tuple[int, ...] = (group_idx,)
-        _stamp_group(group_ops, group_id, loop_count, tiled_dims, op_to_position)
+        _stamp_group(group_ops, group_id, loop_count, group_tiled_dims, op_to_position)
 
 
 # ---------------------------------------------------------------------------

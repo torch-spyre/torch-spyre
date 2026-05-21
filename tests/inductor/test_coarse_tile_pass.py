@@ -232,6 +232,41 @@ class TestCoarseTile(unittest.TestCase):
         self.assertEqual(d0.ranges[0], Integer(8))
         self.assertEqual(d1.ranges[0], Integer(16))
 
+    def test_per_group_tiled_dims_override(self):
+        """Each group may carry its own tiled_dims as a third tuple element."""
+        # op0: 2D [32, 16] — tile dim 0 (tiled_dims=1, default)
+        # op1: 2D [8, 64]  — tile dim 1 (tiled_dims override via third element)
+        d0 = _make_pointwise([Integer(32), Integer(16)])
+        d1 = _make_pointwise([Integer(8), Integer(64)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        self._run(
+            [op0, op1],
+            [
+                ([op0], Integer(4)),  # uses default tiled_dims=None → dim 0
+                ([op1], Integer(4), 2),  # per-group override: tile first 2 dims
+            ],
+        )
+        # op0: dim 0 divided, dim 1 unchanged
+        self.assertEqual(d0.ranges[0], Integer(8))
+        self.assertEqual(d0.ranges[1], Integer(16))
+        # op1: both dims divided
+        self.assertEqual(d1.ranges[0], Integer(2))
+        self.assertEqual(d1.ranges[1], Integer(16))
+
+    def test_per_group_tiled_dims_none_overrides_kwarg(self):
+        """Per-group tiled_dims=None overrides a non-None kwarg default."""
+        d0 = _make_pointwise([Integer(32), Integer(16)])
+        op0 = _make_op(d0, "op0")
+        # kwarg default would tile 2 dims, but group says None → tile only dim 0
+        self._run(
+            [op0],
+            [([op0], Integer(4), None)],
+            tiled_dims=2,
+        )
+        self.assertEqual(d0.ranges[0], Integer(8))
+        self.assertEqual(d0.ranges[1], Integer(16))  # untouched
+
 
 if __name__ == "__main__":
     unittest.main()

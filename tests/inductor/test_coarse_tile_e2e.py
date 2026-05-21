@@ -71,6 +71,23 @@ def _groups_split_k4_k8(operations: list[Operation]):
     return groups
 
 
+def _groups_per_op_tiled_dim(operations: list[Operation]):
+    """Two groups each tiling a different iteration-space dimension.
+
+    Group 0: first ComputedBuffer, K=4, tiled_dims=1 (tile dim 0, the default).
+    Group 1: second ComputedBuffer, K=4, tiled_dims=2 (tile first two dims,
+             so the second dimension is also divided — exercises the per-group
+             tiled_dims path).
+    """
+    ops = [op for op in operations if isinstance(op, ComputedBuffer)]
+    groups = []
+    if ops[:1]:
+        groups.append((ops[:1], sympy.Integer(4)))  # default: tile dim 0
+    if ops[1:]:
+        groups.append((ops[1:], sympy.Integer(4), 2))  # override: tile dims 0+1
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -234,6 +251,59 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             has_loop_spec,
             f"Expected a LoopSpec in generate_bundle specs, "
             f"got: {[type(s).__name__ for s in captured]}",
+        )
+
+    # ------------------------------------------------------------------
+    # Per-group tiled_dims: two ops tiling different iteration dimensions
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_per_op_tiled_dim,
+        }
+    )
+    def test_per_group_tiled_dims(self):
+        """Two ops in separate groups tile different iteration-space dimensions.
+
+        op_a = abs(x): 2-D iteration space [B, D].
+          Group 0 uses the default tiled_dims (None → tile dim 0).
+          After tiling K=4: iteration space [B/4, D].
+
+        op_b = neg(x.T): operates on a transposed view so its natural
+          iteration space is also [B, D] but logically "D-major".
+          Group 1 uses tiled_dims=2 (tile both dims 0 and 1).
+          After tiling K=4: iteration space [B/4, D/4].
+
+        Both groups should produce separate LoopSpec(count=sympify('4'))
+        entries in the generated source, confirming that each group's
+        tiled_dims was applied independently.
+        """
+        B, D = 256, 128
+        x = torch.randn(B, D, dtype=torch.float16).to("spyre")
+        y = torch.randn(B, D, dtype=torch.float16).to("spyre")
+
+        def fn(x, y):
+            return torch.abs(x), torch.neg(y)
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x, y)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+
+        # Both groups produce a LoopSpec with count=4.
+        loop_spec_count = src.count("LoopSpec(")
+        self.assertGreaterEqual(
+            loop_spec_count,
+            2,
+            f"Expected ≥2 LoopSpec entries (one per group), "
+            f"got {loop_spec_count}\n\nSource:\n{src}",
+        )
+        self.assertIn(
+            "sympify('4')",
+            src,
+            "Expected loop count 4 in generated source",
         )
 
 

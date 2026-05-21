@@ -96,20 +96,28 @@ object.__setattr__(data, "ranges", ranges)
 ```python
 def coarse_tile(
     operations: list[Operation],
-    groups: list[tuple[list[Operation], Expr]],
+    groups: list[tuple],   # (ops, loop_count[, tiled_dims])
     *,
     tiled_dims: int | None = None,
 ) -> None:
 ```
 
-`groups` is a pre-computed list of `(ops, loop_count)` pairs supplied by
-the caller (e.g., `config.coarse_tiling_groups_fn`).  Each `ops` list must
-be a contiguous sub-sequence of `operations`; a gap indicates a data-flow
-dependency crossing the group boundary and raises `RuntimeError`.
+`groups` is a pre-computed list of `(ops, loop_count[, tiled_dims])` tuples
+supplied by the caller (e.g., `config.coarse_tiling_groups_fn`).  Each `ops`
+list must be a contiguous sub-sequence of `operations`; a gap indicates a
+data-flow dependency crossing the group boundary and raises `RuntimeError`.
 
-`tiled_dims` controls how many leading iteration-space dimensions are
-divided by `loop_count`.  `None` (the default) divides only the single
-outermost dimension.
+The optional third element of each tuple overrides the `tiled_dims` keyword
+argument for that specific group, allowing different groups to tile different
+iteration-space dimensions.  This is necessary when the logical dimension
+being tiled appears at different indices in each operation's iteration space —
+for example, after work division and stickification, the batch dimension may
+be dim 0 for one op but dim 1 for another.
+
+The `tiled_dims` keyword is the default: how many leading iteration-space
+dimensions to divide by `loop_count`.  `None` (the default) divides only
+the single outermost dimension.  Overridden per-group by a third tuple
+element.
 
 ### Feature flag and groups callable
 
@@ -498,10 +506,10 @@ The filenames are assigned in depth-first traversal order.
 | `torch_spyre/_inductor/wrapper.py` | Add `LoopSpec` to the generated wrapper's import line |
 | `torch_spyre/_inductor/codegen/bundle.py` | Extend `generate_bundle()` to walk `LoopSpec` tree and emit `scf.for` in `bundle.mlir`; number SDSC JSON files in depth-first order |
 | `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; `_find_unimplemented` recurses into `LoopSpec.body` |
-| `tests/inductor/test_coarse_tile_pass.py` | Unit tests for `coarse_tile()` IR pass (16 tests) |
+| `tests/inductor/test_coarse_tile_pass.py` | Unit tests for `coarse_tile()` IR pass (18 tests, including per-group `tiled_dims`) |
 | `tests/inductor/test_bundle_loop.py` | Unit tests for `generate_bundle` with `LoopSpec` including MLIR snapshot tests (27 tests) |
 | `tests/inductor/test_counted_loop_node.py` | Unit tests for `build_loop_scheduler_nodes` (8 tests) |
-| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, bundle interception (5 tests) |
+| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, per-group tiled dims, bundle interception (6 tests) |
 
 ## Invariants and failure modes
 
