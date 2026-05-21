@@ -6,7 +6,6 @@ and other test utilities that are used by TorchTestBase.
 """
 
 from typing import Any, Callable
-
 import torch
 
 
