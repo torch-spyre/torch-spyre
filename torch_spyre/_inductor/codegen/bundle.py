@@ -30,8 +30,8 @@ logger = get_inductor_logger("sdsc_compile")
 # ---------------------------------------------------------------------------
 
 # Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides)
-#   base_symbol_values: list[int] of base HBM byte offsets registered in the
-#                       global symbols table for this SDSC
+#   base_symbol_values: list[int] of base HBM byte offsets for this SDSC,
+#                       one per registered symbol ID
 #   affine_strides:     list[dict] parallel to SDSCSpec.args —
 #                       {tiled_sym: stride_bytes} for tiled HBM tensors,
 #                       empty dict for non-tiled / lx tensors
@@ -53,8 +53,9 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list):
     """
     # -----------------------------------------------------------------------
     # Pass 1: compile all OpSpecs depth-first.
-    # Populates the global deduplicated ``symbols`` list of base HBM addresses
-    # and writes one ``sdsc_N.json`` file per OpSpec.
+    # ``symbols`` is indexed by abs(symbol_id)-1: one entry per symbol ID in
+    # registration order, values may repeat across SDSCs.  Writes one
+    # ``sdsc_N.json`` file per OpSpec.
     # -----------------------------------------------------------------------
     symbols: list[int] = []
     compiled: list[_CompiledEntry] = []
@@ -105,7 +106,7 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list):
             for lb_idx, lb in enumerate(loop_bounds):
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
-        # One arith.constant per unique base address.
+        # One arith.constant per symbol ID (symbols[N] → %sym_{N+1}).
         for sym_idx, value in enumerate(symbols):
             f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
@@ -116,7 +117,6 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list):
             compiled_iter,
             loop_bounds,
             loop_bound_idx,
-            symbols,
             affine_map_index,
             addr_counter,
             [],
@@ -234,7 +234,6 @@ def _emit_specs(
     compiled_iter,
     loop_bounds: list,
     loop_bound_idx: list,
-    symbols: list[int],
     affine_map_index: dict,
     addr_counter: list,
     loop_vars: list,
@@ -256,7 +255,6 @@ def _emit_specs(
                 compiled_iter,
                 loop_bounds,
                 loop_bound_idx,
-                symbols,
                 affine_map_index,
                 addr_counter,
                 loop_vars + [loop_var],
@@ -272,28 +270,39 @@ def _emit_specs(
             sdsc_idx = sdsc_name.split("_")[0]
             sdsc_filename = f"sdsc_{sdsc_idx}.json"
 
-            # Extract symbol_ids from the negative IDs stored in the JSON.
+            # Extract symbol_ids from the negative IDs stored in the JSON
+            # (unique, in registration order).
             symbol_ids = _extract_symbol_ids(sdsc_json)
 
-            # Build operand list: one %sym_N or %addr_N per (tensor, core).
-            operands: list[str] = []
+            # Build affine.apply ops for tiled tensors, tracking which
+            # symbol IDs have been upgraded to per-iteration %addr_N names.
+            sym_id_to_operand: dict[int, str] = {}
             for tensor_idx, tensor_strides in enumerate(affine_strides):
+                if not tensor_strides:
+                    continue
                 num_cores = _sdsc_num_cores(sdsc_json)
                 for c in range(num_cores):
-                    addr_str = _emit_tensor_core_addr(
-                        tensor_idx,
-                        c,
-                        tensor_strides,
-                        sdsc_json,
-                        symbols,
-                        affine_map_index,
-                        addr_counter,
-                        loop_vars,
-                        f,
-                        tab,
+                    base_sym_id = _get_tensor_core_sym_id(sdsc_json, tensor_idx, c)
+                    if base_sym_id is None or base_sym_id in sym_id_to_operand:
+                        continue
+                    stride_key = tuple(tensor_strides.values())
+                    map_idx = affine_map_index[stride_key]
+                    addr_name = f"%addr_{addr_counter[0]}"
+                    addr_counter[0] += 1
+                    base_addr_name = _sym_id_to_mlir_name(base_sym_id)
+                    loop_var_str = ", ".join(loop_vars)
+                    f.write(
+                        f"{tab}{addr_name} = affine.apply #map_{map_idx}"
+                        f"({loop_var_str})[{base_addr_name}]\n"
                     )
-                    if addr_str is not None:
-                        operands.append(addr_str)
+                    sym_id_to_operand[base_sym_id] = addr_name
+
+            # Each operand position matches one symbol_id entry.
+            # Tiled sym_ids use the %addr_N computed above; others use %sym_N.
+            operands = [
+                sym_id_to_operand.get(sid, _sym_id_to_mlir_name(sid))
+                for sid in symbol_ids
+            ]
 
             operand_str = ", ".join(operands)
             symbol_ids_str = ", ".join(str(i) for i in symbol_ids)
@@ -329,52 +338,6 @@ def _sdsc_num_cores(sdsc_json: dict) -> int:
     return 1
 
 
-def _emit_tensor_core_addr(
-    tensor_idx: int,
-    core: int,
-    tensor_strides: dict,
-    sdsc_json: dict,
-    symbols: list[int],
-    affine_map_index: dict,
-    addr_counter: list,
-    loop_vars: list,
-    f,
-    tab: str,
-) -> str | None:
-    """Emit an affine.apply (if tiled) or return %sym_N (if not), or None (if lx).
-
-    Returns the MLIR SSA name to use as an operand to sdsc_execute, or None
-    if the tensor is lx (address baked into JSON, not an operand).
-    """
-    # Look up this tensor's base symbol ID from the JSON.
-    base_sym_id = _get_tensor_core_sym_id(sdsc_json, tensor_idx, core)
-    if base_sym_id is None:
-        # lx tensor — address is baked into JSON, not an operand.
-        return None
-
-    # Map the negative symbol ID back to a %sym_N name.
-    # symbols list index = (-base_sym_id - 1) for globally allocated symbols,
-    # but the actual global index is stored in the symbols list by value.
-    # We need to find which %sym_N corresponds to this symbol ID.
-    base_addr_name = _sym_id_to_mlir_name(base_sym_id, sdsc_json, symbols)
-
-    if not tensor_strides or not loop_vars:
-        # Non-tiled or outside a loop: use the base constant directly.
-        return base_addr_name
-
-    # Tiled tensor inside a loop: emit affine.apply.
-    stride_key = tuple(tensor_strides.values())
-    map_idx = affine_map_index[stride_key]
-    addr_name = f"%addr_{addr_counter[0]}"
-    addr_counter[0] += 1
-    loop_var_str = ", ".join(loop_vars)
-    f.write(
-        f"{tab}{addr_name} = affine.apply #map_{map_idx}"
-        f"({loop_var_str})[{base_addr_name}]\n"
-    )
-    return addr_name
-
-
 def _get_tensor_core_sym_id(sdsc_json: dict, tensor_idx: int, core: int) -> int | None:
     """Return the symbol ID (negative int) for (tensor_idx, core), or None if lx."""
     for top_val in sdsc_json.values():
@@ -392,53 +355,14 @@ def _get_tensor_core_sym_id(sdsc_json: dict, tensor_idx: int, core: int) -> int 
     return None
 
 
-def _sym_id_to_mlir_name(sym_id: int, sdsc_json: dict, symbols: list[int]) -> str:
-    """Map a negative symbol ID back to a %sym_N MLIR name.
+def _sym_id_to_mlir_name(sym_id: int) -> str:
+    """Map a negative symbol ID to a %sym_N MLIR name.
 
-    The mapping is: the N-th unique symbol ID registered for this SDSC (in
-    registration order) maps to %sym_{global_index+1} in the symbols list.
-    We recover the base address value from the compiled entry and look it up
-    in the global symbols list.
+    Symbol IDs are assigned sequentially across the whole bundle starting at
+    -1, and symbols[abs(id)-1] holds the corresponding value.  So %sym_N where
+    N = abs(sym_id) is always correct.
     """
-    # Build the local -> global mapping by collecting all unique symbol IDs
-    # from the JSON in registration order, paired with their position in symbols.
-    # The global %sym_N index is: symbols.index(base_addr_value) + 1.
-    # We have the sym_id but need the base_addr_value.  Since the JSON stores
-    # str(sym_id) as the data value, we collect (sym_id -> base_addr_value) by
-    # cross-referencing with the local_sym_values we stored... but we don't have
-    # them here.  Instead, we rebuild the mapping: the K-th unique negative ID
-    # in the JSON (in ascending absolute value) corresponds to the K-th entry
-    # in local_sym_values.  We get the %sym_N name from the position of that
-    # value in the global symbols list.
-    #
-    # However, we don't have local_sym_values here.  To avoid threading it,
-    # we use the fact that the sdsc_json data values ARE the symbol IDs, and
-    # the global symbols list contains the base addresses in registration order.
-    # The (abs(sym_id) - 1 - offset) within the local group gives the local
-    # index, which maps to the same position in local_sym_values.
-    #
-    # Simpler approach: collect unique sym_ids in order of absolute value,
-    # that order is the same as local registration order, which is also the
-    # order entries were appended to the global symbols list.  Find the first
-    # sym_id in global symbols to get the starting offset.
-    all_sym_ids = _extract_symbol_ids(sdsc_json)
-    if not all_sym_ids:
-        raise RuntimeError(f"No symbol IDs found in SDSC JSON for sym_id={sym_id}")
-    # Sort by absolute value (registration order).
-    ordered = sorted(all_sym_ids, key=lambda x: abs(x))
-    local_idx = ordered.index(sym_id)
-    # The global index of the first symbol for this SDSC.
-    # We locate it by finding the minimum abs value sym_id's global position.
-    # Since local_sym_values are appended to symbols in order, and the first
-    # sym_id has abs value = symbol_id_offset + 1 for this SDSC, the global
-    # position is len(symbols) - len(ordered) + local_idx at registration time.
-    # We can recover this because all symbols are in the global list.
-    # The absolute value of the first registered sym_id for this SDSC minus 1
-    # equals symbol_id_offset at the time of compilation.
-    first_abs = abs(ordered[0])  # = symbol_id_offset + 1
-    global_start = first_abs - 1  # = symbol_id_offset = index into symbols list
-    global_idx = global_start + local_idx
-    return f"%sym_{global_idx + 1}"
+    return f"%sym_{abs(sym_id)}"
 
 
 # ---------------------------------------------------------------------------

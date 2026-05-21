@@ -253,13 +253,18 @@ def generate_sdsc(
     # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
     # For tiled tensors the base is the iteration-0 address (tiled dims contribute 0);
     # for non-tiled tensors it is the full per-core address (as before).
+    #
+    # NOTE: no cross-SDSC deduplication — each call to offset_as_symbol within
+    # this SDSC gets its own sequential ID and appends to symbols.  Two SDSCs
+    # that happen to share a base address will emit two separate arith.constant
+    # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
+    # symbols list indices: symbols[abs(id)-1] is always the value for id.
     local_symbols: dict[int, int] = {}
 
     def offset_as_symbol(s):
         if s not in local_symbols:
-            if s not in symbols:
-                symbols.append(s)
             local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
+            symbols.append(s)
         return local_symbols[s]
 
     # Compute per-tensor affine strides and register base addresses in symbols.
