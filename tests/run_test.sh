@@ -1334,8 +1334,36 @@ _run_pytest_isolated() {
     (
         set +euo pipefail
         cd "$_dir"
-        python3 -m pytest "$_base" "${_args[@]}"
-        echo $? > "$_exit_tmp"
+
+        if [[ "$_dir" == *"/distributed"* ]] || [[ "$_dir" == *"/distributed" ]]; then
+            # Check that AIU_WORLD_SIZE is set
+            if [[ -z "${AIU_WORLD_SIZE:-}" ]]; then
+                echo "Error: AIU_WORLD_SIZE environment variable is not set" >&2
+                exit 1
+            fi
+            # Use torchrun for distributed tests
+            _NPROC="${AIU_WORLD_SIZE}"
+            echo "[spyre_run] Running distributed test with torchrun (nproc=$_NPROC)"
+
+            # Set environment variables for split_output.sh
+            export _LOGDIR=/tmp/pytest-torch-spyre-dist
+            export _SHOW_PROGRESS=1
+
+            # Create log directory
+            mkdir -p "${_LOGDIR}"
+
+            # Run with split_output.sh wrapper
+            torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+            echo $? > "$_exit_tmp"
+
+            # Clean up log directory
+            rm -rf "${_LOGDIR}"
+        else
+            echo "[spyre_run] Running serial test"
+            # Regular pytest for non-distributed tests
+            python3 -m pytest "$_base" "${_args[@]}"
+            echo $? > "$_exit_tmp"
+        fi
     ) || true
 }
 
