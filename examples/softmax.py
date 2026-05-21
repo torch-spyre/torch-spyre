@@ -18,8 +18,8 @@ import torch_spyre._inductor.passes as passes
 import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
-declare_real_dim = prd.declare_real_dim
-annotate_real_dims = prd.annotate_real_dims
+declare_tensor_dim = prd.declare_tensor_dim
+name_tensor_dims = prd.name_tensor_dims
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
@@ -36,10 +36,10 @@ cpu_result = func(x)
 
 x_device = x.to(DEVICE)
 
-declare_real_dim("R", R)
-declare_real_dim("C", C)
+declare_tensor_dim("R", R)
+declare_tensor_dim("C", C)
 
-annotate_real_dims(x_device, ["R", "C"])
+name_tensor_dims(x_device, ["R", "C"])
 
 eager_result = func(x_device).cpu()
 

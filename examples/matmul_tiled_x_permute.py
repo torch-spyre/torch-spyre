@@ -3,8 +3,8 @@ import torch_spyre._inductor.passes as passes
 import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
-declare_real_dim = prd.declare_real_dim
-annotate_real_dims = prd.annotate_real_dims
+declare_tensor_dim = prd.declare_tensor_dim
+name_tensor_dims = prd.name_tensor_dims
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
@@ -33,13 +33,13 @@ print(f"CPU result shape: {cpu_result.shape}")
 x_dev = x_cpu.to(DEVICE)
 y_dev = y_cpu.to(DEVICE)
 
-declare_real_dim("B", B)
-declare_real_dim("S", S)
-declare_real_dim("H", H)
-declare_real_dim("D", D)
+declare_tensor_dim("B", B)
+declare_tensor_dim("S", S)
+declare_tensor_dim("H", H)
+declare_tensor_dim("D", D)
 
-annotate_real_dims(x_dev, ["B", "S", "D", "H"])  # [2, 128, 128, 32]
-annotate_real_dims(y_dev, ["H", "D", "H", "D"])  # [4096, 4096] = [H*D, H*D]
+name_tensor_dims(x_dev, ["B", "S", "D", "H"])  # [2, 128, 128, 32]
+name_tensor_dims(y_dev, ["H", "D", "H", "D"])  # [4096, 4096] = [H*D, H*D]
 
 compiled = torch.compile(fn)
 result = compiled(x_dev, y_dev).cpu()

@@ -5,8 +5,8 @@ import torch_spyre._inductor.passes as passes
 import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
-declare_real_dim = prd.declare_real_dim
-annotate_real_dims = prd.annotate_real_dims
+declare_tensor_dim = prd.declare_tensor_dim
+name_tensor_dims = prd.name_tensor_dims
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
@@ -33,17 +33,17 @@ x_device = x.to(DEVICE)
 y_device = y.to(DEVICE)
 z_device = z.to(DEVICE)
 
-declare_real_dim("N", 1)
-declare_real_dim("A", A)
-declare_real_dim("BD", B * D)
-declare_real_dim("C", C)
-declare_real_dim("D", D)
-declare_real_dim("E", E)
+declare_tensor_dim("N", 1)
+declare_tensor_dim("A", A)
+declare_tensor_dim("BD", B * D)
+declare_tensor_dim("C", C)
+declare_tensor_dim("D", D)
+declare_tensor_dim("E", E)
 
-annotate_real_dims(w_device, ["N", "A", "BD", "E"])
-annotate_real_dims(x_device, ["N", "A", "BD", "E"])
-annotate_real_dims(y_device, ["N", "A", "C", "D", "E"])
-annotate_real_dims(z_device, ["N", "A", "C"])
+name_tensor_dims(w_device, ["N", "A", "BD", "E"])
+name_tensor_dims(x_device, ["N", "A", "BD", "E"])
+name_tensor_dims(y_device, ["N", "A", "C", "D", "E"])
+name_tensor_dims(z_device, ["N", "A", "C"])
 
 compiled_sm = torch.compile(func)
 compiled_result = compiled_sm(w_device, x_device, y_device, z_device).cpu()

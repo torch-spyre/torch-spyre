@@ -5,8 +5,8 @@ import torch_spyre._inductor.passes as passes
 import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
-declare_real_dim = prd.declare_real_dim
-annotate_real_dims = prd.annotate_real_dims
+declare_tensor_dim = prd.declare_tensor_dim
+name_tensor_dims = prd.name_tensor_dims
 
 torch.manual_seed(0xAFFE)
 
@@ -27,15 +27,15 @@ y_dev = y.to("spyre")
 w_dev = w.to("spyre")
 z_dev = z.to("spyre")
 
-declare_real_dim("A", A)
-declare_real_dim("B", B)
-declare_real_dim("C", C)
-declare_real_dim("D", D)
+declare_tensor_dim("A", A)
+declare_tensor_dim("B", B)
+declare_tensor_dim("C", C)
+declare_tensor_dim("D", D)
 
-annotate_real_dims(x_dev, ["A", "B"])
-annotate_real_dims(y_dev, ["B", "C"])
-annotate_real_dims(w_dev, ["C", "D"])
-annotate_real_dims(z_dev, ["A", "D"])
+name_tensor_dims(x_dev, ["A", "B"])
+name_tensor_dims(y_dev, ["B", "C"])
+name_tensor_dims(w_dev, ["C", "D"])
+name_tensor_dims(z_dev, ["A", "D"])
 
 result = torch.compile(f)(x_dev, y_dev, w_dev, z_dev).cpu()
 

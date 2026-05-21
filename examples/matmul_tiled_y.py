@@ -3,8 +3,8 @@ import torch_spyre._inductor.passes as passes
 import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
-declare_real_dim = prd.declare_real_dim
-annotate_real_dims = prd.annotate_real_dims
+declare_tensor_dim = prd.declare_tensor_dim
+name_tensor_dims = prd.name_tensor_dims
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
@@ -38,18 +38,16 @@ print(f"CPU result shape: {cpu_result.shape}")
 x_dev = x_cpu.to(DEVICE)
 kv_dev = kv_cpu.to(DEVICE)
 
-declare_real_dim("B", B)
-declare_real_dim("H_KV", H_KV)
-declare_real_dim("GQA", GQA)
-declare_real_dim("S", S)
-declare_real_dim("D", D)
+declare_tensor_dim("B", B)
+declare_tensor_dim("H_KV", H_KV)
+declare_tensor_dim("GQA", GQA)
+declare_tensor_dim("S", S)
+declare_tensor_dim("D", D)
 
-annotate_real_dims(
+name_tensor_dims(
     x_dev, ["B", "H_KV", "GQA", "S", "D"]
 )  # x shape [2,32,128,128]: H=H_KV*GQA tiled
-annotate_real_dims(
-    kv_dev, ["B", "H_KV", "S", "D"]
-)  # kv shape [2,1024,128]: H_KV*S tiled
+name_tensor_dims(kv_dev, ["B", "H_KV", "S", "D"])  # kv shape [2,1024,128]: H_KV*S tiled
 
 compiled = torch.compile(fn)
 result = compiled(x_dev, kv_dev).cpu()

@@ -52,16 +52,16 @@ def reset():
     _enabled = False
 
 
-def declare_real_dim(name, size):
+def declare_tensor_dim(name, size):
     """
-    Declare a real dimension
+    Declare a named tensor dimension and its size.
     """
     _real_dims[name] = size
 
 
-def annotate_real_dims(tensor, real_dims):
+def name_tensor_dims(tensor, real_dims):
     """
-    Annotate tensor with real dimensions: [(name, size), ...]
+    Annotate a tensor with its named dimensions: [name, ...]
     """
     global _enabled
     _enabled = True

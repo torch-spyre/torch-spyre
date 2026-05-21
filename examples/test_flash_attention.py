@@ -5,8 +5,8 @@ import torch_spyre._inductor.passes as passes
 import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
-declare_real_dim = prd.declare_real_dim
-annotate_real_dims = prd.annotate_real_dims
+declare_tensor_dim = prd.declare_tensor_dim
+name_tensor_dims = prd.name_tensor_dims
 
 
 def flash(Q, K, V, block_size):
@@ -57,20 +57,20 @@ if __name__ == "__main__":
     K = torch.randn(B, H, L, D, dtype=torch.float16)
     V = torch.randn(B, H, L, D, dtype=torch.float16)
 
-    declare_real_dim("B", B)
-    declare_real_dim("H", H)
-    declare_real_dim("L", L)
-    declare_real_dim("NB", L // block_size)
-    declare_real_dim("BS", block_size)
-    declare_real_dim("D", D)
+    declare_tensor_dim("B", B)
+    declare_tensor_dim("H", H)
+    declare_tensor_dim("L", L)
+    declare_tensor_dim("NB", L // block_size)
+    declare_tensor_dim("BS", block_size)
+    declare_tensor_dim("D", D)
 
     q_spyre = Q.to("spyre")
     k_spyre = K.to("spyre")
     v_spyre = V.to("spyre")
 
-    annotate_real_dims(q_spyre, ["B", "H", "L", "D"])
-    annotate_real_dims(k_spyre, ["B", "H", "NB", "BS", "D"])
-    annotate_real_dims(v_spyre, ["B", "H", "NB", "BS", "D"])
+    name_tensor_dims(q_spyre, ["B", "H", "L", "D"])
+    name_tensor_dims(k_spyre, ["B", "H", "NB", "BS", "D"])
+    name_tensor_dims(v_spyre, ["B", "H", "NB", "BS", "D"])
 
     spyre_out = compiled_flash(q_spyre, k_spyre, v_spyre, block_size).cpu()
     cpu_out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
