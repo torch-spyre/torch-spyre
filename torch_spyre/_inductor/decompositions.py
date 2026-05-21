@@ -452,6 +452,12 @@ def spyre_layer_norm(
             f"spyre_layer_norm: only supports spyre device with normalized_shape of length 1, "
             f"got device={input.device.type}, normalized_shape={normalized_shape}"
         )
+    # F.layer_norm treats weight=None as identity and bias=None as zero;
+    # spyre.layernormnorm doesn't handle missing args, so substitute defaults.
+    if weight is None:
+        weight = input.new_ones(normalized_shape)
+    if bias is None:
+        bias = input.new_zeros(normalized_shape)
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
@@ -527,10 +533,6 @@ def spyre__sdpa_overrideable(
     max_seqlen_q = query.size(2)
     max_seqlen_kv = key.size(2)
 
-    query = query.clone(memory_format=torch.contiguous_format)
-    key = key.clone(memory_format=torch.contiguous_format)
-    value = value.clone(memory_format=torch.contiguous_format)
-
     scaling_factor = scale
     if scaling_factor is None:
         scaling_factor = 1.0 / math.sqrt(query.shape[-1])
@@ -543,7 +545,7 @@ def spyre__sdpa_overrideable(
     if expansion != 1:
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-    key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
+    key_t = key.transpose(-2, -1)
 
     attn = torch.matmul(query, key_t)
 
@@ -573,6 +575,7 @@ def spyre__sdpa_overrideable(
     out = torch.matmul(attn, value)
 
     # B, S, H, E
+    # Do not remove contiguous here.
     # This is needed to maintain the API promise from SDPA (attn needs to have same size+stride as q)
     out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
 

@@ -23,6 +23,35 @@ except ImportError as _yaml_err:  # pragma: no cover
     ) from _yaml_err
 
 
+"""
+Utility for printing per-test tags at run time alongside PASS/FAIL output.
+"""
+
+# To store method_name -> full tag list set during test execution
+_RUNTIME_TAGS: Dict[str, List[str]] = {}
+
+
+def print_test_tags_oot(test_instance, op_tags: List[str] = []) -> None:
+    """Print [TAGS = ...] for a test method at run time.
+
+    Combines method-level tags (test-level + dynamic op__/dtype__/module__) stored
+    at collection time with per-op tags available only at run time.
+
+    Usage in a test method:
+        from spyre_test_utilities import print_test_tags_oot
+        print_test_tags_oot(self, op_tags=op.op_tags)
+    """
+    method_name = test_instance._testMethodName
+    _method_fn = getattr(test_instance.__class__, method_name, None)
+    _method_tags = getattr(_method_fn, "_spyre_method_tags", [])
+    _per_op_tags = [t for t in op_tags if t not in set(_method_tags)]
+    _all_tags = _method_tags + _per_op_tags
+    # Store for pytest_runtest_makereport hook to work without -s
+    _RUNTIME_TAGS[method_name] = _all_tags
+    # Also write directly to stderr (visible with -s)
+    os.write(2, f"[TAGS = {' '.join(_all_tags)}]\n".encode())
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -105,11 +134,16 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Merge per-file entries from all configs into a deduplicated list.
 
     Two entries with the same ``path`` value are merged: their ``tests``
-    lists are concatenated (with deduplication by name) and their
-    ``unlisted_test_mode`` is kept from the first occurrence (a warning is
-    emitted if configs disagree).
+    lists are combined and their ``unlisted_test_mode`` is kept from the
+    first occurrence.
 
-    Entries with distinct paths are appended in the order they appear.
+    Test block deduplication within a path:
+    - A block is a TRUE duplicate and dropped only when its ``names``,
+      ``tags``, AND ``edits`` all match an already-seen block exactly.
+    - Blocks that share the same ``names`` but differ in ``tags`` or
+      ``edits`` (e.g. the same test op run for different models/dtypes)
+      are kept as SEPARATE entries so each produces its own tagged variant.
+    - Entries with distinct paths are appended in the order they appear.
     """
     # Preserve insertion order; key = resolved path string.
     merged: Dict[str, Dict[str, Any]] = {}
@@ -136,20 +170,28 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     file=sys.stderr,
                 )
 
-            # Merge tests: deduplicate by the set of names in each test block.
-            existing_test_names: set = set()
-            for t in existing["tests"]:
-                for n in t.get("names") or []:
-                    existing_test_names.add(n.strip())
-
             for test_block in entry.get("tests") or []:
-                block_names = {n.strip() for n in (test_block.get("names") or [])}
-                # Append the whole block if ANY of its names is new.
-                # (Partial overlaps are very unlikely in practice but if they
-                # occur the block is still added so no test is silently lost.)
-                if not block_names.issubset(existing_test_names):
+                block_names = frozenset(
+                    n.strip() for n in (test_block.get("names") or [])
+                )
+
+                # A block is a TRUE duplicate only when names + tags + edits
+                # all match an already-present block exactly.  Blocks with
+                # the same names but different tags/edits represent distinct
+                # configurations (e.g. same op for different models) and must
+                # be kept as separate entries.
+                is_true_duplicate = any(
+                    frozenset(n.strip() for n in (t.get("names") or [])) == block_names
+                    and t.get("tags") == test_block.get("tags")
+                    and t.get("edits") == test_block.get("edits")
+                    for t in existing["tests"]
+                )
+
+                if not is_true_duplicate:
                     existing["tests"].append(test_block)
-                    existing_test_names.update(block_names)
+                    # Note: we intentionally do NOT track block_names in a
+                    # global "seen names" set here, because the same name is
+                    # reused across configs with different tags.
 
     return list(merged.values())
 
