@@ -8,8 +8,10 @@ Spyre's compilation pipeline runs a sequence of optimization passes over
 tiling**: take a sequence of operations that share an iteration space
 dimension, split that dimension into K chunks (where K may be a symbolic
 shape), and emit the body operations inside a counted outer loop.  This
-allows the hardware to amortize setup cost over K iterations without
-requiring the full iteration space to fit in on-chip memory at once.
+is the key program transformation for working set reduction -- a tiling
+of the computation in the time domain that enables effective scratchpad
+utilization by reshaping the computation so that most tensors can be
+allocated to the scratchpad.
 
 The output of this pass needs to survive through:
 
@@ -25,8 +27,11 @@ and consumed.
 
 ## Design Overview
 
-The design has three layers that correspond to the three pipeline stages
-above.
+The tiling loop structure must be created early (before work division sees
+the iteration space) and preserved intact through scheduling and codegen so
+that the hardware executes the reduced per-iteration working set — not the
+full pre-tiling range.  The design has three layers that correspond to the
+three pipeline stages above.
 
 ```
 Pre-scheduling IR pass  (CustomPreSchedulingPasses)
@@ -180,8 +185,11 @@ be wrong relative to the reduced `ranges` written by the tiling pass.
 already run before `work_distribution`, so placing `coarse_tile` with
 them is consistent.
 
-`scratchpad_planning` must run after coarse tiling because scratchpad
-allocation depends on the final (reduced) iteration space.
+`scratchpad_planning` must run after coarse tiling because it sizes
+scratchpad allocations to fit the per-iteration working set.  If it ran
+before, it would see the full iteration space and allocate too much —
+defeating the working-set reduction that coarse tiling is designed to
+achieve.
 
 ## Layer 2 — `CountedLoopSchedulerNode`
 
