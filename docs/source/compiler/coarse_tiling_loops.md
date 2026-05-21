@@ -534,37 +534,6 @@ invalidated when the pass changes.  The `coarse_tiling_groups_fn` must be
 a module-level named function (not a lambda) for Inductor's cache
 pickling to work.
 
-## Implementation milestones
-
-All four milestones have been implemented.
-
-### Milestone 1 — `LoopSpec` data structure and serialization ✓
-
-Added `LoopSpec` to `op_spec.py`, extended `SpyreKernel.codegen_kernel()`
-to serialize `LoopSpec` recursively, fixed the `arg_index` fixup to walk
-nested bodies, and added `wrap_op_specs_in_loop()`.
-
-### Milestone 2 — `CountedLoopSchedulerNode` and post-fusion pass ✓
-
-Added `CountedLoopSchedulerNode(FusedSchedulerNode)` with `unpack()` and
-`can_fuse()` overrides; implemented `build_loop_scheduler_nodes` and
-registered it in `CustomPostFusionPasses` before `spyre_fuse_nodes`.
-Extended `SuperDSCScheduling.codegen_node()` with `_codegen_counted_loop`
-and `_codegen_loop_body`.
-
-### Milestone 3 — IR-level loop group stamping (`coarse_tile.py`) ✓
-
-Implemented `coarse_tile(operations, groups)` with contiguity validation
-and `object.__setattr__`-based range mutation.  Added `coarse_tiling` flag
-and `coarse_tiling_groups_fn` config knob.
-
-### Milestone 4 — `bundle.mlir` `scf.for` emission ✓
-
-Refactored `generate_bundle` to walk the `list[OpSpec | LoopSpec]` tree
-recursively and emit `scf.for` blocks in `bundle.mlir`.  Concrete integer
-loop counts are emitted as `arith.constant`; symbolic counts are not yet
-supported.
-
 ## Rejected design alternatives
 
 ### Inductor's existing loop IR
