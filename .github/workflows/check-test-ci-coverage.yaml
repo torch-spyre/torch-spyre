@@ -15,7 +15,7 @@ on:
     paths:
       - tests/**/test_*.py
       - tests/configs/**
-      - .github/workflows/torch-spyre-tests.yaml
+      - .github/workflows/torch_spyre_tests.yaml
       - .github/workflows/check-test-ci-coverage.yaml
     branches: [main]
 
@@ -24,8 +24,8 @@ on:
     paths:
       - tests/**/test_*.py
       - tests/configs/**
-      - .github/workflows/torch-spyre-tests.yaml
-      - .github/workflows/check-test-ci-coverage.yml
+      - .github/workflows/torch_spyre_tests.yaml
+      - .github/workflows/check-test-ci-coverage.yaml
   merge_group:
     types: [checks_requested]
 
@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       # ----- Run the coverage check -----
       - name: Check every test file has a config and is in the workflow matrix

@@ -1,0 +1,126 @@
+name: model-module-tests
+
+on:
+  # Run automatically on every merge to main
+  push:
+    branches: [main]
+    paths-ignore:
+      - tests/docs/**
+      - docs/**
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - tests/docs/**
+      - docs/**
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  model-module-tests:
+    name: ${{ matrix.suite.name }}
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 720
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
+
+    # ---------------------------------------------------------------------------
+    # To add a new module test suite, append an entry here:
+    #   - name: <human-readable label shown in the GHA UI>
+    #     config: <filename inside tests/configs/module_tests/>
+    #
+    # The JUnit XML report is automatically named after the config file, e.g.:
+    #   granite_3_3_8b_instruct_spyre.yaml  ->  granite_3_3_8b_instruct_spyre.xml
+    # ---------------------------------------------------------------------------
+    strategy:
+      fail-fast: false   # run all suites even if one fails
+      matrix:
+        suite:
+          - name: Granite 3.3 8B Instruct
+            config: granite_3_3_8b_instruct_spyre.yaml
+
+    steps:
+      # Sparse checkout into the GHA workspace so the local composite
+      # actions under .github/actions/ are available. The pre-cloned
+      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
+      # against.
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - uses: ./.github/actions/build-torch-spyre
+
+      - name: Run ${{ matrix.suite.name }} module test suite
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
+          # Derive the XML report name from the config filename
+          # Example:
+          #   granite_3_3_8b_instruct_spyre.yaml  ->  granite_3_3_8b_instruct_spyre.xml
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="${CONFIG%.yaml}.xml"
+          REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
+
+          # Expose report path/name to subsequent steps via GITHUB_ENV
+          echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+
+          echo "Running ${{ matrix.suite.name }} module tests..."
+          bash tests/run_test.sh "tests/configs/module_tests/${CONFIG}" -v --junit-xml="${REPORT_PATH}"
+          echo "${{ matrix.suite.name }} module tests done"
+
+
+
+      # ---------------------------------------------------------------------------
+      # Upload the JUnit XML as a GHA artifact so it can be downloaded and
+      # ingested by the Spyre dashboard.
+      #
+      # if: always() ensures the report is uploaded even when tests fail —
+      # a failed run is exactly when you most want the dashboard to show results.
+      #
+      # Artifact name matches the report filename so multiple matrix jobs don't
+      # overwrite each other (each config produces a distinct name).
+      # ---------------------------------------------------------------------------
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn (not fail) if pytest itself crashed
+          retention-days: 10

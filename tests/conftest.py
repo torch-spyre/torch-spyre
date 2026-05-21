@@ -312,6 +312,12 @@ def compile_backend(pytestconfig):
 
 def pytest_configure(config):
     shared_config._PYTEST_CONFIG = config
+
+    config.addinivalue_line(
+        "markers",
+        "requires_spyre_profiler: test requires Spyre hardware "
+        "and USE_SPYRE_PROFILER=1",
+    )
     # auto-register model_<name> markers based on YAML files
     mdir = config.rootpath / "tests" / "resource" / "models"
     for p in mdir.glob("*.yaml"):
@@ -396,3 +402,35 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     for rep in skipped:
         # terminalreporter.write_line(rep)
         terminalreporter.write_line(rep.nodeid)
+
+
+def _is_spyre_hardware_available() -> bool:
+    """
+    Detect whether Spyre hardware is available.
+
+    Returns True if the torch_spyre runtime and device can be initialized.
+    This function is defensive and returns False if any step fails.
+    """
+    try:
+        import torch
+
+        x = torch.empty(1, device="spyre")
+        return x.device.type == "spyre"
+    except (ImportError, RuntimeError):
+        return False
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """
+    Automatically skip tests marked with @pytest.mark.requires_spyre_profiler
+    when the Spyre profiler is not available.
+    """
+    if "requires_spyre_profiler" in item.keywords:
+        use_profiler = os.environ.get("USE_SPYRE_PROFILER") == "1"
+        hardware_available = _is_spyre_hardware_available()
+
+        if not (use_profiler and hardware_available):
+            pytest.skip(
+                "Skipping test: requires Spyre profiler "
+                "(set USE_SPYRE_PROFILER=1 and ensure Spyre hardware is available)"
+            )
