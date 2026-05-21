@@ -13,30 +13,36 @@
 # limitations under the License.
 
 import torch
+import torch_spyre._inductor.passes as passes
+
+import torch_spyre._inductor.propagate_real_dims2 as prd
+
+passes.propagate_real_dims = prd.propagate_real_dims
+declare_real_dim = prd.declare_real_dim
+annotate_real_dims = prd.annotate_real_dims
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
-# Create input tensor
-x = torch.rand(512, 1024, dtype=torch.float16)
+R, C = 512, 1024
+x = torch.rand(R, C, dtype=torch.float16)
 
-# Compute softmax on the cpu
-cpu_result = torch.softmax(x, dim=0)
+def func(a):
+    return torch.softmax(a, dim=0)
 
-# Send input tensor to device
+cpu_result = func(x)
+
 x_device = x.to(DEVICE)
 
-# Compute softmax on the device in eager mode and get the result back to the host
-eager_result = torch.softmax(x_device, dim=0).cpu()
+declare_real_dim("R", R)
+declare_real_dim("C", C)
 
-# Compute softmax on the device in compiled mode and get the result back to the host
-compiled_sm = torch.compile(lambda a: torch.softmax(a, dim=0))
-compiled_result = compiled_sm(x_device).cpu()
+annotate_real_dims(x_device, ["R", "C"])
 
-# Print the results and compare them
-print(f"CPU result\n{cpu_result}")
-print(f"Spyre Eager result\n{eager_result}")
-print(f"Spyre Compiled result\n{compiled_result}")
+eager_result = func(x_device).cpu()
+
+compiled_result = torch.compile(func)(x_device).cpu()
+
 device_delta = torch.abs(eager_result - compiled_result).max()
 cpu_delta = torch.abs(compiled_result - cpu_result).max()
 

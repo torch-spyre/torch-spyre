@@ -140,7 +140,7 @@ def _reduction_real_dims(op, inputs):
     out_coords = op_out_coords(op)
     reduction_var = get_reduction_dim(inputs[0], out_coords)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
-    op.real_ranges = op.real_dims + rdims[reduction_var]
+    op.reduction_dims = rdims[reduction_var]
     op.rdims = rdims
 
 
@@ -151,7 +151,6 @@ def _pointwise_real_dims(op, inputs):
     # Part 2: pointwise dimension mapping (no reduction)
     out_coords = op_out_coords(op)
     op.real_dims = coords_to_real_dims(out_coords, rdims)
-    op.real_ranges = op.real_dims
     op.rdims = rdims
 
 
@@ -211,10 +210,40 @@ def propagate_real_dims(
 
     # debug
 
+    print("DECLARED DIMS")
+    for name, size in _real_dims.items():
+        print(f"  {name} = {size}")
+
+    print("INPUT TENSORS")
+    for name in V.graph.graph_input_names:
+        tb = V.graph.graph_inputs[name]
+        if isinstance(tb, TensorBox):
+            print(f"  {name}: real_dims={tb.real_dims}")
+
     print("OPS")
     for op in iter(operations):
-        print(op.get_operation_name(), op.real_ranges, op.rdims)
-
-    print("TENSORS")
-    for buf in V.graph.buffers:
-        print(buf.name, buf.real_dims)
+        if not hasattr(op, 'rdims'):
+            print(f"  {op.get_operation_name()}: no rdims")
+            continue
+        is_reduction = isinstance(op.data, Reduction)
+        print(f"  {op.get_operation_name()} ({'reduction' if is_reduction else 'pointwise'})")
+        rw = op.get_read_writes()
+        all_deps = list(rw.reads) + list(rw.writes)
+        for dep in rw.reads:
+            if isinstance(dep, MemoryDep):
+                buf = _get_buffer(dep)
+                real_dims = getattr(buf, 'real_dims', '?')
+                print(f"    input {dep.name}: real_dims={real_dims}  index={dep.index}  ranges={dict(dep.ranges)}")
+        print(f"    loop vars:")
+        ranges = {}
+        for dep in all_deps:
+            if isinstance(dep, MemoryDep):
+                ranges.update({str(s): int(v) for s, v in dep.ranges.items()})
+        for sym, names in op.rdims.items():
+            size = ranges.get(str(sym), "?")
+            declared = [f"{n}={_real_dims.get(n,'?')}" for n in names]
+            print(f"      {sym}: range={size}  real_dim(s)={names}  declared={declared}")
+        if is_reduction:
+            print(f"    reduction over: {op.reduction_dims}")
+        print(f"    output: ({op.get_name()}) real_dims={op.real_dims}")
+        print()
