@@ -74,7 +74,7 @@ class TestCollectOpSpecs(unittest.TestCase):
 
     def test_single_loop(self):
         a, b = _make_op_spec("a"), _make_op_spec("b")
-        loop = LoopSpec(count=Integer(4), tiled_dims=1, body=[a, b])
+        loop = LoopSpec(count=Integer(4), body=[a, b])
         result: list[OpSpec] = []
         _collect_op_specs([loop], result)
         self.assertEqual(result, [a, b])
@@ -82,15 +82,15 @@ class TestCollectOpSpecs(unittest.TestCase):
     def test_nested_loop(self):
         a = _make_op_spec("a")
         b = _make_op_spec("b")
-        inner = LoopSpec(count=Integer(2), tiled_dims=1, body=[b])
-        outer = LoopSpec(count=Integer(4), tiled_dims=1, body=[a, inner])
+        inner = LoopSpec(count=Integer(2), body=[b])
+        outer = LoopSpec(count=Integer(4), body=[a, inner])
         result: list[OpSpec] = []
         _collect_op_specs([outer], result)
         self.assertEqual(result, [a, b])
 
     def test_mixed_flat_and_loop(self):
         a, b, c = _make_op_spec("a"), _make_op_spec("b"), _make_op_spec("c")
-        loop = LoopSpec(count=Integer(3), tiled_dims=1, body=[b])
+        loop = LoopSpec(count=Integer(3), body=[b])
         result: list[OpSpec] = []
         _collect_op_specs([a, loop, c], result)
         self.assertEqual(result, [a, b, c])
@@ -113,20 +113,20 @@ class TestCollectLoopCounts(unittest.TestCase):
         self.assertEqual(counts, [])
 
     def test_single_loop(self):
-        loop = LoopSpec(count=Integer(4), tiled_dims=1, body=[])
+        loop = LoopSpec(count=Integer(4), body=[])
         counts = _collect_loop_counts([loop])
         self.assertEqual(counts, [Integer(4)])
 
     def test_nested_loops_depth_first_order(self):
-        inner = LoopSpec(count=Integer(2), tiled_dims=1, body=[])
-        outer = LoopSpec(count=Integer(4), tiled_dims=1, body=[inner])
+        inner = LoopSpec(count=Integer(2), body=[])
+        outer = LoopSpec(count=Integer(4), body=[inner])
         counts = _collect_loop_counts([outer])
         # outer count first, then inner
         self.assertEqual(counts, [Integer(4), Integer(2)])
 
     def test_two_sequential_loops(self):
-        loop0 = LoopSpec(count=Integer(4), tiled_dims=1, body=[])
-        loop1 = LoopSpec(count=Integer(8), tiled_dims=1, body=[])
+        loop0 = LoopSpec(count=Integer(4), body=[])
+        loop1 = LoopSpec(count=Integer(8), body=[])
         counts = _collect_loop_counts([loop0, loop1])
         self.assertEqual(counts, [Integer(4), Integer(8)])
 
@@ -180,7 +180,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
 
     def test_single_loop_emits_scf_for(self):
         a, b = _make_op_spec("a"), _make_op_spec("b")
-        loop = LoopSpec(count=Integer(4), tiled_dims=1, body=[a, b])
+        loop = LoopSpec(count=Integer(4), body=[a, b])
         mlir = self._bundle([loop])
         self.assertIn("scf.for", mlir)
         self.assertIn("arith.constant 4 : index", mlir)
@@ -191,7 +191,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
 
     def test_single_loop_structure(self):
         a = _make_op_spec("a")
-        loop = LoopSpec(count=Integer(3), tiled_dims=1, body=[a])
+        loop = LoopSpec(count=Integer(3), body=[a])
         mlir = self._bundle([loop])
         # scf.for line should precede sdsc_execute line
         for_pos = mlir.index("scf.for")
@@ -204,7 +204,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         before = _make_op_spec("before")
         body = _make_op_spec("body")
         after = _make_op_spec("after")
-        loop = LoopSpec(count=Integer(2), tiled_dims=1, body=[body])
+        loop = LoopSpec(count=Integer(2), body=[body])
         mlir = self._bundle([before, loop, after])
         self.assertIn("scf.for", mlir)
         self.assertEqual(mlir.count("sdsc_execute"), 3)
@@ -212,8 +212,8 @@ class TestGenerateBundleMlir(unittest.TestCase):
     def test_nested_loops(self):
         a = _make_op_spec("a")
         b = _make_op_spec("b")
-        inner = LoopSpec(count=Integer(2), tiled_dims=1, body=[b])
-        outer = LoopSpec(count=Integer(4), tiled_dims=1, body=[a, inner])
+        inner = LoopSpec(count=Integer(2), body=[b])
+        outer = LoopSpec(count=Integer(4), body=[a, inner])
         mlir = self._bundle([outer])
         self.assertEqual(mlir.count("scf.for"), 2)
         self.assertIn("arith.constant 4 : index", mlir)
@@ -227,7 +227,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
     def test_sdsc_json_files_written_depth_first(self):
         a = _make_op_spec("a")
         b = _make_op_spec("b")
-        loop = LoopSpec(count=Integer(2), tiled_dims=1, body=[a, b])
+        loop = LoopSpec(count=Integer(2), body=[a, b])
         generate_bundle("test_kernel", self.tmpdir, [loop])
         written = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".json"))
         # Two JSON files: idx 0 → a, idx 1 → b
@@ -243,7 +243,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
     def test_symbolic_count_raises(self):
         k = Symbol("K")
         a = _make_op_spec("a")
-        loop = LoopSpec(count=k, tiled_dims=1, body=[a])
+        loop = LoopSpec(count=k, body=[a])
         with self.assertRaises(NotImplementedError):
             self._bundle([loop])
 
@@ -274,7 +274,7 @@ class TestFindUnimplemented(unittest.TestCase):
         from torch_spyre.execution.async_compile import _find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
-        loop = LoopSpec(count=Integer(4), tiled_dims=1, body=[unimp])
+        loop = LoopSpec(count=Integer(4), body=[unimp])
         result = _find_unimplemented([loop])
         self.assertIs(result, unimp)
 
@@ -283,8 +283,8 @@ class TestFindUnimplemented(unittest.TestCase):
         from torch_spyre.execution.async_compile import _find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
-        inner = LoopSpec(count=Integer(2), tiled_dims=1, body=[unimp])
-        outer = LoopSpec(count=Integer(4), tiled_dims=1, body=[inner])
+        inner = LoopSpec(count=Integer(2), body=[unimp])
+        outer = LoopSpec(count=Integer(4), body=[inner])
         result = _find_unimplemented([outer])
         self.assertIs(result, unimp)
 
@@ -318,7 +318,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
 
     def test_single_loop_snapshot(self):
         a = _make_op_spec("a")
-        loop = LoopSpec(count=Integer(8), tiled_dims=1, body=[a])
+        loop = LoopSpec(count=Integer(8), body=[a])
         mlir = self._bundle([loop])
         expected = (
             "module {\n"

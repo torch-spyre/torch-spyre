@@ -57,6 +57,10 @@ class OpSpec:
         iteration_space: The iteration space of the operation. The values are tuples of (range, work_division).
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
+        tiled_symbols: Iteration-space symbols divided by the enclosing loop's count.
+            Empty for ops that are not inside a LoopSpec.  The runtime computes the
+            per-iteration tensor base offset for symbol ``s`` as
+            ``loop_var * iteration_space[s].range``.
     """
 
     op: str
@@ -64,6 +68,7 @@ class OpSpec:
     iteration_space: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
+    tiled_symbols: list[Symbol] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -77,18 +82,15 @@ class LoopSpec:
 
     Attributes:
         count: Trip count of the loop. May be a symbolic shape expression.
-        tiled_dims: Number of leading iteration-space dimensions divided by
-            ``count``.  The per-iteration tile size for dimension ``i`` (where
-            ``i < tiled_dims``) is the corresponding range value in each body
-            ``OpSpec.iteration_space``.  The runtime computes the tensor base
-            offset for iteration ``k`` as ``k * tile_size[i]`` for each tiled
-            dimension.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
+
+    Per-op tiling information (which iteration-space symbols are divided by
+    ``count``) is recorded on each ``OpSpec.tiled_symbols`` rather than here,
+    because different body ops may tile different dimensions.
     """
 
     count: Expr
-    tiled_dims: int
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]

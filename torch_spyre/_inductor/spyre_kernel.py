@@ -453,12 +453,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             k: (v, work_division.get(k, 1)) for k, v in it_space.items()
         }
 
+        # If this op is inside a coarse-tiling loop, identify which iteration-space
+        # symbols are tiled by the enclosing loop.  loop_tiled_dims on the IR node
+        # counts the leading dimensions of data.ranges that were divided; those
+        # correspond to the first N symbols in the scheduler-level iteration space
+        # (MemoryDep.ranges preserves the data.ranges ordering).
+        loop_tiled_dims = getattr(ir_node, "loop_tiled_dims", 0)
+        tiled_syms = list(it_space.keys())[:loop_tiled_dims]
+
         return OpSpec(
             op,
             is_reduction,
             it_space_extended,
             args,
             op_info,
+            tiled_symbols=tiled_syms,
         )
 
     def remove_kernel_local_buffers(self) -> None:
@@ -607,11 +616,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
-    def wrap_op_specs_in_loop(self, count: sympy.Expr, tiled_dims: int) -> None:
+    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
-        self.op_specs = [
-            LoopSpec(count=count, tiled_dims=tiled_dims, body=self.op_specs)
-        ]
+        self.op_specs = [LoopSpec(count=count, body=self.op_specs)]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
@@ -671,13 +678,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
     for op_spec in specs:
         if isinstance(op_spec, LoopSpec):
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"op_spec: LoopSpec(count={op_spec.count}, tiled_dims={op_spec.tiled_dims})"
-                )
+                logger.debug(f"op_spec: LoopSpec(count={op_spec.count})")
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
-                buf.writeline(f"tiled_dims={op_spec.tiled_dims},")
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)
@@ -713,6 +717,12 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                     + "},"
                 )
                 buf.writeline(f"op_info={_serialize_value(op_spec.op_info)},")
+                if op_spec.tiled_symbols:
+                    buf.writeline(
+                        "tiled_symbols=["
+                        + ", ".join(sympy_str(s) for s in op_spec.tiled_symbols)
+                        + "],"
+                    )
                 buf.writeline("args=[")
                 with buf.indent():
                     for arg in op_spec.args:

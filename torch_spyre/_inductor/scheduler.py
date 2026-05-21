@@ -44,41 +44,34 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
     """A group of SchedulerNodes to be executed inside a counted outer loop.
 
     Produced by build_loop_scheduler_nodes from SchedulerNodes whose
-    underlying ir.Operation has been stamped with loop_group_id, loop_count,
-    and loop_tiled_dims attributes by the coarse-tiling IR pass.
+    underlying ir.Operation has been stamped with loop_group_id and
+    loop_count attributes by the coarse-tiling IR pass.
 
     loop_count is the trip count of the loop that directly contains this
     group's operations.  For nested loops, the snodes may themselves
     contain CountedLoopSchedulerNodes.
-
-    loop_tiled_dims is the number of leading iteration-space dimensions that
-    are divided by loop_count.
     """
 
     loop_count: sympy.Expr
-    loop_tiled_dims: int
 
     def __init__(
         self,
         scheduler,
         snodes: list[BaseSchedulerNode],
         loop_count: sympy.Expr,
-        loop_tiled_dims: int,
     ) -> None:
         super().__init__(scheduler, snodes)
         self.loop_count = loop_count
-        self.loop_tiled_dims = loop_tiled_dims
 
     @classmethod
     def create(  # type: ignore[override]
         cls,
         snodes: list[BaseSchedulerNode],
         loop_count: sympy.Expr,
-        loop_tiled_dims: int,
     ) -> "CountedLoopSchedulerNode":
         scheduler = snodes[0].scheduler
         assert all(node.scheduler is scheduler for node in snodes)
-        grouped = cls(scheduler, snodes, loop_count, loop_tiled_dims)
+        grouped = cls(scheduler, snodes, loop_count)
         for snode in snodes:
             scheduler.name_to_fused_node[snode.get_name()] = grouped
         scheduler.name_to_fused_node[grouped.get_name()] = grouped
@@ -113,16 +106,6 @@ def _loop_count(node: BaseSchedulerNode) -> sympy.Expr:
     raise AssertionError(f"Node {node.get_name()} has loop_group_id but no loop_count")
 
 
-def _loop_tiled_dims(node: BaseSchedulerNode) -> int:
-    """Return the loop_tiled_dims of the ir.Operation inside node, defaulting to 1."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode) and snode.node is not None:
-            td = getattr(snode.node, "loop_tiled_dims", None)
-            if td is not None:
-                return td
-    return 1
-
-
 def _build_loop_group(
     nodes: list[BaseSchedulerNode], depth: int
 ) -> list[BaseSchedulerNode]:
@@ -142,10 +125,9 @@ def _build_loop_group(
             continue
 
         outer_key = gid[depth]
-        # loop_count / loop_tiled_dims for this level come from nodes directly
-        # at this depth (path length == depth + 1).  Deeper nodes have their own.
+        # loop_count for this level comes from nodes directly at this depth
+        # (path length == depth + 1).  Deeper nodes have their own counts.
         count = _loop_count(node) if len(gid) == depth + 1 else None
-        tiled_dims = _loop_tiled_dims(node) if len(gid) == depth + 1 else None
         run = [node]
         i += 1
         while i < len(nodes):
@@ -158,29 +140,22 @@ def _build_loop_group(
                 break
             if len(next_gid) == depth + 1:
                 next_count = _loop_count(nodes[i])
-                next_tiled_dims = _loop_tiled_dims(nodes[i])
                 if count is None:
                     count = next_count
-                    tiled_dims = next_tiled_dims
                 else:
                     assert next_count == count, (
                         f"Loop group {outer_key} has inconsistent loop_count: "
                         f"{count} vs {next_count}"
-                    )
-                    assert next_tiled_dims == tiled_dims, (
-                        f"Loop group {outer_key} has inconsistent loop_tiled_dims: "
-                        f"{tiled_dims} vs {next_tiled_dims}"
                     )
             run.append(nodes[i])
             i += 1
         assert count is not None, (
             f"Loop group {outer_key} has no direct members at depth {depth}"
         )
-        assert tiled_dims is not None
 
         # Recursively wrap any deeper nesting within this run.
         inner = _build_loop_group(run, depth + 1)
-        result.append(CountedLoopSchedulerNode.create(inner, count, tiled_dims))
+        result.append(CountedLoopSchedulerNode.create(inner, count))
 
     return result
 
@@ -367,7 +342,7 @@ class SuperDSCScheduling(BaseScheduling):
                         ]
                         snode.codegen(index_vars)
 
-        kernel.wrap_op_specs_in_loop(node.loop_count, node.loop_tiled_dims)
+        kernel.wrap_op_specs_in_loop(node.loop_count)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -424,9 +399,7 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(
-            LoopSpec(count=node.loop_count, tiled_dims=node.loop_tiled_dims, body=body)
-        )
+        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """
