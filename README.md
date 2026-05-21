@@ -72,3 +72,5 @@ This project contains 2 main folders for development:
 Profiling support is under active development. See `torch_spyre/profiler/` — requires the kineto-spyre wheel (version matching the PyTorch install).
 
 The kineto-spyre wheel install is required currently for `profiler/__init__.py` and `profiler/_spyre_activity.py`.
+ 
+# Testing workflows inside fork
