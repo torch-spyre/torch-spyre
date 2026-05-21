@@ -1,0 +1,19 @@
+# Configuration file for torch-spyre distributed tests
+# These tests require multi-process execution via torchrun
+#
+# Usage:
+#   cd torch-spyre/tests
+#   ./run_test.sh configs/test_distributed_config.yaml
+#
+# The run_test.sh script automatically detects tests in the distributed/
+# directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
+
+test_suite_config:
+  files:
+    # SpyreCCL Backend Availability Test
+    - path: ${TORCH_DEVICE_ROOT}/tests/distributed/spyreccl_backend.py
+      unlisted_test_mode: mandatory_success
+      tests:
+        - names:
+            - TestSpyreCCLBackend::test_spyreccl_device_to_backend
+          mode: mandatory_success

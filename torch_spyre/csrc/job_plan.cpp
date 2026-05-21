@@ -21,8 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "flex/allocator/alloc_address.hpp"
-#include "flex/runtime_stream/runtime_operation.hpp"
 #include "spyre_allocator.h"
 
 namespace spyre {
@@ -44,13 +42,26 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepD2H::construct(
 }
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
-    LaunchContext&) const {
+    LaunchContext& ctx) const {
+  if (bind_io_addresses_) {
+    std::vector<const flex::CompositeAddress*> inp;
+    for (auto& tensor : ctx.inputs_outputs) {
+      flex::CompositeAddress* address =
+          &(static_cast<SharedOwnerCtx*>(
+                tensor.storage().data_ptr().get_context())
+                ->composite_addr);
+      inp.push_back(address);
+    }
+
+    auto op =
+        std::make_unique<flex::RuntimeOperationCompute>(&binary_address_, inp);
+    op->setPipelineBarrier(pipeline_barrier_);
+    return op;
+  }
   auto op = std::make_unique<flex::RuntimeOperationCompute>(&binary_address_);
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
-
-// constexpr int64_t SegmentSize = 16LL * 1024 * 1024 * 1024;
 
 // convert CompositeAddress to address that host compute function expects
 int64_t convert_address(flex::CompositeAddress& composite_address) {
@@ -59,7 +70,7 @@ int64_t convert_address(flex::CompositeAddress& composite_address) {
 
   // TODO(jni): update once resolved on flex support
   // const auto& addr = composite_address.chunks().at(0).addr;
-  // int64_t address = addr.segment_id * SegmentSize + addr.offset;
+  // int64_t address = addr.segment_id * flex::SEGMENT_SIZE + addr.offset;
 
   TORCH_CHECK(false,
               "convert_address not yet implemented - waiting for flex support");
@@ -85,22 +96,5 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
 
   return op;
 }
-
-// TODO(jni): to be added once flex PR merged
-// std::unique_ptr<flex::RuntimeOperation>
-// JobPlanStepComputeSpecialize::construct(
-//     LaunchContext& ctx) const {
-//   std::vector<flex::CompositeAddress*> inp;
-//   for (auto& tensor : ctx.inputs_outputs) {
-//     flex::CompositeAddress* address = &(
-//         static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
-//             ->composite_addr);
-//     inp.push_back((address));
-//   }
-//   auto op =
-//   std::make_unique<flex::RuntimeOperationComputeSpecializeResident>(
-//       &binary_address_, inp);
-//   return op;
-// }
 
 }  // namespace spyre
