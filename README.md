@@ -1,4 +1,4 @@
-# Torch Spyre Device Enablement
+# Torch Spyre Device Enablement:
 
 This project contains the PyTorch layer C++ and Python code for supporting the [IBM Spyre device](./docs/source/architecture/spyre_accelerator.md) as a new device, named `spyre`, in PyTorch.
 
