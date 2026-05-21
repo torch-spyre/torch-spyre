@@ -111,7 +111,7 @@ bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
   DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            device().index());
+            static_cast<int>(device().index()));
 
   flex::RuntimeStream* handle = getRuntimeHandle();
   return handle->query();
@@ -121,7 +121,7 @@ void SpyreStream::synchronize() const {
   c10::DeviceGuard guard(stream_.device());
 
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            device().index());
+            static_cast<int>(device().index()));
 
   flex::RuntimeStream* handle = getRuntimeHandle();
   handle->synchronize();
