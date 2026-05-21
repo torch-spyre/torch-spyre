@@ -53,14 +53,13 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
       inp.push_back(address);
     }
 
-    auto op =
-        std::unique_ptr<flex::RuntimeOperationCompute>(
-          flex::RuntimeOperationCompute::create(&binary_address_, inp));
+    auto op = std::unique_ptr<flex::RuntimeOperationCompute>(
+        flex::RuntimeOperationCompute::create(&binary_address_, inp));
     op->setPipelineBarrier(pipeline_barrier_);
     return op;
   }
   auto op = std::unique_ptr<flex::RuntimeOperationCompute>(
-    flex::RuntimeOperationCompute::create(&binary_address_));
+      flex::RuntimeOperationCompute::create(&binary_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
