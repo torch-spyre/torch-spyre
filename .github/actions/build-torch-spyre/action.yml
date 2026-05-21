@@ -1,0 +1,38 @@
+name: Build torch-spyre
+description: |
+  Runs `uv sync` in the pre-cloned torch-spyre directory to reconcile the
+  pre-baked .venv against the freshly checked-out pyproject.toml + uv.lock,
+  and force-rebuilds torch-spyre from source.
+
+  uv sync only reinstalls torch when the resolved version or source differs
+  from what's already installed (e.g. a PR bumps the torch~=2.10.0
+  constraint, or the pre-baked venv has a torch from a different index than
+  the pytorch-cpu source in uv.lock). torch-spyre itself is always rebuilt
+  via --reinstall-package.
+
+inputs:
+  cloned-dir:
+    description: Path to the pre-cloned torch-spyre directory in the image.
+    required: false
+    default: /home/senuser/torch-spyre
+
+runs:
+  using: composite
+  steps:
+    - name: Build torch-spyre
+      shell: bash
+      env:
+        CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        cd "$CLONED_TORCH_SPYRE_DIR"
+        source .venv/bin/activate
+        uv sync \
+          --verbose \
+          --all-extras \
+          --active \
+          --inexact \
+          --reinstall-package torch-spyre
+        uv pip show torch
+        uv pip freeze
