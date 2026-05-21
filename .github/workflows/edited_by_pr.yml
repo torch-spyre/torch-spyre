@@ -1,0 +1,39 @@
+name: EditedByPR heuristic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  print-edited-by-pr:
+    name: Print EditedByPR heuristic
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch base branch
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
+
+      - name: List changed files
+        run: |
+          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD | sort > changed_files.txt
+          echo "Changed files:" && cat changed_files.txt
+
+      - name: Run EditedByPR heuristic
+        run: |
+          python3 .github/scripts/edited_by_pr.py --changed-files changed_files.txt
