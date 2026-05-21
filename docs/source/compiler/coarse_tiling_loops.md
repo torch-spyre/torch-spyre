@@ -67,14 +67,14 @@ attached with `setattr`; no Inductor base class is modified.
 
 | Attribute | Type | Meaning |
 |---|---|---|
-| `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. All ops sharing the same tuple form the body of one counted loop at that depth. |
-| `loop_count` | `sympy.Expr` | Trip count of the loop at **this op's nesting depth** — i.e. the loop whose body directly contains this op. For a flat `(0,)` group this is the sole loop count. For nested groups, each depth level reads its count from the ops whose path length equals that depth (e.g. ops with `loop_group_id=(0,)` carry the outer count; ops with `loop_group_id=(0, 1)` carry the inner count). Must be identical for every op sharing the same `loop_group_id`. |
-| `loop_tiled_dims` | `list[int]` | Positional indices into `data.ranges` that are divided by `loop_count` for this op. Different ops in the same group may carry different indices if their iteration spaces are shaped differently (e.g. after work division places the batch dimension at a different position). Defaults to `[0]` when the `tiled_dims` argument to `coarse_tile()` is `None`. |
+| `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. Its length equals the nesting depth. All ops sharing the same tuple form the body of the innermost counted loop at that path. |
+| `loop_count` | `list[sympy.Expr]` | Trip counts, one per nesting level from outermost to innermost. For a flat (depth-1) group this is a 1-element list `[K]`. For a two-level nested group it is `[K1, K2]`. All ops sharing the same `loop_group_id` must agree on the count at every level. |
+| `loop_tiled_dims` | `list[list[int]]` | Per-level positional indices into `data.ranges` that are divided by the corresponding count. For a flat group: `[[0]]` (tile only dim 0). For a two-level nested group: `[[0], [1]]` (outer loop tiles dim 0, inner loop tiles dim 1). Different ops in the same group may carry different indices if their iteration spaces are shaped differently. |
 
-The pass also **rewrites the op's iteration ranges**: the dimensions at the
-indices in `loop_tiled_dims` are divided by `loop_count` so that each
-inner `OpSpec` describes only the work done per loop iteration, not the
-full iteration space.
+The pass also **rewrites the op's iteration ranges**: for each level, the
+dimensions at the corresponding indices in `loop_tiled_dims` are divided by
+the corresponding count in `loop_count`, so that each inner `OpSpec`
+describes only the work done per innermost-loop iteration.
 
 `loop_group_id` is a tuple rather than a flat integer to support nested
 loops.  See "Nested loops and the `loop_group_id` tree" below.
@@ -83,13 +83,15 @@ loops.  See "Nested loops and the `loop_group_id` tree" below.
 
 `loop_count` is redundant across all ops sharing the same `loop_group_id`
 (they must agree), but keeping it on each op means the post-fusion pass does
-not need to maintain a separate side table.  The `loop_group_id` is the join key.  `loop_tiled_dims`
-is the bridge between the pre-scheduling pass (which operates on positional
-`data.ranges` indices) and the codegen phase (which uses named sympy Symbols)
-— it is read by `create_op_spec` to identify, by index, which scheduler-level
-symbols correspond to the tiled dimensions and should be recorded in
-`OpSpec.tiled_symbols`.  Using a list of indices rather than a leading count
-allows different ops in the same loop to tile non-contiguous or differently
+not need to maintain a separate side table.  The `loop_group_id` is the join
+key.  `loop_tiled_dims` is the bridge between the pre-scheduling pass (which
+operates on positional `data.ranges` indices) and the codegen phase (which
+uses named sympy Symbols) — it is read by `create_op_spec` to identify, by
+index, which scheduler-level symbols correspond to the tiled dimensions and
+should be recorded in `OpSpec.tiled_symbols`.  All levels are flattened
+(outermost first) so that `tiled_symbols` covers every loop variable for the
+op.  Using a list-of-lists of indices (rather than a count or a flag) allows
+different ops in the same loop to tile non-contiguous or differently
 positioned dimensions of their respective iteration spaces.
 
 ### `Loops` is a frozen dataclass
@@ -108,28 +110,42 @@ object.__setattr__(data, "ranges", ranges)
 ```python
 def coarse_tile(
     operations: list[Operation],
-    groups: list[tuple],   # (ops, loop_count[, tiled_dims])
+    groups: list[tuple],
     *,
     tiled_dims: list[int] | None = None,
 ) -> None:
 ```
 
-`groups` is a pre-computed list of `(ops, loop_count[, tiled_dims])` tuples
-supplied by the caller (e.g., `config.coarse_tiling_groups_fn`).  Each `ops`
-list must be a contiguous sub-sequence of `operations`; a gap indicates a
-data-flow dependency crossing the group boundary and raises `RuntimeError`.
+`groups` is a pre-computed list of group tuples supplied by the caller
+(e.g., `config.coarse_tiling_groups_fn`).  Each `ops` list must be a
+contiguous sub-sequence of `operations`; a gap indicates a data-flow
+dependency crossing the group boundary and raises `RuntimeError`.
 
-The optional third element of each tuple overrides the `tiled_dims` keyword
-argument for that specific group, allowing different groups to tile different
-iteration-space dimensions.  This is necessary when the logical dimension
-being tiled appears at different indices in each operation's iteration space —
-for example, after work division and stickification, the batch dimension may
-be dim 0 for one op but dim 2 for another.
+Each group tuple takes one of two forms:
 
-The `tiled_dims` keyword is the default: a list of positional indices into
-each op's `data.ranges` to divide by `loop_count`.  `None` (the default)
-divides only dimension 0 (the single outermost dimension).  Overridden
-per-group by a third tuple element.
+**Flat (single loop):**
+
+```python
+(ops, K)               # tile dim 0 by K (default)
+(ops, K, [0, 1])       # tile dims 0 and 1 by K
+```
+
+The optional third element overrides the `tiled_dims` keyword argument for
+that specific group.  `None` (the default) divides only dimension 0.
+
+**Nested (multiple independent loops on the same ops):**
+
+```python
+(ops, [(K1, [0]), (K2, [1])])    # outer K1 on dim 0; inner K2 on dim 1
+(ops, [(K1, [0]), (K2, [0,1])]) # outer K1 on dim 0; inner K2 on dims 0 and 1
+```
+
+The second element is a list of `(count, tiled_dims)` pairs, outermost first.
+The ops end up in the innermost loop body; each level's count divides the
+corresponding dims independently (outermost pass applied first).
+
+`coarse_tile()` normalises flat syntax to the list-of-pairs form internally,
+so `_stamp_group` always works with the canonical representation.
 
 ### Feature flag and groups callable
 
@@ -337,11 +353,14 @@ belong to the inner `OpSpec`s.
 The `body` type is recursive: a `LoopSpec` body may itself contain
 `LoopSpec` entries, representing nested counted loops.
 
-`OpSpec.tiled_symbols` carries the per-op tiling information: the
-iteration-space symbols that are divided by the enclosing loop's `count`.
-It is **empty for ops that are not inside a `LoopSpec`**.  For a tiled op,
-the runtime computes the per-iteration tensor base offset for symbol `s` as
-`loop_var * iteration_space[s].range`.
+`OpSpec.tiled_symbols` carries the per-op tiling information: all
+iteration-space symbols that are divided by any enclosing loop, listed
+**outermost first**.  It is **empty for ops that are not inside a
+`LoopSpec`**.  For a single-level tiled op, `tiled_symbols = [s0]`.  For
+a two-level nested tiled op, `tiled_symbols = [s_outer, s_inner]`.  The
+runtime uses this list together with the enclosing loop variables (also
+outermost-first) to build the affine address formula:
+`base + s_outer_stride * i_outer + s_inner_stride * i_inner`.
 
 Tiling information is stored on `OpSpec` rather than on `LoopSpec` because
 different body ops may tile different iteration-space dimensions.  Two ops in
@@ -352,29 +371,39 @@ per-op `list[Symbol]` can.
 
 ### Nested loops and the `loop_group_id` tree
 
-To support nesting, each `ir.Operation` carries a `loop_group_id` that is
-a **path** rather than a flat integer.  A path is a tuple of integers, one
-element per nesting level:
+Each `ir.Operation` carries a `loop_group_id` that is a **path** rather
+than a flat integer.  A path is a tuple of integers, one element per
+nesting level:
 
 | `loop_group_id` | Meaning |
 |---|---|
 | `(0,)` | outermost loop group 0, not nested |
-| `(0, 1)` | inner loop group 1 inside outer loop group 0 |
-| `(0, 1, 2)` | three levels deep |
+| `(0, 0)` | single op nested two levels deep inside group 0 |
+| `(0, 1)` | ops at depth 2 inside outer group 0, inner group 1 |
 
-`loop_count` remains a single `sympy.Expr` on each op — it is the trip
-count of the **innermost** loop that directly contains this op.  Outer
-loop counts are read from the ops at the corresponding prefix level.
+`loop_count` is a **list** parallel to the path.  For a flat op at
+`(0,)`, `loop_count = [K]`.  For a single op at `(0, 0)`,
+`loop_count = [K1, K2]` — the scheduler reads `loop_count[0] = K1` when
+building the outer `CountedLoopSchedulerNode` and `loop_count[1] = K2`
+when building the inner one.  This allows a single op to supply the counts
+for all its enclosing loops without requiring sibling ops at intermediate
+depths.
 
-The post-fusion pass reconstructs the tree by grouping on prefix:
+The post-fusion pass (`_build_loop_group`) reconstructs the tree
+recursively:
 
-1. Group flat `SchedulerNode` list into runs that share the same
-   outermost group id (first path element).
-2. For each such run, recursively group any nodes whose path length is
-   greater than 1 into nested `CountedLoopSchedulerNode`s (stripping the
-   first path element before recursing).
-3. Wrap the top-level run in a `CountedLoopSchedulerNode` whose
-   `loop_count` is the trip count from the outermost path element.
+1. Group the flat `SchedulerNode` list into runs that share the same
+   outermost group id element (index `depth`).
+2. Read the count for this depth from `_loop_count(node, depth)`, which
+   indexes `loop_count[depth - base_depth]`.  All nodes in the run must
+   agree on this count.
+3. Recursively call `_build_loop_group(run, depth + 1)` to build the
+   inner level.
+4. Wrap the result in a `CountedLoopSchedulerNode(count=K_outer, ...)`.
+
+Because every op carries the full `loop_count` list, the algorithm works
+even when a run contains only a single op that spans all nesting levels —
+there is no need for placeholder ops at intermediate depths.
 
 ### Bundle boundary constraint
 
@@ -481,11 +510,12 @@ LoopSpec(
 ```
 
 `tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it reads
-`loop_tiled_dims` (a `list[int]`) from the `ir.Operation` (stamped by
-`coarse_tile()`) and selects the symbols at those indices from the
-scheduler-level `iteration_space` dict.  `MemoryDep.ranges` preserves the
-`data.ranges` ordering, so this positional correspondence is stable across
-the pre-scheduling to codegen boundary.
+`loop_tiled_dims` (a `list[list[int]]`) from the `ir.Operation` (stamped
+by `coarse_tile()`), flattens all levels outermost-first, and selects the
+symbols at those indices from the scheduler-level `iteration_space` dict.
+`MemoryDep.ranges` preserves the `data.ranges` ordering, so this
+positional correspondence is stable across the pre-scheduling to codegen
+boundary.
 
 `tiled_symbols` is omitted from the serialized source when empty (i.e. for ops
 that are not inside a loop), keeping the generated output identical to the
@@ -557,10 +587,11 @@ The filenames are assigned in depth-first traversal order.
 | `torch_spyre/_inductor/wrapper.py` | Add `LoopSpec` to the generated wrapper's import line |
 | `torch_spyre/_inductor/codegen/bundle.py` | Extend `generate_bundle()` to walk `LoopSpec` tree and emit `scf.for` in `bundle.mlir`; number SDSC JSON files in depth-first order |
 | `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; `_find_unimplemented` recurses into `LoopSpec.body` |
-| `tests/inductor/test_coarse_tile_pass.py` | Unit tests for `coarse_tile()` IR pass (18 tests, including per-group `tiled_dims`) |
-| `tests/inductor/test_bundle_loop.py` | Unit tests for `generate_bundle` with `LoopSpec` including MLIR snapshot tests (27 tests) |
-| `tests/inductor/test_counted_loop_node.py` | Unit tests for `build_loop_scheduler_nodes` (8 tests) |
-| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, per-group tiled dims, bundle interception (6 tests) |
+| `tests/inductor/test_coarse_tile_pass.py` | Unit tests for `coarse_tile()` IR pass (24 tests, including flat, per-group `tiled_dims`, and nested groups) |
+| `tests/inductor/test_bundle_loop.py` | Unit tests for `generate_bundle` with `LoopSpec` including MLIR snapshot tests and nested tiling (36 tests) |
+| `tests/inductor/test_counted_loop_node.py` | Unit tests for `build_loop_scheduler_nodes` (12 tests) |
+| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, per-group tiled dims (5 tests) |
+| `tests/inductor/test_sdsc_tiled_address.py` | Unit tests for `generate_sdsc` tiled address generation and `compile_op_spec` symbol mapping (14 tests) |
 
 ## Invariants and failure modes
 
@@ -570,13 +601,14 @@ pass stamps ops that have a data dependency crossing the group boundary,
 the post-fusion pass will detect a non-contiguous run and raise a
 `RuntimeError`.
 
-**Consistent `loop_count`**: all ops in a group must agree on `loop_count`.
-The post-fusion pass asserts this.
+**Consistent `loop_count`**: all ops sharing a `loop_group_id` must agree
+on `loop_count` at every depth level.  The post-fusion pass asserts this.
 
 **`tiled_symbols` populated iff inside a loop**: `OpSpec.tiled_symbols` is
 non-empty exactly when the op was codegen'd inside a `CountedLoopSchedulerNode`.
-Its elements are a prefix of the op's `iteration_space` keys, with length equal
-to `loop_tiled_dims` on the corresponding `ir.Operation`.
+Its elements are the flattened (outermost-first) per-level tiled dims from
+`loop_tiled_dims` on the corresponding `ir.Operation`, selected from the
+scheduler-level `iteration_space` keys.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
 before `span_reduction`, `k_fast_division`, `work_distribution`, and

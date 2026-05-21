@@ -509,5 +509,109 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         self.assertEqual(mlir, expected)
 
 
+# ---------------------------------------------------------------------------
+# Tests for nested tiling: two-level affine_map with two loop variables
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateBundleNestedTiling(unittest.TestCase):
+    """Verify that nested LoopSpec with a two-entry affine_strides dict produces
+    a 2-dimensional affine_map and nested scf.for loops."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.s0 = Symbol("s0")
+        self.s1 = Symbol("s1")
+
+    def _bundle(self, specs, fake_compile):
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=fake_compile,
+        ):
+            generate_bundle("test_kernel", self.tmpdir, specs)
+        with open(os.path.join(self.tmpdir, "bundle.mlir")) as f:
+            return f.read()
+
+    def _fake_compile_two_strides(self, outer_stride, inner_stride):
+        """Return a fake_compile that injects a two-entry affine_strides dict."""
+        s0, s1 = self.s0, self.s1
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x1000)
+            return (
+                _make_tiled_json(idx, sym_id),
+                [0x1000],
+                [{s0: outer_stride, s1: inner_stride}],
+            )
+
+        return fake_compile
+
+    def test_nested_loop_emits_two_scf_for(self):
+        """Two nested LoopSpecs produce two scf.for blocks."""
+        op = _make_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        self.assertEqual(mlir.count("scf.for"), 2)
+
+    def test_nested_tiling_emits_2d_affine_map(self):
+        """A two-entry affine_strides dict produces affine_map<(d0, d1)[s0] -> ...>."""
+        op = _make_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        self.assertIn("affine_map<(d0, d1)[s0]", mlir)
+        self.assertIn("512*d0", mlir)
+        self.assertIn("64*d1", mlir)
+
+    def test_nested_tiling_affine_apply_uses_both_loop_vars(self):
+        """affine.apply inside the inner loop must reference both %i_0 and %i_1."""
+        op = _make_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        self.assertIn("affine.apply", mlir)
+        apply_line = next(line for line in mlir.splitlines() if "affine.apply" in line)
+        self.assertIn("%i_0", apply_line)
+        self.assertIn("%i_1", apply_line)
+
+    def test_nested_tiling_snapshot(self):
+        """Exact snapshot for a single op inside nested K=4/K=2 loops."""
+        op = _make_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        expected = (
+            "#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 512*d0 + 64*d1)>\n"
+            "module {\n"
+            "\tfunc.func @sdsc_bundle() {\n"
+            "\t\t%c0 = arith.constant 0 : index\n"
+            "\t\t%c1 = arith.constant 1 : index\n"
+            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
+            "\t\t%loop_bound_1 = arith.constant 2 : index\n"
+            "\t\t%sym_1 = arith.constant 4096 : index\n"
+            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
+            "\t\t\tscf.for %i_1 = %c0 to %loop_bound_1 step %c1 {\n"
+            "\t\t\t\t%addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]\n"
+            '\t\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
+            ' "symbol_ids"=[-1]}\n'
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

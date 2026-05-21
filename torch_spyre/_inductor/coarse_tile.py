@@ -14,9 +14,9 @@
 
 """Coarse-tiling IR pass: stamp loop_group_id / loop_count on ir.Operation objects.
 
-Each group of operations is wrapped in a counted outer loop whose trip count is
-``loop_count``.  For every operation in the group the iteration ranges that are
-divided by ``loop_count`` are scaled down by that factor; the resulting (smaller)
+Each group of operations is wrapped in one or more nested counted loops.  For
+every operation in the group the iteration ranges that are divided by each
+loop's trip count are scaled down by that factor; the resulting (smaller)
 per-iteration ranges are what the downstream scheduler and work-division passes
 will see.
 
@@ -25,28 +25,35 @@ A ``loop_group_id`` tuple encodes the nesting path:
   - ``(g, h)``     — inner loop group ``h`` nested inside outer group ``g``
   - etc.
 
-``loop_count`` is always the trip count of the *innermost* loop that directly
-contains the operation, i.e. the loop whose body the operation lives in.
+``loop_count`` is a *list* of trip counts, one per nesting level from outermost
+to innermost.  For a flat (depth-1) group this is a 1-element list ``[K]``.
+``loop_tiled_dims`` is a *list of lists*, one sub-list per nesting level.
 
-Usage::
+Usage — flat (single loop)::
 
     coarse_tile(
         operations,
         groups=[
-            ([op_a, op_b], count_k),         # group 0: tile outermost dim (default)
-            ([op_c], count_m, 1),             # group 1: tile dim 1 specifically
+            ([op_a, op_b], K),            # group 0: tile dim 0 by K (default)
+            ([op_c], K2, [0, 1]),          # group 1: tile dims 0 and 1 by K2
         ],
     )
 
-``groups`` is a list of ``(ops, loop_count[, tiled_dims])`` tuples.  Each
-``ops`` list must be a contiguous sub-sequence of ``operations`` (a gap would
-indicate a data-flow dependency crossing the group boundary).  The optional
-third element ``tiled_dims`` overrides the ``tiled_dims`` keyword argument for
-that group, allowing different groups to tile different iteration-space
-dimensions.  ``tiled_dims`` is a list of positional indices into each op's
-``data.ranges``; e.g. ``[0]`` tiles the outermost dimension, ``[0, 2]`` tiles
-dimensions 0 and 2.  Nested groups are not yet exposed by this API but the
-stamped attributes support them.
+Usage — nested (two independent loops on one op)::
+
+    coarse_tile(
+        operations,
+        groups=[
+            ([op_a], [(K1, [0]), (K2, [1])]),  # outer K1 on dim 0; inner K2 on dim 1
+        ],
+    )
+
+``groups`` is a list of ``(ops, spec[, tiled_dims])`` tuples where ``spec`` is
+either:
+  - a scalar ``loop_count`` (optionally with a third ``tiled_dims`` element), or
+  - a list of ``(loop_count, tiled_dims)`` pairs for nested loops.
+
+Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 """
 
 from __future__ import annotations
@@ -81,27 +88,37 @@ def coarse_tile(
         The full ordered list of IR operations (as seen by
         CustomPreSchedulingPasses).  Not modified; used only for validation.
     groups:
-        Sequence of ``(ops, loop_count[, tiled_dims])`` tuples.  Each ``ops``
-        is a list of ``ComputedBuffer`` operations that belong to the same
-        outermost loop group.  ``loop_count`` is the trip count (may be
-        symbolic).  The optional third element overrides the ``tiled_dims``
-        keyword argument for that specific group, allowing different groups to
-        tile different iteration-space dimensions.
+        Sequence of ``(ops, spec[, tiled_dims])`` tuples.  ``spec`` is either:
+
+        * A scalar ``loop_count`` (with optional third element ``tiled_dims``)
+          for a flat single-level loop — tile all ops in ``ops`` by that count.
+        * A list of ``(loop_count, tiled_dims)`` pairs for nested loops —
+          the outermost pair is first, the innermost last.  The ops end up in
+          the innermost loop body; each level's count and dims are stamped on
+          the op and the corresponding iteration ranges are divided.
     tiled_dims:
-        List of positional indices into each op's ``data.ranges`` that are
-        divided by ``loop_count``.  ``None`` means tile only dimension 0
-        (the single outermost dimension).  Overridden per-group by a third
-        tuple element.
+        Default ``tiled_dims`` for flat groups that do not supply their own.
+        ``None`` means tile only dimension 0.  Ignored for nested-spec groups.
     """
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
     }
 
     for group_idx, group in enumerate(groups):
-        group_ops, loop_count = group[0], group[1]
-        group_tiled_dims = group[2] if len(group) > 2 else tiled_dims
+        group_ops = group[0]
+        spec = group[1]
         group_id: tuple[int, ...] = (group_idx,)
-        _stamp_group(group_ops, group_id, loop_count, group_tiled_dims, op_to_position)
+
+        if isinstance(spec, list):
+            # Nested spec: list of (loop_count, tiled_dims) pairs.
+            levels: list[tuple[Expr, list[int]]] = spec
+        else:
+            # Flat spec: scalar loop_count with optional tiled_dims override.
+            flat_tiled = group[2] if len(group) > 2 else tiled_dims
+            effective_dims: list[int] = [0] if flat_tiled is None else flat_tiled
+            levels = [(spec, effective_dims)]
+
+        _stamp_group(group_ops, group_id, levels, op_to_position)
 
 
 # ---------------------------------------------------------------------------
@@ -112,17 +129,31 @@ def coarse_tile(
 def _stamp_group(
     ops: list[Operation],
     group_id: tuple[int, ...],
-    loop_count: Expr,
-    tiled_dims: list[int] | None,
+    levels: list[tuple[Expr, list[int]]],
     op_to_position: dict[str, int],
 ) -> None:
-    """Stamp loop_group_id / loop_count and divide ranges for a single group."""
+    """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
+
+    ``levels`` is a list of ``(loop_count, tiled_dims)`` pairs, outermost
+    first.  The op receives a ``loop_group_id`` whose length equals
+    ``len(levels)`` (one path element per nesting level).  ``loop_count`` and
+    ``loop_tiled_dims`` are stamped as lists parallel to ``levels``.
+
+    Iteration ranges are divided in outermost-first order: outer count applied
+    to outer dims, then inner count applied to inner dims.
+    """
     if not ops:
         return
 
     _validate_contiguous(ops, op_to_position, group_id)
 
-    effective_tiled_dims: list[int] = [0] if tiled_dims is None else tiled_dims
+    # Build full nested group_id: (group_idx, 0, 0, ...) with len == len(levels).
+    # The inner path elements are always 0 because each level contains exactly
+    # the ops from this group (no siblings at inner depths).
+    nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
+
+    counts = [lvl[0] for lvl in levels]
+    dims_per_level = [lvl[1] for lvl in levels]
 
     for op in ops:
         if not isinstance(op, ComputedBuffer):
@@ -133,18 +164,19 @@ def _stamp_group(
             )
             continue
 
-        _divide_ranges(op, loop_count, effective_tiled_dims)
+        for count, dims in levels:
+            _divide_ranges(op, count, dims)
 
-        op.loop_group_id = group_id  # type: ignore[attr-defined]
-        op.loop_count = loop_count  # type: ignore[attr-defined]
-        op.loop_tiled_dims = effective_tiled_dims  # type: ignore[attr-defined]
+        op.loop_group_id = nested_group_id  # type: ignore[attr-defined]
+        op.loop_count = counts  # type: ignore[attr-defined]
+        op.loop_tiled_dims = dims_per_level  # type: ignore[attr-defined]
 
         logger.debug(
             "coarse_tile: stamped %s loop_group_id=%s loop_count=%s loop_tiled_dims=%s",
             op.get_operation_name(),
-            group_id,
-            loop_count,
-            effective_tiled_dims,
+            nested_group_id,
+            counts,
+            dims_per_level,
         )
 
 

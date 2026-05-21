@@ -96,14 +96,30 @@ def _loop_group_id(node: BaseSchedulerNode):
     return None
 
 
-def _loop_count(node: BaseSchedulerNode) -> sympy.Expr:
-    """Return the loop_count of the ir.Operation inside node."""
+def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
+    """Return the loop_count for ``depth`` from the ir.Operation inside node.
+
+    ``loop_count`` on the ir.Operation is a list of trip counts, one per
+    nesting level from outermost to innermost (stamped by coarse_tile()).
+    ``depth`` is the absolute nesting depth being queried (0 = outermost).
+
+    For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
+    For a nested op with ``loop_group_id = (g, 0)``, ``loop_count = [K1, K2]``
+    and depth 0 → K1, depth 1 → K2.
+    """
     for snode in node.get_nodes():
         if isinstance(snode, SchedulerNode) and snode.node is not None:
-            count = getattr(snode.node, "loop_count", None)
-            if count is not None:
-                return count
-    raise AssertionError(f"Node {node.get_name()} has loop_group_id but no loop_count")
+            raw = getattr(snode.node, "loop_count", None)
+            if raw is not None:
+                counts: list = raw if isinstance(raw, list) else [raw]
+                gid = getattr(snode.node, "loop_group_id", ())
+                # The outermost count is at index (depth - base_depth) where
+                # base_depth is the depth at which this op's counts start.
+                base_depth = len(gid) - len(counts)
+                idx = depth - base_depth
+                if 0 <= idx < len(counts):
+                    return counts[idx]
+    raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
 def _build_loop_group(
@@ -125,9 +141,10 @@ def _build_loop_group(
             continue
 
         outer_key = gid[depth]
-        # loop_count for this level comes from nodes directly at this depth
-        # (path length == depth + 1).  Deeper nodes have their own counts.
-        count = _loop_count(node) if len(gid) == depth + 1 else None
+        # Every node in the run (regardless of path length) supplies the count
+        # for this depth via its loop_count list.  Read it from the first node
+        # and verify all others agree.
+        count = _loop_count(node, depth)
         run = [node]
         i += 1
         while i < len(nodes):
@@ -138,20 +155,13 @@ def _build_loop_group(
                 or next_gid[depth] != outer_key
             ):
                 break
-            if len(next_gid) == depth + 1:
-                next_count = _loop_count(nodes[i])
-                if count is None:
-                    count = next_count
-                else:
-                    assert next_count == count, (
-                        f"Loop group {outer_key} has inconsistent loop_count: "
-                        f"{count} vs {next_count}"
-                    )
+            next_count = _loop_count(nodes[i], depth)
+            assert next_count == count, (
+                f"Loop group {outer_key} has inconsistent loop_count at depth "
+                f"{depth}: {count} vs {next_count}"
+            )
             run.append(nodes[i])
             i += 1
-        assert count is not None, (
-            f"Loop group {outer_key} has no direct members at depth {depth}"
-        )
 
         # Recursively wrap any deeper nesting within this run.
         inner = _build_loop_group(run, depth + 1)

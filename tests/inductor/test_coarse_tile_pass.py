@@ -151,7 +151,8 @@ class TestCoarseTile(unittest.TestCase):
         op = _make_op(data, "op0")
         self._run([op], [([op], Integer(4))])
         self.assertEqual(op.loop_group_id, (0,))
-        self.assertEqual(op.loop_count, Integer(4))
+        self.assertEqual(op.loop_count, [Integer(4)])
+        self.assertEqual(op.loop_tiled_dims, [[0]])
         self.assertEqual(data.ranges[0], Integer(16))
 
     def test_two_groups_get_distinct_ids(self):
@@ -162,8 +163,8 @@ class TestCoarseTile(unittest.TestCase):
         self._run([op0, op1], [([op0], Integer(4)), ([op1], Integer(8))])
         self.assertEqual(op0.loop_group_id, (0,))
         self.assertEqual(op1.loop_group_id, (1,))
-        self.assertEqual(op0.loop_count, Integer(4))
-        self.assertEqual(op1.loop_count, Integer(8))
+        self.assertEqual(op0.loop_count, [Integer(4)])
+        self.assertEqual(op1.loop_count, [Integer(8)])
         self.assertEqual(d0.ranges[0], Integer(8))
         self.assertEqual(d1.ranges[0], Integer(8))
 
@@ -197,7 +198,7 @@ class TestCoarseTile(unittest.TestCase):
         data = _make_pointwise([n])
         op = _make_op(data, "op0")
         self._run([op], [([op], k)])
-        self.assertEqual(op.loop_count, k)
+        self.assertEqual(op.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
     def test_non_contiguous_group_raises(self):
@@ -275,6 +276,84 @@ class TestCoarseTile(unittest.TestCase):
         )
         self.assertEqual(d0.ranges[0], Integer(8))
         self.assertEqual(d0.ranges[1], Integer(16))  # untouched
+
+
+# ---------------------------------------------------------------------------
+# Tests for nested (multi-level) coarse_tile groups
+# ---------------------------------------------------------------------------
+
+
+class TestCoarseTileNested(unittest.TestCase):
+    """Verify that the nested group format [(K1, dims1), (K2, dims2)] works."""
+
+    def test_nested_spec_stamps_list_attributes(self):
+        """loop_count and loop_tiled_dims are lists; loop_group_id has depth 2."""
+        data = _make_pointwise([Integer(256), Integer(128)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+
+        self.assertEqual(op.loop_group_id, (0, 0))
+        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_tiled_dims, [[0], [1]])
+
+    def test_nested_spec_divides_ranges_both_levels(self):
+        """Each level's dims are divided by the corresponding count."""
+        # dim 0: 256 / 4 = 64; dim 1: 128 / 2 = 64
+        data = _make_pointwise([Integer(256), Integer(128)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+
+        self.assertEqual(data.ranges[0], Integer(64))
+        self.assertEqual(data.ranges[1], Integer(64))
+
+    def test_nested_spec_outer_only_divides_outer_dim(self):
+        """Only the dims listed at each level are divided."""
+        # outer: tile dim 0 by 4; inner: tile dim 1 by 8; dim 2 untouched
+        data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(8), [1])])])
+
+        self.assertEqual(data.ranges[0], Integer(8))  # 32 / 4
+        self.assertEqual(data.ranges[1], Integer(8))  # 64 / 8
+        self.assertEqual(data.ranges[2], Integer(16))  # untouched
+
+    def test_flat_and_nested_groups_coexist(self):
+        """A flat group and a nested group in the same coarse_tile call."""
+        d0 = _make_pointwise([Integer(64), Integer(32)])
+        d1 = _make_pointwise([Integer(128), Integer(64)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        coarse_tile(
+            [op0, op1],
+            [
+                ([op0], Integer(4)),  # flat: tile dim 0 by 4
+                ([op1], [(Integer(4), [0]), (Integer(2), [1])]),  # nested
+            ],
+        )
+        # Flat group: depth-1 path, 1-element lists
+        self.assertEqual(op0.loop_group_id, (0,))
+        self.assertEqual(op0.loop_count, [Integer(4)])
+        self.assertEqual(op0.loop_tiled_dims, [[0]])
+        self.assertEqual(d0.ranges[0], Integer(16))
+        self.assertEqual(d0.ranges[1], Integer(32))  # untouched
+
+        # Nested group: depth-2 path, 2-element lists
+        self.assertEqual(op1.loop_group_id, (1, 0))
+        self.assertEqual(op1.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op1.loop_tiled_dims, [[0], [1]])
+        self.assertEqual(d1.ranges[0], Integer(32))  # 128 / 4
+        self.assertEqual(d1.ranges[1], Integer(32))  # 64 / 2
+
+    def test_nested_same_dim_different_counts(self):
+        """Two levels can tile the same dimension by different counts."""
+        # dim 0: 256 / 4 = 64, then 64 / 2 = 32
+        data = _make_pointwise([Integer(256)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [0])])])
+
+        self.assertEqual(data.ranges[0], Integer(32))
+        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_tiled_dims, [[0], [0]])
 
 
 if __name__ == "__main__":

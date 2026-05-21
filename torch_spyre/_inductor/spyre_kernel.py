@@ -454,14 +454,19 @@ class SpyreKernel(Kernel[CSEVariable]):
         }
 
         # If this op is inside a coarse-tiling loop, identify which iteration-space
-        # symbols are tiled by the enclosing loop.  loop_tiled_dims on the IR node
-        # is a list of positional indices into data.ranges that were divided; those
-        # correspond to the symbols at the same positions in the scheduler-level
-        # iteration space (MemoryDep.ranges preserves the data.ranges ordering).
-        loop_tiled_dims: list[int] = getattr(ir_node, "loop_tiled_dims", [])
+        # symbols are tiled by the enclosing loop(s).  loop_tiled_dims on the IR
+        # node is either a flat list[int] (legacy single-level) or a
+        # list[list[int]] (nested multi-level, outermost first).  We flatten all
+        # levels so that tiled_symbols covers every loop variable from outermost
+        # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
+        raw_tiled_dims = getattr(ir_node, "loop_tiled_dims", [])
+        if raw_tiled_dims and not isinstance(raw_tiled_dims[0], list):
+            # Legacy flat list — wrap in a single-level list.
+            raw_tiled_dims = [raw_tiled_dims]
+        all_tiled_dims = [d for level in raw_tiled_dims for d in level]
         it_space_keys = list(it_space.keys())
         tiled_syms = [
-            it_space_keys[i] for i in loop_tiled_dims if i < len(it_space_keys)
+            it_space_keys[i] for i in all_tiled_dims if i < len(it_space_keys)
         ]
 
         return OpSpec(

@@ -341,6 +341,77 @@ def _make_tiled_op_spec() -> OpSpec:
     )
 
 
+class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
+    """Verify compile_op_spec returns two-entry affine_strides for two tiled symbols.
+
+    Uses a 3D tensor [batch=2, rows=4, cols=64] where cols is the stick dimension.
+    Both batch (c0) and rows (c1) appear as explicit device strides, so both
+    tiled symbols produce entries in affine_strides.
+    """
+
+    def _make_3d_op_spec(self) -> OpSpec:
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        fp16 = _FP16
+        tensor_in = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=fp16,
+            device_size=[2, 4, 64],
+            device_coordinates=[c0, c1, c2],
+            allocation={"hbm": 0x1000},
+        )
+        tensor_out = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=fp16,
+            device_size=[2, 4, 64],
+            device_coordinates=[c0, c1, c2],
+            allocation={"hbm": 0x2000},
+        )
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                c0: (Integer(2), 1),
+                c1: (Integer(4), 1),
+                c2: (Integer(64), 1),
+            },
+            args=[tensor_in, tensor_out],
+            op_info={},
+            tiled_symbols=[c0, c1],  # c0 = outer loop, c1 = inner loop
+        )
+
+    def test_two_tiled_symbols_produce_two_stride_entries(self):
+        """An OpSpec with two tiled_symbols yields a two-entry affine_strides dict."""
+        op_spec = self._make_3d_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols)
+
+        # HBM tensors (in and out) should each have two-entry affine_strides dicts.
+        hbm_strides = [d for d in affine_strides if len(d) > 0]
+        self.assertGreater(len(hbm_strides), 0, "Expected at least one tiled tensor")
+        for tensor_strides in hbm_strides:
+            self.assertEqual(
+                len(tensor_strides),
+                2,
+                f"Expected 2 stride entries (one per tiled symbol), got {tensor_strides}",
+            )
+
+    def test_two_tiled_symbols_strides_are_positive(self):
+        """Both stride values must be positive byte counts."""
+        op_spec = self._make_3d_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols)
+
+        for tensor_strides in affine_strides:
+            for sym, stride in tensor_strides.items():
+                self.assertGreater(
+                    stride, 0, f"Expected positive stride for {sym}, got {stride}"
+                )
+
+
 class TestCompileOpSpecSymbolMapping(unittest.TestCase):
     """Verify compile_op_spec translates tiled_symbols through symbol_mapping.
 
