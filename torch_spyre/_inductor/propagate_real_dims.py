@@ -40,7 +40,7 @@ logger = get_inductor_logger("propagate_real_dims")
 
 # Used for propagation of real-dims if this pass runs
 # This pass does not run unless the driver program called annotate_real_dims
-_real_dims: dict[str, int | str] = {}
+_real_dims: dict[str, int] = {}
 _real_tensor_dims = WeakTensorKeyDictionary()
 _enabled = False
 
@@ -223,8 +223,7 @@ def propagate_real_dims(
             logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
         logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
 
-    it = iter(operations)
-    for op in it:
+    for op in operations:
         if op.is_no_op():
             op.real_dims = []
             op.iterations = []
@@ -255,24 +254,22 @@ def propagate_real_dims(
             logger.warning(f"unhandled operation type {type(op)}")
             _set_no_real_dims(op)
 
-    # debug
-
-    print("DECLARED DIMS")
+    logger.info("DECLARED DIMS")
     for name, size in _real_dims.items():
-        print(f"  {name} = {size}")
+        logger.info(f"  {name} = {size}")
 
-    print("INPUT TENSORS")
+    logger.info("INPUT TENSORS")
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if isinstance(tb, TensorBox):
-            print(f"  {name}: real_dims={tb.real_dims}")
+            logger.info(f"  {name}: real_dims={tb.real_dims}")
 
-    print("OPS")
-    for op in iter(operations):
+    logger.info("OPS")
+    for op in operations:
         if not hasattr(op, "rdims") or op.real_dims is None:
             origins = getattr(getattr(op, "data", op), "origins", set())
             aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
-            print(
+            logger.info(
                 f"  {op.get_operation_name()}: skipped ({type(op).__name__} / {type(getattr(op, 'data', op)).__name__})  aten={aten_ops}"
             )
             continue
@@ -280,7 +277,7 @@ def propagate_real_dims(
         origins = getattr(op.data, "origins", set())
         aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
         reduction_type = getattr(op.data, "reduction_type", None)
-        print(
+        logger.info(
             f"  {op.get_operation_name()} ({'reduction' if is_reduction else 'pointwise'})  aten={aten_ops}  reduction_type={reduction_type}"
         )
         rw = op.get_read_writes()
@@ -292,10 +289,10 @@ def propagate_real_dims(
                 host_size = (
                     list(buf.get_layout().size) if hasattr(buf, "get_layout") else "?"
                 )
-                print(
+                logger.info(
                     f"    input {dep.name}: real_dims={real_dims}  host_size={host_size}  index={dep.index}  ranges={dict(dep.ranges)}"
                 )
-        print("    loop vars:")
+        logger.info("    loop vars:")
         ranges = {}
         for dep in all_deps:
             if isinstance(dep, MemoryDep):
@@ -305,10 +302,10 @@ def propagate_real_dims(
             declared = [
                 f"{n}={_real_dims[n] if n in _real_dims else '?'}" for n in names
             ]
-            print(
+            logger.info(
                 f"      {sym}: range={sym_range}  real_dim(s)={names}  declared={declared}"
             )
         if is_reduction:
-            print(f"    reduction over: {op.reduction_dims}")
-        print(f"    output: ({op.get_name()}) real_dims={op.real_dims}")
-        print()
+            logger.info(f"    reduction over: {op.reduction_dims}")
+        logger.info(f"    output: ({op.get_name()}) real_dims={op.real_dims}")
+        logger.info("")
