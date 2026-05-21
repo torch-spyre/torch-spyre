@@ -330,6 +330,7 @@ class TestSpyreModelOps(TestCase):
                 op_name,
                 repr(ops_item.sample_inputs_func.args),
                 repr(ops_item.sample_inputs_func.kwargs),
+                dtype,  # variants with different runtime dtypes are distinct test cases
             )
             if dedup_key in seen_case_keys:
                 pytest.skip(
