@@ -40,6 +40,8 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.clamp` | | Y | Spyre | Custom op + lowering |
 | `torch.pow` | Y | Y | Spyre | |
+| `torch.ceil` | | Y | Spyre | Custom decomposition |
+| `torch.sign` | | Y | Spyre | Custom decomposition |
 | **Pointwise Binary** | | | | |
 | `torch.add` | Y | Y | Spyre | |
 | `torch.sub` | Y | Y | Spyre | |
