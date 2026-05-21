@@ -121,6 +121,8 @@ jobs:
             config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
           - name: Test Stream
             config: torch_spyre_tests/test_stream_config.yaml
+          - name: Test Spyre Profiler
+            config: torch_spyre_tests/test_spyre_profiler_config.yaml
           - name: Test Prepare Kernel
             config: torch_spyre_tests/test_prepare_kernel_config.yaml
           # Inductor tests
@@ -146,6 +148,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_dedup_constants_config.yaml
           - name: Inductor Padding
             config: torch_spyre_tests/inductor/test_padding_config.yaml
+          - name: Inductor Overwrite
+            config: torch_spyre_tests/inductor/test_overwrite.yaml
           - name: Inductor Restickify
             config: torch_spyre_tests/inductor/test_restickify_config.yaml
           - name: Inductor Scratchpad Patterns

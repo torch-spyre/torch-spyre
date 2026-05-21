@@ -14,6 +14,7 @@
 
 from typing import Optional, Sequence
 import torch
+import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.fallbacks import warn_fallback
 from torch_spyre.ops.eager import compile_once
@@ -320,7 +321,19 @@ def overwrite(
     offsets: Sequence[int],
     compiled,
 ) -> None:
-    return compiled(input, output, dims, offsets)
+    # specialize_int=True installs int-equality guards on the int-list
+    # args so each unique (dims, offsets) triggers a fresh trace and a
+    # fresh SDSC binary; without this dynamo's default specialize_int=
+    # False reuses one baked binary across all values and scatters all
+    # writes to the first call's offset (see test_overwrite.py).
+    # Patch is call-scoped to leave process-wide dynamo behavior alone.
+    # Note: this gives one compiled binary per unique (input shape, dims,
+    # offsets) tuple. dynamo's cache_size_limit is bumped to 1024 in
+    # torch_spyre/__init__.py — long-running workloads that scatter into
+    # many distinct slots can blow past that. Symbolic offsets (one
+    # binary, any value) are tracked in issues #220 / #1371-3.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(input, output, dims, offsets)
 
 
 @overwrite.register_fake
