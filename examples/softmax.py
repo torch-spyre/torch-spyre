@@ -27,8 +27,10 @@ torch.manual_seed(0xAFFE)
 R, C = 512, 1024
 x = torch.rand(R, C, dtype=torch.float16)
 
+
 def func(a):
     return torch.softmax(a, dim=0)
+
 
 cpu_result = func(x)
 

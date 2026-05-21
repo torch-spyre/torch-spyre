@@ -41,8 +41,8 @@ declare_real_dim("S", S)
 declare_real_dim("H", H)
 declare_real_dim("D", D)
 
-annotate_real_dims(x_dev, ["B", "S", "H", "D"])   # [2, 128, 32, 128]
-annotate_real_dims(y_dev, ["H", "D", "H", "D"])   # [4096, 4096] = [H*D, H*D]
+annotate_real_dims(x_dev, ["B", "S", "H", "D"])  # [2, 128, 32, 128]
+annotate_real_dims(y_dev, ["H", "D", "H", "D"])  # [4096, 4096] = [H*D, H*D]
 
 compiled = torch.compile(fn)
 result = compiled(x_dev, y_dev).cpu()

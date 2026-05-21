@@ -17,11 +17,11 @@ H = H_KV * GQA  # 32 query heads
 def fn(x, kv_cache):
     # x:        [2, 32, 128, 128]
     # kv_cache: [2, 128, 8, 128]  (as stored: batch, seq, kv_heads, head_dim)
-    y = kv_cache.view(B, S, H_KV, D)       # [2, 128, 8, 128]
-    y = y.permute(0, 2, 1, 3)              # [2, 8, 128, 128]
-    y = y.unsqueeze(2)                      # [2, 8, 1, 128, 128]
-    y = y.expand(-1, -1, GQA, -1, -1)      # [2, 8, 4, 128, 128]
-    y = y.clone()                           # contiguous [2, 8, 4, 128, 128]
+    y = kv_cache.view(B, S, H_KV, D)  # [2, 128, 8, 128]
+    y = y.permute(0, 2, 1, 3)  # [2, 8, 128, 128]
+    y = y.unsqueeze(2)  # [2, 8, 1, 128, 128]
+    y = y.expand(-1, -1, GQA, -1, -1)  # [2, 8, 4, 128, 128]
+    y = y.clone()  # contiguous [2, 8, 4, 128, 128]
     # bmm: x [2*32, 128, 128] @ y.T [2*32, 128, 128]
     return torch.bmm(
         x.reshape(B * H, S, D),
@@ -44,8 +44,12 @@ declare_real_dim("GQA", GQA)
 declare_real_dim("S", S)
 declare_real_dim("D", D)
 
-annotate_real_dims(x_dev, ["B", "H_KV", "GQA", "S", "D"])  # x shape [2,32,128,128]: H=H_KV*GQA tiled
-annotate_real_dims(kv_dev, ["B", "H_KV", "S", "D"])         # kv shape [2,1024,128]: H_KV*S tiled
+annotate_real_dims(
+    x_dev, ["B", "H_KV", "GQA", "S", "D"]
+)  # x shape [2,32,128,128]: H=H_KV*GQA tiled
+annotate_real_dims(
+    kv_dev, ["B", "H_KV", "S", "D"]
+)  # kv shape [2,1024,128]: H_KV*S tiled
 
 compiled = torch.compile(fn)
 result = compiled(x_dev, kv_dev).cpu()

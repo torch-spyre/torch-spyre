@@ -18,8 +18,8 @@ def fn(x_base, y):
     # a previous op outputs 4D [B, S, H, D], then a linear projects it.
     # Inductor sees the 4D buffer and accesses it with a flat reduction
     # index over the last two dims, producing tiled host coords.
-    x = x_base.permute(0, 1, 3, 2)   # [2, 128, 32, 128], non-contiguous
-    x = x.clone()                      # contiguous, stride=[524288, 4096, 128, 1]
+    x = x_base.permute(0, 1, 3, 2)  # [2, 128, 32, 128], non-contiguous
+    x = x.clone()  # contiguous, stride=[524288, 4096, 128, 1]
     # linear: flatten last two dims implicitly via matmul
     return torch.matmul(x.reshape(B, S, H * D), y)
 
@@ -38,8 +38,8 @@ declare_real_dim("S", S)
 declare_real_dim("H", H)
 declare_real_dim("D", D)
 
-annotate_real_dims(x_dev, ["B", "S", "D", "H"])   # [2, 128, 128, 32]
-annotate_real_dims(y_dev, ["H", "D", "H", "D"])   # [4096, 4096] = [H*D, H*D]
+annotate_real_dims(x_dev, ["B", "S", "D", "H"])  # [2, 128, 128, 32]
+annotate_real_dims(y_dev, ["H", "D", "H", "D"])  # [4096, 4096] = [H*D, H*D]
 
 compiled = torch.compile(fn)
 result = compiled(x_dev, y_dev).cpu()

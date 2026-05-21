@@ -17,6 +17,7 @@ x = torch.randn((1, A, B * D * E), dtype=torch.float16) * 0.1
 y = torch.randn((1, A, C, D, E), dtype=torch.float16) * 0.1
 z = torch.randn((1, A, C, 1, 1, 1), dtype=torch.float16) * 0.1
 
+
 def func(w, x, y, z):
     t = w + x
     t = t.view(1, A, B, D, E)
@@ -25,7 +26,7 @@ def func(w, x, y, z):
 
 
 cpu_result = func(w, x, y, z)
-print ("CPU Result shape", cpu_result.shape, "strides", cpu_result.stride())
+print("CPU Result shape", cpu_result.shape, "strides", cpu_result.stride())
 
 w_device = w.to(DEVICE)
 x_device = x.to(DEVICE)
@@ -48,7 +49,7 @@ compiled_sm = torch.compile(func)
 compiled_result = compiled_sm(w_device, x_device, y_device, z_device).cpu()
 
 # print(f"AIU result\n{compiled_result}")
-print ("AIU shape :", compiled_result.shape, "strides:", compiled_result.stride())
+print("AIU shape :", compiled_result.shape, "strides:", compiled_result.stride())
 
 cpu_delta = torch.abs(compiled_result - cpu_result).max()
 print(f"Max delta Compiled Spyre vs. CPU: {cpu_delta}")
@@ -62,15 +63,19 @@ try:
         rtol=0.1,
         msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
     )
-    print ("ANSWER CORRECT!")
+    print("ANSWER CORRECT!")
 
 except AssertionError as e:
     print(e)
 
 
 if cpu_result.stride() == compiled_result.stride():
-    print ("STRIDES CORRECT")
+    print("STRIDES CORRECT")
 else:
-    print (f"ERROR: Stride mismatch: CPU {cpu_result.stride()} vs. Compiled Spyre {compiled_result.stride()}")
+    print(
+        f"ERROR: Stride mismatch: CPU {cpu_result.stride()} vs. Compiled Spyre {compiled_result.stride()}"
+    )
 
-assert (cpu_result.shape == compiled_result.shape), f"Shape mismatch: CPU {cpu_result.shape} vs. Compiled Spyre {compiled_result.shape}"
+assert cpu_result.shape == compiled_result.shape, (
+    f"Shape mismatch: CPU {cpu_result.shape} vs. Compiled Spyre {compiled_result.shape}"
+)
