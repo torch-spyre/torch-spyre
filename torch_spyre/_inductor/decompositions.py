@@ -533,10 +533,6 @@ def spyre__sdpa_overrideable(
     max_seqlen_q = query.size(2)
     max_seqlen_kv = key.size(2)
 
-    query = query.clone(memory_format=torch.contiguous_format)
-    key = key.clone(memory_format=torch.contiguous_format)
-    value = value.clone(memory_format=torch.contiguous_format)
-
     scaling_factor = scale
     if scaling_factor is None:
         scaling_factor = 1.0 / math.sqrt(query.shape[-1])
@@ -549,7 +545,7 @@ def spyre__sdpa_overrideable(
     if expansion != 1:
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-    key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
+    key_t = key.transpose(-2, -1)
 
     attn = torch.matmul(query, key_t)
 
@@ -579,6 +575,7 @@ def spyre__sdpa_overrideable(
     out = torch.matmul(attn, value)
 
     # B, S, H, E
+    # Do not remove contiguous here.
     # This is needed to maintain the API promise from SDPA (attn needs to have same size+stride as q)
     out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
 
