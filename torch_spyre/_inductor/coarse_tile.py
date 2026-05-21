@@ -43,8 +43,10 @@ Usage::
 indicate a data-flow dependency crossing the group boundary).  The optional
 third element ``tiled_dims`` overrides the ``tiled_dims`` keyword argument for
 that group, allowing different groups to tile different iteration-space
-dimensions.  Nested groups are not yet exposed by this API but the stamped
-attributes support them.
+dimensions.  ``tiled_dims`` is a list of positional indices into each op's
+``data.ranges``; e.g. ``[0]`` tiles the outermost dimension, ``[0, 2]`` tiles
+dimensions 0 and 2.  Nested groups are not yet exposed by this API but the
+stamped attributes support them.
 """
 
 from __future__ import annotations
@@ -69,7 +71,7 @@ def coarse_tile(
     operations: list[Operation],
     groups: list[tuple],
     *,
-    tiled_dims: int | None = None,
+    tiled_dims: list[int] | None = None,
 ) -> None:
     """Stamp loop_group_id / loop_count on operations and scale their ranges.
 
@@ -86,9 +88,10 @@ def coarse_tile(
         keyword argument for that specific group, allowing different groups to
         tile different iteration-space dimensions.
     tiled_dims:
-        Default number of leading iteration-space dimensions to divide by
-        ``loop_count``.  ``None`` means tile only the single outermost
-        dimension.  Overridden per-group by a third tuple element.
+        List of positional indices into each op's ``data.ranges`` that are
+        divided by ``loop_count``.  ``None`` means tile only dimension 0
+        (the single outermost dimension).  Overridden per-group by a third
+        tuple element.
     """
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
@@ -110,7 +113,7 @@ def _stamp_group(
     ops: list[Operation],
     group_id: tuple[int, ...],
     loop_count: Expr,
-    tiled_dims: int | None,
+    tiled_dims: list[int] | None,
     op_to_position: dict[str, int],
 ) -> None:
     """Stamp loop_group_id / loop_count and divide ranges for a single group."""
@@ -118,6 +121,8 @@ def _stamp_group(
         return
 
     _validate_contiguous(ops, op_to_position, group_id)
+
+    effective_tiled_dims: list[int] = [0] if tiled_dims is None else tiled_dims
 
     for op in ops:
         if not isinstance(op, ComputedBuffer):
@@ -128,9 +133,8 @@ def _stamp_group(
             )
             continue
 
-        _divide_ranges(op, loop_count, tiled_dims)
+        _divide_ranges(op, loop_count, effective_tiled_dims)
 
-        effective_tiled_dims = 1 if tiled_dims is None else tiled_dims
         op.loop_group_id = group_id  # type: ignore[attr-defined]
         op.loop_count = loop_count  # type: ignore[attr-defined]
         op.loop_tiled_dims = effective_tiled_dims  # type: ignore[attr-defined]
@@ -147,16 +151,16 @@ def _stamp_group(
 def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
-    tiled_dims: int | None,
+    tiled_dims: list[int],
 ) -> None:
-    """Divide the outermost ``tiled_dims`` iteration ranges of op by loop_count.
+    """Divide the specified iteration ranges of op by loop_count.
 
     For a ``Pointwise`` the full ranges are op.data.ranges.
     For a ``Reduction`` the non-reduction (outer) ranges are op.data.ranges;
     op.data.reduction_ranges are left untouched.
 
-    When ``tiled_dims`` is None, only the single outermost dimension is divided.
-    When ``tiled_dims`` is 0 or the op has no ranges, nothing is modified.
+    ``tiled_dims`` is a list of positional indices into ``data.ranges``.
+    Out-of-bounds indices are silently skipped.
     """
     data = op.data
     if not isinstance(data, (Pointwise, Reduction)):
@@ -166,11 +170,9 @@ def _divide_ranges(
     if not ranges:
         return
 
-    n_dims = 1 if tiled_dims is None else min(tiled_dims, len(ranges))
-    if n_dims == 0:
-        return
-
-    for i in range(n_dims):
+    for i in tiled_dims:
+        if i >= len(ranges):
+            continue
         ranges[i] = sympy.Rational(1, 1) * ranges[i] / loop_count
         # Simplify: keep as integer expression when divisible.
         ranges[i] = sympy.simplify(ranges[i])

@@ -455,11 +455,14 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # If this op is inside a coarse-tiling loop, identify which iteration-space
         # symbols are tiled by the enclosing loop.  loop_tiled_dims on the IR node
-        # counts the leading dimensions of data.ranges that were divided; those
-        # correspond to the first N symbols in the scheduler-level iteration space
-        # (MemoryDep.ranges preserves the data.ranges ordering).
-        loop_tiled_dims = getattr(ir_node, "loop_tiled_dims", 0)
-        tiled_syms = list(it_space.keys())[:loop_tiled_dims]
+        # is a list of positional indices into data.ranges that were divided; those
+        # correspond to the symbols at the same positions in the scheduler-level
+        # iteration space (MemoryDep.ranges preserves the data.ranges ordering).
+        loop_tiled_dims: list[int] = getattr(ir_node, "loop_tiled_dims", [])
+        it_space_keys = list(it_space.keys())
+        tiled_syms = [
+            it_space_keys[i] for i in loop_tiled_dims if i < len(it_space_keys)
+        ]
 
         return OpSpec(
             op,

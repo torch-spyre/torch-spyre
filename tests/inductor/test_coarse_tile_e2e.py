@@ -74,17 +74,18 @@ def _groups_split_k4_k8(operations: list[Operation]):
 def _groups_per_op_tiled_dim(operations: list[Operation]):
     """Two groups each tiling a different iteration-space dimension.
 
-    Group 0: first ComputedBuffer, K=4, tiled_dims=1 (tile dim 0, the default).
-    Group 1: second ComputedBuffer, K=4, tiled_dims=2 (tile first two dims,
-             so the second dimension is also divided — exercises the per-group
-             tiled_dims path).
+    Group 0: first ComputedBuffer, K=4, tiled_dims=[0] (tile dim 0, the default).
+    Group 1: second ComputedBuffer, K=4, tiled_dims=[0, 1] (tile both dims 0 and 1,
+             exercises the per-group tiled_dims path).
     """
     ops = [op for op in operations if isinstance(op, ComputedBuffer)]
     groups = []
     if ops[:1]:
         groups.append((ops[:1], sympy.Integer(4)))  # default: tile dim 0
     if ops[1:]:
-        groups.append((ops[1:], sympy.Integer(4), 2))  # override: tile dims 0+1
+        groups.append(
+            (ops[1:], sympy.Integer(4), [0, 1])
+        )  # override: tile dims 0 and 1
     return groups
 
 
@@ -272,7 +273,7 @@ class TestCoarseTileEndToEnd(InductorTestCase):
 
         op_b = neg(x.T): operates on a transposed view so its natural
           iteration space is also [B, D] but logically "D-major".
-          Group 1 uses tiled_dims=2 (tile both dims 0 and 1).
+          Group 1 uses tiled_dims=[0, 1] (tile both dims 0 and 1).
           After tiling K=4: iteration space [B/4, D/4].
 
         Both groups should produce separate LoopSpec(count=sympify('4'))

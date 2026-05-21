@@ -78,7 +78,7 @@ class TestDivideRanges(unittest.TestCase):
     def test_pointwise_single_dim_divided(self):
         data = _make_pointwise([Integer(64)])
         op = _make_op(data)
-        _divide_ranges(op, Integer(4), tiled_dims=None)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges[0], Integer(16))
 
     def test_pointwise_symbolic_count(self):
@@ -86,43 +86,43 @@ class TestDivideRanges(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_op(data)
-        _divide_ranges(op, k, tiled_dims=None)
+        _divide_ranges(op, k, tiled_dims=[0])
         # n / K should simplify to n/K
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
     def test_pointwise_multidim_default_tiles_outermost_only(self):
         data = _make_pointwise([Integer(32), Integer(8)])
         op = _make_op(data)
-        _divide_ranges(op, Integer(4), tiled_dims=None)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
         # Only dim 0 is divided by 4; dim 1 is unchanged
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
 
-    def test_tiled_dims_2(self):
+    def test_tiled_dims_indices_0_1(self):
         data = _make_pointwise([Integer(32), Integer(16), Integer(4)])
         op = _make_op(data)
-        _divide_ranges(op, Integer(4), tiled_dims=2)
+        _divide_ranges(op, Integer(4), tiled_dims=[0, 1])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(4))
         self.assertEqual(data.ranges[2], Integer(4))  # untouched
 
-    def test_tiled_dims_0_no_change(self):
+    def test_tiled_dims_empty_no_change(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data)
         original = list(data.ranges)
-        _divide_ranges(op, Integer(4), tiled_dims=0)
+        _divide_ranges(op, Integer(4), tiled_dims=[])
         self.assertEqual(data.ranges, original)
 
     def test_empty_ranges_no_change(self):
         data = _make_pointwise([])
         op = _make_op(data)
-        _divide_ranges(op, Integer(4), tiled_dims=None)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges, [])
 
     def test_reduction_outer_dims_divided_inner_untouched(self):
         data = _make_reduction([Integer(64)], [Integer(128)])
         op = _make_op(data)
-        _divide_ranges(op, Integer(4), tiled_dims=None)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
         # Outer range is divided
         self.assertEqual(data.ranges[0], Integer(16))
         # Reduction range is left alone
@@ -134,7 +134,7 @@ class TestDivideRanges(unittest.TestCase):
 
         op = _make_op(MagicMock(spec=Operation))
         # Should not raise
-        _divide_ranges(op, Integer(4), tiled_dims=None)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +234,8 @@ class TestCoarseTile(unittest.TestCase):
 
     def test_per_group_tiled_dims_override(self):
         """Each group may carry its own tiled_dims as a third tuple element."""
-        # op0: 2D [32, 16] — tile dim 0 (tiled_dims=1, default)
-        # op1: 2D [8, 64]  — tile dim 1 (tiled_dims override via third element)
+        # op0: 2D [32, 16] — tile dim 0 only (default)
+        # op1: 2D [8, 64]  — tile dims 0 and 1 (per-group override)
         d0 = _make_pointwise([Integer(32), Integer(16)])
         d1 = _make_pointwise([Integer(8), Integer(64)])
         op0 = _make_op(d0, "op0")
@@ -243,8 +243,8 @@ class TestCoarseTile(unittest.TestCase):
         self._run(
             [op0, op1],
             [
-                ([op0], Integer(4)),  # uses default tiled_dims=None → dim 0
-                ([op1], Integer(4), 2),  # per-group override: tile first 2 dims
+                ([op0], Integer(4)),  # uses default tiled_dims=None → [0]
+                ([op1], Integer(4), [0, 1]),  # per-group override: tile dims 0 and 1
             ],
         )
         # op0: dim 0 divided, dim 1 unchanged
@@ -254,15 +254,24 @@ class TestCoarseTile(unittest.TestCase):
         self.assertEqual(d1.ranges[0], Integer(2))
         self.assertEqual(d1.ranges[1], Integer(16))
 
+    def test_non_contiguous_dim_indices(self):
+        """tiled_dims=[0, 2] tiles dims 0 and 2, leaving dim 1 untouched."""
+        data = _make_pointwise([Integer(32), Integer(16), Integer(8)])
+        op = _make_op(data, "op0")
+        self._run([op], [([op], Integer(4), [0, 2])])
+        self.assertEqual(data.ranges[0], Integer(8))  # dim 0 divided
+        self.assertEqual(data.ranges[1], Integer(16))  # dim 1 untouched
+        self.assertEqual(data.ranges[2], Integer(2))  # dim 2 divided
+
     def test_per_group_tiled_dims_none_overrides_kwarg(self):
         """Per-group tiled_dims=None overrides a non-None kwarg default."""
         d0 = _make_pointwise([Integer(32), Integer(16)])
         op0 = _make_op(d0, "op0")
-        # kwarg default would tile 2 dims, but group says None → tile only dim 0
+        # kwarg default would tile dims 0 and 1, but group says None → tile only dim 0
         self._run(
             [op0],
             [([op0], Integer(4), None)],
-            tiled_dims=2,
+            tiled_dims=[0, 1],
         )
         self.assertEqual(d0.ranges[0], Integer(8))
         self.assertEqual(d0.ranges[1], Integer(16))  # untouched

@@ -69,10 +69,10 @@ attached with `setattr`; no Inductor base class is modified.
 |---|---|---|
 | `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. All ops sharing the same tuple form the body of one counted loop at that depth. |
 | `loop_count` | `sympy.Expr` | Trip count of the innermost loop that directly contains this op. Must be identical for every op sharing a `loop_group_id`. |
-| `loop_tiled_dims` | `int` | Number of leading iteration-space dimensions divided by `loop_count` for this op. Different ops in the same group may carry different values here if their iteration spaces are shaped differently (e.g. after work division). Defaults to `1` when the `tiled_dims` argument to `coarse_tile()` is `None`. |
+| `loop_tiled_dims` | `list[int]` | Positional indices into `data.ranges` that are divided by `loop_count` for this op. Different ops in the same group may carry different indices if their iteration spaces are shaped differently (e.g. after work division places the batch dimension at a different position). Defaults to `[0]` when the `tiled_dims` argument to `coarse_tile()` is `None`. |
 
-The pass also **rewrites the op's iteration ranges**: the leading
-`loop_tiled_dims` dimensions are divided by `loop_count` so that each
+The pass also **rewrites the op's iteration ranges**: the dimensions at the
+indices in `loop_tiled_dims` are divided by `loop_count` so that each
 inner `OpSpec` describes only the work done per loop iteration, not the
 full iteration space.
 
@@ -86,9 +86,11 @@ keeping it on each op means the post-fusion pass does not need to maintain
 a separate side table.  The `loop_group_id` is the join key.  `loop_tiled_dims`
 is the bridge between the pre-scheduling pass (which operates on positional
 `data.ranges` indices) and the codegen phase (which uses named sympy Symbols)
-— it is read by `create_op_spec` to identify which scheduler-level symbols
-correspond to the tiled dimensions and should be recorded in
-`OpSpec.tiled_symbols`.
+— it is read by `create_op_spec` to identify, by index, which scheduler-level
+symbols correspond to the tiled dimensions and should be recorded in
+`OpSpec.tiled_symbols`.  Using a list of indices rather than a leading count
+allows different ops in the same loop to tile non-contiguous or differently
+positioned dimensions of their respective iteration spaces.
 
 ### `Loops` is a frozen dataclass
 
@@ -108,7 +110,7 @@ def coarse_tile(
     operations: list[Operation],
     groups: list[tuple],   # (ops, loop_count[, tiled_dims])
     *,
-    tiled_dims: int | None = None,
+    tiled_dims: list[int] | None = None,
 ) -> None:
 ```
 
@@ -122,12 +124,12 @@ argument for that specific group, allowing different groups to tile different
 iteration-space dimensions.  This is necessary when the logical dimension
 being tiled appears at different indices in each operation's iteration space —
 for example, after work division and stickification, the batch dimension may
-be dim 0 for one op but dim 1 for another.
+be dim 0 for one op but dim 2 for another.
 
-The `tiled_dims` keyword is the default: how many leading iteration-space
-dimensions to divide by `loop_count`.  `None` (the default) divides only
-the single outermost dimension.  Overridden per-group by a third tuple
-element.
+The `tiled_dims` keyword is the default: a list of positional indices into
+each op's `data.ranges` to divide by `loop_count`.  `None` (the default)
+divides only dimension 0 (the single outermost dimension).  Overridden
+per-group by a third tuple element.
 
 ### Feature flag and groups callable
 
@@ -479,11 +481,11 @@ LoopSpec(
 ```
 
 `tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it reads
-`loop_tiled_dims` from the `ir.Operation` (stamped by `coarse_tile()`) and
-takes the first `loop_tiled_dims` symbols from the scheduler-level
-`iteration_space` dict.  `MemoryDep.ranges` preserves the `data.ranges`
-ordering, so this positional correspondence is stable across the pre-scheduling
-to codegen boundary.
+`loop_tiled_dims` (a `list[int]`) from the `ir.Operation` (stamped by
+`coarse_tile()`) and selects the symbols at those indices from the
+scheduler-level `iteration_space` dict.  `MemoryDep.ranges` preserves the
+`data.ranges` ordering, so this positional correspondence is stable across
+the pre-scheduling to codegen boundary.
 
 `tiled_symbols` is omitted from the serialized source when empty (i.e. for ops
 that are not inside a loop), keeping the generated output identical to the
