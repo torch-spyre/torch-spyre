@@ -154,7 +154,12 @@ else:
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
+
+if use_new_system:
+    LIBRARIES = ["flex"]
+else:
+    LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 if use_spyre_ccl:
     LIBRARIES.append("spyre_comms")
 
@@ -241,6 +246,8 @@ if __name__ == "__main__":
         ]
         if use_spyre_ccl:
             base_define_macros.append(("USE_SPYRE_CCL", None))
+        if use_new_system:
+            base_define_macros.append(("USE_FLEX_NAMESPACE", None))
 
         ext_modules = [
             CppExtension(
