@@ -23,9 +23,9 @@ import torch
 _tests_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_tests_dir)
 
-from inductor.utils_inductor import ParameterizedTestMeta, cached_randn  # noqa: E402
+from inductor.utils_inductor import ParameterizedTestMeta, cached_randn  # type: ignore[attr-defined]  # noqa: E402
 
-import torch_spyre  # noqa: F401
+import torch_spyre  # noqa: F401, E402
 
 DTYPE = torch.float16
 

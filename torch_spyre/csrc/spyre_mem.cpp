@@ -682,8 +682,8 @@ const at::Tensor& spyre_resize_(
   const auto dtype = c10::typeMetaToScalarType(self.dtype());
   TORCH_CHECK(spyre::is_supported_dtype(dtype),
               "Spyre backend does not support dtype ", dtype);
-  const size_t new_storage_bytes = at::detail::computeStorageNbytesContiguous(
-      size_int, self.itemsize());
+  const size_t new_storage_bytes =
+      at::detail::computeStorageNbytesContiguous(size_int, self.itemsize());
   auto* self_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   // Case 2: Same-numel or shrink — metadata-only update, no reallocation.
   //

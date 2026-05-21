@@ -221,19 +221,31 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
 void SpyreStream::executeProgramAsync(
     const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
-  // NOTE: Maybe it's better/faster if we know the exact number of arguments
-  // as it is tracked inside KerntlArtifacts
   std::vector<const flex::CompositeAddress*> tensor_allocs;
+  std::vector<uint64_t> tensor_byte_offsets;
   for (size_t i = 0; i < args.size(); ++i) {
     auto* ctx = static_cast<SharedOwnerCtx*>(
         args[i].storage().data_ptr().get_context());
     tensor_allocs.push_back(&ctx->composite_addr);
+
+    int64_t byte_offset =
+        args[i].storage_offset() * static_cast<int64_t>(args[i].element_size());
+    // Only pass stick-aligned offsets (multiples of DEVICE_ALIGNMENT = 128
+    // bytes). Non-aligned offsets are handled by _normalize_storage_offset in
+    // kernel_runner.py.
+    uint64_t safe_offset =
+        (byte_offset > 0 &&
+         byte_offset % static_cast<int64_t>(flex::DEVICE_ALIGNMENT) == 0)
+            ? static_cast<uint64_t>(byte_offset)
+            : 0;
+    tensor_byte_offsets.push_back(safe_offset);
   }
 
   // Program
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
   flex::RuntimeOperationCompute compute_op(
-      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
+      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path,
+      std::move(tensor_byte_offsets));
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
