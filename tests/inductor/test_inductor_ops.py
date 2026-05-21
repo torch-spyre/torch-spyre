@@ -38,11 +38,13 @@ POINTWISE_UNARY_OPS_DICT = {
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "sign": torch.sign,
     "sin": torch.sin,
     "tanh": torch.tanh,
 }
 
 POINTWISE_UNARY_OPS_FP32_DICT = {
+    "ceil": torch.ceil,
     "floor": torch.floor,
 }
 
