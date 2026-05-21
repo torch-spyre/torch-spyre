@@ -26,6 +26,9 @@ No device or backend compiler is required.
 
 import unittest
 
+import os
+import tempfile
+
 from sympy import Integer, Symbol
 
 from torch_spyre._C import DataFormats
@@ -33,7 +36,8 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _tiled_byte_stride,
     generate_sdsc,
 )
-from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec
+from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec, compile_op_spec
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 
 _FP16 = DataFormats.SEN169_FP16  # 64 elems/stick → 2 bytes per element
 
@@ -249,13 +253,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         ids = [int(v) for v in data.values()]
         self.assertTrue(all(i <= -6 for i in ids), f"Expected ids ≤ -6, got {ids}")
 
-    def test_multi_core_same_base_deduped_within_sdsc(self):
-        """Two cores with the same tiled base address share one symbol entry.
+    def test_multi_core_tiled_per_core_symbols(self):
+        """Two cores in a tiled op each get their own iter-0 base address symbol.
 
-        With work_slices={s: 2} the non-tiled slice offset is zero for both
-        cores (because the s dim is tiled and therefore zeroed in the base
-        computation).  Both cores' base address equals start_address, so
-        offset_as_symbol deduplicates and only one entry lands in symbols.
+        With work_slices={s: 2} core 0 starts at start_address and core 1 at
+        start_address + 1 * stride * bytes.  Both symbols are registered so
+        that each core's per-iteration address is: sym + affine_stride * iter.
         """
         s = Symbol("s")
         core_id = Symbol("core_id")
@@ -291,11 +294,97 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[s]
         )
 
-        # Both cores zero-out the tiled dim → same base address → one symbol.
-        self.assertEqual(len(symbols), 1)
+        # Each core gets its own iter-0 base symbol.
+        # core_idx_to_slice_offset: wk_slice[s]=1, stride=128, work_slices[s]=2
+        # → offset = 1 * 128 // 2 = 64 elements → 64 * 2 bytes = 128 bytes
+        # core 0: 0x1000 + 0 = 0x1000
+        # core 1: 0x1000 + 128 = 0x1080
+        self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0x1000)
+        self.assertEqual(symbols[1], 0x1000 + 128)
         # Tiled stride is still present.
         self.assertIn(s, affine_strides[0])
+
+
+# ---------------------------------------------------------------------------
+# Tests for compile_op_spec: symbol_mapping translation of tiled_symbols
+# ---------------------------------------------------------------------------
+
+
+def _make_tiled_op_spec() -> OpSpec:
+    """Minimal OpSpec with tiled_symbols that compile_op_spec can process."""
+    c0 = Symbol("c0")
+    fp16 = _FP16
+    tensor_in = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=fp16,
+        device_size=[2, 64],
+        device_coordinates=[Integer(0), c0],
+        allocation={"hbm": 0x1000},
+    )
+    tensor_out = TensorArg(
+        is_input=False,
+        arg_index=1,
+        device_dtype=fp16,
+        device_size=[2, 64],
+        device_coordinates=[Integer(0), c0],
+        allocation={"hbm": 0x2000},
+    )
+    return OpSpec(
+        op="add",
+        is_reduction=False,
+        iteration_space={c0: (Integer(128), 1)},
+        args=[tensor_in, tensor_out],
+        op_info={},
+        tiled_symbols=[c0],
+    )
+
+
+class TestCompileOpSpecSymbolMapping(unittest.TestCase):
+    """Verify compile_op_spec translates tiled_symbols through symbol_mapping.
+
+    parse_op_spec renames inductor symbols (c0, c1, ...) to SDSC dimension
+    labels (mb, out, ...).  compile_op_spec must apply the same mapping to
+    tiled_symbols before forwarding them to generate_sdsc.  Without this
+    translation generate_sdsc finds no matching symbol in tensor.strides and
+    returns affine_strides=[{}, ...], causing generate_bundle to fall back to
+    static addresses instead of affine.apply.
+    """
+
+    def test_affine_strides_non_empty_for_tiled_op(self):
+        """compile_op_spec returns non-empty affine_strides when tiled_symbols is set."""
+        op_spec = _make_tiled_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols)
+
+        has_strides = any(len(d) > 0 for d in affine_strides)
+        self.assertTrue(
+            has_strides,
+            f"Expected non-empty affine_strides; got {affine_strides}. "
+            "tiled_symbols may not have been translated through symbol_mapping.",
+        )
+
+    def test_generate_bundle_emits_affine_apply_for_tiled_loop(self):
+        """generate_bundle emits affine.apply when OpSpec carries tiled_symbols."""
+        from torch_spyre._inductor.codegen.bundle import generate_bundle
+
+        op_spec = _make_tiled_op_spec()
+        loop = LoopSpec(count=Integer(4), body=[op_spec])
+        tmpdir = tempfile.mkdtemp()
+        generate_bundle("test_kernel", tmpdir, [loop])
+
+        with open(os.path.join(tmpdir, "bundle.mlir")) as f:
+            mlir = f.read()
+
+        self.assertIn(
+            "affine.apply",
+            mlir,
+            "Expected affine.apply in bundle.mlir. "
+            "symbol_mapping translation may be broken in compile_op_spec.",
+        )
+        self.assertIn("affine_map", mlir)
+        self.assertIn("scf.for", mlir)
 
 
 if __name__ == "__main__":

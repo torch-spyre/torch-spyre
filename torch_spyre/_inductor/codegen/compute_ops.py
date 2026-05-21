@@ -284,7 +284,11 @@ def generate_sdsc(
                 offset_as_symbol(full_addr)
             affine_strides.append({})
         else:
-            # Tiled HBM: base address = start + non-tiled core offset (tiled dims @ iter 0).
+            # Tiled HBM: symbol value = per-core iter-0 base address.
+            # The affine map adds loop_var * tile_stride on top at runtime.
+            # Per-core intra-iteration offsets are preserved (not zeroed), so
+            # each core gets a distinct symbol tracking its own starting row
+            # within iteration 0.
             strides_for_tensor = {}
             for s in tensor_tiled:
                 strides_for_tensor[s] = _tiled_byte_stride(
@@ -292,13 +296,7 @@ def generate_sdsc(
                 )
             for c in range(sdsc_spec.num_cores):
                 base_addr = tensor.start_address + core_idx_to_slice_offset(
-                    tensor,
-                    # Zero out the tiled dims so we get the iteration-0 base.
-                    {
-                        k: (0 if k in [str(s) for s in tensor_tiled] else v)
-                        for k, v in core_id_to_wk_slice[str(c)].items()
-                    },
-                    sdsc_spec.work_slices,
+                    tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
                 offset_as_symbol(base_addr)
             affine_strides.append(strides_for_tensor)
@@ -310,22 +308,11 @@ def generate_sdsc(
                 f"[{c}, 0, 0]": str(tensor.start_address)
                 for c in range(sdsc_spec.num_cores)
             }
-        tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
         result = {}
         for c in range(sdsc_spec.num_cores):
-            if not tensor_tiled:
-                addr = tensor.start_address + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                ) * num_bytes(tensor.data_format)
-            else:
-                addr = tensor.start_address + core_idx_to_slice_offset(
-                    tensor,
-                    {
-                        k: (0 if k in [str(s) for s in tensor_tiled] else v)
-                        for k, v in core_id_to_wk_slice[str(c)].items()
-                    },
-                    sdsc_spec.work_slices,
-                ) * num_bytes(tensor.data_format)
+            addr = tensor.start_address + core_idx_to_slice_offset(
+                tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+            ) * num_bytes(tensor.data_format)
             result[f"[{c}, 0, 0]"] = str(offset_as_symbol(addr))
         return result
 
