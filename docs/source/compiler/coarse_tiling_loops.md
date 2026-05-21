@@ -68,7 +68,7 @@ attached with `setattr`; no Inductor base class is modified.
 | Attribute | Type | Meaning |
 |---|---|---|
 | `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. All ops sharing the same tuple form the body of one counted loop at that depth. |
-| `loop_count` | `sympy.Expr` | Trip count of the innermost loop that directly contains this op. Must be identical for every op sharing a `loop_group_id`. |
+| `loop_count` | `sympy.Expr` | Trip count of the loop at **this op's nesting depth** — i.e. the loop whose body directly contains this op. For a flat `(0,)` group this is the sole loop count. For nested groups, each depth level reads its count from the ops whose path length equals that depth (e.g. ops with `loop_group_id=(0,)` carry the outer count; ops with `loop_group_id=(0, 1)` carry the inner count). Must be identical for every op sharing the same `loop_group_id`. |
 | `loop_tiled_dims` | `list[int]` | Positional indices into `data.ranges` that are divided by `loop_count` for this op. Different ops in the same group may carry different indices if their iteration spaces are shaped differently (e.g. after work division places the batch dimension at a different position). Defaults to `[0]` when the `tiled_dims` argument to `coarse_tile()` is `None`. |
 
 The pass also **rewrites the op's iteration ranges**: the dimensions at the
@@ -81,9 +81,9 @@ loops.  See "Nested loops and the `loop_group_id` tree" below.
 
 ### Why these three attributes are sufficient
 
-`loop_count` is redundant across all ops in a group (they must agree), but
-keeping it on each op means the post-fusion pass does not need to maintain
-a separate side table.  The `loop_group_id` is the join key.  `loop_tiled_dims`
+`loop_count` is redundant across all ops sharing the same `loop_group_id`
+(they must agree), but keeping it on each op means the post-fusion pass does
+not need to maintain a separate side table.  The `loop_group_id` is the join key.  `loop_tiled_dims`
 is the bridge between the pre-scheduling pass (which operates on positional
 `data.ranges` indices) and the codegen phase (which uses named sympy Symbols)
 — it is read by `create_op_spec` to identify, by index, which scheduler-level
