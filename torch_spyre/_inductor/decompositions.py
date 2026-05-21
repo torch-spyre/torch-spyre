@@ -374,6 +374,16 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     return torch.eq(input, zero)
 
 
+@register_spyre_decomposition([torch.ops.aten.sign.default])
+def spyre_sign(input: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros_like(input)
+    return torch.where(
+        torch.gt(input, zero),
+        torch.ones_like(input),
+        torch.where(torch.lt(input, zero), -torch.ones_like(input), zero),
+    )
+
+
 @register_spyre_decomposition([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
 def addmm_decomp(
     input: torch.Tensor,
@@ -678,6 +688,13 @@ def decompose_cat(
         return output
     else:
         return orig_decomp
+
+
+@register_spyre_decomposition([torch.ops.aten.ceil.default])
+def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aten.neg.default(
+        torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
