@@ -351,5 +351,163 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         self.assertEqual(mlir, expected)
 
 
+# ---------------------------------------------------------------------------
+# Tests for generate_bundle with non-empty affine_strides (tiled address path)
+# ---------------------------------------------------------------------------
+
+
+def _make_tiled_json(idx: int, sym_id: int) -> dict:
+    """Return a minimal SDSC JSON with one HBM tensor whose symbol ID is sym_id."""
+    return {
+        f"{idx}_add": {
+            "numCoresUsed_": 1,
+            "dscs_": [
+                {
+                    "add": {
+                        "scheduleTree_": [
+                            {
+                                "component_": "hbm",
+                                "startAddressCoreCorelet_": {
+                                    "data_": {"[0, 0, 0]": str(sym_id)}
+                                },
+                            }
+                        ]
+                    }
+                }
+            ],
+        }
+    }
+
+
+class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
+    """Verify scf.for + affine.apply emission when compile_op_spec returns strides."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._s = Symbol("s")
+
+    def _bundle(self, specs, fake_compile):
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=fake_compile,
+        ):
+            generate_bundle("test_kernel", self.tmpdir, specs)
+        with open(os.path.join(self.tmpdir, "bundle.mlir")) as f:
+            return f.read()
+
+    def test_tiled_tensor_emits_affine_apply(self):
+        """A tiled tensor inside a LoopSpec produces an affine.apply in the MLIR."""
+        s = self._s
+        stride = 16384
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x1000)
+            return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}]
+
+        op = _make_op_spec("a")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        self.assertIn("affine_map", mlir)
+        self.assertIn(str(stride), mlir)
+        self.assertIn("affine.apply", mlir)
+        self.assertIn("%addr_0", mlir)
+        self.assertIn(
+            'sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json"', mlir
+        )
+        self.assertIn('"symbol_ids"=[-1]', mlir)
+
+    def test_non_tiled_tensor_in_loop_no_affine_apply(self):
+        """A non-tiled tensor inside a LoopSpec uses %sym_N directly, no affine.apply."""
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x2000)
+            return _make_tiled_json(idx, sym_id), [0x2000], [{}]
+
+        op = _make_op_spec("b")
+        loop = LoopSpec(count=Integer(2), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        self.assertNotIn("affine.apply", mlir)
+        self.assertNotIn("affine_map", mlir)
+        self.assertIn("%sym_1", mlir)
+        self.assertIn("sdscbundle.sdsc_execute (%sym_1)", mlir)
+
+    def test_affine_map_stride_at_module_level(self):
+        """affine_map definition must appear before 'module {' body."""
+        s = self._s
+        stride = 8192
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x3000)
+            return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}]
+
+        op = _make_op_spec("c")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        map_pos = mlir.index("affine_map")
+        module_pos = mlir.index("module {")
+        self.assertLess(map_pos, module_pos, "affine_map must precede module {")
+
+    def test_affine_apply_inside_scf_for(self):
+        """affine.apply must appear inside the scf.for body (after it, before })."""
+        s = self._s
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x4000)
+            return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}]
+
+        op = _make_op_spec("d")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        for_pos = mlir.index("scf.for")
+        apply_pos = mlir.index("affine.apply")
+        execute_pos = mlir.index("sdsc_execute")
+        self.assertLess(for_pos, apply_pos)
+        self.assertLess(apply_pos, execute_pos)
+
+    def test_tiled_snapshot(self):
+        """Exact snapshot for a single tiled op in a loop."""
+        s = self._s
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x1000)
+            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}]
+
+        op = _make_op_spec("a")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        expected = (
+            "#map_0 = affine_map<(d0)[s0] -> (s0 + 256*d0)>\n"
+            "module {\n"
+            "\tfunc.func @sdsc_bundle() {\n"
+            "\t\t%c0 = arith.constant 0 : index\n"
+            "\t\t%c1 = arith.constant 1 : index\n"
+            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
+            "\t\t%sym_1 = arith.constant 4096 : index\n"
+            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
+            "\t\t\t%addr_0 = affine.apply #map_0(%i_0)[%sym_1]\n"
+            '\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
+            ' "symbol_ids"=[-1]}\n'
+            "\t\t}\n"
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

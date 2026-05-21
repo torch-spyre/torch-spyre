@@ -307,6 +307,51 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "Expected loop count 4 in generated source",
         )
 
+    # ------------------------------------------------------------------
+    # tiled_symbols wiring: verify coarse_tile → loop_tiled_dims →
+    # OpSpec.tiled_symbols → compile_op_spec
+    # ------------------------------------------------------------------
+
+    @config.patch({"coarse_tiling": True, "coarse_tiling_groups_fn": _groups_all_k4})
+    def test_tiled_symbols_flow_through_compile_op_spec(self):
+        """coarse_tile stamps loop_tiled_dims, which reaches compile_op_spec as
+        non-empty tiled_symbols on each OpSpec inside the LoopSpec."""
+        from torch_spyre._inductor.codegen import superdsc as _superdsc_mod
+
+        captured_tiled: list[list] = []
+        original_compile = _superdsc_mod.compile_op_spec
+
+        def recording_compile(idx, op_spec, symbols, symbol_id_offset=0):
+            captured_tiled.append(list(op_spec.tiled_symbols))
+            return original_compile(idx, op_spec, symbols, symbol_id_offset)
+
+        x = torch.randn(256, 128, dtype=torch.float16).to("spyre")
+
+        def fn(x):
+            return torch.abs(x)
+
+        with (
+            mock_patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=recording_compile,
+            ),
+            mock_patch("subprocess.run"),
+            mock_patch(_LAUNCH_KERNEL),
+        ):
+            cfn = torch.compile(fn)
+            cfn(x)
+
+        self.assertTrue(
+            len(captured_tiled) > 0,
+            "compile_op_spec was never called — coarse_tiling pipeline may be broken",
+        )
+        has_tiled = any(len(syms) > 0 for syms in captured_tiled)
+        self.assertTrue(
+            has_tiled,
+            f"Expected at least one OpSpec with non-empty tiled_symbols; "
+            f"got: {captured_tiled}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
