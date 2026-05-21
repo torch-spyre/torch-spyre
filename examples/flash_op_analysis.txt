@@ -1,0 +1,41 @@
+flash attention op analysis
+===========================
+
+op0: skipped
+  type: FallbackKernel
+  reason: FallbackKernel is not a ComputedBuffer with Pointwise/Reduction data.
+  This is torch.zeros_like(Q) -- an allocation op that falls back to CPU.
+  No real_dims propagation possible; correct to skip.
+
+op1: skipped
+  type: MultiOutput
+  reason: MultiOutput is the output extraction from a multi-result FallbackKernel.
+  It has no Pointwise/Reduction data, so real_dims cannot be computed.
+  Correct to skip; but note downstream ops reading from MultiOutput will also skip.
+
+op2: skipped
+  type: FallbackKernel
+  reason: Same as op0. This is torch.full((B,H,L), -inf) -- another CPU fallback allocation.
+
+op3: skipped
+  type: MultiOutput
+  reason: Same as op1. Output extraction from the torch.full FallbackKernel.
+
+op4: PROCESSED (pointwise) -- CORRECT
+  source: K_block_T = K_block.transpose(-1, -2).contiguous()  (first block, offset=0)
+         aten: slice + permute + clone
+  K annotated ["B","H","NB","BS","D"] where NB=2, BS=128, NB*BS=L=256.
+  Input arg1_1 index = 16384*d0 + d1 + 64*d2
+    d0: range=8   -> H=8   ✓
+    d2: range=128 -> BS=128 ✓
+    d1: range=64  -> D=64  ✓
+  Output buf4 host_size=[1,8,64,128] = (B,H,D,BS) after transpose.
+  Output real_dims=['H','D','BS'] -- correct, reflects transposed shape.
+
+op5: PROCESSED (reduction) -- CORRECT
+  source: scores = torch.matmul(Q, K_block_T) * scale  (first block)
+         aten: spyre.batched_matmul  reduction_type=batchmatmul
+  Q (arg0_1) index = 16384*d0 + 64*d1 + d3 -> d0=H, d1=L, d3=D ✓
+  K_block_T (buf4) index = 8192*d0 + d2 + 128*d3 -> d0=H, d2=BS, d3=D ✓
+  d3=D is the reduction dim (contracted between Q and K_block_T) ✓
+  output buf5 host_size=(B,H,L,BS), real_dims=['H','L','BS'] ✓

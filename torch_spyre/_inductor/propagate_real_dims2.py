@@ -31,8 +31,9 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP
-from .pass_utils import host_coordinates
+from .pass_utils import host_coordinates, device_coordinates
 from .views import matching_dim, compute_coordinates
+from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
 logger = get_inductor_logger("propagate_real_dims")
@@ -80,18 +81,26 @@ def _compute_real_layout(real_dims):
 def compute_input_real_dims(dep: MemoryDep) -> dict:
     """Map loop vars to real dim names for a single input dep, using real-space coords."""
     buf = _get_buffer(dep)
+    if not hasattr(buf, 'real_dims') or buf.real_dims is None:
+        # Scalar broadcast: constant index, contributes nothing to rdims
+        if not dep.index.free_symbols:
+            return {}
+        return None
     real_size, real_stride = _compute_real_layout(buf.real_dims)
     coords = compute_coordinates(real_size, real_stride, dep.ranges, dep.index)
-    # build stride → name lookup
-    stride_map = {s: n for s, n in zip(real_stride, buf.real_dims)}
-    # print(f"  compute_input_real_dims: dep={dep.name} real_dims={buf.real_dims}")
-    # print(f"    coords={coords} stride_map={stride_map}")
     result = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:
             sym = _lone_sym(coord)
-            result.setdefault(sym, []).append(buf.real_dims[i])
-            # print(f"    coord={coord} sym={sym} -> {buf.real_dims[i]}")
+            name = buf.real_dims[i]
+            actual_range = int(dep.ranges[sym])
+            declared_size = _real_dims.get(name)
+            if declared_size is not None and actual_range != declared_size:
+                logger.warning(
+                    f"{dep.name}: loop var {sym} has range {actual_range} "
+                    f"but maps to '{name}' declared as {declared_size} -- partial/sliced dim"
+                )
+            result.setdefault(sym, []).append(name)
     return result
 
 
@@ -105,18 +114,25 @@ def coords_to_real_dims(coords: list, rdims: dict) -> list:
     result = []
     for c in coords:
         if c.free_symbols:
-            result.extend(rdims[_lone_sym(c)])
+            sym = _lone_sym(c)
+            if sym not in rdims:
+                logger.warning(f"coords_to_real_dims: no mapping for {sym} -- returning None")
+                return None
+            result.extend(rdims[sym])
     return result
 
 
 def get_input_real_dims(inputs: list) -> dict:
     """
     Manage real_dims for all inputs, mapping dims from upstream node to this node.
-    Must handle views, etc.
+    Returns None if any input has no real_dims.
     """
     rdims = {}
     for inp in inputs:
-        rdims.update(compute_input_real_dims(inp))
+        new = compute_input_real_dims(inp)
+        if new is None:
+            return None
+        rdims.update(new)
     return rdims
 
 
@@ -130,39 +146,28 @@ def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
     return _lone_sym(reduction_coord)
 
 
-def _reduction_real_dims(op, inputs):
-    """
-    Works for single input reductions and matmul
-    """
-    rdims = get_input_real_dims(inputs)
-
-    # Part 2: reduction dimension mapping
-    out_coords = op_out_coords(op)
-    reduction_var = get_reduction_dim(inputs[0], out_coords)
-    op.real_dims = coords_to_real_dims(out_coords, rdims)
-    op.reduction_dims = rdims[reduction_var]
-    op.rdims = rdims
-
-
-def _pointwise_real_dims(op, inputs):
-    # Part 1: compute input real dims (generic, op-agnostic)
-    rdims = get_input_real_dims(inputs)
-
-    # Part 2: pointwise dimension mapping (no reduction)
-    out_coords = op_out_coords(op)
-    op.real_dims = coords_to_real_dims(out_coords, rdims)
-    op.rdims = rdims
+def _set_no_real_dims(op):
+    op.real_dims = None
+    op.reduction_dims = None
+    op.rdims = {}
 
 
 def _compute_real_dims(op, inputs):
-    """
-    Augment op with real ranges and output real dims
-    """
+    rdims = get_input_real_dims(inputs)
+    if rdims is None:
+        _set_no_real_dims(op)
+        return
+    out_coords = op_out_coords(op)
+    real_dims = coords_to_real_dims(out_coords, rdims)
+    if real_dims is None:
+        _set_no_real_dims(op)
+        return
+    op.real_dims = real_dims
+    op.rdims = rdims
     if isinstance(op.data, Reduction):
-        return _reduction_real_dims(op, inputs)
-    if isinstance(op.data, Pointwise):
-        return _pointwise_real_dims(op, inputs)
-    raise NotImplementedError(f"real dims not implemented for {type(op.data)}")
+        op.reduction_dims = rdims[get_reduction_dim(inputs[0], out_coords)]
+    else:
+        op.reduction_dims = None
 
 
 def propagate_real_dims(
@@ -188,6 +193,20 @@ def propagate_real_dims(
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
                 tb.real_dims = _real_tensor_dims.get(real_input)
 
+    def _dump_dep(label, dep):
+        buf = V.graph.get_buffer(dep.name)
+        layout = buf.get_layout() if hasattr(buf, 'get_layout') else None
+        real_dims = getattr(buf, 'real_dims', '?')
+        logger.debug(f"  {label} {dep.name}: real_dims={real_dims}")
+        if layout is not None:
+            logger.debug(f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}")
+            logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
+        stl = getattr(buf, 'layout', None)
+        if isinstance(stl, SpyreTensorLayout):
+            logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
+            logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
+        logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
+
     it = iter(operations)
     for op in it:
         if op.is_no_op():
@@ -196,17 +215,27 @@ def propagate_real_dims(
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
+            origins = getattr(op.data, 'origins', set())
+            aten_ops = [str(n.target) for n in origins if hasattr(n, 'target')]
+            reduction_type = getattr(op.data, 'reduction_type', None)
+            logger.debug(f"\n--- {op.get_operation_name()} ({type(op.data).__name__}) aten={aten_ops} reduction_type={reduction_type}")
             rw = op.get_read_writes()
             inputs = []
             for input in rw.reads:
                 if isinstance(input, MemoryDep):
                     inputs.append(input)
+                    _dump_dep("input", input)
+            for write in rw.writes:
+                if isinstance(write, MemoryDep):
+                    _dump_dep("output", write)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_real_dims(op, inputs)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
+                _set_no_real_dims(op)
         else:
             logger.warning(f"unhandled operation type {type(op)}")
+            _set_no_real_dims(op)
 
     # debug
 
@@ -222,18 +251,24 @@ def propagate_real_dims(
 
     print("OPS")
     for op in iter(operations):
-        if not hasattr(op, 'rdims'):
-            print(f"  {op.get_operation_name()}: no rdims")
+        if not hasattr(op, 'rdims') or op.real_dims is None:
+            origins = getattr(getattr(op, 'data', op), 'origins', set())
+            aten_ops = [str(n.target) for n in origins if hasattr(n, 'target')]
+            print(f"  {op.get_operation_name()}: skipped ({type(op).__name__} / {type(getattr(op, 'data', op)).__name__})  aten={aten_ops}")
             continue
         is_reduction = isinstance(op.data, Reduction)
-        print(f"  {op.get_operation_name()} ({'reduction' if is_reduction else 'pointwise'})")
+        origins = getattr(op.data, 'origins', set())
+        aten_ops = [str(n.target) for n in origins if hasattr(n, 'target')]
+        reduction_type = getattr(op.data, 'reduction_type', None)
+        print(f"  {op.get_operation_name()} ({'reduction' if is_reduction else 'pointwise'})  aten={aten_ops}  reduction_type={reduction_type}")
         rw = op.get_read_writes()
         all_deps = list(rw.reads) + list(rw.writes)
         for dep in rw.reads:
             if isinstance(dep, MemoryDep):
                 buf = _get_buffer(dep)
                 real_dims = getattr(buf, 'real_dims', '?')
-                print(f"    input {dep.name}: real_dims={real_dims}  index={dep.index}  ranges={dict(dep.ranges)}")
+                host_size = list(buf.get_layout().size) if hasattr(buf, 'get_layout') else '?'
+                print(f"    input {dep.name}: real_dims={real_dims}  host_size={host_size}  index={dep.index}  ranges={dict(dep.ranges)}")
         print(f"    loop vars:")
         ranges = {}
         for dep in all_deps:

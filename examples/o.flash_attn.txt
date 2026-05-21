@@ -1,0 +1,144 @@
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch._inductor.ir.FallbackKernel'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch._inductor.ir.MultiOutput'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch._inductor.ir.FallbackKernel'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch._inductor.ir.MultiOutput'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch_spyre._inductor.ir.SpyreConstantFallback'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch_spyre._inductor.ir.SpyreConstantFallback'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch._inductor.ir.FallbackKernel'>
+[WARNING] [propagate_real_dims2] unhandled operation type <class 'torch._inductor.ir.MultiOutput'>
+/home/marnold/dt-inductor/torch-spyre/torch_spyre/_inductor/customops.py:220: FallbackWarning: torch.ops.spyre.full is falling back to cpu
+  warn_fallback("torch.ops.spyre.full")
+DECLARED DIMS
+  B = 1
+  H = 8
+  L = 256
+  NB = 2
+  BS = 128
+  D = 64
+INPUT TENSORS
+  arg0_1: real_dims=['B', 'H', 'L', 'D']
+  arg1_1: real_dims=['B', 'H', 'NB', 'BS', 'D']
+  arg2_1: real_dims=['B', 'H', 'NB', 'BS', 'D']
+OPS
+  op0: skipped (FallbackKernel / FallbackKernel)  aten=['spyre.full.default']
+  op1: skipped (MultiOutput / MultiOutput)  aten=['spyre.full.default']
+  op2: skipped (FallbackKernel / FallbackKernel)  aten=['spyre.full.default']
+  op3: skipped (MultiOutput / MultiOutput)  aten=['spyre.full.default']
+  op4 (pointwise)  aten=['aten.clone.default', 'aten.permute.default', 'aten.slice.Tensor']  reduction_type=None
+    input arg1_1: real_dims=['B', 'H', 'NB', 'BS', 'D']  host_size=[1, 8, 256, 64]  index=16384*d0 + d1 + 64*d2  ranges={d0: 8, d1: 64, d2: 128}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+      d1: range=64  real_dim(s)=['D']  declared=['D=64']
+    output: (buf4) real_dims=['H', 'D', 'BS']
+
+  op5 (reduction)  aten=['spyre.batched_matmul.default']  reduction_type=batchmatmul
+    input arg0_1: real_dims=['B', 'H', 'L', 'D']  host_size=[1, 8, 256, 64]  index=16384*d0 + 64*d1 + d3  ranges={d0: 8, d1: 256, d2: 128, d3: 64}
+    input buf4: real_dims=['H', 'D', 'BS']  host_size=[1, 8, 64, 128]  index=8192*d0 + d2 + 128*d3  ranges={d0: 8, d1: 256, d2: 128, d3: 64}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d1: range=256  real_dim(s)=['L']  declared=['L=256']
+      d3: range=64  real_dim(s)=['D']  declared=['D=64']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+    reduction over: ['D']
+    output: (buf5) real_dims=['H', 'L', 'BS']
+
+  op6: skipped (SpyreConstantFallback / SpyreConstantFallback)  aten=['spyre.constant.default']
+  op7 (pointwise)  aten=['aten.mul.Tensor']  reduction_type=None
+    input buf5: real_dims=['H', 'L', 'BS']  host_size=[1, 8, 256, 128]  index=32768*d0 + 128*d1 + d2  ranges={d0: 8, d1: 256, d2: 128}
+    input buf6: real_dims=None  host_size=[]  index=0  ranges={}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d1: range=256  real_dim(s)=['L']  declared=['L=256']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+    output: (buf7) real_dims=['H', 'L', 'BS']
+
+  op8 (pointwise)  aten=['aten.clone.default', 'aten.permute.default']  reduction_type=None
+    input buf7: real_dims=['H', 'L', 'BS']  host_size=[1, 8, 256, 128]  index=32768*d0 + d1 + 128*d2  ranges={d0: 8, d1: 128, d2: 256}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d2: range=256  real_dim(s)=['L']  declared=['L=256']
+      d1: range=128  real_dim(s)=['BS']  declared=['BS=128']
+    output: (buf8) real_dims=['H', 'BS', 'L']
+
+  op9 (reduction)  aten=['aten.amax.default']  reduction_type=max
+    input buf8: real_dims=['H', 'BS', 'L']  host_size=[1, 8, 128, 256]  index=32768*d0 + d1 + 256*d2  ranges={d0: 8, d1: 256, d2: 128}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+      d1: range=256  real_dim(s)=['L']  declared=['L=256']
+    reduction over: ['BS']
+    output: (buf9) real_dims=['H', 'L']
+
+  op10: skipped (ComputedBuffer / Pointwise)  aten=['aten.maximum.default']
+  op11: skipped (ComputedBuffer / Pointwise)  aten=['aten.sub.Tensor']
+  op12: skipped (ComputedBuffer / Pointwise)  aten=['aten.exp.default']
+  op13: skipped (ComputedBuffer / Pointwise)  aten=['aten.mul.Tensor', 'aten.unsqueeze.default']
+  op14: skipped (ComputedBuffer / Pointwise)  aten=['aten.sub.Tensor', 'aten.unsqueeze.default']
+  op15: skipped (ComputedBuffer / Pointwise)  aten=['aten.exp.default']
+  op16: skipped (ComputedBuffer / Reduction)  aten=['spyre.batched_matmul.default', 'aten.permute.default', 'aten.slice.Tensor']
+  op17: skipped (ComputedBuffer / Pointwise)  aten=['aten.add.Tensor']
+  op18 (pointwise)  aten=['aten.clone.default', 'aten.permute.default', 'aten.slice.Tensor']  reduction_type=None
+    input arg1_1: real_dims=['B', 'H', 'NB', 'BS', 'D']  host_size=[1, 8, 256, 64]  index=16384*d0 + d1 + 64*d2 + 8192  ranges={d0: 8, d1: 64, d2: 128}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+      d1: range=64  real_dim(s)=['D']  declared=['D=64']
+    output: (buf18) real_dims=['H', 'D', 'BS']
+
+  op19 (reduction)  aten=['spyre.batched_matmul.default']  reduction_type=batchmatmul
+    input arg0_1: real_dims=['B', 'H', 'L', 'D']  host_size=[1, 8, 256, 64]  index=16384*d0 + 64*d1 + d3  ranges={d0: 8, d1: 256, d2: 128, d3: 64}
+    input buf18: real_dims=['H', 'D', 'BS']  host_size=[1, 8, 64, 128]  index=8192*d0 + d2 + 128*d3  ranges={d0: 8, d1: 256, d2: 128, d3: 64}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d1: range=256  real_dim(s)=['L']  declared=['L=256']
+      d3: range=64  real_dim(s)=['D']  declared=['D=64']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+    reduction over: ['D']
+    output: (buf19) real_dims=['H', 'L', 'BS']
+
+  op20: skipped (SpyreConstantFallback / SpyreConstantFallback)  aten=['spyre.constant.default']
+  op21 (pointwise)  aten=['aten.mul.Tensor']  reduction_type=None
+    input buf19: real_dims=['H', 'L', 'BS']  host_size=[1, 8, 256, 128]  index=32768*d0 + 128*d1 + d2  ranges={d0: 8, d1: 256, d2: 128}
+    input buf20: real_dims=None  host_size=[]  index=0  ranges={}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d1: range=256  real_dim(s)=['L']  declared=['L=256']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+    output: (buf21) real_dims=['H', 'L', 'BS']
+
+  op22 (pointwise)  aten=['aten.clone.default', 'aten.permute.default']  reduction_type=None
+    input buf21: real_dims=['H', 'L', 'BS']  host_size=[1, 8, 256, 128]  index=32768*d0 + d1 + 128*d2  ranges={d0: 8, d1: 128, d2: 256}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d2: range=256  real_dim(s)=['L']  declared=['L=256']
+      d1: range=128  real_dim(s)=['BS']  declared=['BS=128']
+    output: (buf22) real_dims=['H', 'BS', 'L']
+
+  op23 (reduction)  aten=['aten.amax.default']  reduction_type=max
+    input buf22: real_dims=['H', 'BS', 'L']  host_size=[1, 8, 128, 256]  index=32768*d0 + d1 + 256*d2  ranges={d0: 8, d1: 256, d2: 128}
+    loop vars:
+      d0: range=8  real_dim(s)=['H']  declared=['H=8']
+      d2: range=128  real_dim(s)=['BS']  declared=['BS=128']
+      d1: range=256  real_dim(s)=['L']  declared=['L=256']
+    reduction over: ['BS']
+    output: (buf23) real_dims=['H', 'L']
+
+  op24: skipped (ComputedBuffer / Pointwise)  aten=['aten.maximum.default']
+  op25: skipped (ComputedBuffer / Pointwise)  aten=['aten.sub.Tensor']
+  op26: skipped (ComputedBuffer / Pointwise)  aten=['aten.exp.default']
+  op27: skipped (ComputedBuffer / Pointwise)  aten=['aten.mul.Tensor', 'aten.unsqueeze.default']
+  op28: skipped (ComputedBuffer / Pointwise)  aten=['aten.sub.Tensor', 'aten.unsqueeze.default']
+  op29: skipped (ComputedBuffer / Pointwise)  aten=['aten.exp.default']
+  op30: skipped (ComputedBuffer / Reduction)  aten=['spyre.batched_matmul.default', 'aten.permute.default', 'aten.slice.Tensor']
+  op31: skipped (ComputedBuffer / Pointwise)  aten=['aten.add.Tensor']
+  op32: skipped (FallbackKernel / FallbackKernel)  aten=['spyre.full.default']
+  op33: skipped (MultiOutput / MultiOutput)  aten=['spyre.full.default']
+  op34: skipped (ComputedBuffer / Pointwise)  aten=['aten.mul.Tensor']
+  op35: skipped (ComputedBuffer / Reduction)  aten=['aten.sum.dim_IntList']
+  op36: skipped (ComputedBuffer / Pointwise)  aten=['aten.add.Tensor']
+  op37: skipped (ComputedBuffer / Pointwise)  aten=['aten.mul.Tensor']
+  op38: skipped (ComputedBuffer / Reduction)  aten=['aten.sum.dim_IntList']
+  op39: skipped (ComputedBuffer / Pointwise)  aten=['aten.add.Tensor']
+  op40: skipped (ComputedBuffer / Pointwise)  aten=['aten.div.Tensor', 'aten.unsqueeze.default']
+Max delta Compiled Spyre vs. CPU: 0.0048828125

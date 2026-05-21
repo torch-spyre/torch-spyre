@@ -163,11 +163,20 @@ def propagate_real_dims(
                 if isinstance(input, MemoryDep):
                     inputs.append(input)
             if isinstance(op.data, (Pointwise, Reduction)):
-                _compute_real_dims(op, inputs)
+                if any(_get_buffer(inp).real_dims is None for inp in inputs):
+                    logger.warning(f"skipping {op.get_operation_name()}: input has no real_dims")
+                    op.real_dims = None
+                    op.real_ranges = None
+                else:
+                    _compute_real_dims(op, inputs)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
+                op.real_dims = None
+                op.real_ranges = None
         else:
             logger.warning(f"unhandled operation type {type(op)}")
+            op.real_dims = None
+            op.real_ranges = None
 
     # debug
 
