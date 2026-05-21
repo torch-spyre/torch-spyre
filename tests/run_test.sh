@@ -40,10 +40,10 @@
 # Segfault resilience
 # -------------------
 # If a file-level pytest run exits with any signal (exit >= 128, e.g. SIGSEGV/139
-# or C-level abort/255), the file is automatically retried with "-n1" via
-# pytest-xdist.  xdist spawns each test in a worker subprocess; when a worker
-# crashes the xdist controller catches the worker death, records that test as
-# ERROR, and continues with the remaining tests.
+# or C-level abort/255), the file is automatically retried with "-n1" and
+# "--max-worker-restart 999999" via pytest-xdist.  xdist spawns each test in
+# a worker subprocess; when a worker crashes the xdist controller catches the
+# worker death, records that test as ERROR, and continues with the remaining tests.
 #
 # --collect-only is NOT used as the fallback strategy: the process that crashes
 # during test execution often also crashes during collection, yielding zero IDs.
@@ -1374,7 +1374,8 @@ _run_pytest_isolated() {
 # Called when a file-level pytest run exits with a signal (exit >= 128, most
 # commonly SIGSEGV or exit 255 from a C-level abort).
 #
-# Re-runs the same file with "-n1" (pytest-xdist, 1 worker subprocess).
+# Re-runs the same file with "-n1" (pytest-xdist, 1 worker subprocess) and
+# "--max-worker-restart 999999" (pytest-xdist, restart worker up to 999999 times).
 # xdist spawns each test in a worker process; when a worker crashes the
 # xdist controller catches the worker death, marks that test as ERROR, and
 # continues with the remaining tests
@@ -1417,7 +1418,7 @@ _run_xdist_fallback() {
         fi
     fi
 
-    local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
+    local _xdist_args=("-n1" "--max-worker-restart 999999" "${_extra[@]+"${_extra[@]}"}")
     [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
 
     _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "${_xdist_args[@]}"
