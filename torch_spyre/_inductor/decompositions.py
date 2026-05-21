@@ -636,18 +636,6 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.max((values, indices))
 
 
-@register_spyre_decomposition([torch.ops.aten.amax.out])
-def spyre_amax_out_decomp(input, dim=None, keepdim=False, *, out):
-    """
-    Decompose amax.out variant by computing result and copying to output.
-    The .default variant is handled by multi_dim_reduction_pass.
-    """
-    # Use the Python API which will use .default internally
-    result = torch.amax(input, dim=dim, keepdim=keepdim)
-    out.copy_(result)
-    return out
-
-
 @register_spyre_decomposition([torch.ops.aten.cat.default])
 def decompose_cat(
     tensors: list[torch.Tensor],
