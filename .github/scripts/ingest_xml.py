@@ -6,7 +6,7 @@ batch-inserts the results into ClickHouse.
 Usage (called by the GHA workflow):
     python3 ingest_xml.py \
         --xml-dir xml_artifacts \
-        --workflow "module-tests" \
+        --workflow "model-module-tests" \
         --branch   "main" \
         --sha      "abcdef1234..." \
         --run-id   "12345678" \

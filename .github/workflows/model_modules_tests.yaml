@@ -1,4 +1,4 @@
-name: module-tests
+name: model-module-tests
 
 on:
   # Run automatically on every merge to main
@@ -28,7 +28,7 @@ permissions:
   checks: write
 
 jobs:
-  module-tests:
+  model-module-tests:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
