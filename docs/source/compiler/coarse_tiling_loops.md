@@ -69,21 +69,26 @@ attached with `setattr`; no Inductor base class is modified.
 |---|---|---|
 | `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. All ops sharing the same tuple form the body of one counted loop at that depth. |
 | `loop_count` | `sympy.Expr` | Trip count of the innermost loop that directly contains this op. Must be identical for every op sharing a `loop_group_id`. |
+| `loop_tiled_dims` | `int` | Number of leading iteration-space dimensions divided by `loop_count` for this op. Different ops in the same group may carry different values here if their iteration spaces are shaped differently (e.g. after work division). Defaults to `1` when the `tiled_dims` argument to `coarse_tile()` is `None`. |
 
-The pass also **rewrites the op's iteration ranges**: the dimension being
-tiled is divided by `loop_count` so that each inner `OpSpec` describes only
-the work done per loop iteration, not the full iteration space.
+The pass also **rewrites the op's iteration ranges**: the leading
+`loop_tiled_dims` dimensions are divided by `loop_count` so that each
+inner `OpSpec` describes only the work done per loop iteration, not the
+full iteration space.
 
 `loop_group_id` is a tuple rather than a flat integer to support nested
 loops.  See "Nested loops and the `loop_group_id` tree" below.
 
-### Why these two attributes are sufficient
+### Why these three attributes are sufficient
 
 `loop_count` is redundant across all ops in a group (they must agree), but
 keeping it on each op means the post-fusion pass does not need to maintain
-a separate side table.  The `loop_group_id` is the join key; it does not
-need to carry any other information because the reduced iteration space is
-already embedded in the op's `ranges`.
+a separate side table.  The `loop_group_id` is the join key.  `loop_tiled_dims`
+is the bridge between the pre-scheduling pass (which operates on positional
+`data.ranges` indices) and the codegen phase (which uses named sympy Symbols)
+— it is read by `create_op_spec` to identify which scheduler-level symbols
+correspond to the tiled dimensions and should be recorded in
+`OpSpec.tiled_symbols`.
 
 ### `Loops` is a frozen dataclass
 
@@ -304,13 +309,22 @@ bug in the tiling pass.  The post-fusion pass asserts contiguity.
 
 ## Layer 3 — `LoopSpec` and codegen
 
-### `LoopSpec` in `op_spec.py`
+### `LoopSpec` and `OpSpec.tiled_symbols` in `op_spec.py`
 
 ```python
 @dataclasses.dataclass
 class LoopSpec:
     count: sympy.Expr
     body: list[OpSpec | UnimplementedOp | LoopSpec]
+
+@dataclasses.dataclass
+class OpSpec:
+    op: str
+    is_reduction: bool
+    iteration_space: dict[Symbol, tuple[Expr, int]]
+    args: Sequence[TensorArg]
+    op_info: dict[str, Any]
+    tiled_symbols: list[Symbol] = field(default_factory=list)
 ```
 
 `LoopSpec` is a peer of `OpSpec` and `UnimplementedOp` in the list that
@@ -320,6 +334,19 @@ belong to the inner `OpSpec`s.
 
 The `body` type is recursive: a `LoopSpec` body may itself contain
 `LoopSpec` entries, representing nested counted loops.
+
+`OpSpec.tiled_symbols` carries the per-op tiling information: the
+iteration-space symbols that are divided by the enclosing loop's `count`.
+It is **empty for ops that are not inside a `LoopSpec`**.  For a tiled op,
+the runtime computes the per-iteration tensor base offset for symbol `s` as
+`loop_var * iteration_space[s].range`.
+
+Tiling information is stored on `OpSpec` rather than on `LoopSpec` because
+different body ops may tile different iteration-space dimensions.  Two ops in
+the same loop group can have different `tiled_symbols` if, for example, work
+division or stickification places the batch dimension at different positions in
+each op's iteration space.  A single `int` on `LoopSpec` cannot express this;
+per-op `list[Symbol]` can.
 
 ### Nested loops and the `loop_group_id` tree
 
@@ -437,16 +464,30 @@ A `LoopSpec` entry is serialized as:
 LoopSpec(
     count=sympify('K'),
     body=[
-        OpSpec(...),
+        OpSpec(
+            ...,
+            tiled_symbols=[sympify('c0')],   # emitted only when non-empty
+        ),
         LoopSpec(          # nested loop
             count=sympify('J'),
             body=[
-                OpSpec(...),
-            ]
+                OpSpec(..., tiled_symbols=[sympify('c0'), sympify('c1')]),
+            ],
         ),
-    ]
+    ],
 )
 ```
+
+`tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it reads
+`loop_tiled_dims` from the `ir.Operation` (stamped by `coarse_tile()`) and
+takes the first `loop_tiled_dims` symbols from the scheduler-level
+`iteration_space` dict.  `MemoryDep.ranges` preserves the `data.ranges`
+ordering, so this positional correspondence is stable across the pre-scheduling
+to codegen boundary.
+
+`tiled_symbols` is omitted from the serialized source when empty (i.e. for ops
+that are not inside a loop), keeping the generated output identical to the
+pre-tiling baseline for non-tiled kernels.
 
 The generated Python wrapper imports `LoopSpec` from `op_spec.py` so the
 serialized source is re-loadable from the Inductor cache.
@@ -505,12 +546,12 @@ The filenames are assigned in depth-first traversal order.
 
 | File | Change |
 |---|---|
-| `torch_spyre/_inductor/op_spec.py` | Add `LoopSpec` dataclass (recursive body type) |
-| `torch_spyre/_inductor/spyre_kernel.py` | Add `SpyreKernel.wrap_op_specs_in_loop()`; extend `codegen_kernel()` to serialize `LoopSpec` recursively; fix `arg_index` fixup to walk nested bodies |
+| `torch_spyre/_inductor/op_spec.py` | Add `LoopSpec` dataclass (recursive body type); add `tiled_symbols: list[Symbol]` to `OpSpec` |
+| `torch_spyre/_inductor/spyre_kernel.py` | Add `SpyreKernel.wrap_op_specs_in_loop()`; extend `codegen_kernel()` to serialize `LoopSpec` recursively; populate `OpSpec.tiled_symbols` in `create_op_spec`; fix `arg_index` fixup to walk nested bodies |
 | `torch_spyre/_inductor/scheduler.py` | Add `CountedLoopSchedulerNode(FusedSchedulerNode)` with `unpack()` override; add `build_loop_scheduler_nodes` and `_codegen_counted_loop`/`_codegen_loop_body` to `SuperDSCScheduling` |
 | `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call in `CustomPreSchedulingPasses`; reorder `CustomPostFusionPasses` to `[memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]` |
 | `torch_spyre/_inductor/config.py` | Add `coarse_tiling: bool` flag and `coarse_tiling_groups_fn` callable |
-| `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps tuple `loop_group_id` paths and `loop_count` on ops, rewrites `ranges` via `object.__setattr__` |
+| `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps `loop_group_id`, `loop_count`, and `loop_tiled_dims` on ops; rewrites `ranges` via `object.__setattr__` |
 | `torch_spyre/_inductor/wrapper.py` | Add `LoopSpec` to the generated wrapper's import line |
 | `torch_spyre/_inductor/codegen/bundle.py` | Extend `generate_bundle()` to walk `LoopSpec` tree and emit `scf.for` in `bundle.mlir`; number SDSC JSON files in depth-first order |
 | `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; `_find_unimplemented` recurses into `LoopSpec.body` |
@@ -529,6 +570,11 @@ the post-fusion pass will detect a non-contiguous run and raise a
 
 **Consistent `loop_count`**: all ops in a group must agree on `loop_count`.
 The post-fusion pass asserts this.
+
+**`tiled_symbols` populated iff inside a loop**: `OpSpec.tiled_symbols` is
+non-empty exactly when the op was codegen'd inside a `CountedLoopSchedulerNode`.
+Its elements are a prefix of the op's `iteration_space` keys, with length equal
+to `loop_tiled_dims` on the corresponding `ir.Operation`.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
 before `span_reduction`, `k_fast_division`, `work_distribution`, and
