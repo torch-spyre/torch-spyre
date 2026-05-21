@@ -28,7 +28,7 @@ namespace spyre {
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepH2D::construct(
     LaunchContext&) const {
   auto op = std::unique_ptr<flex::RuntimeOperationH2D>(
-      flex::RuntimeOperationH2D::create(host_address_, device_address_));
+      flex::RuntimeOperationH2D::create(host_address_, &device_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
@@ -36,7 +36,7 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepH2D::construct(
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepD2H::construct(
     LaunchContext&) const {
   auto op = std::unique_ptr<flex::RuntimeOperationD2H>(
-      flex::RuntimeOperationD2H::create(device_address_, host_address_));
+      flex::RuntimeOperationD2H::create(&device_address_, host_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
@@ -54,11 +54,13 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
     }
 
     auto op =
-        std::make_unique<flex::RuntimeOperationCompute>(&binary_address_, inp);
+        std::unique_ptr<flex::RuntimeOperationCompute>(
+          flex::RuntimeOperationCompute::create(&binary_address_, inp));
     op->setPipelineBarrier(pipeline_barrier_);
     return op;
   }
-  auto op = std::make_unique<flex::RuntimeOperationCompute>(&binary_address_);
+  auto op = std::unique_ptr<flex::RuntimeOperationCompute>(
+    flex::RuntimeOperationCompute::create(&binary_address_));
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }

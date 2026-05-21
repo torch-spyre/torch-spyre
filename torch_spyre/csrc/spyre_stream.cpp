@@ -212,12 +212,12 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
   // Create and launch operation
   if (host2device) {
     auto op =
-        flex::RuntimeOperationH2D::create(cpu_ptr, *device_address, dci_ptr);
+        flex::RuntimeOperationH2D::create(cpu_ptr, device_address, dci_ptr);
     flex_stream->launchOperation(*op);
     flex::RuntimeOperationH2D::destroyOperation(op);
   } else {
     auto op =
-        flex::RuntimeOperationD2H::create(*device_address, cpu_ptr, dci_ptr);
+        flex::RuntimeOperationD2H::create(device_address, cpu_ptr, dci_ptr);
     flex_stream->launchOperation(*op);
     flex::RuntimeOperationD2H::destroyOperation(op);
   }
@@ -237,7 +237,7 @@ void SpyreStream::executeProgramAsync(
   // Program
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
   auto compute_op = flex::RuntimeOperationCompute::create(
-      ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
+      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
