@@ -6,15 +6,17 @@ on:
     branches: [main]
     paths-ignore:
       - tests/docs/**
+      - docs/**
   pull_request:
     branches: [main]
     paths-ignore:
       - tests/docs/**
+      - docs/**
   merge_group:
     types: [checks_requested]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -64,70 +66,23 @@ jobs:
             config: test_profiler_config.yaml
 
     steps:
-      - name: Checkout PR branch/commit in pre-cloned torch-spyre
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_REF: ${{ github.ref }}
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          # The pre-cloned repo may be owned by a different user than the
-          # runner process; mark all directories as safe to avoid git's
-          # "dubious ownership" error (covers the repo and any submodules).
-          git config --global --add safe.directory '*'
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          # Prefer the PR head SHA when triggered by pull_request, otherwise
-          # fall back to the SHA of the push/tag that triggered the workflow.
-          TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
-          TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
-          echo "TARGET_REF=${TARGET_REF}"
-          echo "TARGET_SHA=${TARGET_SHA}"
-          git fetch --tags --force origin "+${TARGET_SHA}" || \
-            git fetch --tags --force origin
-          git checkout --force "${TARGET_SHA}"
-          git submodule sync --recursive
-          git submodule update --init --recursive --force
-          git log -1 --oneline
+      # Sparse checkout into the GHA workspace so the local composite
+      # actions under .github/actions/ are available. The pre-cloned
+      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
+      # against.
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
 
-      - name: Gather runner info
-        run: |
-          echo "================================="
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          date
-          pwd
-          whoami
-          id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          echo "TORCH_ROOT $TORCH_ROOT"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo "--- env ---"
-          env | sort
-          echo "--- AIU env ---"
-          env | sort | grep AIU || true
-          echo "--- repo listing ---"
-          ls -lart "$CLONED_TORCH_SPYRE_DIR"
-          echo "================================="
+      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
 
-      - name: Build torch-spyre
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-          uv sync \
-            --verbose \
-            --all-extras \
-            --active \
-            --inexact \
-            --reinstall-package torch-spyre
-          uv pip show torch
-          uv pip freeze
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} upstream test suite
         run: |
@@ -164,7 +119,7 @@ jobs:
       # ---------------------------------------------------------------------------
       - name: Upload JUnit XML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}

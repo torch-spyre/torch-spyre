@@ -67,6 +67,10 @@ _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cp
 
 @instantiate_parametrized_tests
 class TestSpyre(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
@@ -97,6 +101,15 @@ class TestSpyre(TestCase):
 
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
+
+    def test_empty_factory_in_device_context(self):
+        # The error only repros if at least one allocation
+        # has already happened
+        _ = torch.empty(64, dtype=torch.float16, device="spyre")
+
+        with torch.device("spyre"):
+            a = torch.empty(50, dtype=torch.float16)
+        self.assertEqual(a.device.type, "spyre")
 
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)
@@ -222,16 +235,16 @@ class TestSpyre(TestCase):
         ):
             b = a.to(device="spyre").add(2.0).to(device="cpu")
 
-        self.assertEqual(b.ndim, 1)
+        self.assertEqual(b.ndim, 0)
         self.assertEqual(b.numel(), 1)
 
         expected = a + 2
         if dtype == torch.float8_e4m3fn:
-            torch.testing.assert_close(b.float(), expected.reshape(1).float())
+            torch.testing.assert_close(b.float(), expected.float())
         else:
             torch.testing.assert_close(
                 b,
-                expected.reshape(1),
+                expected,
                 rtol=2e-3,
                 atol=1e-5,
                 check_dtype=False,

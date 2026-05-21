@@ -76,7 +76,7 @@ class TestFallbacks(TestCase):
         self.atol = 1e-3
         self.dtype = torch.float16
 
-        torch.random.manual_seed(42)
+        torch.manual_seed(0xAFFE)
 
         warnings.simplefilter("ignore", FallbackWarning)
 

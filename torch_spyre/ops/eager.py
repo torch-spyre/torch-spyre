@@ -106,12 +106,15 @@ register_torch_compile_kernel(
         aten.sub,
         aten.addmm,
         aten.eq,
+        aten.ne,
         aten.ge,
         aten.gt,
         aten.lt,
         aten.maximum,
+        aten.minimum,
         aten.pow,
         aten.linalg_vector_norm,
+        aten.clamp,
     ]
 )
 

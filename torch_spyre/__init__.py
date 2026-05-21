@@ -17,7 +17,7 @@ import threading
 import types
 import importlib
 
-from .constants import DEVICE_NAME
+from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
 
 from . import memory
 from . import profiler
@@ -226,10 +226,34 @@ def _autoload():
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
+
     import torch_spyre.ops.eager  # noqa: F401
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()
+
+    # Register the Spyre CCL distributed backend.
+    # The creator function is a lazy proxy — _C is not imported until
+    # someone actually calls init_process_group(backend="spyreccl").
+    try:
+        import torch.distributed as dist
+
+        def _create_spyre_ccl_backend(store, rank, size, timeout):
+            # Ensure the Spyre runtime is initialized before the CCL
+            # backend constructor accesses the runtime and default stream.
+            if not torch.spyre.is_initialized():
+                torch.spyre._impl._lazy_init()
+            from torch_spyre._C import createSpyreCCLBackend
+
+            return createSpyreCCLBackend(store, rank, size, timeout)
+
+        dist.Backend.register_backend(
+            DISTRIBUTED_BACKEND_NAME,
+            _create_spyre_ccl_backend,
+            devices=[DEVICE_NAME],
+        )
+    except ImportError:
+        pass
 
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config

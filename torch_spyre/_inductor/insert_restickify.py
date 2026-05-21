@@ -19,7 +19,7 @@ import torch
 
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .pass_utils import host_coordinates, device_coordinates
+from .pass_utils import host_coordinates, device_coordinates, stick_compatible
 from .pass_utils import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
@@ -299,14 +299,17 @@ def finalize_layouts(operations: list) -> None:
                 continue
             in_stl = in_layout.device_layout
             host_coords = host_coordinates(in_layout, dep)
-            device_coords = device_coordinates(in_stl, dep)
-            target_stick_expr = device_coordinates(target_stl, output_dep)[-1]
-            in_stick_expr = device_coords[-1]
+            in_device_coords = device_coordinates(in_stl, dep)
+            target_device_coords = device_coordinates(target_stl, output_dep)
 
-            if in_stick_expr == target_stick_expr:
+            if stick_compatible([in_device_coords, target_device_coords]):
                 continue
             restick_stl = compute_restickify_target_layout(
-                in_stl, in_layout, target_stick_expr, host_coords, device_coords
+                in_stl,
+                in_layout,
+                target_device_coords[-1],
+                host_coords,
+                in_device_coords,
             )
             if restick_stl is None:
                 raise Unsupported(

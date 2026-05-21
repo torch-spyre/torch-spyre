@@ -1,0 +1,49 @@
+name: Gather runner info
+description: |
+  Prints diagnostic information about the GHA runner: identity, key paths,
+  Python version, and (optionally) a full env dump and a directory listing
+  of the pre-cloned torch-spyre repo.
+
+inputs:
+  verbose:
+    description: |
+      When 'true', also dumps sorted env, AIU env vars, and a directory
+      listing of the pre-cloned repo. Defaults to 'false' for a terse log.
+    required: false
+    default: 'false'
+  cloned-dir:
+    description: Path to the pre-cloned torch-spyre directory in the image.
+    required: false
+    default: /home/senuser/torch-spyre
+
+runs:
+  using: composite
+  steps:
+    - name: Gather runner info
+      shell: bash
+      env:
+        VERBOSE: ${{ inputs.verbose }}
+        CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        echo "================================="
+        date
+        pwd
+        whoami
+        id
+        echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+        echo "PATH $PATH"
+        echo "HOME $HOME"
+        echo "TORCH_ROOT ${TORCH_ROOT:-<unset>}"
+        python3 --version
+        python3 -c 'import sys; print(sys.path)'
+        if [[ "${VERBOSE}" == "true" ]]; then
+          echo "--- env ---"
+          env | sort
+          echo "--- AIU env ---"
+          env | sort | grep AIU || true
+          echo "--- repo listing ---"
+          ls -lart "$CLONED_TORCH_SPYRE_DIR"
+        fi
+        echo "================================="
