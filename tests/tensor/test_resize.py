@@ -14,51 +14,76 @@
 
 # Owner(s): ["module: cpp"]
 
+import os
+import sys
+import unittest
+
 import torch
-from torch.testing._internal.common_utils import (
-    TestCase,
-    instantiate_parametrized_tests,
-    parametrize,
-    run_tests,
-    subtest,
-)
+
+_tests_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.append(_tests_dir)
+
+from inductor.utils_inductor import ParameterizedTestMeta, cached_randn  # noqa: E402
 
 import torch_spyre  # noqa: F401
 
 DTYPE = torch.float16
 
 
-def _make(shape: list[int]) -> torch.Tensor:
-    """Create a sequential fp16 tensor on Spyre."""
-    numel = 1
-    for d in shape:
-        numel *= d
-    return torch.arange(0, numel, dtype=DTYPE).reshape(shape).to("spyre")
+class TestResize(unittest.TestCase, metaclass=ParameterizedTestMeta):
+    PARAMS = {
+        ("test_same_numel_data_preserved", "test_same_numel"): {
+            "param_sets": {
+                "1d_noop": ([16], [16]),
+                "1d_noop_larger": ([32], [32]),
+                "2d_to_1d_flatten": ([4, 8], [32]),
+                "2d_to_1d_flatten_small": ([2, 8], [16]),
+                "2d_transpose_shape": ([4, 8], [8, 4]),
+                "2d_regroup": ([4, 8], [2, 16]),
+                "3d_to_2d_merge_all": ([2, 4, 8], [8, 8]),
+                "3d_to_2d_merge_last_two": ([2, 4, 8], [4, 16]),
+                # multi-stick boundary cases (1 stick = 64 fp16 elements)
+                "1d_2sticks_noop": ([256], [256]),
+                "2d_to_1d_2sticks": ([8, 16], [128]),
+            },
+        },
+        ("test_shrink_data_preserved", "test_shrink"): {
+            "param_sets": {
+                "1d_half": ([8], [4]),
+                "1d_to_one": ([8], [1]),
+                "1d_non_power_of_two": ([8], [6]),
+                "2d_to_1d_full_row": ([4, 8], [16]),
+                "2d_to_1d_half_row": ([4, 8], [8]),
+                "2d_shrink_rows": ([4, 8], [2, 8]),
+                "2d_shrink_both_dims": ([4, 8], [2, 4]),
+                "3d_to_2d_drop_outer": ([2, 4, 8], [4, 8]),
+                "3d_to_2d_half": ([2, 4, 8], [2, 8]),
+                # stick-boundary cases (1 stick = 64 fp16 elements)
+                "1d_2sticks_to_1stick": ([128], [64]),
+                "2d_4sticks_to_1stick": ([16, 16], [8, 8]),
+            },
+        },
+        ("test_expand_original_elements_preserved", "test_expand"): {
+            "param_sets": {
+                "1d_4x": ([8], [32]),
+                "1d_4x_small": ([4], [16]),
+                "2d_to_1d_double": ([2, 8], [32]),
+                "2d_to_1d_4x": ([2, 8], [64]),
+                "2d_double_rows": ([2, 8], [4, 8]),
+                "2d_double_both": ([2, 8], [4, 16]),
+                "3d_to_2d_expand": ([2, 2, 8], [8, 8]),
+                "3d_to_2d_expand_regroup": ([2, 2, 8], [4, 16]),
+                # stick-boundary cases (1 stick = 64 fp16 elements)
+                "1d_1stick_to_4sticks": ([64], [256]),
+                "2d_1stick_to_2sticks": ([8, 8], [8, 16]),
+                "1d_large_4sticks_to_16sticks": ([256], [1024]),
+            },
+        },
+    }
 
-
-@instantiate_parametrized_tests
-class TestResizeSameNumel(TestCase):
-    """resize_: new shape has the same number of elements as the original.
-
-    The storage is not reallocated and all elements must be preserved in
-    their original flat order.
-    """
-
-    @parametrize(
-        "orig_shape,new_shape",
-        [
-            subtest(([16], [16]), name="1d_noop"),
-            subtest(([32], [32]), name="1d_noop_larger"),
-            subtest(([4, 8], [32]), name="2d_to_1d_flatten"),
-            subtest(([2, 8], [16]), name="2d_to_1d_flatten_small"),
-            subtest(([4, 8], [8, 4]), name="2d_transpose_shape"),
-            subtest(([4, 8], [2, 16]), name="2d_regroup"),
-            subtest(([2, 4, 8], [8, 8]), name="3d_to_2d_merge_all"),
-            subtest(([2, 4, 8], [4, 16]), name="3d_to_2d_merge_last_two"),
-        ],
-    )
-    def test_data_preserved(self, orig_shape, new_shape):
-        t = _make(orig_shape)
+    def test_same_numel(self, orig_shape, new_shape):
+        """resize_ to a shape with the same numel preserves all elements in flat order."""
+        t = cached_randn(orig_shape, dtype=DTYPE).to("spyre")
         orig_flat = t.cpu().flatten()
 
         t.resize_(*new_shape)
@@ -67,31 +92,9 @@ class TestResizeSameNumel(TestCase):
         self.assertEqual(t.numel(), orig_flat.numel())
         torch.testing.assert_close(t.cpu().flatten(), orig_flat)
 
-
-@instantiate_parametrized_tests
-class TestResizeShrink(TestCase):
-    """resize_: new shape has fewer elements than the original.
-
-    Storage is not reallocated.  The first new_numel elements (in flat
-    order) must equal the corresponding elements of the original tensor.
-    """
-
-    @parametrize(
-        "orig_shape,new_shape",
-        [
-            subtest(([8], [4]), name="1d_half"),
-            subtest(([8], [1]), name="1d_to_one"),
-            subtest(([8], [6]), name="1d_non_power_of_two"),
-            subtest(([4, 8], [16]), name="2d_to_1d_full_row"),
-            subtest(([4, 8], [8]), name="2d_to_1d_half_row"),
-            subtest(([4, 8], [2, 8]), name="2d_shrink_rows"),
-            subtest(([4, 8], [2, 4]), name="2d_shrink_both_dims"),
-            subtest(([2, 4, 8], [4, 8]), name="3d_to_2d_drop_outer"),
-            subtest(([2, 4, 8], [2, 8]), name="3d_to_2d_half"),
-        ],
-    )
-    def test_data_preserved(self, orig_shape, new_shape):
-        t = _make(orig_shape)
+    def test_shrink(self, orig_shape, new_shape):
+        """resize_ to a smaller shape preserves the first new_numel elements in flat order."""
+        t = cached_randn(orig_shape, dtype=DTYPE).to("spyre")
         orig_flat = t.cpu().flatten()
 
         t.resize_(*new_shape)
@@ -100,40 +103,17 @@ class TestResizeShrink(TestCase):
         self.assertEqual(list(t.shape), new_shape)
         torch.testing.assert_close(t.cpu().flatten(), orig_flat[:new_numel])
 
-
-@instantiate_parametrized_tests
-class TestResizeExpand(TestCase):
-    """resize_: new shape has more elements than the original.
-
-    New storage is allocated and the original elements are copied into flat
-    positions [0 .. old_numel-1].  Elements beyond that are uninitialised
-    and are not checked.
-    """
-
-    @parametrize(
-        "orig_shape,new_shape",
-        [
-            subtest(([8], [32]), name="1d_4x"),
-            subtest(([4], [16]), name="1d_4x_small"),
-            subtest(([2, 8], [32]), name="2d_to_1d_double"),
-            subtest(([2, 8], [64]), name="2d_to_1d_4x"),
-            subtest(([2, 8], [4, 8]), name="2d_double_rows"),
-            subtest(([2, 8], [4, 16]), name="2d_double_both"),
-            subtest(([2, 2, 8], [8, 8]), name="3d_to_2d_expand"),
-            subtest(([2, 2, 8], [4, 16]), name="3d_to_2d_expand_regroup"),
-        ],
-    )
-    def test_original_elements_preserved(self, orig_shape, new_shape):
-        t = _make(orig_shape)
+    def test_expand(self, orig_shape, new_shape):
+        """resize_ to a larger shape preserves original elements in flat positions [0..old_numel-1]."""
+        t = cached_randn(orig_shape, dtype=DTYPE).to("spyre")
         old_numel = t.numel()
         orig_flat = t.cpu().flatten()
 
         t.resize_(*new_shape)
 
         self.assertEqual(list(t.shape), new_shape)
-        # Only the first old_numel elements are guaranteed; tail is uninitialised.
         torch.testing.assert_close(t.cpu().flatten()[:old_numel], orig_flat)
 
 
 if __name__ == "__main__":
-    run_tests()
+    unittest.main()

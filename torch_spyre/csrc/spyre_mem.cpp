@@ -671,35 +671,26 @@ const at::Tensor& spyre_resize_(
     std::optional<c10::MemoryFormat> memory_format_opt) {
   auto size_int = c10::asIntArrayRefUnchecked(size);
   // Case 1: No-op.
-  if (self.sizes() == size_int) return self;
-  // Spyre tensors are always contiguous; treat Preserve as Contiguous.
-  if (memory_format_opt == c10::MemoryFormat::Preserve)
-    memory_format_opt = c10::MemoryFormat::Contiguous;
+  if (self.sizes() == size_int && self.is_contiguous()) {
+    return self;
+  }
+  TORCH_CHECK(memory_format_opt != c10::MemoryFormat::Preserve,
+              "aten::resize_ does not support MemoryFormat::Preserve");
   TORCH_CHECK(!memory_format_opt.has_value() ||
                   *memory_format_opt == c10::MemoryFormat::Contiguous,
               "aten::resize_ on Spyre only supports contiguous memory format");
   const auto dtype = c10::typeMetaToScalarType(self.dtype());
   TORCH_CHECK(spyre::is_supported_dtype(dtype),
               "Spyre backend does not support dtype ", dtype);
-  // Compute contiguous strides for the new shape.
-  std::vector<int64_t> new_strides(size_int.size());
-  {
-    int64_t s = 1;
-    for (int i = static_cast<int>(size_int.size()) - 1; i >= 0; --i) {
-      new_strides[i] = s;
-      s *= size_int[i];
-    }
-  }
-  int64_t new_numel = 1;
-  for (auto d : size_int) new_numel *= d;
-  const int64_t old_numel = self.numel();
+  const size_t new_storage_bytes = at::detail::computeStorageNbytesContiguous(
+      size_int, self.itemsize());
   auto* self_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   // Case 2: Same-numel or shrink — metadata-only update, no reallocation.
   //
   // spyre_layout, dma_sizes, and dma_strides describe the physical allocation
   // and are left unchanged.  Only the logical sizes/strides are updated.
-  if (new_numel <= old_numel) {
-    self_impl->set_sizes_and_strides(size_int, c10::IntArrayRef(new_strides));
+  if (new_storage_bytes <= self.storage().nbytes()) {
+    self_impl->set_sizes_contiguous(size_int);
     DEBUGINFO("resize_ to shape=", size_int,
               " layout=", self_impl->spyre_layout.toString());
     return self;
@@ -723,7 +714,7 @@ const at::Tensor& spyre_resize_(
   tmp_impl->set_sizes_contiguous(size_int);
   tmp_impl->spyre_layout = new_layout;
   tmp_impl->dma_sizes = size_int.vec();
-  tmp_impl->dma_strides = new_strides;
+  tmp_impl->dma_strides = tmp_impl->strides().vec();
   at::Tensor cpu_buf = self.cpu();
 
   cpu_buf.resize_(size_int);
@@ -734,7 +725,7 @@ const at::Tensor& spyre_resize_(
   self_impl->set_sizes_contiguous(size_int);
   self_impl->spyre_layout = new_layout;
   self_impl->dma_sizes = size_int.vec();
-  self_impl->dma_strides = new_strides;
+  self_impl->dma_strides = self_impl->strides().vec();
   DEBUGINFO("resize_ expand to shape=", size_int,
             " layout=", self_impl->spyre_layout.toString());
   return self;
