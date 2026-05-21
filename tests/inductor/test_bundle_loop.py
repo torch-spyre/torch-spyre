@@ -50,9 +50,11 @@ def _make_op_spec(name: str) -> OpSpec:
     )
 
 
-def _fake_compile_op_spec(idx: int, op_spec: OpSpec):
-    """Stub that returns a dict keyed by op name (no real SDSC compilation)."""
-    return {f"{op_spec.op}_{idx}": {"op": op_spec.op}}
+def _fake_compile_op_spec(
+    idx: int, op_spec: OpSpec, symbols: list, symbol_id_offset: int = 0
+):
+    """Stub that returns (json, [], []) — no real SDSC compilation."""
+    return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], []
 
 
 def _read_mlir(output_dir: str) -> str:
@@ -327,7 +329,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
             "\t\t%c1 = arith.constant 1 : index\n"
             "\t\t%loop_bound_0 = arith.constant 8 : index\n"
             "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_a_0.json"}\n'
+            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\t}\n"
             "\t\treturn\n"
             "\t}\n"
@@ -341,7 +343,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         expected = (
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
-            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_a_0.json"}\n'
+            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\treturn\n"
             "\t}\n"
             "}\n"
