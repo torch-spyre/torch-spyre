@@ -1,11 +1,11 @@
 name: push-to-clickhouse
 
-# Runs automatically after module-tests,upstream-tests completes etc.
+# Runs automatically after model-module-tests,upstream-tests completes etc.
 # Also supports manual dispatch for re-ingesting a specific run.
 on:
   workflow_run:
     workflows:
-      - module-tests
+      - model-module-tests
       - upstream-pytorch-tests
       # to add more workflows
     types: [completed]
@@ -16,7 +16,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (module-tests | upstream-tests)
+        description: Workflow name (model-module-tests | upstream-tests)
         required: false
         default: upstream-pytorch-tests
 

@@ -106,13 +106,14 @@ jobs:
           REPORT_NAME="${CONFIG%.yaml}.xml"
           REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
 
+          # Expose report path/name to subsequent steps via GITHUB_ENV
+          echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+
           echo "Running ${{ matrix.suite.name }} model ops tests..."
           bash tests/run_test.sh "tests/configs/model_ops_tests/${CONFIG}" -v --junit-xml="${REPORT_PATH}"
           echo "${{ matrix.suite.name }} model ops tests done"
 
-          # Expose report path/name to subsequent steps via GITHUB_ENV
-          echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
-          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and
