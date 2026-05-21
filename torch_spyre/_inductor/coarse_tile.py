@@ -130,14 +130,17 @@ def _stamp_group(
 
         _divide_ranges(op, loop_count, tiled_dims)
 
+        effective_tiled_dims = 1 if tiled_dims is None else tiled_dims
         op.loop_group_id = group_id  # type: ignore[attr-defined]
         op.loop_count = loop_count  # type: ignore[attr-defined]
+        op.loop_tiled_dims = effective_tiled_dims  # type: ignore[attr-defined]
 
         logger.debug(
-            "coarse_tile: stamped %s loop_group_id=%s loop_count=%s",
+            "coarse_tile: stamped %s loop_group_id=%s loop_count=%s loop_tiled_dims=%s",
             op.get_operation_name(),
             group_id,
             loop_count,
+            effective_tiled_dims,
         )
 
 

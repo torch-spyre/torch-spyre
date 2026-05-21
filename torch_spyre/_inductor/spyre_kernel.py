@@ -607,9 +607,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
-    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
+    def wrap_op_specs_in_loop(self, count: sympy.Expr, tiled_dims: int) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
-        self.op_specs = [LoopSpec(count=count, body=self.op_specs)]
+        self.op_specs = [
+            LoopSpec(count=count, tiled_dims=tiled_dims, body=self.op_specs)
+        ]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
@@ -669,10 +671,13 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
     for op_spec in specs:
         if isinstance(op_spec, LoopSpec):
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"op_spec: LoopSpec(count={op_spec.count})")
+                logger.debug(
+                    f"op_spec: LoopSpec(count={op_spec.count}, tiled_dims={op_spec.tiled_dims})"
+                )
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
+                buf.writeline(f"tiled_dims={op_spec.tiled_dims},")
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)

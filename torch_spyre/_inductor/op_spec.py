@@ -77,11 +77,18 @@ class LoopSpec:
 
     Attributes:
         count: Trip count of the loop. May be a symbolic shape expression.
+        tiled_dims: Number of leading iteration-space dimensions divided by
+            ``count``.  The per-iteration tile size for dimension ``i`` (where
+            ``i < tiled_dims``) is the corresponding range value in each body
+            ``OpSpec.iteration_space``.  The runtime computes the tensor base
+            offset for iteration ``k`` as ``k * tile_size[i]`` for each tiled
+            dimension.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
     """
 
     count: Expr
+    tiled_dims: int
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
