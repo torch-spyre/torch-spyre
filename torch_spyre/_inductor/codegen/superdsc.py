@@ -657,7 +657,13 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
 def compile_op_spec(
     idx: int, op_spec: OpSpec, symbols: list[int], symbol_id_offset: int = 0
-) -> tuple[Any, list[int]]:
+) -> tuple[Any, list[int], list[dict]]:
     sdsc_spec = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    return generate_sdsc(idx, sdsc_spec, symbols, symbol_id_offset)
+    return generate_sdsc(
+        idx,
+        sdsc_spec,
+        symbols,
+        symbol_id_offset,
+        tiled_symbols=op_spec.tiled_symbols,
+    )
