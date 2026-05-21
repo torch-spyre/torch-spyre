@@ -1,40 +1,43 @@
-import torch
-import torch_spyre
 import math
 
 import torch
-import torch_spyre
-import math
 
-def flash(Q,K,V, block_size):
+
+def flash(Q, K, V, block_size):
     B, H, L, D = Q.shape
 
     output = torch.zeros_like(Q)
-    M = torch.full((B,H,L), float('-inf'), device=Q.device)
-    denominator = torch.zeros((B,H,L), device=Q.device)
+    M = torch.full((B, H, L), float("-inf"), device=Q.device, dtype=torch.float16)
+    denominator = torch.zeros((B, H, L), device=Q.device, dtype=torch.float16)
 
     scale = 1.0 / math.sqrt(D)
 
     for start in range(0, L, block_size):
         end = start + block_size
 
-        K_block = K[:, :, start:end, :] # B, H, Block, D
-        V_block = V[:, :, start:end, :] # B, H, Block, D
+        K_block = K[:, :, start:end, :]
+        V_block = V[:, :, start:end, :]
         K_block_T = K_block.transpose(-1, -2).contiguous()  # B, H, D, Block
-        print(K_block_T)
-        
-        scores = torch.matmul(Q, K_block_T) * scale
-        # Use torch.amax directly instead of max(dim=-1).values to avoid argmax decomposition
-        # Flash Attention only needs the maximum values, not the indices
-        max_running = torch.maximum(M, torch.amax(scores, dim=-1))
-        exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
 
-        denominator = denominator* torch.exp(M - max_running) + exp_scores.sum(dim=-1)
-        output = output* torch.exp(M - max_running).unsqueeze(-1) + torch.bmm(exp_scores.flatten(0,1), V_block.flatten(0,1)).unflatten(0, (B,H))
+        scores = torch.matmul(Q, K_block_T) * scale  # B, H, L, Block
+        scores = scores.transpose(-1, -2).contiguous()  # avoid stick reduction
+        block_max = torch.amax(scores, dim=-2)
+        max_running = torch.maximum(M, block_max)
+
+        exp_scores = torch.exp(scores - max_running.unsqueeze(-2))  # B, H, Block, L
+
+        correction = torch.exp(M - max_running)
+
+        denominator = denominator * correction + exp_scores.sum(dim=-2)
+        output = output * correction.unsqueeze(-1) + torch.bmm(
+            exp_scores.transpose(-1, -2).flatten(0, 1), V_block.flatten(0, 1)
+        ).unflatten(0, (B, H))
 
         M = max_running
+
     output = output / denominator.unsqueeze(-1)
     return output
+
 
 compiled_flash = torch.compile(flash, dynamic=False)
 
@@ -44,17 +47,16 @@ if __name__ == "__main__":
     B, H, L, D = 1, 8, 256, 64
     block_size = 128
 
-    Q = torch.randn(B, H, L, D, dtype=torch.float16).to('spyre')
-    K = torch.randn(B, H, L, D, dtype=torch.float16).to('spyre')
-    V = torch.randn(B, H, L, D, dtype=torch.float16).to('spyre')
+    Q = torch.randn(B, H, L, D, dtype=torch.float16)
+    K = torch.randn(B, H, L, D, dtype=torch.float16)
+    V = torch.randn(B, H, L, D, dtype=torch.float16)
 
-    #Q = torch.randn(B, H, L, D, dtype=torch.float32).to('cpu')
-    #K = torch.randn(B, H, L, D, dtype=torch.float32).to('cpu')
-    #V = torch.randn(B, H, L, D, dtype=torch.float32).to('cpu')
+    q_spyre = Q.to("spyre")
+    k_spyre = K.to("spyre")
+    v_spyre = V.to("spyre")
 
-    #ref = torch.nn.functional.scaled_dot_product_attention(Q,K,V)
-    #print(f'Ref: {ref}')
+    spyre_out = compiled_flash(q_spyre, k_spyre, v_spyre, block_size).cpu()
+    cpu_out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+    cpu_delta = torch.abs(spyre_out - cpu_out).max()
 
-    #out = flash(Q,K,V,block_size) #Eager
-    out = compiled_flash(Q,K,V,block_size) 
-    print(f'Out: {out}')
+    print(f"Max delta Compiled Spyre vs. CPU: {cpu_delta}")
