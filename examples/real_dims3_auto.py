@@ -1,7 +1,7 @@
 import torch
 import torch_spyre._inductor.passes as passes
 
-import torch_spyre._inductor.propagate_real_dims2 as prd
+import torch_spyre._inductor.propagate_real_dims as prd
 
 passes.propagate_real_dims = prd.propagate_real_dims
 
