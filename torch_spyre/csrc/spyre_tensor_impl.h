@@ -32,6 +32,15 @@ namespace spyre {
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
 
+enum class ElementArrangement {
+  STANDARD,      // coordinates in sequential order
+  DL16_TO_FP32,  // non-sequential coordinate order produced by fp16->fp32
+                 // conversion
+  DL16_TO_FP8,   // non-sequential coordinate order produced by fp16->fp8
+                 // conversion
+  EXX2,          // non-standard stick reduction: two values per stick
+};
+
 class SpyreTensorLayout {
  public:
   /**
@@ -49,6 +58,8 @@ class SpyreTensorLayout {
   std::vector<int64_t> stride_map;
 
   DataFormats device_dtype;
+
+  ElementArrangement element_arrangement = ElementArrangement::STANDARD;
 
   SpyreTensorLayout() = default;
   ~SpyreTensorLayout() = default;
@@ -68,10 +79,12 @@ class SpyreTensorLayout {
    * using the default device memory layout.
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
-  SpyreTensorLayout(std::vector<int64_t> host_size,
-                    std::vector<int64_t> host_strides, c10::ScalarType dtype,
-                    std::vector<int32_t> dim_order) {
+  SpyreTensorLayout(
+      std::vector<int64_t> host_size, std::vector<int64_t> host_strides,
+      c10::ScalarType dtype, std::vector<int32_t> dim_order,
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD) {
     init(host_size, host_strides, dtype, dim_order);
+    this->element_arrangement = element_arrangement;
   }
 
   /**
@@ -81,11 +94,23 @@ class SpyreTensorLayout {
    * device memory layout, but callers are responsible for ensuring
    * that all device layout invariants are satisfied.
    */
-  SpyreTensorLayout(std::vector<int64_t> device_size,
-                    std::vector<int64_t> stride_map, DataFormats device_dtype)
+  SpyreTensorLayout(
+      std::vector<int64_t> device_size, std::vector<int64_t> stride_map,
+      DataFormats device_dtype,
+      ElementArrangement element_arrangement = ElementArrangement::STANDARD)
       : device_size(device_size),
         stride_map(stride_map),
-        device_dtype(device_dtype) {}
+        device_dtype(device_dtype),
+        element_arrangement(element_arrangement) {}
+
+  /**
+   * Return a copy of this layout with element_arrangement overridden.
+   */
+  SpyreTensorLayout with_element_arrangement(ElementArrangement ea) const {
+    SpyreTensorLayout copy = *this;
+    copy.element_arrangement = ea;
+    return copy;
+  }
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
@@ -101,7 +126,8 @@ class SpyreTensorLayout {
   bool operator==(const SpyreTensorLayout& other) const {
     return this->device_size == other.device_size &&
            this->stride_map == other.stride_map &&
-           this->device_dtype == other.device_dtype;
+           this->device_dtype == other.device_dtype &&
+           this->element_arrangement == other.element_arrangement;
   }
 };
 
@@ -165,6 +191,8 @@ struct hash<spyre::SpyreTensorLayout> {
       seed = c10::hash_combine(seed, std::hash<int64_t>{}(v));
     seed = c10::hash_combine(
         seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
+    seed = c10::hash_combine(
+        seed, std::hash<int>{}(static_cast<int>(layout.element_arrangement)));
     return seed;
   }
 };

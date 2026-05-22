@@ -55,7 +55,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 2;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 3;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -172,6 +172,11 @@ PYBIND11_MODULE(_C, m) {
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
+      .def_readonly("element_arrangement",
+                    &spyre::SpyreTensorLayout::element_arrangement)
+      .def("with_element_arrangement",
+           &spyre::SpyreTensorLayout::with_element_arrangement,
+           py::arg("element_arrangement"))
       .def("__str__",
            [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("__repr__",
@@ -185,12 +190,15 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, c10::ScalarType,
-                    std::vector<int32_t>>(),
+                    std::vector<int32_t>, spyre::ElementArrangement>(),
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
-           py::arg("dim_order"))
-      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats>(),
+           py::arg("dim_order"),
+           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
+      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
+                    spyre::ElementArrangement>(),
            py::arg("device_size"), py::arg("stride_map"),
-           py::arg("device_dtype"))
+           py::arg("device_dtype"),
+           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(py::pickle(
           [](const spyre::SpyreTensorLayout& p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
@@ -199,7 +207,8 @@ PYBIND11_MODULE(_C, m) {
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
-                                  p.device_size, p.stride_map, p.device_dtype);
+                                  p.device_size, p.stride_map, p.device_dtype,
+                                  p.element_arrangement);
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -222,6 +231,17 @@ PYBIND11_MODULE(_C, m) {
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[2].cast<std::vector<int64_t>>(),
                                               t[3].cast<DataFormats>());
+            } else if (version == 3) {
+              // Version 3: (version, device_size, stride_map, device_dtype,
+              // element_arrangement)
+              if (t.size() != 5) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v3: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[4].cast<spyre::ElementArrangement>());
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
@@ -235,6 +255,12 @@ PYBIND11_MODULE(_C, m) {
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
   m.def("reinterpret_tensor_with_layout",
         &spyre::reinterpret_tensor_with_layout);
+
+  py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
+      .value("STANDARD", spyre::ElementArrangement::STANDARD)
+      .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
+      .value("DL16_TO_FP8", spyre::ElementArrangement::DL16_TO_FP8)
+      .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
