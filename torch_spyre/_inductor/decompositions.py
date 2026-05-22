@@ -649,16 +649,27 @@ def decompose_cat(
     tensors: list[torch.Tensor],
     dim: int = 0,
 ) -> torch.Tensor:
-    orig_decomp = torch._inductor.decomposition.cat(tensors, dim)
+    # Filter out zero-element tensors: they contribute nothing to the output
+    # and may have collapsed shapes (e.g. 1D [0]) that cause dimension
+    # validation failures when dim exceeds their ndim.
+    non_empty = [t for t in tensors if t.numel() > 0]
+    if len(non_empty) == 0:
+        # All inputs are empty — fall through with originals so upstream
+        # handling produces the correct empty output.
+        non_empty = tensors
+    elif len(non_empty) == 1:
+        return non_empty[0]
+
+    orig_decomp = torch._inductor.decomposition.cat(non_empty, dim)
     if orig_decomp == NotImplemented:
         expanded_size = 0
-        for t in tensors:
+        for t in non_empty:
             expanded_size += t.size(dim)
-        output_size = list(tensors[0].size())
+        output_size = list(non_empty[0].size())
         output_size[dim] = expanded_size
-        output = tensors[0].new_empty(output_size)
+        output = non_empty[0].new_empty(output_size)
         offset = 0
-        for input in tensors:
+        for input in non_empty:
             output = torch.ops.spyre.overwrite_f(
                 input=input, output=output, dims=[dim], offsets=[offset]
             )
