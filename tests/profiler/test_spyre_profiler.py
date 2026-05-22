@@ -63,8 +63,13 @@ def test_synchronize_callable():
     assert hasattr(torch, "spyre"), "torch.spyre namespace is missing"
     assert hasattr(torch.spyre, "synchronize"), "torch.spyre.synchronize() is missing"
 
-    x = torch.randn(64, 64, device="spyre")
-    y = torch.randn(64, 64, device="spyre")
+    cpu_x = torch.randn(64, 64)
+    cpu_y = torch.randn(64, 64)
+
+    ref = torch.matmul(cpu_x, cpu_y)
+
+    x = cpu_x.to("spyre")
+    y = cpu_y.to("spyre")
 
     z = torch.matmul(x, y)
 
@@ -72,5 +77,4 @@ def test_synchronize_callable():
 
     result = z.cpu()
 
-    assert result.numel() == 64 * 64
-    assert torch.isfinite(result).all()
+    assert torch.allclose(result, ref)
