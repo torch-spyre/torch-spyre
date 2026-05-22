@@ -8,6 +8,7 @@ import json
 from typing import Dict, List, Optional, Set
 import warnings
 
+import regex as re
 import pytest  # type: ignore
 import torch
 
@@ -154,6 +155,29 @@ def _entry_dtype_set(
     if included:
         return included
     return global_supported_dtypes  # may itself be None
+
+
+# Matches "test_model_ops_db_<unique>__<idx>_<device>_<dtype>", capturing
+# the op unique_name key into model_ops_entry_by_unique_name.
+_MODEL_OPS_VARIANT_RE = re.compile(
+    r"^test_model_ops_db_(?P<unique>.+?__\d+)_[A-Za-z0-9]+_\w+$"
+)
+
+
+def _select_entry_by_op_index(method_name: str) -> Optional["TestEntry"]:
+    """Resolve the TestEntry for a test_model_ops_db variant via the
+    authoritative unique_name mapping; returns None to let callers fall
+    back to the dtype heuristic."""
+    m = _MODEL_OPS_VARIANT_RE.match(method_name)
+    if not m:
+        return None
+    try:
+        from models.test_model_ops_v2 import (  # type: ignore
+            model_ops_entry_by_unique_name,
+        )
+    except ImportError:
+        return None
+    return model_ops_entry_by_unique_name.get(m.group("unique"))
 
 
 def _select_entry_for_variant(
@@ -694,9 +718,13 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             # ------------------------------------------------------------------
             resolved_entry: Optional[TestEntry] = None
             if all_entries_for_name:
-                resolved_entry = _select_entry_for_variant(
-                    all_entries_for_name, method_name, cls.GLOBAL_SUPPORTED_DTYPES
-                )
+                resolved_entry = _select_entry_by_op_index(method_name)
+                if resolved_entry is None:
+                    resolved_entry = _select_entry_for_variant(
+                        all_entries_for_name,
+                        method_name,
+                        cls.GLOBAL_SUPPORTED_DTYPES,
+                    )
 
             # Tags for this specific variant = tags from the resolved entry only
             variant_tags: List[str] = (
