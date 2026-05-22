@@ -867,3 +867,6 @@ codegen time.
 - Symbolic loop counts in `bundle.mlir` (currently raises
   `NotImplementedError`; requires runtime shape plumbing into the MLIR
   function signature).
+- The graph transformations needed for correct handling of tiled reductions
+  and of tiles that outlive their loop iteration are not yet covered in this document.
+  This document will be extended to cover those cases as part of [issue 2266](https://github.com/torch-spyre/torch-spyre/issues/2266).
