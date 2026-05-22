@@ -163,7 +163,7 @@ module {
         %sym_1 = arith.constant <base_addr> : index
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
-                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]  // 4194304·i₀ + 2048·i₁
+                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]  // 4194304*i_0 + 2048*i_1
                 sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}
             }
         }
@@ -173,7 +173,7 @@ module {
 ```
 
 Each iteration of the inner loop dispatches the `add` kernel at a base address
-computed from both loop variables: `base + 4194304·i₀ + 2048·i₁`.
+computed from both loop variables: `base + 4194304·i_0 + 2048·i_1`.
 
 ## Layer 1 — Pre-scheduling IR pass
 
