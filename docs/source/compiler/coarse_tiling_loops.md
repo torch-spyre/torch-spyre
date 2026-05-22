@@ -86,6 +86,9 @@ def f(a, b):
 This produces a hardware program whose per-iteration working set is 512 × 1024
 elements (1/8th of the original), enabling effective scratchpad reuse.
 
+For simplicity this example uses `SENCORES=1` (single-core); the
+implementation fully supports multi-core execution.
+
 ### What the coarse-tiling pass stamps
 
 `coarse_tile()` sees this as a nested group spec and stamps the following
