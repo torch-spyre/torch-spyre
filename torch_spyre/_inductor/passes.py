@@ -101,6 +101,11 @@ class CustomPreGradPasses:
         for p in self.passes:
             p(graph)
 
+    def uuid(self) -> Optional[Any]:
+        files = [inspect.getfile(c) for c in CustomPreGradPasses.passes]
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
+
 
 class CustomPrePasses(CustomGraphPass):
     """

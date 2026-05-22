@@ -1,4 +1,4 @@
-name: model-ops-tests
+name: model-module-tests
 
 on:
   # Run automatically on every merge to main
@@ -7,11 +7,13 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
-  # Removing from CICD till the ops tests get matured
-  # pull_request:
-  #   branches: [main]
-  # merge_group:
-  #   types: [checks_requested]
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - tests/docs/**
+      - docs/**
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -26,7 +28,7 @@ permissions:
   checks: write
 
 jobs:
-  model-ops-tests:
+  model-module-tests:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
@@ -47,31 +49,19 @@ jobs:
       TORCH_ROOT: /home/senuser/pytorch
 
     # ---------------------------------------------------------------------------
-    # To add a new model ops test suite, append an entry here:
+    # To add a new module test suite, append an entry here:
     #   - name: <human-readable label shown in the GHA UI>
-    #     config: <filename inside tests/configs/model_ops_tests/>
+    #     config: <filename inside tests/configs/module_tests/>
     #
     # The JUnit XML report is automatically named after the config file, e.g.:
-    #   granite_4.0_h_tiny_spyre.yaml  ->  granite_4.0_h_tiny_spyre.xml
+    #   granite_3_3_8b_instruct_spyre.yaml  ->  granite_3_3_8b_instruct_spyre.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
-          - name: GPT OSS 20B
-            config: gpt_oss_20b_spyre.yaml
-          - name: Granite 3.3 8B Instruct FMS
-            config: granite_3.3_8b_instruct_fms_spyre.yaml
           - name: Granite 3.3 8B Instruct
-            config: granite_3.3_8b_instruct_spyre.yaml
-          # - name: Granite 4.0 H Tiny   # omitted for now
-          #   config: granite_4.0_h_tiny_spyre.yaml
-          - name: Meta Llama 3.1 8B Instruct
-            config: meta_llama_3.1_8b_instruct_spyre.yaml
-          - name: Ministral 3 14B Instruct 2512
-            config: ministral_3_14B_Instruct_2512_spyre.yaml
-          - name: Mistral Small 3.2 24B Instruct 2506
-            config: mistral_small_3.2_24B_instruct_2506_spyre.yaml
+            config: granite_3_3_8b_instruct_spyre.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
@@ -92,7 +82,7 @@ jobs:
 
       - uses: ./.github/actions/build-torch-spyre
 
-      - name: Run ${{ matrix.suite.name }} model ops test suite
+      - name: Run ${{ matrix.suite.name }} module test suite
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -101,7 +91,7 @@ jobs:
 
           # Derive the XML report name from the config filename
           # Example:
-          #   granite_3.3_8b_instruct_spyre.yaml  ->  granite_3.3_8b_instruct_spyre.xml
+          #   granite_3_3_8b_instruct_spyre.yaml  ->  granite_3_3_8b_instruct_spyre.xml
           CONFIG="${{ matrix.suite.config }}"
           REPORT_NAME="${CONFIG%.yaml}.xml"
           REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
@@ -110,9 +100,10 @@ jobs:
           echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
 
-          echo "Running ${{ matrix.suite.name }} model ops tests..."
-          bash tests/run_test.sh "tests/configs/model_ops_tests/${CONFIG}" -v --junit-xml="${REPORT_PATH}"
-          echo "${{ matrix.suite.name }} model ops tests done"
+          echo "Running ${{ matrix.suite.name }} module tests..."
+          bash tests/run_test.sh "tests/configs/module_tests/${CONFIG}" -v --junit-xml="${REPORT_PATH}"
+          echo "${{ matrix.suite.name }} module tests done"
+
 
 
       # ---------------------------------------------------------------------------

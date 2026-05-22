@@ -235,16 +235,16 @@ class TestSpyre(TestCase):
         ):
             b = a.to(device="spyre").add(2.0).to(device="cpu")
 
-        self.assertEqual(b.ndim, 1)
+        self.assertEqual(b.ndim, 0)
         self.assertEqual(b.numel(), 1)
 
         expected = a + 2
         if dtype == torch.float8_e4m3fn:
-            torch.testing.assert_close(b.float(), expected.reshape(1).float())
+            torch.testing.assert_close(b.float(), expected.float())
         else:
             torch.testing.assert_close(
                 b,
-                expected.reshape(1),
+                expected,
                 rtol=2e-3,
                 atol=1e-5,
                 check_dtype=False,
@@ -558,14 +558,14 @@ class TestSpyre(TestCase):
         # This must not raise TypeError about MRO
         instantiate_device_type_tests(_TestMROCheck, ns, only_for=("privateuse1",))
 
-        # instantiate_device_type_tests should create a class named
-        # _TestMROCheckPRIVATEUSE1 in the namespace
-        assert "_TestMROCheckPRIVATEUSE1" in ns, (
-            f"Expected _TestMROCheckPRIVATEUSE1 in namespace, got {list(ns)}"
-        )
+        # instantiate_device_type_tests creates a class named either
+        # _TestMROCheckPRIVATEUSE1 (PT <=2.10) or _TestMROCheckSPYRE (PT 2.11+)
+        expected_names = ("_TestMROCheckPRIVATEUSE1", "_TestMROCheckSPYRE")
+        found = [n for n in expected_names if n in ns]
+        assert found, f"Expected one of {expected_names} in namespace, got {list(ns)}"
 
         # The generated class should be instantiable (valid MRO)
-        cls = ns["_TestMROCheckPRIVATEUSE1"]
+        cls = ns[found[0]]
         assert issubclass(cls, TestCase)
 
     def test_device_to_device(self):

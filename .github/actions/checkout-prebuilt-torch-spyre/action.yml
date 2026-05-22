@@ -1,0 +1,45 @@
+name: Checkout torch-spyre in pre-cloned image
+description: |
+  Checks out the workflow's target SHA inside the pre-cloned torch-spyre
+  directory baked into the image_torch_spyre runner image. Prefers the PR
+  head SHA when triggered by pull_request, otherwise falls back to the SHA
+  of the push, tag, schedule, or merge_group event that triggered the
+  workflow.
+
+inputs:
+  cloned-dir:
+    description: Path to the pre-cloned torch-spyre directory in the image.
+    required: false
+    default: /home/senuser/torch-spyre
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout branch/commit in pre-cloned torch-spyre
+      shell: bash
+      env:
+        CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_REF: ${{ github.ref }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        # The pre-cloned repo may be owned by a different user than the
+        # runner process; mark all directories as safe to avoid git's
+        # "dubious ownership" error (covers the repo and any submodules).
+        git config --global --add safe.directory '*'
+        cd "$CLONED_TORCH_SPYRE_DIR"
+        # Prefer the PR head SHA when triggered by pull_request, otherwise
+        # fall back to the SHA of the push/tag/schedule/merge_group event.
+        TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+        TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
+        echo "TARGET_REF=${TARGET_REF}"
+        echo "TARGET_SHA=${TARGET_SHA}"
+        git fetch --tags --force origin "+${TARGET_SHA}" || \
+          git fetch --tags --force origin
+        git checkout --force "${TARGET_SHA}"
+        git submodule sync --recursive
+        git submodule update --init --recursive --force
+        git log -1 --oneline

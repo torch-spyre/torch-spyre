@@ -48,7 +48,7 @@ class TestModuleCustom(TestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
-    @modules(module_db, allowed_dtypes=[torch.float32])
+    @modules(module_db)
     def test_eager_vs_compile(self, device, dtype, module_info, training):
         """Test eager mode vs compile mode, comparing CPU and Spyre outputs.
 
@@ -144,7 +144,7 @@ class TestModuleCustom(TestCase):
                     msg=f"{module_info.name}: Spyre eager vs Spyre compile mismatch (tensor {i})",
                 )
 
-    @modules(module_db, allowed_dtypes=[torch.float32])
+    @modules(module_db)
     def test_layout_stride(self, device, dtype, module_info, training):
         """Test module with real YAML-specified layouts and strides.
 

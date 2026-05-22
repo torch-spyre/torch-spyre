@@ -14,8 +14,8 @@
 
 from typing import Optional, Sequence
 import torch
+import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
-from torch_spyre.ops.fallbacks import warn_fallback
 from torch_spyre.ops.eager import compile_once
 
 from .errors import Unsupported
@@ -190,51 +190,6 @@ def _(
     return input.new_empty(input.size())
 
 
-# spyre::full is registered via the low-level Library API rather than
-# torch.library.custom_op because the latter dispatches through
-# python_dispatch.cpp's `redispatch_boxed` lambda, whose c_return event is
-# dropped by CPython's sys.setprofile when the lambda releases the GIL and
-# calls back into Python. With with_stack=True profilers the dropped c_return
-# corrupts post-processing of the outer pybind frame, attributing trace-end
-# timestamps to every spyre::full event. The Library API path is direct C
-# dispatch and pairs c_call/c_return correctly.
-#
-# Because spyre::full takes no Tensor arguments, BackendSelect cannot infer a
-# device-specific dispatch key, so the impl is registered on
-# CompositeExplicitAutograd which fires before BackendSelect for tensorless
-# schemas. The implementation routes by the `device` argument internally.
-_spyre_lib = torch.library.Library("spyre", "FRAGMENT")
-_spyre_lib.define(
-    "full(int[] size, Scalar fill_value, Device device, *, "
-    "ScalarType? dtype=None) -> Tensor"
-)
-
-
-def spyre_full(
-    size: Sequence[int],
-    fill_value: torch.types.Number,
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    # Fall back to CPU.
-    warn_fallback("torch.ops.spyre.full")
-    tmp = torch.full(size, fill_value, dtype=dtype, device="cpu")
-    return tmp.to(device)
-
-
-def _spyre_full_meta(
-    size: Sequence[int],
-    fill_value: torch.types.Number,
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    return torch.empty(size, dtype=dtype, device=device)
-
-
-_spyre_lib.impl("full", spyre_full, "CompositeExplicitAutograd")
-_spyre_lib.impl("full", _spyre_full_meta, "Meta")
-
-
 @torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
 def spyre_empty(
     size: Sequence[int],
@@ -265,26 +220,6 @@ def logical_not(input: torch.Tensor) -> torch.Tensor:
 @logical_not.register_fake
 def _(input: torch.Tensor):
     return input.new_empty(input.size())
-
-
-@torch.library.custom_op("spyre::ones_scalar", mutates_args=(), device_types="spyre")
-def spyre_ones_scalar(
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    """Return a 1-element tensor containing 1 on Spyre. Used for ones via identity broadcast."""
-    warn_fallback("torch.ops.spyre.ones_scalar")
-    out = torch.empty(1, dtype=dtype, device=device)
-    out.fill_(1)
-    return out
-
-
-@spyre_ones_scalar.register_fake
-def _ones_scalar_fake(
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-):
-    return torch.empty(1, dtype=dtype, device="spyre")
 
 
 @torch.library.custom_op(
@@ -320,7 +255,19 @@ def overwrite(
     offsets: Sequence[int],
     compiled,
 ) -> None:
-    return compiled(input, output, dims, offsets)
+    # specialize_int=True installs int-equality guards on the int-list
+    # args so each unique (dims, offsets) triggers a fresh trace and a
+    # fresh SDSC binary; without this dynamo's default specialize_int=
+    # False reuses one baked binary across all values and scatters all
+    # writes to the first call's offset (see test_overwrite.py).
+    # Patch is call-scoped to leave process-wide dynamo behavior alone.
+    # Note: this gives one compiled binary per unique (input shape, dims,
+    # offsets) tuple. dynamo's cache_size_limit is bumped to 1024 in
+    # torch_spyre/__init__.py — long-running workloads that scatter into
+    # many distinct slots can blow past that. Symbolic offsets (one
+    # binary, any value) are tracked in issues #220 / #1371-3.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(input, output, dims, offsets)
 
 
 @overwrite.register_fake
