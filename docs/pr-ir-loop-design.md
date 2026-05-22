@@ -164,18 +164,14 @@ When the flag is True:
 
 ## Tests
 
-Six new test files, all mock-based (no device required):
+Two new test files, all mock-based (no device required):
 
 | File | What it tests |
 |---|---|
-| `test_loop_spec.py` | `LoopSpec` / `OpSpec` data structures and serialization |
-| `test_coarse_tile_pass.py` | `coarse_tile()` IR pass: range rewriting, attribute stamping, nested groups |
-| `test_counted_loop_node.py` | `CountedLoopSchedulerNode` and `build_loop_scheduler_nodes` |
-| `test_sdsc_tiled_address.py` | `generate_sdsc` and `compile_op_spec` symbol/affine-stride paths |
-| `test_bundle_loop.py` | `generate_bundle` MLIR output: loop structure, affine maps, symbol constants |
+| `test_coarse_tiling.py` | Unit tests for all coarse-tiling infrastructure: `LoopSpec`/`OpSpec` data structures, `coarse_tile()` IR pass, `CountedLoopSchedulerNode`, `generate_sdsc`/`compile_op_spec` symbol paths, `generate_bundle` MLIR output |
 | `test_coarse_tile_e2e.py` | End-to-end: `coarse_tile()` → `OpSpec` / `LoopSpec` wiring through codegen |
 
-CI config YAMLs and workflow matrix entries added for all six.
+CI config YAMLs and workflow matrix entries added for both.
 
 ---
 
@@ -195,8 +191,9 @@ CI config YAMLs and workflow matrix entries added for all six.
 | `torch_spyre/_inductor/codegen/bundle.py` | Full `LoopSpec`-aware MLIR generation |
 | `torch_spyre/execution/async_compile.py` | Pass `bundle_hbm_symbols` config to `generate_bundle` |
 | `docs/source/compiler/coarse_tiling_loops.md` | Design doc with motivating example |
-| `tests/inductor/test_*.py` (×6) | New test suites |
-| `tests/configs/torch_spyre_tests/inductor/*.yaml` (×6) | CI config files |
+| `tests/inductor/test_coarse_tiling.py` | New unit test suite (consolidates 5 files) |
+| `tests/inductor/test_coarse_tile_e2e.py` | New end-to-end test suite |
+| `tests/configs/torch_spyre_tests/inductor/*.yaml` (×2) | CI config files |
 | `.github/workflows/torch_spyre_tests.yaml` | Workflow matrix entries |
 
 ---
