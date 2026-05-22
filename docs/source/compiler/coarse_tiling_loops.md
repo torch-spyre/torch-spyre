@@ -70,9 +70,9 @@ codegen_node
 
 ## Motivating Example
 
-Consider a pointwise add `y = a + b` over a `[8, 16]` tensor, tiled by
-**K=2 in the outer loop** (splitting the 8 rows into 2 groups of 4) and
-**M=4 in the inner loop** (splitting the 16 columns into 4 groups of 4).
+Consider a pointwise add `y = a + b` over a `[1024, 4096]` tensor, tiled by
+**K=2 in the outer loop** (splitting the 1024 rows into 2 groups of 512) and
+**M=4 in the inner loop** (splitting the 4096 columns into 4 groups of 1024).
 The intended user-facing syntax (PR #2226) is:
 
 ```python
@@ -83,7 +83,7 @@ def f(a, b):
     return y
 ```
 
-This produces a hardware program whose per-iteration working set is 4 × 4
+This produces a hardware program whose per-iteration working set is 512 × 1024
 elements (1/8th of the original), enabling effective scratchpad reuse.
 
 ### What the coarse-tiling pass stamps
@@ -99,10 +99,10 @@ op.loop_tiled_dims = [[0], [1]]    # outer loop tiles dim 0; inner tiles dim 1
 
 `_divide_ranges` is applied once per level in outermost-first order:
 
-1. Outer level `(K=2, [dim 0])`: `data.ranges [8, 16] → [4, 16]`
-2. Inner level `(M=4, [dim 1])`: `data.ranges [4, 16] → [4, 4]`
+1. Outer level `(K=2, [dim 0])`: `data.ranges [1024, 4096] → [512, 4096]`
+2. Inner level `(M=4, [dim 1])`: `data.ranges [512, 4096] → [512, 1024]`
 
-The per-inner-iteration `data.ranges` is `[4, 4]`.
+The per-inner-iteration `data.ranges` is `[512, 1024]`.
 
 ### Generated OpSpec (Python wrapper source)
 
@@ -121,8 +121,8 @@ sdsc_fused_add_0 = async_compile.sdsc('sdsc_fused_add_0',
                             op='add',
                             is_reduction=False,
                             iteration_space={
-                                sympify('c0'): (sympify('4'), 4),
-                                sympify('c1'): (sympify('4'), 1),
+                                sympify('c0'): (sympify('512'), 32),
+                                sympify('c1'): (sympify('1024'), 1),
                             },
                             tiled_symbols=[sympify('c0'), sympify('c1')],
                             ...
@@ -136,19 +136,21 @@ sdsc_fused_add_0 = async_compile.sdsc('sdsc_fused_add_0',
 ```
 
 `c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
-`iteration_space` reflects the per-inner-iteration range `[4, 4]`.
+`iteration_space` reflects the per-inner-iteration range `[512, 1024]`.
 `tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
 to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
 
 ### Generated `bundle.mlir`
 
 The SDSC compiler (`compile_op_spec`) translates `tiled_symbols` into per-loop
-byte strides, producing a 2-dimensional `affine_map`.  For fp16 tensors with
-Spyre stick layout the outer stride is 512 bytes (4 rows × 128 bytes/row) and
-the inner stride is 64 bytes (4 elements × 2 bytes, one stick-column step).
+byte strides, producing a 2-dimensional `affine_map`.  For this `[1024, 4096]`
+fp16 tensor with Spyre stick layout (128 bytes/stick, 64 elements/stick):
+
+- Outer stride: 512 rows × 64 sticks/row × 128 bytes/stick = 4,194,304 bytes
+- Inner stride: 1024 columns / 64 elements/stick × 128 bytes/stick = 2,048 bytes
 
 ```mlir
-#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 512*d0 + 64*d1)>
+#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 4194304*d0 + 2048*d1)>
 module {
     func.func @sdsc_bundle() {
         %c0 = arith.constant 0 : index
@@ -158,7 +160,7 @@ module {
         %sym_1 = arith.constant <base_addr> : index
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
-                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
+                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]  // 4194304·i₀ + 2048·i₁
                 sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}
             }
         }
@@ -168,7 +170,7 @@ module {
 ```
 
 Each iteration of the inner loop dispatches the `add` kernel at a base address
-computed from both loop variables: `base + 512·i₀ + 64·i₁`.
+computed from both loop variables: `base + 4194304·i₀ + 2048·i₁`.
 
 ## Layer 1 — Pre-scheduling IR pass
 

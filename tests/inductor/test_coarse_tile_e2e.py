@@ -303,12 +303,12 @@ class TestCoarseTileEndToEnd(InductorTestCase):
     def test_nested_loop_two_dims(self):
         """A pointwise add tiled by K=2 (outer, dim 0) and M=4 (inner, dim 1).
 
-        Input shape [8, 16]: outer loop runs 2× over dim 0 (8/2=4 rows/iter),
-        inner loop runs 4× over dim 1 (16/4=4 cols/iter).  Generated source
+        Input shape [1024, 4096]: outer loop runs 2× over dim 0 (512 rows/iter),
+        inner loop runs 4× over dim 1 (1024 cols/iter).  Generated source
         must contain two nested LoopSpec entries with counts 2 and 4.
         """
-        a = torch.randn(8, 16, dtype=torch.float16).to("spyre")
-        b = torch.randn(8, 16, dtype=torch.float16).to("spyre")
+        a = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+        b = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
 
         def fn(a, b):
             return a + b
