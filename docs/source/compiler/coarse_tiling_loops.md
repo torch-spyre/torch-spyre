@@ -25,6 +25,16 @@ The output of this pass needs to survive through:
 This document describes how that loop structure is represented, transported,
 and consumed.
 
+**Quick navigation:**
+[Design Overview](#design-overview) |
+[Motivating Example](#motivating-example) |
+[Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass) |
+[Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode) |
+[Layer 3 — `LoopSpec` & codegen](#layer-3--loopspec-and-codegen) |
+[Files changed](#files-changed) |
+[Invariants](#invariants-and-failure-modes) |
+[Rejected alternatives](#rejected-design-alternatives)
+
 ## Design Overview
 
 The tiling loop structure must be created early (before work division sees
@@ -56,6 +66,108 @@ codegen_node
   └─ wraps them in LoopSpec(count=K, body=[OpSpec, ...])
   └─ LoopSpec is serialized alongside OpSpec in codegen_kernel()
 ```
+
+## Motivating Example
+
+Consider a pointwise add `y = a + b` over a `[8, 16]` tensor, tiled by
+**K=2 in the outer loop** (splitting the 8 rows into 2 groups of 4) and
+**M=4 in the inner loop** (splitting the 16 columns into 4 groups of 4).
+The intended user-facing syntax (PR #2226) is:
+
+```python
+def f(a, b):
+    with spyre_hint(tiles={"K": 2}):    # outer loop: 2 iterations
+        with spyre_hint(tiles={"M": 4}): # inner loop: 4 iterations
+            y = a + b
+    return y
+```
+
+This produces a hardware program whose per-iteration working set is 4 × 4
+elements (1/8th of the original), enabling effective scratchpad reuse.
+
+### What the coarse-tiling pass stamps
+
+`coarse_tile()` sees this as a nested group spec and stamps the following
+attributes on the `ir.Operation` for `y = a + b`:
+
+```python
+op.loop_group_id   = (0, 0)        # depth-2 path: group 0, inner slot 0
+op.loop_count      = [2, 4]        # [K_outer, M_inner]
+op.loop_tiled_dims = [[0], [1]]    # outer loop tiles dim 0; inner tiles dim 1
+```
+
+`_divide_ranges` is applied once per level in outermost-first order:
+
+1. Outer level `(K=2, [dim 0])`: `data.ranges [8, 16] → [4, 16]`
+2. Inner level `(M=4, [dim 1])`: `data.ranges [4, 16] → [4, 4]`
+
+The per-inner-iteration `data.ranges` is `[4, 4]`.
+
+### Generated OpSpec (Python wrapper source)
+
+The Python wrapper emitted by `codegen_kernel()` contains:
+
+```python
+sdsc_fused_add_0 = async_compile.sdsc('sdsc_fused_add_0',
+    [
+        LoopSpec(
+            count=sympify('2'),        # outer K=2 loop
+            body=[
+                LoopSpec(
+                    count=sympify('4'),    # inner M=4 loop
+                    body=[
+                        OpSpec(
+                            op='add',
+                            is_reduction=False,
+                            iteration_space={
+                                sympify('c0'): (sympify('4'), 4),
+                                sympify('c1'): (sympify('4'), 1),
+                            },
+                            tiled_symbols=[sympify('c0'), sympify('c1')],
+                            ...
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    ]
+)
+```
+
+`c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
+`iteration_space` reflects the per-inner-iteration range `[4, 4]`.
+`tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
+to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
+
+### Generated `bundle.mlir`
+
+The SDSC compiler (`compile_op_spec`) translates `tiled_symbols` into per-loop
+byte strides, producing a 2-dimensional `affine_map`.  For fp16 tensors with
+Spyre stick layout the outer stride is 512 bytes (4 rows × 128 bytes/row) and
+the inner stride is 64 bytes (4 elements × 2 bytes, one stick-column step).
+
+```mlir
+#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 512*d0 + 64*d1)>
+module {
+    func.func @sdsc_bundle() {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %loop_bound_0 = arith.constant 2 : index   // K=2
+        %loop_bound_1 = arith.constant 4 : index   // M=4
+        %sym_1 = arith.constant <base_addr> : index
+        scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
+            scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
+                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
+                sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}
+            }
+        }
+        return
+    }
+}
+```
+
+Each iteration of the inner loop dispatches the `add` kernel at a base address
+computed from both loop variables: `base + 512·i₀ + 64·i₁`.
 
 ## Layer 1 — Pre-scheduling IR pass
 

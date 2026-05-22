@@ -71,6 +71,15 @@ def _groups_split_k4_k8(operations: list[Operation]):
     return groups
 
 
+def _groups_nested_k2_m4(operations: list[Operation]):
+    """One group: single op with nested K=2 outer (dim 0) / M=4 inner (dim 1) loops."""
+    ops = [op for op in operations if isinstance(op, ComputedBuffer)]
+    if not ops:
+        return []
+    # Take only the first ComputedBuffer and wrap it in nested loops.
+    return [(ops[:1], [(sympy.Integer(2), [0]), (sympy.Integer(4), [1])])]
+
+
 def _groups_per_op_tiled_dim(operations: list[Operation]):
     """Two groups each tiling a different iteration-space dimension.
 
@@ -279,6 +288,44 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "sympify('4')",
             src,
             "Expected loop count 4 in generated source",
+        )
+
+    # ------------------------------------------------------------------
+    # Nested loops: single op tiled on two dimensions independently
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_nested_k2_m4,
+        }
+    )
+    def test_nested_loop_two_dims(self):
+        """A pointwise add tiled by K=2 (outer, dim 0) and M=4 (inner, dim 1).
+
+        Input shape [8, 16]: outer loop runs 2× over dim 0 (8/2=4 rows/iter),
+        inner loop runs 4× over dim 1 (16/4=4 cols/iter).  Generated source
+        must contain two nested LoopSpec entries with counts 2 and 4.
+        """
+        a = torch.randn(8, 16, dtype=torch.float16).to("spyre")
+        b = torch.randn(8, 16, dtype=torch.float16).to("spyre")
+
+        def fn(a, b):
+            return a + b
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a, b)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
+        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
+        # The nested LoopSpec must appear inside another LoopSpec.
+        self.assertGreaterEqual(
+            src.count("LoopSpec("),
+            2,
+            f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
         )
 
 
