@@ -427,7 +427,11 @@ def generate_sdsc(
                                     "component_": "lx"
                                     if "lx" in tensor.allocation
                                     else "hbm",
-                                    "isStartAddrSymbolic_": 1,
+                                    **(
+                                        {"isStartAddrSymbolic_": 1}
+                                        if use_symbols
+                                        else {}
+                                    ),
                                     "layoutDimOrder_": [
                                         str(dim) for dim in tensor.dim_order
                                     ],
