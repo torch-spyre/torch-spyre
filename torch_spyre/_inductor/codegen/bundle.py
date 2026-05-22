@@ -171,6 +171,7 @@ def generate_bundle(
             [],
             f,
             indent=2,
+            use_symbols=use_symbols,
         )
 
         f.write("\t\treturn\n")
@@ -294,6 +295,7 @@ def _emit_specs(
     loop_vars: list,
     f,
     indent: int,
+    use_symbols: bool = False,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
     tab = "\t" * indent
@@ -315,6 +317,7 @@ def _emit_specs(
                 loop_vars + [loop_var],
                 f,
                 indent + 1,
+                use_symbols=use_symbols,
             )
             f.write(f"{tab}}}\n")
 
@@ -360,12 +363,18 @@ def _emit_specs(
             ]
 
             operand_str = ", ".join(operands)
-            symbol_ids_str = ", ".join(str(i) for i in symbol_ids)
-            f.write(
-                f"{tab}sdscbundle.sdsc_execute ({operand_str}) "
-                f'{{sdsc_filename="{sdsc_filename}", '
-                f'"symbol_ids"=[{symbol_ids_str}]}}\n'
-            )
+            if use_symbols:
+                symbol_ids_str = ", ".join(str(i) for i in symbol_ids)
+                f.write(
+                    f"{tab}sdscbundle.sdsc_execute ({operand_str}) "
+                    f'{{sdsc_filename="{sdsc_filename}", '
+                    f'"symbol_ids"=[{symbol_ids_str}]}}\n'
+                )
+            else:
+                f.write(
+                    f"{tab}sdscbundle.sdsc_execute () "
+                    f'{{sdsc_filename="{sdsc_filename}"}}\n'
+                )
 
 
 def _extract_symbol_ids(sdsc_json: dict) -> list[int]:
