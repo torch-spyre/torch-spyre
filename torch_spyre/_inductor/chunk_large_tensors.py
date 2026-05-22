@@ -22,8 +22,6 @@ before ``span_reduction``.  Each chunk becomes a normal
 import math
 
 from dataclasses import dataclass
-import torch
-from torch._inductor import lowering as ind_lowering
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -295,18 +293,15 @@ def _make_chunk_fn(orig_fn, dim: int, offset: int):
     return inner_fn
 
 
-def _make_overwrite_fn(overwrite_op, loader, offset: int, split_dim: int):
-    """Return ``(inner_fn, output_indexer)`` for a scatter overwrite."""
-
-    def inner_fn(index):
-        return overwrite_op(loader(index))
+def _make_output_indexer(offset: int, split_dim: int):
+    """Return a scatter output indexer shifted by *offset* on *split_dim*."""
 
     def output_indexer(index):
         out = list(index)
         out[split_dim] = out[split_dim] + offset
         return out
 
-    return inner_fn, output_indexer
+    return output_indexer
 
 
 def _register_and_insert(
@@ -347,8 +342,10 @@ def _chunk_op(
     """Split *op* into memory-safe chunks along the controlling dim.
 
     Chunk 0 is the original op shrunk in-place (ranges only; layout
-    stays full-size so the scheduler finds it by name).  Chunks 1..N-1
-    are new ComputedBuffer + Scatter overwrite pairs.
+    stays full-size so the scheduler finds it by name). Chunks 1..N-1
+    are direct ``Scatter`` mutation buffers that compute each chunk
+    inline and write it into the corresponding region of the original
+    output.
 
     Chunk sizes are stick-aligned (multiples of ``stick_elems``) so the
     hardware scheduler always finds valid chunk-parameter candidates.
@@ -389,8 +386,6 @@ def _chunk_op(
         chunking_info.total_bytes / (1024**3),
     )
 
-    overwrite_fn = ind_lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
-
     # -- Chunk 0: shrink original op in-place --
     chunk0_size = min(chunk_size, split_dim_full_size)
     chunk0_ranges = list(original_ranges)
@@ -400,7 +395,7 @@ def _chunk_op(
     insert_pos = op_index + 1
     n_inserted = 0
 
-    # -- Chunks 1..N-1: compute + overwrite-scatter pairs --
+    # -- Chunks 1..N-1: direct scatter mutations into the original output --
     for chunk_idx in range(1, num_chunks):
         chunk_offset = chunk_idx * chunk_size
         remaining_elems = max(0, split_dim_full_size - chunk_offset)
@@ -411,39 +406,19 @@ def _chunk_op(
         chunk_ranges = list(original_ranges)
         chunk_ranges[split_dim_idx] = this_chunk_size
 
-        chunk_pw = Pointwise(
+        mutation_data = Scatter(
             device=op.data.device,
             dtype=op.data.dtype,
             inner_fn=_make_chunk_fn(original_inner_fn, split_dim_idx, chunk_offset),
             ranges=chunk_ranges,
+            output_indexer=_make_output_indexer(chunk_offset, split_dim_idx),
         )
-        object.__setattr__(chunk_pw, "origins", op.data.origins)
-        object.__setattr__(chunk_pw, "traceback", op.data.traceback)
-
-        chunk_layout = _make_chunk_layout(original_ftl, split_dim_idx, this_chunk_size)
-        chunk_buf = ComputedBuffer(name=None, layout=chunk_layout, data=chunk_pw)
-        chunk_buf.origin_node = op.origin_node
-        insert_pos = _register_and_insert(chunk_buf, op, operations, insert_pos)
-        n_inserted += 1
-        overwrite_inner, overwrite_indexer = _make_overwrite_fn(
-            overwrite_fn,
-            chunk_buf.make_loader(),
-            chunk_offset,
-            split_dim_idx,
-        )
-        overwrite_data = Scatter(
-            device=op.data.device,
-            dtype=op.data.dtype,
-            inner_fn=overwrite_inner,
-            ranges=chunk_ranges,
-            output_indexer=overwrite_indexer,
-        )
-        overwrite_buf = ComputedBuffer(
+        mutation_buf = ComputedBuffer(
             name=None,
             layout=MutationLayoutSHOULDREMOVE(op),
-            data=overwrite_data,
+            data=mutation_data,
         )
-        insert_pos = _register_and_insert(overwrite_buf, op, operations, insert_pos)
+        insert_pos = _register_and_insert(mutation_buf, op, operations, insert_pos)
         n_inserted += 1
     return n_inserted
 

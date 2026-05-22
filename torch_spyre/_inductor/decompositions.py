@@ -644,106 +644,11 @@ def spyre_min_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.min((values, indices))
 
 
-@register_spyre_decomposition([torch.ops.aten.cat.default])
-def decompose_cat(
-    tensors: list[torch.Tensor],
-    dim: int = 0,
-) -> torch.Tensor:
-    # Spyre replaces the upstream cat decomposition because the upstream
-    # lowering (ConcatKernel/pointwise_cat) emits CPU/CUDA IR that Spyre
-    # cannot execute. Instead we lower to spyre::overwrite_f.
-    #
-    # Because this decomposition fully replaces upstream, we must also
-    # replicate the zero-element filtering that upstream does in
-    # torch/_inductor/decomposition.py:390-413. Without it, collapsed
-    # 1D [0] tensors cause _validate_dim assertions in the fallback path.
-    non_empty = [t for t in tensors if t.numel() > 0]
-    if not non_empty:
-        non_empty = tensors
-    elif len(non_empty) == 1:
-        return non_empty[0]
-
-    orig_decomp = torch._inductor.decomposition.cat(non_empty, dim)
-    if orig_decomp == NotImplemented:
-        expanded_size = 0
-        for t in non_empty:
-            expanded_size += t.size(dim)
-        output_size = list(non_empty[0].size())
-        output_size[dim] = expanded_size
-        output = non_empty[0].new_empty(output_size)
-        offset = 0
-        for t in non_empty:
-            output = torch.ops.spyre.overwrite_f(
-                input=t, output=output, dims=[dim], offsets=[offset]
-            )
-            offset += t.size(dim)
-        return output
-    return orig_decomp
-
-
 @register_spyre_decomposition([torch.ops.aten.ceil.default])
 def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.aten.neg.default(
         torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
-
-
-@register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
-def pad_decomp(
-    input: torch.Tensor,
-    pad: list[int],
-    value: float = 0,
-) -> torch.Tensor:
-    # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
-    n_dims_padded = len(pad) // 2
-
-    # Negative pad values (cropping) require reading from a non-zero storage
-    # offset or a sub-stick position, neither of which the SFP supports.
-    if any(p < 0 for p in pad):
-        raise Unsupported(
-            f"constant_pad_nd: negative padding (cropping) is not supported on "
-            f"Spyre (pad={pad})"
-        )
-
-    # Left-padding on the last (stick) dimension shifts the output start address
-    # by `left` elements. The hardware can only express this in whole sticks, so
-    # `left` must be a multiple of the stick size (64 fp16 elements).
-    # Sub-stick left-padding on the last dimension is tracked in:
-    # https://github.com/torch-spyre/torch-spyre/issues/1464
-    last_dim_left = pad[0]
-    if last_dim_left > 0:
-        elems_per_stick = 128 // input.element_size()
-        if last_dim_left % elems_per_stick != 0:
-            raise Unsupported(
-                f"constant_pad_nd: sub-stick left-padding on the last dimension is "
-                f"not supported on Spyre (pad={pad}, left={last_dim_left}, "
-                f"stick_size={elems_per_stick})"
-            )
-
-    # Build the padded output shape and collect which dimensions need padding.
-    output_size = list(input.size())
-    dims: list[int] = []
-    offsets: list[int] = []
-    for i in range(n_dims_padded - 1, -1, -1):
-        left = pad[2 * i]
-        right = pad[2 * i + 1]
-        if left + right == 0:
-            continue
-        dim = input.dim() - 1 - i
-        output_size[dim] += left + right
-        dims.append(dim)
-        offsets.append(left)
-
-    if not dims:
-        return input
-
-    output = torch.ops.aten.full(
-        output_size, value, dtype=input.dtype, device=input.device
-    )
-    output = torch.ops.spyre.overwrite_f(
-        input=input, output=output, dims=dims, offsets=offsets
-    )
-    return output
 
 
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
