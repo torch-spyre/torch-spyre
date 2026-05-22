@@ -13,11 +13,8 @@
 # limitations under the License.
 
 import torch
-import torch_spyre._inductor.passes as passes
-
 import torch_spyre._inductor.propagate_real_dims as prd
 
-passes.propagate_real_dims = prd.propagate_real_dims
 declare_tensor_dim = prd.declare_tensor_dim
 name_tensor_dims = prd.name_tensor_dims
 
