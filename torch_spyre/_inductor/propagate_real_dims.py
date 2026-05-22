@@ -133,17 +133,19 @@ def coords_to_real_dims(coords: list, rdims: dict) -> list | None:
     return result
 
 
+def real_dims_for_sym(op: ComputedBuffer, sym: sympy.Symbol) -> list[tuple[str, int]]:
+    """Return [(name, size), ...] for the real dims covered by a loop variable."""
+    names = op.rdims.get(sym, [])
+    return [(n, _real_dims[n]) for n in names if n in _real_dims]
+
+
 def real_dims_for_coord(
     op: ComputedBuffer, coord: sympy.Expr
 ) -> list[tuple[str, int]] | None:
     """Return [(name, size), ...] for the real dims covered by a host coord expression."""
     if not coord.free_symbols:
         return None
-    sym = _lone_sym(coord)
-    names = op.rdims.get(sym)
-    if names is None:
-        return None
-    return [(n, _real_dims[n]) for n in names if n in _real_dims]
+    return real_dims_for_sym(op, _lone_sym(coord))
 
 
 def get_input_real_dims(inputs: list) -> dict | None:
