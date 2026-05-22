@@ -145,10 +145,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
 
   // TODO(tmhoangt): add type conversion node
-  // Type checking - no type conversion support yet
-  TORCH_CHECK(
-      src.scalar_type() == dst.scalar_type(),
-      "Spyre backend does not support type conversion yet during copy.");
+  // (yuezhu1) Remove requirement for src.scalar_type() == dst.scalar_type()
+  // and let type conversion validation be delegated to backend
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
