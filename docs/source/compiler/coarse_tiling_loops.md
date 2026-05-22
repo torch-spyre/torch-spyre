@@ -174,7 +174,7 @@ fp16 tensor with Spyre stick layout (128 bytes/stick, 64 elements/stick):
 - Outer stride: 512 rows × 64 sticks/row × 128 bytes/stick = 4,194,304 bytes
 - Inner stride: 1024 columns / 64 elements/stick × 128 bytes/stick = 2,048 bytes
 
-```llvm
+```none
 #map_0 = affine_map<(d0, d1)[s0] -> (s0 + 4194304*d0 + 2048*d1)>
 module {
     func.func @sdsc_bundle() {
@@ -687,7 +687,7 @@ concrete integer; symbolic loop counts raise `NotImplementedError`.
 
 Emitted MLIR for a single-level loop with one body op:
 
-```llvm
+```none
 module {
   func.func @sdsc_bundle() {
     %c0 = arith.constant 0 : index
@@ -704,7 +704,7 @@ module {
 For nested loops, `scf.for` blocks are nested and induction variables are
 numbered sequentially (`%i_0`, `%i_1`, ...):
 
-```llvm
+```none
 %loop_bound_0 = arith.constant 4 : index
 %loop_bound_1 = arith.constant 8 : index
 scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
