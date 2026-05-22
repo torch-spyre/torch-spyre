@@ -72,6 +72,8 @@ jobs:
             config: ministral_3_14B_Instruct_2512_spyre.yaml
           - name: Mistral Small 3.2 24B Instruct 2506
             config: mistral_small_3.2_24B_instruct_2506_spyre.yaml
+          - name: Meta-Llama-3.1-8B-Instruct
+            config: Meta-Llama-3.1-8B-Instruct.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
