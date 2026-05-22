@@ -35,33 +35,33 @@ from .views import matching_dim, compute_coordinates
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
-logger = get_inductor_logger("propagate_real_dims")
+logger = get_inductor_logger("propagate_named_dims")
 
 
-# Used for propagation of real-dims if this pass runs
-# This pass does not run unless the driver program called annotate_real_dims
-_real_dims: dict[str, int] = {}
-_real_tensor_dims = WeakTensorKeyDictionary()
+# Used for propagation of named dims if this pass runs.
+# This pass does not run unless the driver program called name_tensor_dims.
+_named_dims: dict[str, int] = {}
+_named_tensor_dims = WeakTensorKeyDictionary()
 _enabled = False
 
 
 def reset():
     global _enabled
-    _real_dims.clear()
-    _real_tensor_dims.clear()
+    _named_dims.clear()
+    _named_tensor_dims.clear()
     _enabled = False
 
 
 def declare_tensor_dim(name: str, size: int) -> None:
     """Declare a named tensor dimension and its size."""
-    _real_dims[name] = size
+    _named_dims[name] = size
 
 
-def name_tensor_dims(tensor: torch.Tensor, real_dims: list[str]) -> torch.Tensor:
+def name_tensor_dims(tensor: torch.Tensor, named_dims: list[str]) -> torch.Tensor:
     """Annotate a tensor with its named dimensions: [name, ...]"""
     global _enabled
     _enabled = True
-    _real_tensor_dims[tensor] = real_dims
+    _named_tensor_dims[tensor] = named_dims
     return tensor
 
 
@@ -75,31 +75,33 @@ def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
 
 def _untracked_name(context: str, sym, size: int) -> str:
     name = f"_untracked_{size}"
-    _real_dims.setdefault(name, size)
-    logger.warning(f"{context}: loop var {sym} has no real dim mapping -- using {name}")
+    _named_dims.setdefault(name, size)
+    logger.warning(
+        f"{context}: loop var {sym} has no named dim mapping -- using {name}"
+    )
     return name
 
 
-def _compute_real_layout(real_dims):
-    """Compute real size and stride from declared real dim sizes."""
+def _compute_named_layout(named_dims):
+    """Compute size and stride from declared named dim sizes."""
     size = []
     stride = [1]
-    for s in reversed(real_dims):
-        if s not in _real_dims:
+    for s in reversed(named_dims):
+        if s not in _named_dims:
             raise KeyError(
-                f"Real dim '{s}' used in name_tensor_dims but not declared -- "
+                f"Named dim '{s}' used in name_tensor_dims but not declared -- "
                 f"call declare_tensor_dim('{s}', size) before compiling"
             )
-        stride.append(stride[-1] * _real_dims[s])
-        size.append(_real_dims[s])
+        stride.append(stride[-1] * _named_dims[s])
+        size.append(_named_dims[s])
     return list(reversed(size)), list(reversed(stride[:-1]))
 
 
-def compute_input_real_dims(dep: MemoryDep, op=None) -> dict:
-    """Map loop vars to real dim names for a single input dep, using real-space coords."""
+def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
+    """Map loop vars to named dim names for a single input dep, using named-space coords."""
     buf = _get_buffer(dep)
-    if not hasattr(buf, "real_dims") or buf.real_dims is None:
-        # Scalar broadcast: constant index, contributes nothing to rdims
+    if not hasattr(buf, "named_dims") or buf.named_dims is None:
+        # Scalar broadcast: constant index, contributes nothing to loop_var_dims
         if not dep.index.free_symbols:
             return {}
         # Unannotated tensor: synthesize _untracked_ names from dep ranges
@@ -108,18 +110,18 @@ def compute_input_real_dims(dep: MemoryDep, op=None) -> dict:
             sym: [_untracked_name(context, sym, int(size))]
             for sym, size in dep.ranges.items()
         }
-    real_size, real_stride = _compute_real_layout(buf.real_dims)
-    coords = compute_coordinates(real_size, real_stride, dep.ranges, dep.index)
+    named_size, named_stride = _compute_named_layout(buf.named_dims)
+    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
         if coord.free_symbols:
             sym = _lone_sym(coord)
-            result.setdefault(sym, []).append(buf.real_dims[i])
+            result.setdefault(sym, []).append(buf.named_dims[i])
     for sym, names in result.items():
         actual_range = int(dep.ranges[sym])
         product = 1
         for n in names:
-            product *= _real_dims.get(n, actual_range)
+            product *= _named_dims.get(n, actual_range)
         if actual_range != product:
             logger.warning(
                 f"{dep.name}: loop var {sym} has range {actual_range} "
@@ -134,47 +136,49 @@ def op_out_coords(op: ComputedBuffer) -> list:
     return host_coordinates(op.get_layout(), output_dep)
 
 
-def coords_to_real_dims(coords: list, rdims: dict) -> list:
-    """Map coordinate expressions to real dim names via their loop variable."""
+def coords_to_named_dims(coords: list, loop_var_dims: dict) -> list:
+    """Map coordinate expressions to named dim names via their loop variable."""
     result = []
     for c in coords:
         if c.free_symbols:
             sym = _lone_sym(c)
-            assert sym in rdims, (
-                f"coords_to_real_dims: no mapping for loop var {sym} -- "
-                f"this is a bug in _compute_real_dims synthesis"
+            assert sym in loop_var_dims, (
+                f"coords_to_named_dims: no mapping for loop var {sym} -- "
+                f"this is a bug in _compute_named_dims synthesis"
             )
-            result.extend(rdims[sym])
+            result.extend(loop_var_dims[sym])
     return result
 
 
-def real_dims_for_sym(op: ComputedBuffer, sym: sympy.Symbol) -> list[tuple[str, int]]:
-    """Return [(name, size), ...] for the real dims covered by a loop variable."""
-    names = op.rdims.get(sym, [])
-    return [(n, _real_dims[n]) for n in names if n in _real_dims]
+def named_dims_for_sym(op: ComputedBuffer, sym: sympy.Symbol) -> list[tuple[str, int]]:
+    """Return [(name, size), ...] for the named dims covered by a loop variable."""
+    names = op.loop_var_dims.get(sym, [])
+    return [(n, _named_dims[n]) for n in names if n in _named_dims]
 
 
-def real_dims_for_coord(
+def named_dims_for_coord(
     op: ComputedBuffer, coord: sympy.Expr
 ) -> list[tuple[str, int]] | None:
-    """Return [(name, size), ...] for the real dims covered by a host coord expression."""
+    """Return [(name, size), ...] for the named dims covered by a host coord expression."""
     if not coord.free_symbols:
         return None
-    return real_dims_for_sym(op, _lone_sym(coord))
+    return named_dims_for_sym(op, _lone_sym(coord))
 
 
-def get_input_real_dims(inputs: list, op=None) -> dict:
+def get_input_named_dims(inputs: list, op=None) -> dict:
     """
-    Merge real dim mappings from all inputs into a single loop-var → names dict.
+    Merge named dim mappings from all inputs into a single loop-var → names dict.
     Real names win over _untracked_ placeholders when both inputs cover the same sym.
     """
-    rdims: dict[sympy.Symbol, list[str]] = {}
+    loop_var_dims: dict[sympy.Symbol, list[str]] = {}
     for inp in inputs:
-        new = compute_input_real_dims(inp, op)
+        new = compute_input_named_dims(inp, op)
         for sym, names in new.items():
-            if sym not in rdims or all(n.startswith("_untracked_") for n in rdims[sym]):
-                rdims[sym] = names
-    return rdims
+            if sym not in loop_var_dims or all(
+                n.startswith("_untracked_") for n in loop_var_dims[sym]
+            ):
+                loop_var_dims[sym] = names
+    return loop_var_dims
 
 
 def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
@@ -186,40 +190,42 @@ def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
     return _lone_sym(reduction_coord)
 
 
-def _set_no_real_dims(op):
-    op.real_dims = []
-    op.reduction_dims = None
-    op.rdims = {}
+def _set_no_named_dims(op):
+    op.named_dims = []
+    op.reduction_named_dims = None
+    op.loop_var_dims = {}
 
 
-def _compute_real_dims(op, inputs):
-    rdims = get_input_real_dims(inputs, op)
+def _compute_named_dims(op, inputs):
+    loop_var_dims = get_input_named_dims(inputs, op)
     out_coords = op_out_coords(op)
     if not isinstance(op.data, Reduction):
         # For pointwise ops, synthesize names for loop vars not covered by any input.
-        # This handles full/zeros_like: their iteration space defines real dims but
-        # their constant value contributes nothing to rdims.
+        # This handles full/zeros_like: their iteration space defines named dims but
+        # their constant value contributes nothing to loop_var_dims.
         output_dep = next(iter(op.get_read_writes().writes))
         for coord in out_coords:
             if coord.free_symbols:
                 sym = _lone_sym(coord)
-                if sym not in rdims:
+                if sym not in loop_var_dims:
                     size = int(output_dep.ranges[sym])
-                    rdims[sym] = [_untracked_name(op.get_name(), sym, size)]
-    real_dims = coords_to_real_dims(out_coords, rdims)
-    op.real_dims = real_dims
-    op.rdims = rdims
+                    loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+    named_dims = coords_to_named_dims(out_coords, loop_var_dims)
+    op.named_dims = named_dims
+    op.loop_var_dims = loop_var_dims
     if isinstance(op.data, Reduction):
-        op.reduction_dims = rdims[get_reduction_dim(inputs[0], out_coords)]
+        op.reduction_named_dims = loop_var_dims[
+            get_reduction_dim(inputs[0], out_coords)
+        ]
     else:
-        op.reduction_dims = None
+        op.reduction_named_dims = None
 
 
 def _log_dep_debug(label: str, dep: MemoryDep) -> None:
     buf = V.graph.get_buffer(dep.name)
     layout = buf.get_layout() if hasattr(buf, "get_layout") else None
-    real_dims = getattr(buf, "real_dims", "?")
-    logger.debug(f"  {label} {dep.name}: real_dims={real_dims}")
+    named_dims = getattr(buf, "named_dims", "?")
+    logger.debug(f"  {label} {dep.name}: named_dims={named_dims}")
     if layout is not None:
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
@@ -236,12 +242,12 @@ def _log_op_inputs(op: ComputedBuffer) -> None:
     for dep in op.get_read_writes().reads:
         if isinstance(dep, MemoryDep):
             buf = _get_buffer(dep)
-            real_dims = getattr(buf, "real_dims", "?")
+            named_dims = getattr(buf, "named_dims", "?")
             host_size = (
                 list(buf.get_layout().size) if hasattr(buf, "get_layout") else "?"
             )
             logger.info(
-                f"    input {dep.name}: real_dims={real_dims}  host_size={host_size}"
+                f"    input {dep.name}: named_dims={named_dims}  host_size={host_size}"
                 f"  index={dep.index}  ranges={dict(dep.ranges)}"
             )
 
@@ -249,7 +255,7 @@ def _log_op_inputs(op: ComputedBuffer) -> None:
 def _log_op(op: Operation) -> None:
     origins: set = getattr(getattr(op, "data", op), "origins", set())
     aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
-    if not hasattr(op, "rdims") or not op.rdims:
+    if not hasattr(op, "loop_var_dims") or not op.loop_var_dims:
         logger.info(
             f"  {op.get_operation_name()}: skipped"
             f" ({type(op).__name__} / {type(getattr(op, 'data', op)).__name__})"
@@ -258,7 +264,8 @@ def _log_op(op: Operation) -> None:
         if isinstance(op, ComputedBuffer):
             _log_op_inputs(op)
             logger.info(
-                f"    output: ({op.get_name()}) real_dims={getattr(op, 'real_dims', '?')}"
+                f"    output: ({op.get_name()})"
+                f" named_dims={getattr(op, 'named_dims', '?')}"
             )
         return
     is_reduction = isinstance(op.data, Reduction)
@@ -275,22 +282,22 @@ def _log_op(op: Operation) -> None:
     for dep in list(rw.reads) + list(rw.writes):
         if isinstance(dep, MemoryDep):
             ranges.update({str(s): int(v) for s, v in dep.ranges.items()})
-    for sym, names in op.rdims.items():
+    for sym, names in op.loop_var_dims.items():
         sym_range: int | str = ranges.get(str(sym), "?")
-        declared = [f"{n}={_real_dims[n] if n in _real_dims else '?'}" for n in names]
+        declared = [f"{n}={_named_dims[n] if n in _named_dims else '?'}" for n in names]
         logger.info(
-            f"      {sym}: range={sym_range}  real_dim(s)={names}  declared={declared}"
+            f"      {sym}: range={sym_range}  named_dim(s)={names}  declared={declared}"
         )
     if is_reduction:
-        logger.info(f"    reduction over: {op.reduction_dims}")
-    logger.info(f"    output: ({op.get_name()}) real_dims={op.real_dims}")
+        logger.info(f"    reduction over: {op.reduction_named_dims}")
+    logger.info(f"    output: ({op.get_name()}) named_dims={op.named_dims}")
     logger.info("")
 
 
-def propagate_real_dims(
+def propagate_named_dims(
     operations: list[Operation],
 ) -> None:
-    """Propagate real dims from annotated inputs through the op graph."""
+    """Propagate named dims from annotated inputs through the op graph."""
     if not _enabled:
         return
     if len(V.graph.graph_input_names) > 0:
@@ -308,11 +315,11 @@ def propagate_real_dims(
                 layout = tb.data.data.layout
                 if not isinstance(layout, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                tb.real_dims = _real_tensor_dims.get(real_input)
+                tb.named_dims = _named_tensor_dims.get(real_input)
 
     for op in operations:
         if op.is_no_op():
-            op.real_dims = []
+            op.named_dims = []
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
@@ -331,24 +338,24 @@ def propagate_real_dims(
                 if isinstance(dep, MemoryDep):
                     _log_dep_debug("output", dep)
             if isinstance(op.data, (Pointwise, Reduction)):
-                _compute_real_dims(op, inputs)
+                _compute_named_dims(op, inputs)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
-                _set_no_real_dims(op)
+                _set_no_named_dims(op)
         else:
             logger.warning(f"unhandled operation type {type(op)}")
-            _set_no_real_dims(op)
+            _set_no_named_dims(op)
 
     # LOG THE RESULTS
     logger.info("DECLARED DIMS")
-    for name, size in _real_dims.items():
+    for name, size in _named_dims.items():
         logger.info(f"  {name} = {size}")
 
     logger.info("INPUT TENSORS")
     for name in V.graph.graph_input_names:
         tb = V.graph.graph_inputs[name]
         if isinstance(tb, TensorBox):
-            logger.info(f"  {name}: real_dims={tb.real_dims}")
+            logger.info(f"  {name}: named_dims={tb.named_dims}")
 
     logger.info("OPS")
     for op in operations:
