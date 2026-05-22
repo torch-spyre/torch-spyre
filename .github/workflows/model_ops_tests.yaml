@@ -33,7 +33,7 @@ jobs:
       - spyre_pf_x1
       - linux
       - image_torch_spyre
-    timeout-minutes: 720
+    timeout-minutes: 60
     env:
       # The CI env var is very important.
       # GitHub actions automatically sets CI=true
