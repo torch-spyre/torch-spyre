@@ -629,7 +629,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
 
 def compile_op_spec(
-    idx: int, op_spec: OpSpec, symbols: list[int], symbol_id_offset: int = 0
+    idx: int,
+    op_spec: OpSpec,
+    symbols: list[int],
+    symbol_id_offset: int = 0,
+    use_symbols: bool = True,
 ) -> tuple[Any, list[int], list[dict]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
@@ -644,4 +648,5 @@ def compile_op_spec(
         symbols,
         symbol_id_offset,
         tiled_symbols=tiled_symbols,
+        use_symbols=use_symbols,
     )

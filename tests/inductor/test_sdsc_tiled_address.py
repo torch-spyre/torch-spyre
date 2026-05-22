@@ -443,7 +443,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
-        generate_bundle("test_kernel", tmpdir, [loop])
+        generate_bundle("test_kernel", tmpdir, [loop], use_symbols=True)
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
             mlir = f.read()

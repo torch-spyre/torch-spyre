@@ -18,6 +18,7 @@ import os
 import subprocess
 
 from torch._inductor.runtime.runtime_utils import cache_dir
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, UnimplementedOp
 from torch_spyre._inductor.codegen.bundle import generate_bundle
@@ -59,7 +60,12 @@ class SpyreAsyncCompile:
 
         # Generate SDSC Bundle from specs (may contain LoopSpec entries).
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs)
+        generate_bundle(
+            kernel_name,
+            output_dir,
+            specs,
+            use_symbols=_spyre_config.bundle_hbm_symbols,
+        )
 
         # Invoke backend compiler of SDSC Bundle
         subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)

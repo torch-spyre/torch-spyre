@@ -43,14 +43,56 @@ _CompiledEntry = tuple[Any, list[int], list[dict]]
 # ---------------------------------------------------------------------------
 
 
-def generate_bundle(kernel_name: str, output_dir: str, specs: list):
+def _contains_tiled_loop_spec(specs: list) -> bool:
+    """Return True if any OpSpec inside a LoopSpec has non-empty tiled_symbols."""
+    for entry in specs:
+        if isinstance(entry, LoopSpec):
+            if _any_tiled_op(entry.body):
+                return True
+        elif isinstance(entry, OpSpec):
+            continue
+    return False
+
+
+def _any_tiled_op(specs: list) -> bool:
+    """Return True if specs (possibly nested) contains an OpSpec with tiled_symbols."""
+    for entry in specs:
+        if isinstance(entry, OpSpec) and entry.tiled_symbols:
+            return True
+        if isinstance(entry, LoopSpec) and _any_tiled_op(entry.body):
+            return True
+    return False
+
+
+def generate_bundle(
+    kernel_name: str,
+    output_dir: str,
+    specs: list,
+    use_symbols: bool = False,
+):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
     ``specs`` is a list of ``OpSpec | LoopSpec`` entries (nested ``LoopSpec``
     entries are supported).  ``LoopSpec`` entries produce ``scf.for`` loops in
     the generated ``bundle.mlir``, with ``affine.apply`` expressions computing
     per-iteration tensor start addresses for tiled dimensions.
+
+    When ``use_symbols=False`` (default), HBM tensor addresses are baked as
+    concrete integers into the SDSC JSON — matching the main-branch behaviour.
+    ``LoopSpec`` entries require ``use_symbols=True`` because tiled addressing
+    relies on runtime symbols; passing a spec tree that contains tiled ops in a
+    ``LoopSpec`` with ``use_symbols=False`` raises ``RuntimeError``.
+
+    Set ``use_symbols=True`` (or ``BUNDLE_HBM_SYMBOLS=1``) to enable the
+    symbol-indirection path required for coarse tiling.
     """
+    if not use_symbols and _contains_tiled_loop_spec(specs):
+        raise RuntimeError(
+            "bundle_hbm_symbols must be True when the spec tree contains tiled ops "
+            "inside a LoopSpec.  Set BUNDLE_HBM_SYMBOLS=1 or "
+            "config.bundle_hbm_symbols=True."
+        )
+
     # -----------------------------------------------------------------------
     # Pass 1: compile all OpSpecs depth-first.
     # ``symbols`` is indexed by abs(symbol_id)-1: one entry per symbol ID in
@@ -63,7 +105,13 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list):
     symbol_id_offset_counter = [0]
 
     _compile_specs(
-        specs, symbols, compiled, sdsc_counter, symbol_id_offset_counter, output_dir
+        specs,
+        symbols,
+        compiled,
+        sdsc_counter,
+        symbol_id_offset_counter,
+        output_dir,
+        use_symbols=use_symbols,
     )
 
     # -----------------------------------------------------------------------
@@ -107,6 +155,7 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list):
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
         # One arith.constant per symbol ID (symbols[N] → %sym_{N+1}).
+        # Skipped when use_symbols=False (symbols list is empty in that case).
         for sym_idx, value in enumerate(symbols):
             f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
@@ -141,6 +190,7 @@ def _compile_specs(
     sdsc_counter: list,
     symbol_id_offset_counter: list,
     output_dir: str,
+    use_symbols: bool = False,
 ) -> None:
     """Recursively compile all OpSpecs in specs depth-first."""
     for entry in specs:
@@ -152,12 +202,17 @@ def _compile_specs(
                 sdsc_counter,
                 symbol_id_offset_counter,
                 output_dir,
+                use_symbols=use_symbols,
             )
         elif isinstance(entry, OpSpec):
             idx = sdsc_counter[0]
             sdsc_counter[0] += 1
             sdsc_json, local_sym_values, affine_strides = compile_op_spec(
-                idx, entry, symbols, symbol_id_offset_counter[0]
+                idx,
+                entry,
+                symbols,
+                symbol_id_offset_counter[0],
+                use_symbols=use_symbols,
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
             compiled.append((sdsc_json, local_sym_values, affine_strides))

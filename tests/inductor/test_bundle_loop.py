@@ -46,7 +46,11 @@ def _make_op_spec(name: str) -> OpSpec:
 
 
 def _fake_compile_op_spec(
-    idx: int, op_spec: OpSpec, symbols: list, symbol_id_offset: int = 0
+    idx: int,
+    op_spec: OpSpec,
+    symbols: list,
+    symbol_id_offset: int = 0,
+    use_symbols: bool = True,
 ):
     """Stub that returns (json, [], []) — no real SDSC compilation."""
     return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], []
@@ -297,7 +301,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=fake_compile,
         ):
-            generate_bundle("test_kernel", self.tmpdir, specs)
+            generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
         with open(os.path.join(self.tmpdir, "bundle.mlir")) as f:
             return f.read()
 
@@ -306,7 +310,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 16384
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}]
@@ -328,7 +332,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_non_tiled_tensor_in_loop_no_affine_apply(self):
         """A non-tiled tensor inside a LoopSpec uses %sym_N directly, no affine.apply."""
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [{}]
@@ -347,7 +351,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 8192
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
             return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}]
@@ -365,7 +369,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         """affine.apply must appear inside the scf.for body (after it, before })."""
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
             return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}]
@@ -385,7 +389,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         """Exact snapshot for a single tiled op in a loop."""
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}]
@@ -434,7 +438,7 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=fake_compile,
         ):
-            generate_bundle("test_kernel", self.tmpdir, specs)
+            generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
         with open(os.path.join(self.tmpdir, "bundle.mlir")) as f:
             return f.read()
 
@@ -442,7 +446,7 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
         """Return a fake_compile that injects a two-entry affine_strides dict."""
         s0, s1 = self.s0, self.s1
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return (
@@ -517,6 +521,46 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(mlir, expected)
+
+
+# ---------------------------------------------------------------------------
+# Guard: tiled LoopSpec with use_symbols=False raises CompilationError
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateBundleUseSymbolsGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def test_tiled_loop_without_use_symbols_raises(self):
+        """Tiled op inside a LoopSpec raises CompilationError when use_symbols=False."""
+        s = Symbol("s")
+        op = _make_op_spec("a")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        with self.assertRaises(RuntimeError):
+            generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=False)
+
+    def test_non_tiled_loop_without_use_symbols_ok(self):
+        """A LoopSpec with non-tiled ops is allowed when use_symbols=False."""
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=_fake_compile_op_spec,
+        ):
+            op = _make_op_spec("a")
+            loop = LoopSpec(count=Integer(2), body=[op])
+            # Should not raise.
+            generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=False)
+
+    def test_flat_op_without_use_symbols_ok(self):
+        """A flat OpSpec (no LoopSpec) is allowed when use_symbols=False."""
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=_fake_compile_op_spec,
+        ):
+            op = _make_op_spec("a")
+            # Should not raise.
+            generate_bundle("test_kernel", self.tmpdir, [op], use_symbols=False)
 
 
 if __name__ == "__main__":

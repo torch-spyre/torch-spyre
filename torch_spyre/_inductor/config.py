@@ -43,6 +43,14 @@ core_id_k_fast_emission: bool = (
 
 coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
 
+# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
+# constants) in bundle.mlir and resolved via affine.apply for tiled loops.
+# Requires backend compiler support for the sdscbundle symbol table, which is
+# still under development.  Must be True when coarse_tiling is True (LoopSpec
+# nodes in the spec tree require symbols).  Defaults to False until backend
+# support is complete.
+bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
+
 # Optional callable injected by callers to compute coarse-tiling groups.
 # Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr[, int|None]]]
 # Each tuple is (ops, loop_count) or (ops, loop_count, tiled_dims).
