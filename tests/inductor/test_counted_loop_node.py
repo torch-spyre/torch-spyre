@@ -44,12 +44,17 @@ def _make_scheduler():
 
 
 def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
-    """Return a fake ir.Operation optionally stamped with loop attributes."""
+    """Return a fake ir.Operation optionally stamped with loop attributes.
+
+    loop_count must be a list of trip counts (one per nesting level), matching
+    the contract stamped by coarse_tile().  A bare Expr is accepted as a
+    convenience shorthand and is wrapped in a 1-element list.
+    """
     op = MagicMock()
     op.name = name
     if loop_group_id is not None:
         op.loop_group_id = loop_group_id
-        op.loop_count = loop_count
+        op.loop_count = loop_count if isinstance(loop_count, list) else [loop_count]
     else:
         # Make getattr(..., None) work correctly by not having the attribute.
         del op.loop_group_id
@@ -97,14 +102,14 @@ class TestHelpers(unittest.TestCase):
         sched = _make_scheduler()
         op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(8))
         snode = _make_snode(sched, op)
-        self.assertEqual(_loop_count(snode), Integer(8))
+        self.assertEqual(_loop_count(snode, depth=0), Integer(8))
 
     def test_loop_count_symbolic(self):
         sched = _make_scheduler()
         s = Symbol("s0")
         op = _make_ir_op(loop_group_id=(0,), loop_count=s)
         snode = _make_snode(sched, op)
-        self.assertEqual(_loop_count(snode), s)
+        self.assertEqual(_loop_count(snode, depth=0), s)
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +190,15 @@ class TestBuildLoopSchedulerNodes(unittest.TestCase):
 
     def test_nested_group(self):
         sched = _make_scheduler()
-        # Outer group (0,) contains an inner group (0, 0)
+        # Outer group (0,) contains an inner group (0, 0).
+        # loop_count for a depth-2 op is [outer_count, inner_count].
         outer = _make_snode(sched, _make_ir_op((0,), Integer(4)), "outer")
-        inner1 = _make_snode(sched, _make_ir_op((0, 0), Integer(2)), "inner1")
-        inner2 = _make_snode(sched, _make_ir_op((0, 0), Integer(2)), "inner2")
+        inner1 = _make_snode(
+            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner1"
+        )
+        inner2 = _make_snode(
+            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner2"
+        )
         result, created = self._run([outer, inner1, inner2])
         # Outermost result has one CountedLoopSchedulerNode for group (0,)
         self.assertEqual(len(result), 1)

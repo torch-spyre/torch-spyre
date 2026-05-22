@@ -26,12 +26,7 @@ from sympy import Integer, Symbol
 from unittest.mock import patch
 
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
-from torch_spyre._inductor.codegen.bundle import (
-    generate_bundle,
-    _collect_op_specs,
-    _collect_loop_counts,
-    _mlir_count_value,
-)
+from torch_spyre._inductor.codegen.bundle import generate_bundle
 
 
 # ---------------------------------------------------------------------------
@@ -60,95 +55,6 @@ def _fake_compile_op_spec(
 def _read_mlir(output_dir: str) -> str:
     with open(os.path.join(output_dir, "bundle.mlir")) as f:
         return f.read()
-
-
-# ---------------------------------------------------------------------------
-# Tests for _collect_op_specs
-# ---------------------------------------------------------------------------
-
-
-class TestCollectOpSpecs(unittest.TestCase):
-    def test_flat_list(self):
-        a, b = _make_op_spec("a"), _make_op_spec("b")
-        result: list[OpSpec] = []
-        _collect_op_specs([a, b], result)
-        self.assertEqual(result, [a, b])
-
-    def test_single_loop(self):
-        a, b = _make_op_spec("a"), _make_op_spec("b")
-        loop = LoopSpec(count=Integer(4), body=[a, b])
-        result: list[OpSpec] = []
-        _collect_op_specs([loop], result)
-        self.assertEqual(result, [a, b])
-
-    def test_nested_loop(self):
-        a = _make_op_spec("a")
-        b = _make_op_spec("b")
-        inner = LoopSpec(count=Integer(2), body=[b])
-        outer = LoopSpec(count=Integer(4), body=[a, inner])
-        result: list[OpSpec] = []
-        _collect_op_specs([outer], result)
-        self.assertEqual(result, [a, b])
-
-    def test_mixed_flat_and_loop(self):
-        a, b, c = _make_op_spec("a"), _make_op_spec("b"), _make_op_spec("c")
-        loop = LoopSpec(count=Integer(3), body=[b])
-        result: list[OpSpec] = []
-        _collect_op_specs([a, loop, c], result)
-        self.assertEqual(result, [a, b, c])
-
-    def test_empty(self):
-        result: list[OpSpec] = []
-        _collect_op_specs([], result)
-        self.assertEqual(result, [])
-
-
-# ---------------------------------------------------------------------------
-# Tests for _collect_loop_counts
-# ---------------------------------------------------------------------------
-
-
-class TestCollectLoopCounts(unittest.TestCase):
-    def test_no_loops(self):
-        a = _make_op_spec("a")
-        counts = _collect_loop_counts([a])
-        self.assertEqual(counts, [])
-
-    def test_single_loop(self):
-        loop = LoopSpec(count=Integer(4), body=[])
-        counts = _collect_loop_counts([loop])
-        self.assertEqual(counts, [Integer(4)])
-
-    def test_nested_loops_depth_first_order(self):
-        inner = LoopSpec(count=Integer(2), body=[])
-        outer = LoopSpec(count=Integer(4), body=[inner])
-        counts = _collect_loop_counts([outer])
-        # outer count first, then inner
-        self.assertEqual(counts, [Integer(4), Integer(2)])
-
-    def test_two_sequential_loops(self):
-        loop0 = LoopSpec(count=Integer(4), body=[])
-        loop1 = LoopSpec(count=Integer(8), body=[])
-        counts = _collect_loop_counts([loop0, loop1])
-        self.assertEqual(counts, [Integer(4), Integer(8)])
-
-
-# ---------------------------------------------------------------------------
-# Tests for _mlir_count_value
-# ---------------------------------------------------------------------------
-
-
-class TestMlirCountValue(unittest.TestCase):
-    def test_integer_count(self):
-        self.assertEqual(_mlir_count_value(Integer(4)), "arith.constant 4 : index")
-
-    def test_integer_count_one(self):
-        self.assertEqual(_mlir_count_value(Integer(1)), "arith.constant 1 : index")
-
-    def test_symbolic_count_raises(self):
-        k = Symbol("K")
-        with self.assertRaises(NotImplementedError):
-            _mlir_count_value(k)
 
 
 # ---------------------------------------------------------------------------
