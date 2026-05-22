@@ -195,10 +195,54 @@ jobs:
           source .venv/bin/activate
 
           CONFIG="${{ matrix.suite.config }}"
+          METRICS_DIR="${GITHUB_WORKSPACE}/workflow-metrics"
+          mkdir -p "$METRICS_DIR"
+          CONFIG_SLUG=$(echo "${CONFIG}" | tr '/.' '__')
+          TIME_LOG="${METRICS_DIR}/time_${CONFIG_SLUG}.log"
+          METRICS_JSON="${METRICS_DIR}/metrics_${CONFIG_SLUG}.json"
 
           echo "Running ${{ matrix.suite.name }} tests..."
-          bash tests/run_test.sh "tests/configs/${CONFIG}" -v --capture=sys
+          set +e
+          START_EPOCH=$(date +%s)
+          /usr/bin/time -v -o "$TIME_LOG" bash tests/run_test.sh "tests/configs/${CONFIG}" -v --capture=sys
+          STATUS=$?
+          END_EPOCH=$(date +%s)
+          set -e
+
+          DURATION_SECONDS=$((END_EPOCH - START_EPOCH))
+          MAX_RSS_KB=$(awk -F': ' '/Maximum resident set size/ {print $2}' "$TIME_LOG")
+
+          cat > "$METRICS_JSON" <<EOF
+          {
+            "workflow": "${GITHUB_WORKFLOW}",
+            "job": "${GITHUB_JOB}",
+            "suite_name": "${{ matrix.suite.name }}",
+            "config": "${CONFIG}",
+            "start_epoch": ${START_EPOCH},
+            "end_epoch": ${END_EPOCH},
+            "duration_seconds": ${DURATION_SECONDS},
+            "max_rss_kb": ${MAX_RSS_KB},
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_number": "${GITHUB_RUN_NUMBER}",
+            "sha": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}"
+          }
+          EOF
+
+          if [[ $STATUS -ne 0 ]]; then
+            exit $STATUS
+          fi
+
           echo "${{ matrix.suite.name }} tests done"
+
+      - name: Upload workflow metrics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: workflow-metrics-${{ matrix.suite.config }}
+          path: ${{ github.workspace }}/workflow-metrics/metrics_*.json
+          if-no-files-found: warn
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
   # Job 3: Multi-Spyre test matrix
@@ -228,7 +272,7 @@ jobs:
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-
+f
     strategy:
       fail-fast: false
       matrix:
@@ -252,7 +296,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
-
+f
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
@@ -274,11 +318,55 @@ jobs:
           source .venv/bin/activate
 
           CONFIG="${{ matrix.suite.config }}"
+          METRICS_DIR="${GITHUB_WORKSPACE}/workflow-metrics"
+          mkdir -p "$METRICS_DIR"
+          CONFIG_SLUG=$(echo "${CONFIG}" | tr '/.' '__')
+          TIME_LOG="${METRICS_DIR}/time_${CONFIG_SLUG}.log"
+          METRICS_JSON="${METRICS_DIR}/metrics_${CONFIG_SLUG}.json"
 
           echo "Running ${{ matrix.suite.name }} tests..."
           env | sort
-          bash tests/run_test.sh "tests/configs/${CONFIG}" -v
+          set +e
+          START_EPOCH=$(date +%s)
+          /usr/bin/time -v -o "$TIME_LOG" bash tests/run_test.sh "tests/configs/${CONFIG}" -v
+          STATUS=$?
+          END_EPOCH=$(date +%s)
+          set -e
+
+          DURATION_SECONDS=$((END_EPOCH - START_EPOCH))
+          MAX_RSS_KB=$(awk -F': ' '/Maximum resident set size/ {print $2}' "$TIME_LOG")
+
+          cat > "$METRICS_JSON" <<EOF
+          {
+            "workflow": "${GITHUB_WORKFLOW}",
+            "job": "${GITHUB_JOB}",
+            "suite_name": "${{ matrix.suite.name }}",
+            "config": "${CONFIG}",
+            "start_epoch": ${START_EPOCH},
+            "end_epoch": ${END_EPOCH},
+            "duration_seconds": ${DURATION_SECONDS},
+            "max_rss_kb": ${MAX_RSS_KB},
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_number": "${GITHUB_RUN_NUMBER}",
+            "sha": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}"
+          }
+          EOF
+
+          if [[ $STATUS -ne 0 ]]; then
+            exit $STATUS
+          fi
+
           echo "${{ matrix.suite.name }} tests done"
+
+      - name: Upload workflow metrics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: workflow-metrics-${{ matrix.suite.config }}
+          path: ${{ github.workspace }}/workflow-metrics/metrics_*.json
+          if-no-files-found: warn
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
   # Job 4: run-spyre-unit-tests (required check gate)
@@ -324,3 +412,74 @@ jobs:
 
           echo "One or more test suites failed or were cancelled."
           exit 1
+
+  summarize-workflow-metrics:
+    name: Summarize workflow metrics
+    runs-on: ubuntu-latest
+    needs: [changes, test, test_multi_spyre]
+    if: always()
+    steps:
+      - name: Download workflow metrics
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: workflow-metrics-*
+          path: workflow-metrics
+          merge-multiple: true
+          if-no-files-found: warn
+
+      - name: Build workflow summary
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+          import os
+
+          files = glob.glob("workflow-metrics/**/*.json", recursive=True)
+          suites = []
+          for path in files:
+            try:
+              with open(path, "r", encoding="utf-8") as handle:
+                suites.append(json.load(handle))
+            except Exception:
+              continue
+
+          durations = [s.get("duration_seconds", 0) for s in suites]
+          max_rss = [s.get("max_rss_kb", 0) for s in suites]
+          starts = [s.get("start_epoch") for s in suites if "start_epoch" in s]
+          ends = [s.get("end_epoch") for s in suites if "end_epoch" in s]
+
+          workflow_elapsed_seconds = (
+            max(ends) - min(starts)
+            if starts and ends else 0
+          )
+
+          summary = {
+            "workflow": os.environ.get("GITHUB_WORKFLOW"),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_number": os.environ.get("GITHUB_RUN_NUMBER"),
+            "sha": os.environ.get("GITHUB_SHA"),
+            "ref": os.environ.get("GITHUB_REF"),
+            "suite_count": len(suites),
+            "workflow_elapsed_seconds": workflow_elapsed_seconds,
+            "aggregate_suite_seconds": sum(durations),
+            "largest_suite_peak_rss_kb": max(max_rss) if max_rss else 0,
+            "average_suite_peak_rss_kb": (
+              sum(max_rss) / len(max_rss)
+              if max_rss else 0
+            ),
+            "suites": suites,
+          }
+
+          os.makedirs("workflow-metrics-summary", exist_ok=True)
+          with open("workflow-metrics-summary/workflow_metrics.json", "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
+          PY
+
+      - name: Upload workflow summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: workflow-metrics-summary
+          path: workflow-metrics-summary/workflow_metrics.json
+          if-no-files-found: warn
+          retention-days: 30
