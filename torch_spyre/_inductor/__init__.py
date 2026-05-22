@@ -19,6 +19,8 @@ from . import config
 import threading
 from functools import wraps
 
+from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
+
 _autoload_lock = threading.Lock()
 
 

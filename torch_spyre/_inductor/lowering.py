@@ -706,6 +706,42 @@ def lower_restickify(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
+def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if dtype not in (torch.float16, torch.float32):
+        return ir.TensorBox.create(
+            ir.FallbackKernel.create(
+                torch.ops.aten.full.default,
+                size,
+                fill_value,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                pin_memory=pin_memory,
+            )
+        )
+    scalar = ir.TensorBox.create(
+        SpyreConstantFallback(
+            torch.ops.spyre.constant.default, float(fill_value), dtype, device
+        )
+    )
+    scalar_loader = scalar.make_loader()
+
+    def inner_fn(index):
+        return scalar_loader([])
+
+    return Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=list(size),
+    )
+
+
 @register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
 def lower_constant(value, dtype, device):
     op_overload = getattr(
