@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from dataclasses import dataclass
 from typing import Callable, NamedTuple, TypeVar, Union
 
 import torch
@@ -32,6 +34,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
+from .codegen.superdsc import _get_core_to_slice_mapping
 from .ir import FixedTiledLayout
 from .views import compute_coordinates, matching_dim
 
@@ -734,3 +737,97 @@ def lower_pad_sequence(
     )
 
     return padded_buf, list(new_ops)
+
+
+@dataclass(frozen=True)
+class PerCoreView:
+    """How one user slices a buffer across cores.
+
+    Two users with equal PerCoreView values place / read identical bytes on
+    each core's LX scratchpad — i.e. it's safe to keep the buffer on LX
+    between them.
+    """
+
+    slab_layout: SpyreTensorLayout
+    core_to_slot: dict[int, sympy.Expr]
+    reduction_partial: tuple[tuple[str, int], ...]
+
+
+def _per_core_view_on_buf(
+    op: Operation, dep: MemoryDep, buf_name: str
+) -> PerCoreView:
+    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+
+    Steps:
+      1. Recover {symbol: split} from op.op_it_space_splits via
+         apply_splits_from_index_coeff(write_index, read_index, ...).
+      2. For each split symbol, look up its host stride on buf via
+         dep.index.coeff(sym). host_stride == 0 → reduction-partial.
+      3. Place each split on buf's outermost matching device dim
+         with a divisible extent. Sticks are atomic, so a
+         host-stride-1 split may land on the outer-stick dim instead.
+    NOTE: Two different indices are used:
+      - op-level write_index/read_index (any buffer the op writes/reads,
+        not necessarily buf_name) drive step 1's symbol-bridge.
+      - dep.index (the buf_name-specific index for this call) drives
+        step 2's host-stride lookup on buf.
+    """
+    rw = op.get_read_writes()
+    coeff_splits = getattr(op, "op_it_space_splits", ({}, {}))
+    write_index = next(iter(rw.writes)).index
+    read_index = next((d.index for d in rw.reads), write_index)
+    per_sym = apply_splits_from_index_coeff(
+        coeff_splits, write_index, read_index, iteration_space_from_op(op)
+    )
+
+    splits_by_stride: dict[int, int] = {}
+    reduction_partial: list = []
+    for sym, split in per_sym.items():
+        if split <= 1:
+            continue
+        host_stride = int(dep.index.coeff(sym))
+        if host_stride == 0:
+            reduction_partial.append((str(sym), int(split)))
+        else:
+            splits_by_stride[host_stride] = int(split)
+
+    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
+    device_size = list(buf_layout.device_size)
+    stride_map = list(buf_layout.stride_map)
+    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+
+    dim_splits: dict[int, int] = {}
+    consumed: set[int] = set()
+    dims_outer_first = sorted(
+        (i for i, s in enumerate(stride_map) if s > 0),
+        key=lambda i: -stride_map[i],
+    )
+    for h, split in splits_by_stride.items():
+        candidate_strides = {h, elems_per_stick} if h == 1 else {h}
+        for i in dims_outer_first:
+            if (
+                i in consumed
+                or stride_map[i] not in candidate_strides
+                or device_size[i] % split != 0
+            ):
+                continue
+            device_size[i] //= split
+            dim_splits[h] = split
+            consumed.add(i)
+            break
+    assert dim_splits == splits_by_stride, (
+        f"could not place {splits_by_stride} on stride_map={stride_map} "
+        f"device_size={list(buf_layout.device_size)}"
+    )
+
+    slab_layout = SpyreTensorLayout(
+        device_size, list(buf_layout.stride_map), buf_layout.device_dtype
+    )
+    num_cores = int(math.prod(per_sym.values()))
+    core_to_slot = _get_core_to_slice_mapping(dim_splits, dim_splits, num_cores)
+
+    return PerCoreView(
+        slab_layout=slab_layout,
+        core_to_slot=core_to_slot,
+        reduction_partial=tuple(sorted(reduction_partial)),
+    )

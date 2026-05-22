@@ -14,9 +14,11 @@
 
 
 import math
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 from torch_spyre._inductor import config
+from torch_spyre._inductor.pass_utils import _per_core_view_on_buf
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
@@ -102,6 +104,24 @@ def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operati
     return buf_users_read_and_write
 
 
+def _get_buffer_user_deps(
+    graph: GraphLowering | GraphView,
+) -> dict[str, list[tuple[Operation, MemoryDep]]]:
+    """Like get_buffer_users but pairs each op with the specific dep it uses.
+
+    In-place ops (same op reads & writes the same buf) get two entries:
+    one per dep. If their per-core views diverge — read at one index,
+    write at another — the buffer is correctly rejected for LX, since
+    that's a within-core data hazard, not just cross-op disagreement.
+    """
+    buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]] = {}
+    for op in graph.operations:
+        rw = op.get_read_writes()
+        for dep in rw.reads | rw.writes:
+            buf_user_deps.setdefault(dep.name, []).append((op, dep))
+    return buf_user_deps
+
+
 def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
@@ -111,18 +131,38 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
-    buf_users_read_and_write = get_buffer_users(graph)
-    for buf_name, users_rw in buf_users_read_and_write.items():
+    buf_user_deps = _get_buffer_user_deps(graph)
+    for buf_name, users in buf_user_deps.items():
         # this dict includes graph input and output
-        if using_multicore:
-            # graph input and output can have only 1 read or 1 write user.
-            u0_split = users_rw[0].op_it_space_splits  # a list like [16, 1]
-            same_core_div = all(u0_split == u.op_it_space_splits for u in users_rw[1:])
+        if using_multicore and len(users) > 1:
+            # K-split-reduction producers leave partial sums on most cores;
+            # only k-last cores hold the final value. Without a broadcast
+            # codepath the buffer is not safe on LX, even if slab geometry
+            # happens to match. The flag is meaningful only for write-deps
+            # — a consumer reading a K-split input still gets its own valid
+            # slab.
+            analyzed = [
+                (op, dep, *_per_core_view_on_buf(op, dep, buf_name))
+                for op, dep in users
+            ]
+            producer_partials = any(
+                flag for op, dep, _, flag in analyzed
+                if dep in op.get_read_writes().writes
+            )
+            if producer_partials:
+                same_core_div = False
+            else:
+                ref = analyzed[0][2]
+                same_core_div = all(view == ref for _, _, view, _ in analyzed[1:])
+            u0_split = users[0][0].op_it_space_splits
             num_cores = (
                 math.prod([s for p in u0_split for s in p.values()])
                 if same_core_div
                 else -1
             )
+        elif using_multicore:
+            u0_split = users[0][0].op_it_space_splits
+            num_cores = math.prod([s for p in u0_split for s in p.values()])
         else:
             num_cores = 1
         result[buf_name] = num_cores
