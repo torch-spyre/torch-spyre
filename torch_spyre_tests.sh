@@ -1,5 +1,7 @@
 #!/bin/bash
 
+mkdir -p logs
+
 CONFIGS=(
   "torch_spyre_tests/test_device_enum_config.yaml"
   "torch_spyre_tests/test_fallbacks_config.yaml"
@@ -34,16 +36,17 @@ CONFIGS=(
   "torch_spyre_tests/tensors/test_tensor_layout_config.yaml"
 )
 
-printf "\n%-60s %-12s %-15s\n" "TEST NAME" "TIME(s)" "MAX_MEM(MB)"
-printf "%-60s %-12s %-15s\n" "---------" "-------" "-----------"
+printf "\n%-60s %-15s %-15s\n" "TEST NAME" "REAL TIME" "MAX_MEM(MB)"
+printf "%-60s %-15s %-15s\n" "---------" "---------" "-----------"
 
 for CONFIG in "${CONFIGS[@]}"; do
 
     TEST_NAME=$(basename "$CONFIG" .yaml)
 
-    START=$(date +%s)
+    (
+        time bash tests/run_test.sh "tests/configs/${CONFIG}" -v
+    ) > "logs/${TEST_NAME}.log" 2>&1 &
 
-    bash tests/run_test.sh "tests/configs/${CONFIG}" -v &
     PID=$!
 
     MAX=0
@@ -61,14 +64,13 @@ for CONFIG in "${CONFIGS[@]}"; do
 
     wait $PID
 
-    END=$(date +%s)
+    REAL_TIME=$(grep "^real" "logs/${TEST_NAME}.log" | awk '{print $2}')
 
-    TIME_TAKEN=$((END - START))
     MAX_MB=$((MAX / 1024))
 
-    printf "%-60s %-12s %-15s\n" \
+    printf "%-60s %-15s %-15s\n" \
         "$TEST_NAME" \
-        "$TIME_TAKEN" \
+        "$REAL_TIME" \
         "$MAX_MB"
 
 done
