@@ -26,14 +26,15 @@ This document describes how that loop structure is represented, transported,
 and consumed.
 
 **Quick navigation:**
-[Design Overview](#design-overview) |
-[Motivating Example](#motivating-example) |
-[Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass) |
-[Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode) |
-[Layer 3 — `LoopSpec` & codegen](#layer-3--loopspec-and-codegen) |
-[Files changed](#files-changed) |
-[Invariants](#invariants-and-failure-modes) |
-[Rejected alternatives](#rejected-design-alternatives)
+
+- [Design Overview](#design-overview)
+- [Motivating Example](#motivating-example)
+- [Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass)
+- [Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode)
+- [Layer 3 — `LoopSpec` & codegen](#layer-3--loopspec-and-codegen)
+- [Files changed](#files-changed)
+- [Invariants](#invariants-and-failure-modes)
+- [Rejected alternatives](#rejected-design-alternatives)
 
 ## Design Overview
 
