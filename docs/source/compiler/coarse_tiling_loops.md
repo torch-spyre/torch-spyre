@@ -28,7 +28,7 @@ and consumed.
 **Quick navigation:**
 
 - [Design Overview](#design-overview)
-- [Motivating Example](#motivating-example)
+- [Small Example](#small-example)
 - [Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass)
 - [Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode)
 - [Layer 3 — `LoopSpec` & codegen](#layer-3--loopspec-and-codegen)
@@ -68,23 +68,34 @@ codegen_node
   └─ LoopSpec is serialized alongside OpSpec in codegen_kernel()
 ```
 
-## Motivating Example
+## Small Example
 
-Consider a pointwise add `y = a + b` over a `[1024, 4096]` tensor, tiled by
-**K=2 in the outer loop** (splitting the 1024 rows into 2 groups of 512) and
-**M=4 in the inner loop** (splitting the 4096 columns into 4 groups of 1024).
-The intended user-facing syntax (PR #2226) is:
+Consider two chained pointwise operations over `[1024, 4096]` tensors:
 
 ```python
-def f(a, b):
-    with spyre_hint(tiles={"K": 2}):    # outer loop: 2 iterations
-        with spyre_hint(tiles={"M": 4}): # inner loop: 4 iterations
-            y = a + b
-    return y
+def f(a, b, c):
+    y = a + b   # add
+    z = y * c   # mul
+    return z
 ```
 
-This produces a hardware program whose per-iteration working set is 512 × 1024
-elements (1/8th of the original), enabling effective scratchpad reuse.
+Both operations are placed in a single tiling group with **K=2 in the outer
+loop** (splitting the 1024 rows into 2 groups of 512) and **M=4 in the inner
+loop** (splitting the 4096 columns into 4 groups of 1024).  The intended
+user-facing syntax (PR #2226) is:
+
+```python
+def f(a, b, c):
+    with spyre_hint(tiles={"K": 2}):     # outer loop: 2 iterations over rows
+        with spyre_hint(tiles={"M": 4}): # inner loop: 4 iterations over cols
+            y = a + b
+            z = y * c
+    return z
+```
+
+Each inner-loop iteration processes a 512 × 1024 tile (1/8th of the full
+tensor), enabling the intermediate result `y` to remain in scratchpad across
+both operations within the tile.
 
 For simplicity this example uses `SENCORES=1` (single-core); the
 implementation fully supports multi-core execution.
@@ -92,7 +103,7 @@ implementation fully supports multi-core execution.
 ### What the coarse-tiling pass stamps
 
 `coarse_tile()` sees this as a nested group spec and stamps the following
-attributes on the `ir.Operation` for `y = a + b`:
+attributes on **both** `ir.Operation` objects:
 
 ```python
 op.loop_group_id   = (0, 0)        # depth-2 path: group 0, inner slot 0
@@ -105,14 +116,15 @@ op.loop_tiled_dims = [[0], [1]]    # outer loop tiles dim 0; inner tiles dim 1
 1. Outer level `(K=2, [dim 0])`: `data.ranges [1024, 4096] → [512, 4096]`
 2. Inner level `(M=4, [dim 1])`: `data.ranges [512, 4096] → [512, 1024]`
 
-The per-inner-iteration `data.ranges` is `[512, 1024]`.
+The per-inner-iteration `data.ranges` for both ops is `[512, 1024]`.
 
 ### Generated OpSpec (Python wrapper source)
 
-The Python wrapper emitted by `codegen_kernel()` contains:
+The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
+single nested `LoopSpec`:
 
 ```python
-sdsc_fused_add_0 = async_compile.sdsc('sdsc_fused_add_0',
+sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
     [
         LoopSpec(
             count=sympify('2'),        # outer K=2 loop
@@ -122,6 +134,16 @@ sdsc_fused_add_0 = async_compile.sdsc('sdsc_fused_add_0',
                     body=[
                         OpSpec(
                             op='add',
+                            is_reduction=False,
+                            iteration_space={
+                                sympify('c0'): (sympify('512'), 32),
+                                sympify('c1'): (sympify('1024'), 1),
+                            },
+                            tiled_symbols=[sympify('c0'), sympify('c1')],
+                            ...
+                        ),
+                        OpSpec(
+                            op='mul',
                             is_reduction=False,
                             iteration_space={
                                 sympify('c0'): (sympify('512'), 32),
@@ -160,11 +182,14 @@ module {
         %c1 = arith.constant 1 : index
         %loop_bound_0 = arith.constant 2 : index   // K=2
         %loop_bound_1 = arith.constant 4 : index   // M=4
-        %sym_1 = arith.constant <base_addr> : index
+        %sym_1 = arith.constant <base_addr_add> : index
+        %sym_2 = arith.constant <base_addr_mul> : index
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
-                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]  // 4194304*i_0 + 2048*i_1
-                sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}
+                %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
+                sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}  // add
+                %addr_1 = affine.apply #map_0(%i_0, %i_1)[%sym_2]
+                sdscbundle.sdsc_execute (%addr_1) {sdsc_filename="sdsc_1.json", ...}  // mul
             }
         }
         return
@@ -172,8 +197,10 @@ module {
 }
 ```
 
-Each iteration of the inner loop dispatches the `add` kernel at a base address
-computed from both loop variables: `base + 4194304·i_0 + 2048·i_1`.
+Both operations share the same affine map (they have the same tensor shape and
+stride structure).  Each inner-loop iteration dispatches `add` then `mul` at
+tile `(i_0, i_1)`, keeping the intermediate result `y` in scratchpad between
+the two dispatches.
 
 ## Layer 1 — Pre-scheduling IR pass
 

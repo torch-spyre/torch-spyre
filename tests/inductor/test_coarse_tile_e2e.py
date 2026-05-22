@@ -72,12 +72,11 @@ def _groups_split_k4_k8(operations: list[Operation]):
 
 
 def _groups_nested_k2_m4(operations: list[Operation]):
-    """One group: single op with nested K=2 outer (dim 0) / M=4 inner (dim 1) loops."""
+    """One group: all ops share nested K=2 outer (dim 0) / M=4 inner (dim 1) loops."""
     ops = [op for op in operations if isinstance(op, ComputedBuffer)]
     if not ops:
         return []
-    # Take only the first ComputedBuffer and wrap it in nested loops.
-    return [(ops[:1], [(sympy.Integer(2), [0]), (sympy.Integer(4), [1])])]
+    return [(ops, [(sympy.Integer(2), [0]), (sympy.Integer(4), [1])])]
 
 
 def _groups_per_op_tiled_dim(operations: list[Operation]):
@@ -129,7 +128,13 @@ class TestCoarseTileEndToEnd(InductorTestCase):
     # Single group: tile a pointwise op
     # ------------------------------------------------------------------
 
-    @config.patch({"coarse_tiling": True, "coarse_tiling_groups_fn": _groups_all_k4})
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_all_k4,
+            "bundle_hbm_symbols": True,
+        }
+    )
     def test_single_group_tiles_pointwise(self):
         """A pointwise abs tiled K=4 times should produce LoopSpec(count=4)."""
         # 256 rows × 128 cols.  Tiling the outermost dim by 4 → 64 rows/iter.
@@ -154,7 +159,13 @@ class TestCoarseTileEndToEnd(InductorTestCase):
     # Softmax-shaped computation: pointwise → reduce → pointwise chain
     # ------------------------------------------------------------------
 
-    @config.patch({"coarse_tiling": True, "coarse_tiling_groups_fn": _groups_all_k4})
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_all_k4,
+            "bundle_hbm_symbols": True,
+        }
+    )
     def test_softmax_shaped_tiling(self):
         """Tile the pointwise-reduce-pointwise stages of a softmax-like kernel.
 
@@ -199,7 +210,11 @@ class TestCoarseTileEndToEnd(InductorTestCase):
     # ------------------------------------------------------------------
 
     @config.patch(
-        {"coarse_tiling": True, "coarse_tiling_groups_fn": _groups_split_k4_k8}
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_split_k4_k8,
+            "bundle_hbm_symbols": True,
+        }
     )
     def test_two_groups_produce_two_loop_specs(self):
         """Two separate tiling groups produce two LoopSpec entries in the source."""
@@ -245,6 +260,7 @@ class TestCoarseTileEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_per_op_tiled_dim,
+            "bundle_hbm_symbols": True,
         }
     )
     def test_per_group_tiled_dims(self):
@@ -298,24 +314,30 @@ class TestCoarseTileEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
+            "bundle_hbm_symbols": True,
         }
     )
     def test_nested_loop_two_dims(self):
-        """A pointwise add tiled by K=2 (outer, dim 0) and M=4 (inner, dim 1).
+        """Two pointwise ops share nested K=2 (outer, dim 0) / M=4 (inner, dim 1) loops.
 
         Input shape [1024, 4096]: outer loop runs 2× over dim 0 (512 rows/iter),
-        inner loop runs 4× over dim 1 (1024 cols/iter).  Generated source
-        must contain two nested LoopSpec entries with counts 2 and 4.
+        inner loop runs 4× over dim 1 (1024 cols/iter).  Both ops (add and mul)
+        are placed in the same group so they share the nested LoopSpec.
+        Generated source must contain two nested LoopSpec entries with counts 2
+        and 4, with two OpSpec entries in the innermost body.
         """
         a = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
         b = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+        c = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
 
-        def fn(a, b):
-            return a + b
+        def fn(a, b, c):
+            y = a + b
+            z = y * c
+            return z
 
         cfn = torch.compile(fn)
         with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
-            _, source_codes = run_and_get_code(cfn, a, b)
+            _, source_codes = run_and_get_code(cfn, a, b, c)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")

@@ -260,18 +260,21 @@ def generate_sdsc(
         for c in range(sdsc_spec.num_cores)
     }
 
+    # local_symbols maps base HBM byte offset -> globally-unique negative symbol id.
+    # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
+    # For tiled tensors the base is the iteration-0 address (tiled dims contribute 0);
+    # for non-tiled tensors it is the full per-core address (as before).
+    #
+    # NOTE: no cross-SDSC deduplication — each call to offset_as_symbol within
+    # this SDSC gets its own sequential ID and appends to symbols.  Two SDSCs
+    # that happen to share a base address will emit two separate arith.constant
+    # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
+    # symbols list indices: symbols[abs(id)-1] is always the value for id.
+    #
+    # When use_symbols=False this dict stays empty (symbols is not modified).
+    local_symbols: dict[int, int] = {}
+
     if use_symbols:
-        # local_symbols maps base HBM byte offset -> globally-unique negative symbol id.
-        # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
-        # For tiled tensors the base is the iteration-0 address (tiled dims contribute 0);
-        # for non-tiled tensors it is the full per-core address (as before).
-        #
-        # NOTE: no cross-SDSC deduplication — each call to offset_as_symbol within
-        # this SDSC gets its own sequential ID and appends to symbols.  Two SDSCs
-        # that happen to share a base address will emit two separate arith.constant
-        # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
-        # symbols list indices: symbols[abs(id)-1] is always the value for id.
-        local_symbols: dict[int, int] = {}
 
         def offset_as_symbol(s):
             if s not in local_symbols:
@@ -327,7 +330,7 @@ def generate_sdsc(
 
     else:
         # use_symbols=False: bake concrete HBM addresses directly into the JSON,
-        # mirroring the LX tensor path.  symbols is not modified.
+        # mirroring the LX tensor path.  symbols and local_symbols are not modified.
         affine_strides = [{} for _ in sdsc_spec.args]
 
         def _start_addr_data(tensor):
