@@ -203,7 +203,7 @@ def _divide_ranges(
         return
 
     for i in tiled_dims:
-        if i >= len(ranges):
+        if i < 0 or i >= len(ranges):
             continue
         ranges[i] = sympy.Rational(1, 1) * ranges[i] / loop_count
         # Simplify: keep as integer expression when divisible.

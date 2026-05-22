@@ -225,7 +225,7 @@ def generate_sdsc(
     symbols: list[int],
     symbol_id_offset: int = 0,
     tiled_symbols=None,
-    use_symbols: bool = True,
+    use_symbols: bool = False,
 ):
     """Generate SDSC JSON for one OpSpec.
 
@@ -429,7 +429,7 @@ def generate_sdsc(
                                     else "hbm",
                                     **(
                                         {"isStartAddrSymbolic_": 1}
-                                        if use_symbols
+                                        if use_symbols and "lx" not in tensor.allocation
                                         else {}
                                     ),
                                     "layoutDimOrder_": [

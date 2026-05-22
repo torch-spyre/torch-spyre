@@ -907,7 +907,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         sdsc_spec = _make_sdsc_spec(s, iter_range=64, device_stride=128)
         symbols: list[int] = []
         _, _, affine_strides = generate_sdsc(
-            0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[s]
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0])
@@ -918,7 +923,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         start = 0x2000
         sdsc_spec = _make_sdsc_spec(s, start_address=start)
         symbols: list[int] = []
-        generate_sdsc(0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[s])
+        generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
         self.assertEqual(len(symbols), 1)
         self.assertEqual(symbols[0], start)
 
@@ -927,7 +939,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         sdsc_spec = _make_sdsc_spec(s)
         symbols: list[int] = []
         sdsc_json, _, _ = generate_sdsc(
-            0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[s]
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -940,7 +957,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         sdsc_spec = _make_sdsc_spec(s)
         symbols: list[int] = []
         _, _, affine_strides = generate_sdsc(
-            0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[]
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[],
+            use_symbols=True,
         )
         self.assertEqual(affine_strides, [{}])
 
@@ -952,7 +974,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         )
         symbols: list[int] = []
         _, local_sym_values, affine_strides = generate_sdsc(
-            0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[s]
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
         )
         self.assertEqual(symbols, [])
         self.assertEqual(local_sym_values, [])
@@ -963,7 +990,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         sdsc_spec = _make_sdsc_spec(s)
         symbols: list[int] = []
         sdsc_json, local_sym_values, _ = generate_sdsc(
-            0, sdsc_spec, symbols, symbol_id_offset=5, tiled_symbols=[s]
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=5,
+            tiled_symbols=[s],
+            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -1002,7 +1034,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         )
         symbols: list[int] = []
         _, local_sym_values, affine_strides = generate_sdsc(
-            0, sdsc_spec, symbols, symbol_id_offset=0, tiled_symbols=[s]
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0x1000)
@@ -1048,7 +1085,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides = compile_op_spec(0, op_spec, symbols)
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols, use_symbols=True)
         hbm_strides = [d for d in affine_strides if len(d) > 0]
         self.assertGreater(len(hbm_strides), 0)
         for tensor_strides in hbm_strides:
@@ -1057,7 +1094,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides = compile_op_spec(0, op_spec, symbols)
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols, use_symbols=True)
         for tensor_strides in affine_strides:
             for sym, stride in tensor_strides.items():
                 self.assertGreater(stride, 0)
@@ -1067,7 +1104,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
     def test_affine_strides_non_empty_for_tiled_op(self):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides = compile_op_spec(0, op_spec, symbols)
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols, use_symbols=True)
         has_strides = any(len(d) > 0 for d in affine_strides)
         self.assertTrue(
             has_strides,

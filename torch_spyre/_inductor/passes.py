@@ -218,6 +218,8 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
+        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
+        # coarse_tiling=False because no nodes carry loop_group_id attributes.
         return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
 
 

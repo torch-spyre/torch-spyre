@@ -633,7 +633,7 @@ def compile_op_spec(
     op_spec: OpSpec,
     symbols: list[int],
     symbol_id_offset: int = 0,
-    use_symbols: bool = True,
+    use_symbols: bool = False,
 ) -> tuple[Any, list[int], list[dict]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)

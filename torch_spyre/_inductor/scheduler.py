@@ -113,12 +113,13 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
             if raw is not None:
                 counts: list = raw if isinstance(raw, list) else [raw]
                 gid = getattr(snode.node, "loop_group_id", ())
-                # The outermost count is at index (depth - base_depth) where
-                # base_depth is the depth at which this op's counts start.
-                base_depth = len(gid) - len(counts)
-                idx = depth - base_depth
-                if 0 <= idx < len(counts):
-                    return counts[idx]
+                # coarse_tile stamps one count per nesting level, so
+                # len(counts) == len(gid) always holds.
+                assert len(counts) == len(gid), (
+                    f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
+                )
+                if 0 <= depth < len(counts):
+                    return counts[depth]
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 

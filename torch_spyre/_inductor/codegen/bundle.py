@@ -79,9 +79,10 @@ def generate_bundle(
 
     When ``use_symbols=False`` (default), HBM tensor addresses are baked as
     concrete integers into the SDSC JSON — matching the main-branch behaviour.
-    ``LoopSpec`` entries require ``use_symbols=True`` because tiled addressing
-    relies on runtime symbols; passing a spec tree that contains tiled ops in a
-    ``LoopSpec`` with ``use_symbols=False`` raises ``RuntimeError``.
+    ``LoopSpec`` entries that contain tiled ops (``OpSpec.tiled_symbols`` is
+    non-empty) require ``use_symbols=True``; passing such a spec tree with
+    ``use_symbols=False`` raises ``RuntimeError``.  Non-tiled ``LoopSpec``
+    entries (loop structure only) are accepted in either mode.
 
     Set ``use_symbols=True`` (or ``BUNDLE_HBM_SYMBOLS=1``) to enable the
     symbol-indirection path required for coarse tiling.
@@ -127,7 +128,7 @@ def generate_bundle(
     # the nesting depth where the op lives.  For a single-level loop with one
     # tiled sym the key is (stride_bytes,).
     affine_map_index: dict[tuple, int] = {}
-    _collect_affine_maps(specs, compiled, iter(compiled), [], affine_map_index)
+    _collect_affine_maps(specs, iter(compiled), [], affine_map_index)
 
     compiled_iter = iter(compiled)
     addr_counter = [0]
@@ -244,7 +245,6 @@ def _collect_loop_bounds(specs: list, bounds: list) -> None:
 
 def _collect_affine_maps(
     specs: list,
-    compiled: list,
     compiled_iter,
     loop_var_depth: list,
     affine_map_index: dict,
@@ -254,7 +254,6 @@ def _collect_affine_maps(
         if isinstance(entry, LoopSpec):
             _collect_affine_maps(
                 entry.body,
-                compiled,
                 compiled_iter,
                 loop_var_depth + [len(loop_var_depth)],
                 affine_map_index,
