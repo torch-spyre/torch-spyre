@@ -169,19 +169,19 @@ Key points:
 - `op_it_space_splits = {4096: 32}` is stamped by `work_distribution`: the
   coefficient `4096` identifies the stride-1 dimension (columns), and `32`
   is the number of cores dividing that dimension's work.
-- `buf0` (`y`) is the intermediate result.  At this point its layout is still
-  `FixedTiledLayout` pointing at HBM; `scratchpad_planning` later assigns it a
-  `pool` allocation.  `pool` is a pooled HBM region — analogous to CUDA's
-  memory pool — where multiple short-lived tensors share storage at different
-  offsets.  Because `y` is consumed entirely within the same tile iteration, it
-  can safely share HBM storage with other such temporaries.
+- `buf0` (`y`) is the intermediate result.  At this point its layout is a
+  `FixedTiledLayout` with `size=[512, 1024]`; `scratchpad_planning` later
+  assigns it `allocation={'lx': 0}`, placing it in LX scratchpad memory at
+  address 0.  Because `y` is produced and fully consumed within the same tile
+  iteration and its per-tile size fits in scratchpad, no HBM allocation is
+  needed for it at all.
 
 ### Generated OpSpec (Python wrapper source)
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
 single nested `LoopSpec`.  Below is the actual output produced by running the
-e2e test `test_nested_loop_two_dims` (concrete HBM addresses replaced with
-symbolic names for readability):
+e2e test `test_nested_loop_with_scratchpad` (concrete HBM addresses replaced
+with symbolic names for readability):
 
 ```python
 sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
@@ -224,16 +224,16 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                     ],
                                     allocation={'hbm': <base_addr_b>},
                                 ),
-                                TensorArg(              # output y (scratchpad)
+                                TensorArg(              # output y (LX scratchpad)
                                     is_input=False, arg_index=-1,
                                     device_dtype=DataFormats.SEN169_FP16,
-                                    device_size=[64, 1024, 64],
+                                    device_size=[16, 512, 64],
                                     device_coordinates=[
                                         sympify('floor(c1/64)'),
                                         sympify('c0'),
                                         sympify('Mod(c1, 64)'),
                                     ],
-                                    allocation={'pool': 0},
+                                    allocation={'lx': 0},
                                 ),
                             ]
                         ),
@@ -247,16 +247,16 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                             op_info={},
                             tiled_symbols=[sympify('c0'), sympify('c1')],
                             args=[
-                                TensorArg(              # input y (scratchpad)
+                                TensorArg(              # input y (LX scratchpad)
                                     is_input=True, arg_index=-1,
                                     device_dtype=DataFormats.SEN169_FP16,
-                                    device_size=[64, 1024, 64],
+                                    device_size=[16, 512, 64],
                                     device_coordinates=[
                                         sympify('floor(c1/64)'),
                                         sympify('c0'),
                                         sympify('Mod(c1, 64)'),
                                     ],
-                                    allocation={'pool': 0},
+                                    allocation={'lx': 0},
                                 ),
                                 TensorArg(              # input c
                                     is_input=True, arg_index=2,
@@ -269,10 +269,10 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                     ],
                                     allocation={'hbm': <base_addr_c>},
                                 ),
-                                TensorArg(              # output z (HBM)
+                                TensorArg(              # output z (HBM, per-tile)
                                     is_input=False, arg_index=3,
                                     device_dtype=DataFormats.SEN169_FP16,
-                                    device_size=[64, 1024, 64],
+                                    device_size=[16, 512, 64],
                                     device_coordinates=[
                                         sympify('floor(c1/64)'),
                                         sympify('c0'),
@@ -297,19 +297,22 @@ Key observations:
 - `tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
   to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
-  `allocation={'pool': 0}` — it lives in the pooled HBM region.  `pool` is a
-  shared HBM allocation (analogous to CUDA's memory pool) where multiple
-  short-lived tensors are packed at different byte offsets.  Because `y` is
-  fully consumed within the same tile iteration it can reuse pool storage,
-  and its address is a fixed offset that does not change between loop
-  iterations (no `affine.apply` needed).
+  `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
+  Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
+  Because `y` is produced and fully consumed within the same tile iteration,
+  no HBM allocation is needed and its address is a fixed scratchpad offset
+  that does not change between loop iterations (no `affine.apply` needed).
 - The final output `z` (output of `mul`) has `allocation={'hbm': ...}` and
-  `arg_index=3` — it lives in HBM.  The per-iteration write address is
-  computed by `affine.apply` in `bundle.mlir` (see next section).
-- `device_size=[64, 1024, 64]` is the Spyre stick-layout device shape for
-  a `[512, 1024]` fp16 tile: the 512 rows are split as 64 sticks of 64
-  columns each (the stick width for fp16), producing the three-dimensional
-  `[sticks_per_col, rows, cols_per_stick]` device shape.
+  `arg_index=3` — it lives in HBM.  Its `device_size=[16, 512, 64]` also
+  reflects the per-tile shape; the per-iteration write address into the full
+  HBM buffer is computed by `affine.apply` in `bundle.mlir` (see next
+  section).
+- HBM inputs `a`, `b`, `c` have `device_size=[64, 1024, 64]` — the full
+  tensor shape `[1024, 4096]` in Spyre stick layout.  Their
+  `device_coordinates` use `c0` and `c1` to index the per-iteration tile
+  window into the full tensor.  The per-tile output buffers (`y`, `z`) have
+  `device_size=[16, 512, 64]`, the stick-layout shape for `[512, 1024]`
+  fp16: 16 sticks of 64 columns across 512 rows.
 
 ### Generated `bundle.mlir`
 
@@ -336,10 +339,10 @@ module {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
                 %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
                 %addr_1 = affine.apply #map_0(%i_0, %i_1)[%sym_2]
-                sdscbundle.sdsc_execute (%addr_0, %addr_1) {sdsc_filename="sdsc_0.json", ...}  // add: a+b→y(pool)
+                sdscbundle.sdsc_execute (%addr_0, %addr_1) {sdsc_filename="sdsc_0.json", ...}  // add: a+b→y(lx)
                 %addr_2 = affine.apply #map_0(%i_0, %i_1)[%sym_3]
                 %addr_3 = affine.apply #map_0(%i_0, %i_1)[%sym_4]
-                sdscbundle.sdsc_execute (%addr_2, %addr_3) {sdsc_filename="sdsc_1.json", ...}  // mul: y(pool)*c→z
+                sdscbundle.sdsc_execute (%addr_2, %addr_3) {sdsc_filename="sdsc_1.json", ...}  // mul: y(lx)*c→z
             }
         }
         return
@@ -349,7 +352,7 @@ module {
 
 Both operations share the same affine map because they operate on tensors of
 the same shape and stride structure.  The scratchpad tensor `y` does not appear
-as a symbol — it has a fixed `pool` address that does not change between
+as a symbol — it has a fixed `lx` address that does not change between
 iterations.  Each inner-loop iteration dispatches `add` then `mul` at tile
 `(i_0, i_1)`, keeping the intermediate result `y` in scratchpad between the
 two dispatches.
