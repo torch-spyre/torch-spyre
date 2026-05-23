@@ -198,8 +198,16 @@ def _propagate_tiled_op(
     # Reconstruct the original (pre-division) ranges.
     full_ranges = _compute_full_ranges(op)
 
-    op_idx = operations.index(op)
-    full_buf = _allocate_full_buffer(op, full_ranges, operations, op_idx)
+    # Insert the full buffer before the first op in the same outermost loop group
+    # so it doesn't split the group's contiguous run in the operations list.
+    outer_key = loop_group_id[0]
+    group_start_idx = next(
+        i
+        for i, o in enumerate(operations)
+        if isinstance(o, ComputedBuffer)
+        and getattr(o, "loop_group_id", (None,))[0] == outer_key
+    )
+    full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
 
@@ -286,7 +294,7 @@ def _has_inside_consumers(
 def _graph_output_names() -> set[str]:
     """Return the set of buffer names that appear in V.graph graph outputs."""
     try:
-        return set(V.graph.get_graph_output_names())
+        return set(V.graph.get_output_names())
     except Exception:
         return set()
 
@@ -358,9 +366,6 @@ def _allocate_full_buffer(
 
     # Assign a FixedTiledLayout with the full size.
     orig_layout = tiled_op.layout
-    stl = getattr(orig_layout, "allocation", None)
-    if stl is None:
-        stl = generic_layout(full_buf)
     # Recompute strides for the full size (contiguous row-major).
     strides: list[Expr] = []
     stride: Expr = sympy.Integer(1)
@@ -368,12 +373,36 @@ def _allocate_full_buffer(
         strides.insert(0, stride)
         stride = stride * s
 
+    if isinstance(orig_layout, FixedTiledLayout):
+        # Rebuild SpyreTensorLayout for the full size, preserving the
+        # within-stick dimension from the original per-tile layout.
+        orig_stl = orig_layout.device_layout
+        sm_last = int(list(orig_stl.stride_map)[-1])
+        full_strides_ints = [int(s) for s in strides]
+        full_size_ints = [int(s) for s in full_ranges]
+        within_stick_dim = next(
+            (i for i, s in enumerate(full_strides_ints) if s == sm_last), None
+        )
+        if within_stick_dim is None:
+            within_stick_dim = len(full_size_ints) - 1
+        ndim = len(full_size_ints)
+        dim_order = [i for i in range(ndim) if i != within_stick_dim] + [
+            within_stick_dim
+        ]
+        from torch_spyre._C import SpyreTensorLayout
+
+        device_layout = SpyreTensorLayout(
+            full_size_ints, full_strides_ints, dtype, dim_order
+        )
+    else:
+        device_layout = generic_layout(full_buf)
+
     full_buf.layout = FixedTiledLayout(
         device,
         dtype,
         list(full_ranges),
         strides,
-        stl,
+        device_layout,
     )
 
     # Splice into operations at the correct position.
@@ -478,9 +507,10 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
 
     new_tb = TensorBox(StorageBox(new_buf))
     for i, out in enumerate(outputs):
-        # Unwrap to find the underlying buffer name.
+        # Unwrap StorageBox layers to reach ComputedBuffer without going into
+        # the ComputedBuffer's inner data (Pointwise / Reduction).
         candidate = out
-        while hasattr(candidate, "data"):
+        while isinstance(candidate, StorageBox):
             candidate = candidate.data
         if isinstance(candidate, ComputedBuffer) and candidate.get_name() == old_name:
             outputs[i] = new_tb

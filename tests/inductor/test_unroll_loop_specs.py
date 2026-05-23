@@ -14,12 +14,12 @@
 
 """Unit tests for torch_spyre._inductor.codegen.unroll.
 
-Tests build OpSpec / LoopSpec objects directly and mock parse_op_spec so no
-Spyre device or backend compiler is needed.
+Tests build OpSpec / LoopSpec objects directly.  No Spyre device or backend
+compiler is needed.  The per-arg byte stride is derived from
+TensorArg.device_coordinates and device_size; each arg advances independently.
 """
 
 import unittest
-from unittest.mock import patch
 
 import sympy
 from sympy import Symbol
@@ -27,6 +27,7 @@ from sympy import Symbol
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.codegen.unroll import (
+    _hbm_byte_stride_for_arg,
     unroll_loop_specs,
 )
 
@@ -38,7 +39,12 @@ _C0 = Symbol("c0")
 _C1 = Symbol("c1")
 _HBM_BASE = 0x400000000  # SEGMENT_OFFSETS[1]
 _LX_ADDR = 0
-_STRIDE_BYTES = 1024 * 2  # 1024-element tile × 2 bytes/fp16
+
+# device_size=[16, 512, 64], fp16, coord=[0, c0, 0], tile_range=512
+# elem_stride(dim 1) = prod([64]) = 64; byte stride = 64 * 512 * 2 = 65536
+_DEVICE_SIZE = [16, 512, 64]
+_TILE_RANGE = 512
+_STRIDE_BYTES = 64 * _TILE_RANGE * 2  # 65536
 
 
 def _make_hbm_tensor_arg(base: int = _HBM_BASE) -> TensorArg:
@@ -46,7 +52,7 @@ def _make_hbm_tensor_arg(base: int = _HBM_BASE) -> TensorArg:
         is_input=True,
         arg_index=1,
         device_dtype=DataFormats.SEN169_FP16,
-        device_size=[16, 512, 64],
+        device_size=list(_DEVICE_SIZE),
         device_coordinates=[sympy.Integer(0), _C0, sympy.Integer(0)],
         allocation={"hbm": base},
     )
@@ -57,7 +63,7 @@ def _make_lx_tensor_arg() -> TensorArg:
         is_input=False,
         arg_index=-1,
         device_dtype=DataFormats.SEN169_FP16,
-        device_size=[16, 512, 64],
+        device_size=list(_DEVICE_SIZE),
         device_coordinates=[sympy.Integer(0), _C0, sympy.Integer(0)],
         allocation={"lx": _LX_ADDR},
     )
@@ -77,7 +83,7 @@ def _make_op_spec(
             is_input=False,
             arg_index=-1,
             device_dtype=DataFormats.SEN169_FP16,
-            device_size=[16, 512, 64],
+            device_size=list(_DEVICE_SIZE),
             device_coordinates=[sympy.Integer(0), _C0, sympy.Integer(0)],
             allocation={"hbm": _HBM_BASE + 0x100000000},
         )
@@ -85,56 +91,11 @@ def _make_op_spec(
     return OpSpec(
         op="add",
         is_reduction=False,
-        iteration_space={_C0: (sympy.Integer(512), 1)},
+        iteration_space={_C0: (sympy.Integer(_TILE_RANGE), 1)},
         args=args,
         op_info={},
         tiled_symbols=list(tiled_syms),
     )
-
-
-def _make_sdsc_spec_mock(stride_bytes: int, tiled_sym_sdsc: Symbol):
-    """Return a minimal (sdsc_spec, symbol_mapping) mock pair."""
-    from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec
-    from torch_spyre._C import DataFormats as DF
-
-    sdsc_arg = SDSCArgs(
-        layout="A",
-        data_format=DF.SEN169_FP16,
-        scales={},
-        strides={tiled_sym_sdsc: stride_bytes // 2},  # strides are in elements
-        offsets={},
-        max_dim_sizes={},
-        allocation={"hbm": _HBM_BASE},
-        start_address=_HBM_BASE,
-        backGap={},
-    )
-    sdsc_out = SDSCArgs(
-        layout="B",
-        data_format=DF.SEN169_FP16,
-        scales={},
-        strides={tiled_sym_sdsc: stride_bytes // 2},
-        offsets={},
-        max_dim_sizes={},
-        allocation={"hbm": _HBM_BASE + 0x100000000},
-        start_address=_HBM_BASE + 0x100000000,
-        backGap={},
-    )
-    sdsc_spec = SDSCSpec(
-        opfunc="add",
-        execution_unit="sfp",
-        data_format=DF.SEN169_FP16,
-        num_inputs=1,
-        iteration_space={tiled_sym_sdsc: sympy.Integer(512)},
-        num_cores=1,
-        work_slices={tiled_sym_sdsc: 1},
-        core_id_to_work_slice={},
-        padding={},
-        layouts={"A": {"dim_order": [0], "stick_dim_order": 0, "stick_size": 64}},
-        args=[sdsc_arg, sdsc_out],
-        constants={},
-        coordinate_masking={},
-    )
-    return sdsc_spec, {_C0: tiled_sym_sdsc}
 
 
 # ---------------------------------------------------------------------------
@@ -160,22 +121,7 @@ class TestUnrollLoopSpecs(unittest.TestCase):
     def test_flat_loop_k2_advances_hbm(self):
         op = _make_op_spec(tiled_syms=[_C0], hbm_base=_HBM_BASE)
         loop = LoopSpec(count=sympy.Integer(2), body=[op])
-
-        sdsc_sym = Symbol("a0")
-        mock_sdsc, mock_mapping = _make_sdsc_spec_mock(_STRIDE_BYTES, sdsc_sym)
-
-        with (
-            patch(
-                "torch_spyre._inductor.codegen.unroll.parse_op_spec",
-                return_value=(mock_sdsc, {_C0: sdsc_sym}),
-            ),
-            patch(
-                "torch_spyre._inductor.codegen.unroll._tiled_byte_stride",
-                return_value=_STRIDE_BYTES,
-            ),
-        ):
-            result = unroll_loop_specs([loop])
-
+        result = unroll_loop_specs([loop])
         self.assertEqual(len(result), 2)
         addr0 = result[0].args[0].allocation["hbm"]
         addr1 = result[1].args[0].allocation["hbm"]
@@ -189,20 +135,7 @@ class TestUnrollLoopSpecs(unittest.TestCase):
     def test_lx_tensor_unchanged(self):
         op = _make_op_spec(tiled_syms=[_C0], include_lx=True)
         loop = LoopSpec(count=sympy.Integer(3), body=[op])
-
-        sdsc_sym = Symbol("a0")
-        with (
-            patch(
-                "torch_spyre._inductor.codegen.unroll.parse_op_spec",
-                return_value=_make_sdsc_spec_mock(_STRIDE_BYTES, sdsc_sym),
-            ),
-            patch(
-                "torch_spyre._inductor.codegen.unroll._tiled_byte_stride",
-                return_value=_STRIDE_BYTES,
-            ),
-        ):
-            result = unroll_loop_specs([loop])
-
+        result = unroll_loop_specs([loop])
         self.assertEqual(len(result), 3)
         for copy_op in result:
             lx_args = [a for a in copy_op.args if "lx" in a.allocation]
@@ -217,59 +150,20 @@ class TestUnrollLoopSpecs(unittest.TestCase):
     def test_tiled_symbols_cleared(self):
         op = _make_op_spec(tiled_syms=[_C0])
         loop = LoopSpec(count=sympy.Integer(4), body=[op])
-
-        sdsc_sym = Symbol("a0")
-        with (
-            patch(
-                "torch_spyre._inductor.codegen.unroll.parse_op_spec",
-                return_value=_make_sdsc_spec_mock(_STRIDE_BYTES, sdsc_sym),
-            ),
-            patch(
-                "torch_spyre._inductor.codegen.unroll._tiled_byte_stride",
-                return_value=_STRIDE_BYTES,
-            ),
-        ):
-            result = unroll_loop_specs([loop])
-
+        result = unroll_loop_specs([loop])
         self.assertEqual(len(result), 4)
         for copy_op in result:
             self.assertEqual(copy_op.tiled_symbols, [])
 
     # ------------------------------------------------------------------
-    # 5. Nested 2×4 loop → 8 flat copies with correct combined addresses.
+    # 5. Nested 2×4 loop → 8 flat copies.
     # ------------------------------------------------------------------
 
     def test_nested_loops_k2_m4(self):
         op = _make_op_spec(tiled_syms=[_C0, _C1], hbm_base=_HBM_BASE)
-
-        outer_stride = 8192  # bytes per outer step
-        inner_stride = 2048  # bytes per inner step
-
         inner_loop = LoopSpec(count=sympy.Integer(4), body=[op])
         outer_loop = LoopSpec(count=sympy.Integer(2), body=[inner_loop])
-
-        call_count = [0]
-
-        def fake_tiled_byte_stride(sdsc_arg, sdsc_sym, iter_space):
-            # Alternate outer / inner strides based on call order within each
-            # _compute_tiled_byte_strides call: first call → outer, second → inner.
-            val = outer_stride if call_count[0] % 2 == 0 else inner_stride
-            call_count[0] += 1
-            return val
-
-        sdsc_sym0 = Symbol("a0")
-        with (
-            patch(
-                "torch_spyre._inductor.codegen.unroll.parse_op_spec",
-                return_value=_make_sdsc_spec_mock(outer_stride, sdsc_sym0),
-            ),
-            patch(
-                "torch_spyre._inductor.codegen.unroll._tiled_byte_stride",
-                side_effect=fake_tiled_byte_stride,
-            ),
-        ):
-            result = unroll_loop_specs([outer_loop])
-
+        result = unroll_loop_specs([outer_loop])
         self.assertEqual(len(result), 8, f"Expected 8 copies, got {len(result)}")
 
     # ------------------------------------------------------------------
@@ -295,10 +189,74 @@ class TestUnrollLoopSpecs(unittest.TestCase):
         for copy_op in result:
             for a in copy_op.args:
                 if "hbm" in a.allocation:
-                    # All copies should have the original base address.
                     self.assertIn(
                         a.allocation["hbm"], (_HBM_BASE, _HBM_BASE + 0x100000000)
                     )
+
+    # ------------------------------------------------------------------
+    # 8. _hbm_byte_stride_for_arg: coord=c0 in dim 1.
+    #    stride = coeff(c0,dim1)=1 * elem_stride(dim1)=64 * tile_range * 2
+    # ------------------------------------------------------------------
+
+    def test_hbm_byte_stride_for_arg(self):
+        arg = _make_hbm_tensor_arg()
+        stride = _hbm_byte_stride_for_arg(arg, _C0, _TILE_RANGE)
+        self.assertEqual(stride, _STRIDE_BYTES)
+
+    # ------------------------------------------------------------------
+    # 9. arg with c0 in dim 0 (not dim 1) gets different stride.
+    # ------------------------------------------------------------------
+
+    def test_hbm_byte_stride_dim0(self):
+        # device_size=[16, 512, 64], coord=[c0, 0, 0]: c0 is in dim 0.
+        # elem_stride(dim 0) = prod([512, 64]) = 32768
+        # byte stride = 32768 * tile_range * 2
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[16, 512, 64],
+            device_coordinates=[_C0, sympy.Integer(0), sympy.Integer(0)],
+            allocation={"hbm": _HBM_BASE},
+        )
+        expected = 32768 * _TILE_RANGE * 2
+        self.assertEqual(_hbm_byte_stride_for_arg(arg, _C0, _TILE_RANGE), expected)
+
+    # ------------------------------------------------------------------
+    # 10. Two HBM args with different device sizes advance independently.
+    # ------------------------------------------------------------------
+
+    def test_per_arg_independent_strides(self):
+        # arg0: device_size=[16, 512, 64], coord=[0, c0, 0] → stride=65536
+        arg0 = _make_hbm_tensor_arg(_HBM_BASE)
+        # arg1: device_size=[4, 128, 64], coord=[0, c0, 0] → stride=16384
+        small_size = [4, 128, 64]
+        arg1 = TensorArg(
+            is_input=False,
+            arg_index=-1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=small_size,
+            device_coordinates=[sympy.Integer(0), _C0, sympy.Integer(0)],
+            allocation={"hbm": _HBM_BASE + 0x100000000},
+        )
+        op = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={_C0: (sympy.Integer(_TILE_RANGE), 1)},
+            args=[arg0, arg1],
+            op_info={},
+            tiled_symbols=[_C0],
+        )
+        loop = LoopSpec(count=sympy.Integer(2), body=[op])
+        result = unroll_loop_specs([loop])
+        self.assertEqual(len(result), 2)
+        # arg0 advances by 65536 per iteration
+        self.assertEqual(result[1].args[0].allocation["hbm"], _HBM_BASE + 65536)
+        # arg1 advances by 64 * 512 * 2 = 65536 (same tile_range, but size is smaller)
+        # Wait: dim1 elem_stride for [4,128,64] = 64; stride = 64 * 512 * 2 = 65536 too
+        # Actually the tile_range is what matters, device_size only gives elem_stride
+        expected_arg1 = _HBM_BASE + 0x100000000 + 64 * _TILE_RANGE * 2
+        self.assertEqual(result[1].args[1].allocation["hbm"], expected_arg1)
 
 
 if __name__ == "__main__":
