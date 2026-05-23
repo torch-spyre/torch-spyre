@@ -350,6 +350,66 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
         )
 
+    # ------------------------------------------------------------------
+    # Scratchpad (LX) allocation for intermediate tiled buffer
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_nested_k2_m4,
+            "bundle_hbm_symbols": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_nested_loop_with_scratchpad(self):
+        """Intermediate tiled buffer (y = a + b) is allocated to scratchpad.
+
+        With lx_planning enabled and allow_all_ops_in_lx_planning=True,
+        scratchpad_planning runs after coarse_tile and assigns the
+        intermediate add result to LX (scratchpad) memory since it is
+        only consumed within the loop body.  The final output (z = y * c)
+        stays in HBM.
+
+        Assertions:
+        - LoopSpec entries are still emitted (tiling is unaffected).
+        - At least one TensorArg carries allocation={'lx': ...}.
+        - The output buffer allocation uses 'hbm' (not 'lx').
+        - The per-tile buffer size [512, 1024] appears in the allocation.
+        """
+        a = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+        b = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+        c = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+
+        def fn(a, b, c):
+            y = a + b
+            z = y * c
+            return z
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a, b, c)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn(
+            "allocation={'lx'",
+            src,
+            "Expected at least one TensorArg with lx allocation",
+        )
+        self.assertIn(
+            "allocation={'hbm'",
+            src,
+            "Expected output TensorArg with hbm allocation",
+        )
+        # Per-tile buffer shape must appear in the spyre_empty_with_layout call.
+        self.assertIn(
+            "(512, 1024)",
+            src,
+            "Expected per-tile buffer size (512, 1024) in generated source",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
