@@ -167,9 +167,11 @@ Key points:
   coefficient `4096` identifies the stride-1 dimension (columns), and `32`
   is the number of cores dividing that dimension's work.
 - `buf0` (`y`) is the intermediate result.  At this point its layout is still
-  `FixedTiledLayout` pointing at HBM; `scratchpad_planning` later promotes it
-  to a scratchpad (`pool`) allocation because it is consumed entirely within
-  the same tile iteration.
+  `FixedTiledLayout` pointing at HBM; `scratchpad_planning` later assigns it a
+  `pool` allocation.  `pool` is a pooled HBM region — analogous to CUDA's
+  memory pool — where multiple short-lived tensors share storage at different
+  offsets.  Because `y` is consumed entirely within the same tile iteration, it
+  can safely share HBM storage with other such temporaries.
 
 ### Generated OpSpec (Python wrapper source)
 
@@ -292,9 +294,12 @@ Key observations:
 - `tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
   to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
-  `allocation={'pool': 0}` — it lives in scratchpad.  Both ops share the same
-  `pool` address because `y` need only exist for the duration of one tile
-  iteration; it is overwritten each time round the loop.
+  `allocation={'pool': 0}` — it lives in the pooled HBM region.  `pool` is a
+  shared HBM allocation (analogous to CUDA's memory pool) where multiple
+  short-lived tensors are packed at different byte offsets.  Because `y` is
+  fully consumed within the same tile iteration it can reuse pool storage,
+  and its address is a fixed offset that does not change between loop
+  iterations (no `affine.apply` needed).
 - The final output `z` (output of `mul`) has `allocation={'hbm': ...}` and
   `arg_index=3` — it lives in HBM.  The per-iteration write address is
   computed by `affine.apply` in `bundle.mlir` (see next section).
