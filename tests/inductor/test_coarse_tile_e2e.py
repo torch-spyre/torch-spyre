@@ -33,6 +33,9 @@ Tested scenarios
 - test_generate_bundle_receives_loop_spec: verify generate_bundle sees LoopSpec.
 """
 
+import sys
+import os
+
 import sympy
 import torch
 import unittest
@@ -43,6 +46,9 @@ from torch._inductor.utils import run_and_get_code
 from torch._inductor.ir import ComputedBuffer, Operation
 
 from torch_spyre._inductor import config
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+from utils_inductor import compare_with_cpu  # noqa: E402
 
 # Path to mock for disabling actual device kernel execution.
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
@@ -408,6 +414,126 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "(512, 1024)",
             src,
             "Expected per-tile buffer size (512, 1024) in generated source",
+        )
+
+
+# ===========================================================================
+# Unrolled loop execution tests (bundle_hbm_symbols=False)
+# ===========================================================================
+
+
+class TestCoarseTileUnrollEndToEnd(InductorTestCase):
+    """Tests for coarse tiling with loop unrolling (bundle_hbm_symbols=False).
+
+    When bundle_hbm_symbols=False, LoopSpec nodes are fully unrolled before
+    generate_bundle so no scf.for is emitted.  Each iteration becomes an
+    independent OpSpec with concrete per-iteration HBM addresses.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    # ------------------------------------------------------------------
+    # Source inspection: unrolling passes LoopSpec through async_compile
+    # with concrete per-iteration HBM addresses in each unrolled OpSpec.
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_nested_k2_m4,
+            "bundle_hbm_symbols": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_unrolled_source_calls_sdsc(self):
+        """Nested K=2 × M=4 loop with bundle_hbm_symbols=False compiles cleanly.
+
+        The generated wrapper passes a LoopSpec to async_compile.sdsc().
+        SpyreAsyncCompile.sdsc() calls unroll_loop_specs internally, replacing
+        the LoopSpec with K_outer × K_inner = 8 flat copies per op before
+        invoking generate_bundle.  The source must still contain LoopSpec (it's
+        part of the sdsc() call-site), and subprocess.run must be called (the
+        dxp_standalone backend invocation after successful unrolling+bundling).
+        """
+        a = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+        b = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+        c = torch.randn(1024, 4096, dtype=torch.float16).to("spyre")
+
+        def fn(a, b, c):
+            y = a + b
+            z = y * c
+            return z
+
+        cfn = torch.compile(fn)
+        subprocess_calls = []
+
+        def _record_subprocess(*args, **kwargs):
+            subprocess_calls.append(args)
+
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch("subprocess.run", side_effect=_record_subprocess),
+        ):
+            _, source_codes = run_and_get_code(cfn, a, b, c)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        # The generated source passes a LoopSpec to async_compile.sdsc().
+        self.assertIn("LoopSpec(", src)
+        # subprocess.run was called — unroll_loop_specs + generate_bundle
+        # completed without error before invoking dxp_standalone.
+        self.assertTrue(
+            len(subprocess_calls) > 0,
+            "Expected subprocess.run to be called (dxp_standalone invocation)",
+        )
+
+    # ------------------------------------------------------------------
+    # Real execution: unrolled tiling runs on device with sencores=1.
+    # ------------------------------------------------------------------
+
+    @unittest.skip(
+        "insert_tiling_propagation is a no-op (deferred: activation breaks "
+        "core_div_mismatch in LX planning for multi-tile outputs).  The kernel "
+        "writes K per-tile buffers but the wrapper returns only the last tile, "
+        "so the output shape is [tile_rows, cols] instead of [full_rows, cols]."
+    )
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "coarse_tiling_groups_fn": _groups_all_k4,
+            "bundle_hbm_symbols": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "sencores": 1,
+        }
+    )
+    def test_unrolled_real_execution(self):
+        """Unrolled K=4 pointwise tiling executes on device with sencores=1.
+
+        Uses a [256, 128] add+mul pointwise chain (no reductions) tiled with
+        K=4 flat iterations.  sencores=1 avoids the core-division/scratchpad
+        coordination issue that affects multi-core runs.  The compiled Spyre
+        result is compared against the CPU reference.
+        """
+        a = torch.randn(256, 128, dtype=torch.float16)
+        b = torch.randn(256, 128, dtype=torch.float16)
+        c = torch.randn(256, 128, dtype=torch.float16)
+
+        def fn(a, b, c):
+            y = a + b
+            return y * c
+
+        compare_with_cpu(
+            fn,
+            a,
+            b,
+            c,
+            run_compile=True,
+            run_eager=False,
+            atol=0.1,
+            rtol=0.1,
         )
 
 

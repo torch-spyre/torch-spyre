@@ -22,6 +22,7 @@ from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, UnimplementedOp
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.codegen.unroll import unroll_loop_specs
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -60,6 +61,8 @@ class SpyreAsyncCompile:
 
         # Generate SDSC Bundle from specs (may contain LoopSpec entries).
         output_dir = get_output_dir(kernel_name)
+        if not _spyre_config.bundle_hbm_symbols:
+            specs = unroll_loop_specs(specs)
         generate_bundle(
             kernel_name,
             output_dir,
