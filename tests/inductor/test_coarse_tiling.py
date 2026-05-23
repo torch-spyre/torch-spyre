@@ -14,7 +14,7 @@
 
 """Unit tests for the coarse-tiling loop IR infrastructure.
 
-Covers five areas, each in its own class group:
+Covers six areas, each in its own class group:
   1. LoopSpec data structure and codegen_kernel serialization (TestLoopSpec*,
      TestIterOpSpecs, TestCodegenOpSpecListRoundtrip)
   2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
@@ -28,6 +28,8 @@ Covers five areas, each in its own class group:
      (TestGenerateBundleMlir, TestFindUnimplemented,
       TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
       TestGenerateBundleNestedTiling, TestGenerateBundleUseSymbolsGuard)
+  6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
+     (TestCoarseTileBufferPropagation)
 
 No Spyre device or backend compiler is required.
 """
@@ -40,6 +42,7 @@ from unittest.mock import MagicMock, patch
 from sympy import Integer, Symbol, simplify, sympify  # noqa: F401
 
 from torch._inductor.utils import IndentedBuffer
+from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.bundle import generate_bundle
@@ -1549,6 +1552,197 @@ class TestGenerateBundleUseSymbolsGuard(unittest.TestCase):
         ):
             op = _make_minimal_op_spec("a")
             generate_bundle("test_kernel", self.tmpdir, [op], use_symbols=False)
+
+
+# ===========================================================================
+# 6. coarse_tile buffer propagation pass
+# ===========================================================================
+
+
+def _make_rw_with_reads(*names):
+    """Return a fake ReadWrites whose reads set contains MemoryDep mocks for names."""
+    from torch._inductor.dependencies import MemoryDep
+
+    reads = []
+    for name in names:
+        dep = MagicMock(spec=MemoryDep)
+        dep.name = name
+        reads.append(dep)
+    rw = MagicMock()
+    rw.reads = reads
+    return rw
+
+
+def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
+    """Return a ComputedBuffer mock that looks like a stamped tiled Pointwise op."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(ranges)
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_group_id = loop_group_id
+    op.loop_count = list(loop_count)
+    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.get_read_writes.return_value = _make_rw_with_reads()
+    op.origins = OrderedSet()
+    return op
+
+
+def _make_consumer_op(name, reads_buf):
+    """Return a ComputedBuffer mock that reads reads_buf, with no loop_group_id."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = [Integer(64)]
+    data.inner_fn = MagicMock()
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    del op.loop_group_id
+    op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
+    op.origins = OrderedSet()
+    return op
+
+
+def _make_inside_consumer_op(name, reads_buf, loop_group_id):
+    """Return a ComputedBuffer mock inside the same loop group that reads reads_buf."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = [Integer(16)]
+    data.inner_fn = MagicMock()
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_group_id = loop_group_id
+    op.loop_count = [Integer(4)]
+    op.loop_tiled_dims = [[0]]
+    op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
+    op.origins = OrderedSet()
+    return op
+
+
+class TestCoarseTileBufferPropagation(unittest.TestCase):
+    """Tests for insert_tiling_propagation — consumer analysis helpers."""
+
+    # ------------------------------------------------------------------
+    # Tests for _find_outside_consumers and _has_inside_consumers
+    # (these helpers don't call V.graph, so no mocking needed)
+    # ------------------------------------------------------------------
+
+    def test_no_consumers_returns_empty(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [op])
+        self.assertEqual(consumers, [])
+        self.assertFalse(is_out)
+
+    def test_outside_consumer_detected(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        consumer = _make_consumer_op("out0", "op0")  # no loop_group_id → outside
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [tiled, consumer])
+        self.assertEqual(consumers, [consumer])
+        self.assertFalse(is_out)
+
+    def test_graph_output_detected(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value={"op0"},
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [tiled])
+        self.assertEqual(consumers, [])
+        self.assertTrue(is_out)
+
+    def test_inside_consumer_not_counted_as_outside(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        inside = _make_inside_consumer_op("op1", "op0", (0,))
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [tiled, inside])
+        self.assertEqual(consumers, [])
+        self.assertFalse(is_out)
+
+    def test_has_inside_consumer_true(self):
+        from torch_spyre._inductor.coarse_tile import _has_inside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        inside = _make_inside_consumer_op("op1", "op0", (0,))
+        result = _has_inside_consumers("op0", (0,), [tiled, inside])
+        self.assertTrue(result)
+
+    def test_has_inside_consumer_false_when_only_outside(self):
+        from torch_spyre._inductor.coarse_tile import _has_inside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        outside = _make_consumer_op("out0", "op0")
+        result = _has_inside_consumers("op0", (0,), [tiled, outside])
+        self.assertFalse(result)
+
+    def test_compute_full_ranges_flat(self):
+        from torch_spyre._inductor.coarse_tile import _compute_full_ranges
+
+        op = _make_tiled_op("op0", [Integer(16), Integer(8)], (0,), [Integer(4)], [[0]])
+        full = _compute_full_ranges(op)
+        # dim 0: 16 * 4 = 64; dim 1 untiled: 8
+        self.assertEqual(full[0], Integer(64))
+        self.assertEqual(full[1], Integer(8))
+
+    def test_compute_full_ranges_nested(self):
+        from torch_spyre._inductor.coarse_tile import _compute_full_ranges
+
+        # Nested: outer K=4 tiles dim 0, inner K=2 tiles dim 1
+        op = _make_tiled_op(
+            "op0",
+            [Integer(16), Integer(32)],
+            (0, 0),
+            [Integer(4), Integer(2)],
+            [[0], [1]],
+        )
+        full = _compute_full_ranges(op)
+        # dim 0: 16 * 4 = 64; dim 1: 32 * 2 = 64
+        self.assertEqual(full[0], Integer(64))
+        self.assertEqual(full[1], Integer(64))
+
+    def test_different_loop_group_id_is_outside(self):
+        """Op in loop group 1 should be seen as outside consumer of group 0."""
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        other_group = _make_tiled_op("op1", [Integer(16)], (1,), [Integer(4)], [[0]])
+        # Make op1 read op0
+        other_group.get_read_writes.return_value = _make_rw_with_reads("op0")
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, _ = _find_outside_consumers("op0", (0,), [tiled, other_group])
+        self.assertEqual(consumers, [other_group])
 
 
 if __name__ == "__main__":
