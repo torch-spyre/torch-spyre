@@ -126,8 +126,9 @@ this (the `_format_operations` representation with loop attributes added):
 
 ```
 buf0: ComputedBuffer                          # y = a + b
-  layout = FixedTiledLayout(size=[1024, 4096], ...)  # full output shape
-  op_it_space_splits = {4096: 32}            # work division: 32 cores along dim 1
+  layout = FixedTiledLayout(size=[512, 1024], stride=[1024, 1],
+                            device_size=[16, 512, 64])  # per-tile shape
+  op_it_space_splits = {1024: 32}            # work division: 32 cores along dim 1
   loop_group_id   = (0, 0)
   loop_count      = [2, 4]
   loop_tiled_dims = [[0], [1]]
@@ -139,8 +140,9 @@ buf0: ComputedBuffer                          # y = a + b
   )
 
 buf1: ComputedBuffer                          # z = y * c
-  layout = FixedTiledLayout(size=[1024, 4096], ...)  # full output shape
-  op_it_space_splits = {4096: 32}
+  layout = FixedTiledLayout(size=[512, 1024], stride=[1024, 1],
+                            device_size=[16, 512, 64])  # per-tile shape
+  op_it_space_splits = {1024: 32}
   loop_group_id   = (0, 0)
   loop_count      = [2, 4]
   loop_tiled_dims = [[0], [1]]
@@ -160,9 +162,10 @@ Key points:
 - `ranges = [512, 1024]` is the *per-tile* iteration space (1/8th of the full
   tensor).  Work division and codegen see only this reduced space; the loop
   trip counts carry the information needed to reconstruct the full addressing.
-- `layout.size = [1024, 4096]` is the *full* output tensor shape.  The layout
-  records where in HBM the output lives; `affine.apply` in `bundle.mlir`
-  adds the per-iteration offset at runtime.
+- `layout.size = [512, 1024]` matches the per-tile `ranges`.  The layout
+  describes the smaller per-tile output buffer allocated for each loop
+  iteration.  Per-iteration addressing into the full HBM region is handled
+  by `tiled_symbols` / `affine.apply` in `bundle.mlir` at runtime.
 - `op_it_space_splits = {4096: 32}` is stamped by `work_distribution`: the
   coefficient `4096` identifies the stride-1 dimension (columns), and `32`
   is the number of cores dividing that dimension's work.
