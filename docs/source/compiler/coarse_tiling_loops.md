@@ -121,7 +121,9 @@ The per-inner-iteration `data.ranges` for both ops is `[512, 1024]`.
 ### Generated OpSpec (Python wrapper source)
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
-single nested `LoopSpec`:
+single nested `LoopSpec`.  Below is the actual output produced by running the
+e2e test `test_nested_loop_two_dims` (concrete HBM addresses replaced with
+symbolic names for readability):
 
 ```python
 sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
@@ -139,8 +141,43 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 sympify('c0'): (sympify('512'), 32),
                                 sympify('c1'): (sympify('1024'), 1),
                             },
+                            op_info={},
                             tiled_symbols=[sympify('c0'), sympify('c1')],
-                            ...
+                            args=[
+                                TensorArg(              # input a
+                                    is_input=True, arg_index=0,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[64, 1024, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'hbm': <base_addr_a>},
+                                ),
+                                TensorArg(              # input b
+                                    is_input=True, arg_index=1,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[64, 1024, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'hbm': <base_addr_b>},
+                                ),
+                                TensorArg(              # output y (scratchpad)
+                                    is_input=False, arg_index=-1,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[64, 1024, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'pool': 0},
+                                ),
+                            ]
                         ),
                         OpSpec(
                             op='mul',
@@ -149,8 +186,43 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 sympify('c0'): (sympify('512'), 32),
                                 sympify('c1'): (sympify('1024'), 1),
                             },
+                            op_info={},
                             tiled_symbols=[sympify('c0'), sympify('c1')],
-                            ...
+                            args=[
+                                TensorArg(              # input y (scratchpad)
+                                    is_input=True, arg_index=-1,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[64, 1024, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'pool': 0},
+                                ),
+                                TensorArg(              # input c
+                                    is_input=True, arg_index=2,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[64, 1024, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'hbm': <base_addr_c>},
+                                ),
+                                TensorArg(              # output z (HBM)
+                                    is_input=False, arg_index=3,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[64, 1024, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'hbm': <base_addr_z>},
+                                ),
+                            ]
                         ),
                     ],
                 ),
@@ -160,10 +232,23 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
 )
 ```
 
-`c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
-`iteration_space` reflects the per-inner-iteration range `[512, 1024]`.
-`tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
-to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
+Key observations:
+
+- `c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
+  `iteration_space` reflects the per-inner-iteration tile size `[512, 1024]`.
+- `tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
+  to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
+- The intermediate tensor `y` (output of `add`, input to `mul`) has
+  `allocation={'pool': 0}` — it lives in scratchpad.  Both ops share the same
+  `pool` address because `y` need only exist for the duration of one tile
+  iteration; it is overwritten each time round the loop.
+- The final output `z` (output of `mul`) has `allocation={'hbm': ...}` and
+  `arg_index=3` — it lives in HBM.  The per-iteration write address is
+  computed by `affine.apply` in `bundle.mlir` (see next section).
+- `device_size=[64, 1024, 64]` is the Spyre stick-layout device shape for
+  a `[512, 1024]` fp16 tile: the 512 rows are split as 64 sticks of 64
+  columns each (the stick width for fp16), producing the three-dimensional
+  `[sticks_per_col, rows, cols_per_stick]` device shape.
 
 ### Generated `bundle.mlir`
 
@@ -180,16 +265,20 @@ module {
     func.func @sdsc_bundle() {
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
-        %loop_bound_0 = arith.constant 2 : index   // K=2
-        %loop_bound_1 = arith.constant 4 : index   // M=4
-        %sym_1 = arith.constant <base_addr_add> : index
-        %sym_2 = arith.constant <base_addr_mul> : index
+        %loop_bound_0 = arith.constant 2 : index
+        %loop_bound_1 = arith.constant 4 : index
+        %sym_1 = arith.constant <base_addr_a> : index
+        %sym_2 = arith.constant <base_addr_b> : index
+        %sym_3 = arith.constant <base_addr_c> : index
+        %sym_4 = arith.constant <base_addr_z> : index
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
                 %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
-                sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}  // add
                 %addr_1 = affine.apply #map_0(%i_0, %i_1)[%sym_2]
-                sdscbundle.sdsc_execute (%addr_1) {sdsc_filename="sdsc_1.json", ...}  // mul
+                sdscbundle.sdsc_execute (%addr_0, %addr_1) {sdsc_filename="sdsc_0.json", ...}  // add: a+b→y(pool)
+                %addr_2 = affine.apply #map_0(%i_0, %i_1)[%sym_3]
+                %addr_3 = affine.apply #map_0(%i_0, %i_1)[%sym_4]
+                sdscbundle.sdsc_execute (%addr_2, %addr_3) {sdsc_filename="sdsc_1.json", ...}  // mul: y(pool)*c→z
             }
         }
         return
@@ -197,10 +286,12 @@ module {
 }
 ```
 
-Both operations share the same affine map (they have the same tensor shape and
-stride structure).  Each inner-loop iteration dispatches `add` then `mul` at
-tile `(i_0, i_1)`, keeping the intermediate result `y` in scratchpad between
-the two dispatches.
+Both operations share the same affine map because they operate on tensors of
+the same shape and stride structure.  The scratchpad tensor `y` does not appear
+as a symbol — it has a fixed `pool` address that does not change between
+iterations.  Each inner-loop iteration dispatches `add` then `mul` at tile
+`(i_0, i_1)`, keeping the intermediate result `y` in scratchpad between the
+two dispatches.
 
 ## Layer 1 — Pre-scheduling IR pass
 
