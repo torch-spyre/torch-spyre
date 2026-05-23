@@ -559,11 +559,11 @@ def _divide_ranges(
     ``tiled_dims`` is a list of positional indices into ``data.ranges``.
     Out-of-bounds indices are silently skipped.
 
-    Also updates ``op.layout.size`` at the same indices so the layout reflects
-    the per-tile output buffer size.  Strides are left unchanged — they record
-    the step in the underlying allocation, not the tile extent, so the stride
-    of a ``[1024, 4096]`` contiguous tensor remains ``[4096, 1]`` regardless of
-    how the tiled dimension is divided.
+    Also updates ``op.layout.size``, ``op.layout.stride``, and
+    ``op.layout.device_layout`` so the layout describes the smaller per-tile
+    buffer, not the full tensor.  Contiguous host strides are recomputed from
+    the new size; the ``SpyreTensorLayout`` is rebuilt from the new host size
+    and strides, preserving the within-stick dimension from the original layout.
     """
     data = op.data
     if not isinstance(data, (Pointwise, Reduction)):
@@ -583,16 +583,48 @@ def _divide_ranges(
     # Loops is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "ranges", ranges)
 
-    # Keep layout.size in sync with the divided ranges.
-    from torch._inductor.ir import FixedLayout
+    # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
+    from torch._inductor.ir import FixedLayout, FlexibleLayout
+
+    from .ir import FixedTiledLayout
 
     layout = getattr(op, "layout", None)
-    if isinstance(layout, FixedLayout) and len(layout.size) == len(ranges):
-        new_size = list(layout.size)
-        for i in tiled_dims:
-            if 0 <= i < len(new_size):
-                new_size[i] = ranges[i]
-        layout.size = new_size
+    if not (isinstance(layout, FixedLayout) and len(layout.size) == len(ranges)):
+        return
+
+    new_size = list(layout.size)
+    for i in tiled_dims:
+        if 0 <= i < len(new_size):
+            new_size[i] = ranges[i]
+    layout.size = new_size
+
+    # Recompute contiguous strides for the smaller buffer.
+    layout.stride = list(FlexibleLayout.contiguous_strides(new_size))
+
+    # Rebuild SpyreTensorLayout for the new host size, preserving the
+    # within-stick dimension.  stride_map[-1] is the element stride of the
+    # within-stick host dimension in the original layout; match it against the
+    # new contiguous strides to identify which host dim remains the stick dim.
+    if not isinstance(layout, FixedTiledLayout):
+        return
+    orig_stl = layout.device_layout
+    sm_last = int(list(orig_stl.stride_map)[-1])
+    new_strides_ints = [int(s) for s in layout.stride]
+    new_size_ints = [int(s) for s in new_size]
+    within_stick_dim = next(
+        (i for i, s in enumerate(new_strides_ints) if s == sm_last), None
+    )
+    if within_stick_dim is None:
+        # Fall back to last dim (covers the common contiguous fp16 case where
+        # sm_last == 1 and the last stride is also 1).
+        within_stick_dim = len(new_size_ints) - 1
+    ndim = len(new_size_ints)
+    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [within_stick_dim]
+    from torch_spyre._C import SpyreTensorLayout
+
+    layout.device_layout = SpyreTensorLayout(
+        new_size_ints, new_strides_ints, layout.dtype, dim_order
+    )
 
 
 def _validate_contiguous(
