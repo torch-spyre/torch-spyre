@@ -118,6 +118,59 @@ op.loop_tiled_dims = [[0], [1]]    # outer loop tiles dim 0; inner tiles dim 1
 
 The per-inner-iteration `data.ranges` for both ops is `[512, 1024]`.
 
+### LoopLevel IR after CustomPreSchedulingPasses
+
+After `coarse_tile`, `span_reduction`, `work_distribution`, and
+`scratchpad_planning` have all run, the two `ComputedBuffer` objects look like
+this (the `_format_operations` representation with loop attributes added):
+
+```
+buf0: ComputedBuffer                          # y = a + b
+  layout = FixedTiledLayout(size=[1024, 4096], ...)  # full output shape
+  op_it_space_splits = {4096: 32}            # work division: 32 cores along dim 1
+  loop_group_id   = (0, 0)
+  loop_count      = [2, 4]
+  loop_tiled_dims = [[0], [1]]
+  Pointwise(
+    ranges=[512, 1024],                      # per-tile iteration space
+    inner_fn: load(a, i1 + 4096*i0)
+              load(b, i1 + 4096*i0)
+              return a + b
+  )
+
+buf1: ComputedBuffer                          # z = y * c
+  layout = FixedTiledLayout(size=[1024, 4096], ...)  # full output shape
+  op_it_space_splits = {4096: 32}
+  loop_group_id   = (0, 0)
+  loop_count      = [2, 4]
+  loop_tiled_dims = [[0], [1]]
+  Pointwise(
+    ranges=[512, 1024],
+    inner_fn: load(buf0, i1 + 4096*i0)      # reads y
+              load(c,    i1 + 4096*i0)
+              return y * c
+  )
+```
+
+Key points:
+
+- Both ops share the same `loop_group_id = (0, 0)`, `loop_count = [2, 4]`, and
+  `loop_tiled_dims = [[0], [1]]` — this is what `build_loop_scheduler_nodes`
+  uses to wrap them together in a `CountedLoopSchedulerNode`.
+- `ranges = [512, 1024]` is the *per-tile* iteration space (1/8th of the full
+  tensor).  Work division and codegen see only this reduced space; the loop
+  trip counts carry the information needed to reconstruct the full addressing.
+- `layout.size = [1024, 4096]` is the *full* output tensor shape.  The layout
+  records where in HBM the output lives; `affine.apply` in `bundle.mlir`
+  adds the per-iteration offset at runtime.
+- `op_it_space_splits = {4096: 32}` is stamped by `work_distribution`: the
+  coefficient `4096` identifies the stride-1 dimension (columns), and `32`
+  is the number of cores dividing that dimension's work.
+- `buf0` (`y`) is the intermediate result.  At this point its layout is still
+  `FixedTiledLayout` pointing at HBM; `scratchpad_planning` later promotes it
+  to a scratchpad (`pool`) allocation because it is consumed entirely within
+  the same tile iteration.
+
 ### Generated OpSpec (Python wrapper source)
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
