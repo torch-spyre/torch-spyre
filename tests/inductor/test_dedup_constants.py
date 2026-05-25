@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import torch
 from torch._inductor import config as t_inductor_config
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 
 from torch_spyre._C import get_elem_in_stick
@@ -50,10 +51,10 @@ class _CapturingPasses(CustomPreSchedulingPasses):
         cls.test_instance = test_instance
 
     @override
-    def __call__(self, operations: list[Operation]) -> None:
+    def __call__(self, graph: GraphLowering) -> None:
         assert self.test_instance is not None
-        super().__call__(operations)
-        self.test_instance.captured_operations = list(operations)
+        super().__call__(graph)
+        self.test_instance.captured_operations = list(graph.operations)
 
 
 # ---------------------------------------------------------------------------

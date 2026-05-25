@@ -160,6 +160,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_dtype_scalars_config.yaml
           - name: Inductor Cache
             config: torch_spyre_tests/inductor/test_cache_config.yaml
+          - name: Inductor Scratchpad Solver
+            config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml

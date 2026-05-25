@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
-from typing import Any, Callable, TypeVarTuple, Unpack, Optional, override
+from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
 from unittest.mock import patch
 import torch
 
-from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 
-from torch_spyre._inductor.scratchpad import ScratchPadAllocator
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
@@ -47,14 +47,14 @@ class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
         cls.test_instance = test_instance
 
     @override
-    def __call__(self, operations: list[Operation]) -> None:
+    def __call__(self, graph: GraphLowering) -> None:
         assert self.test_instance is not None, (
             "CustomPreSchedulingPassesWithOurPasses.test_instance must be set to an instance of "
             "TestScratchpadUsage before get_passes is called"
         )
-        super().__call__(operations)
+        super().__call__(graph)
         for f in self.test_instance.our_pre_scheduling_passes:
-            f(operations)
+            f(graph)
 
 
 class TestScratchpadUsage(unittest.TestCase):
@@ -94,14 +94,13 @@ class TestScratchpadUsage(unittest.TestCase):
     @contextmanager
     def pre_scheduling_iterating_pass(
         self,
-        f: Callable[[Operation], None],
+        f: Callable[[GraphLowering], None],
     ):
         """Context manager to add a post fusion custom pass that processes each node independently
         using `f`."""
 
-        def new_pass(nodes: list[Operation]) -> None:
-            for node in nodes:
-                f(node)
+        def new_pass(graph: GraphLowering) -> None:
+            f(graph)
 
         self.our_pre_scheduling_passes.append(new_pass)
         yield
@@ -109,25 +108,22 @@ class TestScratchpadUsage(unittest.TestCase):
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
-    ) -> tuple[torch.Tensor, list[dict[str, dict[str, Any]]]]:
-        mem_usages = []
-        alloc = ScratchPadAllocator()
+    ) -> tuple[torch.Tensor, dict[str, str]]:
+        mem_usages = {}
 
-        def visitor(node: Operation) -> None:
+        def visitor(graph: GraphLowering) -> None:
             nonlocal mem_usages
-            mem_usage = alloc.mem_usage_by_op(node)
-            mem_usage = {
-                key: value
-                for key, value in mem_usage.items()
-                if isinstance(value, dict)
-            }
-            for buffer_name, usage in mem_usage.items():
-                buffer = V.graph.get_buffer(buffer_name)
+            operations = graph.operations
+            for op in operations:
+                buf_name = op.name
+                buffer = graph.get_buffer(buf_name)
                 layout = buffer.get_layout()
+                device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
-                usage["location"] = "LX" if "lx" in allocation else "HBM"
-
-            mem_usages.append(mem_usage)
+                mem_usages[buf_name] = {
+                    "location": "LX" if "lx" in allocation else "HBM",
+                    "size": math.prod(device_layout.device_size[:-1]) * 128,
+                }
 
         with self.pre_scheduling_iterating_pass(visitor):
             compiled_kernel = torch.compile(f, fullgraph=True)
@@ -149,11 +145,7 @@ class TestScratchpadUsage(unittest.TestCase):
             device_result, mem_usages = self.compile_and_collect_mem_usage(model, args)
 
         self.assertTrue(
-            any(
-                usage["location"] == "LX"
-                for mem_usage in mem_usages
-                for usage in mem_usage.values()
-            ),
+            any(mem_usage["location"] == "LX" for mem_usage in mem_usages.values()),
             "Expected at least one buffer to be allocated in LX, but none were",
         )
 
@@ -190,10 +182,9 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         transfers are accurately returned by `mem_usage_by_node`."""
         result, mem_usages = self.compile_and_collect_mem_usage(model, args)
         hbm_transfers = sum(
-            usage["size"]
-            for mem_usage in mem_usages
-            for usage in mem_usage.values()
-            if usage["location"] == "HBM"
+            mem_usage["size"]
+            for mem_usage in mem_usages.values()
+            if mem_usage["location"] == "HBM"
         )
         return (result, hbm_transfers)
 
@@ -221,6 +212,8 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
             torch.allclose(result_without_lx, result_with_lx, atol=1e-5),
             "Results do not match between LX planning on and off",
         )
+
+    # TODO: Add additional ops
 
 
 if __name__ == "__main__":
