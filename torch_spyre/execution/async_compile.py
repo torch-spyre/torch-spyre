@@ -13,16 +13,15 @@
 # limitations under the License.
 
 import tempfile
+from collections.abc import Sequence
 from typing import Any
 import os
 import subprocess
 
 from torch._inductor.runtime.runtime_utils import cache_dir
-from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, UnimplementedOp
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, UnimplementedOp
 from torch_spyre._inductor.codegen.bundle import generate_bundle
-from torch_spyre._inductor.codegen.unroll import unroll_loop_specs
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -35,40 +34,23 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
-def _find_unimplemented(specs: list):
-    """Return the first UnimplementedOp in specs (recursing into LoopSpec), or None."""
-    for entry in specs:
-        if isinstance(entry, UnimplementedOp):
-            return entry
-        if isinstance(entry, LoopSpec):
-            found = _find_unimplemented(entry.body)
-            if found is not None:
-                return found
-    return None
-
-
 class SpyreAsyncCompile:
     def __init__(self) -> None:
         pass
 
-    def sdsc(self, kernel_name: str, specs: list):
-        unimp = _find_unimplemented(specs)
-        if unimp is not None:
+    def sdsc(
+        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+    ):
+        unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
+        if len(unimp) != 0:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
+                f"WARNING: Compiling unimplemented {unimp[0].op} to runtime exception"
             )
-            return SpyreUnimplementedRunner(kernel_name, unimp.op)
+            return SpyreUnimplementedRunner(kernel_name, unimp[0].op)
 
-        # Generate SDSC Bundle from specs (may contain LoopSpec entries).
+        # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        if not _spyre_config.bundle_hbm_symbols:
-            specs = unroll_loop_specs(specs)
-        generate_bundle(
-            kernel_name,
-            output_dir,
-            specs,
-            use_symbols=_spyre_config.bundle_hbm_symbols,
-        )
+        generate_bundle(kernel_name, output_dir, specs)
 
         # Invoke backend compiler of SDSC Bundle
         subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)

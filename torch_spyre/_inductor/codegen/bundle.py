@@ -14,11 +14,14 @@
 
 import json
 import os
+from collections.abc import Sequence
 from typing import Any
 
 import sympy
 
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
+from torch_spyre._inductor.codegen.unroll import unroll_loop_specs
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -67,8 +70,8 @@ def _any_tiled_op(specs: list) -> bool:
 def generate_bundle(
     kernel_name: str,
     output_dir: str,
-    specs: list,
-    use_symbols: bool = False,
+    specs: Sequence,
+    use_symbols: bool | None = None,
 ):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
@@ -77,17 +80,30 @@ def generate_bundle(
     the generated ``bundle.mlir``, with ``affine.apply`` expressions computing
     per-iteration tensor start addresses for tiled dimensions.
 
-    When ``use_symbols=False`` (default), HBM tensor addresses are baked as
-    concrete integers into the SDSC JSON — matching the main-branch behaviour.
-    ``LoopSpec`` entries that contain tiled ops (``OpSpec.tiled_symbols`` is
-    non-empty) require ``use_symbols=True``; passing such a spec tree with
-    ``use_symbols=False`` raises ``RuntimeError``.  Non-tiled ``LoopSpec``
-    entries (loop structure only) are accepted in either mode.
+    When ``use_symbols`` is ``None`` (the default) the value is read from
+    ``config.bundle_hbm_symbols``.  Pass an explicit ``True`` or ``False`` to
+    override the config — useful in unit tests that call ``generate_bundle``
+    directly.
+
+    When ``use_symbols=False``, any ``LoopSpec`` entries are fully unrolled
+    before bundle generation: each iteration becomes an independent ``OpSpec``
+    with concrete per-iteration HBM addresses.  ``LoopSpec`` entries that
+    contain tiled ops (``OpSpec.tiled_symbols`` is non-empty) and are passed
+    with ``use_symbols=False`` *without* going through the unroll path raise
+    ``RuntimeError`` — this guards against callers that set ``use_symbols=False``
+    explicitly on an already-tiled spec tree without intending to unroll.
 
     Set ``use_symbols=True`` (or ``BUNDLE_HBM_SYMBOLS=1``) to enable the
     symbol-indirection path required for coarse tiling.
     """
-    if not use_symbols and _contains_tiled_loop_spec(specs):
+    if use_symbols is None:
+        use_symbols = _spyre_config.bundle_hbm_symbols
+
+    specs_list: list = (
+        unroll_loop_specs(list(specs)) if not use_symbols else list(specs)
+    )
+
+    if not use_symbols and _contains_tiled_loop_spec(specs_list):
         raise RuntimeError(
             "bundle_hbm_symbols must be True when the spec tree contains tiled ops "
             "inside a LoopSpec.  Set BUNDLE_HBM_SYMBOLS=1 or "
@@ -106,7 +122,7 @@ def generate_bundle(
     symbol_id_offset_counter = [0]
 
     _compile_specs(
-        specs,
+        specs_list,
         symbols,
         compiled,
         sdsc_counter,
@@ -121,14 +137,14 @@ def generate_bundle(
 
     # Collect loop bounds and affine maps needed across the whole tree.
     loop_bounds: list[sympy.Expr] = []
-    _collect_loop_bounds(specs, loop_bounds)
+    _collect_loop_bounds(specs_list, loop_bounds)
 
     # Affine map deduplication: stride_key -> map index (0-based).
     # A stride_key is a tuple of (stride,) values — one per loop variable at
     # the nesting depth where the op lives.  For a single-level loop with one
     # tiled sym the key is (stride_bytes,).
     affine_map_index: dict[tuple, int] = {}
-    _collect_affine_maps(specs, iter(compiled), [], affine_map_index)
+    _collect_affine_maps(specs_list, iter(compiled), [], affine_map_index)
 
     compiled_iter = iter(compiled)
     addr_counter = [0]
@@ -163,7 +179,7 @@ def generate_bundle(
         # Recursive body emission.
         loop_bound_idx = [0]
         _emit_specs(
-            specs,
+            specs_list,
             compiled_iter,
             loop_bounds,
             loop_bound_idx,
