@@ -58,11 +58,8 @@ from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-<<<<<<< HEAD
 from .chunk_large_tensors import chunk_large_tensors
-=======
 from .coarse_tile import coarse_tile
->>>>>>> 552dc66 (inductor: implement coarse-tiling loop IR (M3 + M4))
 
 
 logger = get_inductor_logger("passes")
