@@ -15,7 +15,7 @@
 
 import os
 import sys
-from typing import Any, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import regex as re
 import torch
@@ -31,15 +31,17 @@ from torch.testing._internal.common_utils import TestCase
 
 import shared_config
 from op_registry import OP_REGISTRY, OpAdapter
-from spyre_test_constants import ENV_TEST_CONFIG
-from spyre_test_config_models import (
+
+from oot_test_constants import ENV_TEST_CONFIG
+from oot_test_config_models import (
+    InputArgTensor,
+    InputArgTensorList,
     OOTTestConfig,
     OpsNamedItem,
     TestEntry,
 )
-from spyre_test_parsing import load_yaml_config, resolve_current_file
-from spyre_test_utilities import print_test_tags_oot
-
+from oot_test_parsing import load_yaml_config, resolve_current_file
+from oot_test_utilities import print_test_tags_oot
 
 # ---------------------------------------------------------------------------
 # ModelOpInfo
@@ -97,48 +99,72 @@ def _build_model_ops_db() -> List[ModelOpInfo]:
         return []
 
     target = "TestSpyreModelOps::test_model_ops_db"
-    test_entry: Optional[TestEntry] = None
-    for entry in file_entry.tests:
-        if target in entry.names:
-            test_entry = entry
-            break
+    matching_entries: List[TestEntry] = [
+        entry for entry in file_entry.tests if target in entry.names
+    ]
 
-    if test_entry is None:
+    if not matching_entries:
         return []
 
     db: List[ModelOpInfo] = []
     seen: Set[str] = set()
+    idx = 0
 
-    for idx, ops_item in enumerate(test_entry.edits.ops.include):
-        op_name = ops_item.name
-        if op_name not in OP_REGISTRY:
-            import warnings
+    for test_entry in matching_entries:
+        for ops_item in test_entry.edits.ops.include:
+            op_name = ops_item.name
+            if op_name not in OP_REGISTRY:
+                import warnings
 
-            warnings.warn(f"test_model_ops: {op_name!r} not in OP_REGISTRY — skipping")
-            continue
+                warnings.warn(
+                    f"test_model_ops: {op_name!r} not in OP_REGISTRY — skipping"
+                )
+                continue
 
-        safe_op = op_name.replace(".", "_")
-        unique_name = f"{safe_op}__{idx}"
+            safe_op = op_name.replace(".", "_")
+            unique_name = f"{safe_op}__{idx}"
 
-        assert unique_name not in seen, f"Duplicate model_ops_db key: {unique_name}"
-        seen.add(unique_name)
+            assert unique_name not in seen, f"Duplicate model_ops_db key: {unique_name}"
+            seen.add(unique_name)
+            idx += 1
 
-        db.append(
-            ModelOpInfo(
-                unique_name,
-                op_name,
-                dtypes=(torch.float16,),
-                adapter=OP_REGISTRY[op_name],
-                ops_item=ops_item,
-                test_entry=test_entry,
-                seed=seed,
+            # choose a representative dtype used as a part of test name
+            args = ops_item.sample_inputs_func.args
+            assert isinstance(args, list)
+            if len(args) == 0:
+                # use float16 as default
+                dtypes = (torch.float16,)
+            elif isinstance(args[0], InputArgTensor):
+                # use dtype of a tensor at the first arg
+                dtypes = (args[0].tensor.resolved_dtype(),)
+            elif isinstance(args[0], InputArgTensorList):
+                # use dtype of the first tensor in a tensor list at the first arg
+                dtypes = (args[0].tensor_list[0].resolved_dtype(),)
+            else:
+                # use float16 as default
+                dtypes = (torch.float16,)
+
+            db.append(
+                ModelOpInfo(
+                    unique_name,
+                    op_name,
+                    dtypes=dtypes,
+                    adapter=OP_REGISTRY[op_name],
+                    ops_item=ops_item,
+                    test_entry=test_entry,
+                    seed=seed,
+                )
             )
-        )
+            model_ops_entry_by_unique_name[unique_name] = test_entry
 
     return db
 
 
 model_ops_db: List[ModelOpInfo] = []
+# unique_name (e.g. "torch_add__2") -> originating TestEntry. Used by the
+# variant resolver in spyre_test_base_common; dtype heuristics alone can
+# pick the wrong entry when merged YAML configs overlap in dtypes.
+model_ops_entry_by_unique_name: Dict[str, TestEntry] = {}
 
 
 def _init_model_ops_db() -> None:
@@ -365,14 +391,14 @@ class TestSpyreModelOps(TestCase):
             SampleInput=SampleInput,
         )
 
-        def _to_spyre(x: Any) -> Any:
+        def _to_target_device(x: Any) -> Any:
             if torch.is_tensor(x):
                 return x.to(test_device)
             if isinstance(x, list):
                 return [t.to(test_device) if torch.is_tensor(t) else t for t in x]
             return x
 
-        test_sample: SampleInput = cpu_sample.transform(_to_spyre)
+        test_sample: SampleInput = cpu_sample.transform(_to_target_device)
 
         # Adapter pre-hook (e.g. dropout sets training=False)
         if adapter.pre is not None:

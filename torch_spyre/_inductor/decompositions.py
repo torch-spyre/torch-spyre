@@ -649,23 +649,36 @@ def decompose_cat(
     tensors: list[torch.Tensor],
     dim: int = 0,
 ) -> torch.Tensor:
-    orig_decomp = torch._inductor.decomposition.cat(tensors, dim)
+    # Spyre replaces the upstream cat decomposition because the upstream
+    # lowering (ConcatKernel/pointwise_cat) emits CPU/CUDA IR that Spyre
+    # cannot execute. Instead we lower to spyre::overwrite_f.
+    #
+    # Because this decomposition fully replaces upstream, we must also
+    # replicate the zero-element filtering that upstream does in
+    # torch/_inductor/decomposition.py:390-413. Without it, collapsed
+    # 1D [0] tensors cause _validate_dim assertions in the fallback path.
+    non_empty = [t for t in tensors if t.numel() > 0]
+    if not non_empty:
+        non_empty = tensors
+    elif len(non_empty) == 1:
+        return non_empty[0]
+
+    orig_decomp = torch._inductor.decomposition.cat(non_empty, dim)
     if orig_decomp == NotImplemented:
         expanded_size = 0
-        for t in tensors:
+        for t in non_empty:
             expanded_size += t.size(dim)
-        output_size = list(tensors[0].size())
+        output_size = list(non_empty[0].size())
         output_size[dim] = expanded_size
-        output = tensors[0].new_empty(output_size)
+        output = non_empty[0].new_empty(output_size)
         offset = 0
-        for input in tensors:
+        for t in non_empty:
             output = torch.ops.spyre.overwrite_f(
-                input=input, output=output, dims=[dim], offsets=[offset]
+                input=t, output=output, dims=[dim], offsets=[offset]
             )
-            offset += input.size(dim)
+            offset += t.size(dim)
         return output
-    else:
-        return orig_decomp
+    return orig_decomp
 
 
 @register_spyre_decomposition([torch.ops.aten.ceil.default])

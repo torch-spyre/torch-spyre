@@ -36,6 +36,10 @@ from .temp_passes import (
     convert_constant_with_graph_node,
 )
 from . import config
+from .propagate_hints import (
+    collect_spyre_hints,
+    recover_spyre_hints,
+)
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -50,6 +54,7 @@ from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
+from .chunk_large_tensors import chunk_large_tensors
 
 
 logger = get_inductor_logger("passes")
@@ -116,7 +121,7 @@ class CustomPrePasses(CustomGraphPass):
     """
     The list of custom passes to run
     """
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [collect_spyre_hints]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPrePasses.passes:
@@ -138,6 +143,7 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        recover_spyre_hints,
         convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
@@ -236,6 +242,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         insert_restickify(operations)
         insert_bmm_padding(operations)
         dedup_and_promote_constants(operations)
+        if config.chunk_large_tensors:
+            chunk_large_tensors(operations)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
@@ -255,6 +263,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
             inspect.getfile(insert_bmm_padding),
+            inspect.getfile(chunk_large_tensors),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),

@@ -288,53 +288,11 @@ def _is_topk(op: str) -> bool:
     return op in TOPK_OPS
 
 
-def _get_op_dim_labels(ndim: int) -> list[str]:
-    return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
-
-
-def _get_matmul_symbol_mapping(op_spec: OpSpec) -> dict[Symbol, Symbol]:
-    """
-    Assign dim labels in specific order to work around backend bug.
-    https://github.com/torch-spyre/torch-spyre/issues/2070
-    """
-
-    def syms(arg):
-        return {s for c in arg.device_coordinates for s in c.free_symbols}
-
-    inp0, inp1, out = (
-        syms(op_spec.args[0]),
-        syms(op_spec.args[1]),
-        syms(op_spec.args[2]),
-    )
-
-    mapping = {}
-    row_batch_syms = set()
-
-    for sym in op_spec.iteration_space:
-        if sym in inp0 and sym in inp1 and sym in out:
-            row_batch_syms.add(sym)
-        elif sym in inp0 and sym in inp1 and sym not in out:
-            # Reduction dim
-            mapping[sym] = Symbol("in")
-        elif sym not in inp0 and sym in inp1:
-            # Output stick dim
-            mapping[sym] = Symbol("out")
-        else:
-            row_batch_syms.add(sym)
-
-    ordered = list(
-        dict.fromkeys(
-            s
-            for coord in reversed(op_spec.args[2].device_coordinates)
-            for s in coord.free_symbols
-            if s in row_batch_syms
-        )
-    )
-    remaining_labels = MATMUL_DIM_LABELS[: len(MATMUL_DIM_LABELS) - 2]
-    for sym, label in zip(ordered[::-1], remaining_labels[: len(ordered)]):
-        mapping[sym] = Symbol(label)
-
-    return mapping
+def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
+    if is_matmul:
+        return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
+    else:
+        return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
 def _create_sdsc_tensors(
@@ -553,13 +511,10 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
 
-    if is_matmul:
-        symbol_mapping = _get_matmul_symbol_mapping(op_spec)
-    else:
-        dim_labels = _get_op_dim_labels(ndim)
-        symbol_mapping = {
-            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-        }
+    dim_labels = _get_op_dim_labels(ndim, is_matmul)
+    symbol_mapping = {
+        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
+    }
     logger.debug(
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),

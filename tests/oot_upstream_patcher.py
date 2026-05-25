@@ -1,9 +1,11 @@
 """
-Upstream PyTorch decorator patchers for the Spyre test framework.
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
+
+Upstream PyTorch decorator patchers for the OOT test framework.
 
 These patchers modify upstream PyTorch test decorators at instantiation time
-to allow Spyre's privateuse1 backend to run tests that would otherwise be
-restricted to specific devices or dtypes.
+to allow the registered privateuse1 backend to run tests that would otherwise
+be restricted to specific devices or dtypes.
 
 Each patcher follows the same pattern:
   1. Receive the test method as passed to instantiate_test()
@@ -21,6 +23,13 @@ would not affect these copies.
 
 from typing import Set, Optional
 import torch
+
+from oot_test_utilities import _get_privateuse1_device_type
+
+# Resolve the registered backend name once at import time.
+# Used in _OOTModuleListPatcher to strip the device suffix when extracting
+# op names from parametrised method names (e.g. "add_<device>_float16").
+_OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
 
 
 def _extract_base_module_name(name: str) -> str:
@@ -190,7 +199,7 @@ class _OOTOpListPatcher:
     on self.op_list.
 
     Access the @ops instance directly via test.__func__.parametrize_fn.__self__
-    (the same path _SpyreDtypePatcher uses for allowed_dtypes) and filter
+    (the same path _OOTDtypePatcher uses for allowed_dtypes) and filter
     self.op_list in-place to keep only supported ops.
     """
 
@@ -256,14 +265,14 @@ class _OOTOpDtypeExpander:
 
     If apply_op_config_overrides narrowed op.__dict__["dtypes"] to only
     global.supported_dtypes, a dtype in edits.dtypes.include won't survive
-    this intersection even if _SpyreDtypePatcher added it to allowed_dtypes.
+    this intersection even if _OOTDtypePatcher added it to allowed_dtypes.
 
     Expand op.__dict__["dtypes"] directly on each OpInfo in @ops.op_list
     to include the extra dtypes before super().instantiate_test() runs.
     Writes to __dict__ directly to bypass OpInfo.__setattr__ validation.
 
-    _SpyreDtypePatcher handles @ops.allowed_dtypes (the outer filter).
-    _SpyreOpDtypeExpander handles op.dtypes on each OpInfo (the inner filter).
+    _OOTDtypePatcher handles @ops.allowed_dtypes (the outer filter).
+    _OOTOpDtypeExpander handles op.dtypes on each OpInfo (the inner filter).
     Both must be patched for a variant to be generated.
 
     edits.dtypes.include is intentionally NOT bounded by global.supported_dtypes.
