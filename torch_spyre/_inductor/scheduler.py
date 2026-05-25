@@ -40,6 +40,38 @@ from .op_spec import LoopSpec
 logger = get_inductor_logger("scheduler")
 
 
+def _find_leaf_sched_node(node: BaseSchedulerNode):
+    """Recursively find the first leaf SchedulerNode inside a (possibly nested) node."""
+    for snode in node.get_nodes():
+        if isinstance(snode, SchedulerNode):
+            return snode
+        result = _find_leaf_sched_node(snode)
+        if result is not None:
+            return result
+    return None
+
+
+def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -> list:
+    """Return the OpSpec iteration-space symbols tiled at ``depth``.
+
+    Uses ``loop_tiled_dims[depth]`` from the IR node and the SchedulerNode's
+    ``iteration_space`` (which produces the same symbols as ``create_op_spec``
+    uses to build ``OpSpec.tiled_symbols``).
+    """
+    ir_op = sched_node.node
+    if ir_op is None:
+        return []
+    raw = getattr(ir_op, "loop_tiled_dims", None)
+    if raw is None or not raw:
+        return []
+    dims_per_level: list = raw if isinstance(raw[0], list) else [raw]
+    if depth >= len(dims_per_level):
+        return []
+    it_space = iteration_space(sched_node)
+    keys = list(it_space.keys())
+    return [keys[d] for d in dims_per_level[depth] if d < len(keys)]
+
+
 class CountedLoopSchedulerNode(FusedSchedulerNode):
     """A group of SchedulerNodes to be executed inside a counted outer loop.
 
@@ -353,7 +385,19 @@ class SuperDSCScheduling(BaseScheduling):
                         ]
                         snode.codegen(index_vars)
 
-        kernel.wrap_op_specs_in_loop(node.loop_count)
+        # Compute per-level tiled symbols for the outer (depth=0) LoopSpec.
+        # Find a leaf SchedulerNode to read loop_tiled_dims + iteration_space.
+        outer_tiled_syms: list = []
+        for inner in inner_nodes:
+            ref = _find_leaf_sched_node(inner)
+            if ref is not None:
+                outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(ref, 0)
+                break
+
+        kernel.wrap_op_specs_in_loop(
+            node.loop_count,
+            tiled_symbols=outer_tiled_syms,
+        )
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -378,6 +422,7 @@ class SuperDSCScheduling(BaseScheduling):
         node: CountedLoopSchedulerNode,
         kernel: SpyreKernel,
         all_schedule_nodes: list[SchedulerNode],
+        depth: int = 1,
     ) -> None:
         """Codegen the body of a nested CountedLoopSchedulerNode into an existing kernel.
 
@@ -394,7 +439,7 @@ class SuperDSCScheduling(BaseScheduling):
         body_start = len(kernel.op_specs)
         for inner in inner_nodes:
             if isinstance(inner, CountedLoopSchedulerNode):
-                self._codegen_loop_body(inner, kernel, all_schedule_nodes)
+                self._codegen_loop_body(inner, kernel, all_schedule_nodes, depth + 1)
             else:
                 sched = self.generate_node_schedule([inner])
                 all_schedule_nodes.extend(sched)
@@ -407,10 +452,24 @@ class SuperDSCScheduling(BaseScheduling):
                     ]
                     snode.codegen(index_vars)
 
+        # Determine this level's tiled symbols using the IR's loop_tiled_dims[depth].
+        ref_sched_node = _find_leaf_sched_node(node)
+        level_syms = (
+            _tiled_syms_for_sched_node_at_depth(ref_sched_node, depth)
+            if ref_sched_node is not None
+            else []
+        )
+
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+        kernel.op_specs.append(
+            LoopSpec(
+                count=node.loop_count,
+                body=body,
+                tiled_symbols=level_syms,
+            )
+        )
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """

@@ -44,6 +44,8 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
+    stride_map: list[int] | None = None
+    per_tile_fixed: bool = False
 
 
 @dataclasses.dataclass
@@ -84,16 +86,18 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
-
-    Per-op tiling information (which iteration-space symbols are divided by
-    ``count``) is recorded on each ``OpSpec.tiled_symbols`` rather than here,
-    because different body ops may tile different dimensions.
+        tiled_symbols: The iteration-space symbols divided by ``count`` at
+            *this* loop level.  Used by the unroller to advance HBM base
+            addresses by exactly the right stride for each nesting level.
+            Empty for LoopSpecs that do not carry per-level tiling info
+            (legacy path; falls back to OpSpec.tiled_symbols).
     """
 
     count: Expr
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    tiled_symbols: list[Symbol] = dataclasses.field(default_factory=list)
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

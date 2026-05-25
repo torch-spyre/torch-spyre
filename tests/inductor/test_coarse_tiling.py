@@ -1745,5 +1745,86 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [other_group])
 
 
+def _make_tiled_reduction_op(
+    name,
+    ranges,
+    reduction_ranges,
+    reduction_type,
+    loop_group_id,
+    loop_count,
+    loop_tiled_dims,
+):
+    """Return a ComputedBuffer mock that looks like a stamped tiled Reduction op."""
+    from torch._inductor.ir import ComputedBuffer, Reduction
+
+    data = MagicMock(spec=Reduction)
+    data.ranges = list(ranges)
+    data.reduction_ranges = list(reduction_ranges)
+    data.reduction_type = reduction_type
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_group_id = loop_group_id
+    op.loop_count = list(loop_count)
+    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.get_read_writes.return_value = _make_rw_with_reads()
+    op.origins = OrderedSet()
+    return op
+
+
+class TestCoarseTileReductionPropagation(unittest.TestCase):
+    """Tests for insert_tiling_propagation Reduction support."""
+
+    def test_matmul_in_loop_raises(self):
+        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        op = _make_tiled_reduction_op(
+            "matmul0",
+            ranges=[Integer(4), Integer(4), Integer(4)],
+            reduction_ranges=[Integer(64)],
+            reduction_type=BATCH_MATMUL_OP,
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        with self.assertRaises(RuntimeError, msg="matmul inside loop should raise"):
+            _check_reduction_tiling_safety(op)
+
+    def test_reduction_tiled_reduction_dim_raises(self):
+        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+
+        # ranges=[M], reduction_ranges=[K]; tiled_dim=1 is >= len(ranges)=1 → reduction dim
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[1]],
+        )
+        with self.assertRaises(RuntimeError, msg="tiled reduction dim should raise"):
+            _check_reduction_tiling_safety(op)
+
+    def test_reduction_output_dim_tiled_ok(self):
+        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+
+        # ranges=[M], reduction_ranges=[K]; tiled_dim=0 is an output dim → no error
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(64)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        # Should not raise
+        _check_reduction_tiling_safety(op)
+
+
 if __name__ == "__main__":
     unittest.main()

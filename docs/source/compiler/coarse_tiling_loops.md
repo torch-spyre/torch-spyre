@@ -514,6 +514,91 @@ before, it would see the full iteration space and allocate too much —
 defeating the working-set reduction that coarse tiling is designed to
 achieve.
 
+### Buffer propagation: `insert_tiling_propagation`
+
+`coarse_tile()` calls `insert_tiling_propagation(operations, groups)`
+immediately after stamping all loop attributes.  Its job is to ensure that
+any op whose result is consumed **outside** the loop (or is a graph output)
+exposes a complete, fully-sized buffer to its consumers.  Ops whose outputs
+are consumed only inside the loop are marked so the unroller does not advance
+their base addresses.
+
+#### Use-def analysis
+
+For each `ComputedBuffer` in a loop group the pass asks two questions:
+
+1. **Does this buffer have outside consumers?**  A consumer is "outside" if
+   it carries a different `loop_group_id` prefix, or has no `loop_group_id`
+   at all.  Graph outputs (recorded in the Inductor buffer's
+   `users`/`get_alias_name` machinery) count as outside consumers.
+
+2. **Does this buffer have inside consumers?**  A consumer is "inside" if it
+   shares the same `loop_group_id` tuple (i.e. it is another op in the same
+   innermost loop body).
+
+#### `per_tile_fixed` — loop-internal buffers
+
+If a buffer has **no** outside consumers and is not a graph output, it is a
+per-tile scratch region that is fully overwritten and read within the same
+loop iteration.  The pass marks it:
+
+```python
+if isinstance(op.layout, FixedTiledLayout):
+    op.layout.per_tile_fixed = True
+```
+
+This flag propagates to `TensorArg.per_tile_fixed` during codegen (in
+`spyre_kernel.py`).  The unroller (`codegen/unroll.py`) then skips two
+things for these args:
+
+- **Address advance** — the base address is fixed; no per-iteration offset
+  is added.
+- **`device_size` update** — the tile geometry is not applied; the hardware
+  uses the original allocation size, which already matches the tile.
+
+#### Case 1 — output used both inside and outside the loop
+
+The tiled op writes into its small, per-iteration buffer as usual.  The pass
+allocates a full-sized HBM buffer (sized to the original pre-division ranges)
+and inserts a **copy op** immediately after the tiled op in the operations
+list.  The copy op carries the same `loop_group_id`, `loop_count`, and
+`loop_tiled_dims` as the original, so the scheduler wraps both ops in the
+same `CountedLoopSchedulerNode`.  Its `TensorArg` for the destination uses
+the full buffer's address; the existing `tiled_symbols` / `affine.apply`
+machinery in `SpyreKernel` and `bundle.py` computes the per-iteration slice
+offset automatically.
+
+All outside consumers are then patched to read the full buffer instead of
+the tiled one.
+
+#### Case 2 — output used only outside the loop
+
+When no inside consumer needs the per-iteration buffer, the simplest fix is
+to rewire the tiled op itself to write directly into the full buffer:
+
+```python
+op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
+```
+
+`MutationLayoutSHOULDREMOVE` tells Inductor that the op mutates an existing
+storage in-place.  Because the full buffer is pre-allocated and its address
+is encoded in the `TensorArg` via the `tiled_symbols` offset, no copy op is
+needed.
+
+#### Reduction safety checks
+
+Before running the propagation logic for a `Reduction` op, the pass calls
+`_check_reduction_tiling_safety(op)` which raises `RuntimeError` in two
+unsupported configurations:
+
+- **Matrix multiply** (`reduction_type == "batchmatmul"`) inside a tiling
+  loop — the accumulation semantics are not handled.
+- **Tiled reduction dim** — if any entry in `loop_tiled_dims` is
+  `>= len(data.ranges)`, the tiled index falls in `reduction_ranges`.
+  Accumulation-buffer support for this case is not yet implemented.
+
+Both checks happen before any buffer allocation, so the error is clean.
+
 ## Layer 2 — `CountedLoopSchedulerNode`
 
 ### Class definition
@@ -883,7 +968,10 @@ The filenames are assigned in depth-first traversal order.
 | `torch_spyre/_inductor/scheduler.py` | Add `CountedLoopSchedulerNode(FusedSchedulerNode)` with `unpack()` override; add `build_loop_scheduler_nodes` and `_codegen_counted_loop`/`_codegen_loop_body` to `SuperDSCScheduling` |
 | `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call in `CustomPreSchedulingPasses`; reorder `CustomPostFusionPasses` to `[memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]` |
 | `torch_spyre/_inductor/config.py` | Add `coarse_tiling: bool` flag and `coarse_tiling_groups_fn` callable |
-| `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps `loop_group_id`, `loop_count`, and `loop_tiled_dims` on ops; rewrites `ranges` via `object.__setattr__` |
+| `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps `loop_group_id`, `loop_count`, and `loop_tiled_dims` on ops; rewrites `ranges` via `object.__setattr__`; `insert_tiling_propagation` allocates full buffers for outside consumers, marks loop-internal buffers `per_tile_fixed` |
+| `torch_spyre/_inductor/ir.py` | Add `per_tile_fixed: bool = False` to `FixedTiledLayout` |
+| `torch_spyre/_inductor/op_spec.py` | Add `per_tile_fixed: bool = False` to `TensorArg` |
+| `torch_spyre/_inductor/codegen/unroll.py` | Add `_tile_device_size` helper; apply tile-sized `device_size` and skip address advance for `per_tile_fixed` args during loop unrolling |
 | `torch_spyre/_inductor/wrapper.py` | Add `LoopSpec` to the generated wrapper's import line |
 | `torch_spyre/_inductor/codegen/bundle.py` | Extend `generate_bundle()` to walk `LoopSpec` tree and emit `scf.for` in `bundle.mlir`; number SDSC JSON files in depth-first order |
 | `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; `_find_unimplemented` recurses into `LoopSpec.body` |
@@ -1022,6 +1110,3 @@ codegen time.
 - Symbolic loop counts in `bundle.mlir` (currently raises
   `NotImplementedError`; requires runtime shape plumbing into the MLIR
   function signature).
-- The graph transformations needed for correct handling of tiled reductions
-  and of tiles that outlive their loop iteration are not yet covered in this document.
-  This document will be extended to cover those cases as part of [issue 2266](https://github.com/torch-spyre/torch-spyre/issues/2266).

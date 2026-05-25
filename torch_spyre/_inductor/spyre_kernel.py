@@ -408,6 +408,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
+            stride_map=list(tensor.layout.device_layout.stride_map),
+            per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -624,9 +626,18 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
-    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
+    def wrap_op_specs_in_loop(
+        self, count: sympy.Expr, tiled_symbols: list | None = None
+    ) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
-        self.op_specs = [LoopSpec(count=count, body=self.op_specs)]
+        body = self.op_specs
+        self.op_specs = [
+            LoopSpec(
+                count=count,
+                body=body,
+                tiled_symbols=tiled_symbols if tiled_symbols is not None else [],
+            )
+        ]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
@@ -694,6 +705,12 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)
                 buf.writeline("],")
+                if op_spec.tiled_symbols:
+                    buf.writeline(
+                        "tiled_symbols=["
+                        + ", ".join(sympy_str(s) for s in op_spec.tiled_symbols)
+                        + "],"
+                    )
             buf.writeline("),")
         elif isinstance(op_spec, (UnimplementedOp, OpSpecUnimplementedOp)):
             if logger.isEnabledFor(logging.DEBUG):
@@ -748,6 +765,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 + "],"
                             )
                             buf.writeline(f"allocation={arg.allocation!r},")
+                            if arg.stride_map is not None:
+                                buf.writeline(f"stride_map={arg.stride_map!r},")
+                            if arg.per_tile_fixed:
+                                buf.writeline("per_tile_fixed=True,")
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")

@@ -79,6 +79,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("coarse_tile")
@@ -148,9 +149,12 @@ def insert_tiling_propagation(
     operations: list[Operation],
     groups: list[tuple],
 ) -> None:
-    """Insert full-sized buffers and copy/mutation ops for tiled Pointwise ops.
+    """Insert full-sized buffers and copy/mutation ops for tiled ops.
 
-    For each Pointwise ComputedBuffer in a tiling group, if its result is
+    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, matrix
+    multiply (batchmatmul) and tiled reduction dims raise RuntimeError.
+
+    For each eligible ComputedBuffer in a tiling group, if its result is
     consumed by any operation outside the loop (different loop_group_id or
     absent) or is a graph output, this pass ensures the outside consumer sees
     the complete result by one of two strategies:
@@ -173,16 +177,49 @@ def insert_tiling_propagation(
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
-            if not isinstance(op.data, Pointwise):
+            if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
             _propagate_tiled_op(op, operations)
+
+
+def _check_reduction_tiling_safety(op: ComputedBuffer) -> None:
+    """Raise RuntimeError for unsupported Reduction-in-loop configurations.
+
+    Two cases are rejected:
+    1. Matrix multiply (batchmatmul) inside a tiling loop — not supported.
+    2. Any tiled dim that falls in the reduction_ranges index range — the
+       accumulation-buffer logic for a tiled reduction dim is not yet
+       implemented.
+    """
+    data = op.data
+    assert isinstance(data, Reduction)
+
+    if data.reduction_type == BATCH_MATMUL_OP:
+        raise RuntimeError(
+            f"coarse_tile: matrix multiply op {op.get_name()!r} inside a "
+            "tiling loop is not supported."
+        )
+
+    n_output_dims = len(data.ranges)
+    loop_tiled_dims: list[list[int]] = getattr(op, "loop_tiled_dims", [])
+    for dims_list in loop_tiled_dims:
+        for d in dims_list:
+            if d >= n_output_dims:
+                raise RuntimeError(
+                    f"coarse_tile: reduction op {op.get_name()!r} has "
+                    f"tiled_dim={d} which falls in the reduction dimension "
+                    "(tiled reduction dims are not yet supported)."
+                )
 
 
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
 ) -> None:
-    """Handle buffer propagation for a single tiled Pointwise op."""
+    """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
+    if isinstance(op.data, Reduction):
+        _check_reduction_tiling_safety(op)
+
     loop_group_id = getattr(op, "loop_group_id", None)
     if loop_group_id is None:
         return
@@ -193,7 +230,13 @@ def _propagate_tiled_op(
     )
 
     if not outside_consumers and not is_graph_output:
-        return  # result is purely loop-internal; no fixup needed
+        # Loop-internal: the buffer is a per-tile scratch region reused every
+        # iteration.  Mark it so the unroller does not advance its base address.
+        from .ir import FixedTiledLayout
+
+        if isinstance(op.layout, FixedTiledLayout):
+            op.layout.per_tile_fixed = True
+        return
 
     # Reconstruct the original (pre-division) ranges.
     full_ranges = _compute_full_ranges(op)
