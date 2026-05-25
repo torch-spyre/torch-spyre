@@ -11,6 +11,8 @@ self-hosted-runner:
     - spyre_pf_x1
     - spyre_pf_x2
     - spyre_pf_x4
+    - spyre_pf_x8
+    - spyre_pf_x12
     - linux
     - image_torch_spyre
     - image_spyre_inference
