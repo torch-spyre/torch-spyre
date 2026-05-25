@@ -1893,6 +1893,39 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": ["1d1", "2d2", "3d3"],
         },
+        ("test_repeat_interleave", "test_repeat_interleave_cpu"): {
+            "param_sets": {
+                "1d_dim0_r2": (0, 2, cached_randn((128,))),
+                "1d_dim0_r3": (0, 3, cached_randn((64,))),
+                "2d_dim0_r2": (0, 2, cached_randn((4, 128))),
+                "3d_dim0_r2": (0, 2, cached_randn((3, 4, 128))),
+                "3d_dim1_r4": (1, 4, cached_randn((3, 4, 128))),
+                "4d_dim0_r2": (0, 2, cached_randn((2, 3, 4, 128))),
+                "4d_dim1_r4": (1, 4, cached_randn((2, 3, 4, 128))),
+                "4d_dim2_r2": (2, 2, cached_randn((2, 3, 4, 64))),
+                "2d_dim1_r3": (1, 3, cached_randn((4, 128))),
+                "3d_dim2_r2": (2, 2, cached_randn((3, 4, 128))),
+                "4d_dim3_r2": (3, 2, cached_randn((2, 3, 4, 64))),
+            },
+        },
+        (
+            "test_repeat_interleave_tensor",
+            "test_repeat_interleave_tensor_cpu",
+        ): {
+            "param_sets": {
+                "uniform": (torch.tensor([2, 2, 2], dtype=torch.int64), 6),
+                "variable": (torch.tensor([2, 3, 1], dtype=torch.int64), 6),
+                "single": (torch.tensor([5], dtype=torch.int64), 5),
+                "with_zeros": (
+                    torch.tensor([0, 3, 0, 2], dtype=torch.int64),
+                    5,
+                ),
+                "larger": (
+                    torch.tensor([4, 1, 3, 2, 5], dtype=torch.int64),
+                    15,
+                ),
+            },
+        },
         ("test_attention", "test_attention_cpu"): {
             "param_sets": {
                 "3d": (
@@ -4322,6 +4355,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.full(*args, dtype=torch.float16, device=device)
 
         self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
+
+    def test_repeat_interleave_cpu(self, dim, repeats, x):
+        def fn(x):
+            return x.repeat_interleave(repeats, dim=dim)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_repeat_interleave_tensor_cpu(self, counts, output_size):
+        def fn(c):
+            return torch.repeat_interleave(c, output_size=output_size)
+
+        self.compare_with_cpu(fn, counts, run_eager=False, atol=0, rtol=0)
 
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):

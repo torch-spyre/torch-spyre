@@ -746,6 +746,69 @@ def pad_decomp(
     return output
 
 
+@register_spyre_decomposition([torch.ops.aten.repeat_interleave.Tensor])
+def repeat_interleave_tensor_decomp(
+    repeat: torch.Tensor,
+    output_size: Optional[int] = None,
+) -> torch.Tensor:
+    if output_size is None:
+        output_size = int(repeat.sum().item())
+
+    assert repeat.ndim == 1
+    assert repeat.dtype in [torch.int32, torch.int64]
+
+    cumsum = repeat.cumsum(0)
+    pos = torch.arange(output_size, device=repeat.device, dtype=repeat.dtype)
+    indices = (pos.unsqueeze(1) >= cumsum.unsqueeze(0)).sum(dim=1)
+    return torch.clamp(indices, max=repeat.size(0) - 1)
+
+
+@register_spyre_decomposition([torch.ops.aten.repeat_interleave.self_int])
+def repeat_interleave_self_int_decomp(
+    input: torch.Tensor,
+    repeats: int,
+    dim: Optional[int] = None,
+    *,
+    output_size: Optional[int] = None,
+) -> torch.Tensor:
+    if dim is None:
+        input = input.flatten()
+        d = 0
+    else:
+        d = dim if dim >= 0 else dim + input.dim()
+
+    if d == input.dim() - 1:
+        # Last dim is the stick dim on Spyre.  The upstream expand path
+        # creates a stride-0 view inside sticks that the compiler can't
+        # restickify.  Work around by moving the repeat target off the
+        # stick position with a transpose, using overwrite_f, then
+        # restoring the original dim order.
+        if input.dim() == 1:
+            # [n] → [1,n] so expand targets dim 0 (not the stick dim).
+            # transpose + contiguous then rearranges into interleaved order.
+            n = input.shape[0]
+            expanded = input.unsqueeze(0).expand(repeats, n).clone()
+            return expanded.transpose(0, 1).contiguous().flatten()
+
+        swapped = input.transpose(d, d - 1).contiguous()
+        new_d = d - 1
+        src = swapped.unsqueeze(new_d + 1)
+        interleaved_shape = list(src.shape)
+        interleaved_shape[new_d + 1] = repeats
+        out = src.new_empty(interleaved_shape)
+        for i in range(repeats):
+            out = torch.ops.spyre.overwrite_f(
+                input=src, output=out, dims=[new_d + 1], offsets=[i]
+            )
+        result_shape_swapped = list(swapped.shape)
+        result_shape_swapped[new_d] = swapped.shape[new_d] * repeats
+        return out.view(result_shape_swapped).transpose(d, d - 1)
+
+    expand_shape = list(input.shape)
+    expand_shape.insert(d + 1, repeats)
+    return input.unsqueeze(d + 1).expand(expand_shape).clone().flatten(d, d + 1)
+
+
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
 def bitwise_not(input: torch.Tensor) -> torch.Tensor:
     if input.dtype is torch.bool:
