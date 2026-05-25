@@ -797,10 +797,66 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             if is_xfail:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
+
+                    def _make_xfail_wrapper(fn, strict):
+                        # Factory function to capture fn and strict per-method.
+                        # Without this, all closures in the loop would share the
+                        # last values of existing_fn and is_strict.
+                        def _xfail_wrapper(self, *args, **kwargs):
+                            try:
+                                fn(self, *args, **kwargs)
+                            except BaseException as e:
+                                if isinstance(e, pytest.skip.Exception):
+                                    # pytest.skip() raised inside the test body (or by
+                                    # PyTorch's test_wrapper infrastructure) is caught by
+                                    # the unittest runner and reported as SKIPPED, completely
+                                    # bypassing the xfail mark. Convert it to AssertionError
+                                    # so the xfail mark sees a real failure instead.
+                                    raise AssertionError(
+                                        f"xfail: converted skip to failure: {e}"
+                                    ) from e
+                                # All other exceptions (TypeError, RuntimeError, etc.)
+                                # propagate normally -- the xfail mark and our
+                                # pytest_runtest_makereport hook will rewrite them to XFAIL.
+                                raise
+
+                        # Copy essential identity attributes so pytest can identify the
+                        # test correctly in output and error messages.
+                        _xfail_wrapper.__name__ = fn.__name__
+                        _xfail_wrapper.__qualname__ = getattr(
+                            fn, "__qualname__", fn.__name__
+                        )
+                        _xfail_wrapper.__doc__ = fn.__doc__
+
+                        # Carry forward any existing marks (op__, dtype__, model__ tags)
+                        # and append the xfail mark. pytest_runtest_makereport in conftest.py
+                        # reads this to rewrite SKIPPED/FAILED -> XFAIL and PASSED -> XPASS,
+                        # since the unittest runner ignores pytest.mark.xfail on TestCase methods.
+                        existing_marks = list(getattr(fn, "pytestmark", []))
+                        _xfail_wrapper.pytestmark = existing_marks + [
+                            pytest.mark.xfail(strict=strict).mark
+                        ]
+                        # Copy per-variant tags onto wrapper so the hook can find them
+                        # via fn._spyre_method_tags / fn._oot_method_tags when resolving
+                        # tags for XFAIL/XPASS report lines.
+                        _xfail_wrapper._spyre_method_tags = getattr(
+                            fn, "_spyre_method_tags", []
+                        )
+                        _xfail_wrapper._oot_method_tags = getattr(
+                            fn, "_oot_method_tags", []
+                        )
+
+                        # Defensively remove __wrapped__ in case it was somehow inherited.
+                        # pytest walks __wrapped__ chains to resolve item.obj at collection
+                        # time — if present it would resolve to the original function,
+                        # losing our pytestmark.
+                        if hasattr(_xfail_wrapper, "__wrapped__"):
+                            del _xfail_wrapper.__wrapped__
+
+                        return _xfail_wrapper
+
                     setattr(
-                        cls,
-                        method_name,
-                        pytest.mark.xfail(strict=is_strict)(existing_fn),
+                        cls, method_name, _make_xfail_wrapper(existing_fn, is_strict)
                     )
 
         # Flush {method_name: [tags]} to sidecar for _XML_INJECT_PY.

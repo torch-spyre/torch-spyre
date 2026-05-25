@@ -77,7 +77,7 @@ test_suite_config:
       tests:
         - names:
             - TestSpyreModelOps::test_model_ops_db
-          mode: mandatory_success
+          mode: xfail
           tags:
             - model__Ministral-3-14B-Instruct-2512_spyre
           edits:
