@@ -38,11 +38,13 @@ POINTWISE_UNARY_OPS_DICT = {
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "sign": torch.sign,
     "sin": torch.sin,
     "tanh": torch.tanh,
 }
 
 POINTWISE_UNARY_OPS_FP32_DICT = {
+    "ceil": torch.ceil,
     "floor": torch.floor,
 }
 
@@ -3526,6 +3528,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randn(B, S, H, D, dtype=torch.float16) * 0.01
         y = torch.randn(H * D, H * D, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
+    def test_matmul_1d_view_x(self):
+        # x is a 1D buffer viewed as 2D: inductor keeps the 1D buffer and uses
+        # a compound index, so reduction var must be found via symbol-set arithmetic.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x.view(A, B) @ y
+
+        x = torch.rand(A * B, dtype=torch.float16) * 0.01
+        y = torch.rand(B, C, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
+    def test_matmul_1d_view_y(self):
+        # y is a 1D buffer viewed as 2D: same compound-index case but on y.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x @ y.view(B, C)
+
+        x = torch.rand(A, B, dtype=torch.float16) * 0.01
+        y = torch.rand(B * C, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
+    def test_matmul_1d_view_xy(self):
+        # Both x and y are 1D buffers viewed as 2D.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x.view(A, B) @ y.view(B, C)
+
+        x = torch.rand(A * B, dtype=torch.float16) * 0.01
+        y = torch.rand(B * C, dtype=torch.float16) * 0.01
         self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")

@@ -19,7 +19,7 @@ import pytest
 
 
 import shared_config
-from spyre_test_utilities import _RUNTIME_TAGS
+from oot_test_utilities import _RUNTIME_TAGS
 
 
 # Attaches per-test tags to the pytest report object after each test call.
@@ -389,6 +389,26 @@ def pytest_collection_modifyitems(config, items):
     if deselect:
         config.hook.pytest_deselected(items=deselect)
         items[:] = keep
+
+
+def pytest_report_teststatus(report, config):
+    if report.when != "call":
+        return
+
+    tags = getattr(report, "_spyre_tags", [])
+    if len(tags) > 0:
+        tags_str = " ".join(map(str, tags))
+        tags_msg = f" [TAGS = {tags_str}]"
+    else:
+        tags_msg = ""
+
+    if report.failed:
+        return "failed", "F", f"FAILED{tags_msg}"
+    if report.passed:
+        return "passed", ".", f"PASSED{tags_msg}"
+    if report.skipped:
+        return "skipped", "s", "SKIPPED"
+    return None
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

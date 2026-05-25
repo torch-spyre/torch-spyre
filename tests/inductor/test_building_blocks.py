@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import unittest
 import torch
 import torch.nn as nn
@@ -154,3 +155,58 @@ class TestBuildingBlocks(unittest.TestCase):
 
         # Compare with cpu implementation
         compare_with_cpu(rms_norm, *args, cpu_compile=True)
+
+    def test_flash_attention(self):
+        B, H, L, D = 1, 8, 256, 64
+        block_size = 128
+
+        Q = torch.randn(B, H, L, D, dtype=torch.float16)
+        K = torch.randn(B, H, L, D, dtype=torch.float16)
+        V = torch.randn(B, H, L, D, dtype=torch.float16)
+
+        def flash(Q, K, V, block_size):
+            output = torch.zeros_like(Q)
+            M = torch.full(
+                (B, H, L), float("-inf"), device=Q.device, dtype=torch.float16
+            )
+            denominator = torch.zeros((B, H, L), device=Q.device, dtype=torch.float16)
+            scale = 1.0 / math.sqrt(D)
+
+            for start in range(0, L, block_size):
+                end = start + block_size
+                K_block = K[:, :, start:end, :]
+                V_block = V[:, :, start:end, :]
+                K_block_T = K_block.transpose(-1, -2).contiguous()
+
+                scores = torch.matmul(Q, K_block_T) * scale  # B, H, L, Block
+                scores = scores.transpose(-1, -2).contiguous()  # avoid stick reduction
+                block_max = torch.amax(scores, dim=-2)
+                max_running = torch.maximum(M, block_max)
+
+                exp_scores = torch.exp(
+                    scores - max_running.unsqueeze(-2)
+                )  # B, H, Block, L
+                correction = torch.exp(M - max_running)
+
+                denominator = denominator * correction + exp_scores.sum(dim=-2)
+                output = output * correction.unsqueeze(-1) + torch.bmm(
+                    exp_scores.transpose(-1, -2).flatten(0, 1), V_block.flatten(0, 1)
+                ).unflatten(0, (B, H))
+
+                M = max_running
+
+            return output / denominator.unsqueeze(-1)
+
+        def sdpa_ref(Q, K, V, block_size):
+            return F.scaled_dot_product_attention(Q, K, V)
+
+        compare_with_pytorch(
+            flash,
+            sdpa_ref,
+            Q,
+            K,
+            V,
+            block_size,
+            atol=0.1,
+            rtol=0.1,
+        )

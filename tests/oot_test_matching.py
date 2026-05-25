@@ -1,5 +1,7 @@
 """
-Dtype helpers and MatchSet for the Spyre PyTorch test framework.
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
+
+Dtype helpers and MatchSet for the OOT PyTorch test framework.
 
 Responsibilities:
   - parse_dtype / extract_dtype_from_name
@@ -12,7 +14,7 @@ from typing import Dict, Optional, Set
 import regex as re
 import torch
 
-from spyre_test_constants import DTYPE_STR_MAP, DTYPE_NAMES_ORDERED
+from oot_test_constants import DTYPE_STR_MAP, DTYPE_NAMES_ORDERED
 
 
 # ----------------

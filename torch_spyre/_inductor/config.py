@@ -18,6 +18,7 @@ import sys
 from torch.utils._config_module import install_config_module
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "0") == "1"
+chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
