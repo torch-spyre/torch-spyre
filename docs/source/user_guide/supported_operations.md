@@ -36,22 +36,27 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.rsqrt` | Y | Y | Spyre | |
 | `torch.reciprocal` | Y | Y | Spyre | |
 | `torch.tanh` | Y | Y | Spyre | |
+| `torch.floor` | Y | Y | Spyre | |
+| `torch.ceil` | | Y | Spyre | Custom decomposition |
+| `torch.sign` | | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
-| `torch.clamp` | | Y | Spyre | Custom op + lowering |
+| `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
 | `torch.pow` | Y | Y | Spyre | |
+| `torch.nn.functional.mish` | Y | Y | Spyre | Eager via `aten.mish.out` |
 | **Pointwise Binary** | | | | |
 | `torch.add` | Y | Y | Spyre | |
 | `torch.sub` | Y | Y | Spyre | |
 | `torch.mul` | Y | Y | Spyre | |
 | `torch.div` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
+| `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | | Y | Spyre | Custom decomposition |
 | `torch.where` | | Y | Spyre | Compiled only |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
-| `torch.ne` | | Y | Spyre | |
-| `torch.gt` | | Y | Spyre | |
+| `torch.ne` | Y | Y | Spyre | |
+| `torch.gt` | Y | Y | Spyre | |
 | `torch.lt` | Y | Y | Spyre | |
 | `torch.ge` | Y | Y | Spyre | |
 | `torch.le` | | Y | Spyre | |
@@ -60,7 +65,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.mean` | Y | Y | Spyre | |
 | `torch.amax` | | Y | Spyre | Compiled only (no eager dispatch) |
 | `torch.amin` | | Y | Spyre | Compiled only (no eager dispatch) |
-| `torch.max` | | Y | Spyre | Compiled only (no eager dispatch) |
+| `torch.max` | | Y | Spyre | Compiled only; `max.dim` via custom decomposition |
+| `torch.min` | | Y | Spyre | Compiled only; `min.dim` via custom decomposition (fp16) |
+| `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
 | `torch.linalg.vector_norm` | Y | | Spyre | Eager only; compiled support not validated |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` lowering |
@@ -71,6 +78,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.contiguous` | | Y | Spyre | Compiled only |
 | `torch.squeeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
 | `torch.unsqueeze` | | Y | Spyre | Partial; some shapes trigger internal recompile |
+| `torch.flatten` | | Y | Spyre | Compiled only (lowers via `reshape`) |
 | `torch.cat` | Y | Y | Spyre | |
 | `torch.stack` | Y | | Spyre | Eager only |
 | `torch.repeat` | Y | | Spyre | Eager only |
@@ -96,6 +104,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.bitwise_xor` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.bitwise_or` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 
 > **Column key:**
