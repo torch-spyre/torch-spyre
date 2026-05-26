@@ -111,16 +111,16 @@ def generate_bundle(
     if use_symbols is None:
         use_symbols = _spyre_config.bundle_hbm_symbols
 
-    specs_list: list = (
-        unroll_loop_specs(list(specs)) if not use_symbols else list(specs)
-    )
-
-    if not use_symbols and _contains_tiled_loop_spec(specs_list):
+    if not use_symbols and _contains_tiled_loop_spec(list(specs)):
         raise RuntimeError(
             "bundle_hbm_symbols must be True when the spec tree contains tiled ops "
             "inside a LoopSpec.  Set BUNDLE_HBM_SYMBOLS=1 or "
             "config.bundle_hbm_symbols=True."
         )
+
+    specs_list: list = (
+        unroll_loop_specs(list(specs)) if not use_symbols else list(specs)
+    )
 
     # -----------------------------------------------------------------------
     # Pass 1: compile all OpSpecs depth-first.

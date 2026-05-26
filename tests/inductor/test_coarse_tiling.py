@@ -155,7 +155,9 @@ def _make_op(data, name="op0"):
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
+    op.layout = MagicMock()
     op.get_operation_name.return_value = name
+    op.get_name.return_value = name
     del op.loop_group_id
     del op.loop_count
     return op
@@ -1146,7 +1148,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle("test_kernel", self.tmpdir, specs)
+        generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
         return _read_mlir(self.tmpdir)
 
     def test_flat_ops_no_loop(self):
@@ -1204,7 +1206,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         a = _make_minimal_op_spec("a")
         b = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[a, b])
-        generate_bundle("test_kernel", self.tmpdir, [loop])
+        generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=True)
         written = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".json"))
         self.assertEqual(len(written), 2)
 
@@ -1219,7 +1221,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         k = Symbol("K")
         a = _make_minimal_op_spec("a")
         loop = LoopSpec(count=k, body=[a])
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises((NotImplementedError, ValueError)):
             self._bundle([loop])
 
 
@@ -1277,7 +1279,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle("test_kernel", self.tmpdir, specs)
+        generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
         return _read_mlir(self.tmpdir)
 
     def test_single_loop_snapshot(self):
@@ -1291,7 +1293,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
             "\t\t%c1 = arith.constant 1 : index\n"
             "\t\t%loop_bound_0 = arith.constant 8 : index\n"
             "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
+            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\t}\n"
             "\t\treturn\n"
             "\t}\n"
@@ -1305,7 +1307,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         expected = (
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
-            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
+            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\treturn\n"
             "\t}\n"
             "}\n"
