@@ -1225,13 +1225,13 @@ class TestGenerateBundleMlir(unittest.TestCase):
 
 class TestFindUnimplemented(unittest.TestCase):
     def test_no_unimplemented(self):
-        from torch_spyre.execution.async_compile import _find_unimplemented
+        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
 
         a = _make_minimal_op_spec("a")
         self.assertIsNone(_find_unimplemented([a]))
 
     def test_flat_unimplemented(self):
-        from torch_spyre.execution.async_compile import _find_unimplemented
+        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
         a = _make_minimal_op_spec("a")
@@ -1239,7 +1239,7 @@ class TestFindUnimplemented(unittest.TestCase):
         self.assertIs(result, unimp)
 
     def test_unimplemented_inside_loop(self):
-        from torch_spyre.execution.async_compile import _find_unimplemented
+        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
         loop = LoopSpec(count=Integer(4), body=[unimp])
@@ -1247,7 +1247,7 @@ class TestFindUnimplemented(unittest.TestCase):
         self.assertIs(result, unimp)
 
     def test_unimplemented_in_nested_loop(self):
-        from torch_spyre.execution.async_compile import _find_unimplemented
+        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
         inner = LoopSpec(count=Integer(2), body=[unimp])
@@ -1256,7 +1256,7 @@ class TestFindUnimplemented(unittest.TestCase):
         self.assertIs(result, unimp)
 
     def test_returns_first_found(self):
-        from torch_spyre.execution.async_compile import _find_unimplemented
+        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
 
         u1 = UnimplementedOp(op="first")
         u2 = UnimplementedOp(op="second")

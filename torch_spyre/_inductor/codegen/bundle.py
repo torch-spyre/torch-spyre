@@ -22,7 +22,7 @@ import sympy
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.codegen.unroll import unroll_loop_specs
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, UnimplementedOp
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
@@ -44,6 +44,18 @@ _CompiledEntry = tuple[Any, list[int], list[dict]]
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+
+def _find_unimplemented(specs: list) -> UnimplementedOp | None:
+    """Return the first UnimplementedOp in specs (recursing into LoopSpec), or None."""
+    for entry in specs:
+        if isinstance(entry, UnimplementedOp):
+            return entry
+        if isinstance(entry, LoopSpec):
+            found = _find_unimplemented(entry.body)
+            if found is not None:
+                return found
+    return None
 
 
 def _contains_tiled_loop_spec(specs: list) -> bool:

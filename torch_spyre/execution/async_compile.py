@@ -21,7 +21,7 @@ import subprocess
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, UnimplementedOp
-from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.codegen.bundle import _find_unimplemented, generate_bundle
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -41,12 +41,12 @@ class SpyreAsyncCompile:
     def sdsc(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
     ):
-        unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
-        if len(unimp) != 0:
+        unimp = _find_unimplemented(list(specs))
+        if unimp is not None:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp[0].op} to runtime exception"
+                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
             )
-            return SpyreUnimplementedRunner(kernel_name, unimp[0].op)
+            return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
