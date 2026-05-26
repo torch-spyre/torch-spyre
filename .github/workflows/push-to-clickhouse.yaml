@@ -7,6 +7,7 @@ on:
     workflows:
       - model-module-tests
       - upstream-pytorch-tests
+      - model-ops-tests
       # to add more workflows
     types: [completed]
   workflow_dispatch:
@@ -16,7 +17,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (model-module-tests | upstream-tests)
+        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests )
         required: false
         default: upstream-pytorch-tests
 
@@ -60,8 +61,15 @@ jobs:
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       TRIGGERING_AT: ${{ github.event.workflow_run.created_at || '' }}
+      TRIGGERING_PR: ${{ github.event.workflow_run.pull_requests[0].number || '' }}
 
     steps:
+      - name: Debug env
+        run: |
+          echo "TRIGGERING_PR=${TRIGGERING_PR}"
+          echo "All TRIGGERING_* vars:"
+          env | grep TRIGGERING_
+
       - name: Checkout (for the ingest script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -75,6 +83,16 @@ jobs:
 
       - name: Install Python dependencies
         run: pip install requests clickhouse-driver lxml
+
+      - name: Resolve PR number
+        id: resolve-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=$(gh api \
+            "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
+            --jq '.[0].number // 0')
+          echo "pr_number=${PR}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------------
       # Download all XML artifacts produced by the triggering run.
@@ -132,7 +150,8 @@ jobs:
             --branch   "${TRIGGERING_BRANCH}" \
             --sha      "${TRIGGERING_SHA}" \
             --run-id   "${TRIGGERING_RUN_ID}" \
-            --triggered-at "${TRIGGERING_AT}"
+            --triggered-at "${TRIGGERING_AT}" \
+            --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}"
         env:
           CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
           CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
@@ -150,6 +169,8 @@ jobs:
             echo "|---|---|"
             echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
             echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
+            echo "| PR number           | ${{ steps.resolve-pr.outputs.pr_number }} |"
+            echo "| PR number(from env) | ${TRIGGERING_PR} |"
             echo "| Branch              | ${TRIGGERING_BRANCH} |"
             echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
             echo "| XML files ingested  | ${XML_COUNT} |"

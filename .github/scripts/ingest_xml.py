@@ -10,7 +10,8 @@ Usage (called by the GHA workflow):
         --branch   "main" \
         --sha      "abcdef1234..." \
         --run-id   "12345678" \
-        --triggered-at "2026-04-25T14:20:45Z"
+        --triggered-at "2026-04-25T14:20:45Z" \
+        --pr-number 2271
 """
 
 import argparse
@@ -249,7 +250,7 @@ def insert_run(client, run_id: str, run: dict, args):
         """
         INSERT INTO test_runs
             (run_id, workflow, suite_name, filename, branch, commit_sha,
-             gha_run_id, triggered_at, total_tests, passed, failed,
+             pr_number, gha_run_id, triggered_at, total_tests, passed, failed,
              skipped, xfail, errors, xpass, duration_s)
         VALUES
         """,
@@ -261,6 +262,7 @@ def insert_run(client, run_id: str, run: dict, args):
                 "filename": run["filename"],
                 "branch": args.branch,
                 "commit_sha": (args.sha or "").ljust(40)[:40],
+                "pr_number": int(args.pr_number) if args.pr_number.strip() else 0,
                 "gha_run_id": int(args.run_id or 0),
                 "triggered_at": run["triggered_at"].replace(tzinfo=None),
                 "total_tests": run["total_tests"],
@@ -328,6 +330,7 @@ def main():
     parser.add_argument("--sha", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--triggered-at", default="")
+    parser.add_argument("--pr-number", default="")
     args = parser.parse_args()
 
     xml_dir = Path(args.xml_dir)
