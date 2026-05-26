@@ -27,7 +27,7 @@ jobs:
   # Job 1: changes
   #
   # Runs on every PR. Uses gh CLI to fetch the full list of changed files
-  # and checks if any file outside tests/docs/ or docs/ was modified.
+  # and checks if any file outside tests/docs/, docs/, or README.md was modified.
   #
   # code_changed=true  --> non-doc files changed  --> run tests
   # code_changed=false --> only doc files changed --> skip tests
@@ -59,8 +59,8 @@ jobs:
           echo "$FILES"
 
           # Check if any changed file is outside the doc directories.
-          # tests/docs/ and docs/ are the only paths that should skip tests.
-          NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' || true)
+          # tests/docs/, docs/, and README.md are the only paths that should skip tests.
+          NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' | grep -v '^README\.md$' || true)
 
           if [[ -z "$NON_DOC" ]]; then
             echo "Only doc files changed — skipping tests."
@@ -306,7 +306,7 @@ jobs:
     if: always()
     steps:
       - name: Evaluate test results
-        run: |
+        run: |-
           TEST_RESULT="${{ needs.test.result }}"
           TEST_MULTI_SPYRE_RESULT="${{ needs.test_multi_spyre.result }}"
           echo "Test job result: ${TEST_RESULT}"

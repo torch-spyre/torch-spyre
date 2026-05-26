@@ -7,11 +7,13 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
   pull_request:
     branches: [main]
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
   merge_group:
     types: [checks_requested]
 
@@ -77,6 +79,8 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:

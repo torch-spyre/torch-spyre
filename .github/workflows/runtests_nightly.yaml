@@ -50,6 +50,8 @@ jobs:
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
 
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
+
       - uses: ./.github/actions/gather-runner-info
 
       - uses: ./.github/actions/build-torch-spyre

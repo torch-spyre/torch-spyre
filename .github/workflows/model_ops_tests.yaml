@@ -7,6 +7,7 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
   # Removing from CICD till the ops tests get matured
   # pull_request:
   #   branches: [main]
@@ -99,6 +100,8 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
