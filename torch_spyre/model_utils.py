@@ -146,6 +146,8 @@ def load_model_to_spyre(
 
     Idempotent: parameters already on Spyre are skipped.
     """
+    # Ensure Spyre runtime is initialized before using _C functions
+    torch.empty(0, dtype=torch.float16, device=DEVICE_NAME)
     linear_count = 0
     other_param_count = 0
     buffer_count = 0
@@ -262,6 +264,18 @@ def patch_module_to_for_spyre() -> None:
         "optimization"
     )
 
+    # Plug optimized transfer into safetensors_patch (issue #400)
+    # so safe_open(device="spyre") also gets dim_order=[1,0] layout.
+    try:
+        from torch_spyre.safetensors_patch import set_tensor_to_spyre_fn
+
+        set_tensor_to_spyre_fn(_transfer_tensor_for_spyre)
+        logger.info(
+            "Plugged optimal dim_order layout into safetensors_patch"
+        )
+    except ImportError:
+        pass  # safetensors_patch not available; safe_open not patched
+
 
 # --- safetensors monkeypatch -----------------------------------------
 
@@ -301,6 +315,32 @@ def _transfer_state_dict_model_aware(
     return result
 
 
+def _transfer_tensor_for_spyre(
+    tensor: torch.Tensor,
+    key: str = "",
+) -> torch.Tensor:
+    """Transfer a single tensor to Spyre, choosing the right layout.
+
+    Uses the name-based heuristic: 2D tensors with "weight" in the key
+    (excluding embeddings, norms) get dim_order=[1,0]. Everything else
+    gets the default layout.
+
+    This function is plugged into safetensors_patch.py so that
+    safe_open(device="spyre") also gets the optimal layout.
+    """
+    is_likely_linear_weight = (
+        tensor.ndim == 2
+        and "weight" in key
+        and "embed" not in key
+        and "norm" not in key
+        and "layernorm" not in key
+        and "ln_" not in key
+    )
+    if is_likely_linear_weight:
+        return _dma_to_spyre_dim_order_swapped(tensor)
+    return _dma_to_spyre_default(tensor)
+
+
 def _transfer_tensors_heuristic(tensors):
     """Transfer state dict to Spyre using a name-based heuristic.
 
@@ -310,18 +350,7 @@ def _transfer_tensors_heuristic(tensors):
     """
     result = {}
     for key, tensor in tensors.items():
-        is_likely_linear_weight = (
-            tensor.ndim == 2
-            and "weight" in key
-            and "embed" not in key
-            and "norm" not in key
-            and "layernorm" not in key
-            and "ln_" not in key
-        )
-        if is_likely_linear_weight:
-            result[key] = _dma_to_spyre_dim_order_swapped(tensor)
-        else:
-            result[key] = _dma_to_spyre_default(tensor)
+        result[key] = _transfer_tensor_for_spyre(tensor, key)
     return result
 
 

@@ -280,6 +280,31 @@ def _autoload():
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()
+    # Patch safetensors to recognize spyre device (issue #400),
+    # and install optimal weight layout for .to("spyre") (issue #1339).
+    try:
+        from torch_spyre.safetensors_patch import patch_safetensors
+
+        patch_safetensors()
+    except Exception as e:
+        import warnings
+
+        warnings.warn(f"Failed to patch safetensors: {e}")
+
+    try:
+        from torch_spyre.model_utils import (
+            patch_module_to_for_spyre,
+            patch_safetensors_for_spyre,
+        )
+
+        patch_module_to_for_spyre()
+        patch_safetensors_for_spyre()
+    except Exception as e:
+        import warnings
+
+        warnings.warn(f"Failed to install optimal weight layout patches: {e}")
+
+
 
     # Register the Spyre CCL distributed backend.
     # The creator function is a lazy proxy — _C is not imported until
