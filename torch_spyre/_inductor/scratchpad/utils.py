@@ -122,6 +122,19 @@ def _get_buffer_user_deps(
     return buf_user_deps
 
 
+def _op_num_cores(op: Operation) -> int:
+    """Cores implied by op.op_it_space_splits (defaults to 1 when unset).
+
+    `op_it_space_splits` is set conditionally by span_reduction_pass /
+    work_distribution; ops that don't get split (e.g. trivial pointwise
+    on a small output) leave the attribute unset. Match the existing
+    convention (pass_utils.py, work_division.py) and treat missing as
+    no-split → 1 core.
+    """
+    splits = getattr(op, "op_it_space_splits", ({}, {}))
+    return math.prod([s for p in splits for s in p.values()])
+
+
 def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
@@ -154,15 +167,13 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             else:
                 ref = analyzed[0][2]
                 same_core_div = all(view == ref for _, _, view, _ in analyzed[1:])
-            u0_split = users[0][0].op_it_space_splits
             num_cores = (
-                math.prod([s for p in u0_split for s in p.values()])
+                max(_op_num_cores(op) for op, _ in users)
                 if same_core_div
                 else -1
             )
         elif using_multicore:
-            u0_split = users[0][0].op_it_space_splits
-            num_cores = math.prod([s for p in u0_split for s in p.values()])
+            num_cores = _op_num_cores(users[0][0])
         else:
             num_cores = 1
         result[buf_name] = num_cores
