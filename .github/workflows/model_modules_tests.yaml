@@ -7,11 +7,13 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
   pull_request:
     branches: [main]
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
   merge_group:
     types: [checks_requested]
 
