@@ -27,6 +27,7 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -446,7 +447,11 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
   const c10::DeviceGuard device_guard(device);
 
   auto device_layout = SpyreTensorLayout(size.vec(), dtype);
-  size_t size_bytes = get_device_size_in_bytes(device_layout);
+  size_t device_size_bytes = get_device_size_in_bytes(device_layout);
+  int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
+                                      std::multiplies<int64_t>());
+  size_t cpu_size_bytes = cpu_numel * c10::elementSize(dtype);
+  size_t size_bytes = std::max(device_size_bytes, cpu_size_bytes);
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
@@ -490,7 +495,11 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
             ", dtype: ", dtype, ") to be mapped onto device ", device);
   auto device_layout = SpyreTensorLayout(size.vec(), stride.vec(), scalar_type,
                                          generic_stick_dim_order(size.size()));
-  size_t size_bytes = get_device_size_in_bytes(device_layout);
+  size_t device_size_bytes = get_device_size_in_bytes(device_layout);
+  int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
+                                      std::multiplies<int64_t>());
+  size_t cpu_size_bytes = cpu_numel * c10::elementSize(scalar_type);
+  size_t size_bytes = std::max(device_size_bytes, cpu_size_bytes);
 
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
       c10::StorageImpl::use_byte_size_t(), size_bytes,
@@ -523,7 +532,11 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   at::detail::check_size_nonnegative(size);
   c10::Device device =
       c10::impl::VirtualGuardImpl{c10::DeviceType::PrivateUse1}.getDevice();
-  size_t size_bytes = get_device_size_in_bytes(device_layout);
+  size_t device_size_bytes = get_device_size_in_bytes(device_layout);
+  int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
+                                      std::multiplies<int64_t>());
+  size_t cpu_size_bytes = cpu_numel * c10::elementSize(dtype);
+  size_t size_bytes = std::max(device_size_bytes, cpu_size_bytes);
   auto spyre_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
       c10::StorageImpl::use_byte_size_t(), size_bytes,
       &SpyreAllocator::instance(),
@@ -637,7 +650,11 @@ at::Tensor empty_with_layout(
               "Spyre backend does not support dtype ", dtype);
   const c10::DeviceGuard device_guard(device);
 
-  size_t size_bytes = get_device_size_in_bytes(device_layout);
+  size_t device_size_bytes = get_device_size_in_bytes(device_layout);
+  int64_t cpu_numel = std::accumulate(size.begin(), size.end(), 1LL,
+                                      std::multiplies<int64_t>());
+  size_t cpu_size_bytes = cpu_numel * c10::elementSize(dtype);
+  size_t size_bytes = std::max(device_size_bytes, cpu_size_bytes);
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(c10::make_intrusive<SpyreStorageImpl>(
