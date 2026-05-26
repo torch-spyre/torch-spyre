@@ -131,7 +131,7 @@ def _op_num_cores(op: Operation) -> int:
     convention (pass_utils.py, work_division.py) and treat missing as
     no-split → 1 core.
     """
-    splits = getattr(op, "op_it_space_splits", ({}, {}))
+    splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     return math.prod([s for p in splits for s in p.values()])
 
 
@@ -159,7 +159,8 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
                 for op, dep in users
             ]
             producer_partials = any(
-                flag for op, dep, _, flag in analyzed
+                flag
+                for op, dep, _, flag in analyzed
                 if dep in op.get_read_writes().writes
             )
             if producer_partials:
@@ -168,9 +169,7 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
                 ref = analyzed[0][2]
                 same_core_div = all(view == ref for _, _, view, _ in analyzed[1:])
             num_cores = (
-                max(_op_num_cores(op) for op, _ in users)
-                if same_core_div
-                else -1
+                max(_op_num_cores(op) for op, _ in users) if same_core_div else -1
             )
         elif using_multicore:
             num_cores = _op_num_cores(users[0][0])
