@@ -27,7 +27,7 @@ Covers six areas, each in its own class group:
   5. generate_bundle MLIR output: loop structure, affine maps, symbol constants
      (TestGenerateBundleMlir, TestFindUnimplemented,
       TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
-      TestGenerateBundleNestedTiling, TestGenerateBundleUseSymbolsGuard)
+      TestGenerateBundleNestedTiling, TestGenerateBundleUnrollPath)
   6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
      (TestCoarseTileBufferPropagation)
 
@@ -1526,17 +1526,9 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
         self.assertEqual(mlir, expected)
 
 
-class TestGenerateBundleUseSymbolsGuard(unittest.TestCase):
+class TestGenerateBundleUnrollPath(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-
-    def test_tiled_loop_without_use_symbols_raises(self):
-        s = Symbol("s")
-        op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
-        loop = LoopSpec(count=Integer(4), body=[op])
-        with self.assertRaises(RuntimeError):
-            generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=False)
 
     def test_non_tiled_loop_without_use_symbols_ok(self):
         with patch(

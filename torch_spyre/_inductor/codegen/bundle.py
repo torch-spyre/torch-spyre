@@ -58,27 +58,6 @@ def _find_unimplemented(specs: list) -> UnimplementedOp | None:
     return None
 
 
-def _contains_tiled_loop_spec(specs: list) -> bool:
-    """Return True if any OpSpec inside a LoopSpec has non-empty tiled_symbols."""
-    for entry in specs:
-        if isinstance(entry, LoopSpec):
-            if _any_tiled_op(entry.body):
-                return True
-        elif isinstance(entry, OpSpec):
-            continue
-    return False
-
-
-def _any_tiled_op(specs: list) -> bool:
-    """Return True if specs (possibly nested) contains an OpSpec with tiled_symbols."""
-    for entry in specs:
-        if isinstance(entry, OpSpec) and entry.tiled_symbols:
-            return True
-        if isinstance(entry, LoopSpec) and _any_tiled_op(entry.body):
-            return True
-    return False
-
-
 def generate_bundle(
     kernel_name: str,
     output_dir: str,
@@ -110,13 +89,6 @@ def generate_bundle(
     """
     if use_symbols is None:
         use_symbols = _spyre_config.bundle_hbm_symbols
-
-    if not use_symbols and _contains_tiled_loop_spec(list(specs)):
-        raise RuntimeError(
-            "bundle_hbm_symbols must be True when the spec tree contains tiled ops "
-            "inside a LoopSpec.  Set BUNDLE_HBM_SYMBOLS=1 or "
-            "config.bundle_hbm_symbols=True."
-        )
 
     specs_list: list = (
         unroll_loop_specs(list(specs)) if not use_symbols else list(specs)
