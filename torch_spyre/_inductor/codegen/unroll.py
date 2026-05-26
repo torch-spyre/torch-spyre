@@ -20,13 +20,13 @@ When ``bundle_hbm_symbols=False`` the backend compiler does not support
 into a flat list of ``OpSpec`` entries with concrete per-iteration addresses
 baked into each ``TensorArg.allocation``.
 
-Whether a tensor's address advances per iteration is determined by
+Whether a tensor's address advances per iteration is determined solely by
 ``TensorArg.per_tile_fixed`` (set by ``insert_tiling_propagation``'s use-def
-analysis) and the allocation type:
+analysis):
 
 - ``per_tile_fixed=True``: tile-local scratch reused every iteration — fixed.
-- ``lx``: scratchpad memory — always fixed.
-- ``hbm`` or ``pool`` with ``per_tile_fixed=False``: advances per iteration.
+- ``per_tile_fixed=False``: address advances per iteration regardless of
+  allocation type (hbm, pool, or lx).
 
 After unrolling, ``tiled_symbols`` is cleared on every copy so
 ``generate_bundle`` treats the ops as plain non-tiled entries.
@@ -49,8 +49,8 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 logger = get_inductor_logger("codegen.unroll")
 
 
-def _hbm_byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> int:
-    """Byte advance in HBM per loop iteration for a single TensorArg.
+def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> int:
+    """Byte advance per loop iteration for a single TensorArg.
 
     Computes the byte advance using:
         delta[d] = coord_d(sym=tile_range, others=0) - coord_d(sym=0, others=0)
@@ -60,7 +60,7 @@ def _hbm_byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int)
     layout's ``floor(c/64)`` and ``Mod(c, 64)`` expressions.
     """
     assert arg.stride_map is not None, (
-        "_hbm_byte_stride_for_arg: TensorArg has no stride_map — "
+        "_byte_stride_for_arg: TensorArg has no stride_map — "
         "all TensorArgs reaching the unroller must be constructed with stride_map"
     )
     all_syms: set = set()
@@ -137,13 +137,11 @@ def _arg_byte_strides_for_syms(
     """
     result: list[dict[Symbol, int]] = []
     for arg in op_spec.args:
-        # per_tile_fixed: buffer is a tile-local scratch region reused every
-        # iteration (determined by insert_tiling_propagation use-def analysis).
-        # lx: scratchpad memory — fixed address by definition.
-        if arg.per_tile_fixed or "lx" in arg.allocation:
-            result.append({})
-            continue
-        if "hbm" not in arg.allocation and "pool" not in arg.allocation:
+        # per_tile_fixed: buffer is a tile-local scratch reused every iteration
+        # (determined by insert_tiling_propagation use-def analysis) — fixed.
+        # All other args advance per iteration regardless of allocation type
+        # (hbm, pool, or lx).
+        if arg.per_tile_fixed:
             result.append({})
             continue
 
@@ -152,7 +150,7 @@ def _arg_byte_strides_for_syms(
             if tiled_sym not in op_spec.iteration_space:
                 continue
             tile_range = int(op_spec.iteration_space[tiled_sym][0])
-            stride = _hbm_byte_stride_for_arg(arg, tiled_sym, tile_range)
+            stride = _byte_stride_for_arg(arg, tiled_sym, tile_range)
             if stride != 0:
                 strides[tiled_sym] = stride
         result.append(strides)
@@ -217,7 +215,7 @@ def _unroll_one(loop: LoopSpec) -> list:
             strides_per_op.append([])
             tile_sizes_per_op.append([])
 
-    # --- Emit count copies, advancing HBM addresses per iteration. -------
+    # --- Emit count copies, advancing addresses per iteration. -----------
     result: list = []
     for i in range(count):
         for entry, arg_strides, tile_sizes in zip(
@@ -237,8 +235,11 @@ def _unroll_one(loop: LoopSpec) -> list:
                 )
                 if iter_offset:
                     arg.allocation = dict(arg.allocation)
-                    alloc_key = "pool" if "pool" in arg.allocation else "hbm"
-                    arg.allocation[alloc_key] += iter_offset
+                    # Advance whichever allocation key is present (hbm, pool, lx).
+                    for alloc_key in ("pool", "hbm", "lx"):
+                        if alloc_key in arg.allocation:
+                            arg.allocation[alloc_key] += iter_offset
+                            break
                 # Replace device_size with the tile dimensions so the SDSC
                 # does not generate a backGap relative to the full tensor.
                 if tile_size is not None:
@@ -258,14 +259,15 @@ def unroll_loop_specs(specs: list) -> list:
     """Fully unroll all LoopSpec nodes in specs, returning a flat spec list.
 
     Each ``LoopSpec(count=K, body=[...])`` is replaced by K copies of its
-    body.  For each HBM ``TensorArg`` the base address is advanced by the
-    per-arg, per-iteration byte offset derived from ``device_coordinates`` and
-    ``device_size`` — so args with different tile sizes or layouts each get
-    the correct independent advance.
+    body.  For each ``TensorArg`` with ``per_tile_fixed=False`` the base
+    address is advanced by the per-arg, per-iteration byte offset derived from
+    ``device_coordinates`` and ``stride_map`` — so args with different tile
+    sizes or layouts each get the correct independent advance regardless of
+    allocation type (hbm, pool, or lx).
 
-    LX tensors are left unchanged.  Pool (intermediate HBM) tensors are
-    advanced like HBM tensors.  ``tiled_symbols`` is cleared on every copy so
-    ``generate_bundle`` treats the ops as plain non-tiled entries.
+    ``per_tile_fixed=True`` args are left unchanged.  ``tiled_symbols`` is
+    cleared on every copy so ``generate_bundle`` treats the ops as plain
+    non-tiled entries.
 
     ``count`` must be a concrete integer expression; symbolic counts raise
     ``ValueError``.  Nested ``LoopSpec`` nodes are unrolled innermost-first.

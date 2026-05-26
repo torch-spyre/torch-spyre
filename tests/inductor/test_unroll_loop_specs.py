@@ -40,7 +40,7 @@ from sympy import Integer, Symbol
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.codegen.unroll import (
-    _hbm_byte_stride_for_arg,
+    _byte_stride_for_arg,
     unroll_loop_specs,
 )
 
@@ -79,6 +79,7 @@ def _make_hbm_tensor_arg(base: int = _HBM_BASE) -> TensorArg:
 
 
 def _make_lx_tensor_arg() -> TensorArg:
+    # per_tile_fixed=True: tile-local scratch reused every iteration.
     return TensorArg(
         is_input=False,
         arg_index=-1,
@@ -87,6 +88,7 @@ def _make_lx_tensor_arg() -> TensorArg:
         device_coordinates=_device_coords(),
         allocation={"lx": _LX_ADDR},
         stride_map=list(_STRIDE_MAP),
+        per_tile_fixed=True,
     )
 
 
@@ -155,7 +157,9 @@ class TestUnrollLoopSpecs(unittest.TestCase):
         self.assertEqual(addr1, _HBM_BASE + _STRIDE_BYTES)
 
     # ------------------------------------------------------------------
-    # 3. LX tensor address identical in all copies.
+    # 3. per_tile_fixed LX tensor address identical in all copies.
+    #    The lx arg has per_tile_fixed=True (tile-local scratch), so its
+    #    address must not advance regardless of allocation type.
     # ------------------------------------------------------------------
 
     def test_lx_tensor_unchanged(self):
@@ -220,18 +224,18 @@ class TestUnrollLoopSpecs(unittest.TestCase):
                     )
 
     # ------------------------------------------------------------------
-    # 8. _hbm_byte_stride_for_arg: tiling c_row (row dimension).
+    # 8. _byte_stride_for_arg: tiling c_row (row dimension).
     #    coord[1] = c_row; stride_map[1] = 256; tile_range = 512
     #    byte_stride = 512 * 256 * 2 = 262144
     # ------------------------------------------------------------------
 
-    def test_hbm_byte_stride_for_arg(self):
+    def test_byte_stride_for_arg(self):
         arg = _make_hbm_tensor_arg()
-        stride = _hbm_byte_stride_for_arg(arg, _C_ROW, _T_ROW)
+        stride = _byte_stride_for_arg(arg, _C_ROW, _T_ROW)
         self.assertEqual(stride, _STRIDE_BYTES)
 
     # ------------------------------------------------------------------
-    # 9. _hbm_byte_stride_for_arg: tiling c_col (column dimension).
+    # 9. _byte_stride_for_arg: tiling c_col (column dimension).
     #    coord[0] = c_col//64 (sticks_per_row), coord[2] = c_col%64 (within-stick).
     #    Advancing by T_COL=128 elements (2 sticks):
     #      delta[0] = 128//64 = 2; delta[2] = 128%64 = 0
@@ -242,7 +246,7 @@ class TestUnrollLoopSpecs(unittest.TestCase):
         arg = _make_hbm_tensor_arg()
         t_col = 128  # 2 sticks
         expected = (t_col // 64) * _STRIDE_MAP[0] * 2  # 2 * 64 * 2 = 256
-        self.assertEqual(_hbm_byte_stride_for_arg(arg, _C_COL, t_col), expected)
+        self.assertEqual(_byte_stride_for_arg(arg, _C_COL, t_col), expected)
 
     # ------------------------------------------------------------------
     # 10. Two HBM args with different tensor shapes advance independently.
