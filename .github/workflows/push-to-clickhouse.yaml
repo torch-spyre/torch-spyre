@@ -61,12 +61,11 @@ jobs:
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       TRIGGERING_AT: ${{ github.event.workflow_run.created_at || '' }}
-      TRIGGERING_PR: ${{ github.event.workflow_run.pull_requests[0].number || '' }}
+
 
     steps:
-      - name: Debug env
+      - name: Print TRIGERRING Envs
         run: |
-          echo "TRIGGERING_PR=${TRIGGERING_PR}"
           echo "All TRIGGERING_* vars:"
           env | grep TRIGGERING_
 
@@ -170,7 +169,6 @@ jobs:
             echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
             echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
             echo "| PR number           | ${{ steps.resolve-pr.outputs.pr_number }} |"
-            echo "| PR number(from env) | ${TRIGGERING_PR} |"
             echo "| Branch              | ${TRIGGERING_BRANCH} |"
             echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
             echo "| XML files ingested  | ${XML_COUNT} |"
