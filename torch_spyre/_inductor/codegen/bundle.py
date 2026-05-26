@@ -78,14 +78,11 @@ def generate_bundle(
 
     When ``use_symbols=False``, any ``LoopSpec`` entries are fully unrolled
     before bundle generation: each iteration becomes an independent ``OpSpec``
-    with concrete per-iteration HBM addresses.  ``LoopSpec`` entries that
-    contain tiled ops (``OpSpec.tiled_symbols`` is non-empty) and are passed
-    with ``use_symbols=False`` *without* going through the unroll path raise
-    ``RuntimeError`` — this guards against callers that set ``use_symbols=False``
-    explicitly on an already-tiled spec tree without intending to unroll.
+    with concrete per-iteration HBM addresses baked in.  Tiled ops (non-empty
+    ``OpSpec.tiled_symbols``) are supported on both paths.
 
-    Set ``use_symbols=True`` (or ``BUNDLE_HBM_SYMBOLS=1``) to enable the
-    symbol-indirection path required for coarse tiling.
+    Set ``use_symbols=True`` (or ``BUNDLE_HBM_SYMBOLS=1``) to emit ``scf.for``
+    loops with ``affine.apply`` symbol-indirection instead.
     """
     if use_symbols is None:
         use_symbols = _spyre_config.bundle_hbm_symbols
