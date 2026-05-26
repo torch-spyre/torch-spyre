@@ -140,23 +140,23 @@ jobs:
             config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
           - name: Inductor Ops Matmul
             config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
-            pytest_args: -k "test_addmm or test_mm_ or test_bmm or test_einsum or test_matmul or test_large_matmul or test_linear"
+            k_expr: test_addmm or test_mm_ or test_bmm or test_einsum or test_matmul or test_large_matmul or test_linear
           - name: Inductor Ops Reductions
             config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
-            pytest_args: -k "keepdim or test_reduce or test_max_default or test_topk or test_argmin or test_count_nonzero or test_logsumexp or test_nanmean
-              or test_nansum or test_all_dim or test_any_dim or test_prod_dim or test_std_ or test_var_ or test_cumprod or test_logcumsumexp or test_cummax
-              or test_cummin or test_quantile or test_nanquantile or test_median or test_nanmedian or test_mode_ or test_sum_eager or test_mean_eager or
-              test_max_eager or test_min_eager"
+            k_expr: keepdim or test_reduce or test_max_default or test_topk or test_argmin or test_count_nonzero or test_logsumexp or test_nanmean or test_nansum
+              or test_all_dim or test_any_dim or test_prod_dim or test_std_ or test_var_ or test_cumprod or test_logcumsumexp or test_cummax or test_cummin
+              or test_quantile or test_nanquantile or test_median or test_nanmedian or test_mode_ or test_sum_eager or test_mean_eager or test_max_eager
+              or test_min_eager
           - name: Inductor Ops Pointwise
             config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
-            pytest_args: -k "test_pointwise or test_sqrt or test_rsqrt or test_log_ or test_alias_operands or test_cmp or test_logical_not or test_bool"
+            k_expr: test_pointwise or test_sqrt or test_rsqrt or test_log_ or test_alias_operands or test_cmp or test_logical_not or test_bool
           - name: Inductor Ops Misc
             config: torch_spyre_tests/inductor/test_inductor_ops_config.yaml
-            pytest_args: -k "not (test_addmm or test_mm_ or test_bmm or test_einsum or test_matmul or test_large_matmul or test_linear) and not (keepdim
-              or test_reduce or test_max_default or test_topk or test_argmin or test_count_nonzero or test_logsumexp or test_nanmean or test_nansum or test_all_dim
-              or test_any_dim or test_prod_dim or test_std_ or test_var_ or test_cumprod or test_logcumsumexp or test_cummax or test_cummin or test_quantile
+            k_expr: not (test_addmm or test_mm_ or test_bmm or test_einsum or test_matmul or test_large_matmul or test_linear) and not (keepdim or test_reduce
+              or test_max_default or test_topk or test_argmin or test_count_nonzero or test_logsumexp or test_nanmean or test_nansum or test_all_dim or
+              test_any_dim or test_prod_dim or test_std_ or test_var_ or test_cumprod or test_logcumsumexp or test_cummax or test_cummin or test_quantile
               or test_nanquantile or test_median or test_nanmedian or test_mode_ or test_sum_eager or test_mean_eager or test_max_eager or test_min_eager)
-              and not (test_pointwise or test_sqrt or test_rsqrt or test_log_ or test_alias_operands or test_cmp or test_logical_not or test_bool)"
+              and not (test_pointwise or test_sqrt or test_rsqrt or test_log_ or test_alias_operands or test_cmp or test_logical_not or test_bool)
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar
@@ -210,7 +210,7 @@ jobs:
 
       - name: Run ${{ matrix.suite.name }} tests
         env:
-          SUITE_PYTEST_ARGS: ${{ matrix.suite.pytest_args || '' }}
+          SUITE_K_EXPR: ${{ matrix.suite.k_expr || '' }}
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -220,7 +220,11 @@ jobs:
           CONFIG="tests/configs/${{ matrix.suite.config }}"
 
           echo "Running ${{ matrix.suite.name }} tests..."
-          eval bash tests/run_test.sh "$CONFIG" -v --capture=sys $SUITE_PYTEST_ARGS
+          if [[ -n "$SUITE_K_EXPR" ]]; then
+            bash tests/run_test.sh "$CONFIG" -v --capture=sys -k "$SUITE_K_EXPR"
+          else
+            bash tests/run_test.sh "$CONFIG" -v --capture=sys
+          fi
           echo "${{ matrix.suite.name }} tests done"
 
   # ---------------------------------------------------------------------------
