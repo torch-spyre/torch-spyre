@@ -41,6 +41,7 @@ from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
+from .propagate_named_dims import propagate_named_dims
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -239,6 +240,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        propagate_named_dims(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
@@ -261,6 +263,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(dedup_and_promote_constants),
+            inspect.getfile(propagate_named_dims),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
