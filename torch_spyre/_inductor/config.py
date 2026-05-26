@@ -58,6 +58,9 @@ bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
 # When None and coarse_tiling is True, coarse_tile() is called with groups=[]
 # (a no-op useful for testing the pipeline without real group detection).
 # Must be a module-level named function (not a lambda) for Inductor cache pickling.
+# This is intended to be used for interim testing of the coarse-tiling transformation
+# until the working set reduction annotation framework is being developed.
+# It will be removed once the full-fledged annotation mechanism is available.
 coarse_tiling_groups_fn: Optional[Callable] = None
 
 install_config_module(sys.modules[__name__])
