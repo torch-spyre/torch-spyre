@@ -149,6 +149,20 @@ POINTWISE_TEST_FAILURES = [
     "test_fallback_1d",
     "test_fallback_2d",
     "test_fallback_3d",
+    # torch.flatten tests - Contiguous access pattern with span of 4 elements
+    # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
+    # support for partially-filled contiguous regions. See PR #1866.
+    "test_flatten_2d_full",
+    "test_flatten_3d_full",
+    "test_flatten_3d_mixed_dims",
+    "test_flatten_3d_neg_dims",
+    "test_flatten_3d_neg_full",
+    "test_flatten_3d_noncontig_full",
+    "test_flatten_3d_noncontig_partial",
+    "test_flatten_3d_trailing",
+    "test_flatten_4d_full",
+    "test_flatten_4d_large_full",
+    "test_flatten_4d_trailing",
     "test_full_value_1",
     "test_full_value_2",
     "test_large_matmul_matmul_3d_M3_K11_N2880",
@@ -297,6 +311,13 @@ REDUCTION_TEST_FAILURES = [
     "test_fallback_1d",
     "test_fallback_2d",
     "test_fallback_3d",
+    # torch.flatten tests - Contiguous access pattern with span of 4 elements
+    # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
+    # support for partially-filled contiguous regions. See PR #1866.
+    "test_flatten_3d_neg_dims",
+    "test_flatten_3d_noncontig_partial",
+    "test_flatten_3d_trailing",
+    "test_flatten_4d_trailing",
     "test_full_value_1",
     "test_full_value_2",
     "test_large_matmul_matmul_2d_M2048_K2048_N65536",

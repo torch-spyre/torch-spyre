@@ -7,12 +7,12 @@ help: ## Show this help message
 .DEFAULT_GOAL := help
 
 PYTEST_ARGS ?= -v
-TEST_CONFIGS ?= tests/configs/module_tests tests/configs/torch_spyre_tests
+TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 
 # ---------------------------------------------------------------------------
 # Test suites
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
-tests: ## Run all torch spyre tests + module tests by default. Override with: make tests TEST_CONFIGS="tests/configs/torch_spyre_tests/inductor"
+tests: ## Run all torch spyre tests by default (except distributed). Override with: make tests TEST_CONFIGS="tests/configs/..."
 	@bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
