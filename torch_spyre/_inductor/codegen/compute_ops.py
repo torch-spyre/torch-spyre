@@ -239,8 +239,7 @@ def generate_sdsc(
       ops inside ``scf.for`` loops.
 
     When ``use_symbols=False``, HBM tensor addresses are baked directly as
-    concrete integers into the SDSC JSON (mirroring the LX tensor path and
-    the main-branch behaviour).  No symbol IDs are registered and ``symbols``
+    concrete integers into the SDSC JSON.  No symbol IDs are registered and ``symbols``
     is not modified.  This is the default until backend symbol-table support
     is complete.
 
