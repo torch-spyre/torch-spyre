@@ -38,7 +38,6 @@ innermost-first, yielding K×M flat copies with correct combined addresses.
 from __future__ import annotations
 
 import copy
-import math
 
 import sympy
 from sympy import Symbol
@@ -53,40 +52,28 @@ logger = get_inductor_logger("codegen.unroll")
 def _hbm_byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> int:
     """Byte advance in HBM per loop iteration for a single TensorArg.
 
-    When ``arg.stride_map`` is available, computes the byte advance using:
+    Computes the byte advance using:
         delta[d] = coord_d(sym=tile_range, others=0) - coord_d(sym=0, others=0)
         byte_stride = dot(delta, stride_map) * bytes_per_elem
 
     This correctly handles non-linear device coordinates such as the stick
     layout's ``floor(c/64)`` and ``Mod(c, 64)`` expressions.
-
-    Falls back to the linear-coefficient approach when ``stride_map`` is None
-    (for backward compatibility with test code that constructs TensorArg
-    directly without a stride_map).
     """
-    if arg.stride_map is not None:
-        all_syms: set = set()
-        for expr in arg.device_coordinates:
-            all_syms |= expr.free_symbols
-        sub_zero = {s: 0 for s in all_syms}
-        sub_range = {**sub_zero, tiled_sym: tile_range}
-        total_elem_stride = 0
-        for d, coord_expr in enumerate(arg.device_coordinates):
-            at_range = int(coord_expr.subs(sub_range))
-            at_zero = int(coord_expr.subs(sub_zero))
-            total_elem_stride += (at_range - at_zero) * arg.stride_map[d]
-        return total_elem_stride * num_bytes(arg.device_dtype)
-
-    # Fallback: works for linear coordinates only.
+    assert arg.stride_map is not None, (
+        "_hbm_byte_stride_for_arg: TensorArg has no stride_map — "
+        "all TensorArgs reaching the unroller must be constructed with stride_map"
+    )
+    all_syms: set = set()
+    for expr in arg.device_coordinates:
+        all_syms |= expr.free_symbols
+    sub_zero = {s: 0 for s in all_syms}
+    sub_range = {**sub_zero, tiled_sym: tile_range}
     total_elem_stride = 0
-    ndim = len(arg.device_size)
     for d, coord_expr in enumerate(arg.device_coordinates):
-        coeff = coord_expr.coeff(tiled_sym)
-        if coeff == 0:
-            continue
-        elem_stride = math.prod(arg.device_size[d + 1 :]) if d + 1 < ndim else 1
-        total_elem_stride += int(coeff) * elem_stride
-    return total_elem_stride * tile_range * num_bytes(arg.device_dtype)
+        at_range = int(coord_expr.subs(sub_range))
+        at_zero = int(coord_expr.subs(sub_zero))
+        total_elem_stride += (at_range - at_zero) * arg.stride_map[d]
+    return total_elem_stride * num_bytes(arg.device_dtype)
 
 
 def _tile_device_size(
@@ -108,9 +95,10 @@ def _tile_device_size(
     column symbol appears in both the sticks-per-row coordinate and the
     within-stick coordinate, so it is excluded from this update.
     """
-    if arg.stride_map is None:
-        return list(arg.device_size)
-
+    assert arg.stride_map is not None, (
+        "_tile_device_size: TensorArg has no stride_map — "
+        "all TensorArgs reaching the unroller must be constructed with stride_map"
+    )
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
