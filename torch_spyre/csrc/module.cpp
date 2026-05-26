@@ -167,6 +167,12 @@ PYBIND11_MODULE(_C, m) {
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
+  py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
+      .value("STANDARD", spyre::ElementArrangement::STANDARD)
+      .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
+      .value("DL16_TO_FP8", spyre::ElementArrangement::DL16_TO_FP8)
+      .value("EXX2", spyre::ElementArrangement::EXX2);
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
@@ -255,12 +261,6 @@ PYBIND11_MODULE(_C, m) {
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
   m.def("reinterpret_tensor_with_layout",
         &spyre::reinterpret_tensor_with_layout);
-
-  py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
-      .value("STANDARD", spyre::ElementArrangement::STANDARD)
-      .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
-      .value("DL16_TO_FP8", spyre::ElementArrangement::DL16_TO_FP8)
-      .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
