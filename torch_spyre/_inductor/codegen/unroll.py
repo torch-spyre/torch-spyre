@@ -171,25 +171,20 @@ def _arg_byte_strides_for_syms(
     return result
 
 
-def _unroll_one(
-    loop: LoopSpec,
-    accumulated_offsets: list[int],
-) -> list:
+def _unroll_one(loop: LoopSpec) -> list:
     """Unroll a single LoopSpec node, returning flat OpSpec copies.
 
-    ``accumulated_offsets`` is a list of per-arg HBM byte offsets already
-    applied by outer loop iterations.  It is parallel to the args of each
-    OpSpec in the flattened body; outer loops pass their offsets inward so
-    nested strides accumulate correctly.
-
-    For a top-level call pass an empty list (``[]``); offsets are computed
-    lazily per op.
+    Nested ``LoopSpec`` nodes are unrolled innermost-first: inner loops are
+    fully flattened before the outer loop iterates over them.  Each level
+    independently computes per-iteration byte strides from its own
+    ``tiled_symbols`` and ``iteration_space``, so strides accumulate
+    correctly across nesting depths without explicit offset propagation.
     """
     # --- Recursively unroll any nested LoopSpecs in body first. ----------
     flat_body: list[OpSpec] = []
     for entry in loop.body:
         if isinstance(entry, LoopSpec):
-            flat_body.extend(_unroll_one(entry, accumulated_offsets=[]))
+            flat_body.extend(_unroll_one(entry))
         else:
             flat_body.append(entry)
 
@@ -290,7 +285,7 @@ def unroll_loop_specs(specs: list) -> list:
     result: list = []
     for entry in specs:
         if isinstance(entry, LoopSpec):
-            result.extend(_unroll_one(entry, accumulated_offsets=[]))
+            result.extend(_unroll_one(entry))
         else:
             result.append(entry)
     return result

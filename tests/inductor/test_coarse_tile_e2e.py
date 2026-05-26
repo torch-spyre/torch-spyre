@@ -372,7 +372,7 @@ class TestCoarseTileEndToEnd(InductorTestCase):
         "insert_tiling_propagation allocates a full-size output buffer via "
         "MutationLayoutSHOULDREMOVE, which causes core_div_mismatch in "
         "scratchpad_planning — the intermediate add buffer falls back to pool "
-        "instead of lx.  Skip until core_div_mismatch handling is fixed."
+        "instead of lx.  Tracked for a follow-up PR."
     )
     @config.patch(
         {
@@ -506,11 +506,8 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
     # ------------------------------------------------------------------
 
     @unittest.skip(
-        "Nested K=2×M=4 unrolling produces wrong results on device. Root cause: "
-        "the unroller's _tile_device_size fix (eliminating backGap.mb) generates "
-        "correct SDSC JSON in standalone runs, but a caching layer prevents the "
-        "updated kernel from reaching the hardware during pytest execution. "
-        "Unskip once the caching issue is resolved."
+        "Nested K=2×M=4 unrolling produces wrong results on device. "
+        "Tracked for a follow-up PR."
     )
     @config.patch(
         {
@@ -581,10 +578,8 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
     # ------------------------------------------------------------------
 
     @unittest.skip(
-        "device_size fix in unroll.py eliminates backGap.mb (correct) but the "
-        "nested-loop case still produces wrong results — the unroller's tile "
-        "device_size change is not reaching the hardware (caching issue under "
-        "investigation).  Kept as a regression probe; unskip once fixed."
+        "Nested K=2×M=2 unrolling produces wrong results on device. "
+        "Kept as a regression probe; tracked for a follow-up PR."
     )
     @config.patch(
         {

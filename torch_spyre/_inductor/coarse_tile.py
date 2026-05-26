@@ -236,6 +236,9 @@ def _propagate_tiled_op(
 
         if isinstance(op.layout, FixedTiledLayout):
             op.layout.per_tile_fixed = True
+        # Non-FixedTiledLayout buffers (e.g. MutationLayoutSHOULDREMOVE from a
+        # prior pass) are intentionally left unmarked — their addressing is
+        # handled by the layout type itself, not by the unroller.
         return
 
     # Reconstruct the original (pre-division) ranges.
@@ -284,7 +287,8 @@ def _reads_buffer(op: ComputedBuffer, buf_name: str) -> bool:
     """Return True if op reads buf_name."""
     try:
         rw = op.get_read_writes()
-    except Exception:
+    except Exception as e:
+        logger.debug("_reads_buffer: get_read_writes() raised for %s: %s", op.get_name(), e)
         return False
     return any(getattr(dep, "name", None) == buf_name for dep in rw.reads)
 
@@ -338,7 +342,8 @@ def _graph_output_names() -> set[str]:
     """Return the set of buffer names that appear in V.graph graph outputs."""
     try:
         return set(V.graph.get_output_names())
-    except Exception:
+    except Exception as e:
+        logger.debug("_graph_output_names: V.graph.get_output_names() raised: %s", e)
         return set()
 
 

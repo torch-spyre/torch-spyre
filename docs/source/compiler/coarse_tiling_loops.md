@@ -974,12 +974,10 @@ The filenames are assigned in depth-first traversal order.
 | `torch_spyre/_inductor/codegen/unroll.py` | Add `_tile_device_size` helper; apply tile-sized `device_size` and skip address advance for `per_tile_fixed` args during loop unrolling |
 | `torch_spyre/_inductor/wrapper.py` | Add `LoopSpec` to the generated wrapper's import line |
 | `torch_spyre/_inductor/codegen/bundle.py` | Extend `generate_bundle()` to walk `LoopSpec` tree and emit `scf.for` in `bundle.mlir`; number SDSC JSON files in depth-first order |
-| `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; `_find_unimplemented` recurses into `LoopSpec.body` |
-| `tests/inductor/test_coarse_tile_pass.py` | Unit tests for `coarse_tile()` IR pass (24 tests, including flat, per-group `tiled_dims`, and nested groups) |
-| `tests/inductor/test_bundle_loop.py` | Unit tests for `generate_bundle` with `LoopSpec` including MLIR snapshot tests and nested tiling (36 tests) |
-| `tests/inductor/test_counted_loop_node.py` | Unit tests for `build_loop_scheduler_nodes` (12 tests) |
-| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, per-group tiled dims (5 tests) |
-| `tests/inductor/test_sdsc_tiled_address.py` | Unit tests for `generate_sdsc` tiled address generation and `compile_op_spec` symbol mapping (14 tests) |
+| `torch_spyre/execution/async_compile.py` | `sdsc()` accepts `Sequence[OpSpec | UnimplementedOp | LoopSpec]`; delegates `_find_unimplemented` to `bundle.py` |
+| `tests/inductor/test_coarse_tiling.py` | Consolidated unit test suite: `LoopSpec`/`OpSpec` data structures, `coarse_tile()` IR pass, `insert_tiling_propagation`, `CountedLoopSchedulerNode`, `generate_sdsc`/`compile_op_spec` symbol paths, `generate_bundle` MLIR output and snapshot tests (104 tests) |
+| `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests: baseline, single group, softmax-shaped, two groups, per-group tiled dims, unrolled execution |
+| `tests/inductor/test_unroll_loop_specs.py` | Unit tests for `unroll_loop_specs`: address arithmetic, `per_tile_fixed` handling, nested loops, stride computation |
 
 ## Invariants and failure modes
 
