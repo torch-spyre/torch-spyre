@@ -288,7 +288,9 @@ def _reads_buffer(op: ComputedBuffer, buf_name: str) -> bool:
     try:
         rw = op.get_read_writes()
     except Exception as e:
-        logger.debug("_reads_buffer: get_read_writes() raised for %s: %s", op.get_name(), e)
+        logger.debug(
+            "_reads_buffer: get_read_writes() raised for %s: %s", op.get_name(), e
+        )
         return False
     return any(getattr(dep, "name", None) == buf_name for dep in rw.reads)
 
