@@ -364,19 +364,11 @@ def _matmul_layouts(
     y = args[1]
 
     # Hardware stick constraints (DF16):
-<<<<<<< HEAD
     #   Input1 (x): stick on reduction_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = _find_reduction_var(x.dep, output_dep, data.reduction_type)
     generated_var = _find_matmul_generated_var(y.dep, x.dep, output_dep)
-=======
-    #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
-    #   Input2 (y): stick on generated_dim (the y coord that appears in output)
-    #   Output:     stick on generated_dim
-    reduction_coord = _find_reduction_coord(x_coords, out_coords)
-    generated_coord = _matmul_generated_coord(y_coords, x_coords, out_coords)
->>>>>>> c36a2a1 (Convert prints to logging)
 
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
