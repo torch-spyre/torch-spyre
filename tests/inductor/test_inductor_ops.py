@@ -1181,6 +1181,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
+            "ops_dict": {
+                "ne": torch.ne,
+            },
+            "param_sets": {
+                # [1, 64] int64 non-contiguous (stride (64,1)) != scalar
+                "ne_1x64_int64_noncontig_eager": (
+                    torch.randint(0, 100, (1, 64), dtype=torch.int64).as_strided(
+                        (1, 64), (64, 1)
+                    ),
+                    0,
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
@@ -3539,6 +3553,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # - torch.matmul: numerical divergence (close=False) in eager 2d case
         eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt, torch.ne)
         self.compare_with_cpu(op, x, y, run_eager=eager_supported)
+
+    def test_cmp_scalar_int64_cpu(self, op, x, scalar):
+        # Test comparison ops with int64 tensors and scalar values.
+        self.compare_with_cpu(op, x, scalar, run_eager=True, run_compile=False)
 
     def test_linear_fn(self, x, weight, bias):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without
