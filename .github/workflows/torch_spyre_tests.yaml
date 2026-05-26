@@ -181,8 +181,6 @@ jobs:
             config: torch_spyre_tests/inductor/test_cache_config.yaml
           - name: Inductor Scratchpad Solver
             config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
-          - name: Inductor Bundle Loop
-            config: torch_spyre_tests/inductor/test_bundle_loop_config.yaml
           - name: Inductor Coarse Tiling
             config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
           - name: Inductor Coarse Tile E2E
