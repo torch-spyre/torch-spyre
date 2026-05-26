@@ -806,6 +806,8 @@ def _per_core_view_on_buf(
     """
     rw = op.get_read_writes()
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        return PerCoreView(slab_dims=(), core_to_slot={}), False
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads), write_index)
     iter_space = iteration_space_from_op(op)
