@@ -125,6 +125,8 @@ jobs:
             config: torch_spyre_tests/test_spyre_profiler_config.yaml
           - name: Test Prepare Kernel
             config: torch_spyre_tests/test_prepare_kernel_config.yaml
+          - name: Test Launch Jobplan
+            config: torch_spyre_tests/test_launch_jobplan_config.yaml
           # Inductor tests
           - name: Inductor Building Blocks
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
