@@ -671,10 +671,11 @@ class TestSpyre(TestCase):
 
         Tests roundtrip for each supported dtype conversion: create tensor on
         CPU with src_dtype, transfer to Spyre with dst_dtype (H2D), then back
-        to CPU (D2H).
+        to CPU (D2H). Also tests that unsupported dtype conversions raise errors.
         """
         from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
+        # Test supported conversions
         for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
             # Create tensor on CPU with src_dtype
             if src_dtype.is_floating_point:
@@ -693,6 +694,24 @@ class TestSpyre(TestCase):
             tensor_back = tensor_on_spyre.to("cpu", dtype=src_dtype)
             self.assertEqual(tensor_back.device.type, "cpu")
             self.assertEqual(tensor_back.dtype, src_dtype)
+
+        # Test unsupported conversions
+        unsupported_pairs = [
+            (torch.int8, torch.float16),
+            (torch.float32, torch.int32),
+            (torch.float16, torch.int64),
+        ]
+
+        for src_dtype, dst_dtype in unsupported_pairs:
+            # Create tensor on CPU with src_dtype
+            if src_dtype.is_floating_point:
+                tensor = torch.randn(2, 2, dtype=src_dtype)
+            else:
+                tensor = torch.randint(0, 10, (2, 2), dtype=src_dtype)
+
+            # H2D: Expect error when moving to Spyre with unsupported dst_dtype
+            with self.assertRaises(RuntimeError):
+                tensor.to("spyre", dtype=dst_dtype)
 
 
 if __name__ == "__main__":
