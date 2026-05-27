@@ -3549,9 +3549,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
         # - torch.eq, torch.ge, torch.gt, torch.lt: work eagerly
-        # - torch.le: aten::le.Tensor_out not registered
         # - torch.matmul: numerical divergence (close=False) in eager 2d case
-        eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt, torch.ne)
+        eager_supported = op in (
+            torch.eq,
+            torch.ge,
+            torch.gt,
+            torch.lt,
+            torch.ne,
+            torch.le,
+        )
         self.compare_with_cpu(op, x, y, run_eager=eager_supported)
 
     def test_cmp_scalar_int64_cpu(self, op, x, scalar):
