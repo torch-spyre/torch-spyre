@@ -292,10 +292,7 @@ def generate_sdsc(idx, sdsc_spec):
                                 if "lx" in tensor.allocation
                                 else "hbm",
                                 "layoutDimOrder_": [
-                                    str(dim)
-                                    for dim in sdsc_spec.layouts[tensor.layout][
-                                        "dim_order"
-                                    ]
+                                    str(dim) for dim in tensor.dim_order
                                 ],
                                 "maxDimSizes_": [
                                     tensor.max_dim_sizes[dim]

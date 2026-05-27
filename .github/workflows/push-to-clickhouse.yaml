@@ -33,7 +33,11 @@ permissions:
 jobs:
   ingest:
     name: Ingest XML -> ClickHouse
-    runs-on: ubuntu-latest
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
     timeout-minutes: 15
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
@@ -49,11 +53,20 @@ jobs:
       #   CLICKHOUSE_PASS   the password
       #   CLICKHOUSE_DB     e.g. spyre
       # ---------------------------------------------------------------------------
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+
+      # DEV INSTANCE
+      # CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      # CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      # CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      # CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      # CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+
+      # PROD INSTANCE
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -68,6 +81,8 @@ jobs:
         run: |
           echo "All TRIGGERING_* vars:"
           env | grep TRIGGERING_
+          which python3
+          python3 --version
 
       - name: Checkout (for the ingest script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -75,13 +90,18 @@ jobs:
           sparse-checkout: |
             .github/scripts/ingest_xml.py
 
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: '3.12'
-
       - name: Install Python dependencies
-        run: pip install requests clickhouse-driver lxml
+        run: |
+          source /home/senuser/torch-spyre/.venv/bin/activate
+          uv pip install requests clickhouse-driver clickhouse-connect lxml
+
+      - name: Install gh CLI
+        run: |
+          wget -q https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz
+          tar -xzf gh_2.92.0_linux_amd64.tar.gz
+          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
+          gh_2.92.0_linux_amd64/bin/gh --version
+
 
       - name: Resolve PR number
         id: resolve-pr
@@ -91,7 +111,8 @@ jobs:
           PR=$(gh api \
             "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
             --jq '.[0].number // 0')
-          echo "pr_number=${PR}" >> "$GITHUB_OUTPUT"
+          echo "Resolved PR number: ${PR}"
+          echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
       # Download all XML artifacts produced by the triggering run.
@@ -143,6 +164,7 @@ jobs:
       # ---------------------------------------------------------------------------
       - name: Ingest XML files into ClickHouse
         run: |
+          source /home/senuser/torch-spyre/.venv/bin/activate
           python3 .github/scripts/ingest_xml.py \
             --xml-dir xml_artifacts \
             --workflow "${TRIGGERING_WORKFLOW}" \
@@ -152,11 +174,12 @@ jobs:
             --triggered-at "${TRIGGERING_AT}" \
             --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}"
         env:
-          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+          # PROD INSTANCE
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
       - name: Summary
         if: always()

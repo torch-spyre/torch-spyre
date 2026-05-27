@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from lxml import etree
-import clickhouse_driver
+import clickhouse_connect
 
 # ---------------------------------------------------------------------------
 # Status classification — uses the logic in dashboard.html parseXML()
@@ -234,10 +234,10 @@ def parse_xml(xml_path: Path):
 
 
 def get_client():
-    return clickhouse_driver.Client(
+    return clickhouse_connect.get_client(
         host=os.environ["CLICKHOUSE_HOST"],
-        # port=int(os.environ.get("CLICKHOUSE_PORT", 9440)),
-        port=9440,  # native TCP+TLS port, always 9440 on ClickHouse Cloud
+        # port=9440,  # native TCP+TLS port, always 9440 on ClickHouse Cloud
+        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
         user=os.environ.get("CLICKHOUSE_USER", "default"),
         password=os.environ["CLICKHOUSE_PASS"],
         database=os.environ.get("CLICKHOUSE_DB", "spyre"),
@@ -246,34 +246,47 @@ def get_client():
 
 
 def insert_run(client, run_id: str, run: dict, args):
-    client.execute(
-        """
-        INSERT INTO test_runs
-            (run_id, workflow, suite_name, filename, branch, commit_sha,
-             pr_number, gha_run_id, triggered_at, total_tests, passed, failed,
-             skipped, xfail, errors, xpass, duration_s)
-        VALUES
-        """,
+    client.insert(
+        "test_runs",
         [
-            {
-                "run_id": run_id,
-                "workflow": args.workflow,
-                "suite_name": run["suite_name"],
-                "filename": run["filename"],
-                "branch": args.branch,
-                "commit_sha": (args.sha or "").ljust(40)[:40],
-                "pr_number": int(args.pr_number) if args.pr_number.strip() else 0,
-                "gha_run_id": int(args.run_id or 0),
-                "triggered_at": run["triggered_at"].replace(tzinfo=None),
-                "total_tests": run["total_tests"],
-                "passed": run["passed"],
-                "failed": run["failed"],
-                "skipped": run["skipped"],
-                "xfail": run["xfail"],
-                "errors": run["errors"],
-                "xpass": run["xpass"],
-                "duration_s": run["duration_s"],
-            }
+            [
+                run_id,
+                args.workflow,
+                run["suite_name"],
+                run["filename"],
+                args.branch,
+                (args.sha or "").ljust(40)[:40],
+                int(args.pr_number) if args.pr_number.strip() else 0,
+                int(args.run_id or 0),
+                run["triggered_at"].replace(tzinfo=None),
+                run["total_tests"],
+                run["passed"],
+                run["failed"],
+                run["skipped"],
+                run["xfail"],
+                run["errors"],
+                run["xpass"],
+                run["duration_s"],
+            ]
+        ],
+        column_names=[
+            "run_id",
+            "workflow",
+            "suite_name",
+            "filename",
+            "branch",
+            "commit_sha",
+            "pr_number",
+            "gha_run_id",
+            "triggered_at",
+            "total_tests",
+            "passed",
+            "failed",
+            "skipped",
+            "xfail",
+            "errors",
+            "xpass",
+            "duration_s",
         ],
     )
 
@@ -281,23 +294,38 @@ def insert_run(client, run_id: str, run: dict, args):
 def insert_cases(client, run_id: str, cases: list[dict], workflow: str = ""):
     if not cases:
         return
-    rows = [
-        {
-            "run_id": run_id,
-            "case_id": c["case_id"],
-            "classname": c["classname"],
-            "name": c["name"],
-            "op_name": c["op_name"],
-            "dtype": c["dtype"],
-            "status": c["status"],
-            "duration_s": c["duration_s"],
-            "fail_message": c["fail_message"][:8192],  # cap very long traces
-            "triggered_at": c["triggered_at"].replace(tzinfo=None),
-            "workflow": workflow,
-        }
-        for c in cases
-    ]
-    client.execute("INSERT INTO test_cases VALUES", rows)
+    client.insert(
+        "test_cases",
+        [
+            [
+                run_id,
+                c["case_id"],
+                c["classname"],
+                c["name"],
+                c["op_name"],
+                c["dtype"],
+                c["status"],
+                c["duration_s"],
+                c["fail_message"][:8192],
+                c["triggered_at"].replace(tzinfo=None),
+                workflow,
+            ]
+            for c in cases
+        ],
+        column_names=[
+            "run_id",
+            "case_id",
+            "classname",
+            "name",
+            "op_name",
+            "dtype",
+            "status",
+            "duration_s",
+            "fail_message",
+            "triggered_at",
+            "workflow",
+        ],
+    )
 
 
 def insert_properties(client, run_id: str, cases: list[dict]):
@@ -314,7 +342,26 @@ def insert_properties(client, run_id: str, cases: list[dict]):
                 }
             )
     if rows:
-        client.execute("INSERT INTO run_properties VALUES", rows)
+        client.insert(
+            "run_properties",
+            [
+                [
+                    r["run_id"],
+                    r["case_id"],
+                    r["prop_name"],
+                    r["prop_value"],
+                    r["triggered_at"].replace(tzinfo=None),
+                ]
+                for r in rows
+            ],
+            column_names=[
+                "run_id",
+                "case_id",
+                "prop_name",
+                "prop_value",
+                "triggered_at",
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +391,7 @@ def main():
         f"Connecting to ClickHouse at {os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 9000)} ..."
     )
     client = get_client()
-    client.execute("SELECT 1")  # connectivity check
+    client.command("SELECT 1")  # connectivity check
     print("Connected.")
 
     total_cases = 0
@@ -356,18 +403,14 @@ def main():
 
         # Deduplication check — skip if this exact GHA run + filename
         # has already been ingested
-        existing = client.execute(
-            """
-            SELECT count() FROM test_runs
-            WHERE gha_run_id = %(gha_run_id)s
-            AND   filename   = %(filename)s
-            """,
-            {
+        existing = client.query(
+            "SELECT count() FROM test_runs WHERE gha_run_id = {gha_run_id:UInt64} AND filename = {filename:String}",
+            parameters={
                 "gha_run_id": int(args.run_id or 0),
                 "filename": run["filename"],
             },
         )
-        if existing[0][0] > 0:
+        if existing.result_rows[0][0] > 0:
             print(f"  Already ingested — skipping {run['filename']}")
             continue
 
@@ -380,27 +423,22 @@ def main():
 
         insert_run(client, run_id, run, args)
 
-        existing_cases_after_run = client.execute(
-            """
-            SELECT count() FROM test_cases tc
-            INNER JOIN test_runs tr ON tc.run_id = tr.run_id
-            WHERE tr.gha_run_id = %(gha_run_id)s
-            AND   tr.filename   = %(filename)s
-            """,
-            {
+        existing_cases_after_run = client.query(
+            "SELECT count() FROM test_cases tc INNER JOIN test_runs tr ON tc.run_id = tr.run_id WHERE tr.gha_run_id = {gha_run_id:UInt64} AND tr.filename = {filename:String}",
+            parameters={
                 "gha_run_id": int(args.run_id or 0),
                 "filename": run["filename"],
             },
         )
-        if existing_cases_after_run[0][0] > 0:
+        if existing_cases_after_run.result_rows[0][0] > 0:
             print("  Cases already exist — skipping case+property inserts")
         else:
             insert_cases(client, run_id, cases, workflow=args.workflow)
-            existing_props = client.execute(
-                "SELECT count() FROM run_properties WHERE run_id = %(run_id)s",
-                {"run_id": run_id},
+            existing_props = client.query(
+                "SELECT count() FROM run_properties WHERE run_id = {run_id:String}",
+                parameters={"run_id": run_id},
             )
-            if existing_props[0][0] > 0:
+            if existing_props.result_rows[0][0] > 0:
                 print("  Properties already exist — skipping property insert")
             else:
                 insert_properties(client, run_id, cases)
