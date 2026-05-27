@@ -181,6 +181,12 @@ jobs:
             config: torch_spyre_tests/inductor/test_cache_config.yaml
           - name: Inductor Scratchpad Solver
             config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
+          - name: Inductor Coarse Tiling
+            config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
+          - name: Inductor Coarse Tile E2E
+            config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
+          - name: Inductor Unroll Loop Specs
+            config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
