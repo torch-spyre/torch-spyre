@@ -81,7 +81,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python dependencies
-        run: pip install requests clickhouse-driver lxml
+        run: pip install requests clickhouse-driver clickhouse-connect lxml
 
       - name: Resolve PR number
         id: resolve-pr
