@@ -122,12 +122,25 @@ class _OOTOnlyOnPatcher:
                 if isinstance(val.device_type, list):
                     if self._PRIVATEUSE1 not in val.device_type:
                         val.device_type.append(self._PRIVATEUSE1)
+                    # Also append "privateuse1" because TorchTestBase.device_type is
+                    # reset to "privateuse1" in setUpClass (to preserve correct class
+                    # naming for PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1), so the
+                    # @onlyOn check sees "privateuse1" at runtime, not the registered
+                    # backend name.
+                    if "privateuse1" not in val.device_type:
+                        val.device_type.append("privateuse1")
 
                 # Less common scenario: @onlyOn("cuda") -- single string.
                 # Replace with a list containing both the original and ours.
                 elif isinstance(val.device_type, str):
                     if val.device_type != self._PRIVATEUSE1:
-                        val.device_type = [val.device_type, self._PRIVATEUSE1]
+                        val.device_type = [
+                            val.device_type,
+                            self._PRIVATEUSE1,
+                            "privateuse1",
+                        ]
+                    elif val.device_type != "privateuse1":
+                        val.device_type = [val.device_type, "privateuse1"]
                 return
 
             # This layer had no onlyOn instance in its closure.
