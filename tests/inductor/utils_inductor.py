@@ -30,7 +30,10 @@ DEVICE = torch.device("spyre")
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
-    out = torch.randn(shape, dtype=dtype) * scale
+    seed = hash((shape, differentiation, abs, str(dtype), scale)) & 0x7FFFFFFF
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
 
 
@@ -40,8 +43,11 @@ def cached_xavier(
     differentiation=None,
     dtype=torch.float16,
 ):
+    seed = hash((shape, differentiation, str(dtype))) & 0x7FFFFFFF
+    gen = torch.Generator()
+    gen.manual_seed(seed)
     out = torch.empty(shape, dtype=dtype)
-    torch.nn.init.xavier_uniform_(out)
+    torch.nn.init.xavier_uniform_(out, generator=gen)
     return out
 
 
