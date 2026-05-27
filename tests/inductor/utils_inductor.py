@@ -14,6 +14,7 @@
 
 import copy
 import functools
+import hashlib
 import torch
 import os
 import pytest
@@ -23,6 +24,19 @@ import unittest
 DEVICE = torch.device("spyre")
 
 
+def _make_generator(*args) -> torch.Generator:
+    """Return a seeded Generator whose seed is a stable hash of ``args``.
+
+    Uses SHA-256 via hashlib so the seed is identical across Python processes
+    regardless of PYTHONHASHSEED (unlike the built-in ``hash()``).
+    """
+    key = repr(args).encode()
+    seed = int(hashlib.sha256(key).hexdigest()[:8], 16)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    return gen
+
+
 # shape is a tuple of integers representing dimension of the tensor
 # to avoid using the same cached tensor of the same shape, add a unique
 # differentiation argument
@@ -30,9 +44,7 @@ DEVICE = torch.device("spyre")
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
-    seed = hash((shape, differentiation, abs, str(dtype), scale)) & 0x7FFFFFFF
-    gen = torch.Generator()
-    gen.manual_seed(seed)
+    gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
 
@@ -43,9 +55,7 @@ def cached_xavier(
     differentiation=None,
     dtype=torch.float16,
 ):
-    seed = hash((shape, differentiation, str(dtype))) & 0x7FFFFFFF
-    gen = torch.Generator()
-    gen.manual_seed(seed)
+    gen = _make_generator(shape, differentiation, dtype)
     out = torch.empty(shape, dtype=dtype)
     torch.nn.init.xavier_uniform_(out, generator=gen)
     return out
