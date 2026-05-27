@@ -686,14 +686,20 @@ class TestSpyre(TestCase):
                 tensor = torch.randint(0, 10, (2, 2), dtype=src_dtype)
 
             # H2D: Move to Spyre with dst_dtype
+            h2d_ctx = f"H2D {src_dtype} -> {dst_dtype}"
             tensor_on_spyre = tensor.to("spyre", dtype=dst_dtype)
-            self.assertEqual(tensor_on_spyre.device.type, "spyre")
-            self.assertEqual(tensor_on_spyre.dtype, dst_dtype)
+            self.assertEqual(tensor_on_spyre.device.type, "spyre", msg=h2d_ctx)
+            self.assertEqual(tensor_on_spyre.dtype, dst_dtype, msg=h2d_ctx)
+            self.assertEqual(
+                tensor_on_spyre.to("cpu"), tensor.to(dst_dtype), msg=h2d_ctx
+            )
 
             # D2H: Move back to CPU with src_dtype
+            d2h_ctx = f"D2H {dst_dtype} -> {src_dtype}"
             tensor_back = tensor_on_spyre.to("cpu", dtype=src_dtype)
-            self.assertEqual(tensor_back.device.type, "cpu")
-            self.assertEqual(tensor_back.dtype, src_dtype)
+            self.assertEqual(tensor_back.device.type, "cpu", msg=d2h_ctx)
+            self.assertEqual(tensor_back.dtype, src_dtype, msg=d2h_ctx)
+            self.assertEqual(tensor_back, tensor, msg=d2h_ctx)
 
         # Test unsupported conversions
         unsupported_pairs = [
