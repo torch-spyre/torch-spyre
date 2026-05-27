@@ -28,10 +28,8 @@ def generate_bundle(kernel_name: str, output_dir: str, specs: list[OpSpec]):
 
     # 1. Generate SDSC.json for each OpSpec
     sdscs_json = []
-    # argIdx_to_split: dict = {}  # for DT PR 4255
     for idx, ks in enumerate(specs):
         sdsc_json = compile_op_spec(idx, ks)
-        # update_core_id_to_wk_slice(sdsc_json, ks, argIdx_to_split)
         sdscs_json.append(sdsc_json)
 
     # Write JSON SDSCs to file system

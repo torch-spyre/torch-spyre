@@ -150,10 +150,10 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
         if using_multicore and len(users) > 1:
             # K-split-reduction producers leave partial sums on most cores;
             # only k-last cores hold the final value. Without a broadcast
-            # codepath the buffer is not safe on LX, even if slab geometry
-            # happens to match. The flag is meaningful only for write-deps
-            # — a consumer reading a K-split input still gets its own valid
-            # slab.
+            # codepath the buffer is not safe on LX, even if work-slice
+            # geometry happens to match. The flag is meaningful only for
+            # write-deps — a consumer reading a K-split input still gets
+            # its own valid work slice.
             analyzed = [
                 (op, dep, *_per_core_view_on_buf(op, dep, buf_name))
                 for op, dep in users

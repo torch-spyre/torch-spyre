@@ -754,12 +754,12 @@ class PerCoreView:
 
     K-split-reduction producers leave partial sums on most cores and the
     final value only on k-last cores. That correctness issue is independent
-    of slab geometry; `_per_core_view_on_buf` returns it as a separate
-    boolean alongside the view rather than folding it in here, so equality
-    keeps its narrow geometric meaning.
+    of work-slice geometry; `_per_core_view_on_buf` returns it as a
+    separate boolean alongside the view rather than folding it in here, so
+    equality keeps its narrow geometric meaning.
     """
 
-    slab_dims: tuple[tuple[int, int], ...]
+    work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: dict[str, Expr]
 
 
@@ -783,7 +783,7 @@ def _per_core_view_on_buf(
     on most cores until the broadcast TODO in scratchpad.py lands) is
     the caller's concern, not the view's: the caller treats the flag as
     a rejection signal only for write-deps, since a consumer reading a
-    K-split input still gets its own valid slab.
+    K-split input still gets its own valid work slice.
 
     Steps:
       1. Recover {symbol: split} from op.op_it_space_splits via
@@ -791,7 +791,8 @@ def _per_core_view_on_buf(
       2. For each split symbol, look up its host stride on buf via
          dep.index.coeff(sym). host_stride == 0 means the split is along
          a contracted axis and does not slice this buffer; it does not
-         contribute to slab geometry, but flips `has_partial_reduction`.
+         contribute to work-slice geometry, but flips
+         `has_partial_reduction`.
       3. Place each non-contracting split on buf's outermost matching
          device dim with a divisible extent. Sticks are atomic, so a
          host-stride-1 split may land on the outer-stick dim instead.
@@ -807,7 +808,7 @@ def _per_core_view_on_buf(
     rw = op.get_read_writes()
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        return PerCoreView(slab_dims=(), core_to_slot={}), False
+        return PerCoreView(work_slice_dims=(), core_to_slot={}), False
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads), write_index)
     iter_space = iteration_space_from_op(op)
@@ -831,7 +832,7 @@ def _per_core_view_on_buf(
     stride_map = list(buf_layout.stride_map)
     elems_per_stick = buf_layout.device_dtype.elems_per_stick()
 
-    slab_dims: dict[int, int] = {}
+    work_slice_dims: dict[int, int] = {}
     consumed: set[int] = set()
     dims_outer_first = sorted(
         (i for i, s in enumerate(stride_map) if s > 0),
@@ -848,7 +849,7 @@ def _per_core_view_on_buf(
             ):
                 continue
             device_size[i] //= split
-            slab_dims[i] = split
+            work_slice_dims[i] = split
             placed_strides[h] = split
             consumed.add(i)
             break
@@ -874,7 +875,7 @@ def _per_core_view_on_buf(
     }
 
     view = PerCoreView(
-        slab_dims=tuple(sorted(slab_dims.items())),
+        work_slice_dims=tuple(sorted(work_slice_dims.items())),
         core_to_slot=pruned_core_to_slot,
     )
     return view, has_partial_reduction
