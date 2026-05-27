@@ -14,9 +14,12 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.spyre import SpyreTensorLayout
 
 
 class TestSpyreEmptyMemoryFormat(TestCase):
+    """Memory-format guard tests for spyre_empty (aten::empty.memory_format dispatch)."""
+
     def test_channels_last_raises(self) -> None:
         """channels_last must raise — regression guard for issue #2175."""
         with self.assertRaisesRegex(
@@ -33,6 +36,39 @@ class TestSpyreEmptyMemoryFormat(TestCase):
     def test_contiguous_format_accepted(self) -> None:
         """Default contiguous allocation must not raise."""
         t = torch.empty((2, 64), device="spyre", dtype=torch.float16)
+        self.assertEqual(t.device.type, "spyre")
+        self.assertTrue(t.is_contiguous())
+
+
+class TestEmptyWithLayoutMemoryFormat(TestCase):
+    """Memory-format guard tests for empty_with_layout (torch.empty + device_layout path)."""
+
+    def _make_layout(self, size: list) -> SpyreTensorLayout:
+        return SpyreTensorLayout(size, torch.float16)
+
+    def test_channels_last_raises(self) -> None:
+        """channels_last must raise when device_layout is supplied."""
+        stl = self._make_layout([1, 3, 4, 4])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Spyre backend only supports contiguous memory format",
+        ):
+            torch.empty(
+                (1, 3, 4, 4),
+                device_layout=stl,
+                dtype=torch.float16,
+                memory_format=torch.channels_last,
+            )
+
+    def test_preserve_format_accepted(self) -> None:
+        """preserve_format is explicitly allowed alongside contiguous with device_layout."""
+        stl = self._make_layout([2, 64])
+        t = torch.empty(
+            (2, 64),
+            device_layout=stl,
+            dtype=torch.float16,
+            memory_format=torch.preserve_format,
+        )
         self.assertEqual(t.device.type, "spyre")
         self.assertTrue(t.is_contiguous())
 
