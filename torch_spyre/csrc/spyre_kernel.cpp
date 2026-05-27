@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "job_plan.h"
 #include "logging.h"
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
@@ -209,6 +210,12 @@ void launchKernel(const std::string& code_dir,
   auto& arts = getOrLoadArtifacts(code_dir, stream);
 
   stream.executeProgramAsync(arts, args);
+}
+
+void launchJobPlan(const JobPlan& job_plan,
+                   const std::vector<at::Tensor>& args) {
+  auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+  stream.launch(job_plan, args);
 }
 
 void clearArtifactCache() {
