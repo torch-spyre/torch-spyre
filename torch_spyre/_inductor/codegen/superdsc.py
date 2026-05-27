@@ -15,7 +15,7 @@
 import dataclasses
 import math
 from typing import Any
-
+from collections import Counter
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
@@ -43,6 +43,7 @@ logger = get_inductor_logger("codegen.superdsc")
 @dataclasses.dataclass
 class SDSCArgs:
     layout: str
+    dim_order: list[Symbol]
     data_format: DataFormats
     scales: dict[Symbol, Any]
     strides: dict[Symbol, Any]
@@ -61,6 +62,7 @@ class SDSCArgs:
         return (
             f"SDSCArgs(\n"
             f"  layout={self.layout},\n"
+            f"  dim_order={self.dim_order}, \n"
             f"  data_format={self.data_format.name},\n"
             f"  scales=[{scales}],\n"
             f"  strides=[{strides}],\n"
@@ -240,7 +242,7 @@ def _get_layout_label(
     for label, layout in layouts.items():
         if (
             layout["stick_dim_order"] == stick_dim_order
-            and layout["dim_order"] == dim_order
+            and Counter(layout["dim_order"]) == Counter(dim_order)
             and layout["stick_size"] == stick_size
         ):
             return label
@@ -258,6 +260,7 @@ def _get_padded_iteration_space(
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
+    dim_order,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -266,11 +269,11 @@ def _get_padded_iteration_space(
     Returns a mapping of dim -> padding amount
     """
     padding: dict = {}
-    for sdsc_arg, op_spec_arg in zip(sdsc_args, op_spec_args):
+    for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
         stick_dim = layout["stick_dim_order"]
         dev_size = op_spec_arg.device_size[-2::-1]
-        for idx, dim in enumerate(layout["dim_order"]):
+        for idx, dim in enumerate(dim_order):
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
             unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
@@ -373,6 +376,7 @@ def _create_sdsc_tensors(
         sdsc_args.append(
             SDSCArgs(
                 layout=label,
+                dim_order=dim_order,
                 data_format=arg.device_dtype,
                 scales=scales,
                 strides=strides,
@@ -563,13 +567,25 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.
     is_dtype_op = DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
     if is_matmul or is_dtype_op:
-        pad_args, pad_sdsc_args = list(op_spec.args), args
+        pad_args, pad_sdsc_args, dim_order = (
+            list(op_spec.args),
+            args,
+            [arg.dim_order for arg in args],
+        )
     elif op_spec.is_reduction or op_spec.op == "overwrite":
-        pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
+        pad_args, pad_sdsc_args, dim_order = (
+            [op_spec.args[0]],
+            [args[0]],
+            [args[0].dim_order],
+        )
     else:
-        pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
+        pad_args, pad_sdsc_args, dim_order = (
+            [op_spec.args[-1]],
+            [args[-1]],
+            [args[-1].dim_order],
+        )
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
+        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
