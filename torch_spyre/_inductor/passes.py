@@ -35,6 +35,7 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
+    process_hints,
 )
 from . import config
 from .propagate_hints import (
@@ -241,6 +242,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
         propagate_named_dims(operations)
+        process_hints(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
