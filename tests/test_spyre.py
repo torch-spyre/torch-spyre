@@ -666,6 +666,34 @@ class TestSpyre(TestCase):
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
 
+    def test_d2h_h2d_dtype_conversion(self):
+        """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.
+
+        Tests roundtrip for each supported dtype conversion: create tensor on
+        CPU with src_dtype, transfer to Spyre with dst_dtype (H2D), then back
+        to CPU (D2H).
+        """
+        from torch_spyre._inductor.dtype_ops import DtypeOpTable
+
+        for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
+            # Create tensor on CPU with src_dtype
+            if src_dtype.is_floating_point:
+                tensor = torch.randn(2, 2, dtype=src_dtype)
+            elif src_dtype == torch.bool:
+                tensor = torch.randint(0, 2, (2, 2), dtype=torch.int32).to(torch.bool)
+            else:
+                tensor = torch.randint(0, 10, (2, 2), dtype=src_dtype)
+
+            # H2D: Move to Spyre with dst_dtype
+            tensor_on_spyre = tensor.to("spyre", dtype=dst_dtype)
+            self.assertEqual(tensor_on_spyre.device.type, "spyre")
+            self.assertEqual(tensor_on_spyre.dtype, dst_dtype)
+
+            # D2H: Move back to CPU with src_dtype
+            tensor_back = tensor_on_spyre.to("cpu", dtype=src_dtype)
+            self.assertEqual(tensor_back.device.type, "cpu")
+            self.assertEqual(tensor_back.dtype, src_dtype)
+
 
 if __name__ == "__main__":
     run_tests()
