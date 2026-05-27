@@ -362,6 +362,7 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
     indices = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     return (values, indices)
 
+
 @torch.library.custom_op("spyre::unfold", mutates_args=(), device_types="spyre")
 def spyre_unfold(
     input: torch.Tensor,
@@ -418,8 +419,9 @@ def _(
     return input.new_empty((N, C * K_h * K_w, H_out * W_out))
 
 
-
-@torch.library.custom_op("spyre::reshape_via_cpu", mutates_args=(), device_types="spyre")
+@torch.library.custom_op(
+    "spyre::reshape_via_cpu", mutates_args=(), device_types="spyre"
+)
 def spyre_reshape_via_cpu(
     input: torch.Tensor,
     shape: Sequence[int],
