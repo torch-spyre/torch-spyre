@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence
 import torch
 import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
@@ -376,7 +376,6 @@ def spyre_unfold(
     Uses CPU fallback for the unfold operation.
     """
 
-    print(f"In unfold")
     dilation = dilation or (1, 1)
     padding = padding or (0, 0)
     stride = stride or (1, 1)
