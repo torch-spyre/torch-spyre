@@ -1232,42 +1232,42 @@ class TestGenerateBundleMlir(unittest.TestCase):
 
 class TestFindUnimplemented(unittest.TestCase):
     def test_no_unimplemented(self):
-        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
+        from torch_spyre._inductor.op_spec import find_unimplemented
 
         a = _make_minimal_op_spec("a")
-        self.assertIsNone(_find_unimplemented([a]))
+        self.assertIsNone(find_unimplemented([a]))
 
     def test_flat_unimplemented(self):
-        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
+        from torch_spyre._inductor.op_spec import find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
         a = _make_minimal_op_spec("a")
-        result = _find_unimplemented([a, unimp])
+        result = find_unimplemented([a, unimp])
         self.assertIs(result, unimp)
 
     def test_unimplemented_inside_loop(self):
-        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
+        from torch_spyre._inductor.op_spec import find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
         loop = LoopSpec(count=Integer(4), body=[unimp])
-        result = _find_unimplemented([loop])
+        result = find_unimplemented([loop])
         self.assertIs(result, unimp)
 
     def test_unimplemented_in_nested_loop(self):
-        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
+        from torch_spyre._inductor.op_spec import find_unimplemented
 
         unimp = UnimplementedOp(op="missing")
         inner = LoopSpec(count=Integer(2), body=[unimp])
         outer = LoopSpec(count=Integer(4), body=[inner])
-        result = _find_unimplemented([outer])
+        result = find_unimplemented([outer])
         self.assertIs(result, unimp)
 
     def test_returns_first_found(self):
-        from torch_spyre._inductor.codegen.bundle import _find_unimplemented
+        from torch_spyre._inductor.op_spec import find_unimplemented
 
         u1 = UnimplementedOp(op="first")
         u2 = UnimplementedOp(op="second")
-        result = _find_unimplemented([u1, u2])
+        result = find_unimplemented([u1, u2])
         self.assertIs(result, u1)
 
 

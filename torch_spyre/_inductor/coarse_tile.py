@@ -261,7 +261,9 @@ def _propagate_tiled_op(
         # Case 1: keep tiled op writing to small buffer; insert copy op.
         _insert_copy_op(op, full_buf, operations)
     else:
-        # Case 2: rewire tiled op to write directly into the full buffer.
+        # Case 2: tiled op has no inside consumers — rewire it to write directly
+        # into the full-size buffer.  Note: MutationLayoutSHOULDREMOVE is
+        # incompatible with lx_planning (scratchpad); do not combine the two.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.
@@ -656,9 +658,19 @@ def _divide_ranges(
     for i in tiled_dims:
         if i < 0 or i >= len(ranges):
             continue
-        ranges[i] = sympy.Rational(1, 1) * ranges[i] / loop_count
-        # Simplify: keep as integer expression when divisible.
-        ranges[i] = sympy.simplify(ranges[i])
+        r = ranges[i]
+        if isinstance(r, (int, sympy.Integer)) and isinstance(
+            loop_count, (int, sympy.Integer)
+        ):
+            if int(r) % int(loop_count) != 0:
+                raise RuntimeError(
+                    f"coarse_tile: dimension {i} range {r} is not divisible by "
+                    f"loop_count {loop_count}.  All tiled dimensions must be evenly "
+                    f"divisible by the loop trip count."
+                )
+            ranges[i] = sympy.Integer(int(r) // int(loop_count))
+        else:
+            ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
 
     # Loops is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "ranges", ranges)

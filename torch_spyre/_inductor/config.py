@@ -46,13 +46,12 @@ coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
 # When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
 # constants) in bundle.mlir and resolved via affine.apply for tiled loops.
 # Requires backend compiler support for the sdscbundle symbol table, which is
-# still under development.  Must be True when coarse_tiling is True (LoopSpec
-# nodes in the spec tree require symbols).  Defaults to False until backend
-# support is complete.
+# still under development.  Defaults to False; the default unroll path
+# (bundle_hbm_symbols=False) handles LoopSpec nodes correctly without symbols.
 bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
 
 # Optional callable injected by callers to compute coarse-tiling groups.
-# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr[, int|None]]]
+# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr[, list[int]]]]
 # Each tuple is (ops, loop_count) or (ops, loop_count, tiled_dims).
 # tiled_dims overrides the default per-group (None = tile outermost dim only).
 # When None and coarse_tiling is True, coarse_tile() is called with groups=[]

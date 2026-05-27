@@ -20,8 +20,13 @@ import subprocess
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, UnimplementedOp
-from torch_spyre._inductor.codegen.bundle import _find_unimplemented, generate_bundle
+from torch_spyre._inductor.op_spec import (
+    LoopSpec,
+    OpSpec,
+    UnimplementedOp,
+    find_unimplemented,
+)
+from torch_spyre._inductor.codegen.bundle import generate_bundle
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
@@ -41,7 +46,7 @@ class SpyreAsyncCompile:
     def sdsc(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
     ):
-        unimp = _find_unimplemented(list(specs))
+        unimp = find_unimplemented(list(specs))
         if unimp is not None:
             logger.warning(
                 f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"

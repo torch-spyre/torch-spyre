@@ -102,3 +102,15 @@ class LoopSpec:
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
     return torch.tensor(const_val, dtype=dtype).to(device)
+
+
+def find_unimplemented(specs: list) -> UnimplementedOp | None:
+    """Return the first UnimplementedOp in specs (recursing into LoopSpec), or None."""
+    for entry in specs:
+        if isinstance(entry, UnimplementedOp):
+            return entry
+        if isinstance(entry, LoopSpec):
+            found = find_unimplemented(entry.body)
+            if found is not None:
+                return found
+    return None
