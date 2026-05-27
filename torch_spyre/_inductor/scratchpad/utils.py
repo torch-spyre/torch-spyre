@@ -154,23 +154,16 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             # geometry happens to match. The flag is meaningful only for
             # write-deps — a consumer reading a K-split input still gets
             # its own valid work slice.
-            analyzed = [
-                (op, dep, *_per_core_view_on_buf(op, dep, buf_name))
-                for op, dep in users
-            ]
-            producer_partials = any(
-                flag
-                for op, dep, _, flag in analyzed
-                if dep in op.get_read_writes().writes
-            )
-            if producer_partials:
-                same_core_div = False
-            else:
-                ref = analyzed[0][2]
-                same_core_div = all(view == ref for _, _, view, _ in analyzed[1:])
-            num_cores = (
-                max(_op_num_cores(op) for op, _ in users) if same_core_div else -1
-            )
+            ref_view = None
+            mismatch = False
+            for op, dep in users:
+                view, flag = _per_core_view_on_buf(op, dep, buf_name)
+                if ref_view is None:
+                    ref_view = view
+                if (flag and dep in op.get_read_writes().writes) or (view != ref_view):
+                    mismatch = True
+                    break
+            num_cores = -1 if mismatch else max(_op_num_cores(op) for op, _ in users)
         elif using_multicore:
             num_cores = _op_num_cores(users[0][0])
         else:
