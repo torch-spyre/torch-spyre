@@ -24,6 +24,7 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
@@ -36,6 +37,11 @@ from .temp_passes import (
     convert_constant_with_graph_node,
 )
 from . import config
+from .propagate_hints import (
+    collect_spyre_hints,
+    recover_spyre_hints,
+)
+from .propagate_named_dims import propagate_named_dims
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -45,11 +51,12 @@ from .insert_restickify import insert_restickify, finalize_layouts
 from .memory_planning import memory_planning
 from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
-from .scratchpad import scratchpad_planning
+from .scratchpad.allocator import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
+from .chunk_large_tensors import chunk_large_tensors
 
 
 logger = get_inductor_logger("passes")
@@ -101,6 +108,11 @@ class CustomPreGradPasses:
         for p in self.passes:
             p(graph)
 
+    def uuid(self) -> Optional[Any]:
+        files = [inspect.getfile(c) for c in CustomPreGradPasses.passes]
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
+
 
 class CustomPrePasses(CustomGraphPass):
     """
@@ -111,7 +123,7 @@ class CustomPrePasses(CustomGraphPass):
     """
     The list of custom passes to run
     """
-    passes: List[Callable[[torch.fx.graph.Graph], None]] = []
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [collect_spyre_hints]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPrePasses.passes:
@@ -133,6 +145,7 @@ class CustomPostPasses(CustomGraphPass):
     The list of custom passes to run
     """
     passes: List[Callable[[torch.fx.graph.Graph], None]] = [
+        recover_spyre_hints,
         convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
@@ -213,7 +226,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     Operations are in topological order (guaranteed by GraphLowering).
     """
 
-    def __call__(self, operations: list[Operation]) -> None:
+    def __call__(self, graph: GraphLowering) -> None:
+        operations = graph.operations
         has_spyre_device = any(
             op.get_device() is not None and op.get_device().type == DEVICE_NAME
             for op in operations
@@ -226,18 +240,21 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        propagate_named_dims(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
         insert_bmm_padding(operations)
         dedup_and_promote_constants(operations)
+        if config.chunk_large_tensors:
+            chunk_large_tensors(operations)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
         )
         work_distribution(operations, k_fast_ops)
         if config.lx_planning:
-            scratchpad_planning(operations)
+            scratchpad_planning(graph)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
@@ -246,10 +263,12 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(dedup_and_promote_constants),
+            inspect.getfile(propagate_named_dims),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
             inspect.getfile(insert_bmm_padding),
+            inspect.getfile(chunk_large_tensors),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),

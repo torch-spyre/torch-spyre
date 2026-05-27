@@ -7,6 +7,7 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -28,7 +29,7 @@ jobs:
       - spyre_pf_x1
       - linux
       - image_torch_spyre
-    timeout-minutes: 720
+    timeout-minutes: 60
     env:
       # The CI env var is very important.
       # GitHub actions automatically sets CI=true
@@ -85,6 +86,8 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
 
       - uses: ./.github/actions/gather-runner-info
 

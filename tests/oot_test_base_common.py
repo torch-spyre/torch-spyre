@@ -1,5 +1,6 @@
 """
 Shared class and methods for all OOT PyTorch test overrides.
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
 
 """
 
@@ -8,10 +9,11 @@ import json
 from typing import Dict, List, Optional, Set
 import warnings
 
+import regex as re
 import pytest  # type: ignore
 import torch
 
-from spyre_test_constants import (
+from oot_test_constants import (
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
     MODE_MANDATORY_SUCCESS,
@@ -20,18 +22,18 @@ from spyre_test_constants import (
     MODE_XFAIL_STRICT,
     UNLISTED_MODE_XFAIL,
 )
-from spyre_test_matching import (
+from oot_test_matching import (
     extract_dtype_from_name,
     parse_dtype,
 )
-from spyre_test_parsing import (
+from oot_test_parsing import (
     FileEntry,
     apply_op_config_overrides,
     load_yaml_config,
     resolve_current_file,
 )
 
-from spyre_upstream_patcher import (
+from oot_upstream_patcher import (
     _OOTDtypePatcher,
     _OOTModuleMarkerPatcher,
     _OOTOnlyOnPatcher,
@@ -42,17 +44,18 @@ from spyre_upstream_patcher import (
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
 )
-from spyre_test_config_models import (
+from oot_test_config_models import (
     OOTTestConfig,
     Precision,
     SupportedOpConfig,
     SupportedModuleConfig,
     TestEntry,
 )
-from spyre_test_common_methods_invocations import (
+from oot_test_common_methods_invocations import (
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
+from oot_test_utilities import _get_privateuse1_device_type
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 
@@ -75,14 +78,7 @@ def _log_error(msg: str) -> None:
 # Resolve the actual backend name registered for privateuse1.
 # torch._C._get_privateuse1_backend_name() returns e.g. "spyre".
 # This is what slf.device_type will be at test runtime.
-def _get_privateuse1_device_type() -> str:
-    try:
-        return torch._C._get_privateuse1_backend_name()
-    except Exception:
-        return "privateuse1"  # fallback if not registered yet
-
-
-_SPYRE_DEVICE_TYPE: str = _get_privateuse1_device_type()
+_OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +152,29 @@ def _entry_dtype_set(
     return global_supported_dtypes  # may itself be None
 
 
+# Matches "test_model_ops_db_<unique>__<idx>_<device>_<dtype>", capturing
+# the op unique_name key into model_ops_entry_by_unique_name.
+_MODEL_OPS_VARIANT_RE = re.compile(
+    r"^test_model_ops_db_(?P<unique>.+?__\d+)_[A-Za-z0-9]+_\w+$"
+)
+
+
+def _select_entry_by_op_index(method_name: str) -> Optional["TestEntry"]:
+    """Resolve the TestEntry for a test_model_ops_db variant via the
+    authoritative unique_name mapping; returns None to let callers fall
+    back to the dtype heuristic."""
+    m = _MODEL_OPS_VARIANT_RE.match(method_name)
+    if not m:
+        return None
+    try:
+        from models.test_model_ops_v2 import (  # type: ignore
+            model_ops_entry_by_unique_name,
+        )
+    except ImportError:
+        return None
+    return model_ops_entry_by_unique_name.get(m.group("unique"))
+
+
 def _select_entry_for_variant(
     entries: List["TestEntry"],
     method_name: str,
@@ -210,7 +229,7 @@ def _extract_op_name_from_method(
 ) -> Optional[str]:
     """Extract the op name from a parametrized method name.
 
-    method_name: test_scalar_support_add_spyre_float16
+    method_name: test_scalar_support_add_<device>_float16
     base_test_name: test_scalar_support
     returns: "add"
 
@@ -218,11 +237,10 @@ def _extract_op_name_from_method(
     """
     if not method_name.startswith(base_test_name + "_"):
         return None
-    remainder = method_name[len(base_test_name) + 1 :]  # "add_spyre_float16"
+    remainder = method_name[len(base_test_name) + 1 :]  # "add_<device>_float16"
     # op name is the first segment before the device suffix
-    device_type = "spyre"  # or read from _SPYRE_DEVICE_TYPE
-    if f"_{device_type}_" in remainder:
-        return remainder.split(f"_{device_type}_")[0]  # "add"
+    if f"_{_OOT_DEVICE_TYPE}_" in remainder:
+        return remainder.split(f"_{_OOT_DEVICE_TYPE}_")[0]
     return None
 
 
@@ -237,7 +255,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
     All configuration is loaded lazily from the YAML file pointed to by
     PYTORCH_TEST_CONFIG.  The YAML is validated by Pydantic on load.
-    See spyre_test_config_schema.json for the full schema.
+    See oot_test_config_schema.json for the full schema.
     """
 
     device_type: str = "privateuse1"
@@ -261,12 +279,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # PrivateUse1TestBase.setUpClass sets cls.device_type = "spyre"
-        # (the registered backend name). This mutates the base class's
-        # device_type, causing subsequent instantiate_device_type_tests calls
-        # to generate class names like TestOldViewOpsSPYRE instead of
-        # TestOldViewOpsPRIVATEUSE1, which then get filtered out by
-        # PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
+        # PrivateUse1TestBase.setUpClass sets cls.device_type to the registered
+        # backend name (e.g. "spyre").  This mutates the base class's device_type,
+        # causing subsequent instantiate_device_type_tests calls to generate class
+        # names like TestOldViewOpsSPYRE instead of TestOldViewOpsPRIVATEUSE1,
+        # which then get filtered out by PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
         # Reset TorchTestBase.device_type to "privateuse1" so subsequent
         # calls generate the correct class name.
         TorchTestBase.device_type = "privateuse1"
@@ -505,7 +522,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         # resolve final decision
         if effective_mode == MODE_SKIP:
-            return False, "Skipped for Spyre", False, False
+            return False, "Skipped by OOT config", False, False
         elif effective_mode == MODE_XFAIL:
             return True, None, True, False  # run, xfail non-strict
         elif effective_mode == MODE_XFAIL_STRICT:
@@ -528,7 +545,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     # ------------------------------------------------------------------
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
-        _OOTOnlyOnPatcher(test, _SPYRE_DEVICE_TYPE).patch()
+        _OOTOnlyOnPatcher(test, _OOT_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
 
         # Retrieve all entries for this base test name.
@@ -694,9 +711,13 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             # ------------------------------------------------------------------
             resolved_entry: Optional[TestEntry] = None
             if all_entries_for_name:
-                resolved_entry = _select_entry_for_variant(
-                    all_entries_for_name, method_name, cls.GLOBAL_SUPPORTED_DTYPES
-                )
+                resolved_entry = _select_entry_by_op_index(method_name)
+                if resolved_entry is None:
+                    resolved_entry = _select_entry_for_variant(
+                        all_entries_for_name,
+                        method_name,
+                        cls.GLOBAL_SUPPORTED_DTYPES,
+                    )
 
             # Tags for this specific variant = tags from the resolved entry only
             variant_tags: List[str] = (
@@ -731,7 +752,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
             # if not enabled:
             #     @wraps(test)
-            #     def _skip(self, _reason=reason or "Skipped for Spyre"):
+            #     def _skip(self, _reason=reason or "Skipped by OOT config"):
             #         raise unittest.SkipTest(_reason)
 
             #     setattr(cls, method_name, _skip)
@@ -765,7 +786,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
                     # Store BEFORE marking so the attribute is on the base function
-                    existing_fn._spyre_method_tags = method_tags
+                    existing_fn._oot_method_tags = method_tags
                     marked_fn = existing_fn
                     for tag in method_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
@@ -776,10 +797,66 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             if is_xfail:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
+
+                    def _make_xfail_wrapper(fn, strict):
+                        # Factory function to capture fn and strict per-method.
+                        # Without this, all closures in the loop would share the
+                        # last values of existing_fn and is_strict.
+                        def _xfail_wrapper(self, *args, **kwargs):
+                            try:
+                                fn(self, *args, **kwargs)
+                            except BaseException as e:
+                                if isinstance(e, pytest.skip.Exception):
+                                    # pytest.skip() raised inside the test body (or by
+                                    # PyTorch's test_wrapper infrastructure) is caught by
+                                    # the unittest runner and reported as SKIPPED, completely
+                                    # bypassing the xfail mark. Convert it to AssertionError
+                                    # so the xfail mark sees a real failure instead.
+                                    raise AssertionError(
+                                        f"xfail: converted skip to failure: {e}"
+                                    ) from e
+                                # All other exceptions (TypeError, RuntimeError, etc.)
+                                # propagate normally -- the xfail mark and our
+                                # pytest_runtest_makereport hook will rewrite them to XFAIL.
+                                raise
+
+                        # Copy essential identity attributes so pytest can identify the
+                        # test correctly in output and error messages.
+                        _xfail_wrapper.__name__ = fn.__name__
+                        _xfail_wrapper.__qualname__ = getattr(
+                            fn, "__qualname__", fn.__name__
+                        )
+                        _xfail_wrapper.__doc__ = fn.__doc__
+
+                        # Carry forward any existing marks (op__, dtype__, model__ tags)
+                        # and append the xfail mark. pytest_runtest_makereport in conftest.py
+                        # reads this to rewrite SKIPPED/FAILED -> XFAIL and PASSED -> XPASS,
+                        # since the unittest runner ignores pytest.mark.xfail on TestCase methods.
+                        existing_marks = list(getattr(fn, "pytestmark", []))
+                        _xfail_wrapper.pytestmark = existing_marks + [
+                            pytest.mark.xfail(strict=strict).mark
+                        ]
+                        # Copy per-variant tags onto wrapper so the hook can find them
+                        # via fn._spyre_method_tags / fn._oot_method_tags when resolving
+                        # tags for XFAIL/XPASS report lines.
+                        _xfail_wrapper._spyre_method_tags = getattr(
+                            fn, "_spyre_method_tags", []
+                        )
+                        _xfail_wrapper._oot_method_tags = getattr(
+                            fn, "_oot_method_tags", []
+                        )
+
+                        # Defensively remove __wrapped__ in case it was somehow inherited.
+                        # pytest walks __wrapped__ chains to resolve item.obj at collection
+                        # time — if present it would resolve to the original function,
+                        # losing our pytestmark.
+                        if hasattr(_xfail_wrapper, "__wrapped__"):
+                            del _xfail_wrapper.__wrapped__
+
+                        return _xfail_wrapper
+
                     setattr(
-                        cls,
-                        method_name,
-                        pytest.mark.xfail(strict=is_strict)(existing_fn),
+                        cls, method_name, _make_xfail_wrapper(existing_fn, is_strict)
                     )
 
         # Flush {method_name: [tags]} to sidecar for _XML_INJECT_PY.

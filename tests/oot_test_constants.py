@@ -1,5 +1,7 @@
 """
-Constants for the Spyre PyTorch test framework.
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
+
+Constants for the OOT PyTorch test framework.
 All string literals, default values, and dtype maps are here.
 """
 

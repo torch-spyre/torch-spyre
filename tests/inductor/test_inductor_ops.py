@@ -38,11 +38,13 @@ POINTWISE_UNARY_OPS_DICT = {
     "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
+    "sign": torch.sign,
     "sin": torch.sin,
     "tanh": torch.tanh,
 }
 
 POINTWISE_UNARY_OPS_FP32_DICT = {
+    "ceil": torch.ceil,
     "floor": torch.floor,
 }
 
@@ -538,6 +540,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_2": (2, cached_randn((12, 8, 25, 64))),
                 "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
             },
+        },
+        ("test_sub_scalar", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "sub_scalar_5": lambda x: torch.sub(x, 5.0),
+                "sub_scalar_neg": lambda x: torch.sub(x, -3.5),
+                "sub_scalar_zero": lambda x: torch.sub(x, 0.0),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),),
+                    ((67, 256),),
+                    ((67, 71, 256),),
+                ]
+            ),
+        },
+        ("test_sub_broadcast", "test_binary_op_cpu"): {
+            "ops_dict": {"sub": torch.sub},
+            "param_sets": {
+                "1d_2d": (
+                    cached_randn((256,)),
+                    cached_randn((67, 256)),
+                ),
+                "2d_3d": (
+                    cached_randn((71, 256)),
+                    cached_randn((67, 71, 256)),
+                ),
+                "scalar_broadcast": (
+                    cached_randn((1,)),
+                    cached_randn((67, 256)),
+                ),
+                "3d_4d": (
+                    cached_randn((12, 32, 64)),
+                    cached_randn((7, 12, 32, 64)),
+                ),
+            },
+        },
+        ("test_sub_alpha", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "sub_alpha_2": lambda a, b: torch.sub(a, b, alpha=2.0),
+                "sub_alpha_0.5": lambda a, b: torch.sub(a, b, alpha=0.5),
+                "sub_alpha_neg": lambda a, b: torch.sub(a, b, alpha=-1.0),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                ]
+            ),
         },
         (
             "test_alias_operands",
@@ -1131,6 +1181,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
+            "ops_dict": {
+                "ne": torch.ne,
+            },
+            "param_sets": {
+                # [1, 64] int64 non-contiguous (stride (64,1)) != scalar
+                "ne_1x64_int64_noncontig_eager": (
+                    torch.randint(0, 100, (1, 64), dtype=torch.int64).as_strided(
+                        (1, 64), (64, 1)
+                    ),
+                    0,
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
@@ -1243,6 +1307,68 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_0_3_1_2": ((2, 2, 256, 48), (0, 3, 1, 2)),
                 "4d_0_m2_m1_1": ((2, 48, 2, 256), (0, -2, -1, 1)),
                 "5d_0_2_3_4_1": ((2, 48, 2, 256, 265), (0, 2, 3, 4, 1)),
+            },
+        },
+        ("test_flatten", "test_flatten_cpu"): {
+            "param_sets": {
+                # 0D and 1D (identity cases)
+                "0d_scalar": (0, -1, torch.tensor(42, dtype=torch.float16)),
+                "1d_identity": (
+                    0,
+                    -1,
+                    torch.tensor([10, 20, 30, 40, 50], dtype=torch.float16),
+                ),
+                # 2D tensors
+                "2d_full": (
+                    0,
+                    -1,
+                    torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.float16),
+                ),
+                "2d_noop_dim0": (
+                    0,
+                    0,
+                    torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.float16),
+                ),
+                "2d_noop_dim1": (
+                    1,
+                    1,
+                    torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.float16),
+                ),
+                # 3D tensors - contiguous
+                "3d_full": (0, -1, cached_randn((2, 3, 4))),
+                "3d_leading": (0, 1, cached_randn((2, 3, 4))),
+                "3d_trailing": (1, 2, cached_randn((2, 3, 4))),
+                # 4D tensors - contiguous
+                "4d_full": (0, -1, cached_randn((2, 3, 4, 5))),
+                "4d_middle": (1, 2, cached_randn((2, 3, 4, 5))),
+                "4d_leading": (0, 2, cached_randn((2, 3, 4, 5))),
+                "4d_trailing": (1, 3, cached_randn((2, 3, 4, 5))),
+                # Negative dimensions
+                "3d_neg_dims": (-2, -1, cached_randn((2, 3, 4))),
+                "3d_neg_full": (-3, -1, cached_randn((2, 3, 4))),
+                "3d_mixed_dims": (-3, 2, cached_randn((2, 3, 4))),
+                # Non-contiguous tensors (after permute)
+                "3d_noncontig_partial": (
+                    1,
+                    2,
+                    torch.arange(24, dtype=torch.float16)
+                    .reshape(2, 3, 4)
+                    .permute(0, 2, 1),
+                ),
+                "3d_noncontig_full": (
+                    0,
+                    -1,
+                    torch.arange(24, dtype=torch.float16)
+                    .reshape(2, 3, 4)
+                    .permute(2, 0, 1),
+                ),
+                # Edge cases
+                "single_elem_1d": (0, -1, torch.ones((1,), dtype=torch.float16)),
+                "single_elem_2d": (0, -1, torch.ones((1, 1), dtype=torch.float16)),
+                "single_elem_3d": (0, -1, torch.ones((1, 1, 1), dtype=torch.float16)),
+                # Large tensor
+                "4d_large_middle": (1, 2, cached_randn((2, 8, 16, 32))),
+                "4d_large_full": (0, -1, cached_randn((2, 8, 16, 32))),
             },
         },
         (
@@ -3428,6 +3554,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt, torch.ne)
         self.compare_with_cpu(op, x, y, run_eager=eager_supported)
 
+    def test_cmp_scalar_int64_cpu(self, op, x, scalar):
+        # Test comparison ops with int64 tensors and scalar values.
+        self.compare_with_cpu(op, x, scalar, run_eager=True, run_compile=False)
+
     def test_linear_fn(self, x, weight, bias):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without
         self.compare_with_cpu(
@@ -3441,6 +3571,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_addmm_cpu(self, input, mat1, mat2):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
         self.compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
+
+    def test_matmul_tiled_y(self):
+        # Inspired by granite code that broke with no covering tests.
+        # GQA pattern: y is a 5D contiguous buffer from clone(expand(...))
+        # giving tiled host coords where the reduction dim decomposes as
+        # floor(...) and Mod(...) over a single loop variable.
+        B, H_KV, GQA, S, D = 2, 8, 4, 128, 128
+        H = H_KV * GQA
+
+        def fn(x, kv_cache):
+            y = kv_cache.view(B, S, H_KV, D)
+            y = y.permute(0, 2, 1, 3)
+            y = y.unsqueeze(2)
+            y = y.expand(-1, -1, GQA, -1, -1)
+            y = y.clone()
+            return torch.bmm(
+                x.reshape(B * H, S, D),
+                y.reshape(B * H, S, D).transpose(1, 2),
+            )
+
+        x = torch.randn(B, H, S, D, dtype=torch.float16)
+        kv = torch.randn(B, S * H_KV, D, dtype=torch.float16)
+        self.compare_with_cpu(fn, x, kv, atol=0.5, rtol=0.1)
+
+    def test_matmul_tiled_x(self):
+        # Inspired by granite code that broke with no covering tests.
+        # x is a 4D contiguous buffer [B,S,H,D] giving tiled host coords
+        # where the reduction dim decomposes as floor(...) and Mod(...)
+        # over a single flat loop variable.
+        B, S, H, D = 2, 128, 32, 128
+
+        def fn(x_base, y):
+            x = x_base.clone()
+            return torch.matmul(x.reshape(B, S, H * D), y)
+
+        x = torch.randn(B, S, H, D, dtype=torch.float16) * 0.01
+        y = torch.randn(H * D, H * D, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
+    def test_matmul_1d_view_x(self):
+        # x is a 1D buffer viewed as 2D: inductor keeps the 1D buffer and uses
+        # a compound index, so reduction var must be found via symbol-set arithmetic.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x.view(A, B) @ y
+
+        x = torch.rand(A * B, dtype=torch.float16) * 0.01
+        y = torch.rand(B, C, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
+    def test_matmul_1d_view_y(self):
+        # y is a 1D buffer viewed as 2D: same compound-index case but on y.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x @ y.view(B, C)
+
+        x = torch.rand(A, B, dtype=torch.float16) * 0.01
+        y = torch.rand(B * C, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
+
+    def test_matmul_1d_view_xy(self):
+        # Both x and y are 1D buffers viewed as 2D.
+        A, B, C = 64, 128, 256
+
+        def fn(x, y):
+            return x.view(A, B) @ y.view(B, C)
+
+        x = torch.rand(A * B, dtype=torch.float16) * 0.01
+        y = torch.rand(B * C, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
@@ -4072,6 +4274,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda input: torch.permute(input, dims),
             cached_randn(input_dims, dtype=torch.float16),
         )
+
+    def test_flatten_cpu(self, start_dim, end_dim, x):
+        """Test flatten operation with various dimension ranges."""
+        self.compare_with_cpu(lambda x: x.flatten(start_dim, end_dim), x)
 
     def test_dropout_functional(self, input, kwargs):
         self.compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)

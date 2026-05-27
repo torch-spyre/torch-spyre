@@ -24,8 +24,7 @@ jobs:
       - spyre_pf_x1
       - linux
       - image_torch_spyre
-    # increase timeout to 12 hours
-    timeout-minutes: 720
+    timeout-minutes: 60
     env:
       # The CI env var is very important.
       # GitHub actions automatically sets CI=true
@@ -50,6 +49,8 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
 
       - uses: ./.github/actions/gather-runner-info
 

@@ -1,7 +1,21 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
-import itertools
 from typing import Callable, Optional, Iterable, override
 from unittest import TestCase, expectedFailure
 from enum import Enum
@@ -11,11 +25,13 @@ from functools import wraps
 import torch
 from torch.utils._ordered_set import OrderedSet
 
-from torch_spyre._inductor.scratchpad import (
+from torch_spyre._inductor.scratchpad.allocator import (
     scratchpad_planning,
-    ScratchPadAllocator,
-    GreedyAllocationStrategy,
+    DefaultAllocator,
+    LifetimeBoundBuffer,
 )
+from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
+from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
 from torch_spyre._inductor import config
 
 # From scratchpad.py
@@ -70,9 +86,9 @@ class ReadWrites:
 
 @dataclass
 class Operation:
-    name: str
+    _opname: str
     inputs: list[str]
-    outputs: list[str]
+    output: str
     _buffer_registry: dict[str, "Buffer"]
 
     # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
@@ -82,13 +98,17 @@ class Operation:
     op_it_space_splits = None
     origin_node = None
     target = None
-    _opname = None
+    name = None
 
     def __post_init__(self):
         self.op_it_space_splits = []
         self.origin_node = self
         self.target = self
-        self._opname = self.name
+        self.name = self.output
+
+    @property
+    def outputs(self):
+        return [self.output]
 
     def get_read_writes(self) -> ReadWrites:
         # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
@@ -105,16 +125,15 @@ class Operation:
 
 
 def make_operations(
-    names_inputs_outputs: Iterable[tuple[str, str | list[str], str | list[str]]],
+    names_inputs_outputs: Iterable[tuple[str, str | list[str], str]],
     buffers: dict[str, Buffer],
 ) -> list[Operation]:
     result = []
-    for name, ins, outs in names_inputs_outputs:
+    for name, ins, out in names_inputs_outputs:
         if isinstance(ins, str):
             ins = [ins]
-        if isinstance(outs, str):
-            outs = [outs]
-        result.append(Operation(name, ins, outs, buffers))
+        assert isinstance(out, str)
+        result.append(Operation(name, ins, out, buffers))
     return result
 
 
@@ -206,101 +225,65 @@ class Pattern:
         return (list(inputs), outputs)
 
 
-class InstrumentedAllocator(ScratchPadAllocator):
-    def __init__(self, pattern: Pattern, lowering: "MockGraphLowering"):
-        super().__init__()
-        self.allocations: dict[str, int] = {}
-        # This overwrites the value set in the superclass constructor:
-        self.graph_lowering = lowering
-        self.inputs, self.outputs = pattern.determine_inputs_outputs()
-
-    @override
-    def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
-        return True
-
-    @override
-    def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
-        return True
-
-    @override
-    def allocate(self, tensor_name: str, addr: int):
-        if tensor_name in self.allocations:
-            # TODO: At this point we don't know where we are in terms of time / operations, so we
-            # can't record at what point in time the allocation happens. This is okay as long as we
-            # every buffer name can be uniquely allocated with a single address. In order to change
-            # this, we need to store allocations differently, and then modify the logic for
-            # measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to account for
-            # this. Also update TestExamplePattern.verify_actual_run to account for this.
-            assert self.allocations[tensor_name] == addr, (
-                f"Buffer {tensor_name} was already allocated at address "
-                f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
-                f" That is probably a good improvement, but it means this test needs to be "
-                f"adjusted."
-            )
-        self.allocations[tensor_name] = addr
-
-    @override
-    def mem_usage_by_op(
-        self,
-        op: Operation,
-        core_div_mismatch: dict[str, bool] = {},
-        release_next: list = [],
-    ) -> dict[str, dict[str, bool | int | str] | list[str]]:
-        # Returns a dict mapping each buffer name to a dict with keys "is_input" and "size".
-        # is_input is True if the buffer is an input to the op, and False otherwise. size is the
-        # size of the buffer.
-        result = {}
-        for tensor_name, is_input in itertools.chain(
-            ((tensor_name, True) for tensor_name in op.inputs),
-            ((tensor_name, False) for tensor_name in op.outputs),
-        ):
-            result[tensor_name] = {
-                "is_input": is_input,
-                "size": op._buffer_registry[tensor_name].size,
-                "core_div_mismatch": False,
-                "last_usage": tensor_name in release_next,
-            }
-
-        result["all_inputs"] = op.inputs
-        result["all_outputs"] = op.outputs
-        result["all_buf_used"] = op.inputs + op.outputs
-
-        return result
-
-    @override
-    def get_output_names(self) -> list[str]:
-        return self.outputs
-
-    @override
-    def is_graph_input(self, buffer: str) -> bool:
-        return buffer in self.inputs
-
-
 class MockGraphLowering:
     """This class impersonates V.graph."""
 
     def __init__(self, pattern: Pattern):
-        self.graph_input_names = pattern.determine_inputs_outputs()[0]
+        self.graph_input_names, self._output_names = pattern.determine_inputs_outputs()
         self.buffers = pattern.buffers
+        self.operations = pattern.operations
+
+    def get_output_names(self):
+        return self._output_names
 
     def get_buffer(self, buf: str) -> Buffer:
         return self.buffers[buf]
 
 
-class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
-    def __init__(
-        self,
-        pattern: Pattern,
-        alloc: InstrumentedAllocator,
-        lowering: MockGraphLowering,
-    ):
-        super().__init__(alloc, lowering)
+class InstrumentedAllocator(DefaultAllocator):
+    def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
         self.buffers = pattern.buffers
         self.operations = pattern.operations
+        layout_planning = GreedyLayoutSolver(AVAILABLE_LX_SIZE)
+        super().__init__(
+            layout_planning,
+            pre_optimization_passes=[
+                MockCloneInputNodesPass(layout_planning.limit, self)
+            ],
+        )
+        self.allocations: dict[str, int] = {}
+        self.graph_lowering = lowering
+        self.inputs, self.outputs = pattern.determine_inputs_outputs()
 
-    @override
-    def should_consider_op(self, op: Operation) -> bool:
+    def _op_output_good_for_lx_reuse(self, op: Operation) -> bool:
         return True
+
+    def _op_good_for_lx_inplace(self, op: Operation) -> bool:
+        return True
+
+    def _push_allocation(
+        self, graph: MockGraphLowering, buffers: list[LifetimeBoundBuffer]
+    ):
+        # push the allocation into the code generation
+        for b in buffers:
+            tensor_name = b.name
+            addr = b.address
+            if b.address is None:
+                continue
+            if tensor_name in self.allocations:
+                # TODO: At this point we don't know where we are in terms of time / operations, so we
+                # can't record at what point in time the allocation happens. This is okay as long as we
+                # every buffer name can be uniquely allocated with a single address. In order to change
+                # this, we need to store allocations differently, and then modify the logic for
+                # measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to account for
+                # this. Also update TestExamplePattern.verify_actual_run to account for this.
+                assert self.allocations[tensor_name] == addr, (
+                    f"Buffer {tensor_name} was already allocated at address "
+                    f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
+                    f" That is probably a good improvement, but it means this test needs to be "
+                    f"adjusted."
+                )
+            self.allocations[tensor_name] = addr
 
     def new_name(self, prefix: str, current_names: set[str]) -> str:
         candidate = prefix
@@ -310,13 +293,20 @@ class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
             i += 1
         return candidate
 
+
+class MockCloneInputNodesPass(CloneInputNodesPass):
+    def __init__(self, limit: int, allocator: "InstrumentedAllocator"):
+        super().__init__(limit)
+        self._allocator = allocator
+
     @override
-    def insert_op_after(
+    def _insert_op_after(
         self,
+        graph: MockGraphLowering,
         buf: Buffer,
         lowering_func: Callable,
         buf_users: dict,
-        operations: list[Operation],
+        operations: list,
     ) -> None:
         buf_index = [i for i, op in enumerate(operations) if buf.name in op.inputs]
         if not buf_index:
@@ -324,22 +314,25 @@ class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
                 f"Was asked to insert after {buf.name}, but couldn't find it"
             )
 
-        buffer_name = self.new_name("copy_buf", {buf for buf in self.buffers})
-        self.buffers[buffer_name] = Buffer(buffer_name, buf.size)
+        buffers = self._allocator.buffers
+        buffer_name = self._allocator.new_name("copy_buf", set(buffers))
+        buffers[buffer_name] = Buffer(buffer_name, buf.size)
 
-        op_name = self.new_name("copy_op", {op.name for op in self.operations})
+        op_name = self._allocator.new_name(
+            "copy_op", {op.name for op in self._allocator.operations}
+        )
         new_op = Operation(
             op_name,
             inputs=[buf.name],
             outputs=[buffer_name],
-            _buffer_registry=self.buffers,
+            _buffer_registry=buffers,
         )
 
         # The expected order in the list of operations is actually *before* the first operation
         # that uses buf.
-        self.operations.insert(buf_index[0], new_op)
+        self._allocator.operations.insert(buf_index[0], new_op)
 
-        for op in self.operations[buf_index[0] + 1 :]:
+        for op in self._allocator.operations[buf_index[0] + 1 :]:
             op.inputs = [
                 buffer_name if buf.name == input else input for input in op.inputs
             ]
@@ -561,9 +554,8 @@ class TestExamplePattern(TestCase):
         pattern_copy = copy.deepcopy(pattern)
         lowering = MockGraphLowering(pattern_copy)
         alloc = InstrumentedAllocator(pattern_copy, lowering)
-        strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc, lowering)
 
-        scratchpad_planning(pattern_copy.operations, strategy)
+        scratchpad_planning(lowering, alloc)
 
         # Verify that the currently implemented allocation is indeed valid
         self.verify_actual_run(pattern_copy, alloc)
@@ -715,9 +707,9 @@ class TestExamplePattern(TestCase):
 
         def op_tuples(i: int) -> list[tuple[str, str | list[str], str]]:
             return [
-                (f"op{i}_load", f"A{i}_HBM", f"A{i}"),
-                (f"op{i}_0", f"A{i}", f"B{i}"),
-                (f"op{i}_1", [f"A{i}", f"B{i}"], f"C{i}"),
+                (f"A{i}", f"A{i}_HBM", f"A{i}"),
+                (f"B{i}", f"A{i}", f"B{i}"),
+                (f"C{i}", [f"A{i}", f"B{i}"], f"C{i}"),
             ]
 
         ops = make_operations(
@@ -861,7 +853,10 @@ class TestExamplePattern(TestCase):
 
         op_spec = [
             [
-                (f"op{i}_load", f"S{i}_HBM", group),
+                *[
+                    (f"op{i}_{j}_load", f"S{i}_HBM", group[j])
+                    for j in range(len(group))
+                ],
                 *[(f"op{i}_{j}", group, f"C{i}_{j}") for j in range(4)],
             ]
             for i, group in enumerate(pattern)
@@ -879,22 +874,19 @@ class TestExamplePattern(TestCase):
 
         good_allocations = []
         for i, group in enumerate(pattern):
-            good_allocations.append(
-                [Allocation(buffer=f"S{i}_HBM", component=Component.HBM)]
-                + [
+            input_buffer = []
+            for buffer in group:
+                input_buffer.append(
                     Allocation(buffer=buffer, address=addresses_per_group[i][buffer])
-                    for buffer in group
-                ]
-            )
+                )
+                good_allocations.append(
+                    [Allocation(buffer=f"S{i}_HBM", component=Component.HBM)]
+                    + input_buffer
+                )
 
             for j in range(4):
                 good_allocations.append(
-                    [
-                        Allocation(
-                            buffer=buffer, address=addresses_per_group[i][buffer]
-                        )
-                        for buffer in group
-                    ]
+                    input_buffer
                     + [Allocation(buffer=f"C{i}_{j}", component=Component.HBM)]
                 )
 
@@ -1204,7 +1196,6 @@ class TestExamplePattern(TestCase):
     def test_verify_moe_mlp_pattern(self):
         self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
 
-    @usuallyExpectedFailure
     def test_moe_mlp_pattern(self):
         self.run_pattern(self.make_moe_mlp_pattern())
 

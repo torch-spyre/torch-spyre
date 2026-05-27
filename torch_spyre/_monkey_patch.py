@@ -231,3 +231,55 @@ def _patch_tensor_for_spyre():
         )
 
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
+    # ───────────────────FxGraph Cache Key Extension ───────────────────
+    # Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key
+    # preventing incorrect disk cache hits across process boundaries.
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_fx_graph_hash()
+
+
+def _patch_fx_graph_hash():
+    """
+    Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key.
+    """
+    import torch
+    from torch._inductor.codecache import FxGraphHashDetails
+    from torch._inductor.virtualized import V
+
+    if getattr(FxGraphHashDetails, "_spyre_hash_patched", False):
+        return
+
+    original_init = FxGraphHashDetails.__init__
+
+    def _spyre_init(self, gm, example_inputs, fx_kwargs, inputs_to_check):
+        # run original first — populates all standard hash fields
+        original_init(self, gm, example_inputs, fx_kwargs, inputs_to_check)
+
+        # V.get_real_inputs() returns real Spyre tensors with SpyreTensorLayout
+        # before they become FakeTensors (which have no layout by design)
+
+        try:
+            real_inputs = V.get_real_inputs()
+        except RuntimeError:
+            return
+
+        # extract layout from real tensors, fallback to example_inputs
+        spyre_layouts = []
+        # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
+        inputs_to_use = (
+            real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
+        )
+
+        for inp in inputs_to_use:
+            if isinstance(inp, torch.Tensor):
+                layout = inp.device_tensor_layout()
+                spyre_layouts.append(layout)
+            else:
+                spyre_layouts.append(None)
+
+        # self.spyre_layouts added as field on FxGraphHashDetails
+        # PyTorch pickles ALL fields → spyre_layouts automatically in hash
+        self.spyre_layouts = spyre_layouts
+
+    FxGraphHashDetails.__init__ = _spyre_init
+    FxGraphHashDetails._spyre_hash_patched = True

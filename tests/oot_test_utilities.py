@@ -1,5 +1,6 @@
 """
-spyre_test_utilities.py -- Utility functions for the torch-spyre OOT test framework.
+oot_test_utilities.py -- Utility functions for the OOT PyTorch test framework.
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
 
 """
 
@@ -18,9 +19,31 @@ try:
     import yaml
 except ImportError as _yaml_err:  # pragma: no cover
     raise ImportError(
-        "PyYAML is required for spyre_test_utilities. "
-        "Install it with: pip install pyyaml"
+        "PyYAML is required for oot_test_utilities. Install it with: pip install pyyaml"
     ) from _yaml_err
+
+import torch
+
+
+# ---------------------------------------------------------------------------
+# Device type helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_privateuse1_device_type() -> str:
+    """Return the backend name registered for the privateuse1 device slot.
+
+    torch._C._get_privateuse1_backend_name() returns e.g. "spyre" or whatever
+    name was passed to torch._register_device_module().  This is what
+    cls.device_type will be at test runtime inside PrivateUse1TestBase.
+
+    Falls back to "privateuse1" if no backend has been registered yet (e.g.
+    during import before the backend module is loaded).
+    """
+    try:
+        return torch._C._get_privateuse1_backend_name()
+    except Exception:
+        return "privateuse1"  # fallback if not registered yet
 
 
 """
@@ -38,12 +61,12 @@ def print_test_tags_oot(test_instance, op_tags: List[str] = []) -> None:
     at collection time with per-op tags available only at run time.
 
     Usage in a test method:
-        from spyre_test_utilities import print_test_tags_oot
+        from oot_test_utilities import print_test_tags_oot
         print_test_tags_oot(self, op_tags=op.op_tags)
     """
     method_name = test_instance._testMethodName
     _method_fn = getattr(test_instance.__class__, method_name, None)
-    _method_tags = getattr(_method_fn, "_spyre_method_tags", [])
+    _method_tags = getattr(_method_fn, "_oot_method_tags", [])
     _per_op_tags = [t for t in op_tags if t not in set(_method_tags)]
     _all_tags = _method_tags + _per_op_tags
     # Store for pytest_runtest_makereport hook to work without -s
@@ -59,14 +82,14 @@ def print_test_tags_oot(test_instance, op_tags: List[str] = []) -> None:
 # Provides YAML config merging for multi-config test runs.
 
 # Usage (Python):
-#     from spyre_test_utilities import merge_yaml_configs
+#     from oot_test_utilities import merge_yaml_configs
 
 #     merged_path = merge_yaml_configs(["config_a.yaml", "config_b.yaml"])
 #     # ... run tests ...
 #     os.unlink(merged_path)   # caller is responsible for cleanup
 
 # Usage (bash, via the CLI entry-point at the bottom):
-#     python3 spyre_test_utilities.py config_a.yaml config_b.yaml
+#     python3 oot_test_utilities.py config_a.yaml config_b.yaml
 #     # prints the path of the merged (temp) YAML to stdout
 
 
@@ -164,7 +187,7 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             incoming_mode = entry.get("unlisted_test_mode", "xfail")
             if existing["unlisted_test_mode"] != incoming_mode:
                 print(
-                    f"[spyre_merge] WARNING: conflicting unlisted_test_mode for "
+                    f"[oot_merge] WARNING: conflicting unlisted_test_mode for "
                     f"path '{path}': keeping '{existing['unlisted_test_mode']}', "
                     f"ignoring '{incoming_mode}'.",
                     file=sys.stderr,
@@ -205,7 +228,7 @@ def merge_yaml_configs(
     config_paths: Sequence[str | os.PathLike],
     *,
     output_dir: Optional[str | os.PathLike] = None,
-    prefix: str = "_spyre_merged_config_",
+    prefix: str = "_oot_merged_config_",
     suffix: str = ".yaml",
 ) -> str:
     """Merge multiple YAML test-suite configs into one temporary file.
@@ -321,9 +344,9 @@ def _cli() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog="spyre_test_utilities",
+        prog="oot_test_utilities",
         description=(
-            "Merge multiple torch-spyre YAML test configs into one temporary file.\n"
+            "Merge multiple OOT PyTorch YAML test configs into one temporary file.\n"
             "Prints the merged file path to stdout. The caller must delete it."
         ),
     )
@@ -352,7 +375,7 @@ def _cli() -> None:
     merged = merge_yaml_configs(args.configs, output_dir=args.output_dir)
     # Emit a human-readable note to stderr so it doesn't pollute the path.
     print(
-        f"[spyre_merge] Merged {len(args.configs)} config(s) -> {merged}",
+        f"[oot_merge] Merged {len(args.configs)} config(s) -> {merged}",
         file=sys.stderr,
     )
     # The path goes to stdout for shell capture.

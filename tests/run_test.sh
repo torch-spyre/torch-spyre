@@ -11,7 +11,7 @@
 #   bash run_test.sh configs/ extra.yaml -- [extra pytest args...]
 
 # When more than one YAML file is supplied the configs are merged in order via
-# spyre_test_utilities.py
+# oot_test_utilities.py
 #   - `files` entries with the same path are combined (tests deduplicated).
 #   - `global` list keys form a superset; identical items are deduplicated.
 #   - Conflicting scalar globals raise an error.
@@ -96,8 +96,8 @@ for _arg in "$@"; do
         if [[ ${#_dir_yamls[@]} -eq 0 ]]; then
             echo "WARNING: No YAML files found in directory: $_arg" >&2
         else
-            echo "[spyre_run] Expanded directory '$_arg' -> ${#_dir_yamls[@]} config(s):"
-            for _f in "${_dir_yamls[@]}"; do echo "[spyre_run]   $_f"; done
+            echo "[torch_oot_device_tests_run] Expanded directory '$_arg' -> ${#_dir_yamls[@]} config(s):"
+            for _f in "${_dir_yamls[@]}"; do echo "[torch_oot_device_tests_run]   $_f"; done
             YAML_CONFIGS+=("${_dir_yamls[@]}")
         fi
     elif [[ $_parsing_yamls -eq 1 && ( "$_arg" == *.yaml || "$_arg" == *.yml ) && -f "$_arg" ]]; then
@@ -128,30 +128,30 @@ if [[ ${#YAML_CONFIGS[@]} -eq 1 ]]; then
         exit 1
     fi
 
-    echo "[spyre_run] Using YAML config: $YAML_CONFIG"
+    echo "[torch_oot_device_tests_run] Using YAML config: $YAML_CONFIG"
 else
     # -----------------------------------------------------------------------
-    # Multi-config path -- merge via spyre_test_utilities.py
+    # Multi-config path -- merge via oot_test_utilities.py
     # -----------------------------------------------------------------------
-    echo "[spyre_run] Merging ${#YAML_CONFIGS[@]} YAML config(s):"
+    echo "[torch_oot_device_tests_run] Merging ${#YAML_CONFIGS[@]} YAML config(s):"
     for _c in "${YAML_CONFIGS[@]}"; do
-        echo "[spyre_run]   $_c"
+        echo "[torch_oot_device_tests_run]   $_c"
     done
 
     _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     _UTILITIES_PY=""
-    if [[ -f "${_script_dir}/spyre_test_utilities.py" ]]; then
-        _UTILITIES_PY="${_script_dir}/spyre_test_utilities.py"
+    if [[ -f "${_script_dir}/oot_test_utilities.py" ]]; then
+        _UTILITIES_PY="${_script_dir}/oot_test_utilities.py"
     else
         _first_config_dir="$(dirname "${YAML_CONFIGS[0]}")"
-        if [[ -f "${_first_config_dir}/spyre_test_utilities.py" ]]; then
-            _UTILITIES_PY="${_first_config_dir}/spyre_test_utilities.py"
+        if [[ -f "${_first_config_dir}/oot_test_utilities.py" ]]; then
+            _UTILITIES_PY="${_first_config_dir}/oot_test_utilities.py"
         fi
     fi
 
     if [[ -z "$_UTILITIES_PY" ]]; then
-        echo "ERROR: spyre_test_utilities.py not found beside run_test.sh or beside the first config." >&2
-        echo "       Place spyre_test_utilities.py in the same directory as run_test.sh." >&2
+        echo "ERROR: oot_test_utilities.py not found beside run_test.sh or beside the first config." >&2
+        echo "       Place oot_test_utilities.py in the same directory as run_test.sh." >&2
         exit 1
     fi
 
@@ -270,7 +270,7 @@ try:
         url = data.get('url', '')
         if url.startswith('file://'):
             candidate = url[len('file://'):]
-            if os.path.isfile(os.path.join(candidate, 'tests', 'spyre_test_base_common.py')):
+            if os.path.isfile(os.path.join(candidate, 'tests', 'oot_test_base_common.py')):
                 print(candidate)
 except Exception:
     pass
@@ -280,7 +280,7 @@ except Exception:
     if [[ -z "$TORCH_DEVICE_ROOT" ]]; then
         _found=$(python3 -c "
 import importlib.util, os
-spec = importlib.util.find_spec('spyre_test_base_common')
+spec = importlib.util.find_spec('oot_test_base_common')
 if spec:
     print(os.path.dirname(os.path.dirname(os.path.abspath(spec.origin))))
 " 2>/dev/null) || true
@@ -288,7 +288,7 @@ if spec:
     fi
 
     if [[ -z "$TORCH_DEVICE_ROOT" ]]; then
-        TORCH_DEVICE_ROOT=$(_walk_up_for_sentinel "$YAML_DIR" "tests/spyre_test_base_common.py" 2>/dev/null) || true
+        TORCH_DEVICE_ROOT=$(_walk_up_for_sentinel "$YAML_DIR" "tests/oot_test_base_common.py" 2>/dev/null) || true
     fi
 
     if [[ -z "$TORCH_DEVICE_ROOT" ]]; then
@@ -300,14 +300,14 @@ if spec:
     fi
 fi
 export TORCH_DEVICE_ROOT
-export TORCH_SPYRE_ROOT="$TORCH_DEVICE_ROOT"
-echo "[spyre_run]   TORCH_DEVICE_ROOT=$TORCH_DEVICE_ROOT"
+export TORCH_OOT_ROOT="$TORCH_DEVICE_ROOT"
+echo "[torch_oot_device_tests_run]   TORCH_OOT_ROOT=$TORCH_DEVICE_ROOT"
 
 # ---------------------------------------------------------------------------
 # 4. Export all framework environment variables
 # ---------------------------------------------------------------------------
 export PYTORCH_TESTING_DEVICE_ONLY_FOR="privateuse1"
-export TORCH_TEST_DEVICES="${TORCH_DEVICE_ROOT}/tests/spyre_test_base_common.py"
+export TORCH_TEST_DEVICES="${TORCH_DEVICE_ROOT}/tests/oot_test_base_common.py"
 export PYTORCH_TEST_CONFIG="$YAML_CONFIG"
 
 _spyre_tests_path="${TORCH_DEVICE_ROOT}/tests"
@@ -317,7 +317,7 @@ case ":${PYTHONPATH:-}:" in
 esac
 
 echo ""
-echo "[spyre_run] Environment set:"
+echo "[torch_oot_device_tests_run] Environment set:"
 echo "  TORCH_ROOT                      = $TORCH_ROOT"
 echo "  TORCH_DEVICE_ROOT               = $TORCH_DEVICE_ROOT"
 echo "  PYTORCH_TESTING_DEVICE_ONLY_FOR = $PYTORCH_TESTING_DEVICE_ONLY_FOR"
@@ -336,7 +336,7 @@ _extract_file_paths_from_yaml() {
         | sed '/^[[:space:]]*$/d'
 }
 
-echo "[spyre_run] Parsing YAML for test file paths..."
+echo "[torch_oot_device_tests_run] Parsing YAML for test file paths..."
 RAW_PATHS=()
 while IFS= read -r line; do
     RAW_PATHS+=("$line")
@@ -347,7 +347,7 @@ if [[ ${#RAW_PATHS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-echo "[spyre_run] Found ${#RAW_PATHS[@]} path entry(s):"
+echo "[torch_oot_device_tests_run] Found ${#RAW_PATHS[@]} path entry(s):"
 for p in "${RAW_PATHS[@]}"; do
     echo "  $p"
 done
@@ -396,7 +396,7 @@ if [[ ${#TEST_FILES[@]} -eq 0 ]]; then
 fi
 
 echo ""
-echo "[spyre_run] Resolved test file(s):"
+echo "[torch_oot_device_tests_run] Resolved test file(s):"
 for f in "${TEST_FILES[@]}"; do
     echo "  $f"
 done
@@ -724,12 +724,12 @@ WRAPPER_FILES=()
 _cleanup_wrappers() {
     for wf in "${WRAPPER_FILES[@]+"${WRAPPER_FILES[@]}"}"; do
         [[ -f "$wf" ]] && rm -f "$wf" && \
-            echo "[spyre_run] Cleaned up wrapper: $wf"
+            echo "[torch_oot_device_tests_run] Cleaned up wrapper: $wf"
     done
     # Remove merged config temp file (only if we created it)
     if [[ $MERGED_CONFIG_IS_TEMP -eq 1 && -n "${YAML_CONFIG:-}" && -f "$YAML_CONFIG" ]]; then
         rm -f "$YAML_CONFIG"
-        echo "[spyre_run] Removed merged temp config: $YAML_CONFIG"
+        echo "[torch_oot_device_tests_run] Removed merged temp config: $YAML_CONFIG"
     fi
     # Remove marker sidecar JSON written by TorchTestBase.instantiate_test.
     # Normally deleted by _XML_INJECT_PY after injection, but when --junit-xml
@@ -737,7 +737,7 @@ _cleanup_wrappers() {
     local _sidecar="${YAML_CONFIG}.markers.json"
     if [[ -f "$_sidecar" ]]; then
         rm -f "$_sidecar"
-        echo "[spyre_run] Cleaned up marker sidecar: $_sidecar"
+        echo "[torch_oot_device_tests_run] Cleaned up marker sidecar: $_sidecar"
     fi
 }
 trap _cleanup_wrappers EXIT
@@ -753,7 +753,7 @@ generate_wrapper_if_needed() {
 
     local result
     if ! result=$(python3 -c "$_ANALYZER_PY" "$test_file" 2>/dev/null); then
-        echo "[spyre_run] WARNING: could not analyze $test_file -- running as-is" >&2
+        echo "[torch_oot_device_tests_run] WARNING: could not analyze $test_file -- running as-is" >&2
         return 0
     fi
 
@@ -762,7 +762,7 @@ generate_wrapper_if_needed() {
 import json,sys; d=json.load(sys.stdin); print(d.get('error',''))
 " 2>/dev/null) || true
     if [[ -n "$err" ]]; then
-        echo "[spyre_run] WARNING: parse error in $test_file: $err -- running as-is" >&2
+        echo "[torch_oot_device_tests_run] WARNING: parse error in $test_file: $err -- running as-is" >&2
         return 0
     fi
 
@@ -798,11 +798,11 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['needs_cleanup']))
     [[ -n "$cleanup_str" ]] && read -r -a CLEANUP_CLASSES <<< "$cleanup_str"
     # Warn about plain classes -- they are safe only when YAML skips them.
     if [[ ${#PLAIN_CLASSES[@]} -gt 0 ]]; then
-        echo "[spyre_run] NOTE: the following classes have no 'device' arg in their"
-        echo "[spyre_run]       test methods. They are safe under mode:skip but will"
-        echo "[spyre_run]       fail at runtime if listed as mandatory_success/xfail:"
+        echo "[torch_oot_device_tests_run] NOTE: the following classes have no 'device' arg in their"
+        echo "[torch_oot_device_tests_run]       test methods. They are safe under mode:skip but will"
+        echo "[torch_oot_device_tests_run]       fail at runtime if listed as mandatory_success/xfail:"
         for cls in "${PLAIN_CLASSES[@]}"; do
-            echo "[spyre_run]         $cls"
+            echo "[torch_oot_device_tests_run]         $cls"
         done
     fi
 
@@ -813,23 +813,23 @@ import json,sys; d=json.load(sys.stdin); print(' '.join(d['needs_cleanup']))
     wrapper_path="${original_dir}/${original_stem}__oot_wrapper.py"
     # Report uncontrolled classes (never instantiated upstream at all)
     if [[ ${#UNCONTROLLED_CLASSES[@]} -gt 0 ]]; then
-        echo "[spyre_run] Injecting instantiate_device_type_tests for uncontrolled classes in: $(basename "$test_file")"
+        echo "[torch_oot_device_tests_run] Injecting instantiate_device_type_tests for uncontrolled classes in: $(basename "$test_file")"
         for cls in "${UNCONTROLLED_CLASSES[@]}"; do
-            echo "[spyre_run]   -> $cls"
+            echo "[torch_oot_device_tests_run]   -> $cls"
         done
     fi
     # Report restricted classes (instantiated upstream with only_for, excluding spyre)
     if [[ ${#RESTRICTED_CLASSES[@]} -gt 0 ]]; then
-        echo "[spyre_run] Re-injecting instantiate_device_type_tests (dropping only_for) for restricted classes in: $(basename "$test_file")"
+        echo "[torch_oot_device_tests_run] Re-injecting instantiate_device_type_tests (dropping only_for) for restricted classes in: $(basename "$test_file")"
         for cls in "${RESTRICTED_CLASSES[@]}"; do
-            echo "[spyre_run]   -> $cls  (upstream: only_for=... excluded privateuse1)"
+            echo "[torch_oot_device_tests_run]   -> $cls  (upstream: only_for=... excluded privateuse1)"
         done
     fi
 
     local conftest_path
     conftest_path="${original_dir}/__oot_conftest_${original_stem}.py"
 
-    echo "[spyre_run] Generating wrapper: $(basename "$wrapper_path")"
+    echo "[torch_oot_device_tests_run] Generating wrapper: $(basename "$wrapper_path")"
     # Build the per-class injection block first (pure bash, no heredoc nesting issue).
     # All classes use _pre_import_classes which is populated before the star-import.
     local injection_block=""
@@ -894,7 +894,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
 # Ensure the spyre tests directory is on sys.path before any torch imports.
 # torch.testing._internal.common_device_type uses runpy to load
-# TORCH_TEST_DEVICES (spyre_test_base_common.py), which imports spyre_*
+# TORCH_TEST_DEVICES (oot_test_base_common.py), which imports spyre_*
 # modules.  Those modules must be findable on sys.path at that point.
 # PYTHONPATH is set by run_test.sh but Python only applies it at interpreter
 # startup -- subsequent imports don't re-read it, so we inject it explicitly.
@@ -1077,18 +1077,18 @@ CONFTEST_EOF
 # 10. Clean up any stale wrappers from previous crashed/interrupted runs
 #     before generating new ones, so pytest never picks up an old wrapper.
 # ---------------------------------------------------------------------------
-echo "[spyre_run] Cleaning up any stale OOT wrappers from previous runs..."
+echo "[torch_oot_device_tests_run] Cleaning up any stale OOT wrappers from previous runs..."
 for test_file in "${TEST_FILES[@]}"; do
     original_dir="$(dirname "$test_file")"
     original_stem="$(basename "$test_file" .py)"
     stale_wrapper="${original_dir}/${original_stem}__oot_wrapper.py"
     stale_conftest="${original_dir}/__oot_conftest_${original_stem}.py"
     if [[ -f "$stale_wrapper" ]]; then
-        echo "[spyre_run]   Removing stale wrapper: $stale_wrapper"
+        echo "[torch_oot_device_tests_run]   Removing stale wrapper: $stale_wrapper"
         rm -f "$stale_wrapper"
     fi
     if [[ -f "$stale_conftest" ]]; then
-        echo "[spyre_run]   Removing stale conftest: $stale_conftest"
+        echo "[torch_oot_device_tests_run]   Removing stale conftest: $stale_conftest"
         rm -f "$stale_conftest"
     fi
 done
@@ -1096,7 +1096,7 @@ done
 # ---------------------------------------------------------------------------
 # 11. Build the final run list (original or wrapper per file)
 # ---------------------------------------------------------------------------
-echo "[spyre_run] Checking for uncontrolled/restricted TestCase classes..."
+echo "[torch_oot_device_tests_run] Checking for uncontrolled/restricted TestCase classes..."
 echo ""
 
 RUN_FILES=()
@@ -1219,7 +1219,7 @@ try:
 except OSError:
     pass
 
-print(f"[spyre_run] Tags injected into XML: {xml_path}", flush=True)
+print(f"[torch_oot_device_tests_run] Tags injected into XML: {xml_path}", flush=True)
 '
 
 OVERALL_EXIT=0
@@ -1313,7 +1313,7 @@ merged = (
     + "</testsuite></testsuites>"
 )
 Path(out_path).write_text(merged)
-print(f"[spyre_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
+print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
 # ---------------------------------------------------------------------------
@@ -1343,7 +1343,7 @@ _run_pytest_isolated() {
             fi
             # Use torchrun for distributed tests
             _NPROC="${AIU_WORLD_SIZE}"
-            echo "[spyre_run] Running distributed test with torchrun (nproc=$_NPROC)"
+            echo "[torch_oot_device_tests_run] Running distributed test with torchrun (nproc=$_NPROC)"
 
             # Set environment variables for split_output.sh
             export _LOGDIR=/tmp/pytest-torch-spyre-dist
@@ -1359,7 +1359,7 @@ _run_pytest_isolated() {
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
-            echo "[spyre_run] Running serial test"
+            echo "[torch_oot_device_tests_run] Running serial test"
             # Regular pytest for non-distributed tests
             python3 -m pytest "$_base" "${_args[@]}"
             echo $? > "$_exit_tmp"
@@ -1401,17 +1401,17 @@ _run_xdist_fallback() {
     local _extra=("$@")
 
     echo ""
-    echo "[spyre_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
-    echo "[spyre_run]     File: $_orig"
-    echo "[spyre_run]     Each test runs in its own worker; crashes are contained."
+    echo "[torch_oot_device_tests_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
+    echo "[torch_oot_device_tests_run]     File: $_orig"
+    echo "[torch_oot_device_tests_run]     Each test runs in its own worker; crashes are contained."
     echo ""
 
     # Check pytest-xdist is available before proceeding.
     if ! python3 -m pytest --co -q --no-header -p xdist /dev/null &>/dev/null 2>&1; then
         if ! python3 -c "import xdist" 2>/dev/null; then
-            echo "[spyre_run] WARNING: pytest-xdist not installed — cannot use -n1 fallback." >&2
-            echo "[spyre_run]          Install with: pip install pytest-xdist" >&2
-            echo "[spyre_run]          Skipping remaining tests in: $_orig" >&2
+            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — cannot use -n1 fallback." >&2
+            echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
+            echo "[torch_oot_device_tests_run]          Skipping remaining tests in: $_orig" >&2
             [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
             return
         fi
@@ -1427,7 +1427,7 @@ _run_xdist_fallback() {
         _xexit=$(< "$_exit_tmp")
         rm -f "$_exit_tmp"
     else
-        echo "[spyre_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
+        echo "[torch_oot_device_tests_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
     fi
 
     # Propagate test failures from the xdist fallback run.
@@ -1451,9 +1451,9 @@ for i in "${!RUN_FILES[@]}"; do
 
     echo "========================================================================"
     if [[ "$run_file" != "$original_file" ]]; then
-        echo "[spyre_run] Running (via OOT wrapper): $original_file"
+        echo "[torch_oot_device_tests_run] Running (via OOT wrapper): $original_file"
     else
-        echo "[spyre_run] Running: $run_file"
+        echo "[torch_oot_device_tests_run] Running: $run_file"
     fi
     echo "========================================================================"
 
@@ -1513,7 +1513,7 @@ for i in "${!RUN_FILES[@]}"; do
 
         if [[ $_probe_exit -eq 5 ]]; then
             # 0 tests match this marker in this file — strip -m from args.
-            echo "[spyre_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
+            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
             _ARGS_NO_M=()
             _skip_m=0
             for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
@@ -1553,7 +1553,7 @@ for i in "${!RUN_FILES[@]}"; do
     else
         # Subshell died before writing the exit code (segfault, OOM, SIGKILL).
         _exit=139
-        echo "[spyre_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
+        echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
     fi
 
     # Post-process XML to inject YAML tags as <properties>.
@@ -1585,14 +1585,14 @@ for i in "${!RUN_FILES[@]}"; do
             ;;
         5)
             # No tests collected — warn but do not fail the overall run.
-            echo "[spyre_run] WARNING: no tests collected for $original_file" >&2
+            echo "[torch_oot_device_tests_run] WARNING: no tests collected for $original_file" >&2
             ;;
         127)
-            echo "[spyre_run] FATAL: python3 or pytest not found (exit 127) for $original_file" >&2
+            echo "[torch_oot_device_tests_run] FATAL: python3 or pytest not found (exit 127) for $original_file" >&2
             OVERALL_EXIT=$_exit
             ;;
         130)
-            echo "[spyre_run] FATAL: interrupted (exit 130) — aborting run." >&2
+            echo "[torch_oot_device_tests_run] FATAL: interrupted (exit 130) — aborting run." >&2
             OVERALL_EXIT=$_exit
             # Propagate immediately; no point continuing after Ctrl-C.
             break
@@ -1604,7 +1604,7 @@ for i in "${!RUN_FILES[@]}"; do
             # worker is caught by the xdist controller and the remaining tests
             # continue.  --collect-only is not used: the same process that crashes
             # during execution often also crashes during collection.
-            echo "[spyre_run] WARNING: pytest exited with signal (code $_exit) for $original_file" >&2
+            echo "[torch_oot_device_tests_run] WARNING: pytest exited with signal (code $_exit) for $original_file" >&2
 
             # Strip --junit-xml from _FILE_PYTEST_ARGS; _run_xdist_fallback
             # re-adds _SHARD_XML itself so it owns the XML output path.
@@ -1641,7 +1641,7 @@ if [[ -n "$_FINAL_XML_PATH" && ${#_XML_SHARDS[@]} -gt 0 ]]; then
     if [[ ${#_existing_shards[@]} -eq 1 ]]; then
         # Single file run: just rename the shard, no merge needed.
         mv "${_existing_shards[0]}" "$_FINAL_XML_PATH"
-        echo "[spyre_run] Single XML shard moved to: $_FINAL_XML_PATH"
+        echo "[torch_oot_device_tests_run] Single XML shard moved to: $_FINAL_XML_PATH"
     elif [[ ${#_existing_shards[@]} -gt 1 ]]; then
         python3 -c "$_XML_MERGE_PY" "$_FINAL_XML_PATH" "${_existing_shards[@]}" || true
         # Clean up shards after successful merge.
@@ -1649,10 +1649,10 @@ if [[ -n "$_FINAL_XML_PATH" && ${#_XML_SHARDS[@]} -gt 0 ]]; then
             rm -f "$_s"
         done
     else
-        echo "[spyre_run] WARNING: No XML shards found to merge." >&2
+        echo "[torch_oot_device_tests_run] WARNING: No XML shards found to merge." >&2
     fi
 fi
 
 echo ""
-echo "[spyre_run] Done. Overall exit code: $OVERALL_EXIT"
+echo "[torch_oot_device_tests_run] Done. Overall exit code: $OVERALL_EXIT"
 exit $OVERALL_EXIT

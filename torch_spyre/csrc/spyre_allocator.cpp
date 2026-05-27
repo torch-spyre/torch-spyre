@@ -122,7 +122,7 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt);
+                                      std::nullopt, flex::MemoryType::Tensor);
   return SpyreAllocator::allocate(nbytes, directive);
 }
 
