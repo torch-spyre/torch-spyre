@@ -240,6 +240,7 @@ def _make_sdsc_spec(
         allocation = {"hbm": start_address}
     tensor = SDSCArgs(
         layout="A",
+        dim_order=[s],
         data_format=_FP16,
         scales={s: 1},
         strides={s: device_stride},
@@ -861,6 +862,7 @@ class TestTiledByteStride(unittest.TestCase):
         s = Symbol("s")
         tensor = SDSCArgs(
             layout="A",
+            dim_order=[s],
             data_format=_FP16,
             scales={s: 1},
             strides={s: 128},
@@ -877,6 +879,7 @@ class TestTiledByteStride(unittest.TestCase):
         s = Symbol("s")
         tensor = SDSCArgs(
             layout="A",
+            dim_order=[s],
             data_format=_FP16,
             scales={s: 1},
             strides={s: 512},
@@ -893,6 +896,7 @@ class TestTiledByteStride(unittest.TestCase):
         s = Symbol("s")
         tensor = SDSCArgs(
             layout="A",
+            dim_order=[s],
             data_format=_FP16,
             scales={s: 1},
             strides={s: 1},
@@ -1013,6 +1017,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         core_id = Symbol("core_id")
         tensor = SDSCArgs(
             layout="A",
+            dim_order=[s],
             data_format=_FP16,
             scales={s: 1},
             strides={s: 128},
