@@ -92,7 +92,9 @@ def unique_randn_along_dim(
         min_val: Minimum value in the range
         max_val: Maximum value in the range
         dtype: Target data type (torch.float16, torch.float32, or integer types)
-        seed: Random seed for reproducibility
+        seed: Optional integer seed. When given, the generator is seeded with
+            this value. When omitted, a stable seed is derived from the other
+            arguments via SHA-256 so results are identical across processes.
         warn_precision: If True, warn about potential float16 precision issues
 
     Returns:
@@ -124,7 +126,10 @@ def unique_randn_along_dim(
     """
 
     if seed is not None:
-        torch.random.manual_seed(seed)
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+    else:
+        gen = _make_generator(shape, dim, min_val, max_val, dtype)
 
     # Check if dtype is an integer type
     is_integer_dtype = dtype in (
@@ -182,10 +187,12 @@ def unique_randn_along_dim(
         # Generate globally unique values
         intermediate_dtype = torch.int64 if is_integer_dtype else torch.float32
         if is_integer_dtype:
-            unique_vals = torch.randperm(unique_size, dtype=torch.int64)
+            unique_vals = torch.randperm(unique_size, dtype=torch.int64, generator=gen)
             scaled = min_val + (unique_vals * value_range) // unique_size
         else:
-            unique_vals = torch.randperm(unique_size, dtype=torch.float32)
+            unique_vals = torch.randperm(
+                unique_size, dtype=torch.float32, generator=gen
+            )
             scaled = min_val + (unique_vals / unique_size) * value_range
 
         # Reshape to target shape and convert to target dtype
@@ -263,10 +270,14 @@ def unique_randn_along_dim(
             # Generate unique values
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
 
             # Compute multi-dimensional index for this slice
@@ -286,10 +297,14 @@ def unique_randn_along_dim(
         for i in range(num_slices):
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
 
@@ -306,10 +321,14 @@ def unique_randn_along_dim(
         for i in range(num_slices):
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
         # Reshape and permute back
