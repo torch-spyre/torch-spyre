@@ -33,7 +33,11 @@ permissions:
 jobs:
   ingest:
     name: Ingest XML -> ClickHouse
-    runs-on: ubuntu-latest
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
     timeout-minutes: 15
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
