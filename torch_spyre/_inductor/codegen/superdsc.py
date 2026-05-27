@@ -511,7 +511,7 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
-def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
+def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
 
@@ -606,26 +606,47 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
             sdsc_iteration_space, dim_splits, num_cores
         )
 
-    return SDSCSpec(
-        opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
-        execution_unit="pt" if is_matmul else "sfp",
-        data_format=op_spec.args[
-            0
-        ].device_dtype,  # TODO: op_spec needs operation data format
-        num_inputs=num_inputs,
-        iteration_space=sdsc_iteration_space,
-        num_cores=num_cores,
-        work_slices=work_slices,
-        core_id_to_work_slice=core_id_to_work_slice,
-        padding=padding,
-        layouts=layouts,
-        args=args,
-        constants=constants,
-        coordinate_masking=coordinate_masking,
+    return (
+        SDSCSpec(
+            opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
+            execution_unit="pt" if is_matmul else "sfp",
+            data_format=op_spec.args[
+                0
+            ].device_dtype,  # TODO: op_spec needs operation data format
+            num_inputs=num_inputs,
+            iteration_space=sdsc_iteration_space,
+            num_cores=num_cores,
+            work_slices=work_slices,
+            core_id_to_work_slice=core_id_to_work_slice,
+            padding=padding,
+            layouts=layouts,
+            args=args,
+            constants=constants,
+            coordinate_masking=coordinate_masking,
+        ),
+        symbol_mapping,
     )
 
 
-def compile_op_spec(idx: int, op_spec: OpSpec) -> Any:
-    sdsc_spec = parse_op_spec(op_spec)
+def compile_op_spec(
+    idx: int,
+    op_spec: OpSpec,
+    symbols: list[int],
+    symbol_id_offset: int = 0,
+    use_symbols: bool = False,
+) -> tuple[Any, list[int], list[dict]]:
+    sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    return generate_sdsc(idx, sdsc_spec)
+    # Translate tiled_symbols from OpSpec's inductor symbols to the renamed
+    # SDSC symbols via the same mapping used to build sdsc_spec.
+    tiled_symbols = [
+        symbol_mapping[s] for s in op_spec.tiled_symbols if s in symbol_mapping
+    ]
+    return generate_sdsc(
+        idx,
+        sdsc_spec,
+        symbols,
+        symbol_id_offset,
+        tiled_symbols=tiled_symbols,
+        use_symbols=use_symbols,
+    )
