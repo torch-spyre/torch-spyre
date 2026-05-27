@@ -464,6 +464,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     # Padding
                     ((2, 55, 2), (2, 2, 99)),
                     ((2, 99, 65), (2, 65, 55)),
+                    # Previous fail cases
+                    # issue 502
+                    ((32, 1, 2880), (32, 2880, 2880)),
+                    # issue 1349
+                    ((44, 1, 2880), (44, 2880, 2880)),
+                    ((256, 1, 128), (256, 128, 512)),
                 ],
                 rand_type="xavier",
             ),
