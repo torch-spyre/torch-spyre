@@ -53,11 +53,20 @@ jobs:
       #   CLICKHOUSE_PASS   the password
       #   CLICKHOUSE_DB     e.g. spyre
       # ---------------------------------------------------------------------------
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+
+      # DEV INSTANCE
+      # CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      # CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      # CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      # CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      # CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+
+      # PROD INSTANCE
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -165,11 +174,12 @@ jobs:
             --triggered-at "${TRIGGERING_AT}" \
             --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}"
         env:
-          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+          # PROD INSTANCE
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
       - name: Summary
         if: always()
