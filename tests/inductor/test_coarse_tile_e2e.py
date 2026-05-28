@@ -432,14 +432,14 @@ class TestCoarseTileEndToEnd(InductorTestCase):
 
 
 # ===========================================================================
-# Unrolled loop execution tests (bundle_hbm_symbols=False)
+# Unrolled loop execution tests (unroll_loops=True)
 # ===========================================================================
 
 
 class TestCoarseTileUnrollEndToEnd(InductorTestCase):
-    """Tests for coarse tiling with loop unrolling (bundle_hbm_symbols=False).
+    """Tests for coarse tiling with loop unrolling (unroll_loops=True).
 
-    When bundle_hbm_symbols=False, LoopSpec nodes are fully unrolled before
+    When unroll_loops=True, LoopSpec nodes are fully unrolled before
     generate_bundle so no scf.for is emitted.  Each iteration becomes an
     independent OpSpec with concrete per-iteration HBM addresses.
     """
@@ -457,11 +457,11 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
         }
     )
     def test_unrolled_source_calls_sdsc(self):
-        """Nested K=2 × M=4 loop with bundle_hbm_symbols=False compiles cleanly.
+        """Nested K=2 × M=4 loop with unroll_loops=True compiles cleanly.
 
         The generated wrapper passes a LoopSpec to async_compile.sdsc().
         SpyreAsyncCompile.sdsc() calls unroll_loop_specs internally, replacing
@@ -513,7 +513,7 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
             "sencores": 1,
         }
     )
@@ -585,7 +585,7 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m2,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
             "sencores": 1,
         }
     )
@@ -662,7 +662,7 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
         {
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_all_k4,
-            "bundle_hbm_symbols": False,
+            "unroll_loops": True,
             "sencores": 1,
         }
     )
