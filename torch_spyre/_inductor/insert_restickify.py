@@ -163,6 +163,9 @@ def insert_restickify_on_node_inputs(
         operations.remove(restick_buff)
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
+        # Propagate hints from consumer so the restickify op joins the same group.
+        if hasattr(op, "spyre_hints"):
+            restick_buff.spyre_hints = op.spyre_hints
 
     # Patch inner_fn once with the full name_map covering all restickified args.
     orig_inner = op.data.inner_fn

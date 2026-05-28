@@ -79,6 +79,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("coarse_tile")
@@ -150,8 +151,8 @@ def insert_tiling_propagation(
 ) -> None:
     """Insert full-sized buffers and copy/mutation ops for tiled ops.
 
-    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, tiled
-    dims that fall in the reduction_ranges index range raise RuntimeError.
+    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, matrix
+    multiply (batchmatmul) and tiled reduction dims raise RuntimeError.
 
     For each eligible ComputedBuffer in a tiling group, if its result is
     consumed by any operation outside the loop (different loop_group_id or
@@ -184,11 +185,20 @@ def insert_tiling_propagation(
 def _check_reduction_tiling_safety(op: ComputedBuffer) -> None:
     """Raise RuntimeError for unsupported Reduction-in-loop configurations.
 
-    Rejects any tiled dim that falls in the reduction_ranges index range — the
-    accumulation-buffer logic for a tiled reduction dim is not yet implemented.
+    Two cases are rejected:
+    1. Matrix multiply (batchmatmul) inside a tiling loop — not supported.
+    2. Any tiled dim that falls in the reduction_ranges index range — the
+       accumulation-buffer logic for a tiled reduction dim is not yet
+       implemented.
     """
     data = op.data
     assert isinstance(data, Reduction)
+
+    if data.reduction_type == BATCH_MATMUL_OP:
+        raise RuntimeError(
+            f"coarse_tile: matrix multiply op {op.get_name()!r} inside a "
+            "tiling loop is not supported."
+        )
 
     n_output_dims = len(data.ranges)
     loop_tiled_dims: list[list[int]] = getattr(op, "loop_tiled_dims", [])
@@ -238,24 +248,11 @@ def _propagate_tiled_op(
     # so it doesn't split the group's contiguous run in the operations list.
     outer_key = loop_group_id[0]
     group_start_idx = next(
-        (
-            i
-            for i, o in enumerate(operations)
-            if isinstance(o, ComputedBuffer)
-            and getattr(o, "loop_group_id", (None,))[0] == outer_key
-        ),
-        None,
+        i
+        for i, o in enumerate(operations)
+        if isinstance(o, ComputedBuffer)
+        and getattr(o, "loop_group_id", (None,))[0] == outer_key
     )
-    if group_start_idx is None:
-        raise RuntimeError(
-            f"coarse_tile: could not find any operation in operations with "
-            f"outer loop_group_id={outer_key!r} while propagating {buf_name!r}. "
-            f"This likely means the op was removed from the operations list by a "
-            f"prior _allocate_full_buffer call (operations.remove() matched the "
-            f"wrong object due to equality vs identity). "
-            f"ops in operations with loop_group_id set: "
-            f"{[(o.get_name(), getattr(o, 'loop_group_id', None)) for o in operations if isinstance(o, ComputedBuffer) and getattr(o, 'loop_group_id', None) is not None]}"
-        )
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
@@ -366,10 +363,6 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
     ranges by multiplying each tiled dimension back by its loop_count.
     """
     full_ranges = list(op.data.ranges)
-    hints = getattr(op, "spyre_hints", [])
-    if hints and all(h.range_size == 0 for h in hints):
-        # Broadcast sentinel: ranges were never divided, already full size.
-        return full_ranges
     loop_count: list[Expr] = op.loop_count
     loop_tiled_dims: list[list[int]] = op.loop_tiled_dims
     for count, dims in zip(loop_count, loop_tiled_dims):
@@ -465,18 +458,8 @@ def _allocate_full_buffer(
     )
 
     # Splice into operations at the correct position.
-    # Use identity (not ==) to avoid removing a different op that compares equal.
-    old_idx = next(i for i, o in enumerate(operations) if o is full_buf)
-    operations.pop(old_idx)
-    if old_idx < insert_at_idx:
-        insert_at_idx -= 1
+    operations.remove(full_buf)
     operations.insert(insert_at_idx, full_buf)
-
-    # Assign operation_name so get_operation_name() doesn't assert.
-    if full_buf.operation_name is None:
-        op_name = V.graph.qualify_name(f"op{len(V.graph.operations)}")
-        V.graph.name_to_op[op_name] = full_buf
-        full_buf.operation_name = op_name
 
     return full_buf
 
@@ -520,10 +503,6 @@ def _insert_copy_op(
     copy_buf.loop_tiled_dims = tiled_op.loop_tiled_dims  # type: ignore[attr-defined]
 
     V.graph.name_to_buffer[copy_name] = copy_buf
-
-    op_name = V.graph.qualify_name(f"op{len(V.graph.operations)}")
-    V.graph.name_to_op[op_name] = copy_buf
-    copy_buf.operation_name = op_name
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, copy_buf)
@@ -632,12 +611,8 @@ def _stamp_group(
             )
             continue
 
-        hints = getattr(op, "spyre_hints", [])
-        is_broadcast = hints and all(h.range_size == 0 for h in hints)
-
-        if not is_broadcast:
-            for count, dims in levels:
-                _divide_ranges(op, count, dims)
+        for count, dims in levels:
+            _divide_ranges(op, count, dims)
 
         op.loop_group_id = nested_group_id  # type: ignore[attr-defined]
         op.loop_count = counts  # type: ignore[attr-defined]
@@ -689,7 +664,7 @@ def _divide_ranges(
         ):
             if int(r) % int(loop_count) != 0:
                 raise RuntimeError(
-                    f"coarse_tile: op {op.get_name()!r} dimension {i} range {r} is not divisible by "
+                    f"coarse_tile: dimension {i} range {r} is not divisible by "
                     f"loop_count {loop_count}.  All tiled dimensions must be evenly "
                     f"divisible by the loop trip count."
                 )

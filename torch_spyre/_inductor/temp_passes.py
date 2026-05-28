@@ -458,14 +458,39 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
         spec = _group_spec(spec_op.spyre_hints)
         groups.append((current_ops, spec))
 
-    summary = (
+    # Build an interleaved view: walk operations in order, emit group boundaries
+    # and ungrouped ops so the reader can see what breaks each consecutive run.
+    grouped_to_group_idx = {
+        id(o): i for i, g in enumerate(groups) for o in g[0]
+    }
+    summary_lines = [
         f"coarse_tile_groups: {len(groups)} group(s) formed"
         + (f" (max_op_index={max_idx})" if max_idx is not None else "")
-    )
-    for i, group in enumerate(groups):
-        summary += f"\n  group {i}: [{', '.join(o.get_name() for o in group[0])}]"
-    print(summary)
-    hints_logger.info("%s", summary)
+    ]
+    pending_ungrouped: list[str] = []
+    last_group_idx: int | None = None
+    for o in operations:
+        if not isinstance(o, ComputedBuffer):
+            continue
+        g_idx = grouped_to_group_idx.get(id(o))
+        if g_idx is None:
+            pending_ungrouped.append(o.get_name())
+        else:
+            if g_idx != last_group_idx:
+                if pending_ungrouped:
+                    summary_lines.append(
+                        f"  ungrouped: [{', '.join(pending_ungrouped)}]"
+                    )
+                    pending_ungrouped = []
+                group_ops = groups[g_idx][0]
+                summary_lines.append(
+                    f"  group {g_idx}: [{', '.join(x.get_name() for x in group_ops)}]"
+                )
+                last_group_idx = g_idx
+    if pending_ungrouped:
+        summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
+
+    hints_logger.info("%s", "\n".join(summary_lines))
 
     return groups
 
@@ -512,6 +537,8 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
                     "py_const",
                     node.type,
                 )
+            if "custom" in node.meta:
+                const_node.meta["custom"] = node.meta["custom"]
             node.update_arg(idx, const_node)
 
     graph.lint()
