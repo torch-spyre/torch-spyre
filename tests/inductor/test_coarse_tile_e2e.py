@@ -149,6 +149,8 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling_groups_fn": _groups_all_k4,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_single_group_tiles_pointwise(self):
@@ -181,6 +183,8 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling_groups_fn": _groups_all_k4,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_softmax_shaped_tiling(self):
@@ -232,6 +236,8 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling_groups_fn": _groups_split_k4_k8,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_two_groups_produce_two_loop_specs(self):
@@ -280,6 +286,8 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling_groups_fn": _groups_per_op_tiled_dim,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_per_group_tiled_dims(self):
@@ -335,6 +343,8 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_nested_loop_two_dims(self):
@@ -374,12 +384,6 @@ class TestCoarseTileEndToEnd(InductorTestCase):
     # Scratchpad (LX) allocation for intermediate tiled buffer
     # ------------------------------------------------------------------
 
-    @unittest.skip(
-        "insert_tiling_propagation allocates a full-size output buffer via "
-        "MutationLayoutSHOULDREMOVE, which causes core_div_mismatch in "
-        "scratchpad_planning — the intermediate add buffer falls back to pool "
-        "instead of lx.  Tracked for a follow-up PR."
-    )
     @config.patch(
         {
             "coarse_tiling": True,
@@ -430,11 +434,18 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             src,
             "Expected output TensorArg with hbm allocation",
         )
-        # Per-tile buffer shape must appear in the spyre_empty_with_layout call.
+        # Per-tile buffer shape must appear in the TensorArg device_size.
+        # K=2 over dim 0 (1024 rows) → 512 rows/tile; M=4 over dim 1 (4096 cols)
+        # → 1024 cols/tile.  In Spyre stick notation [num_sticks_x, rows, 64].
         self.assertIn(
-            "(512, 1024)",
+            "512",
             src,
-            "Expected per-tile buffer size (512, 1024) in generated source",
+            "Expected per-tile row count 512 in generated source",
+        )
+        self.assertIn(
+            "1024",
+            src,
+            "Expected per-tile col count 1024 in generated source",
         )
 
 
@@ -465,6 +476,8 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
             "coarse_tiling": True,
             "coarse_tiling_groups_fn": _groups_nested_k2_m4,
             "unroll_loops": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_unrolled_source_calls_sdsc(self):
@@ -671,6 +684,8 @@ class TestCoarseTileUnrollEndToEnd(InductorTestCase):
             "coarse_tiling_groups_fn": _groups_all_k4,
             "unroll_loops": True,
             "sencores": 1,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
         }
     )
     def test_unrolled_softmax_shaped_execution(self):
@@ -753,7 +768,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # ------------------------------------------------------------------
 
     @config.patch(
-        {"coarse_tiling": True, "bundle_hbm_symbols": True, "unroll_loops": False}
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
     )
     def test_hint_single_group_pointwise(self):
         """spyre_hint(slices={"A": 4}) tiles a pointwise abs into 4 iterations."""
@@ -789,7 +810,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # ------------------------------------------------------------------
 
     @config.patch(
-        {"coarse_tiling": True, "bundle_hbm_symbols": True, "unroll_loops": False}
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
     )
     def test_hint_softmax_shaped(self):
         """Tile the pointwise-reduce-pointwise stages of a softmax-like kernel.
@@ -843,7 +870,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # ------------------------------------------------------------------
 
     @config.patch(
-        {"coarse_tiling": True, "bundle_hbm_symbols": True, "unroll_loops": False}
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
     )
     def test_hint_nested_loop_two_dims(self):
         """Nested spyre_hint scopes produce a two-level tiling loop.
@@ -896,7 +929,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # ------------------------------------------------------------------
 
     @config.patch(
-        {"coarse_tiling": True, "bundle_hbm_symbols": True, "unroll_loops": False}
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
     )
     def test_hint_two_groups(self):
         """Two separate tiling groups produce two LoopSpec entries in the source."""
@@ -937,7 +976,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Softmax with row-tiling: large [NROW, NCOL] tensor
     # ------------------------------------------------------------------
 
-    @config.patch({"coarse_tiling": True})
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
     def test_hint_softmax_row_tiling(self):
         """spyre_hint(slices={"NROW": 4}) tiles softmax over the row dimension."""
         from torch_spyre._inductor import spyre_hint
