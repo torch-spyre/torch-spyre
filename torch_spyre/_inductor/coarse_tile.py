@@ -468,6 +468,12 @@ def _allocate_full_buffer(
         insert_at_idx -= 1
     operations.insert(insert_at_idx, full_buf)
 
+    # Assign operation_name so get_operation_name() doesn't assert.
+    if full_buf.operation_name is None:
+        op_name = V.graph.qualify_name(f"op{len(V.graph.operations)}")
+        V.graph.name_to_op[op_name] = full_buf
+        full_buf.operation_name = op_name
+
     return full_buf
 
 
@@ -510,6 +516,10 @@ def _insert_copy_op(
     copy_buf.loop_tiled_dims = tiled_op.loop_tiled_dims  # type: ignore[attr-defined]
 
     V.graph.name_to_buffer[copy_name] = copy_buf
+
+    op_name = V.graph.qualify_name(f"op{len(V.graph.operations)}")
+    V.graph.name_to_op[op_name] = copy_buf
+    copy_buf.operation_name = op_name
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, copy_buf)

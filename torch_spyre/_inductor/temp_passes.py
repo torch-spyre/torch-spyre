@@ -145,6 +145,8 @@ def _unflatten_mm_to_bmm(
             args=(lhs_input, expanded),
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
+        if "custom" in node.meta:
+            bmm_node.meta["custom"] = node.meta["custom"]
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -235,6 +237,8 @@ def _unflatten_bmm_batch_dims(
             args=(lhs_orig, rhs_orig),
         )
         matmul_node.meta["val"] = output_view.meta["val"]
+        if "custom" in node.meta:
+            matmul_node.meta["custom"] = node.meta["custom"]
 
     # Replace all uses of the output view with the new matmul
     output_view.replace_all_uses_with(matmul_node)
