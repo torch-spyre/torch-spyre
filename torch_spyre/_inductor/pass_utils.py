@@ -469,6 +469,9 @@ def replace_computed_buffer_body(
     new_buf.operation_name = op.operation_name
     new_buf.origins = op.origins
     new_buf.origin_node = op.origin_node
+    for attr in ("spyre_hints", "loop_group_id", "loop_count", "loop_tiled_dims"):
+        if hasattr(op, attr):
+            setattr(new_buf, attr, getattr(op, attr))
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 
     op_idx = operations.index(op)

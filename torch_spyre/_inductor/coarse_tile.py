@@ -238,11 +238,24 @@ def _propagate_tiled_op(
     # so it doesn't split the group's contiguous run in the operations list.
     outer_key = loop_group_id[0]
     group_start_idx = next(
-        i
-        for i, o in enumerate(operations)
-        if isinstance(o, ComputedBuffer)
-        and getattr(o, "loop_group_id", (None,))[0] == outer_key
+        (
+            i
+            for i, o in enumerate(operations)
+            if isinstance(o, ComputedBuffer)
+            and getattr(o, "loop_group_id", (None,))[0] == outer_key
+        ),
+        None,
     )
+    if group_start_idx is None:
+        raise RuntimeError(
+            f"coarse_tile: could not find any operation in operations with "
+            f"outer loop_group_id={outer_key!r} while propagating {buf_name!r}. "
+            f"This likely means the op was removed from the operations list by a "
+            f"prior _allocate_full_buffer call (operations.remove() matched the "
+            f"wrong object due to equality vs identity). "
+            f"ops in operations with loop_group_id set: "
+            f"{[(o.get_name(), getattr(o, 'loop_group_id', None)) for o in operations if isinstance(o, ComputedBuffer) and getattr(o, 'loop_group_id', None) is not None]}"
+        )
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
@@ -448,7 +461,11 @@ def _allocate_full_buffer(
     )
 
     # Splice into operations at the correct position.
-    operations.remove(full_buf)
+    # Use identity (not ==) to avoid removing a different op that compares equal.
+    old_idx = next(i for i, o in enumerate(operations) if o is full_buf)
+    operations.pop(old_idx)
+    if old_idx < insert_at_idx:
+        insert_at_idx -= 1
     operations.insert(insert_at_idx, full_buf)
 
     return full_buf

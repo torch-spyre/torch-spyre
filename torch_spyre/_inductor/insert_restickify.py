@@ -186,6 +186,7 @@ def insert_restickify_on_node_inputs(
     )
     new_consumer_buffer.operation_name = op.operation_name
     new_consumer_buffer.origins = op.origins
+    new_consumer_buffer.spyre_hints = getattr(op, "spyre_hints", [])
     # Replace op in the operations list with the reconstructed buffer.
     operations[op_index] = new_consumer_buffer
     V.graph.name_to_buffer[new_consumer_buffer.get_name()] = new_consumer_buffer
