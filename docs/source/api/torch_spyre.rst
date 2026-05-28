@@ -1,14 +1,15 @@
 torch\_spyre
 ============
 
-After importing ``torch_spyre``, the Spyre backend is registered and
-accessible via ``torch.spyre``. The public API follows the same patterns
-as ``torch.cuda``.
+When the ``torch_spyre`` package is installed, PyTorch picks it up
+through the ``torch.backends`` autoload entry point — no explicit
+``import torch_spyre`` is needed. The Spyre backend registers itself
+on first use of ``torch`` and the public API is available under
+``torch.spyre``, mirroring the ``torch.cuda`` surface.
 
 .. code-block:: python
 
    import torch
-   import torch_spyre  # registers the "spyre" device
 
    torch.spyre.is_available()
    torch.spyre.device_count()
@@ -53,23 +54,12 @@ Device Management
 
    Returns ``True`` if the Spyre runtime has been initialized.
 
-.. function:: torch.spyre.get_device_properties(device=None) -> SpyreDeviceProperties
+.. note::
 
-   Returns the properties of the given Spyre device.
-
-   :param device: Device to query. If ``None``, uses the current device.
-   :type device: torch.device or int, optional
-   :returns: A dataclass with the following fields:
-
-      - ``type`` (*str*) — hardware type identifier (e.g., ``"dd2"``)
-      - ``index`` (*int*) — device index
-      - ``multi_processor_count`` (*int*) — number of cores (up to 32)
-
-   .. code-block:: python
-
-      >>> props = torch.spyre.get_device_properties(0)
-      >>> props.multi_processor_count
-      32
+   ``torch.spyre.get_device_properties()`` is not yet exposed on the public
+   ``torch.spyre`` namespace. The ``SpyreDeviceProperties`` dataclass and
+   ``SpyreInterface.get_device_properties()`` exist internally and are used
+   by the Inductor device interface (see ``torch_spyre/device/interface.py``).
 
 Random Number Generation
 ------------------------
@@ -84,14 +74,18 @@ that your code is portable across backends (CUDA, Spyre, etc.):
 
 **Backend-specific alternative:**
 
-.. function:: torch.spyre.manual_seed(seed, device=None)
+.. function:: torch.spyre.manual_seed(seed)
 
-   Sets the seed for generating random numbers on the specified Spyre device.
+   Sets the seed for generating random numbers on the current Spyre device.
 
    :param int seed: The desired seed.
-   :param device: Device index to set the seed on. If ``None``, uses the
-       current device.
-   :type device: int, optional
+
+   .. note::
+
+      The public binding accepts a single ``seed`` argument. To target a
+      specific device, either call ``set_device`` first, or use
+      ``torch.spyre.manual_seed_all``, which seeds every visible Spyre
+      device.
 
 .. function:: torch.spyre.manual_seed_all(seed)
 
@@ -110,12 +104,18 @@ Streams allow overlapping execution of operations. The API mirrors
    Wrapper around a Spyre stream.
 
    A stream is a linear sequence of execution that belongs to a specific
-   device. Operations on different streams can execute concurrently.
+   device. Operations on different streams can run concurrently. The
+   ``Stream`` object is itself a context manager: putting it in a
+   ``with`` block sets it as the current stream for that block.
 
-   :param device: Device for the stream. If ``None``, uses the current device.
-   :type device: torch.device or int, optional
-   :param int priority: Priority of the stream. Lower numbers indicate
-       higher priority. Default: ``0``.
+   :param device: Device for the stream. Accepts ``torch.device``,
+       ``int``, or a string like ``"spyre"`` or ``"spyre:0"``. If
+       ``None``, the current device is used.
+   :type device: torch.device or int or str, optional
+   :param int priority: Priority class for the stream. ``0`` selects
+       the low-priority pool; any non-zero value selects the
+       high-priority pool. Each pool has 32 streams per device,
+       allocated round-robin. Default: ``0``.
 
    .. code-block:: python
 
@@ -133,23 +133,28 @@ Streams allow overlapping execution of operations. The API mirrors
 
    .. method:: device() -> torch.device
 
-      Returns the device associated with this stream.
+      Returns the device associated with this stream. Unlike
+      ``torch.cuda.Stream.device``, this is a method, not a property.
 
    .. attribute:: id
       :type: int
 
-      The stream ID (read-only).
+      The stream ID (read-only). ``0`` is the default stream, ``1`` to
+      ``32`` are the low-priority streams, and ``33`` to ``64`` are the
+      high-priority streams.
 
    .. attribute:: priority
       :type: int
 
-      The stream priority (read-only). Lower numbers indicate higher priority.
+      The stream priority class (read-only). ``0`` for low-priority,
+      anything non-zero for high-priority.
 
 .. function:: torch.spyre.stream(stream)
 
-   Context manager that sets the given stream as the current stream.
-   All operations within the context will be dispatched to the specified
-   stream.
+   Pass-through helper for use inside a ``with`` block. The actual swap
+   of the current stream is done by ``Stream.__enter__`` and
+   ``Stream.__exit__``; calling ``stream(s)`` just returns ``s`` so the
+   ``with`` form reads naturally.
 
    :param Stream stream: The stream to use.
 
@@ -360,6 +365,8 @@ Constants
 Environment Variables
 ---------------------
 
+**Spyre runtime and compiler:**
+
 .. list-table::
    :header-rows: 1
    :widths: 40 60
@@ -368,8 +375,6 @@ Environment Variables
      - Purpose
    * - ``TORCH_SPYRE_DEBUG=1``
      - Enable C++ debug logging and ``-O0`` builds
-   * - ``SENCORES``
-     - Number of Spyre cores (1--32, default 32)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
      - Suppress float32 → float16 downcast warnings
    * - ``SPYRE_INDUCTOR_LOG=1``
@@ -378,13 +383,63 @@ Environment Variables
      - Set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR)
    * - ``SPYRE_LOG_FILE=path``
      - Redirect Spyre Inductor logs to a file
-   * - ``TORCH_LOGS="+inductor"``
-     - Verbose PyTorch Inductor logging
-   * - ``TORCH_COMPILE_DEBUG=1``
-     - Dump Inductor debug artifacts
    * - ``TORCH_SENDNN_LOG``
      - SendNN library logging level (default: ``CRITICAL``)
    * - ``DT_DEEPRT_VERBOSE``
      - DeepTools runtime verbosity (default: ``-1``, disabled)
    * - ``DTLOG_LEVEL``
      - DeepTools log level (default: ``error``)
+
+**Compiler / Inductor configuration** (``torch_spyre/_inductor/config.py``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Variable
+     - Purpose
+   * - ``SENCORES``
+     - Number of Spyre cores (1--32, default 32)
+   * - ``LX_PLANNING=1``
+     - Enable LX scratchpad memory planning during the pre-scheduling pass
+   * - ``DXP_LX_FRAC_AVAIL``
+     - Fraction of LX scratchpad available to the planner
+
+**Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Variable
+     - Purpose
+   * - ``AIU_WORLD_SIZE``
+     - Override the visible Spyre device count
+   * - ``SPYRE_DEVICES``
+     - Comma-separated list of device indices to expose
+   * - ``FLEX_DEVICE``
+     - Select the underlying flex runtime mode (PF / VF)
+
+**Internal:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Variable
+     - Purpose
+   * - ``IS_INDUCTOR_SPAWNED_SUBPROCESS``
+     - Marker set by Inductor when spawning compile subprocesses
+
+**Useful PyTorch knobs (not defined by torch-spyre):**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Variable
+     - Purpose
+   * - ``TORCH_LOGS="+inductor"``
+     - Verbose PyTorch Inductor logging
+   * - ``TORCH_COMPILE_DEBUG=1``
+     - Dump Inductor debug artifacts

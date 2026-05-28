@@ -12,11 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
+import hashlib
 import torch
 import os
+import pytest
+from torch._inductor.utils import run_and_get_code
+import unittest
 
 DEVICE = torch.device("spyre")
+
+
+def _make_generator(*args) -> torch.Generator:
+    """Return a seeded Generator whose seed is a stable hash of ``args``.
+
+    Uses SHA-256 via hashlib so the seed is identical across Python processes
+    regardless of PYTHONHASHSEED (unlike the built-in ``hash()``).
+    """
+    key = repr(args).encode()
+    seed = int(hashlib.sha256(key).hexdigest()[:8], 16)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    return gen
 
 
 # shape is a tuple of integers representing dimension of the tensor
@@ -26,7 +44,8 @@ DEVICE = torch.device("spyre")
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
-    out = torch.randn(shape, dtype=dtype) * scale
+    gen = _make_generator(shape, differentiation, abs, dtype, scale)
+    out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
 
 
@@ -36,8 +55,9 @@ def cached_xavier(
     differentiation=None,
     dtype=torch.float16,
 ):
+    gen = _make_generator(shape, differentiation, dtype)
     out = torch.empty(shape, dtype=dtype)
-    torch.nn.init.xavier_uniform_(out)
+    torch.nn.init.xavier_uniform_(out, generator=gen)
     return out
 
 
@@ -72,7 +92,9 @@ def unique_randn_along_dim(
         min_val: Minimum value in the range
         max_val: Maximum value in the range
         dtype: Target data type (torch.float16, torch.float32, or integer types)
-        seed: Random seed for reproducibility
+        seed: Optional integer seed. When given, the generator is seeded with
+            this value. When omitted, a stable seed is derived from the other
+            arguments via SHA-256 so results are identical across processes.
         warn_precision: If True, warn about potential float16 precision issues
 
     Returns:
@@ -104,7 +126,10 @@ def unique_randn_along_dim(
     """
 
     if seed is not None:
-        torch.random.manual_seed(seed)
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+    else:
+        gen = _make_generator(shape, dim, min_val, max_val, dtype)
 
     # Check if dtype is an integer type
     is_integer_dtype = dtype in (
@@ -162,10 +187,12 @@ def unique_randn_along_dim(
         # Generate globally unique values
         intermediate_dtype = torch.int64 if is_integer_dtype else torch.float32
         if is_integer_dtype:
-            unique_vals = torch.randperm(unique_size, dtype=torch.int64)
+            unique_vals = torch.randperm(unique_size, dtype=torch.int64, generator=gen)
             scaled = min_val + (unique_vals * value_range) // unique_size
         else:
-            unique_vals = torch.randperm(unique_size, dtype=torch.float32)
+            unique_vals = torch.randperm(
+                unique_size, dtype=torch.float32, generator=gen
+            )
             scaled = min_val + (unique_vals / unique_size) * value_range
 
         # Reshape to target shape and convert to target dtype
@@ -243,10 +270,14 @@ def unique_randn_along_dim(
             # Generate unique values
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
 
             # Compute multi-dimensional index for this slice
@@ -266,10 +297,14 @@ def unique_randn_along_dim(
         for i in range(num_slices):
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
 
@@ -286,10 +321,14 @@ def unique_randn_along_dim(
         for i in range(num_slices):
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
         # Reshape and permute back
@@ -339,10 +378,18 @@ def unique_randn_along_dim(
 
 
 # init_helper initiates tensors given a list of shape tuples
-def init_helper(shapes, dtype=torch.float16, cached=True):
-    randn_func = cached_randn if cached else torch.randn
+def init_helper(shapes, dtype=torch.float16, cached=True, rand_type="randn"):
+    def uncached_xavier(shape, dtype):
+        return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+
+    cached_fn, uncached_fn = {
+        "randn": (cached_randn, torch.randn),
+        "xavier": (cached_xavier, uncached_xavier),
+    }[rand_type]
+    rand_fn = cached_fn if cached else uncached_fn
+
     return tuple(
-        randn_func(shape, differentiation=i, dtype=dtype)
+        rand_fn(shape, dtype=dtype, **({"differentiation": i} if cached else {}))
         for i, shape in enumerate(shapes)
     )
 
@@ -356,8 +403,10 @@ def shapes2key(shapes):
 
 
 # cases: Tuple of cases. Each case is defined by shapes of tensors
-def make_param_dict(cases):
-    return {shapes2key(shapes): init_helper(shapes) for shapes in cases}
+def make_param_dict(cases, rand_type="randn"):
+    return {
+        shapes2key(shapes): init_helper(shapes, rand_type=rand_type) for shapes in cases
+    }
 
 
 # ParameterizedTestMeta injects parameterized test methods
@@ -420,6 +469,7 @@ class ParameterizedTestMeta(type):
 
             ops_dict = cases["ops_dict"] if "ops_dict" in cases else None
             param_sets = cases["param_sets"]
+            expect_fail = cases.get("expect_fail", [])
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -446,6 +496,10 @@ class ParameterizedTestMeta(type):
                             f"Test name conflict: {test_name}"
                         )
                         namespace[test_name] = make_test(base_func, op, params)
+                        if test_case in expect_fail:
+                            namespace[test_name] = pytest.mark.xfail(
+                                reason=f"Expected fail for {test_case}", strict=True
+                            )(namespace[test_name])
                 else:
                     # ---- Original per-case expansion ----
                     def make_test(_base_func, _params):
@@ -467,6 +521,10 @@ class ParameterizedTestMeta(type):
                         f"Test name conflict: {test_name}"
                     )
                     namespace[test_name] = make_test(base_func, params)
+                    if test_case in expect_fail:
+                        namespace[test_name] = pytest.mark.xfail(
+                            reason=f"Expected fail for {test_case}", strict=True
+                        )(namespace[test_name])
 
             # Remove base function if parameterized
             to_delete.add(base_func_name)
@@ -493,9 +551,18 @@ def _to_cpu(result, device):
         return result
 
 
-def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile=True):
+def _compile_and_run(
+    fn,
+    args,
+    device,
+    backend="inductor",
+    needs_device=False,
+    compile=True,
+    source_check=None,
+):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
+    torch._inductor.codecache.FxGraphCache.clear()
     device = torch.device(device) if isinstance(device, str) else device
     device_args = [
         arg.to(device) if isinstance(arg, torch.Tensor) else arg for arg in args
@@ -503,10 +570,16 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
     device_kwargs = {"device": device} if needs_device else {}
 
     if compile:
-        if backend:
-            result = torch.compile(fn, backend=backend)(*device_args, **device_kwargs)
+        comp_func = torch.compile(fn, backend=backend)
+
+        if source_check is not None and device == "spyre":
+            result, source_codes = run_and_get_code(
+                comp_func, *device_args, **device_kwargs
+            )
+            if len(source_codes) > 0:
+                source_check(source_codes[0])
         else:
-            result = torch.compile(fn)(*device_args, **device_kwargs)
+            result = comp_func(*device_args, **device_kwargs)
     else:
         result = fn(*device_args, **device_kwargs)
 
@@ -554,6 +627,8 @@ def compare_with_cpu(
     target=None,
     run_eager=True,
     run_compile=True,
+    source_check=None,
+    clone_inputs=False,
 ):
     """Compare Spyre execution against CPU for one or both Spyre execution paths.
 
@@ -579,7 +654,12 @@ def compare_with_cpu(
         # if this env var is set at all, it gets marked as true
         cpu_compile = bool(os.getenv("TEST_COMPARE_CPU_COMPILE"))
 
-    cpu_result = fn(*args)
+    def get_args():
+        if not clone_inputs:
+            return args
+        return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
+
+    cpu_result = fn(*get_args())
 
     # Order: compiled first, then eager (matches prior [True, False] when both on).
     modes = tuple(
@@ -596,7 +676,12 @@ def compare_with_cpu(
             target
             if target is not None
             else _compile_and_run(
-                fn, args, DEVICE, needs_device=needs_device, compile=compiled
+                fn,
+                get_args(),
+                DEVICE,
+                needs_device=needs_device,
+                compile=compiled,
+                source_check=source_check,
             )
         )
 
@@ -606,7 +691,7 @@ def compare_with_cpu(
 
         if cpu_compile:
             cpu_other_result = _compile_and_run(
-                fn, args, "cpu", needs_device=needs_device, compile=compiled
+                fn, get_args(), "cpu", needs_device=needs_device, compile=compiled
             )
             _assert_results_close(
                 spyre_result,
@@ -625,34 +710,39 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
 
 
-def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False, target=None):
-    """Compare compiled Spyre execution against sendnn backend execution."""
-    if target is None:
-        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
-    sendnn_result = _compile_and_run(fn, args, "cpu", backend="sendnn")
-    _assert_results_close(target, sendnn_result, atol, rtol, "sendnn")
+def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):  # noqa: B902
+    for name, value in my_cls.__dict__.items():
+        if name.startswith("test_"):
+            # You cannot copy functions in Python, so we use closures here to
+            # create objects with different ids. Otherwise, unittest.skip
+            # would modify all methods sharing the same object id. Also, by
+            # using a default argument, we create a copy instead of a
+            # reference. Otherwise, we would lose access to the value.
 
+            @functools.wraps(value)
+            def new_test(self, value=value):
+                return value(self)
 
-def compare(
-    fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
-):
-    """3-way comparison: compiled Spyre vs uncompiled CPU vs sendnn backend."""
-    spyre_compiled_result = _compile_and_run(
-        fn, args, DEVICE, needs_device=needs_device
-    )
-    compare_with_cpu(
-        fn,
-        *args,
-        atol=cpu_atol,
-        rtol=cpu_rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )
-    compare_with_sendnn(
-        fn,
-        *args,
-        atol=atol,
-        rtol=rtol,
-        needs_device=needs_device,
-        target=spyre_compiled_result,
-    )
+            # Copy __dict__ which may contain test metadata
+            new_test.__dict__ = copy.deepcopy(value.__dict__)
+
+            tf = test_failures and name in test_failures
+            if tf:
+                skip_func = unittest.skip("Skipped!")
+                new_test = skip_func(new_test)
+
+            setattr(other_cls, f"{name}_{suffix}", new_test)
+
+    # Copy helper routines that copied tests may call on self.
+    for name in dir(my_cls):
+        value = getattr(my_cls, name)
+        if (
+            name.startswith("_get_")
+            and callable(value)
+            and not hasattr(other_cls, name)
+        ):
+            setattr(other_cls, name, value)
+
+    # Special case convenience routine
+    if hasattr(my_cls, "is_dtype_supported"):
+        other_cls.is_dtype_supported = my_cls.is_dtype_supported

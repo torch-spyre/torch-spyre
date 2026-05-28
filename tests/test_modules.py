@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
 import copy
+import pytest
 
 import torch
 import torch.nn as nn
@@ -39,6 +39,10 @@ class TestOps(TestCase):
         self.rtol = 1e-2
         self.atol = 1e-3
         self.dtype = torch.float16
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
 
     def test_linear(self):
         with torch.no_grad():
@@ -66,7 +70,7 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(y, m(x), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("Roberta still has issues on Eager path")
+    @pytest.mark.xfail(reason="Roberta still has issues on Eager path", strict=True)
     def test_roberta_self_attention(self):
         config = RobertaConfig()
         config.hidden_size = 144
@@ -87,7 +91,7 @@ class TestOps(TestCase):
             y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("Roberta still has issues on Eager path")
+    @pytest.mark.xfail(reason="Roberta still has issues on Eager path", strict=True)
     def test_roberta_layer(self):
         config = RobertaConfig()
         config.hidden_size = 144
@@ -109,7 +113,7 @@ class TestOps(TestCase):
             y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("Roberta HF has issues")
+    @pytest.mark.xfail(reason="Roberta HF has issues", strict=True)
     def test_roberta_encoder(self):
         config = RobertaConfig()
         config.hidden_size = 144
@@ -130,7 +134,7 @@ class TestOps(TestCase):
             y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("Llama still has issues on Eager path")
+    @pytest.mark.xfail(reason="Llama still has issues on Eager path", strict=True)
     def test_llama_attention(self):
         config = LlamaConfig()
         T = 1000
@@ -175,7 +179,7 @@ class TestOps(TestCase):
             y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
         )
 
-    @unittest.skip("Llama still has issues on Eager path")
+    @pytest.mark.xfail(reason="Llama still has issues on Eager path", strict=True)
     def test_llama_layer(self):
         config = LlamaConfig()
         config.hidden_size = 1024

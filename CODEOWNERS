@@ -23,6 +23,11 @@
 /torch_spyre/memory/     @JRosenkranz @thoangtrvn
 /torch_spyre/csrc/       @JRosenkranz @thoangtrvn
 
+# Distributed / collective communication (spyre_ccl)
+/torch_spyre/csrc/distributed/  @jjhursey @JRosenkranz @thoangtrvn
+/tests/distributed/              @jjhursey @thoangtrvn @avery-blanchard
+/examples/distributed/           @jjhursey @thoangtrvn @avery-blanchard
+
 # Profiler
 /torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971
 
@@ -34,10 +39,11 @@
 /tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos
 
 # Documentation
-/docs/                   @kaoutar55 @dgrove-oss
+/docs/                   @kaoutar55 @dgrove-oss @mudhakar @raghukiran1224 @viji560 @tehbone
 
 # CI/CD
-/.github/                 @ashokponkumar
-/.pre-commit-config.yaml  @ashokponkumar
-/pytest.ini               @ashokponkumar
-/pytest_models.ini        @ashokponkumar
+/.github/                 @ashokponkumar @jabostian
+/.pre-commit-config.yaml  @ashokponkumar @jabostian
+/pytest.ini               @ashokponkumar @jabostian
+/pytest_models.ini        @ashokponkumar @jabostian
+/Makefile                 @ashokponkumar @jabostian

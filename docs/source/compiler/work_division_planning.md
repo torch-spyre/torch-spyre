@@ -58,39 +58,68 @@ the compiler raises an error at compile time.
 
 ## Planning Algorithm
 
-For each operation, `plan_splits` drives the planning in three steps:
+Work division is implemented as two sequential compiler passes over all
+operations, both in
+[work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)
+and called from `CustomPreSchedulingPasses` in
+[passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
 
-**Step 1 — Span-required splits (`must_split_vars`).**
-Process tensors one at a time. For each tensor whose per-core span exceeds
-256 MB, iterate over device dimensions outer to inner and search for the best
-split combination (Cartesian product of valid divisors for the variables
-contributing to that dimension) that satisfies the hardware limit. The search
-applies a two-tier selection: among combinations whose total core count does
-not exceed `max_cores`, prefer the one with the **largest span that still fits
-within the limit** (i.e. fewest cores used); if no combination brings the span
-within the limit, fall back to the one with the **smallest span** (most
-progress). Previously committed splits are carried forward as lower bounds,
-narrowing the search for subsequent tensors.
+### Pass 1 — Span Reduction (`span_reduction`)
 
-**Step 2 — Priority ordering (`prioritize_dimensions`).**
-Among the remaining dimensions (those not already committed by step 1), rank
-variables for core assignment. Output dimensions (those present in the output's
-device coordinates) are ranked first by decreasing stick-adjusted size.
-Reduction dimensions follow, also by decreasing size. For non-matmul
-reductions, reduction dimensions are excluded from candidates entirely due to a
-known backend limitation.
+Mandatory. Runs first over all operations.
 
-**Step 3 — Core assignment (`multi_dim_iteration_space_split`).**
-Assign cores in two passes:
+For each operation, `span_reduction_pass` computes the minimum splits required
+to keep every tensor's per-core memory span within 256 MB (`must_split_vars`).
 
-1. Apply the span-required splits from step 1. These variables are excluded
-   from the priority list — the two sets are disjoint.
-2. Distribute remaining cores to the priority-ordered dimensions from step 2,
-   greedily assigning the largest valid divisor of each dimension's size that
-   fits within the remaining core budget.
+`must_split_vars` processes tensors one at a time. For each tensor whose
+per-core span exceeds 256 MB, it iterates over device dimensions outer to inner
+and searches for the best split combination (Cartesian product of valid
+divisors for the variables contributing to that dimension) that satisfies the
+hardware limit. The search applies a two-tier selection: among combinations
+whose total core count does not exceed `max_cores`, prefer the one with the
+**largest span that still fits within the limit** (fewest cores used); if no
+combination brings the span within the limit, fall back to the one with the
+**smallest span** (most progress). Previously committed splits are carried
+forward as lower bounds, narrowing the search for subsequent tensors.
 
-The result is stored as `op_it_space_splits` on the scheduler node — a dict
-mapping each iteration variable to its slice count.
+The resulting minimum splits are written to `op.op_it_space_splits` via
+`apply_splits`. If no span violation exists, `op_it_space_splits` is left
+unset.
+
+### Pass 2 — Work Distribution (`work_distribution`)
+
+Optional (future: graph-aware). Runs after Pass 1 has completed for all
+operations.
+
+For each operation, `work_distribution_pass`:
+
+1. Recovers the splits committed by Pass 1 by reading `op.op_it_space_splits`
+   via `apply_splits_from_index_coeff`. This uses the same coeff-keyed encoding
+   that codegen uses, ensuring stability across compiler passes even as sympy
+   symbols are renamed.
+2. Ranks the remaining dimensions (those not already committed by Pass 1) for
+   additional core assignment (`prioritize_dimensions`): output dimensions
+   first by decreasing stick-adjusted size, reduction dimensions last. At most
+   one reduction dimension is eligible for splitting — the one that maximises
+   `core_split(size, remaining_cores)` after output dimensions have absorbed
+   their share of cores. If Pass 1 already committed a reduction split, no
+   further reduction dimensions are eligible.
+3. Distributes all `max_cores` across committed and priority dimensions
+   (`multi_dim_iteration_space_split`): first applies the committed splits as
+   minimum requirements, then greedily assigns the largest valid divisor of
+   each remaining dimension to the leftover core budget.
+
+The final splits overwrite `op.op_it_space_splits`. The attribute is a `dict`
+keyed by the index coefficients of the buffer's read and write index
+expressions (computed by `splits_by_index_coeff` in
+[pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)),
+with each coefficient mapping to its slice count. Downstream passes can recover
+an iteration-variable view by calling
+`apply_splits_from_index_coeff(splits, write_index, read_index, it_space)`.
+
+:::{note}
+**Two distinct memory limits.** The 256 MB span limit in step 1 is a per-core addressable device memory constraint, set by how much DDR each core can reach in its address space. It is not the same thing as the 2 MB on-core LX scratchpad. Scratchpad allocation is a separate decision, made by the `scratchpad_planning` pass when `LX_PLANNING` is enabled (see [scratchpad.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad.py)).
+:::
 
 ## Operation-Specific Strategies
 
@@ -100,25 +129,24 @@ The iteration space is that of the output tensor. All output dimensions are
 candidates for splitting. There is no reduction dimension. Span-required
 splits are computed jointly over all input and output tensors.
 
-### Reduction Operations (non-matmul)
+### Reduction Operations
 
-Reduction dimensions are excluded from work division candidates due to a known
-backend limitation. Only output dimensions are split. Span-required splits are
-asserted to not involve reduction variables; if they do, the compiler raises an
-error.
+Output dimensions are split first, by decreasing size. After output dimensions
+have been assigned cores, at most one reduction dimension may also be split: the
+one whose size has the most useful divisors for the remaining core budget (i.e.
+maximises `core_split(size, remaining_cores)`). If Pass 1 already committed a
+reduction split to satisfy the span limit, no further reduction dimension is
+split in Pass 2.
 
-### Matrix Multiplication
+Span-required splits may include at most one reduction variable; if more than
+one reduction variable must be split to satisfy the 256 MB limit, the compiler
+raises an error.
 
-The iteration space covers the M (rows), K (reduction), and N (columns)
-dimensions. All three are candidates. The priority order after span-required
-splits is: output dimensions (M and N) by decreasing size, then K last. K is
-only split when M and N cannot utilize all available cores.
-
-### Batched Matrix Multiplication
-
-Same as matrix multiplication, with additional batch dimensions prepended.
-Batch dimensions appear as output dimensions and receive the highest priority
-(largest size first), followed by N, M, and finally K.
+For matrix multiplication the reduction dimension is K. Since all matrix
+multiply variants (mm, bmm) have exactly one K dimension, K is treated as any
+other reduction dimension: output dimensions (batch, M, N) take priority by
+decreasing size, and K is only split when the output dimensions cannot utilise
+all available cores.
 
 ## Configuration
 
@@ -133,7 +161,6 @@ values range from 1 (no parallelization) to 32 (maximum supported cores).
 - Dimensions must divide evenly by the slice count (no uneven splits)
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work division;
   `ExternKernel` and `FallbackKernel` nodes are skipped
-- Non-matmul reductions cannot split along the reduction dimension
 
 **Potential future enhancements:**
 
@@ -143,7 +170,5 @@ values range from 1 (no parallelization) to 32 (maximum supported cores).
 
 ## See Also
 
-- [Work Division Code Generation](work_division_codegen.md) — how division
-  plans are translated to executable code
 - [Tensor Layouts](../user_guide/tensors_and_layouts.md) — device layouts and
   the stick memory model

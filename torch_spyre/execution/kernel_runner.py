@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from torch_spyre._C import launch_kernel
+from torch_spyre._C import launch_kernel, prepare_kernel, launch_jobplan
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("kernel_runner")
@@ -34,9 +34,14 @@ class SpyreSDSCKernelRunner:
     def __init__(self, name: str, code_dir: str):
         self.kernel_name = name
         self.code_dir = code_dir
+        self.jobplan = None
+        dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "0")
+        if dump_spyre_code.isdigit() and int(dump_spyre_code) != 0:
+            self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
     def run(self, *args, **kw_args):
-        g2 = os.path.join(self.code_dir, "g2.graph.cbor")
-        logger.info(f"RUN: {self.kernel_name} {g2}")
-        actuals = list(args)
-        launch_kernel(g2, actuals)
+        logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
+        if self.jobplan:
+            launch_jobplan(self.jobplan, args)
+        else:
+            launch_kernel(self.code_dir, args)

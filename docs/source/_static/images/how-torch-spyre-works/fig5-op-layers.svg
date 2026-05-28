@@ -1,0 +1,46 @@
+<svg viewBox="0 0 1000 445" xmlns="http://www.w3.org/2000/svg"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+
+  <text x="500" y="26" text-anchor="middle" font-size="16" font-weight="700"
+        fill="#374151" letter-spacing="0.01em">Op Enablement Strategy</text>
+  <text x="500" y="48" text-anchor="middle" font-size="13" fill="#1f2937"
+        font-style="italic">Every op in the forward pass has a path to on-device execution</text>
+
+  <!-- LEFT LABELS -->
+  <text x="168" y="108" text-anchor="end" font-size="15" font-weight="700" fill="#2d5a2d">Layer 1</text>
+  <text x="168" y="126" text-anchor="end" font-size="13"   fill="#374151">Native ops</text>
+  <text x="168" y="208" text-anchor="end" font-size="15" font-weight="700" fill="#7a3a00">Layer 2</text>
+  <text x="168" y="226" text-anchor="end" font-size="13"   fill="#374151">Custom ops</text>
+  <text x="168" y="288" text-anchor="end" font-size="15" font-weight="700" fill="#5a4800">Layer 3</text>
+  <text x="168" y="306" text-anchor="end" font-size="13"   fill="#374151">Decompositions</text>
+
+  <!-- LAYER 1: Native ops (merged pointwise + matrix) -->
+  <rect x="180" y="76"  width="800" height="98" rx="4" fill="#eaf2ea" stroke="#9ec49e" stroke-width="1.2"/>
+  <text x="200" y="100" font-size="13" font-weight="600" fill="#2d5a2d">Pointwise: add · sub · mul · truediv · relu · sigmoid · abs · neg · exp · log · sqrt · rsqrt ·</text>
+  <text x="200" y="120" font-size="13" font-weight="600" fill="#2d5a2d">reciprocal · tanh · floor · eq · ne · ge · le · lt · gt · square · where · logical_and · to_dtype</text>
+  <text x="200" y="142" font-size="14" font-weight="600" fill="#2d5a2d">Matrix: mm · bmm  (matmul decomposed to these upstream)</text>
+  <text x="200" y="163" font-size="13" fill="#374151" font-style="italic">Both map directly to Deeptools-native OpFuncs (single SDSC each)</text>
+
+  <!-- LAYER 2: Custom ops -->
+  <rect x="180" y="182" width="800" height="62" rx="4" fill="#fef0e6" stroke="#e0915a" stroke-width="1.2"/>
+  <text x="200" y="206" font-size="13" font-weight="600" fill="#7a3a00">spyre::rms_norm · spyre::layer_norm · spyre::gelu · spyre::softplus · spyre::clamp · spyre::topkvalue · spyre::topkindex</text>
+  <text x="200" y="222" font-size="13" font-weight="600" fill="#7a3a00">spyre::full · spyre::ones_scalar · spyre::logical_not · spyre::constant  (plus infra: restickify, overwrite, copy_from_d2d)</text>
+  <text x="200" y="238" font-size="12" fill="#7a3a00" font-style="italic">torch.library.custom_op with @register_fake + lowering rule</text>
+
+  <!-- LAYER 3: Decompositions -->
+  <rect x="180" y="252" width="800" height="82" rx="4" fill="#f5f0de" stroke="#c8b464" stroke-width="1.2"/>
+  <text x="200" y="275" font-size="13" font-weight="600" fill="#5a4800">logical_not · addmm → matmul+scale+add  ·  linear → matmul+add  ·  rms_norm · layer_norm · gelu · softplus</text>
+  <text x="200" y="293" font-size="13" font-weight="600" fill="#5a4800">topk · max.dim · sdpa → Q·K^T·V  ·  cat · constant_pad_nd · bitwise_not · bitwise_and</text>
+  <text x="200" y="311" font-size="13" font-weight="600" fill="#5a4800">ones → ones_scalar+expand  ·  new_ones · full → spyre::full</text>
+  <text x="200" y="328" font-size="12" fill="#5a4800" font-style="italic">Rewritten to Layer 1 native primitives at compile time</text>
+
+  <!-- SEPARATOR -->
+  <line x1="180" y1="346" x2="980" y2="346" stroke="#E5E7EB" stroke-width="1" stroke-dasharray="4 3"/>
+
+  <!-- CPU FALLBACK -->
+  <rect x="220" y="356" width="760" height="70" rx="4"
+        fill="#F8FAFF" stroke="#B0BDD8" stroke-width="1" stroke-dasharray="5 3"/>
+  <text x="600" y="374" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2937">CPU Fallback (infrequent ops, off the critical path)</text>
+  <text x="600" y="393" text-anchor="middle" font-size="12" fill="#1f2937">embedding · arange · sin · cos · tril · triu · isin · normal_ · argmax · bitwise_or · bitwise_xor · int64 max</text>
+  <text x="600" y="411" text-anchor="middle" font-size="12" fill="#1f2937" font-style="italic">auto-transfer to CPU, transparent to the user</text>
+</svg>

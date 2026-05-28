@@ -16,7 +16,6 @@
 
 import os
 import regex as re
-import unittest
 import psutil
 import warnings
 from contextlib import contextmanager
@@ -45,10 +44,6 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# Applied per parametrized variant (see test_cross_device_copy_scalar_fill).
-# TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1172
-_SCALAR_FILL_XFAIL = pytest.mark.xfail(reason="Support 0-dim tensors in Spyre")
-
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     reason="Support scalar eager add with to_dtype lowering in Spyre"
@@ -72,10 +67,14 @@ _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cp
 
 @instantiate_parametrized_tests
 class TestSpyre(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    @unittest.skip("Skip for now")
+    @pytest.mark.xfail(reason="autograd not yet supported", strict=True)
     def test_autograd_init(self):
         # Make sure autograd is initialized
         torch.ones(2, requires_grad=True, device="spyre").sum().backward()
@@ -102,6 +101,15 @@ class TestSpyre(TestCase):
 
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
+
+    def test_empty_factory_in_device_context(self):
+        # The error only repros if at least one allocation
+        # has already happened
+        _ = torch.empty(64, dtype=torch.float16, device="spyre")
+
+        with torch.device("spyre"):
+            a = torch.empty(50, dtype=torch.float16)
+        self.assertEqual(a.device.type, "spyre")
 
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)
@@ -227,27 +235,26 @@ class TestSpyre(TestCase):
         ):
             b = a.to(device="spyre").add(2.0).to(device="cpu")
 
-        self.assertEqual(b.ndim, 1)
+        self.assertEqual(b.ndim, 0)
         self.assertEqual(b.numel(), 1)
 
         expected = a + 2
         if dtype == torch.float8_e4m3fn:
-            torch.testing.assert_close(b.float(), expected.reshape(1).float())
+            torch.testing.assert_close(b.float(), expected.float())
         else:
             torch.testing.assert_close(
                 b,
-                expected.reshape(1),
+                expected,
                 rtol=2e-3,
                 atol=1e-5,
                 check_dtype=False,
             )
 
-    # ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1187
     @parametrize(
         "factory_name",
         [
-            subtest("zeros", name="zeros", decorators=[_SCALAR_FILL_XFAIL]),
-            subtest("ones", name="ones", decorators=[_SCALAR_FILL_XFAIL]),
+            subtest("zeros", name="zeros"),
+            subtest("ones", name="ones"),
         ],
     )
     def test_cross_device_copy_scalar_fill(self, factory_name):
@@ -360,7 +367,7 @@ class TestSpyre(TestCase):
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
 
-    @unittest.skip("Skip for now")
+    @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")
@@ -551,14 +558,14 @@ class TestSpyre(TestCase):
         # This must not raise TypeError about MRO
         instantiate_device_type_tests(_TestMROCheck, ns, only_for=("privateuse1",))
 
-        # instantiate_device_type_tests should create a class named
-        # _TestMROCheckPRIVATEUSE1 in the namespace
-        assert "_TestMROCheckPRIVATEUSE1" in ns, (
-            f"Expected _TestMROCheckPRIVATEUSE1 in namespace, got {list(ns)}"
-        )
+        # instantiate_device_type_tests creates a class named either
+        # _TestMROCheckPRIVATEUSE1 (PT <=2.10) or _TestMROCheckSPYRE (PT 2.11+)
+        expected_names = ("_TestMROCheckPRIVATEUSE1", "_TestMROCheckSPYRE")
+        found = [n for n in expected_names if n in ns]
+        assert found, f"Expected one of {expected_names} in namespace, got {list(ns)}"
 
         # The generated class should be instantiable (valid MRO)
-        cls = ns["_TestMROCheckPRIVATEUSE1"]
+        cls = ns[found[0]]
         assert issubclass(cls, TestCase)
 
     def test_device_to_device(self):
@@ -580,6 +587,84 @@ class TestSpyre(TestCase):
         b.copy_(a)
         assert torch.allclose(a.cpu(), b.cpu())
         assert torch.allclose(a.cpu().view(64, 8, 512), c.cpu())
+
+    def test_d2h_copy_of_expanded_view(self):
+        """D2H copy of a tensor with stride-0 (broadcast) dims must produce
+        the broadcast values, not the underlying storage's contents."""
+        src = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16, device="spyre")
+        expected = torch.tensor([[1, 2, 3, 4]] * 3, dtype=torch.float16)
+
+        expanded = src.unsqueeze(0).expand(3, 4)
+        self.assertFalse(expanded.is_contiguous())
+        self.assertEqual(expanded.stride(), (0, 1))
+        self.assertEqual(expanded.cpu(), expected)
+
+        # broadcast_to is the alternate API for the same view shape.
+        self.assertEqual(src.broadcast_to(3, 4).cpu(), expected)
+
+        # Multiple stride-0 dims (column-broadcast inside row-broadcast).
+        col = torch.tensor([10.0, 20.0], dtype=torch.float16, device="spyre")
+        wide = col.unsqueeze(1).expand(2, 5)
+        self.assertEqual(
+            wide.cpu(),
+            torch.tensor([[10] * 5, [20] * 5], dtype=torch.float16),
+        )
+
+        # Slice then expand: storage_offset != 0 exercises the asymmetry
+        # between the on-device alloc view (must read from offset 0) and
+        # the CPU-side view (must read from self.storage_offset()).
+        base = torch.tensor(
+            [float(i) for i in range(20)], dtype=torch.float16, device="spyre"
+        )
+        sliced_expanded = base[5:9].unsqueeze(0).expand(3, 4)
+        self.assertEqual(sliced_expanded.storage_offset(), 5)
+        self.assertEqual(
+            sliced_expanded.cpu(),
+            torch.tensor([[5, 6, 7, 8]] * 3, dtype=torch.float16),
+        )
+
+    def test_d2h_copy_of_strided_slice(self):
+        """D2H of a strided slice (e.g. t[::2]) must produce the slice's
+        logical values, not over-DMA the parent's full allocation."""
+        t = torch.tensor(
+            [float(i) for i in range(10)],
+            dtype=torch.float16,
+            device="spyre",
+        )
+        sliced = t[::2]
+        self.assertEqual(sliced.size(), (5,))
+        self.assertEqual(sliced.stride(), (2,))
+        self.assertEqual(
+            sliced.cpu(),
+            torch.tensor([0.0, 2.0, 4.0, 6.0, 8.0], dtype=torch.float16),
+        )
+
+    def test_d2h_copy_of_transposed_view(self):
+        """Transpose / column-major D2H must NOT be intercepted by the
+        realize-on-CPU path; the existing DMA path handles those layouts
+        correctly. Guards against re-broadening the trigger to
+        !is_contiguous(), which infinite-loops when dma_strides is
+        column-major (as produced by some Inductor-codegen outputs)."""
+        m = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]],
+            dtype=torch.float16,
+            device="spyre",
+        )
+        mt = m.t()
+        self.assertFalse(mt.is_contiguous())
+        self.assertEqual(mt.stride(), (1, 4))
+        self.assertEqual(
+            mt.cpu(),
+            torch.tensor(
+                [[1, 5, 9], [2, 6, 10], [3, 7, 11], [4, 8, 12]],
+                dtype=torch.float16,
+            ),
+        )
+
+    def test_scalar_tensor(self):
+        """Test to ensure we have scalar tensor on Spyre"""
+        scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
+        assert scalar.dim() == 0
 
 
 if __name__ == "__main__":

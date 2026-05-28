@@ -21,7 +21,7 @@ from torch.testing._internal.opinfo.core import (  # noqa: F401
     SampleInput,
 )
 
-from op_registry import OP_REGISTRY
+from .op_registry import OP_REGISTRY
 
 DTYPE_MAP = {
     "fp16": torch.float16,

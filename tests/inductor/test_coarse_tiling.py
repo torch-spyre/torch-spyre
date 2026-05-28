@@ -1,0 +1,1829 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for the coarse-tiling loop IR infrastructure.
+
+Covers six areas, each in its own class group:
+  1. LoopSpec data structure and codegen_kernel serialization (TestLoopSpec*,
+     TestIterOpSpecs, TestCodegenOpSpecListRoundtrip)
+  2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
+     (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
+  3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
+     (TestHelpers, TestBuildLoopSchedulerNodes)
+  4. generate_sdsc and compile_op_spec symbol/affine-stride paths
+     (TestTiledByteStride, TestGenerateSdscTiledSymbols,
+      TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
+  5. generate_bundle MLIR output: loop structure, affine maps, symbol constants
+     (TestGenerateBundleMlir, TestFindUnimplemented,
+      TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
+      TestGenerateBundleNestedTiling, TestGenerateBundleUnrollPath)
+  6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
+     (TestCoarseTileBufferPropagation)
+
+No Spyre device or backend compiler is required.
+"""
+
+import os
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from sympy import Integer, Symbol, simplify, sympify  # noqa: F401
+
+from torch._inductor.utils import IndentedBuffer
+from torch.utils._ordered_set import OrderedSet
+
+from torch_spyre._C import DataFormats
+from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.codegen.compute_ops import (
+    _tiled_byte_stride,
+    generate_sdsc,
+)
+from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec, compile_op_spec
+from torch_spyre._inductor.coarse_tile import coarse_tile, _divide_ranges
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.scheduler import (
+    CountedLoopSchedulerNode,
+    _loop_count,
+    _loop_group_id,
+    build_loop_scheduler_nodes,
+)
+from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list, _iter_op_specs
+
+_FP16 = DataFormats.SEN169_FP16
+
+
+# ===========================================================================
+# Shared helpers
+# ===========================================================================
+
+# Eval namespace for LoopSpec/OpSpec round-trip tests.
+_EVAL_NS = {
+    "LoopSpec": LoopSpec,
+    "OpSpec": OpSpec,
+    "TensorArg": TensorArg,
+    "UnimplementedOp": UnimplementedOp,
+    "DataFormats": DataFormats,
+    "sympify": sympify,
+}
+
+
+def _make_tensor_arg(arg_index: int = 0, is_input: bool = True) -> TensorArg:
+    x = Symbol("x0")
+    return TensorArg(
+        is_input=is_input,
+        arg_index=arg_index,
+        device_dtype=DataFormats.SEN169_FP16,
+        device_size=[4, 64],
+        device_coordinates=[x, Integer(0)],
+        allocation=None,
+    )
+
+
+def _make_op_spec(op: str = "add", arg_index: int = 0) -> OpSpec:
+    """Full OpSpec with tensor args — used by LoopSpec round-trip tests."""
+    x0 = Symbol("x0")
+    return OpSpec(
+        op=op,
+        is_reduction=False,
+        iteration_space={x0: (Integer(128), 1)},
+        args=[
+            _make_tensor_arg(arg_index=arg_index, is_input=True),
+            _make_tensor_arg(arg_index=arg_index + 1, is_input=False),
+        ],
+        op_info={},
+    )
+
+
+def _make_minimal_op_spec(name: str) -> OpSpec:
+    """Minimal OpSpec with empty args — used by bundle.mlir tests."""
+    return OpSpec(op=name, is_reduction=False, iteration_space={}, args=[], op_info={})
+
+
+def _roundtrip(specs):
+    """Serialize specs to Python source and eval back."""
+
+    def sympy_str(x):
+        return "sympify('" + str(x) + "')"
+
+    buf = IndentedBuffer()
+    buf.writeline("[")
+    with buf.indent():
+        _codegen_op_spec_list(specs, buf, sympy_str)
+    buf.writeline("]")
+    return eval(buf.getvalue(), _EVAL_NS)  # noqa: S307
+
+
+# ---------------------------------------------------------------------------
+# coarse_tile pass helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_pointwise(ranges):
+    """Return a fake Pointwise with the given ranges."""
+    from torch._inductor.ir import Pointwise
+
+    pw = MagicMock(spec=Pointwise)
+    pw.ranges = list(ranges)
+    return pw
+
+
+def _make_reduction(ranges, reduction_ranges):
+    """Return a fake Reduction with the given ranges and reduction_ranges."""
+    from torch._inductor.ir import Reduction
+
+    red = MagicMock(spec=Reduction)
+    red.ranges = list(ranges)
+    red.reduction_ranges = list(reduction_ranges)
+    return red
+
+
+def _make_op(data, name="op0"):
+    """Return a fake ComputedBuffer wrapping data."""
+    from torch._inductor.ir import ComputedBuffer
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.layout = MagicMock()
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    del op.loop_group_id
+    del op.loop_count
+    return op
+
+
+def _make_non_computed_op(name="extern0"):
+    """Return a fake non-ComputedBuffer operation."""
+    from torch._inductor.ir import Operation
+
+    op = MagicMock(spec=Operation)
+    op.get_operation_name.return_value = name
+    return op
+
+
+# ---------------------------------------------------------------------------
+# Scheduler node helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_scheduler():
+    """Return a minimal fake Scheduler."""
+    sched = MagicMock()
+    sched.name_to_fused_node = {}
+    sched.removed_ops = set()
+    return sched
+
+
+def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
+    """Return a fake ir.Operation optionally stamped with loop attributes.
+
+    loop_count must be a list of trip counts (one per nesting level), matching
+    the contract stamped by coarse_tile().  A bare Expr is accepted as a
+    convenience shorthand and is wrapped in a 1-element list.
+    """
+    op = MagicMock()
+    op.name = name
+    if loop_group_id is not None:
+        op.loop_group_id = loop_group_id
+        op.loop_count = loop_count if isinstance(loop_count, list) else [loop_count]
+    else:
+        del op.loop_group_id
+        del op.loop_count
+    return op
+
+
+def _make_snode(scheduler, ir_op, name="buf0"):
+    """Return a fake SchedulerNode wrapping ir_op."""
+    from torch._inductor.scheduler import SchedulerNode
+
+    snode = MagicMock(spec=SchedulerNode)
+    snode.scheduler = scheduler
+    snode.node = ir_op
+    snode.get_name.return_value = name
+    snode.get_nodes.return_value = [snode]
+    snode.ancestors = set()
+    snode.min_order = 0
+    snode.max_order = 0
+    snode.read_writes = MagicMock()
+    snode.read_writes.reads_and_writes.return_value = []
+    snode.outputs_by_name = {}
+    return snode
+
+
+# ---------------------------------------------------------------------------
+# SDSC helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_sdsc_spec(
+    s: Symbol,
+    *,
+    iter_range: int = 64,
+    device_stride: int = 128,
+    start_address: int = 0x1000,
+    allocation: dict | None = None,
+    num_cores: int = 1,
+) -> SDSCSpec:
+    """Build a minimal SDSCSpec with one HBM tensor and one iteration-space symbol."""
+    if allocation is None:
+        allocation = {"hbm": start_address}
+    tensor = SDSCArgs(
+        layout="A",
+        dim_order=[s],
+        data_format=_FP16,
+        scales={s: 1},
+        strides={s: device_stride},
+        offsets={s: 0},
+        max_dim_sizes={s: -1},
+        allocation=allocation,
+        start_address=start_address,
+        backGap={},
+    )
+    return SDSCSpec(
+        opfunc="add",
+        execution_unit="sfp",
+        data_format=_FP16,
+        num_inputs=1,
+        iteration_space={s: iter_range},
+        num_cores=num_cores,
+        work_slices={s: 1},
+        core_id_to_work_slice={s: Integer(0)},
+        padding={},
+        layouts={
+            "A": {
+                "dim_order": [s],
+                "stick_dim_order": s,
+                "stick_size": 64,
+            }
+        },
+        args=[tensor],
+        constants={},
+        coordinate_masking={},
+    )
+
+
+def _make_tiled_op_spec() -> OpSpec:
+    """Minimal OpSpec with tiled_symbols that compile_op_spec can process."""
+    c0 = Symbol("c0")
+    fp16 = _FP16
+    tensor_in = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=fp16,
+        device_size=[2, 64],
+        device_coordinates=[Integer(0), c0],
+        allocation={"hbm": 0x1000},
+    )
+    tensor_out = TensorArg(
+        is_input=False,
+        arg_index=1,
+        device_dtype=fp16,
+        device_size=[2, 64],
+        device_coordinates=[Integer(0), c0],
+        allocation={"hbm": 0x2000},
+    )
+    return OpSpec(
+        op="add",
+        is_reduction=False,
+        iteration_space={c0: (Integer(128), 1)},
+        args=[tensor_in, tensor_out],
+        op_info={},
+        tiled_symbols=[c0],
+    )
+
+
+# ---------------------------------------------------------------------------
+# bundle.mlir test helpers
+# ---------------------------------------------------------------------------
+
+
+def _fake_compile_op_spec(
+    idx: int,
+    op_spec: OpSpec,
+    symbols: list,
+    symbol_id_offset: int = 0,
+    use_symbols: bool = True,
+):
+    """Stub that returns (json, [], []) — no real SDSC compilation."""
+    return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], []
+
+
+def _read_mlir(output_dir: str) -> str:
+    with open(os.path.join(output_dir, "bundle.mlir")) as f:
+        return f.read()
+
+
+def _make_tiled_json(idx: int, sym_id: int) -> dict:
+    """Return a minimal SDSC JSON with one HBM tensor whose symbol ID is sym_id."""
+    return {
+        f"{idx}_add": {
+            "numCoresUsed_": 1,
+            "dscs_": [
+                {
+                    "add": {
+                        "scheduleTree_": [
+                            {
+                                "component_": "hbm",
+                                "startAddressCoreCorelet_": {
+                                    "data_": {"[0, 0, 0]": str(sym_id)}
+                                },
+                            }
+                        ]
+                    }
+                }
+            ],
+        }
+    }
+
+
+# ===========================================================================
+# 1. LoopSpec data structure and codegen serialization
+# ===========================================================================
+
+
+class TestLoopSpecDataclass(unittest.TestCase):
+    def test_flat_body(self):
+        op = _make_op_spec()
+        loop = LoopSpec(count=Integer(4), body=[op])
+        self.assertEqual(loop.count, Integer(4))
+        self.assertEqual(len(loop.body), 1)
+        self.assertIs(loop.body[0], op)
+
+    def test_nested_body(self):
+        inner = LoopSpec(count=Integer(2), body=[_make_op_spec("mul")])
+        outer = LoopSpec(count=Integer(4), body=[_make_op_spec("add"), inner])
+        self.assertEqual(len(outer.body), 2)
+        self.assertIsInstance(outer.body[1], LoopSpec)
+
+    def test_empty_body(self):
+        loop = LoopSpec(count=Integer(8), body=[])
+        self.assertEqual(loop.body, [])
+
+
+class TestIterOpSpecs(unittest.TestCase):
+    def test_flat_list(self):
+        specs = [_make_op_spec("add"), _make_op_spec("mul")]
+        result = list(_iter_op_specs(specs))
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].op, "add")
+        self.assertEqual(result[1].op, "mul")
+
+    def test_skips_unimplemented(self):
+        specs = [UnimplementedOp(op="foo"), _make_op_spec("add")]
+        result = list(_iter_op_specs(specs))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].op, "add")
+
+    def test_single_level_loop(self):
+        inner = [_make_op_spec("add"), _make_op_spec("mul")]
+        specs = [LoopSpec(count=Integer(4), body=inner)]
+        result = list(_iter_op_specs(specs))
+        self.assertEqual([s.op for s in result], ["add", "mul"])
+
+    def test_nested_loop_depth_first(self):
+        innermost = [_make_op_spec("c")]
+        middle = [_make_op_spec("b"), LoopSpec(count=Integer(2), body=innermost)]
+        specs = [_make_op_spec("a"), LoopSpec(count=Integer(4), body=middle)]
+        result = list(_iter_op_specs(specs))
+        self.assertEqual([s.op for s in result], ["a", "b", "c"])
+
+    def test_empty(self):
+        self.assertEqual(list(_iter_op_specs([])), [])
+
+
+class TestCodegenOpSpecListRoundtrip(unittest.TestCase):
+    def test_flat_op_spec(self):
+        original = [_make_op_spec("add")]
+        result = _roundtrip(original)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], OpSpec)
+        self.assertEqual(result[0].op, "add")
+
+    def test_unimplemented_op(self):
+        original = [UnimplementedOp(op="unknown")]
+        result = _roundtrip(original)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], UnimplementedOp)
+        self.assertEqual(result[0].op, "unknown")
+
+    def test_single_loop_wrapping_two_ops(self):
+        body = [_make_op_spec("add"), _make_op_spec("mul")]
+        original = [LoopSpec(count=Integer(4), body=body)]
+        result = _roundtrip(original)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], LoopSpec)
+        self.assertEqual(result[0].count, Integer(4))
+        self.assertEqual(len(result[0].body), 2)
+        self.assertEqual(result[0].body[0].op, "add")
+        self.assertEqual(result[0].body[1].op, "mul")
+
+    def test_nested_loop(self):
+        inner_loop = LoopSpec(count=Integer(2), body=[_make_op_spec("inner")])
+        original = [
+            LoopSpec(count=Integer(8), body=[_make_op_spec("outer"), inner_loop])
+        ]
+        result = _roundtrip(original)
+        outer = result[0]
+        self.assertIsInstance(outer, LoopSpec)
+        self.assertEqual(outer.count, Integer(8))
+        self.assertEqual(outer.body[0].op, "outer")
+        inner = outer.body[1]
+        self.assertIsInstance(inner, LoopSpec)
+        self.assertEqual(inner.count, Integer(2))
+        self.assertEqual(inner.body[0].op, "inner")
+
+    def test_symbolic_count(self):
+        s = Symbol("s0")
+        original = [LoopSpec(count=s, body=[_make_op_spec("add")])]
+        result = _roundtrip(original)
+        self.assertIsInstance(result[0], LoopSpec)
+        self.assertEqual(result[0].count, s)
+
+    def test_mixed_flat_and_loop(self):
+        original = [
+            _make_op_spec("before"),
+            LoopSpec(count=Integer(4), body=[_make_op_spec("body")]),
+            _make_op_spec("after"),
+        ]
+        result = _roundtrip(original)
+        self.assertEqual(len(result), 3)
+        self.assertIsInstance(result[0], OpSpec)
+        self.assertIsInstance(result[1], LoopSpec)
+        self.assertIsInstance(result[2], OpSpec)
+
+    def test_arg_index_preserved(self):
+        arg = _make_tensor_arg(arg_index=3)
+        op = OpSpec(
+            op="relu",
+            is_reduction=False,
+            iteration_space={Symbol("x0"): (Integer(64), 1)},
+            args=[arg],
+            op_info={},
+        )
+        original = [LoopSpec(count=Integer(2), body=[op])]
+        result = _roundtrip(original)
+        self.assertEqual(result[0].body[0].args[0].arg_index, 3)
+
+
+# ===========================================================================
+# 2. coarse_tile IR pass
+# ===========================================================================
+
+
+class TestDivideRanges(unittest.TestCase):
+    def test_pointwise_single_dim_divided(self):
+        data = _make_pointwise([Integer(64)])
+        op = _make_op(data)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(data.ranges[0], Integer(16))
+
+    def test_pointwise_symbolic_count(self):
+        k = Symbol("K", positive=True)
+        n = Symbol("N", positive=True)
+        data = _make_pointwise([n])
+        op = _make_op(data)
+        _divide_ranges(op, k, tiled_dims=[0])
+        self.assertEqual(simplify(data.ranges[0] - n / k), 0)
+
+    def test_pointwise_multidim_default_tiles_outermost_only(self):
+        data = _make_pointwise([Integer(32), Integer(8)])
+        op = _make_op(data)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(data.ranges[0], Integer(8))
+        self.assertEqual(data.ranges[1], Integer(8))
+
+    def test_tiled_dims_indices_0_1(self):
+        data = _make_pointwise([Integer(32), Integer(16), Integer(4)])
+        op = _make_op(data)
+        _divide_ranges(op, Integer(4), tiled_dims=[0, 1])
+        self.assertEqual(data.ranges[0], Integer(8))
+        self.assertEqual(data.ranges[1], Integer(4))
+        self.assertEqual(data.ranges[2], Integer(4))
+
+    def test_tiled_dims_empty_no_change(self):
+        data = _make_pointwise([Integer(32)])
+        op = _make_op(data)
+        original = list(data.ranges)
+        _divide_ranges(op, Integer(4), tiled_dims=[])
+        self.assertEqual(data.ranges, original)
+
+    def test_empty_ranges_no_change(self):
+        data = _make_pointwise([])
+        op = _make_op(data)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(data.ranges, [])
+
+    def test_reduction_outer_dims_divided_inner_untouched(self):
+        data = _make_reduction([Integer(64)], [Integer(128)])
+        op = _make_op(data)
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(data.ranges[0], Integer(16))
+        self.assertEqual(data.reduction_ranges[0], Integer(128))
+
+    def test_non_loops_type_skipped(self):
+        from torch._inductor.ir import Operation
+
+        op = _make_op(MagicMock(spec=Operation))
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+
+
+class TestCoarseTile(unittest.TestCase):
+    def _run(self, all_ops, groups, **kwargs):
+        coarse_tile(all_ops, groups, **kwargs)
+
+    def test_single_group_stamps_attributes(self):
+        data = _make_pointwise([Integer(64)])
+        op = _make_op(data, "op0")
+        self._run([op], [([op], Integer(4))])
+        self.assertEqual(op.loop_group_id, (0,))
+        self.assertEqual(op.loop_count, [Integer(4)])
+        self.assertEqual(op.loop_tiled_dims, [[0]])
+        self.assertEqual(data.ranges[0], Integer(16))
+
+    def test_two_groups_get_distinct_ids(self):
+        d0 = _make_pointwise([Integer(32)])
+        d1 = _make_pointwise([Integer(64)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        self._run([op0, op1], [([op0], Integer(4)), ([op1], Integer(8))])
+        self.assertEqual(op0.loop_group_id, (0,))
+        self.assertEqual(op1.loop_group_id, (1,))
+        self.assertEqual(op0.loop_count, [Integer(4)])
+        self.assertEqual(op1.loop_count, [Integer(8)])
+        self.assertEqual(d0.ranges[0], Integer(8))
+        self.assertEqual(d1.ranges[0], Integer(8))
+
+    def test_empty_groups_list_is_noop(self):
+        data = _make_pointwise([Integer(32)])
+        op = _make_op(data, "op0")
+        original = list(data.ranges)
+        self._run([op], [])
+        self.assertFalse(
+            hasattr(op, "loop_group_id") and op.loop_group_id != MagicMock()
+        )
+        self.assertEqual(data.ranges, original)
+
+    def test_non_computed_buffer_skipped(self):
+        op_extern = _make_non_computed_op("extern0")
+        data = _make_pointwise([Integer(16)])
+        op_computed = _make_op(data, "op0")
+        self._run([op_extern, op_computed], [([op_extern, op_computed], Integer(2))])
+        self.assertEqual(op_computed.loop_group_id, (0,))
+        self.assertEqual(data.ranges[0], Integer(8))
+
+    def test_symbolic_count(self):
+        k = Symbol("K", positive=True)
+        n = Symbol("N", positive=True)
+        data = _make_pointwise([n])
+        op = _make_op(data, "op0")
+        self._run([op], [([op], k)])
+        self.assertEqual(op.loop_count, [k])
+        self.assertEqual(simplify(data.ranges[0] - n / k), 0)
+
+    def test_non_contiguous_group_raises(self):
+        d0 = _make_pointwise([Integer(32)])
+        d1 = _make_pointwise([Integer(32)])
+        d2 = _make_pointwise([Integer(32)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        op2 = _make_op(d2, "op2")
+        with self.assertRaises(RuntimeError):
+            self._run([op0, op1, op2], [([op0, op2], Integer(4))])
+
+    def test_op_not_in_operations_raises(self):
+        data = _make_pointwise([Integer(32)])
+        op_known = _make_op(data, "op0")
+        op_unknown = _make_op(_make_pointwise([Integer(8)]), "unknown")
+        with self.assertRaises(RuntimeError):
+            self._run([op_known], [([op_unknown], Integer(2))])
+
+    def test_multiple_ops_in_single_group(self):
+        d0 = _make_pointwise([Integer(32)])
+        d1 = _make_pointwise([Integer(64)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        self._run([op0, op1], [([op0, op1], Integer(4))])
+        self.assertEqual(op0.loop_group_id, (0,))
+        self.assertEqual(op1.loop_group_id, (0,))
+        self.assertEqual(d0.ranges[0], Integer(8))
+        self.assertEqual(d1.ranges[0], Integer(16))
+
+    def test_per_group_tiled_dims_override(self):
+        d0 = _make_pointwise([Integer(32), Integer(16)])
+        d1 = _make_pointwise([Integer(8), Integer(64)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        self._run(
+            [op0, op1],
+            [
+                ([op0], Integer(4)),
+                ([op1], Integer(4), [0, 1]),
+            ],
+        )
+        self.assertEqual(d0.ranges[0], Integer(8))
+        self.assertEqual(d0.ranges[1], Integer(16))
+        self.assertEqual(d1.ranges[0], Integer(2))
+        self.assertEqual(d1.ranges[1], Integer(16))
+
+    def test_non_contiguous_dim_indices(self):
+        data = _make_pointwise([Integer(32), Integer(16), Integer(8)])
+        op = _make_op(data, "op0")
+        self._run([op], [([op], Integer(4), [0, 2])])
+        self.assertEqual(data.ranges[0], Integer(8))
+        self.assertEqual(data.ranges[1], Integer(16))
+        self.assertEqual(data.ranges[2], Integer(2))
+
+    def test_per_group_tiled_dims_none_overrides_kwarg(self):
+        d0 = _make_pointwise([Integer(32), Integer(16)])
+        op0 = _make_op(d0, "op0")
+        self._run(
+            [op0],
+            [([op0], Integer(4), None)],
+            tiled_dims=[0, 1],
+        )
+        self.assertEqual(d0.ranges[0], Integer(8))
+        self.assertEqual(d0.ranges[1], Integer(16))
+
+
+class TestCoarseTileNested(unittest.TestCase):
+    """Verify that the nested group format [(K1, dims1), (K2, dims2)] works."""
+
+    def test_nested_spec_stamps_list_attributes(self):
+        data = _make_pointwise([Integer(256), Integer(128)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+        self.assertEqual(op.loop_group_id, (0, 0))
+        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_tiled_dims, [[0], [1]])
+
+    def test_nested_spec_divides_ranges_both_levels(self):
+        data = _make_pointwise([Integer(256), Integer(128)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+        self.assertEqual(data.ranges[0], Integer(64))
+        self.assertEqual(data.ranges[1], Integer(64))
+
+    def test_nested_spec_outer_only_divides_outer_dim(self):
+        data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(8), [1])])])
+        self.assertEqual(data.ranges[0], Integer(8))
+        self.assertEqual(data.ranges[1], Integer(8))
+        self.assertEqual(data.ranges[2], Integer(16))
+
+    def test_flat_and_nested_groups_coexist(self):
+        d0 = _make_pointwise([Integer(64), Integer(32)])
+        d1 = _make_pointwise([Integer(128), Integer(64)])
+        op0 = _make_op(d0, "op0")
+        op1 = _make_op(d1, "op1")
+        coarse_tile(
+            [op0, op1],
+            [
+                ([op0], Integer(4)),
+                ([op1], [(Integer(4), [0]), (Integer(2), [1])]),
+            ],
+        )
+        self.assertEqual(op0.loop_group_id, (0,))
+        self.assertEqual(op0.loop_count, [Integer(4)])
+        self.assertEqual(op0.loop_tiled_dims, [[0]])
+        self.assertEqual(d0.ranges[0], Integer(16))
+        self.assertEqual(d0.ranges[1], Integer(32))
+        self.assertEqual(op1.loop_group_id, (1, 0))
+        self.assertEqual(op1.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op1.loop_tiled_dims, [[0], [1]])
+        self.assertEqual(d1.ranges[0], Integer(32))
+        self.assertEqual(d1.ranges[1], Integer(32))
+
+    def test_nested_same_dim_different_counts(self):
+        data = _make_pointwise([Integer(256)])
+        op = _make_op(data, "op0")
+        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [0])])])
+        self.assertEqual(data.ranges[0], Integer(32))
+        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_tiled_dims, [[0], [0]])
+
+
+# ===========================================================================
+# 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
+# ===========================================================================
+
+
+class TestHelpers(unittest.TestCase):
+    def test_loop_group_id_present(self):
+        sched = _make_scheduler()
+        op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(4))
+        snode = _make_snode(sched, op)
+        self.assertEqual(_loop_group_id(snode), (0,))
+
+    def test_loop_group_id_absent(self):
+        sched = _make_scheduler()
+        op = _make_ir_op()
+        snode = _make_snode(sched, op)
+        self.assertIsNone(_loop_group_id(snode))
+
+    def test_loop_count(self):
+        sched = _make_scheduler()
+        op = _make_ir_op(loop_group_id=(0,), loop_count=Integer(8))
+        snode = _make_snode(sched, op)
+        self.assertEqual(_loop_count(snode, depth=0), Integer(8))
+
+    def test_loop_count_symbolic(self):
+        sched = _make_scheduler()
+        s = Symbol("s0")
+        op = _make_ir_op(loop_group_id=(0,), loop_count=s)
+        snode = _make_snode(sched, op)
+        self.assertEqual(_loop_count(snode, depth=0), s)
+
+
+class TestBuildLoopSchedulerNodes(unittest.TestCase):
+    def _run(self, nodes):
+        created = []
+
+        def fake_create(snodes, loop_count):
+            node = MagicMock(spec=CountedLoopSchedulerNode)
+            node.snodes = snodes
+            node.loop_count = loop_count
+            node.get_nodes.return_value = snodes
+            node.get_name.return_value = "_".join(n.get_name() for n in snodes)
+            node.scheduler = snodes[0].scheduler
+            created.append(node)
+            return node
+
+        with patch.object(
+            CountedLoopSchedulerNode, "create", staticmethod(fake_create)
+        ):
+            result = build_loop_scheduler_nodes(nodes)
+        return result, created
+
+    def test_passthrough_no_loop_group(self):
+        sched = _make_scheduler()
+        nodes = [
+            _make_snode(sched, _make_ir_op(), "a"),
+            _make_snode(sched, _make_ir_op(), "b"),
+        ]
+        result, created = self._run(nodes)
+        self.assertEqual(result, nodes)
+        self.assertEqual(created, [])
+
+    def test_single_group_two_nodes(self):
+        sched = _make_scheduler()
+        n1 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "a")
+        n2 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "b")
+        result, created = self._run([n1, n2])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].loop_count, Integer(4))
+        self.assertIn(n1, created[0].snodes)
+        self.assertIn(n2, created[0].snodes)
+
+    def test_non_group_nodes_pass_through_around_group(self):
+        sched = _make_scheduler()
+        before = _make_snode(sched, _make_ir_op(), "before")
+        g1 = _make_snode(sched, _make_ir_op((0,), Integer(2)), "g1")
+        g2 = _make_snode(sched, _make_ir_op((0,), Integer(2)), "g2")
+        after = _make_snode(sched, _make_ir_op(), "after")
+        result, created = self._run([before, g1, g2, after])
+        self.assertEqual(len(result), 3)
+        self.assertIs(result[0], before)
+        self.assertIsInstance(result[1], MagicMock)
+        self.assertIs(result[2], after)
+        self.assertEqual(created[0].loop_count, Integer(2))
+
+    def test_two_separate_groups(self):
+        sched = _make_scheduler()
+        g0a = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0a")
+        g0b = _make_snode(sched, _make_ir_op((0,), Integer(4)), "g0b")
+        g1a = _make_snode(sched, _make_ir_op((1,), Integer(8)), "g1a")
+        g1b = _make_snode(sched, _make_ir_op((1,), Integer(8)), "g1b")
+        result, created = self._run([g0a, g0b, g1a, g1b])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(created), 2)
+        self.assertEqual(created[0].loop_count, Integer(4))
+        self.assertEqual(created[1].loop_count, Integer(8))
+
+    def test_nested_group(self):
+        sched = _make_scheduler()
+        outer = _make_snode(sched, _make_ir_op((0,), Integer(4)), "outer")
+        inner1 = _make_snode(
+            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner1"
+        )
+        inner2 = _make_snode(
+            sched, _make_ir_op((0, 0), [Integer(4), Integer(2)]), "inner2"
+        )
+        result, created = self._run([outer, inner1, inner2])
+        self.assertEqual(len(result), 1)
+        outer_loop = result[0]
+        self.assertEqual(len(outer_loop.snodes), 2)
+        inner_loop = outer_loop.snodes[1]
+        self.assertEqual(inner_loop.loop_count, Integer(2))
+        self.assertIn(inner1, inner_loop.snodes)
+        self.assertIn(inner2, inner_loop.snodes)
+
+    def test_inconsistent_loop_count_raises(self):
+        sched = _make_scheduler()
+        n1 = _make_snode(sched, _make_ir_op((0,), Integer(4)), "a")
+        n2 = _make_snode(sched, _make_ir_op((0,), Integer(8)), "b")
+        with self.assertRaises(AssertionError):
+            self._run([n1, n2])
+
+    def test_empty_list(self):
+        result, created = self._run([])
+        self.assertEqual(result, [])
+        self.assertEqual(created, [])
+
+    def test_symbolic_loop_count(self):
+        sched = _make_scheduler()
+        s = Symbol("K")
+        n1 = _make_snode(sched, _make_ir_op((0,), s), "a")
+        n2 = _make_snode(sched, _make_ir_op((0,), s), "b")
+        result, created = self._run([n1, n2])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(created[0].loop_count, s)
+
+
+# ===========================================================================
+# 4. generate_sdsc and compile_op_spec — symbol/affine-stride paths
+# ===========================================================================
+
+
+class TestTiledByteStride(unittest.TestCase):
+    def test_fp16_one_core(self):
+        s = Symbol("s")
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[s],
+            data_format=_FP16,
+            scales={s: 1},
+            strides={s: 128},
+            offsets={s: 0},
+            max_dim_sizes={s: -1},
+            allocation={"hbm": 0},
+            start_address=0,
+            backGap={},
+        )
+        stride = _tiled_byte_stride(tensor, s, {s: 64})
+        self.assertEqual(stride, 64 * 128 * 2)
+
+    def test_fp16_larger_stride(self):
+        s = Symbol("s")
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[s],
+            data_format=_FP16,
+            scales={s: 1},
+            strides={s: 512},
+            offsets={s: 0},
+            max_dim_sizes={s: -1},
+            allocation={"hbm": 0},
+            start_address=0,
+            backGap={},
+        )
+        stride = _tiled_byte_stride(tensor, s, {s: 32})
+        self.assertEqual(stride, 32 * 512 * 2)
+
+    def test_stride_one(self):
+        s = Symbol("s")
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[s],
+            data_format=_FP16,
+            scales={s: 1},
+            strides={s: 1},
+            offsets={s: 0},
+            max_dim_sizes={s: -1},
+            allocation={"hbm": 0},
+            start_address=0,
+            backGap={},
+        )
+        stride = _tiled_byte_stride(tensor, s, {s: 16})
+        self.assertEqual(stride, 16 * 1 * 2)
+
+
+class TestGenerateSdscTiledSymbols(unittest.TestCase):
+    def test_tiled_tensor_affine_strides_correct(self):
+        s = Symbol("s")
+        sdsc_spec = _make_sdsc_spec(s, iter_range=64, device_stride=128)
+        symbols: list[int] = []
+        _, _, affine_strides = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        self.assertEqual(len(affine_strides), 1)
+        self.assertIn(s, affine_strides[0])
+        self.assertEqual(affine_strides[0][s], 64 * 128 * 2)
+
+    def test_tiled_tensor_base_address_registered(self):
+        s = Symbol("s")
+        start = 0x2000
+        sdsc_spec = _make_sdsc_spec(s, start_address=start)
+        symbols: list[int] = []
+        generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        self.assertEqual(len(symbols), 1)
+        self.assertEqual(symbols[0], start)
+
+    def test_tiled_tensor_json_stores_symbol_id(self):
+        s = Symbol("s")
+        sdsc_spec = _make_sdsc_spec(s)
+        symbols: list[int] = []
+        sdsc_json, _, _ = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        top_val = next(iter(sdsc_json.values()))
+        node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
+        data = node["startAddressCoreCorelet_"]["data_"]
+        for v in data.values():
+            self.assertLess(int(v), 0, f"Expected negative symbol ID, got {v!r}")
+
+    def test_non_tiled_tensor_empty_affine_strides(self):
+        s = Symbol("s")
+        sdsc_spec = _make_sdsc_spec(s)
+        symbols: list[int] = []
+        _, _, affine_strides = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[],
+            use_symbols=True,
+        )
+        self.assertEqual(affine_strides, [{}])
+
+    def test_lx_tensor_not_in_symbols(self):
+        s = Symbol("s")
+        lx_addr = 0xABC0
+        sdsc_spec = _make_sdsc_spec(
+            s, start_address=lx_addr, allocation={"lx": lx_addr}
+        )
+        symbols: list[int] = []
+        _, local_sym_values, affine_strides = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        self.assertEqual(symbols, [])
+        self.assertEqual(local_sym_values, [])
+        self.assertEqual(affine_strides, [{}])
+
+    def test_symbol_id_offset_applied(self):
+        s = Symbol("s")
+        sdsc_spec = _make_sdsc_spec(s)
+        symbols: list[int] = []
+        sdsc_json, local_sym_values, _ = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=5,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        top_val = next(iter(sdsc_json.values()))
+        node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
+        data = node["startAddressCoreCorelet_"]["data_"]
+        ids = [int(v) for v in data.values()]
+        self.assertTrue(all(i <= -6 for i in ids), f"Expected ids ≤ -6, got {ids}")
+
+    def test_multi_core_tiled_per_core_symbols(self):
+        s = Symbol("s")
+        core_id = Symbol("core_id")
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[s],
+            data_format=_FP16,
+            scales={s: 1},
+            strides={s: 128},
+            offsets={s: 0},
+            max_dim_sizes={s: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0x1000,
+            backGap={},
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={s: 32},
+            num_cores=2,
+            work_slices={s: 2},
+            core_id_to_work_slice={s: core_id},
+            padding={},
+            layouts={"A": {"dim_order": [s], "stick_dim_order": s, "stick_size": 64}},
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+        )
+        symbols: list[int] = []
+        _, local_sym_values, affine_strides = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        self.assertEqual(len(symbols), 2)
+        self.assertEqual(symbols[0], 0x1000)
+        self.assertEqual(symbols[1], 0x1000 + 128)
+        self.assertIn(s, affine_strides[0])
+
+
+class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
+    def _make_3d_op_spec(self) -> OpSpec:
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        fp16 = _FP16
+        tensor_in = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=fp16,
+            device_size=[2, 4, 64],
+            device_coordinates=[c0, c1, c2],
+            allocation={"hbm": 0x1000},
+        )
+        tensor_out = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=fp16,
+            device_size=[2, 4, 64],
+            device_coordinates=[c0, c1, c2],
+            allocation={"hbm": 0x2000},
+        )
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                c0: (Integer(2), 1),
+                c1: (Integer(4), 1),
+                c2: (Integer(64), 1),
+            },
+            args=[tensor_in, tensor_out],
+            op_info={},
+            tiled_symbols=[c0, c1],
+        )
+
+    def test_two_tiled_symbols_produce_two_stride_entries(self):
+        op_spec = self._make_3d_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        hbm_strides = [d for d in affine_strides if len(d) > 0]
+        self.assertGreater(len(hbm_strides), 0)
+        for tensor_strides in hbm_strides:
+            self.assertEqual(len(tensor_strides), 2)
+
+    def test_two_tiled_symbols_strides_are_positive(self):
+        op_spec = self._make_3d_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        for tensor_strides in affine_strides:
+            for sym, stride in tensor_strides.items():
+                self.assertGreater(stride, 0)
+
+
+class TestCompileOpSpecSymbolMapping(unittest.TestCase):
+    def test_affine_strides_non_empty_for_tiled_op(self):
+        op_spec = _make_tiled_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        has_strides = any(len(d) > 0 for d in affine_strides)
+        self.assertTrue(
+            has_strides,
+            f"Expected non-empty affine_strides; got {affine_strides}.",
+        )
+
+    def test_generate_bundle_emits_affine_apply_for_tiled_loop(self):
+        op_spec = _make_tiled_op_spec()
+        loop = LoopSpec(count=Integer(4), body=[op_spec])
+        tmpdir = tempfile.mkdtemp()
+        generate_bundle("test_kernel", tmpdir, [loop], use_symbols=True)
+
+        with open(os.path.join(tmpdir, "bundle.mlir")) as f:
+            mlir = f.read()
+
+        self.assertIn("affine.apply", mlir)
+        self.assertIn("affine_map", mlir)
+        self.assertIn("scf.for", mlir)
+
+
+# ===========================================================================
+# 5. generate_bundle MLIR output
+# ===========================================================================
+
+
+class TestGenerateBundleMlir(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.patch = patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=_fake_compile_op_spec,
+        )
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+
+    def _bundle(self, specs):
+        generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+        return _read_mlir(self.tmpdir)
+
+    def test_flat_ops_no_loop(self):
+        a, b = _make_minimal_op_spec("a"), _make_minimal_op_spec("b")
+        mlir = self._bundle([a, b])
+        self.assertIn("sdscbundle.sdsc_execute", mlir)
+        self.assertNotIn("scf.for", mlir)
+        self.assertNotIn("arith.constant", mlir)
+        self.assertEqual(mlir.count("sdsc_execute"), 2)
+
+    def test_single_loop_emits_scf_for(self):
+        a, b = _make_minimal_op_spec("a"), _make_minimal_op_spec("b")
+        loop = LoopSpec(count=Integer(4), body=[a, b])
+        mlir = self._bundle([loop])
+        self.assertIn("scf.for", mlir)
+        self.assertIn("arith.constant 4 : index", mlir)
+        self.assertIn("%c0", mlir)
+        self.assertIn("%c1", mlir)
+        self.assertEqual(mlir.count("sdsc_execute"), 2)
+
+    def test_single_loop_structure(self):
+        a = _make_minimal_op_spec("a")
+        loop = LoopSpec(count=Integer(3), body=[a])
+        mlir = self._bundle([loop])
+        for_pos = mlir.index("scf.for")
+        exec_pos = mlir.index("sdsc_execute")
+        close_pos = mlir.rindex("}")
+        self.assertLess(for_pos, exec_pos)
+        self.assertLess(exec_pos, close_pos)
+
+    def test_flat_op_before_and_after_loop(self):
+        before = _make_minimal_op_spec("before")
+        body = _make_minimal_op_spec("body")
+        after = _make_minimal_op_spec("after")
+        loop = LoopSpec(count=Integer(2), body=[body])
+        mlir = self._bundle([before, loop, after])
+        self.assertIn("scf.for", mlir)
+        self.assertEqual(mlir.count("sdsc_execute"), 3)
+
+    def test_nested_loops(self):
+        a = _make_minimal_op_spec("a")
+        b = _make_minimal_op_spec("b")
+        inner = LoopSpec(count=Integer(2), body=[b])
+        outer = LoopSpec(count=Integer(4), body=[a, inner])
+        mlir = self._bundle([outer])
+        self.assertEqual(mlir.count("scf.for"), 2)
+        self.assertIn("arith.constant 4 : index", mlir)
+        self.assertIn("arith.constant 2 : index", mlir)
+        self.assertEqual(mlir.count("sdsc_execute"), 2)
+        outer_pos = mlir.index("scf.for")
+        inner_pos = mlir.index("scf.for", outer_pos + 1)
+        self.assertLess(outer_pos, inner_pos)
+
+    def test_sdsc_json_files_written_depth_first(self):
+        a = _make_minimal_op_spec("a")
+        b = _make_minimal_op_spec("b")
+        loop = LoopSpec(count=Integer(2), body=[a, b])
+        generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=True)
+        written = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".json"))
+        self.assertEqual(len(written), 2)
+
+    def test_empty_specs_writes_minimal_bundle(self):
+        mlir = self._bundle([])
+        self.assertIn("func.func @sdsc_bundle", mlir)
+        self.assertIn("return", mlir)
+        self.assertNotIn("sdsc_execute", mlir)
+        self.assertNotIn("scf.for", mlir)
+
+    def test_symbolic_count_raises(self):
+        k = Symbol("K")
+        a = _make_minimal_op_spec("a")
+        loop = LoopSpec(count=k, body=[a])
+        with self.assertRaises(NotImplementedError):
+            self._bundle([loop])
+
+
+class TestFindUnimplemented(unittest.TestCase):
+    def test_no_unimplemented(self):
+        from torch_spyre._inductor.op_spec import find_unimplemented
+
+        a = _make_minimal_op_spec("a")
+        self.assertIsNone(find_unimplemented([a]))
+
+    def test_flat_unimplemented(self):
+        from torch_spyre._inductor.op_spec import find_unimplemented
+
+        unimp = UnimplementedOp(op="missing")
+        a = _make_minimal_op_spec("a")
+        result = find_unimplemented([a, unimp])
+        self.assertIs(result, unimp)
+
+    def test_unimplemented_inside_loop(self):
+        from torch_spyre._inductor.op_spec import find_unimplemented
+
+        unimp = UnimplementedOp(op="missing")
+        loop = LoopSpec(count=Integer(4), body=[unimp])
+        result = find_unimplemented([loop])
+        self.assertIs(result, unimp)
+
+    def test_unimplemented_in_nested_loop(self):
+        from torch_spyre._inductor.op_spec import find_unimplemented
+
+        unimp = UnimplementedOp(op="missing")
+        inner = LoopSpec(count=Integer(2), body=[unimp])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        result = find_unimplemented([outer])
+        self.assertIs(result, unimp)
+
+    def test_returns_first_found(self):
+        from torch_spyre._inductor.op_spec import find_unimplemented
+
+        u1 = UnimplementedOp(op="first")
+        u2 = UnimplementedOp(op="second")
+        result = find_unimplemented([u1, u2])
+        self.assertIs(result, u1)
+
+
+class TestGenerateBundleMlirSnapshot(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.patch = patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=_fake_compile_op_spec,
+        )
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+
+    def _bundle(self, specs):
+        generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+        return _read_mlir(self.tmpdir)
+
+    def test_single_loop_snapshot(self):
+        a = _make_minimal_op_spec("a")
+        loop = LoopSpec(count=Integer(8), body=[a])
+        mlir = self._bundle([loop])
+        expected = (
+            "module {\n"
+            "\tfunc.func @sdsc_bundle() {\n"
+            "\t\t%c0 = arith.constant 0 : index\n"
+            "\t\t%c1 = arith.constant 1 : index\n"
+            "\t\t%loop_bound_0 = arith.constant 8 : index\n"
+            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
+            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
+            "\t\t}\n"
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+    def test_flat_snapshot(self):
+        a = _make_minimal_op_spec("a")
+        mlir = self._bundle([a])
+        expected = (
+            "module {\n"
+            "\tfunc.func @sdsc_bundle() {\n"
+            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+
+class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._s = Symbol("s")
+
+    def _bundle(self, specs, fake_compile):
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=fake_compile,
+        ):
+            generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+        return _read_mlir(self.tmpdir)
+
+    def test_tiled_tensor_emits_affine_apply(self):
+        s = self._s
+        stride = 16384
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x1000)
+            return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}]
+
+        op = _make_minimal_op_spec("a")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        self.assertIn("affine_map", mlir)
+        self.assertIn(str(stride), mlir)
+        self.assertIn("affine.apply", mlir)
+        self.assertIn("%addr_0", mlir)
+        self.assertIn(
+            'sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json"', mlir
+        )
+        self.assertIn('"symbol_ids"=[-1]', mlir)
+
+    def test_non_tiled_tensor_in_loop_no_affine_apply(self):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x2000)
+            return _make_tiled_json(idx, sym_id), [0x2000], [{}]
+
+        op = _make_minimal_op_spec("b")
+        loop = LoopSpec(count=Integer(2), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        self.assertNotIn("affine.apply", mlir)
+        self.assertNotIn("affine_map", mlir)
+        self.assertIn("%sym_1", mlir)
+        self.assertIn("sdscbundle.sdsc_execute (%sym_1)", mlir)
+
+    def test_affine_map_stride_at_module_level(self):
+        s = self._s
+        stride = 8192
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x3000)
+            return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}]
+
+        op = _make_minimal_op_spec("c")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        map_pos = mlir.index("affine_map")
+        module_pos = mlir.index("module {")
+        self.assertLess(map_pos, module_pos)
+
+    def test_affine_apply_inside_scf_for(self):
+        s = self._s
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x4000)
+            return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}]
+
+        op = _make_minimal_op_spec("d")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        for_pos = mlir.index("scf.for")
+        apply_pos = mlir.index("affine.apply")
+        execute_pos = mlir.index("sdsc_execute")
+        self.assertLess(for_pos, apply_pos)
+        self.assertLess(apply_pos, execute_pos)
+
+    def test_tiled_snapshot(self):
+        s = self._s
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x1000)
+            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}]
+
+        op = _make_minimal_op_spec("a")
+        op.tiled_symbols = [s]
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake_compile)
+
+        expected = (
+            "#map_0 = affine_map<(d0)[s0] -> (s0 + 256*d0)>\n"
+            "module {\n"
+            "\tfunc.func @sdsc_bundle() {\n"
+            "\t\t%c0 = arith.constant 0 : index\n"
+            "\t\t%c1 = arith.constant 1 : index\n"
+            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
+            "\t\t%sym_1 = arith.constant 4096 : index\n"
+            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
+            "\t\t\t%addr_0 = affine.apply #map_0(%i_0)[%sym_1]\n"
+            '\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
+            ' "symbol_ids"=[-1]}\n'
+            "\t\t}\n"
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+
+class TestGenerateBundleNestedTiling(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.s0 = Symbol("s0")
+        self.s1 = Symbol("s1")
+
+    def _bundle(self, specs, fake_compile):
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=fake_compile,
+        ):
+            generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+        return _read_mlir(self.tmpdir)
+
+    def _fake_compile_two_strides(self, outer_stride, inner_stride):
+        s0, s1 = self.s0, self.s1
+
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(0x1000)
+            return (
+                _make_tiled_json(idx, sym_id),
+                [0x1000],
+                [{s0: outer_stride, s1: inner_stride}],
+            )
+
+        return fake_compile
+
+    def test_nested_loop_emits_two_scf_for(self):
+        op = _make_minimal_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        self.assertEqual(mlir.count("scf.for"), 2)
+
+    def test_nested_tiling_emits_2d_affine_map(self):
+        op = _make_minimal_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        self.assertIn("affine_map<(d0, d1)[s0]", mlir)
+        self.assertIn("512*d0", mlir)
+        self.assertIn("64*d1", mlir)
+
+    def test_nested_tiling_affine_apply_uses_both_loop_vars(self):
+        op = _make_minimal_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        self.assertIn("affine.apply", mlir)
+        apply_line = next(line for line in mlir.splitlines() if "affine.apply" in line)
+        self.assertIn("%i_0", apply_line)
+        self.assertIn("%i_1", apply_line)
+
+    def test_nested_tiling_snapshot(self):
+        op = _make_minimal_op_spec("add")
+        inner = LoopSpec(count=Integer(2), body=[op])
+        outer = LoopSpec(count=Integer(4), body=[inner])
+        mlir = self._bundle(
+            [outer], self._fake_compile_two_strides(outer_stride=512, inner_stride=64)
+        )
+        expected = (
+            "#map_0 = affine_map<(d0, d1)[s0] -> (s0 + 512*d0 + 64*d1)>\n"
+            "module {\n"
+            "\tfunc.func @sdsc_bundle() {\n"
+            "\t\t%c0 = arith.constant 0 : index\n"
+            "\t\t%c1 = arith.constant 1 : index\n"
+            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
+            "\t\t%loop_bound_1 = arith.constant 2 : index\n"
+            "\t\t%sym_1 = arith.constant 4096 : index\n"
+            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
+            "\t\t\tscf.for %i_1 = %c0 to %loop_bound_1 step %c1 {\n"
+            "\t\t\t\t%addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]\n"
+            '\t\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
+            ' "symbol_ids"=[-1]}\n'
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+
+class TestGenerateBundleUnrollPath(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def test_non_tiled_loop_without_use_symbols_ok(self):
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=_fake_compile_op_spec,
+        ):
+            op = _make_minimal_op_spec("a")
+            loop = LoopSpec(count=Integer(2), body=[op])
+            generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=False)
+
+    def test_flat_op_without_use_symbols_ok(self):
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=_fake_compile_op_spec,
+        ):
+            op = _make_minimal_op_spec("a")
+            generate_bundle("test_kernel", self.tmpdir, [op], use_symbols=False)
+
+
+# ===========================================================================
+# 6. coarse_tile buffer propagation pass
+# ===========================================================================
+
+
+def _make_rw_with_reads(*names):
+    """Return a fake ReadWrites whose reads set contains MemoryDep mocks for names."""
+    from torch._inductor.dependencies import MemoryDep
+
+    reads = []
+    for name in names:
+        dep = MagicMock(spec=MemoryDep)
+        dep.name = name
+        reads.append(dep)
+    rw = MagicMock()
+    rw.reads = reads
+    return rw
+
+
+def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
+    """Return a ComputedBuffer mock that looks like a stamped tiled Pointwise op."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(ranges)
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_group_id = loop_group_id
+    op.loop_count = list(loop_count)
+    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.get_read_writes.return_value = _make_rw_with_reads()
+    op.origins = OrderedSet()
+    return op
+
+
+def _make_consumer_op(name, reads_buf):
+    """Return a ComputedBuffer mock that reads reads_buf, with no loop_group_id."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = [Integer(64)]
+    data.inner_fn = MagicMock()
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    del op.loop_group_id
+    op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
+    op.origins = OrderedSet()
+    return op
+
+
+def _make_inside_consumer_op(name, reads_buf, loop_group_id):
+    """Return a ComputedBuffer mock inside the same loop group that reads reads_buf."""
+    from torch._inductor.ir import ComputedBuffer, Pointwise
+
+    data = MagicMock(spec=Pointwise)
+    data.ranges = [Integer(16)]
+    data.inner_fn = MagicMock()
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_group_id = loop_group_id
+    op.loop_count = [Integer(4)]
+    op.loop_tiled_dims = [[0]]
+    op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
+    op.origins = OrderedSet()
+    return op
+
+
+class TestCoarseTileBufferPropagation(unittest.TestCase):
+    """Tests for insert_tiling_propagation — consumer analysis helpers."""
+
+    # ------------------------------------------------------------------
+    # Tests for _find_outside_consumers and _has_inside_consumers
+    # (these helpers don't call V.graph, so no mocking needed)
+    # ------------------------------------------------------------------
+
+    def test_no_consumers_returns_empty(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [op])
+        self.assertEqual(consumers, [])
+        self.assertFalse(is_out)
+
+    def test_outside_consumer_detected(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        consumer = _make_consumer_op("out0", "op0")  # no loop_group_id → outside
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [tiled, consumer])
+        self.assertEqual(consumers, [consumer])
+        self.assertFalse(is_out)
+
+    def test_graph_output_detected(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value={"op0"},
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [tiled])
+        self.assertEqual(consumers, [])
+        self.assertTrue(is_out)
+
+    def test_inside_consumer_not_counted_as_outside(self):
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        inside = _make_inside_consumer_op("op1", "op0", (0,))
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, is_out = _find_outside_consumers("op0", (0,), [tiled, inside])
+        self.assertEqual(consumers, [])
+        self.assertFalse(is_out)
+
+    def test_has_inside_consumer_true(self):
+        from torch_spyre._inductor.coarse_tile import _has_inside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        inside = _make_inside_consumer_op("op1", "op0", (0,))
+        result = _has_inside_consumers("op0", (0,), [tiled, inside])
+        self.assertTrue(result)
+
+    def test_has_inside_consumer_false_when_only_outside(self):
+        from torch_spyre._inductor.coarse_tile import _has_inside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        outside = _make_consumer_op("out0", "op0")
+        result = _has_inside_consumers("op0", (0,), [tiled, outside])
+        self.assertFalse(result)
+
+    def test_compute_full_ranges_flat(self):
+        from torch_spyre._inductor.coarse_tile import _compute_full_ranges
+
+        op = _make_tiled_op("op0", [Integer(16), Integer(8)], (0,), [Integer(4)], [[0]])
+        full = _compute_full_ranges(op)
+        # dim 0: 16 * 4 = 64; dim 1 untiled: 8
+        self.assertEqual(full[0], Integer(64))
+        self.assertEqual(full[1], Integer(8))
+
+    def test_compute_full_ranges_nested(self):
+        from torch_spyre._inductor.coarse_tile import _compute_full_ranges
+
+        # Nested: outer K=4 tiles dim 0, inner K=2 tiles dim 1
+        op = _make_tiled_op(
+            "op0",
+            [Integer(16), Integer(32)],
+            (0, 0),
+            [Integer(4), Integer(2)],
+            [[0], [1]],
+        )
+        full = _compute_full_ranges(op)
+        # dim 0: 16 * 4 = 64; dim 1: 32 * 2 = 64
+        self.assertEqual(full[0], Integer(64))
+        self.assertEqual(full[1], Integer(64))
+
+    def test_different_loop_group_id_is_outside(self):
+        """Op in loop group 1 should be seen as outside consumer of group 0."""
+        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        other_group = _make_tiled_op("op1", [Integer(16)], (1,), [Integer(4)], [[0]])
+        # Make op1 read op0
+        other_group.get_read_writes.return_value = _make_rw_with_reads("op0")
+        with patch(
+            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            consumers, _ = _find_outside_consumers("op0", (0,), [tiled, other_group])
+        self.assertEqual(consumers, [other_group])
+
+
+def _make_tiled_reduction_op(
+    name,
+    ranges,
+    reduction_ranges,
+    reduction_type,
+    loop_group_id,
+    loop_count,
+    loop_tiled_dims,
+):
+    """Return a ComputedBuffer mock that looks like a stamped tiled Reduction op."""
+    from torch._inductor.ir import ComputedBuffer, Reduction
+
+    data = MagicMock(spec=Reduction)
+    data.ranges = list(ranges)
+    data.reduction_ranges = list(reduction_ranges)
+    data.reduction_type = reduction_type
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.get_operation_name.return_value = name
+    op.get_name.return_value = name
+    op.loop_group_id = loop_group_id
+    op.loop_count = list(loop_count)
+    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.get_read_writes.return_value = _make_rw_with_reads()
+    op.origins = OrderedSet()
+    return op
+
+
+class TestCoarseTileReductionPropagation(unittest.TestCase):
+    """Tests for insert_tiling_propagation Reduction support."""
+
+    def test_matmul_in_loop_raises(self):
+        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        op = _make_tiled_reduction_op(
+            "matmul0",
+            ranges=[Integer(4), Integer(4), Integer(4)],
+            reduction_ranges=[Integer(64)],
+            reduction_type=BATCH_MATMUL_OP,
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        with self.assertRaises(RuntimeError, msg="matmul inside loop should raise"):
+            _check_reduction_tiling_safety(op)
+
+    def test_reduction_tiled_reduction_dim_raises(self):
+        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+
+        # ranges=[M], reduction_ranges=[K]; tiled_dim=1 is >= len(ranges)=1 → reduction dim
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[1]],
+        )
+        with self.assertRaises(RuntimeError, msg="tiled reduction dim should raise"):
+            _check_reduction_tiling_safety(op)
+
+    def test_reduction_output_dim_tiled_ok(self):
+        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+
+        # ranges=[M], reduction_ranges=[K]; tiled_dim=0 is an output dim → no error
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(64)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        # Should not raise
+        _check_reduction_tiling_safety(op)
+
+
+if __name__ == "__main__":
+    unittest.main()

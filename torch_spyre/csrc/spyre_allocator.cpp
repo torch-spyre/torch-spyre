@@ -121,6 +121,13 @@ void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
 }
 
 c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
+  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
+                                      std::nullopt, flex::MemoryType::Tensor);
+  return SpyreAllocator::allocate(nbytes, directive);
+}
+
+c10::DataPtr SpyreAllocator::allocate(
+    size_t nbytes, const flex::AllocationDirective& directive) {
   c10::Device curr_device =
       c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
 
@@ -134,22 +141,22 @@ c10::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   auto flex_alloc = getFlexAllocator();
 
   // Allocate first-class raw storage via CompositeAddress.
-  flex::CompositeAddress composite_addr = flex_alloc->allocate(nbytes);
+  flex::CompositeAddress composite_addr =
+      flex_alloc->allocate(nbytes, directive);
 
-  // Bridge to the legacy DeviceMemoryAllocationPtr view for existing PF-mode
-  // users that still expect a pointer-like object referring to the same
-  // storage.
-  flex::DeviceMemoryAllocationPtr data =
-      flex_alloc->makeInterimAllocationPtr(composite_addr);
-  TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
+  // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
+  // allocation may be larger than the requested nbytes. Use total_size() for
+  // accurate memory profiling.
+  size_t actual_nbytes = composite_addr.total_size();
 
-  // Create context with both owner and CompositeAddress
-  auto* ctx = new SharedOwnerCtx(std::move(data), std::move(composite_addr),
-                                 device_id, nbytes);
+  auto* ctx = new SharedOwnerCtx(std::move(composite_addr), device_id);
   void* ctx_void = static_cast<void*>(ctx);
 
-  void* data_void = static_cast<void*>(ctx->owner.get());
-  recordAlloc(nbytes, data_void, device_id);
+  // Use the SharedOwnerCtx pointer as the unique data handle for c10::DataPtr.
+  // This pointer is never dereferenced — it serves only as a unique token for
+  // memory profiling (recordAlloc/recordRelease).
+  void* data_void = static_cast<void*>(ctx);
+  recordAlloc(actual_nbytes, data_void, device_id);
 
   auto data_ptr_result =
       at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
@@ -162,10 +169,10 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
     return;
   }
   auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-  size_t nbytes = ctx->nbytes;
+  size_t nbytes = ctx->composite_addr.total_size();
 
-  SpyreAllocator::instance().recordRelease(
-      nbytes, static_cast<void*>(ctx->owner.get()), ctx->device_id);
+  SpyreAllocator::instance().recordRelease(nbytes, static_cast<void*>(ctx),
+                                           ctx->device_id);
   delete ctx;
 }
 

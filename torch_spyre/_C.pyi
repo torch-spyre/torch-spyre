@@ -9,6 +9,7 @@ import typing
 
 __all__: list[str] = [
     "DataFormats",
+    "JobPlan",
     "SpyreTensorLayout",
     "_SpyreStreamBase",
     "current_stream",
@@ -17,7 +18,6 @@ __all__: list[str] = [
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
-    "convert_artifacts",
     "empty_with_layout",
     "copy_tensor",
     "encode_constant",
@@ -26,7 +26,9 @@ __all__: list[str] = [
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "launch_jobplan",
     "launch_kernel",
+    "prepare_kernel",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_with_layout",
@@ -116,8 +118,8 @@ class DataFormats:
     def value(self) -> int: ...
 
 class SpyreTensorLayout:
-    __hash__: typing.ClassVar[None] = None  # type: ignore
-    def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore
+    def __hash__(self) -> int: ...
+    def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore[override]
     @typing.overload
     def __init__(
         self,
@@ -239,7 +241,6 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def convert_artifacts(arg0: str) -> None: ...
 def copy_tensor(
     self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
 ) -> None:
@@ -269,7 +270,56 @@ def get_downcast_warning() -> bool:
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
-def launch_kernel(arg0: str, arg1: collections.abc.Sequence[torch.Tensor]) -> None: ...
+
+class JobPlan:
+    """
+    A torch-spyre internal container for executing a unit of work.
+
+    Produced by prepare_kernel() and consumed by launch_jobplan().
+    """
+    def num_steps(self) -> int:
+        """Get the number of steps in the JobPlan"""
+        ...
+
+    def job_allocation_size(self) -> int:
+        """Get the size of the job allocation"""
+        ...
+
+    def get_step_type(self, idx: int) -> str:
+        """Get the type of step at the given index (H2D, D2H, Compute, or HostCompute)"""
+        ...
+
+def launch_jobplan(
+    job_plan: JobPlan, args: collections.abc.Sequence[torch.Tensor]
+) -> None:
+    """
+    Launch a prepared JobPlan with the given tensor arguments.
+
+    Args:
+        job_plan: The JobPlan to execute
+        args: Sequence of input/output tensors
+    """
+    ...
+
+def launch_kernel(
+    code_dir: str, args: collections.abc.Sequence[torch.Tensor]
+) -> None: ...
+def prepare_kernel(
+    spyrecode_dir: str, stream: _SpyreStreamBase | None = None
+) -> JobPlan:
+    """
+    Prepare a kernel from a SpyreCode directory and return a JobPlan.
+
+    Args:
+        spyrecode_dir: Path to the SpyreCode directory
+        stream: Stream to use for initialization transfers.
+            If None, uses the current stream. Defaults to None.
+
+    Returns:
+        Prepared JobPlan ready for execution
+    """
+    ...
+
 def set_downcast_warning(arg0: bool) -> None:
     """
     Enable/disable downcast warnings for this process.

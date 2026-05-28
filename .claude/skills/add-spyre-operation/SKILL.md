@@ -143,14 +143,19 @@ register it in `torch_spyre/fallbacks.py`.
 
 ## Test Requirements
 
-Every new op must have tests. See the `write-spyre-op-test` skill for details.
-At minimum:
+Every new op requires two levels of validation:
 
-- **Compiled-path test** in `tests/_inductor/test_inductor_ops.py` using
-  `compare_with_cpu()` or `compare()`
-- **Shape variety:** 1D through 4D, stick-aligned (multiples of 64) and
-  non-aligned sizes
-- **Default dtype:** `torch.float16`
+1. **Model-based verification** — run the op against parameters drawn from
+   real target models:
+   `pytest -c pytest_models.ini tests/models/test_model_ops.py -k <op_name>`
+
+2. **Unit tests** — add compiled-path and (if applicable) eager-path tests.
+   See the `write-spyre-op-test` skill for details. At minimum:
+   - **Compiled-path test** in `tests/_inductor/test_inductor_ops.py` using
+     `compare_with_cpu()` or `compare()`
+   - **Shape variety:** 1D through 4D, stick-aligned (multiples of 64) and
+     non-aligned sizes
+   - **Default dtype:** `torch.float16`
 
 ---
 

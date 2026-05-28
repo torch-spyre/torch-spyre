@@ -116,12 +116,30 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.stride_map, [64, 256, 1])
 
-    def test_equality(self):
+    def test_equality_and_hashable(self):
         x = SpyreTensorLayout([512, 256], torch.float16)
         y = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [0, 1])
         z = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
+        z2 = SpyreTensorLayout([512, 256], torch.float32)
+
+        self.assertEqual(hash(x), hash(x))
+
         self.assertEqual(x, y)
+        self.assertEqual(hash(x), hash(y))
+
         self.assertNotEqual(y, z)
+        self.assertNotEqual(hash(y), hash(z))
+
+        self.assertNotEqual(x, z2)
+        self.assertNotEqual(hash(x), hash(z2))
+
+        # usable as dict key
+        d = {x: "value"}
+        self.assertEqual(d[y], "value")
+
+        # usable in a set
+        s = {x, y, z}
+        self.assertEqual(len(s), 2)
 
     def test_stl_pickleable(self):
         stl = SpyreTensorLayout([512, 256], [256, 1], torch.float16, [1, 0])
@@ -386,25 +404,17 @@ class TestSpyreTensorLayout(TestCase):
         x_dev = x_sliced.to(device_layout=x_stl)
         self.assertEqual(x_sliced, x_dev.cpu())
 
-    @unittest.skip(
-        "Skip until device transfers are updated to account for non-dense tensors"
-    )
     @parametrize(
-        "sizes,strides,device_size,stride_map",
+        "sizes,strides",
         [
-            ([40, 120], [120, 1], [1, 60, 64], [7680, 1, 120]),
-            ([40, 120], [120, 1], [1, 40, 64], [64, 120, 1]),
+            ([40, 120], [120, 1]),
+            ([40, 120], [120, 1]),
         ],
     )
-    def test_to_spyre_layout_explicit_sliced_other(
-        self, sizes, strides, device_size, stride_map
-    ):
+    def test_to_spyre_sliced_other(self, sizes, strides):
         x = torch.empty_strided(sizes, strides, dtype=torch.float16).uniform_(0, 1)
         x_sliced = x[:, sizes[1] // 2 :]
-        x_stl = SpyreTensorLayout(
-            device_size, stride_map, get_device_dtype(torch.float16)
-        )
-        x_dev = x_sliced.to(device_layout=x_stl)
+        x_dev = x_sliced.to("spyre")
         # Sliced tensors (that are not sliced along the batch dimension) are
         # non-dense but produce dense tensors when transferred across devices.
         # This requires an update the the stride_map after the device transfer

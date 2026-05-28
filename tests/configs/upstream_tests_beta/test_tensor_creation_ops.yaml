@@ -1,0 +1,32 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_tensor_creation_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestAsArray::test_unsupported_alias
+            - TestBufferProtocol::test_byte_to_int
+            - TestBufferProtocol::test_invalid_positional_args
+            - TestBufferProtocol::test_not_a_buffer
+            - TestBufferProtocol::test_requires_grad
+            - TestBufferProtocol::test_same_type
+            - TestBufferProtocol::test_with_count
+            - TestBufferProtocol::test_with_count_and_offset
+            - TestBufferProtocol::test_with_offset
+            - TestTensorCreation::test_cat_mem_overlap
+            - TestTensorCreation::test_cat_out_channels_last
+            - TestTensorCreation::test_concat_empty_list_error
+            - TestTensorCreation::test_empty_strided
+            - TestTensorCreation::test_empty_tensor_props
+            - TestTensorCreation::test_linlogspace_mem_overlap
+            - TestTensorCreation::test_meshgrid_empty
+            - TestTensorCreation::test_meshgrid_inconsistent_device
+            - TestTensorCreation::test_meshgrid_inconsistent_dtype
+            - TestTensorCreation::test_meshgrid_non_1d_tensor
+            - TestTensorCreation::test_meshgrid_unsupported_indexing
+            - TestTensorCreation::test_meshgrid_warns_if_no_indexing
+            - TestTensorCreation::test_simple_scalar_cast
+            - TestTensorCreation::test_strided_mismatched_stride_shape
+            - TestTensorCreation::test_tensor_from_non_writable_numpy
+            - TestTensorCreation::test_zeros_bounds_checking
+          mode: mandatory_success

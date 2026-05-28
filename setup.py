@@ -31,6 +31,7 @@ from setuptools import Command, setup
 
 PATH_NAME = "torch_spyre"
 PACKAGE_NAME = "torch_spyre"
+DISTRIBUTED_PACKAGE_NAME = "spyre_ccl"
 
 
 def get_torch_spyre_version() -> str:
@@ -53,8 +54,8 @@ def check_libflex():
 
 
 ROOT_DIR = Path(__file__).absolute().parent
-CODEGEN_DIR = ROOT_DIR / "codegen"
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
+DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
 
 
 # Automatically download json.hpp if not present
@@ -113,9 +114,54 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
 
+# The USE_SPYRE_CCL environment variable can be used to build torch-spyre
+# without support for Multi-Spyre. This is for developers only.
+# If set to '0' then Multi-Spyre support is disabled.
+# Otherwise (default) Multi-Spyre support is enabled.
+use_spyre_ccl = os.environ.get("USE_SPYRE_CCL", "1") != "0"
+
+if not use_spyre_ccl:
+    print("=" * 80)
+    print("WARNING: Multi-Spyre support has been disabled")
+    print("=" * 80)
+else:
+    if "SPYRE_COMMS_INSTALL_DIR" in os.environ:
+        SPYRE_COMMS_DIR = Path(os.environ["SPYRE_COMMS_INSTALL_DIR"])
+        if not SPYRE_COMMS_DIR.exists():
+            raise RuntimeError(
+                f"SPYRE_COMMS_INSTALL_DIR directory does not exist: {SPYRE_COMMS_DIR}"
+            )
+        SPYRE_COMMS_INCLUDE_DIR = SPYRE_COMMS_DIR / "include"
+        if not SPYRE_COMMS_INCLUDE_DIR.exists():
+            raise RuntimeError(
+                f"SPYRE_COMMS_INSTALL_DIR include directory does not exist: {SPYRE_COMMS_INCLUDE_DIR}"
+            )
+        SPYRE_COMMS_LIB_DIR = SPYRE_COMMS_DIR / "lib"
+        if not SPYRE_COMMS_LIB_DIR.exists():
+            raise RuntimeError(
+                f"SPYRE_COMMS_INSTALL_DIR lib directory does not exist: {SPYRE_COMMS_LIB_DIR}"
+            )
+        INCLUDE_DIRS += [
+            SPYRE_COMMS_INCLUDE_DIR,
+        ]
+        LIBRARY_DIRS += [SPYRE_COMMS_LIB_DIR]
+    else:
+        raise RuntimeError(
+            "SPYRE_COMMS_INSTALL_DIR not set. "
+            "Set USE_SPYRE_CCL=0 to build without Multi-Spyre support, "
+            "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
+        )
+
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
+
+if use_new_system:
+    LIBRARIES = ["flex"]
+else:
+    LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+if use_spyre_ccl:
+    LIBRARIES.append("spyre_comms")
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
@@ -124,7 +170,7 @@ LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 # Set TORCH_SPYRE_DEBUG=1 to build with -O0 for easier debugging
 NO_OPT_BUILD = os.environ.get("TORCH_SPYRE_DEBUG", "0") == "1"
 
-EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
+EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++20"]
 if NO_OPT_BUILD:
     EXTRA_CXX_FLAGS += ["-O0"]
 
@@ -149,37 +195,6 @@ class clean(Command):
                 shutil.rmtree(str(path), ignore_errors=True)
 
 
-def run_codegen():
-    import importlib
-    import sys
-
-    is_meta = any(
-        cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
-    )
-
-    if not importlib.util.find_spec("sendnn"):
-        if not is_meta:
-            raise ImportError("sendnn is required for building. Install it first.")
-
-        print("Skipping codegen (sendnn not available, metadata extraction only)")
-        return None
-
-    gen_script = CODEGEN_DIR / "gen.py"
-
-    if not gen_script.exists():
-        raise FileNotFoundError(f"Codegen script not found: {gen_script}")
-
-    print("Running codegen...")
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("gen", gen_script)
-    assert spec is not None
-    assert spec.loader is not None
-    gen = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gen)
-    return gen.generate_and_register_wrappers(CODEGEN_DIR)
-
-
 if __name__ == "__main__":
     import sys
 
@@ -198,11 +213,10 @@ if __name__ == "__main__":
     else:
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-        OUTPUT_CODEGEN_DIR = run_codegen()
-
         sources = list(CSRC_DIR.glob("*.cpp"))
-        if OUTPUT_CODEGEN_DIR:
-            sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
+        distributed_sources = (
+            list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
+        )
 
         # Filenames that belong to the tiny hooks module.
         # "shared" files are compiled into both _hooks.so and _C.so.
@@ -218,22 +232,34 @@ if __name__ == "__main__":
         core_src_paths = [
             p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
         ]
+        distributed_src_paths = [
+            p.relative_to(ROOT_DIR).as_posix() for p in sorted(distributed_sources)
+        ]
+
+        # Build define_macros list conditionally
+        base_define_macros = [
+            ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+            ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
+            ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
+            ("EAGER_MODE_ENV", '"EAGER_MODE"'),
+            ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
+        ]
+        if use_spyre_ccl:
+            base_define_macros.append(("USE_SPYRE_CCL", None))
+        if use_new_system:
+            base_define_macros.append(("USE_FLEX_NAMESPACE", None))
 
         ext_modules = [
             CppExtension(
                 name=f"{PACKAGE_NAME}._C",
-                sources=core_src_paths,
+                sources=core_src_paths + distributed_src_paths,
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,
                 extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
-                define_macros=[
-                    ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+                define_macros=base_define_macros
+                + [
                     ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
-                    ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
-                    ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
-                    ("EAGER_MODE_ENV", '"EAGER_MODE"'),
-                    ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
                 ],
             ),
             CppExtension(
@@ -243,13 +269,9 @@ if __name__ == "__main__":
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,
                 extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
-                define_macros=[
-                    ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+                define_macros=base_define_macros
+                + [
                     ("MODULE_NAME", f'"{PACKAGE_NAME}._hooks"'),
-                    ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
-                    ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
-                    ("EAGER_MODE_ENV", '"EAGER_MODE"'),
-                    ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
                 ],
             ),
         ]

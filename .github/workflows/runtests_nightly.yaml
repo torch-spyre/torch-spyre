@@ -1,8 +1,12 @@
-name: tests
+name: tests-nightly
 
 on:
   schedule:
     - cron: 0 2 * * *
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -15,36 +19,49 @@ permissions:
 jobs:
   test:
     name: Run Spyre unit tests - complete version
-    # runs-on: official-aiu-x86-64-arc-runner-set-v1
-    # runs-on: official-aiu-x86-64-arc-runner-set-v2
-    runs-on: official-aiu-x86-64-arc-runner-set-v3
-    # increase timeout to 12 hours
-    timeout-minutes: 720
-    # env: {}
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 60
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
+
     steps:
-      - name: Checkout repository
+      # Sparse checkout into the GHA workspace so the local composite
+      # actions under .github/actions/ are available. The pre-cloned
+      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
+      # against.
+      - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: get some info
-        run: |
-          echo 'gather info start'
-          pwd
-          ls -la
-          whoami
-          id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
-      - name: Install the torch-spyre package and dependencies
-        run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          # avoid the extra step required by --no-build-isolation
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+
+      - uses: ./.github/actions/build-torch-spyre
+
       - name: Run unit tests
         run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
           echo 'Run unit tests start'
           pytest tests/ --cpu-compile -vvv -s || EXIT_CODE=$?
           EXIT_CODE=${EXIT_CODE:-0}

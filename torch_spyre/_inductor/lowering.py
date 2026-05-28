@@ -14,18 +14,20 @@
 
 
 from contextlib import contextmanager
+from warnings import warn
 
 import torch
 
-from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise, Scatter, StorageBox
+from torch._inductor.ir import Reduction, Pointwise, StorageBox
 import torch._inductor.lowering as lowering
-
+import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
-from .ir import SpyreReduction
+from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
+from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 import threading
@@ -74,16 +76,37 @@ def register_spyre_lowering(
 # the op is registered by default. Here, we unregister ops that are falling back
 # to eager ops
 # Note: If an op has a decomposition defined, a lowering is not registered
-def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=False):
-    for overload in lowering.get_overloads(op):
-        if overload in lowering_dict:
-            del lowering_dict[overload]
-        elif not allow_missing:
-            raise RuntimeError(f"lowering of {overload} is not registered")
+def unregister_lowerings(fallback_ops, lowering_dict, allow_missing=False):
+    saved_overloads = {}
+    # Pass 1: Pre-check for exception safety (Fail-fast)
+    if not allow_missing:
+        missing = [
+            overload
+            for op in fallback_ops
+            for overload in lowering.get_overloads(op)
+            if overload not in lowering_dict
+        ]
+        if missing:
+            raise RuntimeError(f"Cannot unregister. Missing lowerings for: {missing}")
+
+    # Pass 2: Safely remove and store
+    for op in fallback_ops:
+        saved_overloads[op] = {}
+        for overload in lowering.get_overloads(op):
+            if overload in lowering_dict:
+                # .pop() grabs the function and
+                # deletes the key in one atomic step
+                # if all overloads are unique then the op
+                # key is not needed here.
+                saved_overloads[op][overload] = lowering_dict.pop(overload)
+    return saved_overloads
 
 
-for op in fallback_ops:
-    unregister_lowering(op, allow_missing=True)
+def restore_lowerings(saved_overloads, lowering_dict):
+    for _, op_stored_overloads in saved_overloads.items():
+        for overload, func in op_stored_overloads.items():
+            lowering_dict[overload] = func
+
 
 # Overload names for aten.clamp
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
@@ -105,6 +128,10 @@ def enable_spyre_lowerings():
         _lowerings_nesting += 1
 
         if first_enter:
+            enable_spyre_lowerings._removed_fallbacks = {}
+            enable_spyre_lowerings._removed_fallbacks = unregister_lowerings(
+                fallback_ops, lowering.lowerings, allow_missing=True
+            )
             saved_intree_lowerings = {}
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
                 if spyre_lowering_op in lowering.lowerings:
@@ -174,8 +201,13 @@ def enable_spyre_lowerings():
                         ]
                     else:
                         lowering.lowerings.pop(spyre_lowering_op, None)
+                restore_lowerings(
+                    enable_spyre_lowerings._removed_fallbacks, lowering.lowerings
+                )
+
                 # Clean up
                 enable_spyre_lowerings._saved_lowerings = {}
+                enable_spyre_lowerings._removed_fallbacks = {}
 
 
 def ensure_default_handler(op_name):
@@ -216,7 +248,6 @@ def lower_mm(x, y):
 
     # Handle 3D input with 2D weight (batched matmul)
     if x_ndim == 3 and y_ndim == 2:
-        reduction_type = BATCH_MATMUL_OP  # Use BATCH_MATMUL_OP for 3D×2D
         ranges = [x_size[0], x_size[1], y_size[1]]  # [B, M, N]
 
         def inner_fn(index, reduction_index):
@@ -224,7 +255,6 @@ def lower_mm(x, y):
             (r0,) = reduction_index
             return (x_loader([i0, i1, r0]), y_loader([r0, i2]))
     elif x_ndim == 2 and y_ndim == 2:
-        reduction_type = MATMUL_REDUCTION_OP  # Use MATMUL_REDUCTION_OP for 2D×2D
         ranges = [x_size[0], y_size[1]]
 
         def inner_fn(index, reduction_index):
@@ -242,7 +272,7 @@ def lower_mm(x, y):
         result = lowering.mul(x, y)
     else:
         result = Reduction.create(
-            reduction_type=reduction_type,
+            reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
             dst_dtype=x.get_dtype(),
@@ -264,6 +294,7 @@ def lower_mm(x, y):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.batched_matmul.default)
 @register_spyre_lowering(torch.ops.aten.bmm.default)
 def lower_bmm(x, y):
     x.realize()
@@ -407,6 +438,98 @@ def lower_layernormscale(x, eps):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.topkvalue)
+def lower_topkvalue(x, k, dim):
+    x_size = x.get_size()
+    ndim = len(x_size)
+    # Normalize dim to a positive index.
+    norm_dim = dim % ndim
+    loader = x.make_loader()
+
+    if norm_dim == ndim - 1:
+        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
+        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
+        mb = x_size[0]
+        n_in = x_size[1]
+
+        def inner_fn(index, rindex):
+            return loader([index[0], rindex[0]])
+
+        ranges = [mb, k]
+        reduction_ranges = [n_in]
+    else:
+        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
+        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
+        mb = x_size[1]
+
+        def inner_fn(index, rindex):
+            # index = [k_idx, mb_idx], rindex = [n_in_idx]
+            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
+            return loader([rindex[0], index[1]])
+
+        ranges = [k, mb]
+        reduction_ranges = x_size[:1]
+
+    result = Reduction.create(
+        reduction_type="topkvalue",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.spyre.topkindex)
+def lower_topkindex(x, k, dim):
+    x_size = x.get_size()
+    ndim = len(x_size)
+    # Normalize dim to a positive index.
+    norm_dim = dim % ndim
+    loader = x.make_loader()
+
+    if norm_dim == ndim - 1:
+        # dim=-1 (or last dim): input shape [mb, n_in], reduce along n_in.
+        # ranges=[mb, k]: index=[mb_idx, k_idx], rindex=[n_in_idx].
+        mb = x_size[0]
+        n_in = x_size[1]
+
+        def inner_fn(index, rindex):
+            return loader([index[0], rindex[0]])
+
+        ranges = [mb, k]
+        reduction_ranges = [n_in]
+    else:
+        # dim=0: input shape [n_in, mb], reduce along n_in (dim 0).
+        # ranges=[k, mb]: index=[k_idx, mb_idx], rindex=[n_in_idx].
+        mb = x_size[1]
+
+        def inner_fn(index, rindex):
+            # index = [k_idx, mb_idx], rindex = [n_in_idx]
+            # Load from input at (n_in_idx, mb_idx); k_idx is the output row.
+            return loader([rindex[0], index[1]])
+
+        ranges = [k, mb]
+        reduction_ranges = x_size[:1]
+
+    result = Reduction.create(
+        reduction_type="topkindex",
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mean.dim)
 def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     kwargs = lowering._make_reduction_inner(
@@ -510,43 +633,17 @@ def lower_spyre_from_d2d(src, dst):
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
-    fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
+    depr_msg = """torch.ops.spyre.overwrite is deprecated. Use standard PyTorch operations like \
+output[indices] = input or output[indices].copy_(input). Please report any incompatibilities."""
+    warn(depr_msg, FutureWarning, stacklevel=1)
 
-    def inner_fn(index):
-        return fn(input.make_loader()(index))
-
-    def output_indexer(index):
-        out_index = [*index]
-        for dim, offset in zip(dims, offsets):
-            out_index[dim] += offset
-        return out_index
-
-    inp = Scatter(
-        device=input.get_device(),
-        dtype=input.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=input.get_size(),
-        output_indexer=output_indexer,
-    )
-
-    output.realize()
-
-    try:
-        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
-    except ImportError:
-        raise RuntimeError(
-            "spyre::overwrite lowering: MutationLayoutSHOULDREMOVE is not available. "
-            "Upstream likely removed/renamed it."
+    sliced_output = output
+    for dim, offset in zip(dims, offsets):
+        input_size_at_dim = input.get_size()[dim]
+        sliced_output = ir.SliceView.create(
+            sliced_output, dim, offset, offset + input_size_at_dim
         )
-
-    buffer = ComputedBuffer(
-        name=None,
-        layout=MutationLayoutSHOULDREMOVE(output),
-        data=inp,
-    )
-    buffer.name = V.graph.register_buffer(buffer)
-    V.graph.register_operation(buffer)
-
+    lowering.mutate_to(sliced_output, input)
     return output
 
 
@@ -581,3 +678,163 @@ def lower_restickify(x):
 
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
+def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if dtype not in (torch.float16, torch.float32):
+        return ir.TensorBox.create(
+            ir.FallbackKernel.create(
+                torch.ops.aten.full.default,
+                size,
+                fill_value,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                pin_memory=pin_memory,
+            )
+        )
+    scalar = ir.TensorBox.create(
+        SpyreConstantFallback(
+            torch.ops.spyre.constant.default, float(fill_value), dtype, device
+        )
+    )
+    scalar_loader = scalar.make_loader()
+
+    def inner_fn(index):
+        return scalar_loader([])
+
+    return Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=list(size),
+    )
+
+
+@register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
+def lower_constant(value, dtype, device):
+    op_overload = getattr(
+        torch.ops.spyre.constant, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(SpyreConstantFallback(op_overload, value, dtype, device))
+
+
+@register_spyre_lowering(torch.ops.spyre.empty.default, type_promotion_kind=None)
+def lower_empty(size, device, dtype=None):
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    op_overload = getattr(
+        torch.ops.spyre.empty, V.graph.current_node.target._overloadname
+    )
+    return ir.TensorBox.create(
+        SpyreEmptyFallback(op_overload, list(size), device, dtype)
+    )
+
+
+@register_spyre_lowering(torch.ops.aten.cat.default, type_promotion_kind=None)
+def lower_cat(inputs, dim=0):
+    output_size = list(inputs[0].get_size())
+    output_size[dim] = sum(x.get_size()[dim] for x in inputs)
+
+    dtype = inputs[0].get_dtype()
+    device = inputs[0].get_device()
+    output = lowering.empty(output_size, dtype=dtype, device=device)
+
+    offset = 0
+    for input_tensor in inputs:
+        sliced_output = ir.SliceView.create(
+            output, dim, offset, offset + input_tensor.get_size()[dim]
+        )
+        lowering.mutate_to(sliced_output, input_tensor)
+        offset += input_tensor.get_size()[dim]
+
+    return output
+
+
+@register_spyre_lowering(
+    torch.ops.aten.constant_pad_nd.default, type_promotion_kind=None
+)
+def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
+    # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
+    bounds = list(reversed(list(zip(pad[::2], pad[1::2]))))
+    sizes = input.get_size()
+    n = len(sizes) - len(bounds)
+
+    # Apply cropping (negative padding) if needed
+    cropped_input = input
+    for i, (left, right) in enumerate(bounds):
+        if left < 0 or right < 0:
+            dim = n + i
+            size = sizes[n + i] if i == 0 else cropped_input.get_size()[dim]
+            start = max(0, -left)
+            end = size - max(0, -right)
+            cropped_input = ir.SliceView.create(cropped_input, dim, start, end)
+
+    # Apply positive padding
+    cropped_sizes = cropped_input.get_size()
+    output_size = list(cropped_sizes[:n])
+    dims: list[int] = []
+    offsets: list[int] = []
+
+    for (left, right), size in zip(bounds, cropped_sizes[n:]):
+        pad_left = max(0, left)
+        pad_right = max(0, right)
+
+        if pad_left + pad_right == 0:
+            output_size.append(size)
+            continue
+
+        dim = len(output_size)
+        output_size.append(size + pad_left + pad_right)
+        dims.append(dim)
+        offsets.append(pad_left)
+
+    if not dims:
+        return clone(cropped_input)
+
+    dtype = input.get_dtype()
+    device = input.get_device()
+    output = lowering.empty(output_size, dtype=dtype, device=device)
+    pad_constant = lower_constant(value, dtype, device)
+
+    # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.
+    # Extra padding from alignment will be overwritten by input.
+    stick_size = get_elem_in_stick(dtype)
+    for (left, right), dim in zip(bounds, range(n, len(output_size))):
+        pad_left = max(0, left)
+        pad_right = max(0, right)
+        if pad_left + pad_right == 0:
+            continue
+
+        def fill_padding(count, offset):
+            if align_to_stick:
+                count += offset % stick_size
+                offset = (offset // stick_size) * stick_size
+
+            pad_size = list(output_size)
+            pad_size[dim] = count
+            pad_view = lowering.expand(pad_constant, pad_size)
+            sliced_output = ir.SliceView.create(output, dim, offset, offset + count)
+            lowering.mutate_to(sliced_output, pad_view)
+
+        if pad_left > 0:
+            fill_padding(pad_left, 0)
+        if pad_right > 0:
+            fill_padding(pad_right, output_size[dim] - pad_right)
+
+    # Copy cropped input into the output at the correct offsets
+    sliced_output = output
+    for i, dim in enumerate(dims):
+        sliced_output = ir.SliceView.create(
+            sliced_output, dim, offsets[i], offsets[i] + cropped_input.get_size()[dim]
+        )
+
+    # Mutate the slice to contain the cropped input data
+    lowering.mutate_to(sliced_output, cropped_input)
+
+    return output

@@ -23,6 +23,10 @@ from torch._inductor.utils import (
 
 
 class TestSpyreConfig(InductorTestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_config_default(self):
         fn = torch.abs
         x = torch.randn((256, 128, 512)).to("spyre")

@@ -19,9 +19,16 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <vector>
+
 #include "module.h"
+#include "spyre_kernel.h"
 
 namespace spyre {
+
+// Forward declaration
+struct JobPlan;
+
 class SpyreStream {
  private:
   c10::Stream stream_;
@@ -40,15 +47,24 @@ class SpyreStream {
   void synchronize() const;  // Block until work done
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+  void copyProgramAsync(void* prog_cpu_ptr,
+                        const flex::CompositeAddress* device_address) const;
+  void executeProgramAsync(const KernelArtifacts& arts,
+                           const std::vector<at::Tensor>& args) const;
+
+  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
 
   // Conversions
   c10::Stream unwrap() const;
 
  private:
+  mutable flex::RuntimeStream* flex_handle_ = nullptr;
+
   flex::RuntimeStream* getRuntimeHandle() const;
+  flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr,
                      const flex::CompositeAddress* device_address,
-                     const DataConversionInfo& dci, bool host2device) const;
+                     const DataConversionInfo* dci, bool host2device) const;
 };
 
 /**
@@ -71,6 +87,16 @@ SpyreStream getStreamFromPool(
  * @return The default SpyreStream (stream ID 0)
  */
 SpyreStream getDefaultStream(
+    c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+/**
+ * Get the Flex-level default stream for a device.
+ * The default stream is stream ID 0 and is always available.
+ *
+ * @param device Device to get default stream for
+ * @return The default Flex RuntimeStream (stream ID 0)
+ */
+flex::RuntimeStream* getDefaultStreamRuntimeHandle(
     c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
 
 /**

@@ -1,0 +1,201 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from dataclasses import dataclass, field
+from typing import Optional
+from abc import ABC, abstractmethod
+import math
+
+
+@dataclass
+class LifetimeBoundBuffer:
+    """
+    Defines the data fields required for a plan solver.
+    """
+
+    name: str
+    size: int
+    start_time: int
+    end_time: int
+    address: Optional[int] = None
+    in_place_parents: list[str] = field(default_factory=list)
+
+
+class MemoryPlanSolver(ABC):
+    """
+    An abstract class for defining algorithms which solve
+    memory layout patterns based on provided sizes, lifetimes.
+    """
+
+    def __init__(self, size: int, alignment: int = 128):
+        """Initialize the solver with a fixed scratchpad capacity and alignment.
+
+        Args:
+            size (int): Total scratchpad size in bytes. Buffers whose aligned
+                placement would exceed this limit are evicted (address=None).
+            alignment (int): Byte alignment boundary. Every buffer is placed at
+                the next address that is a multiple of this value. Defaults to 128
+                (one Spyre stick).
+        """
+        self.limit = size
+        self.alignment = alignment
+        self.usage: list[LifetimeBoundBuffer] = []
+
+    @abstractmethod
+    def plan_layout(
+        self, buffers: list[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
+        """
+        Utilizes an implementation defined algorithm to determine
+        if and where buffers should be placed in scratchpad memory based
+        on their attributes.
+
+        Args:
+            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
+
+        Returns:
+            list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
+        """
+        pass
+
+
+class GreedyLayoutSolver(MemoryPlanSolver):
+    def _get_lowest_addr_in_use(self):
+        return min(
+            (rec.address for rec in self.usage if rec.address is not None),
+            default=0,
+        )
+
+    def _get_highest_addr_in_use(self):
+        return max(
+            (rec.address + rec.size for rec in self.usage if rec.address is not None),
+            default=0,
+        )
+
+    def _find_free_block(self, size_needed: int) -> Optional[int]:
+        assert all(x.address is not None for x in self.usage)
+        curr_lo = self._get_lowest_addr_in_use()
+        curr_hi = self._get_highest_addr_in_use()
+        if self.limit < size_needed:
+            return None
+
+        if not self.usage or curr_lo >= size_needed:
+            return 0
+
+        address = math.ceil(curr_hi / self.alignment) * self.alignment
+        if address + size_needed <= self.limit:
+            return address
+
+        # Search for a gap between existing allocations
+        self.usage.sort(key=lambda x: (x.address is None, x.address))
+        for i in range(len(self.usage) - 1):
+            assert (current_address := self.usage[i].address) is not None
+            assert (next_address := self.usage[i + 1].address) is not None
+            frag_st = (
+                math.ceil((current_address + self.usage[i].size) / self.alignment)
+                * self.alignment
+            )
+            if next_address - frag_st >= size_needed:
+                return frag_st
+
+        return None
+
+    def _try_allocate(self, buffer: LifetimeBoundBuffer):
+        # Check if the current buffer can be in-placed
+        for in_place_opt in buffer.in_place_parents:
+            matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)
+            if matched_obj is not None and buffer.size <= matched_obj.size:
+                buffer.address = matched_obj.address
+                self.usage.append(buffer)
+                self.usage.remove(matched_obj)
+                return None
+
+        # Decide where to allocate the block from
+        addr = self._find_free_block(buffer.size)
+
+        # Push the allocation result to the buffer and the usage table
+        if addr is not None:
+            buffer.address = addr
+            self.usage.append(buffer)
+        else:
+            buffer.address = None
+
+    def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
+        if isinstance(bufs, LifetimeBoundBuffer):
+            bufs = [bufs]
+
+        for buf in bufs:
+            if buf in self.usage:
+                self.usage.remove(buf)
+
+    def plan_layout(
+        self, buffers: list[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
+        """Allocates addresses to the provided buffer list
+
+        Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
+        allocated addresses with 0 -> `limit` where the maximum starting address of
+        buffers are at most `self.limit` - `LifetimeBoundBuffer.size` - 1. The algorithm
+        increments through logical time where time increments 1 unit for each
+        step in a computation graph. At each step the lifetimes of all buffers are
+        evaluated for allocation and deallocation based on its lifetime relative
+        to the time being evaluated. As an optimization, times where no buffers
+        enter or exit scope are not evaluated.
+
+        When a buffer enters scope, the current usage is evaluated in the following
+        manner:
+            1. Check if there is a permissible in-place buffer already allocated
+            2. Is there enough space from address 0 -> first usage.
+            3. Is there enough space for the current buffer from the max address
+                to the maximum memory address. Allocate as current_max + 1 + alignment.
+            4. Is there space between allocations. Check for gaps between current
+                allocations and find where gaps exceed current size. Allocate if
+                current gap is larger than current size + alignment.
+
+        Args:
+            buffers (list[LifetimeBoundBuffer]): The set of buffers to be planned.
+
+        Returns:
+            list[LifetimeBoundBuffer]: The supplied buffers with addresses assigned.
+        """
+        if not buffers:
+            return []
+        assert all(buf.address is None for buf in buffers), (
+            "Buffers cannot be previously or partially planned"
+        )
+
+        self.usage = []
+
+        # Walk through all transition points in chronological order.
+        # Include end_time + 1 so deallocation fires even when no other
+        # buffer starts or ends at that tick.
+        times = set()
+        for b in buffers:
+            times.add(b.start_time)
+            times.add(b.end_time)
+        sorted_times = sorted(times)
+
+        for idx in sorted_times:
+            # Deallocate all expired buffers before allocating new ones so that
+            # freed slots are immediately available at the same time step.
+            for buffer in buffers:
+                if idx == buffer.end_time:
+                    self._try_deallocate(buffer)
+
+            for buffer in buffers:
+                if idx == buffer.start_time:
+                    self._try_allocate(buffer)
+
+        return buffers

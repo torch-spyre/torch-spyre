@@ -20,6 +20,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include <util/sendefs.h>
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -151,3 +152,20 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
 
 }  // namespace spyre
+
+// Must be in namespace std so std::unordered_map/set find it automatically.
+namespace std {
+template <>
+struct hash<spyre::SpyreTensorLayout> {
+  size_t operator()(const spyre::SpyreTensorLayout& layout) const noexcept {
+    size_t seed = 0;
+    for (int64_t v : layout.device_size)
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(v));
+    for (int64_t v : layout.stride_map)
+      seed = c10::hash_combine(seed, std::hash<int64_t>{}(v));
+    seed = c10::hash_combine(
+        seed, std::hash<size_t>{}(static_cast<size_t>(layout.device_dtype)));
+    return seed;
+  }
+};
+}  // namespace std
