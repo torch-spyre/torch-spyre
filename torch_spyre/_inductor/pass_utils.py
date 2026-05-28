@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from dataclasses import dataclass
 from typing import Callable, NamedTuple, TypeVar, Union
 
 import torch
@@ -33,6 +35,12 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
+from .codegen.superdsc import (
+    _get_core_to_slice_mapping,
+    _k_fast_core_to_slice_mapping,
+    _should_use_k_fast_mapping,
+)
+from .constants import BATCH_MATMUL_OP
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .views import compute_coordinates, matching_dim
 
@@ -668,3 +676,154 @@ def lower_pad_sequence(
     )
 
     return padded_buf, list(new_ops)
+
+
+@dataclass(frozen=True)
+class PerCoreView:
+    """Geometric description of a buffer's per-core slicing.
+
+    - work_slice_dims: (device-dim index, split factor) pairs, one per
+      split dim.
+    - core_to_slot: (device-dim index, slice-index expression in core_id)
+      pairs giving each core's position along that split dim.
+
+    Both fields are keyed by the buffer's device-dim index — not by op-
+    local iter symbols — so the value depends only on the buffer's
+    physical slicing.
+
+    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
+        work_slice_dims = ((0, 4),)
+        core_to_slot    = ((0, Mod(core_id, 4)),)
+    so core_id=2 owns slot 2 along dim 0.
+    """
+
+    work_slice_dims: tuple[tuple[int, int], ...]
+    core_to_slot: tuple[tuple[int, Expr], ...]
+
+
+def _is_matmul_op(op: Operation) -> bool:
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == BATCH_MATMUL_OP
+    )
+
+
+# TODO: refactor core assignment so the LX planner consumes determined
+# assignments instead of re-deriving them here.
+def _per_core_view_on_buf(
+    op: Operation, dep: MemoryDep, buf_name: str
+) -> tuple[PerCoreView, bool]:
+    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+
+    Returns `(view, has_partial_reduction)`. The flag is True when this
+    op's iteration space contains a reduction split — meaning the
+    producer leaves partial sums on most cores. Callers act on it only
+    for write-deps; a read-dep on a K-split input still has a valid work
+    slice.
+
+    Steps:
+      1. Recover {iter-symbol: split} from op.op_it_space_splits.
+      2. Filter to splits that actually slice this buffer (host_stride
+         != 0 in dep.index).
+      3. Place each remaining split on a device dim via stride lookup,
+         producing work_slice_dims keyed by device-dim index.
+      4. Build the core-to-slot mapping (k_fast-aware) and re-key it
+         by device-dim so it's independent of op-local symbol names.
+    """
+    # Step 1: recover {iter-symbol: split} from op.op_it_space_splits.
+    # The op-level write_index / read_index (for *any* buffer the op
+    # writes / reads, not necessarily buf_name) bridge stride-keyed
+    # coeff_splits back to scheduler symbols.
+    rw = op.get_read_writes()
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        return PerCoreView(work_slice_dims=(), core_to_slot=()), False
+    write_index = next(iter(rw.writes)).index
+    read_index = next((d.index for d in rw.reads), write_index)
+    iter_space = iteration_space_from_op(op)
+    per_sym = apply_splits_from_index_coeff(
+        coeff_splits, write_index, read_index, iter_space
+    )
+
+    # Step 2: keep splits that actually slice this buffer, keyed by
+    # their host stride on buf via dep.index.coeff(sym). host_stride == 0
+    # means the split contracts an axis not present on this buffer
+    # (canonical case: a K-split's output dep) and is dropped from the
+    # geometry. The has_partial_reduction flag is op-level — set whenever
+    # the op has any reduction-axis split — and is independent of which
+    # dep we're inspecting here.
+    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
+    splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
+    for sym, split in per_sym.items():
+        host_stride = int(dep.index.coeff(sym))
+        if split <= 1 or host_stride == 0:
+            continue
+        splits_by_stride[host_stride] = (int(split), sym)
+
+    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
+    device_size = buf_layout.device_size
+    stride_map = buf_layout.stride_map
+    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+
+    # Step 3: place each split on a device dim via stride lookup. h=1
+    # maps to elems_per_stick when present (sticks are atomic, so a
+    # host-stride-1 split lands on the outer-stick dim, not on stick
+    # contents); otherwise it falls back to a literal stride-1 dim, as
+    # in sticked [N, 1] layouts where the mb axis itself has stride 1.
+    # Skip stride_map entries < 0 — those are sentinels for collapsed
+    # or broadcast dims and can't host a split.
+    #
+    # Example: host [64, 128] sticked to device [2, 64, 64] with
+    # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
+    # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
+    # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
+    device_stride_to_dim = {s: i for i, s in enumerate(stride_map) if s > 0}
+
+    work_slice_dims: dict[int, int] = {}
+    sym_to_device_dim: dict["sympy.Symbol", int] = {}
+    for h, (split, sym) in sorted(splits_by_stride.items()):
+        if h == 1 and elems_per_stick in device_stride_to_dim:
+            dev_dim = device_stride_to_dim.get(elems_per_stick)
+        else:
+            dev_dim = device_stride_to_dim.get(h)
+        assert (
+            dev_dim is not None
+            and dev_dim not in work_slice_dims
+            and device_size[dev_dim] % split == 0
+        ), (
+            f"could not place split h={h} factor={split} on "
+            f"stride_map={stride_map} device_size={device_size}"
+        )
+        work_slice_dims[dev_dim] = split
+        sym_to_device_dim[sym] = dev_dim
+
+    # Step 4: build the core→slot mapping using the same gate codegen
+    # uses (_should_use_k_fast_mapping), so K-fast matmul ops compare
+    # under the K-cohort-adjacent ordering they will actually emit.
+    num_cores = int(math.prod(per_sym.values()))
+    is_matmul = _is_matmul_op(op)
+    if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
+        _mapping_func = _k_fast_core_to_slice_mapping
+    else:
+        _mapping_func = _get_core_to_slice_mapping
+    core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
+    # Re-key by the buffer's device-dim index (canonical) instead of the op's
+    # iter symbol name. Two ops with the same physical per-core slicing on
+    # this buffer compare equal even if they name their iter axes differently
+    # (e.g. one op calls cols `d0`, another calls cols `d1`). Drop unsplit
+    # dims: _get_core_to_slice_mapping emits Integer(0) for any dim with
+    # split=1, which doesn't affect per-core byte placement but would make
+    # two ops with different iter-space arities compare unequal.
+    pruned_core_to_slot: list[tuple[int, "Expr"]] = []
+    for sym, dev_dim in sym_to_device_dim.items():
+        expr = core_to_slot_by_name.get(str(sym))
+        if expr is not None:
+            pruned_core_to_slot.append((dev_dim, expr))
+    pruned_core_to_slot.sort(key=lambda x: x[0])
+
+    view = PerCoreView(
+        work_slice_dims=tuple(sorted(work_slice_dims.items())),
+        core_to_slot=tuple(pruned_core_to_slot),
+    )
+    return view, has_partial_reduction
