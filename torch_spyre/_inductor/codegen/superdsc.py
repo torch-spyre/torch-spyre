@@ -557,6 +557,27 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
+    # quantization_double_pad.ddl (used for dl16tofp32 / fp32todl16 and similar
+    # dtype-conversion ops) requires at least one outer spatial loop dimension
+    # beyond the stick dimension.  A flat 1D tensor produces op_dim_order=[]
+    # (no spatial dims, only the stick) and the DDL compiler crashes with:
+    #   "Specified dimension of parametric loop operation is marked to be dropped"
+    # Inject a virtual mb=1 row dimension so SDSC sees a 2D spec
+    # {mb: 1, out: N} instead of 1D {out: N}.  The physical tensors remain 1D;
+    # we post-patch each SDSCArgs with scale=1, stride=<row_stride>, offset=0
+    # for mb after _create_sdsc_tensors runs.
+    mb_sym: Symbol | None = None
+    if (
+        DtypeOpTable.is_dtype_op(op_spec.op)
+        and op_spec.op != IDENTITY_OP
+        and len(op_dim_order) == 0
+        and op_stick_dim is not None
+    ):
+        mb_sym = Symbol("mb")
+        sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
+        dim_splits = {mb_sym: 1, **dim_splits}
+        work_slices = {mb_sym: 1, **work_slices}
+
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
@@ -577,6 +598,24 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # A dimension was added to the iteration space, update splits and work slices
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
+
+    if mb_sym is not None:
+        # Post-patch: the physical tensors are 1D so _create_sdsc_tensors produced
+        # empty scales/strides/dim_order for each SDSCArgs.  Add mb with scale=1
+        # (spatial iterator, not a reduction) and stride = total elements of the
+        # 1D allocation (= one virtual row spanning the whole tensor).
+        # Both sdsc_arg.dim_order and the shared layout["dim_order"] must be
+        # prepended so that _get_padded_iteration_space sees the correct dim_order
+        # and the SDSC spec matches what a genuine 2D (1, N) tensor would produce.
+        for arg_spec, sdsc_arg in zip(op_spec.args, args):
+            row_stride = math.prod(arg_spec.device_size[-2:])
+            sdsc_arg.dim_order = [mb_sym] + sdsc_arg.dim_order
+            sdsc_arg.scales[mb_sym] = 1
+            sdsc_arg.strides[mb_sym] = row_stride
+            sdsc_arg.offsets[mb_sym] = 0
+            sdsc_arg.max_dim_sizes[mb_sym] = -1
+        for layout_info in layouts.values():
+            layout_info["dim_order"] = [mb_sym] + layout_info["dim_order"]
 
     # In case of same type conversion (identity op) user gets compile time error & avoid
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.
