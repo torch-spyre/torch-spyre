@@ -320,21 +320,6 @@ PYBIND11_MODULE(_C, m) {
   });
   m.def("device_count", &spyre::device_count);
 
-  // PrepareKernel and JobPlan bindings
-  m.def(
-      "prepare_kernel",
-      [](const std::string& spyrecode_dir,
-         const spyre::SpyreStream* stream) -> std::unique_ptr<spyre::JobPlan> {
-        return spyre::prepareKernel(spyrecode_dir, stream);
-      },
-      py::arg("spyrecode_dir"), py::arg("stream") = nullptr,
-      "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
-      "Args:\n"
-      "    spyrecode_dir (str): Path to the SpyreCode directory\n"
-      "    stream (SpyreStream, optional): Stream to use for initialization "
-      "transfers.\n"
-      "        If None, uses the current stream. Defaults to None.");
-
 #ifdef USE_SPYRE_CCL
   // Spyre CCL distributed backend
   m.def("createSpyreCCLBackend", &c10d::SpyreCCLBackend::createSpyreCCLBackend,
@@ -381,4 +366,20 @@ PYBIND11_MODULE(_C, m) {
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
                ">";
       });
+  m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
+        py::arg("stream") = nullptr,
+        "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
+        "Args:\n"
+        "    spyrecode_dir (str): Path to the SpyreCode directory\n"
+        "    stream (SpyreStream, optional): Stream to use for initialization "
+        "transfers.\n"
+        "        If None, uses the current stream. Defaults to None.\n\n"
+        "Returns:\n"
+        "    Prepared JobPlan ready for execution");
+  m.def("launch_jobplan", &spyre::launchJobPlan, py::arg("job_plan"),
+        py::arg("args"),
+        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+        "Args:\n"
+        "    job_plan: The JobPlan to execute\n"
+        "    args: Sequence of input/output tensors");
 }

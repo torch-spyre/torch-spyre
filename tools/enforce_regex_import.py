@@ -54,11 +54,23 @@ def main() -> int:
 
     total_violations = 0
 
+    # Files that legitimately use stdlib `re`. Keep this list short; only
+    # add a path here when the file must be portable to environments where
+    # the third-party `regex` module isn't available.
+    skip_files = {
+        "setup.py",
+        # Vendored verbatim from spyre-runtimes/scripts/get_torch_minor.py;
+        # used by the runner-image build pipeline AND by torch-spyre CI to
+        # derive the pytorch release branch from pyproject.toml. Must run
+        # without third-party deps to stay portable across both call sites.
+        "tools/get_torch_minor.py",
+    }
+
     for filepath in files:
         if not Path(filepath).exists():
             continue
 
-        if filepath == "setup.py":
+        if filepath in skip_files:
             continue
 
         violations = check_file(filepath)

@@ -24,6 +24,7 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
@@ -34,12 +35,15 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
+    resolve_hints,
+    hints_to_coarse_tile_groups,
 )
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
+from .propagate_named_dims import propagate_named_dims
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -49,12 +53,14 @@ from .insert_restickify import insert_restickify, finalize_layouts
 from .memory_planning import memory_planning
 from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
-from .scratchpad import scratchpad_planning
+from .scratchpad.allocator import scratchpad_planning
 from .fusion import spyre_fuse_nodes
+from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
+from .coarse_tile import coarse_tile
 
 
 logger = get_inductor_logger("passes")
@@ -213,7 +219,9 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [memory_planning, spyre_fuse_nodes]
+        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
+        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):
@@ -224,7 +232,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     Operations are in topological order (guaranteed by GraphLowering).
     """
 
-    def __call__(self, operations: list[Operation]) -> None:
+    def __call__(self, graph: GraphLowering) -> None:
+        operations = graph.operations
         has_spyre_device = any(
             op.get_device() is not None and op.get_device().type == DEVICE_NAME
             for op in operations
@@ -237,6 +246,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
+        propagate_named_dims(operations)
+        resolve_hints(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
@@ -244,13 +255,18 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         dedup_and_promote_constants(operations)
         if config.chunk_large_tensors:
             chunk_large_tensors(operations)
+        if config.coarse_tiling:
+            groups = hints_to_coarse_tile_groups(operations)
+            if config.coarse_tiling_groups_fn is not None:
+                groups = config.coarse_tiling_groups_fn(operations)
+            coarse_tile(operations, groups=groups)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
         )
         work_distribution(operations, k_fast_ops)
         if config.lx_planning:
-            scratchpad_planning(operations)
+            scratchpad_planning(graph)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
@@ -259,6 +275,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(dedup_and_promote_constants),
+            inspect.getfile(propagate_named_dims),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
@@ -268,5 +285,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),
             inspect.getfile(scratchpad_planning),
+            inspect.getfile(coarse_tile),
         ]
         return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))

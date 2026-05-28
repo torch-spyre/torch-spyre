@@ -289,7 +289,7 @@ def overwrite_cpu(
 ) -> None:
     sliced_t = output
     for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], input.size(dim))
     sliced_t.copy_(input)
 
 

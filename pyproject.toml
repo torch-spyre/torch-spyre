@@ -87,10 +87,6 @@ exclude=["tests/inductor"]
 module = ["torch_spyre._inductor.*"]
 disable_error_code = ["attr-defined"]
 
-[[tool.mypy.overrides]]
-module = ["inductor.*"]
-ignore_errors = true
-
 [tool.pytest.ini_options]
 filterwarnings = [
     # PyTorch 2.10.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
