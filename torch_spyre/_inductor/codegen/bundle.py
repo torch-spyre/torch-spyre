@@ -51,33 +51,35 @@ def generate_bundle(
     output_dir: str,
     specs: Sequence,
     use_symbols: bool | None = None,
+    unroll_loops: bool | None = None,
 ):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
     ``specs`` is a list of ``OpSpec | LoopSpec`` entries (nested ``LoopSpec``
-    entries are supported).  ``LoopSpec`` entries produce ``scf.for`` loops in
-    the generated ``bundle.mlir``, with ``affine.apply`` expressions computing
-    per-iteration tensor start addresses for tiled dimensions.
+    entries are supported).
 
-    When ``use_symbols`` is ``None`` (the default) the value is read from
-    ``config.bundle_hbm_symbols``.  Pass an explicit ``True`` or ``False`` to
-    override the config — useful in unit tests that call ``generate_bundle``
-    directly.
+    ``use_symbols`` controls whether HBM tensor addresses are emitted as
+    runtime symbols (``%sym_N`` constants) in ``bundle.mlir`` with
+    ``affine.apply`` indirection.  When ``None`` (the default) the value is
+    read from ``config.bundle_hbm_symbols``.
 
-    When ``use_symbols=False``, any ``LoopSpec`` entries are fully unrolled
-    before bundle generation: each iteration becomes an independent ``OpSpec``
-    with concrete per-iteration HBM addresses baked in.  Tiled ops (non-empty
-    ``OpSpec.tiled_symbols``) are supported on both paths.
+    ``unroll_loops`` controls whether ``LoopSpec`` nodes are fully unrolled
+    into flat ``OpSpec`` nodes before bundle generation.  When ``None`` (the
+    default) the value is read from ``config.unroll_loops``.  Pass an explicit
+    ``True`` or ``False`` to override the config — useful in unit tests that
+    call ``generate_bundle`` directly.
 
-    Set ``use_symbols=True`` (or ``BUNDLE_HBM_SYMBOLS=1``) to emit ``scf.for``
-    loops with ``affine.apply`` symbol-indirection instead.
+    When ``unroll_loops=True``, each ``LoopSpec`` iteration becomes an
+    independent ``OpSpec`` with concrete per-iteration HBM addresses baked in.
+    When ``unroll_loops=False``, ``LoopSpec`` entries are passed through intact
+    and produce ``scf.for`` loops in the generated ``bundle.mlir``.
     """
     if use_symbols is None:
         use_symbols = _spyre_config.bundle_hbm_symbols
+    if unroll_loops is None:
+        unroll_loops = _spyre_config.unroll_loops
 
-    specs_list: list = (
-        unroll_loop_specs(list(specs)) if not use_symbols else list(specs)
-    )
+    specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
 
     # -----------------------------------------------------------------------
     # Pass 1: compile all OpSpecs depth-first.
