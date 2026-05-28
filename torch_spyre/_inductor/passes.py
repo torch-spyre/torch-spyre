@@ -35,7 +35,8 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
-    process_hints,
+    resolve_hints,
+    hints_to_coarse_tile_groups,
 )
 from . import config
 from .propagate_hints import (
@@ -54,10 +55,12 @@ from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad.allocator import scratchpad_planning
 from .fusion import spyre_fuse_nodes
+from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
+from .coarse_tile import coarse_tile
 
 
 logger = get_inductor_logger("passes")
@@ -216,7 +219,9 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [memory_planning, spyre_fuse_nodes]
+        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
+        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):
@@ -242,7 +247,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
         propagate_named_dims(operations)
-        process_hints(operations)
+        resolve_hints(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
@@ -250,6 +255,11 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         dedup_and_promote_constants(operations)
         if config.chunk_large_tensors:
             chunk_large_tensors(operations)
+        if config.coarse_tiling:
+            groups = hints_to_coarse_tile_groups(operations)
+            if config.coarse_tiling_groups_fn is not None:
+                groups = config.coarse_tiling_groups_fn(operations)
+            coarse_tile(operations, groups=groups)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
@@ -275,5 +285,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),
             inspect.getfile(scratchpad_planning),
+            inspect.getfile(coarse_tile),
         ]
         return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))

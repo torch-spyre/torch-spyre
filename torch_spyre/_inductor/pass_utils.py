@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from dataclasses import dataclass
 from typing import Callable, NamedTuple, TypeVar, Union
 
 import torch
@@ -22,6 +24,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     Loops,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -32,7 +35,13 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
-from .ir import FixedTiledLayout
+from .codegen.superdsc import (
+    _get_core_to_slice_mapping,
+    _k_fast_core_to_slice_mapping,
+    _should_use_k_fast_mapping,
+)
+from .constants import BATCH_MATMUL_OP
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .views import compute_coordinates, matching_dim
 
 
@@ -88,7 +97,18 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     size_syms = index.free_symbols - loop_vars
     if not size_syms:
         return index
-    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    # Try each symbol individually
+    subs = {}
+    for s in size_syms:
+        try:
+            hint = V.graph.sizevars.size_hint(s)
+            subs[s] = hint  # Successfully concretized
+        except (TypeError, ValueError):
+            # Can't concretize this symbol, skip it
+            pass
+
+    if not subs:
+        return index  # No symbols concretized, return original
     result = index.subs(subs)
     return result
 
@@ -472,18 +492,15 @@ def lower_pad_sequence(
     ``fill_value``, then copies the original data into offset 0 along ``dim``.
     Only one dimension may differ between ``padded_size`` and the original shape.
 
-    FX nodes created (in order):
-      1. spyre.empty(padded_size)                         — uninitialised allocation
-      2. spyre.constant(fill_value)                       — scalar constant, on-device
-      3. aten.expand(constant, pad_size)                  — broadcast to fill-region shape; free
-      4. aten.clone(expand)                               — on-device broadcast → fill buffer
-      5. overwrite(fill_buf, empty, [dim], [fill_offset]) — write pad region
-      6. overwrite(orig,     empty, [dim], [0])           — copy original data
+    Uses torch.ops.aten.constant_pad_nd which lowers to a 4-op IR sequence:
+      1. ComputedBuffer - output buffer allocation (FixedLayout)
+      2. SpyreConstantFallback - fill constant (FixedLayout)
+      3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
+      4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
 
-    The fill offset is rounded down to the nearest stick boundary so the fill
-    overwrite is always stick-aligned.  Any elements between the aligned offset
-    and the true original size that are over-zeroed by the fill are restored by
-    overwrite_data, which always runs after overwrite_fill.
+    constant_pad_nd is called with align_to_stick=True to ensure the padding region
+    is filled with stick-aligned offsets. This is required because the dim is
+    ensured to be a stick dimension here.
 
     ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer and is used
     to derive the padded buffer's device layout, preserving the within-stick host
@@ -496,11 +513,6 @@ def lower_pad_sequence(
     Returns ``(padded_buf, new_ops)`` where ``padded_buf`` is the allocated buffer
     and ``new_ops`` is the list of new IR operations in topological order.
     """
-    from .propagate_layouts import generic_layout  # deferred to avoid circular import
-    from .ir import (
-        SpyreConstantFallback,
-        SpyreEmptyFallback,
-    )  # deferred to avoid circular import
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -526,97 +538,55 @@ def lower_pad_sequence(
         f"lower_pad_sequence: pad_extent={pad_extent} for dim={dim}; "
         f"padded_size={padded_size}, original_size_dim={original_size_dim}"
     )
-    fill_offset = original_size_dim
 
-    # If fill_offset is not stick-aligned, the fill overwrite would produce a
-    # nonzero constant in the stick device coordinate, which normalize_coordinates
-    # rejects.  Round the fill region down to the nearest stick boundary so the
-    # fill starts at a stick-aligned offset.  This may zero-fill a few extra
-    # elements, but overwrite_data runs after overwrite_fill so the valid data is written on top.
-    stick_size = get_elem_in_stick(dtype)
-    fill_offset_aligned = (fill_offset // stick_size) * stick_size
-    aligned_pad_extent = padded_size[dim] - fill_offset_aligned
-
-    # Fill-region shape: padded_size with dim replaced by aligned_pad_extent.
-    pad_size = list(padded_size)
-    pad_size[dim] = aligned_pad_extent
-    fill_offset = fill_offset_aligned
+    # Build pad tuple for constant_pad_nd: (left, right) pairs in reverse dimension order
+    # We're padding only one dimension, so most pairs are (0, 0)
+    pad_tuple = []
+    for i in range(len(original_shape) - 1, -1, -1):
+        if i == dim:
+            # Pad at the end of this dimension
+            pad_tuple.extend([0, pad_extent])
+        else:
+            pad_tuple.extend([0, 0])
 
     with fx_graph.inserting_before(insert_before):
-        # 1. Uninitialised padded buffer.
-        empty_fx = fx_graph.create_node(
+        # Single constant_pad_nd call (lowers to 4 IR operations)
+        pad_fx = fx_graph.create_node(
             "call_function",
-            torch.ops.spyre.empty.default,
-            args=(padded_size, device, dtype),
+            torch.ops.aten.constant_pad_nd.default,
+            args=(arg_fx_node, pad_tuple, fill_value),
+            kwargs={"align_to_stick": True},
         )
-        empty_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
+        pad_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
 
-        # 2. Scalar constant — generated on-device, no DMA.
-        const_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.spyre.constant.default,
-            args=(fill_value, dtype, device),
-        )
-        const_fx.meta["val"] = fill_value
-
-        # 3. Broadcast to fill-region shape (ExpandView — no allocation).
-        expand_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.aten.expand.default,
-            args=(const_fx, pad_size),
-        )
-        expand_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
-
-        # 4. On-device broadcast copy: clone materialises the fill buffer.
-        clone_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.aten.clone.default,
-            args=(expand_fx,),
-        )
-        clone_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
-
-        # 5. Write fill values into the pad region of empty.
-        overwrite_fill_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.spyre.overwrite.default,
-            args=(clone_fx, empty_fx, [dim], [fill_offset]),
-        )
-        overwrite_fill_fx.meta["val"] = None
-
-        # 6. Copy original data into offset 0 along dim.
-        overwrite_data_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.spyre.overwrite.default,
-            args=(arg_fx_node, empty_fx, [dim], [0]),
-        )
-        overwrite_data_fx.meta["val"] = None
-
-    # Lower each node in dependency order, assigning FixedTiledLayouts immediately.
-    # propagate_spyre_tensor_layouts already ran, so new ops keep FlexibleLayout
+    # Lower the constant_pad_nd node, assigning FixedTiledLayouts immediately.
+    # propagate_spyre_tensor_layouts already ran, so the new op keep FlexibleLayout
     # unless we assign here.
-    #
-    # spyre.empty lowers to SpyreEmptyFallback (single op, ExternKernel subclass);
-    # unwrapped from the returned TensorBox to set its layout.
-    # spyre.constant lowers to SpyreConstantFallback (single op, ExternKernel subclass).
-    # aten.expand lowers to an ExpandView (no Buffer produced, no layout needed).
-    # aten.clone lowers to a ComputedBuffer with FlexibleLayout → FixedTiledLayout.
-    # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
+    pad_tb = graph_lowering.run_node(pad_fx)
+    graph_lowering.env[pad_fx] = pad_tb
+    padded_buf = pad_tb.data.data  # TensorBox -> StorageBox -> Buffer
 
-    def _assign_layout(buf: Buffer) -> None:
-        """Wrap the buffer's current FixedLayout in a FixedTiledLayout."""
-        host_layout = buf.layout
-        buf.layout = FixedTiledLayout(
-            host_layout.device,
-            host_layout.dtype,
-            host_layout.size,
-            host_layout.stride,
-            generic_layout(buf),
-        )
+    # Collect all newly added operations (appended at the end of graph.operations).
+    new_ops = graph_lowering.operations[ops_before:]
 
-    empty_tb = graph_lowering.run_node(empty_fx)
-    graph_lowering.env[empty_fx] = empty_tb
-    padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> SpyreEmptyFallback
-    assert isinstance(padded_buf, SpyreEmptyFallback)
+    assert new_ops[0] == padded_buf
+
+    # Verify structure: constant_pad_nd lowers to 4 operations
+    #   op0: ComputedBuffer - output buffer allocation (FixedLayout)
+    #   op1: SpyreConstantFallback - fill constant (FixedLayout)
+    #   op2: ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
+    #   op3: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    assert (
+        len(new_ops) == 4
+        and isinstance(new_ops[0], ComputedBuffer)
+        and isinstance(new_ops[0].get_layout(), FixedLayout)
+        and isinstance(new_ops[1], SpyreConstantFallback)
+        and isinstance(new_ops[1].get_layout(), FixedLayout)
+        and isinstance(new_ops[2], ComputedBuffer)
+        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[3], ComputedBuffer)
+        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+    )
 
     # --- Build the device layout (SpyreTensorLayout) for the padded buffer. ---
     #
@@ -688,49 +658,183 @@ def lower_pad_sequence(
         padded_stl,
     )
 
-    # --- Lower the remaining FX nodes and assign layouts. ---
-    #
-    # propagate_spyre_tensor_layouts already ran before this pass, so any op
-    # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
-    # immediately.  We do this for spyre.constant and aten.clone; overwrite ops
-    # use MutationLayoutSHOULDREMOVE which we intentionally leave untouched.
-
-    const_tb = graph_lowering.run_node(const_fx)
-    graph_lowering.env[const_fx] = const_tb
-    const_buf = const_tb.data.data  # TensorBox -> StorageBox -> SpyreConstantFallback
-    assert isinstance(const_buf, SpyreConstantFallback)
-    _assign_layout(const_buf)
-
-    expand_tb = graph_lowering.run_node(expand_fx)
-    graph_lowering.env[expand_fx] = expand_tb
-    # aten.expand lowers to an ExpandView — no Buffer, no layout assignment needed.
-
-    clone_tb = graph_lowering.run_node(clone_fx)
-    graph_lowering.env[clone_fx] = clone_tb
-    clone_buf = clone_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
-    assert isinstance(clone_buf, ComputedBuffer)
-    _assign_layout(clone_buf)
-    # assign_origin_node sets origin_node on the inner Pointwise, not the ComputedBuffer.
     # LX planning (scratchpad.py) accesses op.origin_node directly on the ComputedBuffer,
     # so we set it here explicitly.
-    object.__setattr__(clone_buf, "origin_node", clone_fx)
+    object.__setattr__(padded_buf, "origin_node", pad_fx)
 
-    # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE.
-    # run_node returns empty_tb (the mutated buffer), not the overwrite op itself,
-    # so origin_node is not set automatically — patch it onto the last appended op.
-    graph_lowering.run_node(overwrite_fill_fx)
-    graph_lowering.env[overwrite_fill_fx] = empty_tb
-    object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_fill_fx)
+    # propagate_spyre_tensor_layouts already ran before this pass, so any op
+    # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
+    # immediately. The constant buffer (new_ops[1]) is a scalar tensor (size=[]).
+    const_buf = new_ops[1]
+    const_layout = const_buf.get_layout()
+    const_stl = SpyreTensorLayout(const_layout.size, const_layout.dtype)
+    const_buf.layout = FixedTiledLayout(
+        const_layout.device,
+        const_layout.dtype,
+        const_layout.size,
+        const_layout.stride,
+        const_stl,
+    )
 
-    graph_lowering.run_node(overwrite_data_fx)
-    graph_lowering.env[overwrite_data_fx] = empty_tb
-    object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_data_fx)
+    # Mutation ops are intentionally left untouched
 
-    # Collect all newly added operations (appended at the end of graph.operations).
-    # spyre.empty(1) + spyre.constant(1) + clone(1) + overwrite×2(2) = 5.
-    new_ops = graph_lowering.operations[ops_before:]
-    assert len(new_ops) >= 5, (  # noqa: PLR2004
-        f"Expected at least 5 new ops, got {len(new_ops)}"
+    assert (
+        len(new_ops) == 4
+        and isinstance(new_ops[0].get_layout(), FixedTiledLayout)
+        and isinstance(new_ops[1].get_layout(), FixedTiledLayout)
+        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
     return padded_buf, list(new_ops)
+
+
+@dataclass(frozen=True)
+class PerCoreView:
+    """Geometric description of a buffer's per-core slicing.
+
+    - work_slice_dims: (device-dim index, split factor) pairs, one per
+      split dim.
+    - core_to_slot: (device-dim index, slice-index expression in core_id)
+      pairs giving each core's position along that split dim.
+
+    Both fields are keyed by the buffer's device-dim index — not by op-
+    local iter symbols — so the value depends only on the buffer's
+    physical slicing.
+
+    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
+        work_slice_dims = ((0, 4),)
+        core_to_slot    = ((0, Mod(core_id, 4)),)
+    so core_id=2 owns slot 2 along dim 0.
+    """
+
+    work_slice_dims: tuple[tuple[int, int], ...]
+    core_to_slot: tuple[tuple[int, Expr], ...]
+
+
+def _is_matmul_op(op: Operation) -> bool:
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == BATCH_MATMUL_OP
+    )
+
+
+# TODO: refactor core assignment so the LX planner consumes determined
+# assignments instead of re-deriving them here.
+def _per_core_view_on_buf(
+    op: Operation, dep: MemoryDep, buf_name: str
+) -> tuple[PerCoreView, bool]:
+    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+
+    Returns `(view, has_partial_reduction)`. The flag is True when this
+    op's iteration space contains a reduction split — meaning the
+    producer leaves partial sums on most cores. Callers act on it only
+    for write-deps; a read-dep on a K-split input still has a valid work
+    slice.
+
+    Steps:
+      1. Recover {iter-symbol: split} from op.op_it_space_splits.
+      2. Filter to splits that actually slice this buffer (host_stride
+         != 0 in dep.index).
+      3. Place each remaining split on a device dim via stride lookup,
+         producing work_slice_dims keyed by device-dim index.
+      4. Build the core-to-slot mapping (k_fast-aware) and re-key it
+         by device-dim so it's independent of op-local symbol names.
+    """
+    # Step 1: recover {iter-symbol: split} from op.op_it_space_splits.
+    # The op-level write_index / read_index (for *any* buffer the op
+    # writes / reads, not necessarily buf_name) bridge stride-keyed
+    # coeff_splits back to scheduler symbols.
+    rw = op.get_read_writes()
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        return PerCoreView(work_slice_dims=(), core_to_slot=()), False
+    write_index = next(iter(rw.writes)).index
+    read_index = next((d.index for d in rw.reads), write_index)
+    iter_space = iteration_space_from_op(op)
+    per_sym = apply_splits_from_index_coeff(
+        coeff_splits, write_index, read_index, iter_space
+    )
+
+    # Step 2: keep splits that actually slice this buffer, keyed by
+    # their host stride on buf via dep.index.coeff(sym). host_stride == 0
+    # means the split contracts an axis not present on this buffer
+    # (canonical case: a K-split's output dep) and is dropped from the
+    # geometry. The has_partial_reduction flag is op-level — set whenever
+    # the op has any reduction-axis split — and is independent of which
+    # dep we're inspecting here.
+    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
+    splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
+    for sym, split in per_sym.items():
+        host_stride = int(dep.index.coeff(sym))
+        if split <= 1 or host_stride == 0:
+            continue
+        splits_by_stride[host_stride] = (int(split), sym)
+
+    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
+    device_size = buf_layout.device_size
+    stride_map = buf_layout.stride_map
+    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+
+    # Step 3: place each split on a device dim via stride lookup. h=1
+    # maps to elems_per_stick when present (sticks are atomic, so a
+    # host-stride-1 split lands on the outer-stick dim, not on stick
+    # contents); otherwise it falls back to a literal stride-1 dim, as
+    # in sticked [N, 1] layouts where the mb axis itself has stride 1.
+    # Skip stride_map entries < 0 — those are sentinels for collapsed
+    # or broadcast dims and can't host a split.
+    #
+    # Example: host [64, 128] sticked to device [2, 64, 64] with
+    # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
+    # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
+    # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
+    device_stride_to_dim = {s: i for i, s in enumerate(stride_map) if s > 0}
+
+    work_slice_dims: dict[int, int] = {}
+    sym_to_device_dim: dict["sympy.Symbol", int] = {}
+    for h, (split, sym) in sorted(splits_by_stride.items()):
+        if h == 1 and elems_per_stick in device_stride_to_dim:
+            dev_dim = device_stride_to_dim.get(elems_per_stick)
+        else:
+            dev_dim = device_stride_to_dim.get(h)
+        assert (
+            dev_dim is not None
+            and dev_dim not in work_slice_dims
+            and device_size[dev_dim] % split == 0
+        ), (
+            f"could not place split h={h} factor={split} on "
+            f"stride_map={stride_map} device_size={device_size}"
+        )
+        work_slice_dims[dev_dim] = split
+        sym_to_device_dim[sym] = dev_dim
+
+    # Step 4: build the core→slot mapping using the same gate codegen
+    # uses (_should_use_k_fast_mapping), so K-fast matmul ops compare
+    # under the K-cohort-adjacent ordering they will actually emit.
+    num_cores = int(math.prod(per_sym.values()))
+    is_matmul = _is_matmul_op(op)
+    if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
+        _mapping_func = _k_fast_core_to_slice_mapping
+    else:
+        _mapping_func = _get_core_to_slice_mapping
+    core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
+    # Re-key by the buffer's device-dim index (canonical) instead of the op's
+    # iter symbol name. Two ops with the same physical per-core slicing on
+    # this buffer compare equal even if they name their iter axes differently
+    # (e.g. one op calls cols `d0`, another calls cols `d1`). Drop unsplit
+    # dims: _get_core_to_slice_mapping emits Integer(0) for any dim with
+    # split=1, which doesn't affect per-core byte placement but would make
+    # two ops with different iter-space arities compare unequal.
+    pruned_core_to_slot: list[tuple[int, "Expr"]] = []
+    for sym, dev_dim in sym_to_device_dim.items():
+        expr = core_to_slot_by_name.get(str(sym))
+        if expr is not None:
+            pruned_core_to_slot.append((dev_dim, expr))
+    pruned_core_to_slot.sort(key=lambda x: x[0])
+
+    view = PerCoreView(
+        work_slice_dims=tuple(sorted(work_slice_dims.items())),
+        core_to_slot=tuple(pruned_core_to_slot),
+    )
+    return view, has_partial_reduction
