@@ -546,6 +546,12 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     return result
 
 
+@register_spyre_lowering(torch.ops.aten.mean.default)
+def lower_mean_default(x, *, dtype=None):
+    axis = list(range(len(x.get_size())))
+    return lower_mean(x, axis=axis, keepdim=False, dtype=dtype)
+
+
 @register_spyre_lowering(torch.ops.spyre.gelu)
 def lower_gelu(x, approximate="none"):
     pw = Pointwise.create(
