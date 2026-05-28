@@ -97,7 +97,18 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     size_syms = index.free_symbols - loop_vars
     if not size_syms:
         return index
-    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    # Try each symbol individually
+    subs = {}
+    for s in size_syms:
+        try:
+            hint = V.graph.sizevars.size_hint(s)
+            subs[s] = hint  # Successfully concretized
+        except (TypeError, ValueError):
+            # Can't concretize this symbol, skip it
+            pass
+
+    if not subs:
+        return index  # No symbols concretized, return original
     result = index.subs(subs)
     return result
 

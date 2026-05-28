@@ -190,6 +190,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         assert spyre_1 != cpu_1, "SPYRE graph should differ from CPU graph"
 
+    def test_concretize_index_with_symbolic_shapes(self):
+        """
+        Test that concretize_index handles unconvertible symbolic expressions.
+
+        Regression test for: "TypeError: Cannot convert symbols to int"
+        that occurred in index_copy operations with symbolic shapes.
+        """
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.pass_utils import concretize_index
+
+        # Create symbolic variables
+        x = sympy.Symbol("x")  # Loop variable
+        tmp0 = sympy.Symbol("tmp0")  # Unconvertible symbol
+
+        # Create expression: x + tmp0
+        index = x + tmp0
+        loop_vars = {x}
+
+        # Mock size_hint to raise TypeError for tmp0
+        with patch("torch_spyre._inductor.pass_utils.V") as mock_v:
+            mock_v.graph.sizevars.size_hint.side_effect = TypeError(
+                "Cannot convert symbols to int"
+            )
+
+            # Should NOT raise, should return original index
+            result = concretize_index(index, loop_vars)
+            assert result == index, f"Expected {index}, got {result}"
+
 
 if __name__ == "__main__":
     unittest.main()
