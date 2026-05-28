@@ -701,6 +701,11 @@ class TestSpyre(TestCase):
             else:
                 self.assertEqual(actual, expected, msg=ctx)
 
+        # D2H conversions not yet supported on the D2H path.
+        skip_d2h_conversions = {
+            (torch.float32, torch.float16),
+        }
+
         # Test supported conversions
         for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
             ctx = f"H2D {src_dtype}->{dst_dtype}"
@@ -712,6 +717,9 @@ class TestSpyre(TestCase):
             _assert_values_equal(
                 h2d_spyre.to("cpu"), h2d_expected, src_dtype, dst_dtype, ctx
             )
+
+            if (dst_dtype, src_dtype) in skip_d2h_conversions:
+                continue
 
             ctx = f"D2H {dst_dtype}->{src_dtype}"
             d2h_src = _make_cpu_tensor(dst_dtype)

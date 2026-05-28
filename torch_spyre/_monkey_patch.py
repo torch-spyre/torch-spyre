@@ -95,12 +95,19 @@ def _patch_tensor_for_spyre():
                 _device is not None
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
+                and torch.device(_device).type == DEVICE_NAME
             ):
-                # Step 1: plain D2H copy (no dtype change)
-                tmp = orig_to(self, _device)
-                # Step 2: cast dtype on CPU
-                return orig_to(tmp, dtype=_dtype)
+                import warnings
 
+                warnings.warn(
+                    "D2D dtype conversion on Spyre is not directly supported. "
+                    "Using CPU as an intermediate for the cast.",
+                    stacklevel=2,
+                )
+                # Step 1: plain D2H copy (no dtype change)
+                tmp = orig_to(self, "cpu")
+                # Step 2: cast dtype via H2D
+                return orig_to(tmp, _device, dtype=_dtype)
             return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
