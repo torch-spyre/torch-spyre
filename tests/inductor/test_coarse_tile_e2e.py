@@ -955,6 +955,33 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.1, rtol=0.1)
 
+    # ------------------------------------------------------------------
+    # Matmul with row-tiling: tile the M dimension of x @ y
+    # ------------------------------------------------------------------
+
+    @config.patch({"coarse_tiling": True})
+    def test_hint_matmul_row_tiling(self):
+        """spyre_hint(slices={"M": 4}) tiles matmul over the row (M) dimension."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 256, 128, 64
+        x = torch.randn(M, K, dtype=torch.float16) * 0.01
+        y = torch.randn(K, N, dtype=torch.float16) * 0.01
+
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(x, y):
+            _name_tensor_dims(x, ["M", "K"])
+            _name_tensor_dims(y, ["K", "N"])
+            with spyre_hint(slices={"M": 4}):
+                return x @ y
+
+        compare_with_cpu(
+            fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,7 +79,6 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("coarse_tile")
@@ -151,8 +150,8 @@ def insert_tiling_propagation(
 ) -> None:
     """Insert full-sized buffers and copy/mutation ops for tiled ops.
 
-    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, matrix
-    multiply (batchmatmul) and tiled reduction dims raise RuntimeError.
+    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, tiled
+    dims that fall in the reduction_ranges index range raise RuntimeError.
 
     For each eligible ComputedBuffer in a tiling group, if its result is
     consumed by any operation outside the loop (different loop_group_id or
@@ -185,20 +184,11 @@ def insert_tiling_propagation(
 def _check_reduction_tiling_safety(op: ComputedBuffer) -> None:
     """Raise RuntimeError for unsupported Reduction-in-loop configurations.
 
-    Two cases are rejected:
-    1. Matrix multiply (batchmatmul) inside a tiling loop — not supported.
-    2. Any tiled dim that falls in the reduction_ranges index range — the
-       accumulation-buffer logic for a tiled reduction dim is not yet
-       implemented.
+    Rejects any tiled dim that falls in the reduction_ranges index range — the
+    accumulation-buffer logic for a tiled reduction dim is not yet implemented.
     """
     data = op.data
     assert isinstance(data, Reduction)
-
-    if data.reduction_type == BATCH_MATMUL_OP:
-        raise RuntimeError(
-            f"coarse_tile: matrix multiply op {op.get_name()!r} inside a "
-            "tiling loop is not supported."
-        )
 
     n_output_dims = len(data.ranges)
     loop_tiled_dims: list[list[int]] = getattr(op, "loop_tiled_dims", [])
