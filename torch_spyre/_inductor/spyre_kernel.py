@@ -235,10 +235,6 @@ class SpyreOpFuncs:
         return PointwiseOp("neg", [a])
 
     @staticmethod
-    def overwrite(input):
-        return PointwiseOp("overwrite", [input])
-
-    @staticmethod
     def reciprocal(x):
         return PointwiseOp("reciprocal", [x])
 

@@ -22,6 +22,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     Loops,
+    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -32,7 +33,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .views import compute_coordinates, matching_dim
 
 
@@ -472,18 +473,15 @@ def lower_pad_sequence(
     ``fill_value``, then copies the original data into offset 0 along ``dim``.
     Only one dimension may differ between ``padded_size`` and the original shape.
 
-    FX nodes created (in order):
-      1. spyre.empty(padded_size)                         — uninitialised allocation
-      2. spyre.constant(fill_value)                       — scalar constant, on-device
-      3. aten.expand(constant, pad_size)                  — broadcast to fill-region shape; free
-      4. aten.clone(expand)                               — on-device broadcast → fill buffer
-      5. overwrite(fill_buf, empty, [dim], [fill_offset]) — write pad region
-      6. overwrite(orig,     empty, [dim], [0])           — copy original data
+    Uses torch.ops.aten.constant_pad_nd which lowers to a 4-op IR sequence:
+      1. ComputedBuffer - output buffer allocation (FixedLayout)
+      2. SpyreConstantFallback - fill constant (FixedLayout)
+      3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
+      4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
 
-    The fill offset is rounded down to the nearest stick boundary so the fill
-    overwrite is always stick-aligned.  Any elements between the aligned offset
-    and the true original size that are over-zeroed by the fill are restored by
-    overwrite_data, which always runs after overwrite_fill.
+    constant_pad_nd is called with align_to_stick=True to ensure the padding region
+    is filled with stick-aligned offsets. This is required because the dim is
+    ensured to be a stick dimension here.
 
     ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer and is used
     to derive the padded buffer's device layout, preserving the within-stick host
@@ -496,11 +494,6 @@ def lower_pad_sequence(
     Returns ``(padded_buf, new_ops)`` where ``padded_buf`` is the allocated buffer
     and ``new_ops`` is the list of new IR operations in topological order.
     """
-    from .propagate_layouts import generic_layout  # deferred to avoid circular import
-    from .ir import (
-        SpyreConstantFallback,
-        SpyreEmptyFallback,
-    )  # deferred to avoid circular import
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -526,97 +519,55 @@ def lower_pad_sequence(
         f"lower_pad_sequence: pad_extent={pad_extent} for dim={dim}; "
         f"padded_size={padded_size}, original_size_dim={original_size_dim}"
     )
-    fill_offset = original_size_dim
 
-    # If fill_offset is not stick-aligned, the fill overwrite would produce a
-    # nonzero constant in the stick device coordinate, which normalize_coordinates
-    # rejects.  Round the fill region down to the nearest stick boundary so the
-    # fill starts at a stick-aligned offset.  This may zero-fill a few extra
-    # elements, but overwrite_data runs after overwrite_fill so the valid data is written on top.
-    stick_size = get_elem_in_stick(dtype)
-    fill_offset_aligned = (fill_offset // stick_size) * stick_size
-    aligned_pad_extent = padded_size[dim] - fill_offset_aligned
-
-    # Fill-region shape: padded_size with dim replaced by aligned_pad_extent.
-    pad_size = list(padded_size)
-    pad_size[dim] = aligned_pad_extent
-    fill_offset = fill_offset_aligned
+    # Build pad tuple for constant_pad_nd: (left, right) pairs in reverse dimension order
+    # We're padding only one dimension, so most pairs are (0, 0)
+    pad_tuple = []
+    for i in range(len(original_shape) - 1, -1, -1):
+        if i == dim:
+            # Pad at the end of this dimension
+            pad_tuple.extend([0, pad_extent])
+        else:
+            pad_tuple.extend([0, 0])
 
     with fx_graph.inserting_before(insert_before):
-        # 1. Uninitialised padded buffer.
-        empty_fx = fx_graph.create_node(
+        # Single constant_pad_nd call (lowers to 4 IR operations)
+        pad_fx = fx_graph.create_node(
             "call_function",
-            torch.ops.spyre.empty.default,
-            args=(padded_size, device, dtype),
+            torch.ops.aten.constant_pad_nd.default,
+            args=(arg_fx_node, pad_tuple, fill_value),
+            kwargs={"align_to_stick": True},
         )
-        empty_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
+        pad_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
 
-        # 2. Scalar constant — generated on-device, no DMA.
-        const_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.spyre.constant.default,
-            args=(fill_value, dtype, device),
-        )
-        const_fx.meta["val"] = fill_value
-
-        # 3. Broadcast to fill-region shape (ExpandView — no allocation).
-        expand_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.aten.expand.default,
-            args=(const_fx, pad_size),
-        )
-        expand_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
-
-        # 4. On-device broadcast copy: clone materialises the fill buffer.
-        clone_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.aten.clone.default,
-            args=(expand_fx,),
-        )
-        clone_fx.meta["val"] = torch.empty(pad_size, dtype=dtype, device=device)
-
-        # 5. Write fill values into the pad region of empty.
-        overwrite_fill_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.spyre.overwrite.default,
-            args=(clone_fx, empty_fx, [dim], [fill_offset]),
-        )
-        overwrite_fill_fx.meta["val"] = None
-
-        # 6. Copy original data into offset 0 along dim.
-        overwrite_data_fx = fx_graph.create_node(
-            "call_function",
-            torch.ops.spyre.overwrite.default,
-            args=(arg_fx_node, empty_fx, [dim], [0]),
-        )
-        overwrite_data_fx.meta["val"] = None
-
-    # Lower each node in dependency order, assigning FixedTiledLayouts immediately.
-    # propagate_spyre_tensor_layouts already ran, so new ops keep FlexibleLayout
+    # Lower the constant_pad_nd node, assigning FixedTiledLayouts immediately.
+    # propagate_spyre_tensor_layouts already ran, so the new op keep FlexibleLayout
     # unless we assign here.
-    #
-    # spyre.empty lowers to SpyreEmptyFallback (single op, ExternKernel subclass);
-    # unwrapped from the returned TensorBox to set its layout.
-    # spyre.constant lowers to SpyreConstantFallback (single op, ExternKernel subclass).
-    # aten.expand lowers to an ExpandView (no Buffer produced, no layout needed).
-    # aten.clone lowers to a ComputedBuffer with FlexibleLayout → FixedTiledLayout.
-    # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE — left unchanged.
+    pad_tb = graph_lowering.run_node(pad_fx)
+    graph_lowering.env[pad_fx] = pad_tb
+    padded_buf = pad_tb.data.data  # TensorBox -> StorageBox -> Buffer
 
-    def _assign_layout(buf: Buffer) -> None:
-        """Wrap the buffer's current FixedLayout in a FixedTiledLayout."""
-        host_layout = buf.layout
-        buf.layout = FixedTiledLayout(
-            host_layout.device,
-            host_layout.dtype,
-            host_layout.size,
-            host_layout.stride,
-            generic_layout(buf),
-        )
+    # Collect all newly added operations (appended at the end of graph.operations).
+    new_ops = graph_lowering.operations[ops_before:]
 
-    empty_tb = graph_lowering.run_node(empty_fx)
-    graph_lowering.env[empty_fx] = empty_tb
-    padded_buf = empty_tb.data.data  # TensorBox -> StorageBox -> SpyreEmptyFallback
-    assert isinstance(padded_buf, SpyreEmptyFallback)
+    assert new_ops[0] == padded_buf
+
+    # Verify structure: constant_pad_nd lowers to 4 operations
+    #   op0: ComputedBuffer - output buffer allocation (FixedLayout)
+    #   op1: SpyreConstantFallback - fill constant (FixedLayout)
+    #   op2: ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
+    #   op3: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    assert (
+        len(new_ops) == 4
+        and isinstance(new_ops[0], ComputedBuffer)
+        and isinstance(new_ops[0].get_layout(), FixedLayout)
+        and isinstance(new_ops[1], SpyreConstantFallback)
+        and isinstance(new_ops[1].get_layout(), FixedLayout)
+        and isinstance(new_ops[2], ComputedBuffer)
+        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[3], ComputedBuffer)
+        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+    )
 
     # --- Build the device layout (SpyreTensorLayout) for the padded buffer. ---
     #
@@ -688,49 +639,32 @@ def lower_pad_sequence(
         padded_stl,
     )
 
-    # --- Lower the remaining FX nodes and assign layouts. ---
-    #
-    # propagate_spyre_tensor_layouts already ran before this pass, so any op
-    # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
-    # immediately.  We do this for spyre.constant and aten.clone; overwrite ops
-    # use MutationLayoutSHOULDREMOVE which we intentionally leave untouched.
-
-    const_tb = graph_lowering.run_node(const_fx)
-    graph_lowering.env[const_fx] = const_tb
-    const_buf = const_tb.data.data  # TensorBox -> StorageBox -> SpyreConstantFallback
-    assert isinstance(const_buf, SpyreConstantFallback)
-    _assign_layout(const_buf)
-
-    expand_tb = graph_lowering.run_node(expand_fx)
-    graph_lowering.env[expand_fx] = expand_tb
-    # aten.expand lowers to an ExpandView — no Buffer, no layout assignment needed.
-
-    clone_tb = graph_lowering.run_node(clone_fx)
-    graph_lowering.env[clone_fx] = clone_tb
-    clone_buf = clone_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
-    assert isinstance(clone_buf, ComputedBuffer)
-    _assign_layout(clone_buf)
-    # assign_origin_node sets origin_node on the inner Pointwise, not the ComputedBuffer.
     # LX planning (scratchpad.py) accesses op.origin_node directly on the ComputedBuffer,
     # so we set it here explicitly.
-    object.__setattr__(clone_buf, "origin_node", clone_fx)
+    object.__setattr__(padded_buf, "origin_node", pad_fx)
 
-    # overwrite lowers to a ComputedBuffer with MutationLayoutSHOULDREMOVE.
-    # run_node returns empty_tb (the mutated buffer), not the overwrite op itself,
-    # so origin_node is not set automatically — patch it onto the last appended op.
-    graph_lowering.run_node(overwrite_fill_fx)
-    graph_lowering.env[overwrite_fill_fx] = empty_tb
-    object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_fill_fx)
+    # propagate_spyre_tensor_layouts already ran before this pass, so any op
+    # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
+    # immediately. The constant buffer (new_ops[1]) is a scalar tensor (size=[]).
+    const_buf = new_ops[1]
+    const_layout = const_buf.get_layout()
+    const_stl = SpyreTensorLayout(const_layout.size, const_layout.dtype)
+    const_buf.layout = FixedTiledLayout(
+        const_layout.device,
+        const_layout.dtype,
+        const_layout.size,
+        const_layout.stride,
+        const_stl,
+    )
 
-    graph_lowering.run_node(overwrite_data_fx)
-    graph_lowering.env[overwrite_data_fx] = empty_tb
-    object.__setattr__(graph_lowering.operations[-1], "origin_node", overwrite_data_fx)
+    # Mutation ops are intentionally left untouched
 
-    # Collect all newly added operations (appended at the end of graph.operations).
-    # spyre.empty(1) + spyre.constant(1) + clone(1) + overwrite×2(2) = 5.
-    new_ops = graph_lowering.operations[ops_before:]
-    assert len(new_ops) >= 5, (  # noqa: PLR2004
-        f"Expected at least 5 new ops, got {len(new_ops)}"
+    assert (
+        len(new_ops) == 4
+        and isinstance(new_ops[0].get_layout(), FixedTiledLayout)
+        and isinstance(new_ops[1].get_layout(), FixedTiledLayout)
+        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
     return padded_buf, list(new_ops)

@@ -36,7 +36,7 @@ from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
-from torch_spyre._inductor.ir import SpyreConstantFallback, SpyreEmptyFallback
+from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 
 
@@ -143,22 +143,72 @@ class TestInsertPaddingIR(unittest.TestCase):
         return operations[:idx]
 
     @staticmethod
-    def _overwrite_ops(ops: list[Operation]) -> list[ComputedBuffer]:
-        """Return ComputedBuffers whose origin_node calls spyre.overwrite."""
-        result = []
-        for op in ops:
-            if not isinstance(op, ComputedBuffer):
-                continue
-            origin = getattr(op, "origin_node", None)
-            if origin is not None and hasattr(origin, "target"):
-                if origin.target is torch.ops.spyre.overwrite.default:
-                    result.append(op)
-        return result
+    def _padded_buf_ops(operations: list[Operation]) -> list[ComputedBuffer]:
+        """Return ComputedBuffer operations whose origin_node.target is aten.constant_pad_nd."""
+        padded_buf_ops = []
+        aten_op = torch.ops.aten.constant_pad_nd.default
+        for op in operations:
+            if isinstance(op, ComputedBuffer):
+                if getattr(getattr(op, "origin_node", None), "target", None) == aten_op:
+                    padded_buf_ops.append(op)
+        return padded_buf_ops
 
     @staticmethod
-    def _constant_nodes(ops: list[Operation]) -> list[SpyreConstantFallback]:
+    def _constant_ops(ops: list[Operation]) -> list[SpyreConstantFallback]:
         """Return SpyreConstantFallback ops (fill-value constants for padding)."""
         return [op for op in ops if isinstance(op, SpyreConstantFallback)]
+
+    def _assert_constant_pad_nd_ops(self, ops: list[Operation]) -> None:
+        """Assert the constant_pad_nd 4-op pattern."""
+
+        # Expected 4 operations (all with FixedTiledLayout):
+        # 1. ComputedBuffer: output buffer allocation
+        # 2. SpyreConstantFallback: padding fill constant
+        # 3. ComputedBuffer: fill padding region (reads constant, writes output)
+        # 4. ComputedBuffer: copy input data (reads input, writes output)
+
+        self.assertEqual(len(ops), 4, f"Expected 4 ops, got {len(ops)}")
+
+        for op in ops:
+            self.assertTrue(
+                isinstance(op.get_layout(), FixedTiledLayout),
+                f"{type(op).__name__} should have FixedTiledLayout",
+            )
+
+        computed_buffer_ops = [op for op in ops if isinstance(op, ComputedBuffer)]
+        self.assertEqual(len(computed_buffer_ops), 3, "Expected 3 computed buffers")
+
+        padded_buf_ops = next(iter(self._padded_buf_ops(computed_buffer_ops)), None)
+        self.assertIsNotNone(padded_buf_ops, "Expected 1 output buffer")
+
+        constant_op = next(iter(self._constant_ops(ops)), None)
+        self.assertIsNotNone(constant_op, "Expected 1 constant buffer")
+
+        mutation_ops = [op for op in computed_buffer_ops if op is not padded_buf_ops]
+        self.assertEqual(len(mutation_ops), 2, "Expected 2 mutation ops")
+
+        # Verify dependencies (mutation ops write to output buffer):
+        # - Fill padding region: reads constant, writes output
+        # - Copy input data: reads input, writes output
+
+        for op in ops:
+            self.assertTrue(
+                padded_buf_ops.origin_node in op.origins,
+                f"{op.name} origins should contain {padded_buf_ops.origin_node}",
+            )
+        for op in mutation_ops:
+            self.assertTrue(
+                op.get_layout() == padded_buf_ops.get_layout(),
+                f"Mutation op {op.name} should have same layout as output buffer {padded_buf_ops.name}",
+            )
+        self.assertTrue(
+            any(constant_op.name in op.get_read_names() for op in mutation_ops),
+            "One mutation op should read from constant buffer",
+        )
+        self.assertTrue(
+            any("arg" in name for op in mutation_ops for name in op.get_read_names()),
+            "One mutation op should read from input buffer",
+        )
 
     # ------------------------------------------------------------------
     # Tests
@@ -199,10 +249,7 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         # 2 overwrite ops before the matmul: fill + copy for y only (x untouched).
         ops_before = self._ops_before(ops, mm)
-        overwrites = self._overwrite_ops(ops_before)
-        self.assertGreaterEqual(
-            len(overwrites), 2, "Expected at least 2 overwrite ops before matmul"
-        )
+        self._assert_constant_pad_nd_ops(ops_before)
 
     def test_mm_aligned_k_no_padding(self) -> None:
         """2D mm with K=128 (aligned) — no padding ops inserted."""
@@ -229,8 +276,7 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         # No overwrite ops should appear before the matmul.
         ops_before = self._ops_before(ops, mm)
-        overwrites = self._overwrite_ops(ops_before)
-        self.assertEqual(len(overwrites), 0, "Expected no overwrite ops for aligned K")
+        self.assertEqual(len(ops_before), 0, "Expected no padding ops for aligned K")
 
     def test_bmm_3d_unaligned_k_pads(self) -> None:
         """3D bmm (B,M,K)×(B,K,N) with K=67 — only y is padded before bmm."""
@@ -255,8 +301,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(int(reduction.reduction_ranges[0]), 67)
 
         ops_before = self._ops_before(ops, mm)
-        overwrites = self._overwrite_ops(ops_before)
-        self.assertGreaterEqual(len(overwrites), 2)
+        self._assert_constant_pad_nd_ops(ops_before)
 
     def test_bmm_3d_2d_unaligned_k_pads(self) -> None:
         """3D×2D bmm: (B,M,K)×(K,N) with K=67 — only y is padded."""
@@ -281,9 +326,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(int(reduction.reduction_ranges[0]), 67)
 
         ops_before = self._ops_before(ops, mm)
-        overwrites = self._overwrite_ops(ops_before)
-        # 2 overwrites: fill + copy for y only.
-        self.assertGreaterEqual(len(overwrites), 2)
+        self._assert_constant_pad_nd_ops(ops_before)
 
     def test_matmul_4d_unaligned_k_pads(self) -> None:
         """4D matmul (B,H,M,K)×(B,H,K,N) with K=67 — only y is padded."""
@@ -308,8 +351,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(int(reduction.reduction_ranges[0]), 67)
 
         ops_before = self._ops_before(ops, mm)
-        overwrites = self._overwrite_ops(ops_before)
-        self.assertGreaterEqual(len(overwrites), 2)
+        self._assert_constant_pad_nd_ops(ops_before)
 
     def test_einsum_mk_kn_mn_pads(self) -> None:
         """einsum('mk,kn->mn') with K=67 — y is padded; reduction_ranges stays at K."""
@@ -357,7 +399,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         self.assertEqual(len(matmuls), 2, "Expected 2 matmul ops")
 
         # dedup_and_promote_constants merges all (0.0, fp16, spyre) constants into one.
-        constant_ops = self._constant_nodes(ops)
+        constant_ops = self._constant_ops(ops)
         self.assertEqual(
             len(constant_ops),
             1,
@@ -404,10 +446,8 @@ class TestInsertPaddingIR(unittest.TestCase):
         [B, K_padded, N] sticked on N lays out device dims as
         [K_padded, N_sticks, B, stick_size], so device_size[-4] == K_padded.
 
-        spyre.empty lowers to SpyreEmptyFallback.  Exactly one SpyreEmptyFallback op
-        appears before the matmul.
+        Exactly one padded buffer op appears before the matmul.
         """
-        from torch_spyre._inductor.ir import FixedTiledLayout
 
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
@@ -429,21 +469,21 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         ops_before = self._ops_before(ops, mm)
 
-        padded_empties = [op for op in ops_before if isinstance(op, SpyreEmptyFallback)]
-        # Only y is padded — exactly one SpyreEmptyFallback op.
+        padded_buf_ops = self._padded_buf_ops(ops_before)
+        # Only y is padded — exactly one padded buffer.
         self.assertEqual(
-            len(padded_empties),
+            len(padded_buf_ops),
             1,
-            f"Expected 1 padded buffer (y only), found {len(padded_empties)}: "
-            f"{[[int(s) for s in op.get_size()] for op in padded_empties]}",
+            f"Expected 1 padded buffer (y only), found {len(padded_buf_ops)}: "
+            f"{[[int(s) for s in op.get_size()] for op in padded_buf_ops]}",
         )
 
-        y_empty = padded_empties[0]
+        y_padded_buf_ops = padded_buf_ops[0]
 
         # y_padded's host size is [B, K_padded, N]: lower_pad_sequence builds it at the
         # padded shape and no host-downgrade is applied.  The IR iteration space (via
         # reduction_ranges) stays at K; only the buffer allocation is K_padded.
-        host_size = [int(s) for s in y_empty.get_size()]
+        host_size = [int(s) for s in y_padded_buf_ops.get_size()]
         self.assertEqual(
             host_size,
             [B, k_padded, N],
@@ -454,7 +494,7 @@ class TestInsertPaddingIR(unittest.TestCase):
         # y's device_layout.device_size must reflect K_padded in the K-row device dim.
         # For [B, K_padded, N] sticked on N: device_size = [K_padded, N_sticks, B, stick_size].
         # K_padded sits at device_size[-4] (index -stride_idx-2 with stride_idx=2 for K).
-        layout = y_empty.get_layout()
+        layout = y_padded_buf_ops.get_layout()
         self.assertIsInstance(layout, FixedTiledLayout)
         assert isinstance(layout, FixedTiledLayout)
         dev_size = list(layout.device_layout.device_size)
@@ -471,15 +511,13 @@ class TestInsertPaddingIR(unittest.TestCase):
         ``lower_pad_sequence`` constructs the padded buffer's ``SpyreTensorLayout``
         from the padded host size/stride so that ``device_coordinates[-1]`` (the
         stick coordinate expression) is identical for both the original and padded
-        buffers.  Concretely, ``stride_map[-1]`` must be 1 for the padded
-        ``SpyreEmptyFallback``.
+        buffers.  Concretely, ``stride_map[-1]`` must be 1 for the padded buffer.
 
         y is sticked on N (the output dim), which is contiguous, so
         ``stride_map[-1] == 1``.  The test catches a regression that confused the
         stick dim (e.g. producing ``stride_map[-1] == K_padded`` from a default
         layout with the wrong dim_order).
         """
-        from torch_spyre._inductor.ir import FixedTiledLayout
 
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
@@ -522,17 +560,15 @@ class TestInsertPaddingIR(unittest.TestCase):
                 mm = matmuls[0]
                 ops_before = self._ops_before(ops, mm)
 
-                padded_empties = [
-                    op for op in ops_before if isinstance(op, SpyreEmptyFallback)
-                ]
+                padded_buf_ops = self._padded_buf_ops(ops_before)
                 self.assertEqual(
-                    len(padded_empties),
+                    len(padded_buf_ops),
                     1,
                     f"{name}: expected exactly 1 padded buffer (y only)",
                 )
 
-                for empty in padded_empties:
-                    layout = empty.get_layout()
+                for op in padded_buf_ops:
+                    layout = op.get_layout()
                     self.assertIsInstance(
                         layout,
                         FixedTiledLayout,
@@ -544,7 +580,7 @@ class TestInsertPaddingIR(unittest.TestCase):
                         1,
                         f"{name}: padded buffer stride_map[-1]={sm_last}, "
                         f"expected 1 (within-stick dim is contiguous); "
-                        f"size={[int(s) for s in empty.get_size()]}",
+                        f"size={[int(s) for s in op.get_size()]}",
                     )
 
 
