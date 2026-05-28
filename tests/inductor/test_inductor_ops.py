@@ -1297,6 +1297,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_1d": (cached_randn((128,), dtype=torch.float32),),
                 "fp32_2d": (cached_randn((256, 128), dtype=torch.float32),),
                 "fp32_3d": (cached_randn((8, 16, 26), dtype=torch.float32),),
+                "int32_1d": (torch.randint(0, 100, (128,), dtype=torch.int32),),
+                "int32_2d": (torch.randint(0, 100, (256, 128), dtype=torch.int32),),
+                "int32_3d": (torch.randint(0, 100, (8, 16, 26), dtype=torch.int32),),
                 "bool_1d": (torch.rand((128,)) > 0.5,),
                 "bool_2d": (torch.rand((256, 128)) > 0.5,),
                 "bool_3d": (torch.rand((8, 16, 256)) > 0.5,),
@@ -2185,6 +2188,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_stick": (torch.rand(2, 2, 2, 3, dtype=torch.float16),),
                 "5d_stick": (torch.rand(1, 2, 3, 4, 5, dtype=torch.float16),),
                 "6d_stick": (torch.rand(1, 3, 5, 2, 4, 62, dtype=torch.float16),),
+            },
+        },
+        ("test_mean_default", "test_mean_default_cpu"): {
+            "param_sets": {
+                "1d": (cached_randn((512,)),),
+                "2d": (cached_randn((32, 64)),),
+                "3d": (cached_randn((1, 11, 4096)),),
             },
         },
         ("test_mean", "test_mean_cpu"): {
@@ -4592,6 +4602,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_copy_roundtrip(self, x):
         self.compare_with_cpu(lambda x: x, x)
+
+    def test_mean_default_cpu(self, x):
+        self.compare_with_cpu(lambda x: torch.mean(x), x)
 
     def test_mean_cpu(self, dim, keepdim, x):
         self.compare_with_cpu(lambda x: torch.mean(x, dim=dim, keepdim=keepdim), x)

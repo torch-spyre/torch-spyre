@@ -298,6 +298,24 @@ def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
         return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
+def _get_data_format(op, device_dtype):
+    """
+    NOTE: This is NOT a data conversion.
+    This is only a temporary re-labeling of the same 32 bit data.
+    The underlying data remains unchanged.
+
+    In the long term, SDSC should accept int32 as the data format.
+    Such re-labeling will become unnecessary.
+    """
+    data_format = {
+        (
+            IDENTITY_OP,
+            DataFormats.IEEE_INT32,
+        ): DataFormats.IEEE_FP32,  # Identity op: int32 -> fp32
+    }
+    return data_format.get((op, device_dtype), device_dtype)
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -368,11 +386,15 @@ def _create_sdsc_tensors(
             arg.device_dtype.elems_per_stick(),
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
         )
+        # Change dataFormat_ value if needed.
+        # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
+        arg_data_format = _get_data_format(op_spec.op, arg.device_dtype)
+
         sdsc_args.append(
             SDSCArgs(
                 layout=label,
                 dim_order=dim_order,
-                data_format=arg.device_dtype,
+                data_format=arg_data_format,
                 scales=scales,
                 strides=strides,
                 offsets=offsets,
@@ -603,9 +625,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         SDSCSpec(
             opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
             execution_unit="pt" if is_matmul else "sfp",
-            data_format=op_spec.args[
+            data_format=args[
                 0
-            ].device_dtype,  # TODO: op_spec needs operation data format
+            ].data_format,  # TODO: op_spec needs operation data format
             num_inputs=num_inputs,
             iteration_space=sdsc_iteration_space,
             num_cores=num_cores,

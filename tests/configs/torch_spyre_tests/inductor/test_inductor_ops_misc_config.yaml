@@ -1,0 +1,111 @@
+# This config covers the "misc" shard: every test in test_inductor_ops.py
+# that is NOT covered by the other three shards:
+#   - test_inductor_ops_matmul_config.yaml
+#   - test_inductor_ops_reductions_config.yaml
+#   - test_inductor_ops_pointwise_config.yaml
+#
+# When a new test is added to test_inductor_ops.py, check which shard it
+# belongs to, then add it here if it matches none of the other three.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # k_expr: not (matmul) and not (reductions) and not (pointwise)
+            # No regex can express "not", so these are listed explicitly.
+            # test_log is here because k_expr pointwise uses "test_log_" (with
+            # trailing underscore) which does NOT match the base name "test_log".
+            - TestOps::test_activation_cls.*
+            - TestOps::test_activation_fn.*
+            - TestOps::test_add_broadcast.*
+            - TestOps::test_add_broadcast_cpu.*
+            - TestOps::test_arange.*
+            - TestOps::test_attention.*
+            - TestOps::test_bitwise_and.*
+            - TestOps::test_bitwise_not.*
+            - TestOps::test_cat.*
+            - TestOps::test_clone.*
+            - TestOps::test_copy_roundtrip.*
+            # These invalid-dim tests contain no k_expr keyword so fall into misc
+            - TestOps::test_core_reduction_invalid_dims_api.*
+            - TestOps::test_core_reduction_invalid_dims_spyre.*
+            - TestOps::test_dropout_functional.*
+            - TestOps::test_embedding.*
+            - TestOps::test_empty_like.*
+            - TestOps::test_empty_like_dtype_override.*
+            - TestOps::test_empty_like_memory_format.*
+            - TestOps::test_fallback.*
+            - TestOps::test_fill_scalar.*
+            - TestOps::test_flatten.*
+            - TestOps::test_full.*
+            - TestOps::test_inplace_copy.*
+            - TestOps::test_inplace_copy_noncontiguous.*
+            - TestOps::test_inplace_op.*
+            - TestOps::test_isin.*
+            - TestOps::test_isin_out.*
+            - TestOps::test_isin_scalar_tensor_cpu.*
+            - TestOps::test_isin_scalar_tensor_out_cpu.*
+            - TestOps::test_isin_tensor_scalar_cpu.*
+            - TestOps::test_isin_tensor_scalar_out_cpu.*
+            - TestOps::test_item.*
+            - TestOps::test_layernorm.*
+            # k_expr pointwise uses "test_log_" (with underscore); "test_log" (no
+            # underscore suffix) is not matched by that keyword -> misc
+            - TestOps::test_log
+            - TestOps::test_max_sub_broadcast.*
+            - TestOps::test_mean
+            - TestOps::test_mean_default.*
+            - TestOps::test_implicit_loading.*
+            - TestOps::test_new_ones.*
+            - TestOps::test_normal_randn_cpu.*
+            - TestOps::test_numel.*
+            - TestOps::test_ones.*
+            - TestOps::test_overwrite.*
+            - TestOps::test_pad.*
+            - TestOps::test_permute.*
+            - TestOps::test_qkv_attn_paths_fms.*
+            - TestOps::test_rmsnorm.*
+            - TestOps::test_rope_fms.*
+            - TestOps::test_round_trip_to_dtype.*
+            - TestOps::test_scalar_cpu.*
+            - TestOps::test_sdpa.*
+            # These invalid-dim tests contain no k_expr keyword so fall into misc
+            - TestOps::test_single_dim_reduction_invalid_dims_api.*
+            - TestOps::test_single_dim_reduction_invalid_dims_spyre.*
+            - TestOps::test_size_one.*
+            - TestOps::test_slice.*
+            - TestOps::test_softmax.*
+            - TestOps::test_softplus.*
+            - TestOps::test_split.*
+            - TestOps::test_squeeze.*
+            - TestOps::test_squeeze_reduction.*
+            - TestOps::test_sub_alpha.*
+            - TestOps::test_sub_broadcast.*
+            - TestOps::test_sub_scalar.*
+            - TestOps::test_t_1d.*
+            - TestOps::test_t_1d_contiguous.*
+            - TestOps::test_t_2d.*
+            - TestOps::test_t_2d_contiguous.*
+            - TestOps::test_to_dtype.*
+            - TestOps::test_to_dtype_op_map.*
+            - TestOps::test_transpose_2d.*
+            - TestOps::test_transpose_2d_contiguous.*
+            - TestOps::test_transpose_3d.*
+            - TestOps::test_transpose_3d_contiguous.*
+            - TestOps::test_transpose_4d.*
+            - TestOps::test_transpose_4d_contiguous.*
+            - TestOps::test_tril.*
+            - TestOps::test_triu.*
+            - TestOps::test_uniform_cpu.*
+            - TestOps::test_uniform_custom_range_cpu.*
+            - TestOps::test_unsqueeze.*
+            - TestOps::test_unsqueeze_broadcast.*
+            - TestOps::test_where.*
+            - TestOps::test_zeros.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor_not_matmul
+            - ops__inductor_not_reduction
+            - ops__inductor_not_pointwise
