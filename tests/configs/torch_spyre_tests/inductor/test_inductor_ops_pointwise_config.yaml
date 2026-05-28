@@ -1,0 +1,13 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # k_expr: test_pointwise or test_sqrt or test_rsqrt or test_log_
+            #         or test_alias_operands or test_cmp or test_logical_not or test_bool
+            #
+            - TestOps::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp|logical_not|bool).*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-pointwise
