@@ -22,6 +22,7 @@ from torch_spyre._inductor.pass_utils import _per_core_view_on_buf
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
+    "amax",
     "sum",
     # "clone",
     "exp",
