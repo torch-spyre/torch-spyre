@@ -21,9 +21,16 @@ left int-list args un-guarded. See customops.py for the fix.
 """
 
 import unittest
+import warnings
 
 import torch
-import torch_spyre  # noqa: F401
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"torch\.ops\.spyre\.overwrite is deprecated.*",
+    category=FutureWarning,
+)
+
 
 DEVICE = "spyre"
 DTYPE = torch.float16

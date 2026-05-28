@@ -148,9 +148,6 @@ def _single_arg_op_layout(
                 list(range(len(output.size))),
             )
 
-        case spyreop.overwrite.default:
-            return SpyreTensorLayout(output.size, output.dtype)
-
         case prims.convert_element_type.default:
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),

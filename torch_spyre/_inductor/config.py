@@ -14,6 +14,7 @@
 
 import os
 import sys
+from typing import Callable, Optional
 
 from torch.utils._config_module import install_config_module
 
@@ -39,5 +40,26 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
+
+coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
+
+# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
+# constants) in bundle.mlir and resolved via affine.apply for tiled loops.
+# Requires backend compiler support for the sdscbundle symbol table, which is
+# still under development.  Defaults to False; the default unroll path
+# (bundle_hbm_symbols=False) handles LoopSpec nodes correctly without symbols.
+bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
+
+# Optional callable injected by callers to compute coarse-tiling groups.
+# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr[, list[int]]]]
+# Each tuple is (ops, loop_count) or (ops, loop_count, tiled_dims).
+# tiled_dims overrides the default per-group (None = tile outermost dim only).
+# When None and coarse_tiling is True, coarse_tile() is called with groups=[]
+# (a no-op useful for testing the pipeline without real group detection).
+# Must be a module-level named function (not a lambda) for Inductor cache pickling.
+# This is intended to be used for interim testing of the coarse-tiling transformation
+# until the working set reduction annotation framework is being developed.
+# It will be removed once the full-fledged annotation mechanism is available.
+coarse_tiling_groups_fn: Optional[Callable] = None
 
 install_config_module(sys.modules[__name__])

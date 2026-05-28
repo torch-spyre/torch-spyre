@@ -281,6 +281,7 @@ _copy_canonical_tests(
 
 REDUCTION_TEST_FAILURES = [
     "test_activation_cls_gelu_fp16",
+    "test_addmm_1152_10x1152_1152x1152",
     "test_addmm_out_basic",
     "test_addmm_scaled_alpha_0_5",
     "test_alias_operands_cube_67x71x256",

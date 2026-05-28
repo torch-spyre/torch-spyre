@@ -22,3 +22,4 @@ The pipeline consists of two compilers:
    adding_operations
    op_enablement
    scratchpad_planning
+   coarse_tiling_loops
