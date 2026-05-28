@@ -1125,7 +1125,9 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
-        generate_bundle("test_kernel", tmpdir, [loop], use_symbols=True)
+        generate_bundle(
+            "test_kernel", tmpdir, [loop], use_symbols=True, unroll_loops=False
+        )
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
             mlir = f.read()
@@ -1153,7 +1155,9 @@ class TestGenerateBundleMlir(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+        generate_bundle(
+            "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
+        )
         return _read_mlir(self.tmpdir)
 
     def test_flat_ops_no_loop(self):
@@ -1211,7 +1215,9 @@ class TestGenerateBundleMlir(unittest.TestCase):
         a = _make_minimal_op_spec("a")
         b = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[a, b])
-        generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=True)
+        generate_bundle(
+            "test_kernel", self.tmpdir, [loop], use_symbols=True, unroll_loops=False
+        )
         written = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".json"))
         self.assertEqual(len(written), 2)
 
@@ -1284,7 +1290,9 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+        generate_bundle(
+            "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
+        )
         return _read_mlir(self.tmpdir)
 
     def test_single_loop_snapshot(self):
@@ -1330,7 +1338,9 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=fake_compile,
         ):
-            generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+            generate_bundle(
+                "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
+            )
         return _read_mlir(self.tmpdir)
 
     def test_tiled_tensor_emits_affine_apply(self):
@@ -1452,7 +1462,9 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=fake_compile,
         ):
-            generate_bundle("test_kernel", self.tmpdir, specs, use_symbols=True)
+            generate_bundle(
+                "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
+            )
         return _read_mlir(self.tmpdir)
 
     def _fake_compile_two_strides(self, outer_stride, inner_stride):
