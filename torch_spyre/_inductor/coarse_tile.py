@@ -366,6 +366,10 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
     ranges by multiplying each tiled dimension back by its loop_count.
     """
     full_ranges = list(op.data.ranges)
+    hints = getattr(op, "spyre_hints", [])
+    if hints and all(h.range_size == 0 for h in hints):
+        # Broadcast sentinel: ranges were never divided, already full size.
+        return full_ranges
     loop_count: list[Expr] = op.loop_count
     loop_tiled_dims: list[list[int]] = op.loop_tiled_dims
     for count, dims in zip(loop_count, loop_tiled_dims):
@@ -628,8 +632,12 @@ def _stamp_group(
             )
             continue
 
-        for count, dims in levels:
-            _divide_ranges(op, count, dims)
+        hints = getattr(op, "spyre_hints", [])
+        is_broadcast = hints and all(h.range_size == 0 for h in hints)
+
+        if not is_broadcast:
+            for count, dims in levels:
+                _divide_ranges(op, count, dims)
 
         op.loop_group_id = nested_group_id  # type: ignore[attr-defined]
         op.loop_count = counts  # type: ignore[attr-defined]
@@ -681,7 +689,7 @@ def _divide_ranges(
         ):
             if int(r) % int(loop_count) != 0:
                 raise RuntimeError(
-                    f"coarse_tile: dimension {i} range {r} is not divisible by "
+                    f"coarse_tile: op {op.get_name()!r} dimension {i} range {r} is not divisible by "
                     f"loop_count {loop_count}.  All tiled dimensions must be evenly "
                     f"divisible by the loop trip count."
                 )

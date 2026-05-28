@@ -67,4 +67,11 @@ unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 # It will be removed once the full-fledged annotation mechanism is available.
 coarse_tiling_groups_fn: Optional[Callable] = None
 
+# Debug knob: if set, only ops whose index in the operations list is < this
+# value are eligible for coarse-tiling groups (Python slice semantics).
+# Ops at or beyond the cutoff are excluded from all groups.  None means no limit (default).
+# Can also be set via SPYRE_COARSE_TILE_MAX_OP_INDEX env var.
+_max_op_env = os.environ.get("SPYRE_COARSE_TILE_MAX_OP_INDEX")
+coarse_tiling_max_op_index: Optional[int] = int(_max_op_env) if _max_op_env else None
+
 install_config_module(sys.modules[__name__])
