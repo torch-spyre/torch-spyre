@@ -6,7 +6,7 @@ Shared class and methods for all OOT PyTorch test overrides.
 
 import os
 import json
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 import warnings
 
 import regex as re
@@ -109,12 +109,39 @@ remove_builtin_privateuse1_test_base()
 
 
 # ---------------------------------------------------------------------------
+# Regex pattern helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_regex_pattern(name: str) -> bool:
+    return any(c in name for c in r"\.^$*+?{}[]|()")
+
+
+def _regex_entries_for_name(name, regex_entries):
+    """Return all TestEntry objects whose stored regex pattern matches *name*.
+
+    *name* is the base method name as seen by ``instantiate_test`` (e.g.
+    ``"test_rope_fms_prefill_bs1"``).  Matching uses ``re.fullmatch`` so
+    the pattern must match the entire method name, not just a substring.
+
+    Examples of patterns that will match ``test_rope_fms_prefill_bs1``:
+      - ``test_rope_fms_.*``
+      - ``test_rope_fms_prefill_.*``
+      - ``test_rope_.*``
+      - ``test_(rope|qkv)_.*``
+    """
+    return [entry for pattern, entry in regex_entries if re.fullmatch(pattern, name)]
+
+
+# ---------------------------------------------------------------------------
 # Multi-entry test map helpers
 # ---------------------------------------------------------------------------
 
 
-def _build_test_entry_map(file_entry: FileEntry) -> Dict[str, List["TestEntry"]]:
-    """Build {method_name -> [TestEntry, ...]} from file_entry.tests.
+def _build_test_entry_map(
+    file_entry: "FileEntry",
+) -> Tuple[Dict[str, List["TestEntry"]], List[Tuple[str, "TestEntry"]]]:
+    """Build exact-name map and glob list from file_entry.tests.
 
     A single TestEntry can cover multiple test ids via name: [list].
     Each method_name in the list gets its own entry in the map.
@@ -124,12 +151,39 @@ def _build_test_entry_map(file_entry: FileEntry) -> Dict[str, List["TestEntry"]]
     (e.g. the same op tested for two different models).
     The correct entry for a given variant is resolved later by ``_select_entry_for_variant``
     once the dtype is known from the instantiated method name.
+
+    Each method_name in the list is routed to either the exact map or the
+    glob list depending on whether it contains glob metacharacters.
+
+    Returns
+    -------
+    exact_map : Dict[str, List[TestEntry]]
+        Keyed by exact base method names (no glob metacharacters).  Same
+        structure as the original return value so callers that only need
+        exact matching are unaffected.
+    regex_entries : List[Tuple[str, TestEntry]]
+        Ordered list of ``(glob_pattern, entry)`` pairs for names that
+        contain glob metacharacters (``*``, ``?``, ``[``, ``]``).
+        Patterns are bare method names — the ``ClassName::`` prefix has
+        already been stripped by ``entry.method_names()``.
+
+    Usage
+    -----
+    ::
+
+        cls.TEST_ENTRIES, cls.REGEX_ENTRIES = _build_test_entry_map(file_entry)
     """
-    result: Dict[str, List[TestEntry]] = {}
+    exact_map: Dict[str, List["TestEntry"]] = {}
+    regex_entries: List[Tuple[str, "TestEntry"]] = []
+
     for entry in file_entry.tests:
         for method_name in entry.method_names():
-            result.setdefault(method_name, []).append(entry)
-    return result
+            if _is_regex_pattern(method_name):
+                regex_entries.append((method_name, entry))
+            else:
+                exact_map.setdefault(method_name, []).append(entry)
+
+    return exact_map, regex_entries
 
 
 def _entry_dtype_set(
@@ -261,8 +315,16 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     device_type: str = "privateuse1"
     precision: float = DEFAULT_FLOATING_PRECISION
 
-    # multiple configs targeting the same test name with different tags/dtypes.
-    TEST_ENTRIES: Dict[str, List["TestEntry"]] = {}  # {method_name -> [TestEntry, ...]}
+    # Exact-name lookup map: {base_method_name -> [TestEntry, ...]}
+    # Multiple entries per name arise when two configs target the same test
+    # with different tags/dtypes (e.g. same op tested for two different models).
+    TEST_ENTRIES: Dict[str, List["TestEntry"]] = {}
+
+    # Regex-pattern store: [(regex_pattern, TestEntry), ...]
+    # Populated alongside TEST_ENTRIES from YAML names that contain * ? [ ].
+    # Matched against concrete method names in instantiate_test().
+    REGEX_ENTRIES: List[Tuple[str, "TestEntry"]] = []
+
     UNLISTED_TEST_MODE: str = UNLISTED_MODE_XFAIL  # file-level default
     SUPPORTED_OPS_CONFIG: Dict[str, "SupportedOpConfig"] = {}  # {op_name -> config}
     SUPPORTED_MODULES_CONFIG: Dict[
@@ -297,6 +359,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         if not path or getattr(cls, "_yaml_loaded", False):
             return
 
+        # Reset glob store so a fresh load always starts clean.
+        cls.REGEX_ENTRIES = []
+
         config: OOTTestConfig = load_yaml_config(path)
 
         # global op filtering and overrides
@@ -323,7 +388,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         # Build multi-entry map: same method_name can have multiple TestEntry
         # objects when configs differ in tags/dtypes for the same test.
-        cls.TEST_ENTRIES = _build_test_entry_map(file_entry)
+
+        # Build the exact-name lookup map and the regex-pattern list.
+        # Regex patterns (names containing * ? [ ]) go into REGEX_ENTRIES;
+        # everything else goes into TEST_ENTRIES keyed by exact method name.
+        cls.TEST_ENTRIES, cls.REGEX_ENTRIES = _build_test_entry_map(file_entry)
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
         # Initialize file-level module tracking for this config load
@@ -473,6 +542,14 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # single-entry lookup for backward compatibility.
         if entry is None:
             entries = cls.TEST_ENTRIES.get(base_test_name)
+            if not entries:
+                # Also check glob patterns before giving up.
+                entries = (
+                    _regex_entries_for_name(
+                        base_test_name, getattr(cls, "REGEX_ENTRIES", [])
+                    )
+                    or None
+                )
             if entries:
                 entry = _select_entry_for_variant(
                     entries, method_name, cls.GLOBAL_SUPPORTED_DTYPES
@@ -548,10 +625,29 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         _OOTOnlyOnPatcher(test, _OOT_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
 
-        # Retrieve all entries for this base test name.
+        # ------------------------------------------------------------------
+        # Retrieve all TestEntry objects for this base test name.
         # There may be multiple when different configs target the same test
         # name with different tags/dtypes (e.g. same op, different models).
-        all_entries_for_name: List[TestEntry] = cls.TEST_ENTRIES.get(name, [])
+        #
+        #
+        # 1. Exact-name lookup in TEST_ENTRIES
+        # 2. Glob-pattern lookup in GLOB_ENTRIES.  A YAML entry like
+        #    ``TestOps::test_rope_fms_*`` stores ``test_rope_fms_*`` as a
+        #    glob pattern; fnmatch is used to test whether ``name`` matches.
+        #
+        # When both sources return entries the exact-name entries come first,
+        # preserving the original priority ordering.
+        # ------------------------------------------------------------------
+        all_entries_for_name: List[TestEntry] = list(cls.TEST_ENTRIES.get(name, []))
+
+        # Regex-pattern lookup: extend with any entries whose pattern matches
+        # the current base test name.  Skip entries already in the exact list
+        # to avoid double-processing the same TestEntry object.
+        regex_matches = _regex_entries_for_name(name, getattr(cls, "REGEX_ENTRIES", []))
+        for _re in regex_matches:
+            if _re not in all_entries_for_name:
+                all_entries_for_name.append(_re)
 
         # ------------------------------------------------------------------
         # Collect the union of all tags across all entries for collection-time
