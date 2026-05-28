@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import dataclasses
 from typing import Any
 
 import regex as re
@@ -24,6 +25,30 @@ from torch._inductor.ir import Operation
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("propagate_hints")
+
+
+@dataclasses.dataclass
+class DimHint:
+    dim_names: list[str]  # e.g. ["A"]
+    range_size: int  # full loop range, e.g. 256
+    split_count: int  # from slices={"A": 4}, e.g. 4
+    dim_index: int  # index into op.loop_var_dims / op.data.ranges
+    is_reduction: bool
+
+
+# op.spyre_hints: list[DimHint]
+#
+# One entry per hinted dimension, ordered outermost hint scope first.
+# Outer hint IDs are smaller than inner hint IDs (guaranteed by spyre_hint
+# counter order), so sorting by hint ID gives outermost-first ordering.
+#
+# Example — two nested hints on one op:
+#   with spyre_hint(slices={"A": 2}):      # outer scope → smaller hint ID
+#       with spyre_hint(slices={"B": 4}):  # inner scope → larger hint ID
+#           y = a + b
+#
+# spyre_hints = [DimHint(dim_names=["A"], split_count=2, dim_index=0, ...),
+#                 DimHint(dim_names=["B"], split_count=4, dim_index=1, ...)]
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
