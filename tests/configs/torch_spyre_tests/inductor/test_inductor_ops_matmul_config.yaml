@@ -1,0 +1,13 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # k_expr: test_addmm or test_mm_ or test_bmm or test_einsum
+            #         or test_matmul or test_large_matmul or test_linear
+            #
+            - TestOps::test_(addmm|mm_|bmm|einsum|matmul|large_matmul|linear).*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
