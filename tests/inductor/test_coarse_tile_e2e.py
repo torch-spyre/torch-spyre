@@ -973,6 +973,162 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
+    # Op inside hint scope with no matching named dim
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_group_includes_op_with_no_matching_dim(self):
+        """An op inside a hint scope whose loop vars don't match the hinted dim stays in the group.
+
+        torch.full lowers to a scalar-fill pointwise with no named loop variables.
+        It has the hint but no loop var maps to "M", so it gets a scope-marker
+        DimHint.  Its hint_id set still matches the surrounding ops so grouping
+        is not broken.  The generated source must contain a single LoopSpec
+        covering all ops.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+        x = torch.randn(M, K, dtype=torch.float16)
+
+        def fn(x):
+            with spyre_hint(slices={"M": 4}):
+                # torch.full produces a scalar-fill with no M/K loop dim mapping.
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+                return x + bias
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+        self.assertEqual(
+            src.count("LoopSpec("),
+            1,
+            "Op with no matching dim must not break the group into two LoopSpec entries",
+        )
+
+    # ------------------------------------------------------------------
+    # Hint propagation through mm_to_bmm_pass
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_survives_mm_to_bmm_rewrite(self):
+        """spyre_hint is not dropped when mm_to_bmm_pass rewrites mm -> bmm.
+
+        A 3D matmul inside a spyre_hint scope is decomposed to mm then rewritten
+        back to bmm by mm_to_bmm_pass.  copy_fx_custom_meta must propagate the
+        hint onto the new bmm node so assign_dim_hints can tile it.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, M, K, N = 2, 128, 64, 32
+        x = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        y = torch.randn(K, N, dtype=torch.float16) * 0.01
+
+        def fn(x, y):
+            with spyre_hint(slices={"M": 4}):
+                return torch.matmul(x, y)
+
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(x_dev, ["B", "M", "K"])
+        _name_tensor_dims(y_dev, ["K", "N"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "LoopSpec(",
+            src,
+            "Expected LoopSpec: hint must survive mm->bmm rewrite",
+        )
+        self.assertIn("sympify('4')", src, "Expected loop count 4 after bmm rewrite")
+
+    # ------------------------------------------------------------------
+    # Hint propagation into inserted restickify nodes
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_restickify_stays_in_group(self):
+        """A restickify node inserted inside a hint scope lands in the same group.
+
+        output * correction triggers a restickify because output is col-major
+        from a preceding transpose while correction is row-major.  The inserted
+        restickify buffer must carry the hint metadata from its consumer so that
+        assign_dim_hints includes it in the hinted group.  If it were ungrouped
+        the LoopSpec count would cover fewer ops and the generated source would
+        reflect a split group.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, N = 256, 64
+        x = torch.randn(M, N, dtype=torch.float16)
+        scale = torch.randn(M, dtype=torch.float16)
+
+        def fn(x, scale):
+            with spyre_hint(slices={"M": 4}):
+                # transpose + contiguous forces a restickify on x before the mul
+                x_t = x.transpose(0, 1).contiguous().transpose(0, 1)
+                return x_t * scale.unsqueeze(-1)
+
+        x_dev = x.to("spyre")
+        scale_dev = scale.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(x_dev, ["M", "N"])
+        _name_tensor_dims(scale_dev, ["M"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "LoopSpec(",
+            src,
+            "Expected LoopSpec: restickify must not break the hint group",
+        )
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+
+    # ------------------------------------------------------------------
     # Softmax with row-tiling: large [NROW, NCOL] tensor
     # ------------------------------------------------------------------
 

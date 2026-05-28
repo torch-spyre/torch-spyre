@@ -20,7 +20,7 @@ import torch
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import host_coordinates, device_coordinates, stick_compatible
-from .pass_utils import compute_restickify_target_layout
+from .pass_utils import compute_restickify_target_layout, copy_fx_custom_meta
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -121,6 +121,12 @@ def _create_restickify_node(
         restick_fx_node = fx_graph.create_node(
             "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
         )
+    # Propagate hint metadata from the consumer op so assign_dim_hints can assign
+    # spyre_hints to the restickify buffer after insertion.
+    for consumer_fx_node in op.origins:
+        if "custom" in consumer_fx_node.meta:
+            copy_fx_custom_meta(consumer_fx_node, restick_fx_node)
+            break
     # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
@@ -163,9 +169,6 @@ def insert_restickify_on_node_inputs(
         operations.remove(restick_buff)
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
-        # Propagate hints from consumer so the restickify op joins the same group.
-        if hasattr(op, "spyre_hints"):
-            restick_buff.spyre_hints = op.spyre_hints
 
     # Patch inner_fn once with the full name_map covering all restickified args.
     orig_inner = op.data.inner_fn
@@ -189,7 +192,6 @@ def insert_restickify_on_node_inputs(
     )
     new_consumer_buffer.operation_name = op.operation_name
     new_consumer_buffer.origins = op.origins
-    new_consumer_buffer.spyre_hints = getattr(op, "spyre_hints", [])
     # Replace op in the operations list with the reconstructed buffer.
     operations[op_index] = new_consumer_buffer
     V.graph.name_to_buffer[new_consumer_buffer.get_name()] = new_consumer_buffer

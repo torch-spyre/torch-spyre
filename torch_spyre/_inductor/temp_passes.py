@@ -27,12 +27,13 @@ from torch._inductor.pattern_matcher import (
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints, DimHint
+from .pass_utils import copy_fx_custom_meta
 from .propagate_named_dims import named_dims_for_sym
 
 aten = torch.ops.aten
 
 logger = get_inductor_logger("work_division")
-hints_logger = get_inductor_logger("resolve_hints")
+hints_logger = get_inductor_logger("assign_dim_hints")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -145,8 +146,7 @@ def _unflatten_mm_to_bmm(
             args=(lhs_input, expanded),
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
-        if "custom" in node.meta:
-            bmm_node.meta["custom"] = node.meta["custom"]
+        copy_fx_custom_meta(node, bmm_node)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -237,8 +237,7 @@ def _unflatten_bmm_batch_dims(
             args=(lhs_orig, rhs_orig),
         )
         matmul_node.meta["val"] = output_view.meta["val"]
-        if "custom" in node.meta:
-            matmul_node.meta["custom"] = node.meta["custom"]
+        copy_fx_custom_meta(node, matmul_node)
 
     # Replace all uses of the output view with the new matmul
     output_view.replace_all_uses_with(matmul_node)
@@ -278,7 +277,7 @@ def _hint_levels(op) -> list[dict[str, int]]:
     return levels
 
 
-def resolve_hints(operations: list[Operation]) -> None:
+def assign_dim_hints(operations: list[Operation]) -> None:
     """Resolve spyre_hint annotations into DimHint and stamp onto each op.
 
     For each op, reads the hint scopes attached to its FX origins, matches the
@@ -294,12 +293,17 @@ def resolve_hints(operations: list[Operation]) -> None:
             op.spyre_hints = []
             continue
 
-        # Build a flat lookup from dimension name to (split_count, level_idx)
+        # Build a flat lookup from dimension name to (split_count, level_idx, hint_id)
         # so we can quickly resolve each loop variable below.
-        dim_to_level: dict[str, tuple[int, int]] = {}
-        for level_idx, level_splits in enumerate(levels):
-            for name, count in level_splits.items():
-                dim_to_level[name] = (count, level_idx)
+        hint_id_map = {
+            hint_id: hint_dict
+            for hint_id, hint_dict in sorted(get_op_hints(op).items())
+        }
+        dim_to_level: dict[str, tuple[int, int, int]] = {}
+        for level_idx, (hint_id, hint_dict) in enumerate(sorted(hint_id_map.items())):
+            for key in ("tiles", "slices"):
+                for name, count in (hint_dict.get(key) or {}).items():
+                    dim_to_level[name] = (count, level_idx, hint_id)
 
         rw = op.get_read_writes()
         # Collect the full iteration range for each loop symbol from the
@@ -319,7 +323,7 @@ def resolve_hints(operations: list[Operation]) -> None:
             hinted_names = [name for name, _ in nd if name in dim_to_level]
             if not hinted_names:
                 continue
-            split_count, level_idx = dim_to_level[hinted_names[0]]
+            split_count, level_idx, hint_id = dim_to_level[hinted_names[0]]
             unsorted.append(
                 (
                     level_idx,
@@ -332,28 +336,34 @@ def resolve_hints(operations: list[Operation]) -> None:
                         is_reduction=any(
                             name in reduction_dims for name in hinted_names
                         ),
+                        hint_id=hint_id,
                     ),
                 )
             )
         op.spyre_hints = [h for _, _, h in sorted(unsorted)]
 
-        # Op is inside a hint scope but has no non-reduction hinted dims —
-        # either the hinted dim is broadcast in this op, or it only appears as
-        # a reduction dim (e.g. amax over Lk).  Emit a sentinel DimHint so the
-        # op joins the group without tiling.  Tiling safety is enforced later
-        # by _check_reduction_tiling_safety, not here.
-        if not op.spyre_hints or all(h.is_reduction for h in op.spyre_hints):
-            outermost = levels[0]
-            name, count = next(iter(outermost.items()))
-            op.spyre_hints = [
-                DimHint(
-                    dim_names=[name],
-                    range_size=0,
-                    split_count=count,
-                    dim_index=0,
-                    is_reduction=False,
-                )
-            ]
+        # For every hint scope the op is inside but has no matching dim,
+        # add a sentinel DimHint so the op's hint_id set is complete and
+        # grouping by hint ID correctly places it with its peers.
+        matched_hint_ids = {h.hint_id for h in op.spyre_hints}
+        for level_idx, (hint_id, hint_dict) in enumerate(sorted(hint_id_map.items())):
+            if hint_id in matched_hint_ids:
+                continue
+            for key in ("tiles", "slices"):
+                dims = hint_dict.get(key) or {}
+                if dims:
+                    name, count = next(iter(dims.items()))
+                    op.spyre_hints.append(
+                        DimHint(
+                            dim_names=[name],
+                            range_size=0,
+                            split_count=count,
+                            dim_index=0,
+                            is_reduction=False,
+                            hint_id=hint_id,
+                        )
+                    )
+                    break
 
     if hints_logger.isEnabledFor(logging.INFO):
         ops = [
@@ -362,7 +372,7 @@ def resolve_hints(operations: list[Operation]) -> None:
             if isinstance(op, ComputedBuffer) and getattr(op, "spyre_hints", None)
         ]
         if ops:
-            hints_logger.info("=== resolve_hints ===")
+            hints_logger.info("=== assign_dim_hints ===")
             for op in ops:
                 hints_logger.info(f"{op.get_operation_name()}:")
                 for h in op.spyre_hints:
@@ -384,51 +394,45 @@ def _group_spec(spyre_hints: list[DimHint]) -> list[tuple]:
     return [
         (sympy.Integer(h.split_count), [h.dim_index])
         for h in spyre_hints
-        if not h.is_reduction
+        if not h.is_reduction and h.range_size != 0
     ]
 
 
+def _find_spec_op(ops: list[Operation]) -> Operation:
+    """Return the first op with a real (non-sentinel) DimHint, or ops[0] as fallback."""
+    return next(
+        (
+            o
+            for o in ops
+            if any(h.range_size != 0 for h in getattr(o, "spyre_hints", []))
+        ),
+        ops[0],
+    )
+
+
 def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
-    """Build coarse_tile() groups from op.spyre_hints (set by resolve_hints).
+    """Build coarse_tile() groups from op.spyre_hints (set by assign_dim_hints).
 
     coarse_tile() requires ops to be grouped: all ops in a group share the same
     tiling spec and are tiled together inside the same loop nest.  We walk
     operations in topological order and collect consecutive ops that carry
     identical hints into one group, breaking whenever the hint changes or an
     op has no hint at all.
-
-    If config.coarse_tiling_max_op_index is set, only ops at or before that
-    index in operations are eligible; ops beyond it are silently excluded.
     """
-    from . import config as spyre_config
-
-    max_idx = spyre_config.coarse_tiling_max_op_index
 
     def _key(op):
         resolved = getattr(op, "spyre_hints", [])
         if not resolved:
             return None
-        return (
-            tuple(
-                (h.split_count, tuple(sorted(h.dim_names)))
-                for h in resolved
-                if not h.is_reduction
-            )
-            or None
-        )  # all-reduction hint → treat as un-hinted
+        # Key on the set of hint IDs — ops inside the same hint scope(s) group together.
+        return frozenset(h.hint_id for h in resolved)
 
     groups = []
     current_ops: list[Operation] = []
     current_key = None
 
-    for idx, op in enumerate(operations):
+    for op in operations:
         if not isinstance(op, ComputedBuffer):
-            continue
-        if max_idx is not None and idx >= max_idx:
-            hints_logger.debug(
-                "hints_to_coarse_tile_groups: skipping %s (idx=%d >= max_op_index=%d)",
-                op.get_name(), idx, max_idx,
-            )
             continue
         key = _key(op)
 
@@ -436,61 +440,75 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
             current_ops.append(op)
         else:
             if current_ops and current_key is not None:
-                spec_op = next(
-                    (o for o in current_ops if any(
-                        h.range_size != 0 for h in getattr(o, "spyre_hints", [])
-                    )),
-                    current_ops[0],
-                )
-                spec = _group_spec(spec_op.spyre_hints)
+                spec = _group_spec(_find_spec_op(current_ops).spyre_hints)
                 groups.append((current_ops, spec))
             current_ops = [op] if key is not None else []
             current_key = key
 
     # Flush the final group.
     if current_ops and current_key is not None:
-        spec_op = next(
-            (o for o in current_ops if any(
-                h.range_size != 0 for h in getattr(o, "spyre_hints", [])
-            )),
-            current_ops[0],
-        )
-        spec = _group_spec(spec_op.spyre_hints)
+        spec = _group_spec(_find_spec_op(current_ops).spyre_hints)
         groups.append((current_ops, spec))
 
-    # Build an interleaved view: walk operations in order, emit group boundaries
-    # and ungrouped ops so the reader can see what breaks each consecutive run.
-    grouped_to_group_idx = {
-        id(o): i for i, g in enumerate(groups) for o in g[0]
-    }
-    summary_lines = [
-        f"coarse_tile_groups: {len(groups)} group(s) formed"
-        + (f" (max_op_index={max_idx})" if max_idx is not None else "")
-    ]
-    pending_ungrouped: list[str] = []
-    last_group_idx: int | None = None
-    for o in operations:
-        if not isinstance(o, ComputedBuffer):
-            continue
-        g_idx = grouped_to_group_idx.get(id(o))
-        if g_idx is None:
-            pending_ungrouped.append(o.get_name())
-        else:
-            if g_idx != last_group_idx:
-                if pending_ungrouped:
-                    summary_lines.append(
-                        f"  ungrouped: [{', '.join(pending_ungrouped)}]"
+    if hints_logger.isEnabledFor(logging.INFO):
+        # Build an interleaved view: walk operations in order, emit group boundaries
+        # and ungrouped ops so the reader can see what breaks each consecutive run.
+        grouped_to_group_idx = {id(o): i for i, g in enumerate(groups) for o in g[0]}
+        summary_lines = [f"coarse_tile_groups: {len(groups)} group(s) formed"]
+        pending_ungrouped: list[str] = []
+        last_group_idx: int | None = None
+        for o in operations:
+            if not isinstance(o, ComputedBuffer):
+                continue
+            g_idx = grouped_to_group_idx.get(id(o))
+            if g_idx is None:
+                hints = getattr(o, "spyre_hints", [])
+                if hints:
+                    ids = sorted({h.hint_id for h in hints})
+                    reason = f"hint_ids={ids}"
+                else:
+                    reason = "no hints"
+                pending_ungrouped.append(f"{o.get_name()}({reason})")
+            else:
+                if g_idx != last_group_idx:
+                    if pending_ungrouped:
+                        summary_lines.append(
+                            f"  ungrouped: [{', '.join(pending_ungrouped)}]"
+                        )
+                        pending_ungrouped = []
+                    # Emit group header with hint scope info from the spec op.
+                    group_ops = groups[g_idx][0]
+                    spec_op = _find_spec_op(group_ops)
+                    hint_ids = sorted(
+                        {h.hint_id for h in getattr(spec_op, "spyre_hints", [])}
                     )
-                    pending_ungrouped = []
-                group_ops = groups[g_idx][0]
+                    hint_descs = []
+                    for hid in hint_ids:
+                        hints = get_op_hints(spec_op)
+                        if hid in hints:
+                            hint_descs.append(f"hint_{hid}={hints[hid]}")
+                    summary_lines.append(
+                        f"  group {g_idx} scopes=[{', '.join(hint_descs)}]:"
+                    )
+                    last_group_idx = g_idx
+                # Per-op tiling info.
+                tiling_dims = [
+                    f"{h.dim_names}x{h.split_count}"
+                    for h in getattr(o, "spyre_hints", [])
+                    if h.range_size != 0 and not h.is_reduction
+                ]
+                aten_ops = [
+                    str(n.target)
+                    for n in getattr(o, "origins", [])
+                    if hasattr(n, "target")
+                ]
                 summary_lines.append(
-                    f"  group {g_idx}: [{', '.join(x.get_name() for x in group_ops)}]"
+                    f"      {o.get_name()}  aten={aten_ops}"
+                    + (f"  tiles={tiling_dims}" if tiling_dims else "  (no tiled dims)")
                 )
-                last_group_idx = g_idx
-    if pending_ungrouped:
-        summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
-
-    hints_logger.info("%s", "\n".join(summary_lines))
+        if pending_ungrouped:
+            summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
+        hints_logger.info("%s", "\n".join(summary_lines))
 
     return groups
 
@@ -537,8 +555,7 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
                     "py_const",
                     node.type,
                 )
-            if "custom" in node.meta:
-                const_node.meta["custom"] = node.meta["custom"]
+            copy_fx_custom_meta(node, const_node)
             node.update_arg(idx, const_node)
 
     graph.lint()
