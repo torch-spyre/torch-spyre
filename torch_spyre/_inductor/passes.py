@@ -35,7 +35,8 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
-    process_hints,
+    resolve_hints,
+    hints_to_coarse_tile_groups,
 )
 from . import config
 from .propagate_hints import (
@@ -246,7 +247,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
         propagate_named_dims(operations)
-        process_hints(operations)
+        resolve_hints(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
@@ -255,11 +256,9 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         if config.chunk_large_tensors:
             chunk_large_tensors(operations)
         if config.coarse_tiling:
-            groups = (
-                config.coarse_tiling_groups_fn(operations)
-                if config.coarse_tiling_groups_fn is not None
-                else []
-            )
+            groups = hints_to_coarse_tile_groups(operations)
+            if config.coarse_tiling_groups_fn is not None:
+                groups = config.coarse_tiling_groups_fn(operations)
             coarse_tile(operations, groups=groups)
         span_reduction(operations)
         k_fast_ops = (

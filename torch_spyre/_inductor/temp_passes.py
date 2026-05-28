@@ -14,8 +14,10 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
+import logging
+import sympy
 import torch
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -24,13 +26,13 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
-from .propagate_hints import get_op_hints
+from .propagate_hints import get_op_hints, DimHint
 from .propagate_named_dims import named_dims_for_sym
 
 aten = torch.ops.aten
 
 logger = get_inductor_logger("work_division")
-hints_logger = get_inductor_logger("process_hints")
+hints_logger = get_inductor_logger("resolve_hints")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -255,82 +257,164 @@ def _unflatten_bmm_batch_dims(
                 graph.erase_node(expand_node)
 
 
-def _hint_split_counts(op) -> dict[str, int]:
-    """Return {dim_name: split_count} from all hints on op (keys 'tiles' or 'slices')."""
-    result: dict[str, int] = {}
-    for hint_dict in get_op_hints(op).values():
+def _hint_levels(op) -> list[dict[str, int]]:
+    """Return per-level split counts, outermost first (sorted by hint ID).
+
+    Each entry is {dim_name: split_count} for one hint scope. Outer hint IDs
+    are smaller than inner hint IDs (guaranteed by spyre_hint counter order).
+    """
+    levels = []
+    for _, hint_dict in sorted(get_op_hints(op).items()):
+        level: dict[str, int] = {}
         for key in ("tiles", "slices"):
             if isinstance(hint_dict.get(key), dict):
-                result.update(hint_dict[key])
-    return result
+                level.update(hint_dict[key])
+        if level:
+            levels.append(level)
+    return levels
 
 
-def _dim_sizes(op) -> dict[str, int]:
-    """Return {dim_name: declared_size} for all named dims on op."""
-    return {
-        name: size
-        for sym in op.loop_var_dims
-        for name, size in named_dims_for_sym(op, sym)
-    }
+def resolve_hints(operations: list[Operation]) -> None:
+    """Resolve spyre_hint annotations into DimHint and stamp onto each op.
 
-
-def process_hints(operations: list) -> None:
+    For each op, reads the hint scopes attached to its FX origins, matches the
+    hinted dimension names against the op's named loop variables, and builds
+    op.spyre_hints: a flat list of DimHint, one per hinted dimension, ordered
+    outermost hint scope first.
     """
-    Process and log spyre hints, and their impact on each op and output buffer
-    """
+    for op in operations:
+        if not isinstance(op, ComputedBuffer) or not getattr(op, "loop_var_dims", None):
+            continue
+        levels = _hint_levels(op)
+        if not levels:
+            op.spyre_hints = []
+            continue
 
-    if not any(_hint_split_counts(op) for op in operations):
-        return
-
-    ops = [
-        op
-        for op in operations
-        if isinstance(op, ComputedBuffer) and getattr(op, "loop_var_dims", None)
-    ]
-
-    hints_logger.info("=== process_hints ===")
-
-    for op in ops:
-        splits = _hint_split_counts(op)
-        dim_sizes = _dim_sizes(op)
+        # Build a flat lookup from dimension name to (split_count, level_idx)
+        # so we can quickly resolve each loop variable below.
+        dim_to_level: dict[str, tuple[int, int]] = {}
+        for level_idx, level_splits in enumerate(levels):
+            for name, count in level_splits.items():
+                dim_to_level[name] = (count, level_idx)
 
         rw = op.get_read_writes()
+        # Collect the full iteration range for each loop symbol from the
+        # read/write index expressions.
         all_ranges = {
             s: int(v) for dep in [*rw.reads, *rw.writes] for s, v in dep.ranges.items()
         }
         reduction_dims = set(op.reduction_named_dims or [])
 
-        hints_logger.info(f"{op.get_operation_name()}:")
-        hints_logger.info("  Loop vars:")
-        for sym in op.loop_var_dims:
-            sym_range = all_ranges.get(sym, "?")
+        # Walk the op's loop variables in order.  For each one, check whether
+        # any of its named dimensions appear in a hint scope.  If so, create a
+        # DimHint.  Collect into a flat list keyed by (level_idx, loop_var_idx)
+        # so we can sort outermost-first after the walk.
+        unsorted: list[tuple[int, int, DimHint]] = []
+        for i, sym in enumerate(op.loop_var_dims):
             nd = named_dims_for_sym(op, sym)
-            nd_str = ", ".join(f"{n}={s}" for n, s in nd) if nd else "(none)"
-
-            tags = []
-            if any(n in reduction_dims for n, _ in nd):
-                tags.append("[reduction]")
-            for n, _ in nd:
-                if n in splits:
-                    k = splits[n]
-                    sliced = sym_range // k if isinstance(sym_range, int) else "?"
-                    tags.append(f"sliced by {k}: {sym_range} -> {sliced}")
-            suffix = ("  " + "  ".join(tags)) if tags else ""
-            hints_logger.info(
-                f"    {sym}  range={sym_range}  Named Dim(s): {nd_str}{suffix}"
+            hinted_names = [name for name, _ in nd if name in dim_to_level]
+            if not hinted_names:
+                continue
+            split_count, level_idx = dim_to_level[hinted_names[0]]
+            unsorted.append(
+                (
+                    level_idx,
+                    i,
+                    DimHint(
+                        dim_names=hinted_names,
+                        range_size=all_ranges.get(sym, 0),
+                        split_count=split_count,
+                        dim_index=i,
+                        is_reduction=any(
+                            name in reduction_dims for name in hinted_names
+                        ),
+                    ),
+                )
             )
+        op.spyre_hints = [h for _, _, h in sorted(unsorted)]
 
-        if op.named_dims:
-            hints_logger.info(f"  Output buffer: {op.get_name()}")
-            for name in op.named_dims:
-                size = dim_sizes.get(name, "?")
-                if name in splits and isinstance(size, int):
-                    k = splits[name]
+    if hints_logger.isEnabledFor(logging.INFO):
+        ops = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and getattr(op, "spyre_hints", None)
+        ]
+        if ops:
+            hints_logger.info("=== resolve_hints ===")
+            for op in ops:
+                hints_logger.info(f"{op.get_operation_name()}:")
+                for h in op.spyre_hints:
+                    per_tile = h.range_size // h.split_count if h.range_size else "?"
+                    reduction_tag = "  [reduction]" if h.is_reduction else ""
                     hints_logger.info(
-                        f"    {name}  size={size}  sliced by {k}: {size} -> {size // k}"
+                        f"  {h.dim_names}  range={h.range_size}"
+                        f"  split_count={h.split_count}  -> {per_tile} per tile"
+                        f"  dim_index={h.dim_index}{reduction_tag}"
                     )
-                else:
-                    hints_logger.info(f"    {name}  size={size}")
+
+
+def _group_spec(spyre_hints: list[DimHint]) -> list[tuple]:
+    """Build the coarse_tile() spec from op.spyre_hints.
+
+    Returns a list of (K, tiled_dims) tuples, one per hinted dim, outermost
+    first.  Reduction dims are excluded — coarse tiling only tiles compute dims.
+    """
+    return [
+        (sympy.Integer(h.split_count), [h.dim_index])
+        for h in spyre_hints
+        if not h.is_reduction
+    ]
+
+
+def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
+    """Build coarse_tile() groups from op.spyre_hints (set by resolve_hints).
+
+    coarse_tile() requires ops to be grouped: all ops in a group share the same
+    tiling spec and are tiled together inside the same loop nest.  We walk
+    operations in topological order and collect consecutive ops that carry
+    identical hints into one group, breaking whenever the hint changes or an
+    op has no hint at all.
+    """
+
+    def _key(op):
+        # Summarise an op's tiling intent as a hashable tuple so we can detect
+        # when consecutive ops share the same hint and belong in the same group.
+        # Reduction dims are excluded: coarse tiling only tiles compute dims.
+        resolved = getattr(op, "spyre_hints", [])
+        if not resolved:
+            return None
+        return (
+            tuple((h.split_count, h.dim_index) for h in resolved if not h.is_reduction)
+            or None
+        )  # all-reduction hint → treat as un-hinted
+
+    groups = []
+    current_ops: list[Operation] = []
+    current_key = None
+
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        key = _key(op)
+
+        if key is not None and key == current_key:
+            # Same hint as the previous op: extend the current group.
+            current_ops.append(op)
+        else:
+            # Hint changed (or this op has no hint): flush the current group,
+            # then start a new one if this op is hinted.
+            if current_ops and current_key is not None:
+                spec = _group_spec(current_ops[0].spyre_hints)
+                groups.append((current_ops, spec))
+            current_ops = [op] if key is not None else []
+            current_key = key
+
+    # Flush the final group.
+    if current_ops and current_key is not None:
+        spec = _group_spec(current_ops[0].spyre_hints)
+        groups.append((current_ops, spec))
+
+    return groups
 
 
 def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
