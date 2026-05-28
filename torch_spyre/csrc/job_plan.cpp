@@ -25,24 +25,18 @@
 
 namespace spyre {
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepH2D::construct(
-    LaunchContext&) const {
-  auto op = std::unique_ptr<flex::RuntimeOperationH2D>(
-      flex::RuntimeOperationH2D::create(host_address_, &device_address_));
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+void JobPlanStepH2D::construct(
+    LaunchContext&, flex::RuntimeStream* flex_stream) const {
+  flex_stream->launchOperationH2D(host_address_, &device_address_);
 }
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepD2H::construct(
-    LaunchContext&) const {
-  auto op = std::unique_ptr<flex::RuntimeOperationD2H>(
-      flex::RuntimeOperationD2H::create(&device_address_, host_address_));
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+void JobPlanStepD2H::construct(
+    LaunchContext&, flex::RuntimeStream* flex_stream) const {
+  flex_stream->launchOperationD2H(&device_address_, host_address_);
 }
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
-    LaunchContext& ctx) const {
+void JobPlanStepCompute::construct(
+    LaunchContext& ctx, flex::RuntimeStream* flex_stream) const {
   if (bind_io_addresses_) {
     std::vector<const flex::CompositeAddress*> inp;
     for (auto& tensor : ctx.inputs_outputs) {
@@ -53,15 +47,9 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
       inp.push_back(address);
     }
 
-    auto op = std::unique_ptr<flex::RuntimeOperationCompute>(
-        flex::RuntimeOperationCompute::create(&binary_address_, inp));
-    op->setPipelineBarrier(pipeline_barrier_);
-    return op;
+    flex_stream->launchOperationCompute(&binary_address_, inp, "", pipeline_barrier_);
   }
-  auto op = std::unique_ptr<flex::RuntimeOperationCompute>(
-      flex::RuntimeOperationCompute::create(&binary_address_));
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+  flex_stream->launchOperationCompute(&binary_address_, {}, "", pipeline_barrier_);
 }
 
 // convert CompositeAddress to address that host compute function expects
@@ -78,8 +66,8 @@ int64_t convert_address(flex::CompositeAddress& composite_address) {
   return 0;
 }
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
-    LaunchContext& ctx) const {
+void JobPlanStepHostCompute::construct(
+    LaunchContext& ctx, flex::RuntimeStream* flex_stream) const {
   std::vector<int64_t> addresses(ctx.inputs_outputs.size());
   int addr_idx = 0;
   for (auto& tensor : ctx.inputs_outputs) {
@@ -92,11 +80,7 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
     function_(metadata_.get(), output_buffer_, &addresses);
   };
 
-  auto op = std::unique_ptr<flex::RuntimeOperationHostCallback>(
-      flex::RuntimeOperationHostCallback::create(pipeline_barrier_,
-                                                 std::move(callback), nullptr));
-
-  return op;
+  flex_stream->launchOperationHostCallback(pipeline_barrier_, std::move(callback), nullptr);
 }
 
 }  // namespace spyre

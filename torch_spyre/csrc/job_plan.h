@@ -100,8 +100,8 @@ class JobPlanStep {
    * @param ctx Launch context containing composite addresses
    * @return Unique pointer to the constructed RuntimeOperation
    */
-  virtual std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const = 0;
+  virtual void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const = 0;
 
   /**
    * @brief Enable or disable pipeline barrier for this step
@@ -152,8 +152,8 @@ class JobPlanStepH2D final : public JobPlanStep {
       : host_address_(host_address),
         device_address_(std::move(device_address)) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
  private:
   void* host_address_;  // Non-owning pointer (JobPlan owns the buffer)
@@ -178,8 +178,8 @@ class JobPlanStepD2H final : public JobPlanStep {
       : device_address_(std::move(device_address)),
         host_address_(host_address) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
  private:
   flex::CompositeAddress device_address_;
@@ -206,8 +206,8 @@ class JobPlanStepCompute final : public JobPlanStep {
       : binary_address_(std::move(binary_address)),
         bind_io_addresses_(bind_io_addresses) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
  private:
   flex::CompositeAddress binary_address_;
@@ -252,8 +252,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         metadata_(std::move(metadata)),
         output_buffer_(output_buffer) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
  private:
   HostComputeFunction function_;
