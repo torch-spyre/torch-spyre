@@ -2187,6 +2187,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "6d_stick": (torch.rand(1, 3, 5, 2, 4, 62, dtype=torch.float16),),
             },
         },
+        ("test_mean_default", "test_mean_default_cpu"): {
+            "param_sets": {
+                "1d": (cached_randn((512,)),),
+                "2d": (cached_randn((32, 64)),),
+                "3d": (cached_randn((1, 11, 4096)),),
+            },
+        },
         ("test_mean", "test_mean_cpu"): {
             "param_sets": {
                 "3d_dim0": (
@@ -4592,6 +4599,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_copy_roundtrip(self, x):
         self.compare_with_cpu(lambda x: x, x)
+
+    def test_mean_default_cpu(self, x):
+        self.compare_with_cpu(lambda x: torch.mean(x), x)
 
     def test_mean_cpu(self, dim, keepdim, x):
         self.compare_with_cpu(lambda x: torch.mean(x, dim=dim, keepdim=keepdim), x)
