@@ -675,31 +675,52 @@ class TestSpyre(TestCase):
         """
         from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
+        float_tols = {
+            torch.float16: (1e-3, 1e-3),
+            torch.bfloat16: (1e-2, 1.6e-2),
+            torch.float32: (1e-5, 1e-5),
+        }
+
+        def _make_cpu_tensor(dtype):
+            if dtype.is_floating_point:
+                return torch.randn(2, 2, dtype=dtype)
+            if dtype == torch.bool:
+                return torch.randint(0, 2, (2, 2), dtype=torch.int32).to(torch.bool)
+            return torch.randint(0, 10, (2, 2), dtype=dtype)
+
+        def _assert_values_equal(actual, expected, src_dtype, dst_dtype, ctx):
+            if actual.is_floating_point():
+                atol, rtol = max(
+                    float_tols.get(src_dtype, (1e-5, 1e-5)),
+                    float_tols.get(dst_dtype, (1e-5, 1e-5)),
+                )
+                self.assertTrue(
+                    torch.allclose(actual, expected, atol=atol, rtol=rtol),
+                    msg=f"{ctx}: actual={actual}, expected={expected}",
+                )
+            else:
+                self.assertEqual(actual, expected, msg=ctx)
+
         # Test supported conversions
         for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
-            # Create tensor on CPU with src_dtype
-            if src_dtype.is_floating_point:
-                tensor = torch.randn(2, 2, dtype=src_dtype)
-            elif src_dtype == torch.bool:
-                tensor = torch.randint(0, 2, (2, 2), dtype=torch.int32).to(torch.bool)
-            else:
-                tensor = torch.randint(0, 10, (2, 2), dtype=src_dtype)
-
-            # H2D: Move to Spyre with dst_dtype
-            h2d_ctx = f"H2D {src_dtype} -> {dst_dtype}"
-            tensor_on_spyre = tensor.to("spyre", dtype=dst_dtype)
-            self.assertEqual(tensor_on_spyre.device.type, "spyre", msg=h2d_ctx)
-            self.assertEqual(tensor_on_spyre.dtype, dst_dtype, msg=h2d_ctx)
-            self.assertEqual(
-                tensor_on_spyre.to("cpu"), tensor.to(dst_dtype), msg=h2d_ctx
+            ctx = f"H2D {src_dtype}->{dst_dtype}"
+            h2d_src = _make_cpu_tensor(src_dtype)
+            h2d_expected = h2d_src.to(dtype=dst_dtype)  # ground truth on CPU
+            h2d_spyre = h2d_src.to("spyre", dtype=dst_dtype)
+            self.assertEqual(h2d_spyre.device.type, "spyre", msg=ctx)
+            self.assertEqual(h2d_spyre.dtype, dst_dtype, msg=ctx)
+            _assert_values_equal(
+                h2d_spyre.to("cpu"), h2d_expected, src_dtype, dst_dtype, ctx
             )
 
-            # D2H: Move back to CPU with src_dtype
-            d2h_ctx = f"D2H {dst_dtype} -> {src_dtype}"
-            tensor_back = tensor_on_spyre.to("cpu", dtype=src_dtype)
-            self.assertEqual(tensor_back.device.type, "cpu", msg=d2h_ctx)
-            self.assertEqual(tensor_back.dtype, src_dtype, msg=d2h_ctx)
-            self.assertEqual(tensor_back, tensor, msg=d2h_ctx)
+            ctx = f"D2H {dst_dtype}->{src_dtype}"
+            d2h_src = _make_cpu_tensor(dst_dtype)
+            d2h_expected = d2h_src.to(dtype=src_dtype)  # ground truth on CPU
+            d2h_spyre = d2h_src.to("spyre")
+            d2h_cpu = d2h_spyre.to("cpu", dtype=src_dtype)
+            self.assertEqual(d2h_cpu.device.type, "cpu", msg=ctx)
+            self.assertEqual(d2h_cpu.dtype, src_dtype, msg=ctx)
+            _assert_values_equal(d2h_cpu, d2h_expected, dst_dtype, src_dtype, ctx)
 
         # Test unsupported conversions
         unsupported_pairs = [

@@ -96,10 +96,10 @@ def _patch_tensor_for_spyre():
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
             ):
-                # Step 1: cast dtype on CPU
-                tmp = orig_to(self, dtype=_dtype)
-                # Step 2: plain H2D copy with no dtype change
-                return orig_to(tmp, _device)
+                # Step 1: plain D2H copy (no dtype change)
+                tmp = orig_to(self, _device)
+                # Step 2: cast dtype on CPU
+                return orig_to(tmp, dtype=_dtype)
 
             return orig_to(self, *args, **kwargs)
         else:
