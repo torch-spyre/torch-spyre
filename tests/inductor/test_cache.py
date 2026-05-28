@@ -48,3 +48,68 @@ class TestCache(unittest.TestCase):
             self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
 
         self.assertFalse(torch.compiler._cache.CacheArtifactManager.need_serialize())
+
+    def test_cache_key_includes_spyre_layout(self):
+        """
+        Verify that FxGraphHashDetails includes SpyreTensorLayout in the cache key.
+        Different layouts should produce different cache keys, preventing incorrect
+        cache hits across layout changes.
+        """
+        from torch.spyre import SpyreTensorLayout
+
+        x = torch.rand([64, 64], dtype=torch.float16)
+        stl_a = SpyreTensorLayout(
+            list(x.size()), list(x.stride()), torch.float16, [0, 1]
+        )
+        stl_b = SpyreTensorLayout(
+            list(x.size()), list(x.stride()), torch.float16, [1, 0]
+        )
+
+        _ = x.to("spyre")  # wake up spyre
+        tensor_a = x.to(device_layout=stl_a)
+        tensor_b = x.to(device_layout=stl_b)
+
+        fn = torch.compile(lambda a: a + a, dynamic=False)
+
+        # ── Layout A — first compile, cache miss expected ─────────────────────────
+        counters.clear()
+        with fresh_cache():
+            fn(tensor_a)
+            self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
+            self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 0)
+
+            artifacts_a = torch.compiler.save_cache_artifacts()
+            self.assertIsNotNone(artifacts_a)
+            artifact_bytes_a, _ = artifacts_a
+
+        # ── Layout B — different layout, should NOT hit Layout A cache ────────────
+        torch._dynamo.reset()
+        counters.clear()
+        with fresh_cache():
+            # load Layout A artifact into cache
+            torch.compiler.load_cache_artifacts(artifact_bytes_a)
+
+            # compile with Layout B — should miss (different layout → different key)
+            fn(tensor_b)
+            self.assertEqual(
+                counters["inductor"]["fxgraph_cache_miss"],
+                1,
+                "Layout B should miss Layout A cache — different SpyreTensorLayout",
+            )
+            self.assertEqual(
+                counters["inductor"]["fxgraph_cache_hit"],
+                0,
+                "Layout B should not hit Layout A cache — SpyreTensorLayout differs",
+            )
+
+        # ── Layout A again — should hit its own cache ─────────────────────────────
+        torch._dynamo.reset()
+        counters.clear()
+        with fresh_cache():
+            torch.compiler.load_cache_artifacts(artifact_bytes_a)
+            fn(tensor_a)
+            self.assertEqual(
+                counters["inductor"]["fxgraph_cache_hit"],
+                1,
+                "Layout A should hit its own cache",
+            )

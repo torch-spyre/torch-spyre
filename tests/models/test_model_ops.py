@@ -18,9 +18,11 @@ import sys
 import pytest
 import torch
 
-from model_cases_loader import LoadedCase, case_key, load_all_cases
-from runner import run_test, parse_dtype, make_SampleInput
 import shared_config
+
+from .model_cases_loader import LoadedCase, case_key, load_all_cases
+from .runner import run_test, parse_dtype, make_SampleInput
+from .op_registry import OP_REGISTRY, OpAdapter
 
 from typing import Any, Dict, List
 
@@ -32,7 +34,6 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
 )
 from torch.testing._internal.common_utils import TestCase
-from op_registry import OP_REGISTRY, OpAdapter
 
 
 class ModelOpInfo(OpInfo):

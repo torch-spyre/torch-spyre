@@ -238,6 +238,7 @@ def get_per_core_span(
         if not coord.free_symbols:
             continue
         per_core_max = 0
+        per_core_min = 0
         for v in coord.free_symbols:
             term = coord.subs({u: 0 for u in coord.free_symbols - {v}})
             # Concretize the iteration-space size so R (and therefore the
@@ -247,7 +248,8 @@ def get_per_core_span(
             # TODO(issue#1372): Symbolic work division will keep this symbolic.
             R = concretize_expr(it_space_orig[v]) // splits.get(v, 1)
             per_core_max += int(term.subs(v, R - 1))
-        per_core_size = per_core_max + 1
+            per_core_min += int(term.subs(v, 0))
+        per_core_size = per_core_max - per_core_min + 1
         if per_core_size > 1:
             stride_elems = math.prod(device_size[d + 1 :])
             return per_core_size * stride_elems * itemsize

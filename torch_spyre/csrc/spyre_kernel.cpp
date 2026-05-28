@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "job_plan.h"
 #include "logging.h"
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
@@ -184,7 +185,7 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
   arts.program_size = arts.init_bin.size();
   auto& allocator = SpyreAllocator::instance();
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
-                                      std::nullopt);
+                                      std::nullopt, flex::MemoryType::Program);
   arts.device_alloc =
       std::move(allocator.allocate(arts.program_size, directive));
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
@@ -209,6 +210,12 @@ void launchKernel(const std::string& code_dir,
   auto& arts = getOrLoadArtifacts(code_dir, stream);
 
   stream.executeProgramAsync(arts, args);
+}
+
+void launchJobPlan(const JobPlan& job_plan,
+                   const std::vector<at::Tensor>& args) {
+  auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+  stream.launch(job_plan, args);
 }
 
 void clearArtifactCache() {

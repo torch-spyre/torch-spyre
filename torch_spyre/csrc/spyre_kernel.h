@@ -32,6 +32,9 @@ using json = nlohmann::json;
 
 namespace spyre {
 
+// Forward declarations
+class JobPlan;
+
 class SpyreStream;
 struct KernelArtifacts {
   std::vector<uint8_t> init_bin;  // Program binary from init.txt
@@ -59,6 +62,9 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
                                     const SpyreStream& stream);
 void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args);
+
+void launchJobPlan(const JobPlan& job_plan,
+                   const std::vector<at::Tensor>& args);
 
 void clearArtifactCache();
 

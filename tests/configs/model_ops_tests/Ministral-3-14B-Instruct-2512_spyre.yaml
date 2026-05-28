@@ -1,0 +1,2484 @@
+test_suite_config:
+  global:
+    supported_dtypes:
+      - name: float16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: float32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: float64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: bfloat16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int8
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint8
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex128
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: bool
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: half
+        precision:
+          atol: 0.005
+          rtol: 0.005
+    input_config:
+      seed: 123
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/models/test_model_ops_v2.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestSpyreModelOps::test_model_ops_db
+          mode: xfail
+          tags:
+            - model__Ministral-3-14B-Instruct-2512_spyre
+          edits:
+            ops:
+              include:
+                - name: torch.nn.functional.embedding
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14]
+                          stride: [14, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [131072, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 11
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L311 in forward,
+                    code: inputs_embeds = self.get_input_embeddings()(input_ids)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.embedding.1_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [64]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (None, slice(None, None, None), None)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L329 in
+                    forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  tags:
+                    - constant
+                    - torch.getitem.1_spyre
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L329 in
+                    forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  tags:
+                    - torch.float.1_spyre
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: -1
+                      - value: 1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L329 in
+                    forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  tags:
+                    - constant
+                    - torch.Tensor.expand.1_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: cuda:0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L329 in
+                    forward, code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+                  tags:
+                    - constant
+                    - torch.to.1_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14]
+                          stride: [14, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L330 in
+                    forward, code: position_ids_expanded = position_ids[:, None, :].float()'
+                  tags:
+                    - constant
+                    - torch.getitem.2_spyre
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 14]
+                          stride: [14, 14, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L330 in
+                    forward, code: position_ids_expanded = position_ids[:, None, :].float()'
+                  tags:
+                    - torch.float.2
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 14]
+                          stride: [14, 14, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
+                    forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - torch.float.3_spyre
+                - name: torch.matmul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 14]
+                          stride: [14, 14, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
+                    forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - torch.matmul.1_spyre
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 14]
+                          stride: [896, 14, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
+                    forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.transpose.1_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 14, 64]
+                            stride: [896, 1, 14]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 14, 64]
+                            stride: [896, 1, 14]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L335 in
+                    forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
+                  tags:
+                    - constant
+                    - torch.cat.1_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.cos
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 128]
+                          stride: [1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L336 in
+                    forward, code: cos = emb.cos() * self.attention_scaling'
+                  tags:
+                    - torch.cos.1_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 128]
+                          stride: [1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L336 in
+                    forward, code: cos = emb.cos() * self.attention_scaling'
+                  tags:
+                    - constant
+                    - torch.mul.1_spyre
+                - name: torch.sin
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 128]
+                          stride: [1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L337 in
+                    forward, code: sin = emb.sin() * self.attention_scaling'
+                  tags:
+                    - torch.sin.1_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 128]
+                          stride: [1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L339 in
+                    forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+                  tags:
+                    - torch.to.2_spyre
+                  kwargs:
+                    dtype: torch.float16
+                - name: torch._C._log_api_usage_once
+                  sample_inputs_func:
+                    args:
+                      - value: python.nn_module
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L405 in
+                    forward, code: for decoder_layer in self.layers[: self.config.num_hidden_layers]:'
+                  tags:
+                    - constant
+                    - torch._C._log_api_usage_once.1_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.float32
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L206 in
+                    forward, code: hidden_states = hidden_states.to(torch.float32)'
+                  tags:
+                    - constant
+                    - torch.to.3_spyre
+                - name: torch.pow
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L207 in
+                    forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - constant
+                    - torch.pow.1_spyre
+                - name: torch.mean
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L207 in
+                    forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - constant
+                    - torch.mean.1_spyre
+                  kwargs:
+                    keepdim: true
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 1]
+                          stride: [14, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L208 in
+                    forward, code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - constant
+                    - torch.add.1_spyre
+                - name: torch.rsqrt
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 1]
+                          stride: [14, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L208 in
+                    forward, code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - torch.rsqrt.1_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 14, 1]
+                          stride: [14, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L208 in
+                    forward, code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - torch.mul.2_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L209 in
+                    forward, code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - constant
+                    - torch.to.4_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [5120]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L209 in
+                    forward, code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - torch.mul.3_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
+                    forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.1_spyre
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 4096]
+                          stride: [57344, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 14, -1, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
+                    forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.Tensor.view.1_spyre
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 32, 128]
+                          stride: [57344, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
+                    forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.transpose.2_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
+                    forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.2_spyre
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 1024]
+                          stride: [14336, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 14, -1, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
+                    forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.Tensor.view.2_spyre
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 8, 128]
+                          stride: [14336, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
+                    forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.transpose.3_spyre
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 128]
+                          stride: [1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L61 in
+                    apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  tags:
+                    - constant
+                    - torch.unsqueeze.1_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 14, 128]
+                          stride: [1792, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L63 in
+                    apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - torch.mul.4_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L37 in
+                    rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - constant
+                    - torch.getitem.3_spyre
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 64]
+                          stride: [57344, 128, 4096, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - torch.neg.1_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 14, 64]
+                            stride: [28672, 64, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 14, 64]
+                            stride: [57344, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - constant
+                    - torch.cat.2_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 14, 128]
+                          stride: [1792, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L63 in
+                    apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - torch.mul.5_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L63 in
+                    apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - torch.add.2_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 14, 128]
+                          stride: [14336, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 14, 128]
+                          stride: [1792, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L64 in
+                    apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - torch.mul.6_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 14, 128]
+                          stride: [14336, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L37 in
+                    rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - constant
+                    - torch.getitem.4_spyre
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 14, 64]
+                          stride: [14336, 128, 1024, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - torch.neg.2_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 14, 64]
+                            stride: [7168, 64, 512, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 14, 64]
+                            stride: [14336, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - constant
+                    - torch.cat.3_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 14, 128]
+                          stride: [14336, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 14, 128]
+                          stride: [1792, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L64 in
+                    apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - torch.mul.7_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 14, 128]
+                          stride: [14336, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 14, 128]
+                          stride: [14336, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L64 in
+                    apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - torch.add.3_spyre
+                - name: torch.truediv
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 16384
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - constant
+                    - torch.truediv.1_spyre
+                - name: torch.floor
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - torch.floor.1_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - value: 1
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - constant
+                    - torch.add.4_spyre
+                - name: torch.log
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - torch.log.1_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - value: 0.1
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - constant
+                    - torch.mul.8_spyre
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L107 in
+                    _get_llama_4_attn_scale, code: return scaling.unsqueeze(-1)'
+                  tags:
+                    - constant
+                    - torch.unsqueeze.2_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [14, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L150 in
+                    forward, code: ).to(query_states.dtype)'
+                  tags:
+                    - constant
+                    - torch.to.5_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [14, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L146 in
+                    forward, code: query_states = query_states * _get_llama_4_attn_scale('
+                  tags:
+                    - torch.mul.9_spyre
+                - name: torch.zeros
+                  sample_inputs_func:
+                    args:
+                      - value: (1, 8, 2048, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L290 in lazy_initialization, code:
+                    self.keys = torch.zeros('
+                  tags:
+                    - constant
+                    - torch.zeros.1_spyre
+                  kwargs:
+                    dtype: torch.float16
+                    device: cuda:0
+                - name: torch.index_copy_
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [14]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 14, 128]
+                          stride: [14336, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L340 in update, code: self.keys.index_copy_(2,
+                    cache_position, key_states)'
+                  tags:
+                    - constant
+                    - torch.index_copy_.1_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  tags:
+                    - constant
+                    - torch.getitem.5_spyre
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 2048, 128]
+                          stride: [2097152, 262144, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 8
+                      - value: 4
+                      - value: 2048
+                      - value: 128
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  tags:
+                    - constant
+                    - torch.Tensor.expand.2_spyre
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 4, 2048, 128]
+                          stride: [2097152, 262144, 0, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 32, 2048, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv,
+                    code: return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
+                  tags:
+                    - constant
+                    - torch.reshape.1_spyre
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                    code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+                  tags:
+                    - torch.nn.functional.scaled_dot_product_attention.1_spyre
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.08838834764831845
+                    is_causal: false
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 14, 128]
+                          stride: [57344, 1792, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - constant
+                    - torch.transpose.4_spyre
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 32, 128]
+                          stride: [57344, 128, 1792, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - torch.Tensor.contiguous.1_spyre
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 32, 128]
+                          stride: [57344, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 14, -1)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L173 in
+                    forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  tags:
+                    - constant
+                    - torch.reshape.2_spyre
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 4096]
+                          stride: [57344, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L173 in
+                    forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  tags:
+                    - torch.Tensor.contiguous.2_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 4096]
+                          stride: [57344, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [5120, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L174 in
+                    forward, code: attn_output = self.o_proj(attn_output)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.3_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L248 in
+                    forward, code: hidden_states = residual + hidden_states'
+                  tags:
+                    - torch.add.5_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [16384, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
+                    forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.4_spyre
+                - name: torch.nn.functional.silu
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 16384]
+                          stride: [229376, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  tags:
+                    - torch.nn.functional.silu.1_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 16384]
+                          stride: [229376, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 14, 16384]
+                          stride: [229376, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
+                    forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - torch.mul.10_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 16384]
+                          stride: [229376, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [5120, 16384]
+                          stride: [16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
+                    forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.5_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 14, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - constant
+                    - torch.getitem.6_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [71680, 5120, 1]
+                          storage_offset: 66560
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [131072, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.6_spyre
+                - name: torch.nn.functional.embedding
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [131072, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 11
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L311 in forward,
+                    code: inputs_embeds = self.get_input_embeddings()(input_ids)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.embedding.2_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L330 in
+                    forward, code: position_ids_expanded = position_ids[:, None, :].float()'
+                  tags:
+                    - constant
+                    - torch.getitem.7_spyre
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L330 in
+                    forward, code: position_ids_expanded = position_ids[:, None, :].float()'
+                  tags:
+                    - torch.float.4
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
+                    forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - torch.float.5_spyre
+                - name: torch.matmul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
+                    forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - torch.matmul.2_spyre
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
+                    forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.transpose.5_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L335 in
+                    forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
+                  tags:
+                    - constant
+                    - torch.cat.4_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.cos
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L336 in
+                    forward, code: cos = emb.cos() * self.attention_scaling'
+                  tags:
+                    - torch.cos.2_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L336 in
+                    forward, code: cos = emb.cos() * self.attention_scaling'
+                  tags:
+                    - constant
+                    - torch.mul.11_spyre
+                - name: torch.sin
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L337 in
+                    forward, code: sin = emb.sin() * self.attention_scaling'
+                  tags:
+                    - torch.sin.2_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L339 in
+                    forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+                  tags:
+                    - torch.to.6_spyre
+                  kwargs:
+                    dtype: torch.float16
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.float32
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L206 in
+                    forward, code: hidden_states = hidden_states.to(torch.float32)'
+                  tags:
+                    - constant
+                    - torch.to.7_spyre
+                - name: torch.pow
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L207 in
+                    forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - constant
+                    - torch.pow.2_spyre
+                - name: torch.mean
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L207 in
+                    forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - constant
+                    - torch.mean.2_spyre
+                  kwargs:
+                    keepdim: true
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L208 in
+                    forward, code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - constant
+                    - torch.add.6_spyre
+                - name: torch.rsqrt
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L208 in
+                    forward, code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - torch.rsqrt.2_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L208 in
+                    forward, code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - torch.mul.12_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L209 in
+                    forward, code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - constant
+                    - torch.to.8_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [5120]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L209 in
+                    forward, code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - torch.mul.13_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
+                    forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.7_spyre
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
+                    forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.Tensor.view.3_spyre
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
+                    forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.transpose.6_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
+                    forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.8_spyre
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1024]
+                          stride: [1024, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
+                    forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.Tensor.view.4_spyre
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 8, 128]
+                          stride: [1024, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
+                    forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - constant
+                    - torch.transpose.7_spyre
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L61 in
+                    apply_rotary_pos_emb, code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  tags:
+                    - constant
+                    - torch.unsqueeze.3_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L63 in
+                    apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - torch.mul.14_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L37 in
+                    rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - constant
+                    - torch.getitem.8_spyre
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 64]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - torch.neg.3_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 1, 64]
+                            stride: [2048, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 1, 64]
+                            stride: [4096, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - constant
+                    - torch.cat.5_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L63 in
+                    apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - torch.mul.15_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L63 in
+                    apply_rotary_pos_emb, code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - torch.add.7_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L64 in
+                    apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - torch.mul.16_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L37 in
+                    rotate_half, code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - constant
+                    - torch.getitem.9_spyre
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 64
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - torch.neg.4_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 1, 64]
+                            stride: [512, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 1, 64]
+                            stride: [1024, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.float16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
+                    rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - constant
+                    - torch.cat.6_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L64 in
+                    apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - torch.mul.17_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L64 in
+                    apply_rotary_pos_emb, code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - torch.add.8_spyre
+                - name: torch.truediv
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 16384
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - constant
+                    - torch.truediv.2_spyre
+                - name: torch.floor
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - torch.floor.2_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - value: 1
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - constant
+                    - torch.add.9_spyre
+                - name: torch.log
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - torch.log.2_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - value: 0.1
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L106 in
+                    _get_llama_4_attn_scale, code: scaling = 1 + beta * torch.log(1 + torch.floor(positions_ids / max_position_embeddings))'
+                  tags:
+                    - constant
+                    - torch.mul.18_spyre
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L107 in
+                    _get_llama_4_attn_scale, code: return scaling.unsqueeze(-1)'
+                  tags:
+                    - constant
+                    - torch.unsqueeze.4_spyre
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L150 in
+                    forward, code: ).to(query_states.dtype)'
+                  tags:
+                    - constant
+                    - torch.to.9_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L146 in
+                    forward, code: query_states = query_states * _get_llama_4_attn_scale('
+                  tags:
+                    - torch.mul.19_spyre
+                - name: torch.index_copy_
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L340 in update, code: self.keys.index_copy_(2,
+                    cache_position, key_states)'
+                  tags:
+                    - constant
+                    - torch.index_copy_.2_spyre
+                - name: torch.index_copy_
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L341 in update, code: self.values.index_copy_(2,
+                    cache_position, value_states)'
+                  tags:
+                    - constant
+                    - torch.index_copy_.3_spyre
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                    code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+                  tags:
+                    - torch.nn.functional.scaled_dot_product_attention.2_spyre
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.08838834764831845
+                    is_causal: false
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - constant
+                    - torch.transpose.8_spyre
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - torch.Tensor.contiguous.3_spyre
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L173 in
+                    forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  tags:
+                    - constant
+                    - torch.reshape.3_spyre
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L173 in
+                    forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  tags:
+                    - torch.Tensor.contiguous.4_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [5120, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L174 in
+                    forward, code: attn_output = self.o_proj(attn_output)'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.9_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L248 in
+                    forward, code: hidden_states = residual + hidden_states'
+                  tags:
+                    - torch.add.10_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [16384, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
+                    forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.10_spyre
+                - name: torch.nn.functional.silu
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 16384]
+                          stride: [16384, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  tags:
+                    - torch.nn.functional.silu.2_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 16384]
+                          stride: [16384, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 16384]
+                          stride: [16384, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
+                    forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - torch.mul.20_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 16384]
+                          stride: [16384, 16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [5120, 16384]
+                          stride: [16384, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
+                    forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.11_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - constant
+                    - torch.getitem.10_spyre
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 5120]
+                          stride: [5120, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [131072, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - constant
+                    - torch.nn.functional.linear.12_spyre

@@ -1,7 +1,9 @@
 """
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
+
 Pydantic models for the OOT PyTorch test framework YAML config.
 
-Used by spyre_test_parsing.py to validate and parse the YAML config.
+Used by oot_test_parsing.py to validate and parse the YAML config.
 """
 
 import ast
@@ -14,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 import torch
 from pydantic import BaseModel, field_validator, model_validator  # type: ignore
 
-from spyre_test_constants import (
+from oot_test_constants import (
     DTYPE_STR_MAP,
     MODE_MANDATORY_SUCCESS,
     MODE_SKIP,
@@ -22,7 +24,7 @@ from spyre_test_constants import (
     MODE_XFAIL_STRICT,
     REL_PATH_TOKENS,
 )
-from spyre_test_matching import parse_dtype
+from oot_test_matching import parse_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +195,7 @@ class InputTensorSpec(BaseModel):
 
     shape: List[int]
     dtype: str
-    device: str = "spyre"
+    device: str = "privateuse1"
     init: str = "rand"
     init_args: InputInitArgs = InputInitArgs()
     stride: Optional[List[int]] = None
@@ -312,6 +314,14 @@ class InputTensorSpec(BaseModel):
                 raise ValueError(f"Unknown init strategy: {init!r}")
 
         # Handle custom stride/storage_offset
+        # if self.stride is not None or self.storage_offset != 0:
+        #     stride = self.stride if self.stride is not None else list(t.stride())
+        #     offset = self.storage_offset
+        #     needed = offset + (
+        #         sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
+        #     )
+        #     backing = torch.empty(needed, dtype=dtype)
+        #     t = torch.as_strided(backing, shape, stride, offset)
         if self.stride is not None or self.storage_offset != 0:
             stride = self.stride if self.stride is not None else list(t.stride())
             offset = self.storage_offset
@@ -319,22 +329,22 @@ class InputTensorSpec(BaseModel):
                 sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
             )
             backing = torch.empty(needed, dtype=dtype)
-            t = torch.as_strided(backing, shape, stride, offset)
             with torch.no_grad():
                 if init == "rand":
-                    t.copy_(
+                    backing.copy_(  # fill flat backing, no aliasing
                         make_tensor(
-                            *shape, dtype=dtype, device="cpu", low=0.0, high=1.0
+                            needed, dtype=dtype, device="cpu", low=0.0, high=1.0
                         )
                     )
                 elif init == "randn":
-                    t.copy_(make_tensor(*shape, dtype=dtype, device="cpu"))
+                    backing.copy_(make_tensor(needed, dtype=dtype, device="cpu"))
                 elif init == "randint":
-                    t.copy_(
+                    backing.copy_(
                         make_tensor(
-                            *shape, dtype=dtype, device="cpu", low=ia.low, high=ia.high
+                            needed, dtype=dtype, device="cpu", low=ia.low, high=ia.high
                         )
                     )
+            t = torch.as_strided(backing, shape, stride, offset)  # view created after
 
         return t
 
@@ -377,14 +387,13 @@ class InputTensorSpec(BaseModel):
                 sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
             )
             backing = torch.empty(needed, dtype=dtype)
-            t = torch.as_strided(backing, shape, stride, offset)
             with torch.no_grad():
                 if init == "rand":
-                    t.copy_(torch.rand(shape, dtype=dtype))
+                    backing.copy_(torch.rand(needed, dtype=dtype))
                 elif init == "randn":
-                    t.copy_(torch.randn(shape, dtype=dtype))
+                    backing.copy_(torch.randn(needed, dtype=dtype))
                 elif init == "randint":
-                    t.copy_(torch.randint(ia.low, ia.high, shape, dtype=dtype))
+                    backing.copy_(torch.randint(ia.low, ia.high, [needed], dtype=dtype))
 
         return t
 

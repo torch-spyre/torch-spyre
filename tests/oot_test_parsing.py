@@ -1,9 +1,11 @@
 """
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
+
 YAML config parsing and op_db filtering for the OOT PyTorch test framework.
 
 Responsibilities:
   - load_yaml_config: read YAML and return validated OOTTestConfig
-  - resolve_rel_path: expand ${PYTORCH} / ${TORCH_SPYRE} tokens
+  - resolve_rel_path: expand ${PYTORCH} / ${TORCH_DEVICE_ROOT} tokens
   - resolve_current_file: match a YAML file entry against cwd
   - filter_op_db: monkey-patch pytorch op_db lists to supported_ops subset
 """
@@ -16,8 +18,8 @@ from typing import Dict, Optional
 
 import yaml
 
-from spyre_test_constants import REL_PATH_TOKENS
-from spyre_test_config_models import FileEntry, OOTTestConfig, SupportedOpConfig
+from oot_test_constants import REL_PATH_TOKENS
+from oot_test_config_models import FileEntry, OOTTestConfig, SupportedOpConfig
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +53,7 @@ def load_yaml_config(path: str) -> OOTTestConfig:
 
 
 def resolve_rel_path(path: str) -> str:
-    """Expand ${PYTORCH} and ${TORCH_SPYRE} tokens using env vars."""
+    """Expand ${TORCH_ROOT} and ${TORCH_DEVICE_ROOT} tokens using env vars."""
     for token, env_var in REL_PATH_TOKENS:
         if token in path:
             root = os.environ.get(env_var)
@@ -106,7 +108,7 @@ def _unwrap_oot_path(path: str) -> str:
 # xdist worker processes via inherited environment, unlike sys.argv (empty
 # in workers) and PYTEST_CURRENT_TEST (only set during test *execution*,
 # not during the *collection* phase when resolve_current_file is called).
-_ENV_SPYRE_TEST_FILE = "SPYRE_TEST_FILE"
+_ENV_OOT_TEST_FILE = "OOT_TEST_FILE"
 
 
 def _resolve_candidate(raw: str, cwd: Path) -> Optional[str]:
@@ -121,9 +123,9 @@ def _resolve_candidate(raw: str, cwd: Path) -> Optional[str]:
 
 
 def _find_test_file_from_env(cwd: Path) -> Optional[str]:
-    """Return the original (non-wrapper) test file path from SPYRE_TEST_FILE.
+    """Return the original (non-wrapper) test file path from OOT_TEST_FILE.
 
-    run_test.sh exports SPYRE_TEST_FILE=<absolute path to wrapper or original>
+    run_test.sh exports OOT_TEST_FILE=<absolute path to wrapper or original>
     immediately before each pytest invocation.  Child processes — including
     xdist worker subprocesses — inherit it via the environment, so it is
     present during both *collection* and *execution*.
@@ -133,7 +135,7 @@ def _find_test_file_from_env(cwd: Path) -> Optional[str]:
 
     Returns the resolved absolute path string, or None if unset / not found.
     """
-    value = os.environ.get(_ENV_SPYRE_TEST_FILE, "")
+    value = os.environ.get(_ENV_OOT_TEST_FILE, "")
     if not value:
         return None
     # Unwrap before resolving so the path we check on disk is the original file.
@@ -178,7 +180,7 @@ def _find_test_file_from_pytest_current_test(cwd: Path) -> Optional[str]:
     This env var is only set during test *execution*, not during
     *collection*.  resolve_current_file is called from instantiate_test()
     which runs at collection time, so this is a last-resort fallback for
-    cases where SPYRE_TEST_FILE is not set (e.g. direct pytest invocations
+    cases where OOT_TEST_FILE is not set (e.g. direct pytest invocations
     outside of run_test.sh during an ongoing test run).
 
     Returns the resolved absolute path string, or None if not set / not found.
@@ -198,7 +200,7 @@ def resolve_current_file(config: OOTTestConfig, config_path: str) -> FileEntry:
 
     Source priority for determining the current test file:
 
-    1. SPYRE_TEST_FILE env var — exported by run_test.sh before every pytest
+    1. OOT_TEST_FILE env var — exported by run_test.sh before every pytest
        invocation (normal and xdist fallback alike).  Inherited by all child
        processes including xdist workers.  Available during both collection
        and execution, making it the only source that works reliably in all
@@ -216,10 +218,10 @@ def resolve_current_file(config: OOTTestConfig, config_path: str) -> FileEntry:
 
     cwd = Path(os.getcwd()).resolve()
 
-    # --- Source 1: SPYRE_TEST_FILE (set by run_test.sh ---
+    # --- Source 1: OOT_TEST_FILE (set by run_test.sh) ---
     current_test_file = _find_test_file_from_env(cwd)
     if current_test_file is not None:
-        _debug(f"resolved from {_ENV_SPYRE_TEST_FILE}: {current_test_file!r}")
+        _debug(f"resolved from {_ENV_OOT_TEST_FILE}: {current_test_file!r}")
 
     # --- Source 2: sys.argv ---
     if current_test_file is None:
@@ -234,10 +236,10 @@ def resolve_current_file(config: OOTTestConfig, config_path: str) -> FileEntry:
     if current_test_file is None:
         raise EnvironmentError(
             f"Could not determine the test file being run.\n"
-            f"  {_ENV_SPYRE_TEST_FILE}={os.environ.get(_ENV_SPYRE_TEST_FILE, '')!r}\n"
+            f"  {_ENV_OOT_TEST_FILE}={os.environ.get(_ENV_OOT_TEST_FILE, '')!r}\n"
             f"  sys.argv[1:]={sys.argv[1:]!r}\n"
             f"  PYTEST_CURRENT_TEST={os.environ.get('PYTEST_CURRENT_TEST', '')!r}\n"
-            f"Make sure run_test.sh exports {_ENV_SPYRE_TEST_FILE} before invoking pytest, "
+            f"Make sure run_test.sh exports {_ENV_OOT_TEST_FILE} before invoking pytest, "
             f"or invoke pytest with an explicit test file, e.g. `pytest test_ops.py`."
         )
 

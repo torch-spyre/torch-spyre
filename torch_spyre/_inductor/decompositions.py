@@ -306,13 +306,6 @@ def register_spyre_decompositions_via_dispatchkey(
     return decomposition_decorator
 
 
-# TODO (imaihal): Inductor applies constant folding to torch.full, which allocates
-# a one-element Spyre tensor. This currently fails because Spyre does not handle
-# single-element tensors well.
-# Ref: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/_inductor/fx_passes/joint_graph.py#L324-L335
-#
-# Implement ones via identity broadcast: create a size-1 tensor (ones_scalar), expand to
-# target size, then clone (identity) to materialize. Clone op with identity is merged.
 @register_spyre_decomposition([torch.ops.aten.ones.default])
 def ones_decomp(
     size: Union[list, tuple],
@@ -324,8 +317,7 @@ def ones_decomp(
 ) -> torch.Tensor:
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
-    scalar = torch.ops.spyre.ones_scalar(device, dtype=dtype)
-    return scalar.reshape(()) if not size else scalar.expand(size).clone()
+    return torch.ops.aten.full(size, 1, dtype=dtype, layout=layout, device=device)
 
 
 @register_spyre_decomposition([torch.ops.aten.new_ones.default])
@@ -340,27 +332,13 @@ def new_ones_decomp(
 ) -> torch.Tensor:
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
-    dev = device if device is not None else self.device
-    dt = dtype if dtype is not None else self.dtype
-    scalar = torch.ops.spyre.ones_scalar(dev, dtype=dt)
-    return scalar.reshape(()) if not size else scalar.expand(size).clone()
-
-
-# To avoid constant folding, we introduce a custom op `spyre::full` that runs
-# torch.full on CPU and copies the result to Spyre. Remove this workaround once
-# Spyre supports one-element tensors.
-@register_spyre_decomposition([torch.ops.aten.full])
-def full_decomp(
-    size: list[Union[int, torch.SymInt]],
-    fill_value: torch.types.Number,
-    dtype: Optional[torch.dtype] = None,
-    layout: Optional[torch.layout] = None,
-    device: Optional[torch.device] = None,
-    pin_memory: Optional[bool] = None,
-) -> torch.Tensor:
-    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
-    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
-    return torch.ops.spyre.full(size, fill_value, device, dtype=dtype)
+    return torch.ops.aten.full(
+        size,
+        1,
+        dtype=dtype if dtype is not None else self.dtype,
+        layout=layout,
+        device=device if device is not None else self.device,
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.logical_not])
@@ -372,6 +350,16 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
     else:
         zero = torch.zeros_like(input)
     return torch.eq(input, zero)
+
+
+@register_spyre_decomposition([torch.ops.aten.sign.default])
+def spyre_sign(input: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros_like(input)
+    return torch.where(
+        torch.gt(input, zero),
+        torch.ones_like(input),
+        torch.where(torch.lt(input, zero), -torch.ones_like(input), zero),
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.addmm.default, torch.ops.aten.addmm.out])
@@ -656,85 +644,11 @@ def spyre_min_dim_decomp(input, dim, keepdim=False):
         return torch.return_types.min((values, indices))
 
 
-@register_spyre_decomposition([torch.ops.aten.cat.default])
-def decompose_cat(
-    tensors: list[torch.Tensor],
-    dim: int = 0,
-) -> torch.Tensor:
-    orig_decomp = torch._inductor.decomposition.cat(tensors, dim)
-    if orig_decomp == NotImplemented:
-        expanded_size = 0
-        for t in tensors:
-            expanded_size += t.size(dim)
-        output_size = list(tensors[0].size())
-        output_size[dim] = expanded_size
-        output = tensors[0].new_empty(output_size)
-        offset = 0
-        for input in tensors:
-            output = torch.ops.spyre.overwrite_f(
-                input=input, output=output, dims=[dim], offsets=[offset]
-            )
-            offset += input.size(dim)
-        return output
-    else:
-        return orig_decomp
-
-
-@register_spyre_decomposition([torch.ops.aten.constant_pad_nd.default])
-def pad_decomp(
-    input: torch.Tensor,
-    pad: list[int],
-    value: float = 0,
-) -> torch.Tensor:
-    # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
-    n_dims_padded = len(pad) // 2
-
-    # Negative pad values (cropping) require reading from a non-zero storage
-    # offset or a sub-stick position, neither of which the SFP supports.
-    if any(p < 0 for p in pad):
-        raise Unsupported(
-            f"constant_pad_nd: negative padding (cropping) is not supported on "
-            f"Spyre (pad={pad})"
-        )
-
-    # Left-padding on the last (stick) dimension shifts the output start address
-    # by `left` elements. The hardware can only express this in whole sticks, so
-    # `left` must be a multiple of the stick size (64 fp16 elements).
-    # Sub-stick left-padding on the last dimension is tracked in:
-    # https://github.com/torch-spyre/torch-spyre/issues/1464
-    last_dim_left = pad[0]
-    if last_dim_left > 0:
-        elems_per_stick = 128 // input.element_size()
-        if last_dim_left % elems_per_stick != 0:
-            raise Unsupported(
-                f"constant_pad_nd: sub-stick left-padding on the last dimension is "
-                f"not supported on Spyre (pad={pad}, left={last_dim_left}, "
-                f"stick_size={elems_per_stick})"
-            )
-
-    # Build the padded output shape and collect which dimensions need padding.
-    scalar = torch.ops.spyre.full([1], value, input.device, dtype=input.dtype)
-    output_size = list(input.size())
-    dims: list[int] = []
-    offsets: list[int] = []
-    for i in range(n_dims_padded - 1, -1, -1):
-        left = pad[2 * i]
-        right = pad[2 * i + 1]
-        if left + right == 0:
-            continue
-        dim = input.dim() - 1 - i
-        output_size[dim] += left + right
-        dims.append(dim)
-        offsets.append(left)
-
-    if not dims:
-        return input
-
-    output = scalar.expand(output_size).clone()
-    output = torch.ops.spyre.overwrite_f(
-        input=input, output=output, dims=dims, offsets=offsets
+@register_spyre_decomposition([torch.ops.aten.ceil.default])
+def spyre_ceil(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.aten.neg.default(
+        torch.ops.aten.floor.default(torch.ops.aten.neg.default(input))
     )
-    return output
 
 
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
@@ -756,6 +670,26 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
                 torch.ops.aten.bitwise_not(input1), torch.ops.aten.bitwise_not(input2)
             )
         )
+
+
+@register_spyre_decomposition([torch.ops.aten.sub.Tensor])
+def sub_with_alpha(
+    self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1
+) -> torch.Tensor:
+    """
+    Decompose torch.sub(a, b, alpha=alpha) into separate mul and sub operations.
+
+    The Spyre backend does not have a single operation for a - alpha * b.
+    When alpha != 1, we decompose into: a - (alpha * b)
+    This ensures the operations are not fused by Inductor's optimization passes.
+    """
+    if alpha == 1:
+        # Simple subtraction without alpha - use default behavior
+        return NotImplemented
+    else:
+        # Decompose: sub(a, b, alpha) = sub(a, mul(b, alpha))
+        scaled_other = torch.mul(other, alpha)
+        return torch.sub(self, scaled_other)
 
 
 ###############################################################################################

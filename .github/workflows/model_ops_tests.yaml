@@ -7,6 +7,7 @@ on:
     paths-ignore:
       - tests/docs/**
       - docs/**
+      - README.md
   # Removing from CICD till the ops tests get matured
   # pull_request:
   #   branches: [main]
@@ -33,7 +34,7 @@ jobs:
       - spyre_pf_x1
       - linux
       - image_torch_spyre
-    timeout-minutes: 720
+    timeout-minutes: 60
     env:
       # The CI env var is very important.
       # GitHub actions automatically sets CI=true
@@ -59,19 +60,33 @@ jobs:
       matrix:
         suite:
           - name: GPT OSS 20B
-            config: gpt_oss_20b_spyre.yaml
+            config: gpt-oss-20b.yaml
+          - name: GPT OSS 20B Spyre
+            config: gpt-oss-20b_spyre.yaml
           - name: Granite 3.3 8B Instruct FMS
-            config: granite_3.3_8b_instruct_fms_spyre.yaml
+            config: granite-3.3-8b-instruct-fms.yaml
+          - name: Granite 3.3 8B Instruct FMS Spyre
+            config: granite-3.3-8b-instruct-fms_spyre.yaml
           - name: Granite 3.3 8B Instruct
-            config: granite_3.3_8b_instruct_spyre.yaml
+            config: granite-3.3-8b-instruct.yaml
+          - name: Granite 3.3 8B Instruct Spyre
+            config: granite-3.3-8b-instruct_spyre.yaml
           # - name: Granite 4.0 H Tiny   # omitted for now
-          #   config: granite_4.0_h_tiny_spyre.yaml
+          #   config: granite-4.0-h-tiny.yaml
+          # - name: Granite 4.0 H Tiny Spyre   # omitted for now
+          #   config: granite-4.0-h-tiny_spyre.yaml
           - name: Meta Llama 3.1 8B Instruct
-            config: meta_llama_3.1_8b_instruct_spyre.yaml
+            config: Meta-Llama-3.1-8B-Instruct.yaml
+          - name: Meta Llama 3.1 8B Instruct Spyre
+            config: Meta-Llama-3.1-8B-Instruct_spyre.yaml
           - name: Ministral 3 14B Instruct 2512
-            config: ministral_3_14B_Instruct_2512_spyre.yaml
+            config: Ministral-3-14B-Instruct-2512.yaml
+          - name: Ministral 3 14B Instruct 2512 Spyre
+            config: Ministral-3-14B-Instruct-2512_spyre.yaml
           - name: Mistral Small 3.2 24B Instruct 2506
-            config: mistral_small_3.2_24B_instruct_2506_spyre.yaml
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506 Spyre
+            config: Mistral-Small-3.2-24B-Instruct-2506_spyre.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
@@ -85,6 +100,8 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
