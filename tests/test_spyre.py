@@ -690,10 +690,10 @@ class TestSpyre(TestCase):
 
         def _assert_values_equal(actual, expected, src_dtype, dst_dtype, ctx):
             if actual.is_floating_point():
-                atol, rtol = max(
-                    float_tols.get(src_dtype, (1e-5, 1e-5)),
-                    float_tols.get(dst_dtype, (1e-5, 1e-5)),
-                )
+                src_atol, src_rtol = float_tols.get(src_dtype, (1e-5, 1e-5))
+                dst_atol, dst_rtol = float_tols.get(dst_dtype, (1e-5, 1e-5))
+                atol = max(src_atol, dst_atol)
+                rtol = max(src_rtol, dst_rtol)
                 self.assertTrue(
                     torch.allclose(actual, expected, atol=atol, rtol=rtol),
                     msg=f"{ctx}: actual={actual}, expected={expected}",
