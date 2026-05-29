@@ -53,7 +53,10 @@ from .insert_restickify import insert_restickify, finalize_layouts
 from .memory_planning import memory_planning
 from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
-from .scratchpad.allocator import scratchpad_planning
+from .scratchpad.allocator import (
+    StrategyBCoOptimizingAllocator,
+    scratchpad_planning,
+)
 from .fusion import spyre_fuse_nodes
 from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
@@ -266,7 +269,12 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         )
         work_distribution(operations, k_fast_ops)
         if config.lx_planning:
-            scratchpad_planning(graph)
+            allocator = (
+                StrategyBCoOptimizingAllocator()
+                if config.co_optimizing_lx_planning
+                else None
+            )
+            scratchpad_planning(graph, allocator=allocator)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
