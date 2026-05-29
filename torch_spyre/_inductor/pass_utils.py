@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, TypeVar, Union
+from typing import Callable, NamedTuple, Optional, TypeVar, Union
 
 import torch
 import sympy
@@ -753,7 +753,10 @@ def _is_matmul_op(op: Operation) -> bool:
 # TODO: refactor core assignment so the LX planner consumes determined
 # assignments instead of re-deriving them here.
 def _per_core_view_on_buf(
-    op: Operation, dep: MemoryDep, buf_name: str
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    cache: Optional[dict] = None,
 ) -> tuple[PerCoreView, bool]:
     """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
 
@@ -771,15 +774,30 @@ def _per_core_view_on_buf(
          producing work_slice_dims keyed by device-dim index.
       4. Build the core-to-slot mapping (k_fast-aware) and re-key it
          by device-dim so it's independent of op-local symbol names.
+
+    Pass an optional `cache` dict to memoize results across calls,
+    keyed by (op.op_it_space_splits, dep, buf_name).
     """
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if cache is not None:
+        # dicts aren't hashable; freeze each into a frozenset of items so
+        # the key is hashable and order-independent.
+        out, red = coeff_splits
+        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
     # Step 1: recover {iter-symbol: split} from op.op_it_space_splits.
     # The op-level write_index / read_index (for *any* buffer the op
     # writes / reads, not necessarily buf_name) bridge stride-keyed
     # coeff_splits back to scheduler symbols.
     rw = op.get_read_writes()
-    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        return PerCoreView(work_slice_dims=(), core_to_slot=()), False
+        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
+        if cache is not None:
+            cache[key] = result
+        return result
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads), write_index)
     iter_space = iteration_space_from_op(op)
@@ -867,4 +885,7 @@ def _per_core_view_on_buf(
         work_slice_dims=tuple(sorted(work_slice_dims.items())),
         core_to_slot=tuple(pruned_core_to_slot),
     )
-    return view, has_partial_reduction
+    result = (view, has_partial_reduction)
+    if cache is not None:
+        cache[key] = result
+    return result

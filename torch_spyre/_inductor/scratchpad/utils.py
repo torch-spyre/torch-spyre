@@ -20,8 +20,11 @@ from torch._inductor.ir import Operation
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import _per_core_view_on_buf
 
+# Op outputs eligible for LX-pinning. `amax` is the lowered form of
+# `max`; both names are listed to match whichever the IR shows.
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
+    "amax",
     "sum",
     # "clone",
     "exp",
