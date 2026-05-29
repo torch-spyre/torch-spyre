@@ -26,7 +26,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
     "amax",
     "sum",
-    # "clone",
+    "clone",
     "exp",
     "sub",
     # "mul",
