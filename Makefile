@@ -16,3 +16,13 @@ TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 .PHONY: tests
 tests: ## Run all torch spyre tests by default (except distributed). Override with: make tests TEST_CONFIGS="tests/configs/..."
 	@bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
+
+.PHONY: clean
+clean: ## Remove auto-generated OOT wrappers, conftest files, merged configs, and __pycache__ under tests/
+	@find tests/ -name '*__oot_wrapper.py' -delete
+	@find tests/ -name '__oot_conftest_*.py' -delete
+	@find tests/ -name '_oot_merged_config_*.yaml' -delete
+	@find tests/ -name '_spyre_merged_config_*.yaml' -delete
+	@find tests/ -name '*.markers.json' -delete
+	@find tests/ -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+	@echo "Cleaned auto-generated files under tests/"
