@@ -16,11 +16,10 @@
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
-from typing import Callable, Optional, Iterable, override
+from typing import Callable, ClassVar, Optional, Iterable, override
 from unittest import TestCase, expectedFailure
 from enum import Enum
 import os
-from functools import wraps
 
 import torch
 from torch.utils._ordered_set import OrderedSet
@@ -30,24 +29,21 @@ from torch_spyre._inductor.scratchpad.allocator import (
     DefaultAllocator,
     LifetimeBoundBuffer,
 )
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    BestFitLayoutSolver,
+    FirstFitLayoutSolver,
+)
 from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
-from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    MemoryPlanSolver,
+    GreedyLayoutSolver,
+)
 from torch_spyre._inductor import config
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
 
-if os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1":
-    # Define usuallyExpectedFailure as a no-op. This should show failures indicating that the
-    # current allocation uses more HBM than the good allocation, not anything else.
-    def usuallyExpectedFailure(test_item: Callable) -> Callable:
-        @wraps(test_item)
-        def wrapper(*args, **kwargs):
-            return test_item(*args, **kwargs)
-
-        return wrapper
-else:
-    usuallyExpectedFailure = expectedFailure
+BYPASS_XFAIL = os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1"
 
 
 class BufferDeviceLayout:
@@ -148,7 +144,7 @@ class Allocation:
     component: Component = Component.LX
     # If the component is LX, then the address must be an integer. If the component is HBM, we don't
     # care about the address; this is encoded by the address being None. (This is enforced in
-    # TestExamplePattern.verify_pattern.)
+    # PatternTests.verify_pattern.)
     address: Optional[int] = None
 
 
@@ -241,15 +237,14 @@ class MockGraphLowering:
 
 
 class InstrumentedAllocator(DefaultAllocator):
-    def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
+    def __init__(
+        self, solver: MemoryPlanSolver, pattern: Pattern, lowering: MockGraphLowering
+    ):
         self.buffers = pattern.buffers
         self.operations = pattern.operations
-        layout_planning = GreedyLayoutSolver(AVAILABLE_LX_SIZE)
         super().__init__(
-            layout_planning,
-            pre_optimization_passes=[
-                MockCloneInputNodesPass(layout_planning.limit, self)
-            ],
+            solver,
+            pre_optimization_passes=[MockCloneInputNodesPass(solver.limit, self)],
         )
         self.allocations: dict[str, int] = {}
         self.graph_lowering = lowering
@@ -275,8 +270,8 @@ class InstrumentedAllocator(DefaultAllocator):
                 # can't record at what point in time the allocation happens. This is okay as long as we
                 # every buffer name can be uniquely allocated with a single address. In order to change
                 # this, we need to store allocations differently, and then modify the logic for
-                # measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to account for
-                # this. Also update TestExamplePattern.verify_actual_run to account for this.
+                # measuring HBM usage in PatternTests.hbm_usage_for_actual_run to account for
+                # this. Also update PatternTests.verify_actual_run to account for this.
                 assert self.allocations[tensor_name] == addr, (
                     f"Buffer {tensor_name} was already allocated at address "
                     f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
@@ -341,8 +336,58 @@ class MockCloneInputNodesPass(CloneInputNodesPass):
             ]
 
 
-class TestExamplePattern(TestCase):
-    def setUp(self):
+class PatternTests:
+    """Mixin providing pattern definitions and test infrastructure.
+
+    Concrete subclasses are created with a ``role`` keyword:
+    - ``role="verify"``  — generates ``test_verify_{name}_pattern`` methods that validate the
+      good allocation defined in the pattern
+    - ``role="solver"``  — generates ``test_{name}_pattern`` methods that run the solver and
+      check it meets the good allocation; names in ``expected_failures`` are wrapped with
+      ``@expectedFailure``
+    """
+
+    PATTERNS: ClassVar[list[str]] = [
+        "simple_fragmentation",
+        "staircase",
+        "downward_staircase",
+        "simple_eviction",
+        "eviction_reallocation",
+        "gqattention",
+        "moe_mlp",
+    ]
+    INPLACE_PATTERNS: ClassVar[frozenset[str]] = frozenset(
+        {"simple_eviction", "eviction_reallocation", "moe_mlp"}
+    )
+
+    def __init_subclass__(cls, role: str = "", **kwargs: object) -> None:
+        # This creates tests like test_verify_moe_mlp_pattern
+        # and test_moe_mlp_pattern
+        super().__init_subclass__(**kwargs)  # type: ignore[misc]
+        if role == "verify":
+            for name in PatternTests.PATTERNS:
+                inplace = name in PatternTests.INPLACE_PATTERNS
+
+                def _test_verify(self, _n: str = name, _ip: bool = inplace) -> None:
+                    self.verify_pattern(
+                        getattr(self, f"make_{_n}_pattern")(), inplace=_ip
+                    )
+
+                setattr(cls, f"test_verify_{name}_pattern", _test_verify)
+        elif role == "solver":
+            xfails: frozenset[str] = getattr(cls, "expected_failures", frozenset())
+            for name in PatternTests.PATTERNS:
+
+                def _test_solve(self, _n: str = name) -> None:
+                    self.run_pattern(
+                        self.solver_type, getattr(self, f"make_{_n}_pattern")()
+                    )
+
+                if name in xfails and not BYPASS_XFAIL:
+                    _test_solve = expectedFailure(_test_solve)
+                setattr(cls, f"test_{name}_pattern", _test_solve)
+
+    def setUp(self) -> None:
         super().setUp()
         torch.manual_seed(0xAFFE)
 
@@ -548,12 +593,14 @@ class TestExamplePattern(TestCase):
 
         return hbm_usage
 
-    def run_pattern(self, pattern: Pattern):
+    def run_pattern(self, solver_type: type[MemoryPlanSolver], pattern: Pattern):
         # The scratchpad_planning operation may modify the pattern (adding operations), and then
         # examining the "good" allocation will run into trouble.
         pattern_copy = copy.deepcopy(pattern)
         lowering = MockGraphLowering(pattern_copy)
-        alloc = InstrumentedAllocator(pattern_copy, lowering)
+        alloc = InstrumentedAllocator(
+            solver_type(AVAILABLE_LX_SIZE), pattern_copy, lowering
+        )
 
         scratchpad_planning(lowering, alloc)
 
@@ -614,13 +661,6 @@ class TestExamplePattern(TestCase):
         )
         return Pattern(buffers, ops, good_allocation=good_allocation)
 
-    def test_verify_simple_fragmentation_pattern(self):
-        self.verify_pattern(self.make_simple_fragmentation_pattern())
-
-    @usuallyExpectedFailure
-    def test_simple_fragmentation_pattern(self):
-        self.run_pattern(self.make_simple_fragmentation_pattern())
-
     def make_staircase_pattern(self) -> Pattern:
         """Allocate N*2 buffers of sizes k, k, 2*k, 2*k, 3*k, 3*k, ..., N*k, N*k. After an
         even-numbered buffer is allocated, free the previous odd-numbered buffer. This creates a
@@ -631,7 +671,7 @@ class TestExamplePattern(TestCase):
 
         The greedy allocator will always allocate the next buffer just after all other buffers,
         because no gap is big enough for the current size. So it uses
-        2 * (k + 2*k + ... + N*k) = k * N * (N + 1) or roughly 2/3 times more."""
+        2 * (k + 2*k + ... + N*k) = k * N * (N + 1) or roughly 2 times more."""
         N = 7
         k = (2 * AVAILABLE_LX_SIZE) // (N * (N + 3))
         k = (k // 128) * 128  # round down to a multiple of the stick size
@@ -668,13 +708,6 @@ class TestExamplePattern(TestCase):
 
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
-
-    def test_verify_staircase_pattern(self):
-        self.verify_pattern(self.make_staircase_pattern())
-
-    @usuallyExpectedFailure
-    def test_staircase_pattern(self):
-        self.run_pattern(self.make_staircase_pattern())
 
     def make_downward_staircase_pattern(self) -> Pattern:
         """Allocate 1+N*2 buffers of sizes k, N*k, N*k, (N-1)*k, (N-1)*k, ..., 2*k, 2*k, k, k.
@@ -732,13 +765,6 @@ class TestExamplePattern(TestCase):
 
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
-
-    def test_verify_downward_staircase_pattern(self):
-        self.verify_pattern(self.make_downward_staircase_pattern())
-
-    @usuallyExpectedFailure
-    def test_downward_staircase_pattern(self):
-        self.run_pattern(self.make_downward_staircase_pattern())
 
     def make_simple_eviction_pattern(self) -> Pattern:
         """This pattern requires allocating a buffer, evicting it, and then reallocating it later.
@@ -812,13 +838,6 @@ class TestExamplePattern(TestCase):
             good_allocation=make_general_allocation_result(good_allocation),
         )
         return pattern
-
-    def test_verify_simple_eviction_pattern(self):
-        self.verify_pattern(self.make_simple_eviction_pattern(), inplace=True)
-
-    @usuallyExpectedFailure
-    def test_simple_eviction_pattern(self):
-        self.run_pattern(self.make_simple_eviction_pattern())
 
     def make_eviction_reallocation_pattern(self) -> Pattern:
         """This pattern requires allocating a buffer, evicting it, and then reallocating it later
@@ -896,13 +915,6 @@ class TestExamplePattern(TestCase):
             good_allocation=make_general_allocation_result(good_allocations),
         )
         return pattern
-
-    def test_verify_eviction_reallocation_pattern(self):
-        self.verify_pattern(self.make_eviction_reallocation_pattern(), inplace=True)
-
-    @usuallyExpectedFailure
-    def test_eviction_reallocation_pattern(self):
-        self.run_pattern(self.make_eviction_reallocation_pattern())
 
     def make_gqattention_pattern(self) -> Pattern:
         """We describe the GQA attention pattern. The "input" are three tensors, Q, K, and V. The
@@ -1006,13 +1018,6 @@ class TestExamplePattern(TestCase):
 
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
-
-    def test_verify_gqattention_pattern(self):
-        self.verify_pattern(self.make_gqattention_pattern())
-
-    @usuallyExpectedFailure
-    def test_gqattention_pattern(self):
-        self.run_pattern(self.make_gqattention_pattern())
 
     def make_moe_mlp_pattern(self) -> Pattern:
         """This pattern is a (simplified) mixture of experts multi-layer perceptron.
@@ -1193,11 +1198,37 @@ class TestExamplePattern(TestCase):
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
 
-    def test_verify_moe_mlp_pattern(self):
-        self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
 
-    def test_moe_mlp_pattern(self):
-        self.run_pattern(self.make_moe_mlp_pattern())
+class TestVerifyPatterns(PatternTests, TestCase, role="verify"):
+    pass
+
+
+class TestGreedyPatterns(PatternTests, TestCase, role="solver"):
+    solver_type = GreedyLayoutSolver
+    expected_failures: ClassVar[frozenset[str]] = frozenset(
+        {
+            "simple_fragmentation",
+            "staircase",
+            "downward_staircase",
+            "simple_eviction",
+            "eviction_reallocation",
+            "gqattention",
+        }
+    )
+
+
+class TestBestFitPatterns(PatternTests, TestCase, role="solver"):
+    solver_type = BestFitLayoutSolver
+    expected_failures: ClassVar[frozenset[str]] = frozenset(
+        {"eviction_reallocation", "gqattention", "simple_eviction"}
+    )
+
+
+class TestFirstFitPatterns(PatternTests, TestCase, role="solver"):
+    solver_type = FirstFitLayoutSolver
+    expected_failures: ClassVar[frozenset[str]] = frozenset(
+        {"eviction_reallocation", "gqattention", "simple_eviction"}
+    )
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@
 
 import os
 import sys
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 from torch.utils._config_module import install_config_module
 
@@ -69,5 +69,14 @@ unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 # until the working set reduction annotation framework is being developed.
 # It will be removed once the full-fledged annotation mechanism is available.
 coarse_tiling_groups_fn: Optional[Callable] = None
+
+# Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
+# Options:
+#  "greedy":   GreedyLayoutSolver (default),
+#  "bestfit":  BestFitLayoutSolver,
+#  "firstfit": FirstFitLayoutSolver.
+
+# TODO(isuruf): Change to firstfit when deeptools PR4298 lands
+layout_solver: Literal["greedy", "bestfit", "firstfit"] = "greedy"
 
 install_config_module(sys.modules[__name__])
