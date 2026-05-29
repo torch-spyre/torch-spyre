@@ -486,6 +486,7 @@ def _insert_copy_op(
         data=copy_data,
     )
     copy_buf.origins = tiled_op.origins
+    copy_buf.operation_name = copy_name
 
     # Stamp with the same loop metadata so this op is inside the same loop.
     copy_buf.loop_group_id = tiled_op.loop_group_id  # type: ignore[attr-defined]

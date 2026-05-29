@@ -439,6 +439,35 @@ def compute_restickify_needed(
     return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
 
 
+def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
+    """Copy meta["custom"] from one FX node to another.
+
+    Call this whenever a pass creates a new FX node replacing an existing one,
+    so that custom metadata (including spyre hints) is not silently dropped.
+    """
+    if "custom" in src.meta:
+        dst.meta["custom"] = src.meta["custom"]
+
+
+_SPYRE_METADATA_ATTRS = (
+    "spyre_hints",
+    "loop_group_id",
+    "loop_count",
+    "loop_tiled_dims",
+)
+
+
+def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
+    """Copy all Spyre pass metadata from src to dst.
+
+    Call this whenever a pass reconstructs a ComputedBuffer to ensure
+    spyre_hints and coarse-tiling attrs are not silently dropped.
+    """
+    for attr in _SPYRE_METADATA_ATTRS:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+
+
 def replace_computed_buffer_body(
     op: ComputedBuffer,
     new_data: Loops,
@@ -469,6 +498,7 @@ def replace_computed_buffer_body(
     new_buf.operation_name = op.operation_name
     new_buf.origins = op.origins
     new_buf.origin_node = op.origin_node
+    copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 
     op_idx = operations.index(op)
