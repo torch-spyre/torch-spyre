@@ -36,6 +36,7 @@ from .constants import (
     IDENTITY_OP,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    DEPTHWISE_CONV2D_OP,
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
@@ -606,6 +607,26 @@ class SpyreKernel(Kernel[CSEVariable]):
             args = [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(True, y.name, y),
+                self.create_tensor_arg(False, real_dst_name, dst),
+            ]
+            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
+        elif value.op == DEPTHWISE_CONV2D_OP:
+            print(f"In store_reduction for depthwiseconv2dnative op: arguments: {value.arguments} len: {len(value.arguments)}")
+            if (
+                len(value.arguments)  < 2
+                or (not isinstance(value.arguments[0], TensorAccess))
+                or (not isinstance(value.arguments[1], TensorAccess))
+            ):
+                raise Unsupported(f"invalid bdepthwiseconv2dnative arguments {value.arguments}")
+            x = value.arguments[0]
+            w = value.arguments[1]
+            print("")
+            print("")
+            print(f"In store_reduction: x: {x} x.index: {x.index}")
+            print(f"In store_reduction: dst: {dst} real_dst_name: {real_dst_name}")
+            args = [
+                self.create_tensor_arg(True, x.name, x),
+                self.create_tensor_arg(True, w.name, w),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))

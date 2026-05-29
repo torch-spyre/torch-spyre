@@ -167,8 +167,20 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
-        # The iteration space of a Reduction is that of its input
-        return next(iter(n.read_writes.reads)).ranges.copy()
+        # For Reductions in our Spyre scheduler, we need BOTH output and reduction variables
+        # The write dep has the output dimensions, and we need to add the reduction dimensions
+        write_ranges = next(iter(n.read_writes.writes)).ranges.copy()
+
+        # Get the reduction ranges from the Reduction IR node
+        red_node = n.node.data
+        if hasattr(red_node, 'reduction_ranges') and red_node.reduction_ranges:
+            # Create symbols for reduction dimensions
+            # Use the same pattern as the scheduler: r0, r1, etc.
+            for i, red_size in enumerate(red_node.reduction_ranges):
+                red_sym = sympy.Symbol(f"r{i}")
+                write_ranges[red_sym] = red_size
+
+        return write_ranges
     else:
         raise Unsupported("Unexpected node type")
 

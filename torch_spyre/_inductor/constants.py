@@ -15,6 +15,7 @@
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 
 # Type casting operators from deeptools
 DL16TOFP32_OP = "dl16tofp32"
@@ -64,9 +65,13 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
+#CONV2D_LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+CONV2D_DIM_LABELS = ["mb", "in", "i", "j", "ki", "kj", "out"]
+#CONV2D_DIM_LABELS = ["mb", "in", "i", "j", "ki", "kj"]

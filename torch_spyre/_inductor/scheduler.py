@@ -326,10 +326,31 @@ class SuperDSCScheduling(BaseScheduling):
             for node in node_schedule:
                 var_ranges = iteration_space(node)
                 vars = list(var_ranges.keys())
-                index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
-                ]
+
+                # Extract the actual IR node from ComputedBuffer
+                from torch._inductor.ir import Reduction, ComputedBuffer
+                if hasattr(node, 'node') and isinstance(node.node, ComputedBuffer):
+                    actual_ir_node = node.node.data
+                else:
+                    actual_ir_node = None
+
+                # For Reductions, iteration_space now includes both output and reduction symbols
+                # Split them based on node._sizes
+                if isinstance(actual_ir_node, Reduction):
+                    n_output = len(node._sizes[0])
+                    n_reduction = len(node._sizes[1]) if len(node._sizes) > 1 else 0
+
+                    index_vars = [
+                        vars[:n_output],
+                        vars[n_output : n_output + n_reduction],
+                    ]
+                else:
+                    iter_vars_len = len(node._body.iter_vars) if hasattr(node._body, 'iter_vars') else 0
+                    index_vars = [
+                        vars[: iter_vars_len],
+                        vars[iter_vars_len :],
+                    ]
+
                 node.codegen(index_vars)
 
         with V.set_kernel_handler(kernel):

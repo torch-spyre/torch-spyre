@@ -23,7 +23,7 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, DEPTHWISE_CONV2D_OP, CONV2D_DIM_LABELS
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -362,6 +362,96 @@ def lower_bmm(x, y):
             f"bmm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}"
         )
 
+    return result
+
+@register_spyre_lowering(torch.ops.aten.convolution.default)
+def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_padding, groups):
+    print(f"In lower_convolution: Passed in values: x: {x} w: {w}")
+    print(f"In lower_convolution: bias: {bias} stride: {stride} padding: {padding} dilation: {dilation} transposed: {transposed}, \
+                                  output_padding: {output_padding} groups: {groups}") 
+    x = V.graph.get_buffer(x.realize())
+    w = V.graph.get_buffer(w.realize())
+
+    x_loader = x.make_loader()
+    w_loader = w.make_loader()
+
+    # Input / weight shapes
+    N, C_in, H_in, W_in = x.get_size()
+    C_out, G, K_h, K_w = w.get_size()
+
+    H_in_padded = H_in + 2*padding[0]
+    W_in_padded = W_in + 2*padding[1]
+    print(f"In lower_convolution: N: {N} C_in: {C_in} H_in: {H_in} W_in: {W_in} C_out: {C_out} K_h: {K_h} K_w: {K_w}")
+
+    assert C_out == C_in
+    #assert groups == C_in
+
+    # Output spatial sizes
+    H_out = (H_in + 2 * padding[0] - K_h) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - K_w) // stride[1] + 1
+
+    # Get weight strides to manually compute index
+    w_strides = w.get_stride()  
+
+
+    def inner_fn(index, reduction_index):
+        # Output indices
+        n, c, ho, wo = index
+        # Reduction indices: may be [kh, kw] or [kh, kw, g] depending on whether G is 1
+        kh = reduction_index[0]
+        kw = reduction_index[1]
+        g = reduction_index[2] #if len(reduction_index) > 2 else 0
+
+        # Compute input coordinates
+        hi = ho * stride[0] + kh - padding[0]
+        wi = wo * stride[1] + kw - padding[1]
+
+        x_val = x_loader([n, c, ho, wo])
+
+        # Depthwise filter: one filter per input channel
+        w_val = w_loader([c, g, kh, kw])
+
+        return (x_val, w_val)
+
+    op_info = {
+    "conv_params": {
+        "stride_i": stride[0],
+        "stride_j": stride[1],
+        "pad_i": padding[0],
+        "pad_j": padding[1],
+        "dilation_i": dilation[0],
+        "dilation_j": dilation[1],
+        "total_size_i": H_in_padded,
+        "total_size_j": W_in_padded,
+        "pad_dim_i": CONV2D_DIM_LABELS[2],
+        "pad_dim_j": CONV2D_DIM_LABELS[3],
+        "window_dim_i": CONV2D_DIM_LABELS[-3],
+        "window_dim_j": CONV2D_DIM_LABELS[-2],
+        "pad_type": "padded_fullspan_wunneeded",
+        #"pad_type": "padded_nozeropad",
+        }
+    }
+
+
+    # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway)
+    red_ranges = [K_h, K_w]
+    if G != 1:
+        red_ranges.append(G)
+
+    result = SpyreReduction.create(
+        reduction_type=DEPTHWISE_CONV2D_OP,
+        input_node=[x, w],
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C_out, H_out, W_out],
+        #reduction_ranges=red_ranges,
+        reduction_ranges=[K_h, K_w, G],
+        op_info=op_info
+    )
+
+    result.realize()
     return result
 
 
