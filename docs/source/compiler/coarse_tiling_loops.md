@@ -70,34 +70,42 @@ codegen_node
 
 ## Small Example
 
-Consider two chained pointwise operations over `[1024, 4096]` tensors:
+Consider two chained pointwise operations over `[1024, 4096]` tensors, where
+`A=1024` names the row dimension and `B=4096` names the column dimension:
 
 ```python
+from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.propagate_named_dims import declare_tensor_dim, name_tensor_dims
+
+A, B = 1024, 4096
+declare_tensor_dim("A", A)
+declare_tensor_dim("B", B)
+
+a = torch.randn(A, B, dtype=torch.float16).to("spyre")
+b = torch.randn(A, B, dtype=torch.float16).to("spyre")
+c = torch.randn(A, B, dtype=torch.float16).to("spyre")
+name_tensor_dims(a, ["A", "B"])
+name_tensor_dims(b, ["A", "B"])
+name_tensor_dims(c, ["A", "B"])
+
 def f(a, b, c):
-    y = a + b   # add
-    z = y * c   # mul
-    return z
+    with spyre_hint(slices={"A": 2}):     # outer loop: 2 iterations over rows
+        with spyre_hint(slices={"B": 4}): # inner loop: 4 iterations over cols
+            y = a + b
+            z = y * c
+            return z
 ```
 
 Both operations are placed in a single tiling group with **K=2 in the outer
 loop** (splitting the 1024 rows into 2 groups of 512) and **M=4 in the inner
-loop** (splitting the 4096 columns into 4 groups of 1024).  The user-facing syntax is:
+loop** (splitting the 4096 columns into 4 groups of 1024).  Each inner-loop
+iteration processes a 512 × 1024 tile (1/8th of the full tensor), enabling
+the intermediate result `y` to remain in scratchpad across both operations
+within the tile.
 
-```python
-def f(a, b, c):
-    with spyre_hint(slices={"K": 2}):     # outer loop: 2 iterations over rows
-        with spyre_hint(slices={"M": 4}): # inner loop: 4 iterations over cols
-            y = a + b
-            z = y * c
-    return z
-```
-
-Each inner-loop iteration processes a 512 × 1024 tile (1/8th of the full
-tensor), enabling the intermediate result `y` to remain in scratchpad across
-both operations within the tile.
-
-For simplicity this example uses `SENCORES=1` (single-core); the
-implementation fully supports multi-core execution.
+This example is the canonical small example tested by
+`test_hint_nested_loop_with_scratchpad` in
+`tests/inductor/test_coarse_tile_e2e.py`.
 
 ### What the coarse-tiling pass stamps
 
@@ -179,7 +187,8 @@ Key points:
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
 single nested `LoopSpec`.  Below is the actual output produced by running the e2e test
-`test_nested_loop_with_scratchpad` (which runs with `lx_planning=True` and
+`test_hint_nested_loop_with_scratchpad` (which uses `spyre_hint(slices=...)` /
+`declare_tensor_dim` / `name_tensor_dims` with `lx_planning=True` and
 `allow_all_ops_in_lx_planning=True`; concrete HBM addresses replaced with
 symbolic names for readability):
 

@@ -925,6 +925,88 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
+    # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_nested_loop_with_scratchpad(self):
+        """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
+
+        This is the canonical spyre_hint(slices=...) version of the small
+        example from docs/source/compiler/coarse_tiling_loops.md.
+
+        Shape [1024, 4096], outer hint slices A-dim by 2 (512 rows/iter),
+        inner hint slices B-dim by 4 (1024 cols/iter).  With lx_planning
+        enabled, the intermediate result y=a+b is allocated to LX scratchpad
+        (it is only consumed within the loop body); the final output z stays
+        in HBM.
+
+        Assertions:
+        - LoopSpec entries are emitted (tiling is active).
+        - At least one TensorArg carries allocation={'lx': ...}.
+        - The output buffer allocation uses 'hbm'.
+        - The per-tile sizes 512 and 1024 appear in the generated source.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 1024, 4096
+        a = torch.randn(A, B, dtype=torch.float16)
+        b = torch.randn(A, B, dtype=torch.float16)
+        c = torch.randn(A, B, dtype=torch.float16)
+
+        def fn(a, b, c):
+            with spyre_hint(slices={"A": 2}):
+                with spyre_hint(slices={"B": 4}):
+                    y = a + b
+                    z = y * c
+                    return z
+
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        c_dev = c.to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(a_dev, ["A", "B"])
+        _name_tensor_dims(b_dev, ["A", "B"])
+        _name_tensor_dims(c_dev, ["A", "B"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
+        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
+        self.assertGreaterEqual(
+            src.count("LoopSpec("),
+            2,
+            f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
+        )
+        self.assertIn(
+            "allocation={'lx'",
+            src,
+            "Expected intermediate TensorArg with lx allocation",
+        )
+        self.assertIn(
+            "allocation={'hbm'",
+            src,
+            "Expected output TensorArg with hbm allocation",
+        )
+        # Per-tile shape: K=2 over 1024 rows → 512 rows/tile;
+        # M=4 over 4096 cols → 1024 cols/tile.
+        self.assertIn("512", src, "Expected per-tile row count 512")
+        self.assertIn("1024", src, "Expected per-tile col count 1024")
+
+    # ------------------------------------------------------------------
     # Two ops with different slice counts -> two separate groups
     # ------------------------------------------------------------------
 
