@@ -122,8 +122,9 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         user_aten_op = LUTlower_func_to_op[lowering_func]
         # TODO this is a large dict, move it to upper scope so we only need to do it once
         # aten_op is the overloaded version, e.g. ops.aten.clone.*out* instead of .default
-        graph.inserting_after(buf_fx)
-        new_fx_node = graph.create_node("call_function", user_aten_op, (buf_fx,))
+        fx_graph = graph.graph
+        fx_graph.inserting_after(buf_fx)
+        new_fx_node = fx_graph.create_node("call_function", user_aten_op, (buf_fx,))
         for user in old_users:
             user.args = tuple(new_fx_node if ar is buf_fx else ar for ar in user.args)
         graph.orig_gm.recompile()
@@ -181,7 +182,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         operations: list[Operation],
         lx_free_total: int,
         buf_users: dict[str, Operation],
-        core_div_mismatch: dict[str, bool],
+        num_cores_buf: dict[str, int],
     ) -> None:
         """
         Check if any input tensors can fit onto scratchpad and needed more than once =>
@@ -190,20 +191,24 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         for inp_name in graph.graph_input_names:
             buf = graph.get_buffer(inp_name)  # this is a TensorBox
             dev_layout = buf.layout.device_layout
-            dev_size = math.prod(dev_layout.device_size[:-1]) * 128
+            ncores_inp = num_cores_buf.get(inp_name, -1)
+            core_div_mismatch = ncores_inp == -1
+            dev_size_per_core = (
+                math.prod(dev_layout.device_size[:-1]) * 128 // ncores_inp
+            )
             is_on_lx = buf.layout.allocation != {}
             used_only_once = len(buf_users[inp_name]) == 1
             if (
                 used_only_once
-                or dev_size > lx_free_total
+                or core_div_mismatch
+                or dev_size_per_core > lx_free_total
                 or is_on_lx
-                or core_div_mismatch[inp_name]
             ):
                 continue
 
             self._insert_op_after(graph, buf, clone_lowering, buf_users, operations)
 
-            lx_free_total -= dev_size
+            lx_free_total -= dev_size_per_core
 
     def apply_pass(
         self,
@@ -216,14 +221,11 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         buf_users = get_buffer_users(graph)
 
         operations = graph.operations
-        core_div_mismatch = {
-            key: cores == -1 for key, cores in get_ncores_for_buffers(graph).items()
-        }
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
             self._try_insert_clone_op_for_inputs(
                 graph,
                 operations,
                 self.limit,
                 buf_users,
-                core_div_mismatch,
+                get_ncores_for_buffers(graph),
             )
