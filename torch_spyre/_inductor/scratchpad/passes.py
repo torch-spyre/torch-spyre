@@ -191,9 +191,10 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         for inp_name in graph.graph_input_names:
             buf = graph.get_buffer(inp_name)  # this is a TensorBox
             dev_layout = buf.layout.device_layout
-            core_div_mismatch = num_cores_buf[inp_name] == -1
+            ncores_inp = num_cores_buf.get(inp_name, -1)
+            core_div_mismatch = ncores_inp == -1
             dev_size_per_core = (
-                math.prod(dev_layout.device_size[:-1]) * 128 // num_cores_buf[inp_name]
+                math.prod(dev_layout.device_size[:-1]) * 128 // ncores_inp
             )
             is_on_lx = buf.layout.allocation != {}
             used_only_once = len(buf_users[inp_name]) == 1
