@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Callable, NamedTuple, TypeVar, Union
+from typing import Callable, NamedTuple, Optional, TypeVar, Union
 
 import torch
 import sympy
@@ -439,6 +439,35 @@ def compute_restickify_needed(
     return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
 
 
+def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
+    """Copy meta["custom"] from one FX node to another.
+
+    Call this whenever a pass creates a new FX node replacing an existing one,
+    so that custom metadata (including spyre hints) is not silently dropped.
+    """
+    if "custom" in src.meta:
+        dst.meta["custom"] = src.meta["custom"]
+
+
+_SPYRE_METADATA_ATTRS = (
+    "spyre_hints",
+    "loop_group_id",
+    "loop_count",
+    "loop_tiled_dims",
+)
+
+
+def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
+    """Copy all Spyre pass metadata from src to dst.
+
+    Call this whenever a pass reconstructs a ComputedBuffer to ensure
+    spyre_hints and coarse-tiling attrs are not silently dropped.
+    """
+    for attr in _SPYRE_METADATA_ATTRS:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+
+
 def replace_computed_buffer_body(
     op: ComputedBuffer,
     new_data: Loops,
@@ -469,6 +498,7 @@ def replace_computed_buffer_body(
     new_buf.operation_name = op.operation_name
     new_buf.origins = op.origins
     new_buf.origin_node = op.origin_node
+    copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 
     op_idx = operations.index(op)
@@ -723,7 +753,10 @@ def _is_matmul_op(op: Operation) -> bool:
 # TODO: refactor core assignment so the LX planner consumes determined
 # assignments instead of re-deriving them here.
 def _per_core_view_on_buf(
-    op: Operation, dep: MemoryDep, buf_name: str
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    cache: Optional[dict] = None,
 ) -> tuple[PerCoreView, bool]:
     """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
 
@@ -741,15 +774,30 @@ def _per_core_view_on_buf(
          producing work_slice_dims keyed by device-dim index.
       4. Build the core-to-slot mapping (k_fast-aware) and re-key it
          by device-dim so it's independent of op-local symbol names.
+
+    Pass an optional `cache` dict to memoize results across calls,
+    keyed by (op.op_it_space_splits, dep, buf_name).
     """
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if cache is not None:
+        # dicts aren't hashable; freeze each into a frozenset of items so
+        # the key is hashable and order-independent.
+        out, red = coeff_splits
+        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
     # Step 1: recover {iter-symbol: split} from op.op_it_space_splits.
     # The op-level write_index / read_index (for *any* buffer the op
     # writes / reads, not necessarily buf_name) bridge stride-keyed
     # coeff_splits back to scheduler symbols.
     rw = op.get_read_writes()
-    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        return PerCoreView(work_slice_dims=(), core_to_slot=()), False
+        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
+        if cache is not None:
+            cache[key] = result
+        return result
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads), write_index)
     iter_space = iteration_space_from_op(op)
@@ -837,4 +885,7 @@ def _per_core_view_on_buf(
         work_slice_dims=tuple(sorted(work_slice_dims.items())),
         core_to_slot=tuple(pruned_core_to_slot),
     )
-    return view, has_partial_reduction
+    result = (view, has_partial_reduction)
+    if cache is not None:
+        cache[key] = result
+    return result

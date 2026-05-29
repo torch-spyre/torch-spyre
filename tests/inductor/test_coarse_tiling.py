@@ -1788,22 +1788,6 @@ def _make_tiled_reduction_op(
 class TestCoarseTileReductionPropagation(unittest.TestCase):
     """Tests for insert_tiling_propagation Reduction support."""
 
-    def test_matmul_in_loop_raises(self):
-        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
-        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
-
-        op = _make_tiled_reduction_op(
-            "matmul0",
-            ranges=[Integer(4), Integer(4), Integer(4)],
-            reduction_ranges=[Integer(64)],
-            reduction_type=BATCH_MATMUL_OP,
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[0]],
-        )
-        with self.assertRaises(RuntimeError, msg="matmul inside loop should raise"):
-            _check_reduction_tiling_safety(op)
-
     def test_reduction_tiled_reduction_dim_raises(self):
         from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
 

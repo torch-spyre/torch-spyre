@@ -30,10 +30,13 @@ logger = get_inductor_logger("propagate_hints")
 @dataclasses.dataclass
 class DimHint:
     dim_names: list[str]  # e.g. ["A"]
-    range_size: int  # full loop range, e.g. 256
+    range_size: (
+        int  # full loop range, e.g. 256; 0 means sentinel (scope marker, no real dim)
+    )
     split_count: int  # from slices={"A": 4}, e.g. 4
     dim_index: int  # index into op.loop_var_dims / op.data.ranges
     is_reduction: bool
+    hint_id: int = 0  # the _hint_N counter value identifying the scope
 
 
 # op.spyre_hints: list[DimHint]
