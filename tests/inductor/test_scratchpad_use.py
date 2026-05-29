@@ -245,9 +245,11 @@ class TestMeasureHBMUsageCoOptimizing(TestMeasureHBMUsageScratchPad):
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
+        strict: bool = False,
         **kwargs,
     ):
-        """Compare HBM transfers with cooptimization off vs on."""
+        """Compare HBM transfers with cooptimization off vs on. If
+        `strict`, asserts coopt < default; otherwise coopt ≤ default."""
         with ts_inductor_config.patch(lx_planning=True):
             with ts_inductor_config.patch(co_optimizing_lx_planning=False):
                 result_default, hbm_default = self.measure_hbm_transfers(model, args)
@@ -255,10 +257,12 @@ class TestMeasureHBMUsageCoOptimizing(TestMeasureHBMUsageScratchPad):
             with ts_inductor_config.patch(co_optimizing_lx_planning=True):
                 result_coopt, hbm_coopt = self.measure_hbm_transfers(model, args)
 
-        self.assertLessEqual(
+        cmp = self.assertLess if strict else self.assertLessEqual
+        rel = "<" if strict else "≤"
+        cmp(
             hbm_coopt,
             hbm_default,
-            f"Expected cooptimization to be ≤ default HBM, got "
+            f"Expected cooptimization to be {rel} default HBM, got "
             f"coopt={hbm_coopt} default={hbm_default}",
         )
         self.assertTrue(
@@ -273,20 +277,7 @@ class TestMeasureHBMUsageCoOptimizing(TestMeasureHBMUsageScratchPad):
         flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
-
-        with ts_inductor_config.patch(lx_planning=True):
-            with ts_inductor_config.patch(co_optimizing_lx_planning=False):
-                _, hbm_default = self.measure_hbm_transfers(f, (x,))
-            torch.compiler.reset()
-            with ts_inductor_config.patch(co_optimizing_lx_planning=True):
-                _, hbm_coopt = self.measure_hbm_transfers(f, (x,))
-
-        self.assertLess(
-            hbm_coopt,
-            hbm_default,
-            f"Expected cooptimization to strictly reduce HBM for softmax(dim=0), "
-            f"got coopt={hbm_coopt} default={hbm_default}",
-        )
+        self.common(f, (x,), strict=True)
 
     def test_softmax_dim_neg1_no_regression(self):
         """softmax(dim=-1) is the well-behaved baseline where DefaultAllocator

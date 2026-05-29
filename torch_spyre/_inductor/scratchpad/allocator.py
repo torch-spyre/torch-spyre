@@ -298,10 +298,6 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
     space, the worst case matches DefaultAllocator.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.lx_limit = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
-
     def plan_allocation(self, graph: GraphLowering):
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
