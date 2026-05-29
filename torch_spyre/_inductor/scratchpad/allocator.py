@@ -332,9 +332,11 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
     ) -> list[int]:
         """DFS over the option cross-product, scoring each leaf via
         _score_layout. Returns the option index per op for the leaf
-        with minimum HBM bytes. No early-stop pruning — the search is
-        bounded by option count (≤ K^N leaves with K=6, small N) so
-        full enumeration is cheap and stays solver-agnostic.
+        with minimum HBM bytes. No early-stop pruning — bounded by
+        ≤ K^N leaves where N counts ops with >1 option (most return
+        [seed]). Per-leaf cost is one full _generate_buffers +
+        plan_layout pass; the `cache` param on _per_core_view_on_buf
+        amortizes sympy work if it ever becomes hot.
         """
         chosen: list[int] = [0] * len(ops)
         best_total: float = math.inf
@@ -380,10 +382,9 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         graph: GraphLowering,
         buf_total_bytes: dict[str, int],
     ) -> int:
-        """HBM bytes under the current split assignment. Charges any
-        buffer that _generate_buffers excluded (filtered out as HBM) or
-        that the solver couldn't place in LX. Solver-agnostic — swap
-        layout_planning for any MemoryPlanSolver.
+        """HBM bytes under the current split assignment: total device
+        bytes of every buffer the solver couldn't pin. Non-committing
+        (addresses land on throwaway buffers) and solver-agnostic.
         """
         buffers = self._generate_buffers(graph)
         allocation = self.layout_planning.plan_layout(buffers)
