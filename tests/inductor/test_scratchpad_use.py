@@ -216,5 +216,76 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
     # TODO: Add additional ops
 
 
+@unittest.skipUnless(
+    ts_inductor_config.co_optimizing_lx_planning,
+    "CO_OPTIMIZING_LX_PLANNING is off; skipping cooptimization tests",
+)
+class TestMeasureHBMUsageCoOptimizing(TestMeasureHBMUsageScratchPad):
+    """Compares HBM transfers between DefaultAllocator and
+    StrategyBCoOptimizingAllocator. The cooptimizing allocator should be ≤ default on every shape,
+    and should strictly improve on cases where adjacent ops disagree on which
+    iteration-space dim to split — the canonical example is softmax(dim=0)
+    where work_distribution picks rows for the pointwise ops and cols for the
+    reduction ops, forcing 3 of 4 shared buffers to HBM under DefaultAllocator.
+
+    Skipped unless `CO_OPTIMIZING_LX_PLANNING=1` is set in the environment;
+    otherwise the cooptimization code path doesn't activate and there's
+    nothing to compare.
+    """
+
+    @override
+    def setUp(self):
+        super().setUp()
+        # Cooptimization needs > 1 core to have anything to optimize.
+        self.patchers.append(ts_inductor_config.patch("sencores", 4))
+        self.patchers[-1].__enter__()
+
+    @override
+    def run_test(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+        strict: bool = False,
+        **kwargs,
+    ):
+        """Compare HBM transfers with cooptimization off vs on. If
+        `strict`, asserts coopt < default; otherwise coopt ≤ default."""
+        with ts_inductor_config.patch(lx_planning=True):
+            with ts_inductor_config.patch(co_optimizing_lx_planning=False):
+                result_default, hbm_default = self.measure_hbm_transfers(model, args)
+            torch.compiler.reset()
+            with ts_inductor_config.patch(co_optimizing_lx_planning=True):
+                result_coopt, hbm_coopt = self.measure_hbm_transfers(model, args)
+
+        cmp = self.assertLess if strict else self.assertLessEqual
+        rel = "<" if strict else "≤"
+        cmp(
+            hbm_coopt,
+            hbm_default,
+            f"Expected cooptimization to be {rel} default HBM, got "
+            f"coopt={hbm_coopt} default={hbm_default}",
+        )
+        self.assertTrue(
+            torch.allclose(result_default, result_coopt, atol=1e-4),
+            "Results do not match between cooptimization on and off",
+        )
+
+    def test_softmax_dim0_strictly_lower_hbm(self):
+        """The canonical motivating case from the design doc. softmax(dim=0)
+        has every adjacent op pair disagreeing on which dim to split, so
+        DefaultAllocator only pins 1 of 4 shared buffers; Strategy B should
+        flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
+        self.common(f, (x,), strict=True)
+
+    def test_softmax_dim_neg1_no_regression(self):
+        """softmax(dim=-1) is the well-behaved baseline where DefaultAllocator
+        already pins everything pinnable. Strategy B must match (no regression)."""
+        f = functools.partial(torch.softmax, dim=-1)
+        x = self.rand_device((512, 1024))
+        self.common(f, (x,))
+
+
 if __name__ == "__main__":
     unittest.main()
