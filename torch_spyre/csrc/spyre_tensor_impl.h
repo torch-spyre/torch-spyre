@@ -32,13 +32,19 @@ namespace spyre {
 int64_t elems_per_stick(const DataFormats& df);
 std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
 
+/* Describes how device coordinates are arranged in memory.
+ * Certain on-device type conversions result in non-sequential device
+ * coordinates and some stick reduction operations (e.g., exx2) result in
+ * multiple values in the stick.
+ */
 enum class ElementArrangement {
-  STANDARD,      // coordinates in sequential order
-  DL16_TO_FP32,  // non-sequential coordinate order produced by fp16->fp32
-                 // conversion
-  DL16_TO_FP8,   // non-sequential coordinate order produced by fp16->fp8
-                 // conversion
-  EXX2,          // non-standard stick reduction: two values per stick
+  STANDARD,      // sequential element order (default)
+  DL16_TO_FP32,  // non-sequential order produced by dl16->fp32 on-device
+                 // conversions
+  DL16_TO_FP8,   // non-sequential order produced by on-device fp8 quantization
+                 // operations
+  EXX2,          // reduction mode: two values per stick (vs. one for standard
+                 // reductions)
 };
 
 class SpyreTensorLayout {
