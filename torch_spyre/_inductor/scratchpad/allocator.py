@@ -312,6 +312,9 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             if chosen != getattr(op, "op_it_space_splits", ({}, {})):
                 op.op_it_space_splits = chosen
 
+        # try insert clone again, as what was incompatible could be compatible now
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
         # Standard downstream flow on the now-fixed winning splits. Mirrors
         # DefaultAllocator.plan_allocation past the pre-passes.
         buffers = self._generate_buffers(graph)

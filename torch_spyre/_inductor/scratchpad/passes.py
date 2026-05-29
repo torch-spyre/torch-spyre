@@ -192,7 +192,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
             buf = graph.get_buffer(inp_name)  # this is a TensorBox
             dev_layout = buf.layout.device_layout
             core_div_mismatch = num_cores_buf[inp_name] == -1
-            dev_size = (
+            dev_size_per_core = (
                 math.prod(dev_layout.device_size[:-1]) * 128 // num_cores_buf[inp_name]
             )
             is_on_lx = buf.layout.allocation != {}
@@ -200,14 +200,14 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
             if (
                 used_only_once
                 or core_div_mismatch
-                or dev_size > lx_free_total
+                or dev_size_per_core > lx_free_total
                 or is_on_lx
             ):
                 continue
 
             self._insert_op_after(graph, buf, clone_lowering, buf_users, operations)
 
-            lx_free_total -= dev_size
+            lx_free_total -= dev_size_per_core
 
     def apply_pass(
         self,
