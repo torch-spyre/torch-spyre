@@ -482,8 +482,6 @@ The coarse-tiling pass runs after layout finalization and before
 ```python
 deadcode_elimination(operations)
 propagate_spyre_tensor_layouts(operations)
-propagate_named_dims(operations)
-resolve_hints(operations)
 optimize_restickify_locations(operations)
 finalize_layouts(operations)
 insert_restickify(operations)
@@ -491,6 +489,8 @@ insert_bmm_padding(operations)
 dedup_and_promote_constants(operations)
 if config.chunk_large_tensors:
     chunk_large_tensors(operations)
+propagate_named_dims(operations)
+assign_dim_hints(operations)
 if config.coarse_tiling:
     groups = hints_to_coarse_tile_groups(operations)
     if config.coarse_tiling_groups_fn is not None:
@@ -502,17 +502,23 @@ k_fast_ops = (
 )
 work_distribution(operations, k_fast_ops)
 if config.lx_planning:
-    scratchpad_planning(graph)
+    allocator = (
+        StrategyBCoOptimizingAllocator()
+        if config.co_optimizing_lx_planning
+        else None
+    )
+    scratchpad_planning(graph, allocator=allocator)
 ```
 
 This ordering is required by several constraints:
 
-**`propagate_named_dims` and `resolve_hints` must run before coarse tiling.**
-These two passes attach named dimension and `spyre_hint` metadata to each
-`ir.Operation` that the tiling pass reads.  `resolve_hints` calls
-`hints_to_coarse_tile_groups` implicitly; `hints_to_coarse_tile_groups` in
-`CustomPreSchedulingPasses` then converts those resolved hints into the
-`groups` list passed to `coarse_tile`.
+**`propagate_named_dims` and `assign_dim_hints` must run before coarse tiling.**
+`propagate_named_dims` propagates `name_tensor_dims()` annotations through the
+op graph, attaching named dimension metadata to each `ir.Operation`.
+`assign_dim_hints` then combines those named dimensions with the `spyre_hint`
+scope annotations (attached to FX nodes as `meta["custom"]`) to produce
+`op.dim_hints` — a flat list of `DimHint` objects consumed by
+`hints_to_coarse_tile_groups` to form the coarse tiling groups.
 
 **Must run after stickify and padding.**  `propagate_spyre_tensor_layouts`,
 `insert_restickify`, and `insert_bmm_padding` establish the final tiled
@@ -994,7 +1000,7 @@ The filenames are assigned in depth-first traversal order.
 | `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call (with `hints_to_coarse_tile_groups` fallback) in `CustomPreSchedulingPasses`; add `propagate_named_dims` and `resolve_hints` calls before coarse tiling; reorder `CustomPostFusionPasses` to `[memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]` |
 | `torch_spyre/_inductor/config.py` | Add `coarse_tiling: bool` flag, `coarse_tiling_groups_fn` override callable, `bundle_hbm_symbols: bool`, `unroll_loops: bool`, and `allow_all_ops_in_lx_planning: bool` |
 | `torch_spyre/_inductor/propagate_hints.py` | Add `spyre_hint(slices=...)` context manager and `get_op_hints()`; `resolve_hints` stamps hint metadata on `ir.Operation` objects; `hints_to_coarse_tile_groups` converts resolved hints to a `coarse_tile` groups list |
-| `torch_spyre/_inductor/propagate_named_dims.py` | Propagate named tensor dimension metadata from FX nodes to `ir.Operation` objects so that `resolve_hints` can map dimension names to iteration-space indices |
+| `torch_spyre/_inductor/propagate_named_dims.py` | `propagate_named_dims` propagates `name_tensor_dims()` annotations from FX nodes to `ir.Operation` objects; `assign_dim_hints` combines those named dimensions with `spyre_hint` scope metadata to produce `op.dim_hints`, consumed by `hints_to_coarse_tile_groups` |
 | `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps `loop_group_id`, `loop_count`, and `loop_tiled_dims` on ops; rewrites `ranges` via `object.__setattr__`; `insert_tiling_propagation` allocates full buffers for outside consumers, marks loop-internal buffers `per_tile_fixed` |
 | `torch_spyre/_inductor/ir.py` | Add `per_tile_fixed: bool = False` to `FixedTiledLayout` |
 | `torch_spyre/_inductor/op_spec.py` | Add `per_tile_fixed: bool = False` to `TensorArg` |
