@@ -206,7 +206,7 @@ def _build_loop_group(
 def build_loop_scheduler_nodes(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    """Post-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
+    """Pre-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
 
     Reads loop_group_id and loop_count attributes stamped on ir.Operation
     objects by the coarse-tiling IR pass.  Nodes without these attributes
@@ -218,9 +218,11 @@ def build_loop_scheduler_nodes(
     a data-flow dependency crossing the group boundary, which is a bug in
     the tiling pass.
 
-    This pass runs before spyre_fuse_nodes so that CountedLoopSchedulerNodes
-    are already formed before fusion; CountedLoopSchedulerNode.can_fuse returns
-    False, which prevents the loop groups from being merged by the fusion pass.
+    Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
+    visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
+    so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
+    protected because it only fuses plain SchedulerNodes (isinstance check), causing
+    CountedLoopSchedulerNodes to force a bundle boundary.
     """
     result = _build_loop_group(nodes, depth=0)
 
