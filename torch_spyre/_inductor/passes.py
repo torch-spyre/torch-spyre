@@ -210,9 +210,9 @@ class CustomPreFusionPasses(CustomNodePassBase):
     def get_passes(self):
         # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
         # coarse_tiling=False because no nodes carry loop_group_id attributes.
-        # Running here (before any fusion) ensures CountedLoopSchedulerNode.can_fuse
-        # returning False protects loop groups from both Inductor's own fusion pass
-        # and spyre_fuse_nodes.
+        # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
+        # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
+        # False), so loop groups survive Inductor fusion intact.
         return [propagate_mutation_layouts, build_loop_scheduler_nodes]
 
 

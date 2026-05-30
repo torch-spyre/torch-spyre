@@ -218,9 +218,11 @@ def build_loop_scheduler_nodes(
     a data-flow dependency crossing the group boundary, which is a bug in
     the tiling pass.
 
-    Running before any fusion ensures CountedLoopSchedulerNode.can_fuse returning
-    False protects loop groups from both Inductor's own fusion pass and
-    spyre_fuse_nodes.
+    Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
+    visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
+    so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
+    protected because it only fuses plain SchedulerNodes (isinstance check), causing
+    CountedLoopSchedulerNodes to force a bundle boundary.
     """
     result = _build_loop_group(nodes, depth=0)
 
