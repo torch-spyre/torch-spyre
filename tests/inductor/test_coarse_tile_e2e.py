@@ -83,7 +83,7 @@ def _groups_nested_k2_m4(operations: list[Operation]):
     ops = [op for op in operations if isinstance(op, ComputedBuffer)]
     if not ops:
         return []
-    return [(ops, [(sympy.Integer(2), [0]), (sympy.Integer(4), [1])])]
+    return [(ops, [(0, sympy.Integer(2), [0]), (0, sympy.Integer(4), [1])])]
 
 
 def _groups_nested_k2_m2(operations: list[Operation]):
@@ -91,7 +91,7 @@ def _groups_nested_k2_m2(operations: list[Operation]):
     ops = [op for op in operations if isinstance(op, ComputedBuffer)]
     if not ops:
         return []
-    return [(ops, [(sympy.Integer(2), [0]), (sympy.Integer(2), [1])])]
+    return [(ops, [(0, sympy.Integer(2), [0]), (0, sympy.Integer(2), [1])])]
 
 
 def _groups_per_op_tiled_dim(operations: list[Operation]):
@@ -1181,6 +1181,75 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
+
+    @unittest.skip("TODO: coarse tiling correctness not yet resolved")
+    @config.patch({"coarse_tiling": True})
+    def test_hint_flash_attention(self):
+        """Flash attention tiled over H (4 slices) and Lk (2 slices) via nested spyre_hints."""
+        import math
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+
+        scale = 1.0 / math.sqrt(math.sqrt(D))
+        lk_slices = Lk // block_size
+
+        def flash(queries, keys, values):
+            output = torch.zeros_like(queries)
+            M = torch.full(
+                (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
+            )
+            with spyre_hint(
+                slices={"B": 1}
+            ):  # 3 nested scopes exercises multi-hint logic
+                with spyre_hint(slices={"H": 4}):
+                    with spyre_hint(slices={"Lk": lk_slices}):
+                        keys_T = keys.transpose(-1, -2).contiguous()
+                        denominator = torch.zeros(
+                            (B, H, Lq), device=queries.device, dtype=torch.float16
+                        )
+                        scores = torch.matmul(queries * scale, keys_T * scale)
+                        scores = scores.transpose(-1, -2).contiguous()
+                        block_max = torch.amax(scores, dim=-2)
+                        max_running = torch.maximum(M, block_max)
+                        exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
+                        correction = torch.exp(M - max_running)
+                        denominator = denominator * correction + exp_scores.sum(dim=-2)
+                        output = output * correction.unsqueeze(-1) + torch.matmul(
+                            exp_scores.transpose(-1, -2), values
+                        )
+                        M = max_running
+            return output / denominator.unsqueeze(-1)
+
+        # CPU reference first, then device setup — matching the driver pattern exactly
+        ref = flash(queries_t, keys_t, values_t)
+
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+
+        result = torch.compile(flash)(queries_dev, keys_dev, values_dev).cpu()
+        torch.testing.assert_close(
+            result,
+            ref,
+            equal_nan=True,
+            atol=1.0,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
 

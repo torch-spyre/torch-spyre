@@ -122,7 +122,7 @@ def _create_restickify_node(
             "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
         )
     # Propagate hint metadata from the consumer op so assign_dim_hints can assign
-    # spyre_hints to the restickify buffer after insertion.
+    # dim_hints to the restickify buffer after insertion.
     for consumer_fx_node in op.origins:
         if "custom" in consumer_fx_node.meta:
             copy_fx_custom_meta(consumer_fx_node, restick_fx_node)

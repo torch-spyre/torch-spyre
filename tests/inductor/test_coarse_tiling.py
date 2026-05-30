@@ -657,12 +657,12 @@ class TestCoarseTile(unittest.TestCase):
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(K1, dims1), (K2, dims2)] works."""
+    """Verify that the nested group format [(hint_id, K1, dims1), ...] works."""
 
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(2), [1])])])
         self.assertEqual(op.loop_group_id, (0, 0))
         self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_tiled_dims, [[0], [1]])
@@ -670,14 +670,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(2), [1])])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(8), [1])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(8), [1])])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -691,7 +691,7 @@ class TestCoarseTileNested(unittest.TestCase):
             [op0, op1],
             [
                 ([op0], Integer(4)),
-                ([op1], [(Integer(4), [0]), (Integer(2), [1])]),
+                ([op1], [(0, Integer(4), [0]), (0, Integer(2), [1])]),
             ],
         )
         self.assertEqual(op0.loop_group_id, (0,))
@@ -708,7 +708,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [0])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(2), [0])])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_tiled_dims, [[0], [0]])

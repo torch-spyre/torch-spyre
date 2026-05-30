@@ -450,7 +450,7 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
 
 
 _SPYRE_METADATA_ATTRS = (
-    "spyre_hints",
+    "dim_hints",
     "loop_group_id",
     "loop_count",
     "loop_tiled_dims",
@@ -461,7 +461,7 @@ def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
     """Copy all Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    spyre_hints and coarse-tiling attrs are not silently dropped.
+    dim_hints and coarse-tiling attrs are not silently dropped.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):
