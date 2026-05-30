@@ -140,12 +140,24 @@ jobs:
             config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
           - name: Inductor Ops Matmul
             config: torch_spyre_tests/inductor/test_inductor_ops_matmul_config.yaml
-          - name: Inductor Ops Reductions
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_config.yaml
+          - name: Inductor Ops Reductions Keepdim Multidim0
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim0_config.yaml
+          - name: Inductor Ops Reductions Keepdim Multidim1
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim1_config.yaml
+          - name: Inductor Ops Reductions Keepdim Singledim0
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim0_config.yaml
+          - name: Inductor Ops Reductions Keepdim Singledim1
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim1_config.yaml
+          - name: Inductor Ops Reductions Keepdim Index Norm Eager
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_index_norm_eager_config.yaml
+          - name: Inductor Ops Reductions Scalar
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
           - name: Inductor Ops Pointwise
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_config.yaml
+          - name: Inductor Ops Misc Shape
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
+          - name: Inductor Ops Misc Compute
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar
