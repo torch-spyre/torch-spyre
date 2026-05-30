@@ -208,7 +208,12 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [propagate_mutation_layouts]
+        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
+        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        # Running here (before any fusion) ensures CountedLoopSchedulerNode.can_fuse
+        # returning False protects loop groups from both Inductor's own fusion pass
+        # and spyre_fuse_nodes.
+        return [propagate_mutation_layouts, build_loop_scheduler_nodes]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
@@ -221,9 +226,7 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-        # coarse_tiling=False because no nodes carry loop_group_id attributes.
-        return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
+        return [memory_planning, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):
