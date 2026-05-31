@@ -70,35 +70,42 @@ codegen_node
 
 ## Small Example
 
-Consider two chained pointwise operations over `[1024, 4096]` tensors:
+Consider two chained pointwise operations over `[1024, 4096]` tensors, where
+`A=1024` names the row dimension and `B=4096` names the column dimension:
 
 ```python
+from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.propagate_named_dims import declare_tensor_dim, name_tensor_dims
+
+A, B = 1024, 4096
+declare_tensor_dim("A", A)
+declare_tensor_dim("B", B)
+
+a = torch.randn(A, B, dtype=torch.float16).to("spyre")
+b = torch.randn(A, B, dtype=torch.float16).to("spyre")
+c = torch.randn(A, B, dtype=torch.float16).to("spyre")
+name_tensor_dims(a, ["A", "B"])
+name_tensor_dims(b, ["A", "B"])
+name_tensor_dims(c, ["A", "B"])
+
 def f(a, b, c):
-    y = a + b   # add
-    z = y * c   # mul
-    return z
+    with spyre_hint(slices={"A": 2}):     # outer loop: 2 iterations over rows
+        with spyre_hint(slices={"B": 4}): # inner loop: 4 iterations over cols
+            y = a + b
+            z = y * c
+            return z
 ```
 
 Both operations are placed in a single tiling group with **K=2 in the outer
 loop** (splitting the 1024 rows into 2 groups of 512) and **M=4 in the inner
-loop** (splitting the 4096 columns into 4 groups of 1024).  The intended
-user-facing syntax (PR #2226) is:
+loop** (splitting the 4096 columns into 4 groups of 1024).  Each inner-loop
+iteration processes a 512 × 1024 tile (1/8th of the full tensor), enabling
+the intermediate result `y` to remain in scratchpad across both operations
+within the tile.
 
-```python
-def f(a, b, c):
-    with spyre_hint(tiles={"K": 2}):     # outer loop: 2 iterations over rows
-        with spyre_hint(tiles={"M": 4}): # inner loop: 4 iterations over cols
-            y = a + b
-            z = y * c
-    return z
-```
-
-Each inner-loop iteration processes a 512 × 1024 tile (1/8th of the full
-tensor), enabling the intermediate result `y` to remain in scratchpad across
-both operations within the tile.
-
-For simplicity this example uses `SENCORES=1` (single-core); the
-implementation fully supports multi-core execution.
+This example is the canonical small example tested by
+`test_hint_nested_loop_with_scratchpad` in
+`tests/inductor/test_coarse_tile_e2e.py`.
 
 ### What the coarse-tiling pass stamps
 
@@ -166,9 +173,9 @@ Key points:
   describes the smaller per-tile output buffer allocated for each loop
   iteration.  Per-iteration addressing into the full HBM region is handled
   by `tiled_symbols` / `affine.apply` in `bundle.mlir` at runtime.
-- `op_it_space_splits = {4096: 32}` is stamped by `work_distribution`: the
-  coefficient `4096` identifies the stride-1 dimension (columns), and `32`
-  is the number of cores dividing that dimension's work.
+- `op_it_space_splits = {1024: 32}` is stamped by `work_distribution`: the
+  coefficient `1024` identifies the per-tile stride-1 dimension (columns after
+  tiling), and `32` is the number of cores dividing that dimension's work.
 - `buf0` (`y`) is the intermediate result.  At this point its layout is a
   `FixedTiledLayout` with `size=[512, 1024]`; `scratchpad_planning` later
   assigns it `allocation={'lx': 0}`, placing it in LX scratchpad memory at
@@ -179,9 +186,11 @@ Key points:
 ### Generated OpSpec (Python wrapper source)
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
-single nested `LoopSpec`.  Below is the actual output produced by running the
-e2e test `test_nested_loop_with_scratchpad` (concrete HBM addresses replaced
-with symbolic names for readability):
+single nested `LoopSpec`.  Below is the actual output produced by running the e2e test
+`test_hint_nested_loop_with_scratchpad` (which uses `spyre_hint(slices=...)` /
+`declare_tensor_dim` / `name_tensor_dims` with `lx_planning=True` and
+`allow_all_ops_in_lx_planning=True`; concrete HBM addresses replaced with
+symbolic names for readability):
 
 ```python
 sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
@@ -452,13 +461,18 @@ so `_stamp_group` always works with the canonical representation.
 ```python
 # config.py
 coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
-coarse_tiling_groups_fn = None  # (list[Operation]) -> list[tuple[list[Operation], Expr]]
+coarse_tiling_groups_fn: Optional[Callable] = None  # overrides hint-derived groups
 ```
 
-`coarse_tiling_groups_fn` is an optional callable that receives the full
-operations list and returns the groups.  It must be a **module-level named
-function**, not a lambda, because Inductor's FX graph cache pickles the
-config values.
+When `coarse_tiling=True` and `coarse_tiling_groups_fn` is `None`, groups
+are derived automatically from `spyre_hint(slices=...)` annotations via
+`hints_to_coarse_tile_groups` — a no-op if no hints are present.  Setting
+`coarse_tiling_groups_fn` to a callable overrides the hint-derived groups
+entirely; this is intended for interim testing until the annotation framework
+matures and will be removed once it is complete.
+
+`coarse_tiling_groups_fn` must be a **module-level named function**, not a
+lambda, because Inductor's FX graph cache pickles the config values.
 
 ### Placement in `CustomPreSchedulingPasses`
 
@@ -473,12 +487,14 @@ finalize_layouts(operations)
 insert_restickify(operations)
 insert_bmm_padding(operations)
 dedup_and_promote_constants(operations)
+if config.chunk_large_tensors:
+    chunk_large_tensors(operations)
+propagate_named_dims(operations)
+assign_dim_hints(operations)
 if config.coarse_tiling:
-    groups = (
-        config.coarse_tiling_groups_fn(operations)
-        if config.coarse_tiling_groups_fn is not None
-        else []
-    )
+    groups = hints_to_coarse_tile_groups(operations)
+    if config.coarse_tiling_groups_fn is not None:
+        groups = config.coarse_tiling_groups_fn(operations)
     coarse_tile(operations, groups=groups)
 span_reduction(operations)
 k_fast_ops = (
@@ -486,10 +502,23 @@ k_fast_ops = (
 )
 work_distribution(operations, k_fast_ops)
 if config.lx_planning:
-    scratchpad_planning(operations)
+    allocator = (
+        StrategyBCoOptimizingAllocator()
+        if config.co_optimizing_lx_planning
+        else None
+    )
+    scratchpad_planning(graph, allocator=allocator)
 ```
 
-This ordering is required by two constraints:
+This ordering is required by several constraints:
+
+**`propagate_named_dims` and `assign_dim_hints` must run before coarse tiling.**
+`propagate_named_dims` propagates `name_tensor_dims()` annotations through the
+op graph, attaching named dimension metadata to each `ir.Operation`.
+`assign_dim_hints` then combines those named dimensions with the `spyre_hint`
+scope annotations (attached to FX nodes as `meta["custom"]`) to produce
+`op.dim_hints` — a flat list of `DimHint` objects consumed by
+`hints_to_coarse_tile_groups` to form the coarse tiling groups.
 
 **Must run after stickify and padding.**  `propagate_spyre_tensor_layouts`,
 `insert_restickify`, and `insert_bmm_padding` establish the final tiled
@@ -512,7 +541,9 @@ them is consistent.
 scratchpad allocations to fit the per-iteration working set.  If it ran
 before, it would see the full iteration space and allocate too much —
 defeating the working-set reduction that coarse tiling is designed to
-achieve.
+achieve.  `scratchpad_planning` receives the full `GraphLowering` object
+(not just `operations`) because it needs access to graph-level metadata
+for buffer lifetime analysis.
 
 ### Buffer propagation: `insert_tiling_propagation`
 
@@ -966,8 +997,10 @@ The filenames are assigned in depth-first traversal order.
 | `torch_spyre/_inductor/op_spec.py` | Add `LoopSpec` dataclass (recursive body type); add `tiled_symbols: list[Symbol]` to `OpSpec` |
 | `torch_spyre/_inductor/spyre_kernel.py` | Add `SpyreKernel.wrap_op_specs_in_loop()`; extend `codegen_kernel()` to serialize `LoopSpec` recursively; populate `OpSpec.tiled_symbols` in `create_op_spec`; fix `arg_index` fixup to walk nested bodies |
 | `torch_spyre/_inductor/scheduler.py` | Add `CountedLoopSchedulerNode(FusedSchedulerNode)` with `unpack()` override; add `build_loop_scheduler_nodes` and `_codegen_counted_loop`/`_codegen_loop_body` to `SuperDSCScheduling` |
-| `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call in `CustomPreSchedulingPasses`; reorder `CustomPostFusionPasses` to `[memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]` |
-| `torch_spyre/_inductor/config.py` | Add `coarse_tiling: bool` flag and `coarse_tiling_groups_fn` callable |
+| `torch_spyre/_inductor/passes.py` | Add `coarse_tile()` call (with `hints_to_coarse_tile_groups` fallback) in `CustomPreSchedulingPasses`; add `propagate_named_dims` and `resolve_hints` calls before coarse tiling; reorder `CustomPostFusionPasses` to `[memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]` |
+| `torch_spyre/_inductor/config.py` | Add `coarse_tiling: bool` flag, `coarse_tiling_groups_fn` override callable, `bundle_hbm_symbols: bool`, `unroll_loops: bool`, and `allow_all_ops_in_lx_planning: bool` |
+| `torch_spyre/_inductor/propagate_hints.py` | Add `spyre_hint(slices=...)` context manager and `get_op_hints()`; `resolve_hints` stamps hint metadata on `ir.Operation` objects; `hints_to_coarse_tile_groups` converts resolved hints to a `coarse_tile` groups list |
+| `torch_spyre/_inductor/propagate_named_dims.py` | `propagate_named_dims` propagates `name_tensor_dims()` annotations from FX nodes to `ir.Operation` objects; `assign_dim_hints` combines those named dimensions with `spyre_hint` scope metadata to produce `op.dim_hints`, consumed by `hints_to_coarse_tile_groups` |
 | `torch_spyre/_inductor/coarse_tile.py` | New file: `coarse_tile(operations, groups)` pass; stamps `loop_group_id`, `loop_count`, and `loop_tiled_dims` on ops; rewrites `ranges` via `object.__setattr__`; `insert_tiling_propagation` allocates full buffers for outside consumers, marks loop-internal buffers `per_tile_fixed` |
 | `torch_spyre/_inductor/ir.py` | Add `per_tile_fixed: bool = False` to `FixedTiledLayout` |
 | `torch_spyre/_inductor/op_spec.py` | Add `per_tile_fixed: bool = False` to `TensorArg` |
@@ -1002,11 +1035,11 @@ before `span_reduction`, `k_fast_division`, `work_distribution`, and
 `spyre_fuse_nodes` in `CustomPostFusionPasses` — see the ordering
 rationale above.
 
-**Cache invalidation**: `coarse_tile.py` is included in
-`CustomPreSchedulingPasses.uuid()` so the Inductor FX cache is
-invalidated when the pass changes.  The `coarse_tiling_groups_fn` must be
-a module-level named function (not a lambda) for Inductor's cache
-pickling to work.
+**Cache invalidation**: `coarse_tile.py`, `scratchpad_planning`, and all
+other pass source files are included in `CustomPreSchedulingPasses.uuid()`
+so the Inductor FX cache is invalidated when any pass changes.  The
+`coarse_tiling_groups_fn` must be a module-level named function (not a
+lambda) for Inductor's cache pickling to work.
 
 ## Rejected design alternatives
 
