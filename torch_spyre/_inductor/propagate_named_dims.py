@@ -389,7 +389,7 @@ def _get_hint_scopes(op) -> list[dict[str, int]]:
     scopes = []
     for _, hint_dict in sorted(get_op_hints(op).items()):
         scope: dict[str, int] = {}
-        for key in ("tiles", "slices"):
+        for key in ("tiles", "slices", "num_tiles_per_dim"):
             if isinstance(hint_dict.get(key), dict):
                 scope.update(hint_dict[key])
         if scope:
@@ -435,7 +435,7 @@ def assign_dim_hints(operations: list[Operation]) -> None:
         }
         dim_to_level: dict[str, tuple[int, int, int]] = {}
         for level_idx, (hint_id, hint_dict) in enumerate(sorted(hint_id_map.items())):
-            for key in ("tiles", "slices"):
+            for key in ("tiles", "slices", "num_tiles_per_dim"):
                 for name, count in (hint_dict.get(key) or {}).items():
                     dim_to_level[name] = (count, level_idx, hint_id)
 
@@ -477,7 +477,7 @@ def assign_dim_hints(operations: list[Operation]) -> None:
         for level_idx, (hint_id, hint_dict) in enumerate(sorted(hint_id_map.items())):
             if hint_id in matched_hint_ids:
                 continue
-            for key in ("tiles", "slices"):
+            for key in ("tiles", "slices", "num_tiles_per_dim"):
                 dims = hint_dict.get(key) or {}
                 if dims:
                     name, count = next(iter(dims.items()))
