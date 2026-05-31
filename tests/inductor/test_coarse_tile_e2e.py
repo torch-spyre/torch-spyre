@@ -837,7 +837,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(B, D, dtype=torch.float16)
 
         def softmax_fn(x):
-            with spyre_hint(slices={"B": 4}):
+            with spyre_hint(tiles={"B": 4}):
                 max_val = x.amax(dim=-1, keepdim=True)
                 x_shifted = x - max_val
                 exp_x = x_shifted.exp()
@@ -895,7 +895,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def fn(a, b, c):
             with spyre_hint(slices={"A": 2}):
-                with spyre_hint(slices={"B": 4}):
+                with spyre_hint(num_tiles_per_dim={"B": 4}):
                     y = a + b
                     z = y * c
                     return z
