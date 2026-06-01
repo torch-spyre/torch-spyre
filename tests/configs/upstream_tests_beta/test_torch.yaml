@@ -225,38 +225,18 @@ test_suite_config:
         - names:
             - TestTorchDeviceType::test_multinomial_cpu
           mode: mandatory_success
-          edits:
-            dtypes:
-              include:
-                - name: float32
-                  description: The test creates random probability distributions of various shapes and contiguity patterns, then runs torch.multinomial
-                    on CPU for several floating‑point dtypes to verify correct behavior. The largest floating-point type supported by spyre is float32.
-                    Hence it is included.
         - names:
             - TestTorchDeviceType::test_storage_meta_errors
           mode: mandatory_success
-          edits:
-            dtypes:
-              include:
-                - name: bfloat16
-                - name: bool
-                - name: complex128
-                - name: complex64
-                - name: float16
-                - name: float32
-                - name: float64
-                - name: int16
-                - name: int32
-                - name: int64
-                - name: int8
-                - name: uint8
         - names:
             - TestTorchDeviceType::test_ternary_op_mem_overlap
           mode: mandatory_success
-          edits:
-            dtypes:
-              include:
-                - name: float32
-                  description: The test iterates over several ternary PyTorch operations (addcmul, addcdiv, lerp) on both CPU and CUDA, checking that memory‑overlap
-                    detection works correctly for both in‑place and out‑of‑place variants when using double‑precision tensors. Double precision (float64)
-                    is not yet supported in spyre. The largest floating-point type supported by spyre is float32. Hence it is included.
+  global:
+    supported_dtypes:
+      - name: float16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: int64
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bfloat16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+

@@ -6,3 +6,11 @@ test_suite_config:
         - names:
             - TestLazyModules::test_materialize_dtype
           mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: int64
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bfloat16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
