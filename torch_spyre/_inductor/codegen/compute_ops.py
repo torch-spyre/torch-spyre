@@ -272,13 +272,17 @@ def generate_sdsc(
     #
     # When use_symbols=False this dict stays empty (symbols is not modified).
     local_symbols: dict[int, int] = {}
+    # Parallel to local_symbols (insertion order): "kernel" if the symbol came
+    # from a kernel tensor arg (arg_index >= 0), "pool" if pool-allocated.
+    local_symbol_kind: list[str] = []
 
     if use_symbols:
 
-        def offset_as_symbol(s):
+        def offset_as_symbol(s, kind: str):
             if s not in local_symbols:
                 local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
                 symbols.append(s)
+                local_symbol_kind.append(kind)
             return local_symbols[s]
 
         # Compute per-tensor affine strides and register base addresses in symbols.
@@ -289,6 +293,7 @@ def generate_sdsc(
             if "lx" in tensor.allocation:
                 affine_strides.append({})
                 continue
+            kind = "kernel" if tensor.arg_index >= 0 else "pool"
             tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
             if not tensor_tiled:
                 # Non-tiled HBM: register full per-core addresses.
@@ -296,7 +301,7 @@ def generate_sdsc(
                     full_addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(full_addr)
+                    offset_as_symbol(full_addr, kind)
                 affine_strides.append({})
             else:
                 # Tiled HBM: symbol value = per-core iter-0 base address.
@@ -310,7 +315,7 @@ def generate_sdsc(
                     base_addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(base_addr)
+                    offset_as_symbol(base_addr, kind)
                 affine_strides.append(strides_for_tensor)
 
         def _start_addr_data(tensor):
@@ -319,12 +324,13 @@ def generate_sdsc(
                     f"[{c}, 0, 0]": str(tensor.start_address)
                     for c in range(sdsc_spec.num_cores)
                 }
+            kind = "kernel" if tensor.arg_index >= 0 else "pool"
             result = {}
             for c in range(sdsc_spec.num_cores):
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
-                result[f"[{c}, 0, 0]"] = str(offset_as_symbol(addr))
+                result[f"[{c}, 0, 0]"] = str(offset_as_symbol(addr, kind))
             return result
 
     else:
@@ -558,4 +564,5 @@ def generate_sdsc(
         },
         list(local_symbols.keys()),
         affine_strides,
+        local_symbol_kind,
     )

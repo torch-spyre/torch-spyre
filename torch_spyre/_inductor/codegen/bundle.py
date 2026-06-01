@@ -32,13 +32,16 @@ logger = get_inductor_logger("sdsc_compile")
 # Types
 # ---------------------------------------------------------------------------
 
-# Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides)
+# Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides, symbol_kinds)
 #   base_symbol_values: list[int] of base HBM byte offsets for this SDSC,
 #                       one per registered symbol ID
 #   affine_strides:     list[dict] parallel to SDSCSpec.args —
 #                       {tiled_sym: stride_bytes} for tiled HBM tensors,
 #                       empty dict for non-tiled / lx tensors
-_CompiledEntry = tuple[Any, list[int], list[dict]]
+#   symbol_kinds:       list[str] parallel to base_symbol_values —
+#                       "kernel" for kernel tensor args (become input_arg params),
+#                       "pool" for pool-allocated tensors (emit as arith.addi)
+_CompiledEntry = tuple[Any, list[int], list[dict], list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +126,21 @@ def generate_bundle(
     compiled_iter = iter(compiled)
     addr_counter = [0]
 
-    # Derive how many symbols correspond to kernel tensor args (symbolic_args path).
-    num_tensor_args = (
-        _count_tensor_args(specs_list) if (symbolic_args and use_symbols) else 0
+    # Build a per-symbol kind list from compiled entries (symbolic_args path only).
+    # symbol_kinds[i] is "kernel" if symbols[i] came from a kernel tensor arg,
+    # or "pool" if it came from a pool-allocated tensor.
+    symbol_kinds: list[str] = []
+    if symbolic_args and use_symbols:
+        for _, _, _, local_kinds in compiled:
+            symbol_kinds.extend(local_kinds)
+
+    # Determine whether a pool parameter is needed (any pool symbol present).
+    has_pool = symbolic_args and use_symbols and any(k == "pool" for k in symbol_kinds)
+    # Indices of kernel-arg symbols (will become input_arg function parameters).
+    kernel_arg_sym_indices = (
+        [i for i, k in enumerate(symbol_kinds) if k == "kernel"]
+        if symbolic_args and use_symbols
+        else []
     )
 
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
@@ -142,15 +157,23 @@ def generate_bundle(
 
         f.write("module {\n")
 
-        # Function signature: emit one !sdscbundle.input_arg<index> param per
-        # tensor arg when symbolic_args is active, otherwise no params.
-        if num_tensor_args > 0:
-            params_str = ", ".join(
-                f"%sym_0_{n}: !sdscbundle.input_arg<index>"
-                for n in range(1, num_tensor_args + 1)
-            )
-            f.write(f"\tfunc.func @sdsc_bundle({params_str}) {{\n")
-            for n in range(1, num_tensor_args + 1):
+        # Function signature when symbolic_args is active:
+        #   - optional leading %pool param for pool-allocated tensors
+        #   - one !sdscbundle.input_arg<index> param per kernel tensor arg symbol
+        if symbolic_args and use_symbols and (has_pool or kernel_arg_sym_indices):
+            params = []
+            if has_pool:
+                params.append("%pool: !sdscbundle.input_arg<index>")
+            for pos, _ in enumerate(kernel_arg_sym_indices):
+                params.append(f"%sym_0_{pos + 1}: !sdscbundle.input_arg<index>")
+            f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
+            if has_pool:
+                f.write(
+                    "\t\t%pool_extracted = sdscbundle.input_arg_extract value from"
+                    " %pool : !sdscbundle.input_arg<index> -> index\n"
+                )
+            for pos, _ in enumerate(kernel_arg_sym_indices):
+                n = pos + 1
                 f.write(
                     f"\t\t%sym_0_{n}_extracted = sdscbundle.input_arg_extract value from"
                     f" %sym_0_{n} : !sdscbundle.input_arg<index> -> index\n"
@@ -165,14 +188,29 @@ def generate_bundle(
             for lb_idx, lb in enumerate(loop_bounds):
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
-        # One arith.constant per symbol ID (symbols[N] → %sym_{N+1}).
-        # Tensor-arg symbols (indices 0..num_tensor_args-1) are skipped when
-        # symbolic_args is active — they are replaced by function params above.
-        # Skipped entirely when use_symbols=False (symbols list is empty).
+        # Emit one declaration per symbol:
+        #   - "kernel" symbols → already handled as function params above (skipped)
+        #   - "pool" symbols   → arith.addi %pool_extracted, <pool_offset>
+        #   - all others       → arith.constant (plain HBM or use_symbols=False)
+        kernel_arg_sym_set = set(kernel_arg_sym_indices)
+        pool_sym_set = (
+            {i for i, k in enumerate(symbol_kinds) if k == "pool"}
+            if symbolic_args and use_symbols
+            else set()
+        )
         for sym_idx, value in enumerate(symbols):
-            if sym_idx < num_tensor_args:
-                continue
-            f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
+            if sym_idx in kernel_arg_sym_set:
+                continue  # replaced by function parameter + extract op
+            if sym_idx in pool_sym_set:
+                f.write(
+                    f"\t\t%pool_offset_{sym_idx + 1} = arith.constant {value} : index\n"
+                )
+                f.write(
+                    f"\t\t%sym_{sym_idx + 1} = arith.addi %pool_extracted,"
+                    f" %pool_offset_{sym_idx + 1} : index\n"
+                )
+            else:
+                f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
         # Recursive body emission.
         loop_bound_idx = [0]
@@ -188,7 +226,7 @@ def generate_bundle(
             indent=2,
             use_symbols=use_symbols,
             symbolic_args=symbolic_args,
-            num_tensor_args=num_tensor_args,
+            kernel_arg_sym_indices=kernel_arg_sym_indices,
         )
 
         f.write("\t\treturn\n")
@@ -225,15 +263,19 @@ def _compile_specs(
         elif isinstance(entry, OpSpec):
             idx = sdsc_counter[0]
             sdsc_counter[0] += 1
-            sdsc_json, local_sym_values, affine_strides = compile_op_spec(
-                idx,
-                entry,
-                symbols,
-                symbol_id_offset_counter[0],
-                use_symbols=use_symbols,
+            sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
+                compile_op_spec(
+                    idx,
+                    entry,
+                    symbols,
+                    symbol_id_offset_counter[0],
+                    use_symbols=use_symbols,
+                )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
-            compiled.append((sdsc_json, local_sym_values, affine_strides))
+            compiled.append(
+                (sdsc_json, local_sym_values, affine_strides, local_symbol_kinds)
+            )
             file_name = f"sdsc_{idx}.json"
             with open(os.path.join(output_dir, file_name), "w") as f:
                 logger.info(f"Generating {f.name}")
@@ -275,7 +317,7 @@ def _collect_affine_maps(
                 affine_map_index,
             )
         elif isinstance(entry, OpSpec):
-            _, _, affine_strides = next(compiled_iter)
+            _, _, affine_strides, _ = next(compiled_iter)
             for tensor_strides in affine_strides:
                 if not tensor_strides:
                     continue
@@ -312,15 +354,25 @@ def _emit_specs(
     indent: int,
     use_symbols: bool = False,
     symbolic_args: bool = False,
-    num_tensor_args: int = 0,
+    kernel_arg_sym_indices: list | None = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
+    if kernel_arg_sym_indices is None:
+        kernel_arg_sym_indices = []
+
+    # Map from 0-based symbol index to the extracted SSA name for kernel-arg symbols.
+    # kernel_arg_sym_indices[pos] = sym_idx  →  %sym_0_{pos+1}_extracted
+    kernel_arg_sym_to_name: dict[int, str] = {
+        sym_idx: f"%sym_0_{pos + 1}_extracted"
+        for pos, sym_idx in enumerate(kernel_arg_sym_indices)
+    }
 
     def _resolve_sym(sid: int) -> str:
-        n = abs(sid)
-        if symbolic_args and num_tensor_args > 0 and n <= num_tensor_args:
-            return f"%sym_0_{n}_extracted"
-        return f"%sym_{n}"
+        # sid is a negative symbol ID; abs(sid)-1 is the 0-based index into symbols[].
+        sym_idx = abs(sid) - 1
+        if symbolic_args and sym_idx in kernel_arg_sym_to_name:
+            return kernel_arg_sym_to_name[sym_idx]
+        return f"%sym_{abs(sid)}"
 
     tab = "\t" * indent
     for entry in specs:
@@ -343,12 +395,12 @@ def _emit_specs(
                 indent + 1,
                 use_symbols=use_symbols,
                 symbolic_args=symbolic_args,
-                num_tensor_args=num_tensor_args,
+                kernel_arg_sym_indices=kernel_arg_sym_indices,
             )
             f.write(f"{tab}}}\n")
 
         elif isinstance(entry, OpSpec):
-            sdsc_json, local_sym_values, affine_strides = next(compiled_iter)
+            sdsc_json, local_sym_values, affine_strides, _ = next(compiled_iter)
             # Determine the JSON filename from the sdsc_json key.
             sdsc_name = next(iter(sdsc_json))
             sdsc_idx = sdsc_name.split("_")[0]
@@ -457,24 +509,6 @@ def _sym_id_to_mlir_name(sym_id: int) -> str:
 # ---------------------------------------------------------------------------
 # Helpers re-exported for tests
 # ---------------------------------------------------------------------------
-
-
-def _count_tensor_args(specs: list) -> int:
-    """Derive the kernel tensor-arg count from TensorArg.arg_index in the specs.
-
-    Returns max(arg_index) + 1 across all HBM-allocated TensorArgs found
-    depth-first. Returns 0 if no HBM tensor args are present.
-    """
-    max_idx = -1
-    for entry in specs:
-        if isinstance(entry, LoopSpec):
-            sub = _count_tensor_args(entry.body)
-            max_idx = max(max_idx, sub - 1)
-        elif isinstance(entry, OpSpec):
-            for arg in entry.args:
-                if "hbm" in arg.allocation and arg.arg_index >= 0:
-                    max_idx = max(max_idx, arg.arg_index)
-    return max_idx + 1
 
 
 def _collect_op_specs(specs: list, result: list) -> None:
