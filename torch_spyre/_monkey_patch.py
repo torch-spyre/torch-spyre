@@ -74,12 +74,8 @@ def _patch_tensor_for_spyre():
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
         if device_layout is None:
-            # If caller is doing a combined device+dtype move on a Spyre tensor
-            # (e.g. tensor.to("spyre", dtype=torch.int64) or
-            #        tensor.to(device="spyre", dtype=torch.int64)),
-            # split into two steps: cast dtype on CPU first, then copy to device.
-            # This avoids "does not support type conversion during copy" in the
-            # DCI (DataConversionInfo) C++ code in spyre_mem.cpp.
+            # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in spyre_mem.cpp.
+            # For D2D data casting, split it into a D2H copy and a H2D dtype conversion.
             _device = kwargs.get("device", None)
             if (
                 _device is None

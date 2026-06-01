@@ -369,8 +369,15 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   auto dev_str_type = torchScalarToString[dev_tensor->scalar_type()];
   const auto [cpu_format_host, cpu_format_dev] =
       stringToDTDataFormatPair(cpu_str_type);
+  TORCH_CHECK(cpu_format_host != DataFormats::INVALID &&
+                  cpu_format_dev != DataFormats::INVALID,
+              "Unsupported CPU tensor dtype for DMA transfer: ", cpu_str_type);
   const auto [dev_format_host, dev_format_dev] =
       stringToDTDataFormatPair(dev_str_type);
+  TORCH_CHECK(
+      dev_format_host != DataFormats::INVALID &&
+          dev_format_dev != DataFormats::INVALID,
+      "Unsupported Spyre tensor dtype for DMA transfer: ", dev_str_type);
 
   DataConversionInfo dci{};
   dci.dci_dsName_ = "DCI-Tensor-0";
