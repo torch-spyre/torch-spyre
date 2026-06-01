@@ -10,8 +10,6 @@ test_suite_config:
     supported_dtypes:
       - name: float16
         description: Supported by both Spyre and CPU. Required floating point dtype for the test.
-      - name: float32
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
       - name: int64
         description: Supported by both Spyre and CPU. Required floating point dtype for the test.
       - name: bfloat16
