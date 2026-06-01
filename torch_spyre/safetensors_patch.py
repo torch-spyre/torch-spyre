@@ -81,17 +81,21 @@ def set_tensor_to_spyre_fn(fn) -> None:
     logger.debug("safetensors_patch: transfer function replaced by %s", fn)
 
 
-# --- Device detection ------------------------------------------------
-
-
-def _is_spyre_device(device) -> bool:
-    if device is None:
-        return False
-    if isinstance(device, str):
-        return device.startswith(DEVICE_NAME)
-    if isinstance(device, torch.device):
-        return device.type == DEVICE_NAME
-    return False
+def _assign_one(model, name, tensor, is_param, requires_grad=False):
+    """Assign a single tensor to a model parameter or buffer."""
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2:
+        parent = model.get_submodule(parts[0])
+        attr_name = parts[1]
+    else:
+        parent = model
+        attr_name = parts[0]
+    if is_param:
+        parent._parameters[attr_name] = nn.Parameter(
+            tensor, requires_grad=requires_grad
+        )
+    else:
+        parent._buffers[attr_name] = tensor
 
 
 # --- Patch -----------------------------------------------------------
@@ -127,7 +131,9 @@ def patch_safetensors() -> None:
         """
 
         def __init__(self, filename, framework="pt", device="cpu"):
-            self._target_is_spyre = _is_spyre_device(device)
+            self._target_is_spyre = (
+            device is not None and torch.device(device).type == DEVICE_NAME
+            )
             if self._target_is_spyre:
                 self._inner = orig_safe_open(
                     filename, framework=framework, device="cpu"
@@ -165,7 +171,7 @@ def patch_safetensors() -> None:
     # --- load_file wrapper -------------------------------------------
 
     def _spyre_load_file(filename, device="cpu"):
-        if not _is_spyre_device(device):
+        if device is None or torch.device(device).type != DEVICE_NAME:
             return orig_load_file(filename, device=device)
         cpu_tensors = orig_load_file(filename, device="cpu")
         return {k: _tensor_to_spyre(v, k) for k, v in cpu_tensors.items()}
@@ -173,7 +179,7 @@ def patch_safetensors() -> None:
     # --- load_model wrapper ------------------------------------------
 
     def _spyre_load_model(model, filename, strict=True, device="cpu"):
-        if not _is_spyre_device(device):
+        if device is None or torch.device(device).type != DEVICE_NAME:
             return orig_load_model(
                 model, filename, strict=strict, device=device
             )
@@ -184,36 +190,25 @@ def patch_safetensors() -> None:
         }
 
         missing = []
-        unexpected = list(spyre_tensors.keys())
+        unexpected = set(spyre_tensors.keys())
         for name, param in model.named_parameters():
             if name in spyre_tensors:
-                unexpected.remove(name)
-                parts = name.rsplit(".", 1)
-                if len(parts) == 2:
-                    parent = model.get_submodule(parts[0])
-                    attr_name = parts[1]
-                else:
-                    parent = model
-                    attr_name = parts[0]
-                parent._parameters[attr_name] = nn.Parameter(
-                    spyre_tensors[name], requires_grad=param.requires_grad
-                )
+                unexpected.discard(name)
+                _assign_one(model, name, spyre_tensors[name],
+                            is_param=True,
+                            requires_grad=param.requires_grad)
             else:
                 missing.append(name)
         for name, buf in model.named_buffers():
             if name in spyre_tensors:
                 if name in unexpected:
-                    unexpected.remove(name)
-                parts = name.rsplit(".", 1)
-                if len(parts) == 2:
-                    parent = model.get_submodule(parts[0])
-                    attr_name = parts[1]
-                else:
-                    parent = model
-                    attr_name = parts[0]
-                parent._buffers[attr_name] = spyre_tensors[name]
+                    unexpected.discard(name)
+                    _assign_one(model, name, spyre_tensors[name],
+                            is_param=False)
             else:
                 missing.append(name)
+
+        unexpected = sorted(unexpected)
         if strict and (missing or unexpected):
             error = (
                 f"Error(s) in loading state_dict for "

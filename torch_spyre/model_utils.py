@@ -26,8 +26,7 @@ intermediate copy is required.
 Critically, the tensor's PyTorch shape stays ``(out, in)`` -- only the
 *device* layout changes. This means:
 
-  * ``nn.Linear.forward`` works unmodified (no class swap, no forward
-    patch, no flag tracking).
+  * ``nn.Linear.forward`` works unmodified 
   * ``F.linear`` / ``aten.linear`` works unmodified. The Spyre
     decomposition still does ``weight.transpose(-1, -2)`` (a metadata-
     only op), and the Spyre layout propagation engine recognizes the
@@ -48,12 +47,9 @@ Usage::
     from torch_spyre.model_utils import patch_module_to_for_spyre
     patch_module_to_for_spyre()
     model.to("spyre")
+    # safetensors_patch.py handles the patching; model_utils plugs in
+    # the optimal transfer via the hook in patch_module_to_for_spyre().
 
-    # For safetensors-based loaders (HF transformers, vLLM):
-    from torch_spyre.model_utils import patch_safetensors_for_spyre
-    patch_safetensors_for_spyre()
-    # safetensors.torch.load_file/load_model with device="spyre" will
-    # now use the optimal layout transparently.
 """
 
 import logging
@@ -82,9 +78,11 @@ def _dma_to_spyre_default(cpu_tensor: torch.Tensor) -> torch.Tensor:
     parameters, buffers). Stickifies along the last dimension.
     """
     # Ensure tensor is FP16 (Spyre doesn't support dtype conversion during copy)
+    # TODO: remove explicit fp16 conversion once D2H/H2D dtype
+    # conversion support lands — copy_tensor will handle dtype during DMA.
     if cpu_tensor.dtype != torch.float16:
         cpu_tensor = cpu_tensor.to(dtype=torch.float16)
-    
+
     if not cpu_tensor.is_contiguous():
         cpu_tensor = cpu_tensor.contiguous()
     layout = SpyreTensorLayout(list(cpu_tensor.shape), cpu_tensor.dtype)
@@ -107,11 +105,13 @@ def _dma_to_spyre_dim_order_swapped(weight: torch.Tensor) -> torch.Tensor:
     Caller must ensure ``weight.ndim == 2``.
     """
     assert weight.ndim == 2, "dim_order=[1,0] path is for 2D weights only"
-    
+
     # Ensure tensor is FP16 (Spyre doesn't support dtype conversion during copy)
+    # TODO: remove explicit fp16 conversion once D2H/H2D dtype
+    # conversion support lands — copy_tensor will handle dtype during DMA.
     if weight.dtype != torch.float16:
         weight = weight.to(dtype=torch.float16)
-    
+
     if not weight.is_contiguous():
         weight = weight.contiguous()
     layout = SpyreTensorLayout(
@@ -130,11 +130,7 @@ def _dma_to_spyre_dim_order_swapped(weight: torch.Tensor) -> torch.Tensor:
 # --- Model loading ---------------------------------------------------
 
 
-def load_model_to_spyre(
-    model: nn.Module,
-    dtype: Optional[torch.dtype] = None,
-    device_index: int = 0,
-) -> nn.Module:
+def load_model_to_spyre(model: nn.Module) -> nn.Module:
     """Transfer model to Spyre with optimal weight layout.
 
     For each ``nn.Linear``, the weight is transferred using
@@ -143,6 +139,7 @@ def load_model_to_spyre(
     model works unmodified with the existing inference path.
 
     All other parameters and buffers use the default Spyre layout.
+    The ``_dma_*`` helpers handle dtype conversion to fp16 internally.
 
     Idempotent: parameters already on Spyre are skipped.
     """
@@ -162,8 +159,6 @@ def load_model_to_spyre(
                 continue
 
             p = param.data
-            if dtype is not None:
-                p = p.to(dtype=dtype)
 
             # 2D Linear weight -> optimal stickified layout via dim_order.
             # Everything else (bias, embeddings, norms, ...) -> default layout.
@@ -190,8 +185,6 @@ def load_model_to_spyre(
             if buf is None or buf.device.type == DEVICE_NAME:
                 continue
             b = buf
-            if dtype is not None:
-                b = b.to(dtype=dtype)
             module._buffers[buf_name] = _dma_to_spyre_default(b)
             buffer_count += 1
 
@@ -206,8 +199,6 @@ def load_model_to_spyre(
 
 # --- nn.Module.to() monkeypatch --------------------------------------
 
-_module_to_patched = False
-
 
 def patch_module_to_for_spyre() -> None:
     """Monkeypatch ``nn.Module.to`` for automatic optimal Spyre loading.
@@ -215,50 +206,30 @@ def patch_module_to_for_spyre() -> None:
     After patching, ``model.to("spyre")`` will use the optimal weight
     layout for every ``nn.Linear`` in the model. Non-Spyre destinations
     fall through to the original ``nn.Module.to``.
-
-    Idempotent.
+    # Robust idempotency: check the live attribute on the patched callable
+    # rather than a module-level flag.
     """
-    global _module_to_patched
-    if _module_to_patched:
+    if getattr(nn.Module.to, "_spyre_patched", False):
         return
-
     orig_module_to = nn.Module.to
 
     def _spyre_module_to(self, *args, **kwargs):
-        target_is_spyre = False
+        def _is_spyre(d):
+            return d is not None and torch.device(d).type == DEVICE_NAME
 
-        for arg in args:
-            if isinstance(arg, str) and arg.startswith(DEVICE_NAME):
-                target_is_spyre = True
-                break
-            if isinstance(arg, torch.device) and arg.type == DEVICE_NAME:
-                target_is_spyre = True
-                break
-
-        device_kwarg = kwargs.get("device")
-        if device_kwarg is not None:
-            if isinstance(device_kwarg, str) and device_kwarg.startswith(
-                DEVICE_NAME
-            ):
-                target_is_spyre = True
-            elif (
-                isinstance(device_kwarg, torch.device)
-                and device_kwarg.type == DEVICE_NAME
-            ):
-                target_is_spyre = True
+        target_is_spyre = any(
+            _is_spyre(a) for a in args
+            if isinstance(a, (str, torch.device))
+        ) or _is_spyre(kwargs.get("device"))
 
         if not target_is_spyre:
             return orig_module_to(self, *args, **kwargs)
 
-        dtype = kwargs.get("dtype")
-        for arg in args:
-            if isinstance(arg, torch.dtype):
-                dtype = arg
 
-        return load_model_to_spyre(self, dtype=dtype)
+        return load_model_to_spyre(self)
 
+    _spyre_module_to._spyre_patched = True
     nn.Module.to = _spyre_module_to
-    _module_to_patched = True
     logger.info(
         "Patched nn.Module.to() for automatic Spyre weight layout "
         "optimization"
@@ -278,41 +249,6 @@ def patch_module_to_for_spyre() -> None:
 
 
 # --- safetensors monkeypatch -----------------------------------------
-
-_safetensors_patched = False
-
-
-def _is_spyre_device(device) -> bool:
-    if isinstance(device, str):
-        return device.startswith(DEVICE_NAME)
-    if isinstance(device, torch.device):
-        return device.type == DEVICE_NAME
-    return False
-
-
-def _transfer_state_dict_model_aware(
-    state_dict,
-    model: nn.Module,
-):
-    """Transfer state dict to Spyre using model structure for accuracy.
-
-    Walks the model to identify which keys correspond to ``nn.Linear``
-    weights, then uses the dim_order layout for those and the default
-    layout for everything else.
-    """
-    linear_weight_keys = set()
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            key = f"{name}.weight" if name else "weight"
-            linear_weight_keys.add(key)
-
-    result = {}
-    for key, tensor in state_dict.items():
-        if key in linear_weight_keys and tensor.ndim == 2:
-            result[key] = _dma_to_spyre_dim_order_swapped(tensor)
-        else:
-            result[key] = _dma_to_spyre_default(tensor)
-    return result
 
 
 def _transfer_tensor_for_spyre(
@@ -339,114 +275,5 @@ def _transfer_tensor_for_spyre(
     if is_likely_linear_weight:
         return _dma_to_spyre_dim_order_swapped(tensor)
     return _dma_to_spyre_default(tensor)
-
-
-def _transfer_tensors_heuristic(tensors):
-    """Transfer state dict to Spyre using a name-based heuristic.
-
-    Used when no model object is available (``safetensors.torch.load_file``).
-    2D tensors with "weight" in the key are assumed to be Linear weights
-    unless the name suggests an embedding or normalization layer.
-    """
-    result = {}
-    for key, tensor in tensors.items():
-        result[key] = _transfer_tensor_for_spyre(tensor, key)
-    return result
-
-
-def patch_safetensors_for_spyre() -> None:
-    """Monkeypatch ``safetensors.torch`` for optimal Spyre layout.
-
-    After patching, ``safetensors.torch.load_file(file, device="spyre")``
-    and ``safetensors.torch.load_model(model, file, device="spyre")``
-    will transfer weights with the optimal layout.
-
-    Non-Spyre destinations fall through to the original safetensors
-    functions.
-    """
-    global _safetensors_patched
-    if _safetensors_patched:
-        return
-
-    try:
-        import safetensors.torch as st_torch
-    except ImportError:
-        logger.warning(
-            "safetensors not installed; patch_safetensors_for_spyre "
-            "has no effect"
-        )
-        return
-
-    orig_load_file = st_torch.load_file
-    orig_load_model = st_torch.load_model
-
-    def _spyre_load_file(filename, device="cpu"):
-        if not _is_spyre_device(device):
-            return orig_load_file(filename, device=device)
-        cpu_tensors = orig_load_file(filename, device="cpu")
-        return _transfer_tensors_heuristic(cpu_tensors)
-
-    def _spyre_load_model(model, filename, strict=True, device="cpu"):
-        if not _is_spyre_device(device):
-            return orig_load_model(
-                model, filename, strict=strict, device=device
-            )
-
-        cpu_tensors = orig_load_file(filename, device="cpu")
-        spyre_tensors = _transfer_state_dict_model_aware(cpu_tensors, model)
-
-        # Direct parameter assignment. Shapes match the model exactly
-        # (dim_order is a device-layout concern only), so we could in
-        # principle use load_state_dict -- but assigning directly avoids
-        # an extra device-side copy and lets us preserve requires_grad.
-        missing = []
-        unexpected = list(spyre_tensors.keys())
-        for name, param in model.named_parameters():
-            if name in spyre_tensors:
-                unexpected.remove(name)
-                parts = name.rsplit(".", 1)
-                if len(parts) == 2:
-                    parent = model.get_submodule(parts[0])
-                    attr_name = parts[1]
-                else:
-                    parent = model
-                    attr_name = parts[0]
-                parent._parameters[attr_name] = nn.Parameter(
-                    spyre_tensors[name], requires_grad=param.requires_grad
-                )
-            else:
-                missing.append(name)
-        for name, buf in model.named_buffers():
-            if name in spyre_tensors:
-                if name in unexpected:
-                    unexpected.remove(name)
-                parts = name.rsplit(".", 1)
-                if len(parts) == 2:
-                    parent = model.get_submodule(parts[0])
-                    attr_name = parts[1]
-                else:
-                    parent = model
-                    attr_name = parts[0]
-                parent._buffers[attr_name] = spyre_tensors[name]
-            else:
-                missing.append(name)
-        if strict and (missing or unexpected):
-            error = (
-                f"Error(s) in loading state_dict for "
-                f"{model.__class__.__name__}:"
-            )
-            if missing:
-                error += f"\n    Missing: {sorted(missing)}"
-            if unexpected:
-                error += f"\n    Unexpected: {sorted(unexpected)}"
-            raise RuntimeError(error)
-        return set(missing), unexpected
-
-    st_torch.load_file = _spyre_load_file
-    st_torch.load_model = _spyre_load_model
-    _safetensors_patched = True
-    logger.info(
-        "Patched safetensors.torch for optimal Spyre weight layout "
-    )
 
 # Made with Bob
