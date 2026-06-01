@@ -670,13 +670,14 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner(
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
                 kernel_provenance=descriptor,
             )
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is descriptor
         assert runner.profiler_event_name == _event_name(descriptor)
         assert runner.jobplan == "jobplan"
@@ -697,9 +698,10 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is None
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")

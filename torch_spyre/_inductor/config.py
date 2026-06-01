@@ -196,5 +196,12 @@ native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
+# Enable persistent on-disk caching of compiled Spyre kernels across
+# invocations.
+# Set SPYRE_KERNEL_CACHE=0 to disable.
+# To force recompilation (bypass lookup but still save), use the standard
+# PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
+# torch._inductor.config.force_disable_caches = True.
+spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
 install_config_module(sys.modules[__name__])

@@ -47,6 +47,14 @@ class SpyreUnimplementedRunner:
 
 
 class SpyreSDSCKernelRunner:
+    """Kernel runner for a compiled SDSC bundle.
+
+    The jobplan handle is initialised lazily on first call to :meth:`run`.
+    This avoids calling ``prepare_kernel`` (which requires a live C++
+    RuntimeContext) in the compiling process; the context is only guaranteed
+    to be available on the process that actually launches the kernel.
+    """
+
     def __init__(
         self,
         name: str,
@@ -57,10 +65,10 @@ class SpyreSDSCKernelRunner:
         self.code_dir = code_dir
         self.kernel_provenance = kernel_provenance
         self.profiler_event_name: str | None
-        spyrecode_dir = code_dir + "/spyreCodeDir"
+        self._jobplan = None  # initialised lazily, not pickled
+
         if kernel_provenance is None:
             self.profiler_event_name = None
-            self.jobplan = prepare_kernel(spyrecode_dir)
         else:
             self.profiler_event_name = format_kernel_provenance_event_name(
                 kernel_provenance
@@ -72,11 +80,28 @@ class SpyreSDSCKernelRunner:
                 self.profiler_event_name,
                 list(kernel_provenance.debug_handle_ids),
             )
-            with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
-                self.jobplan = prepare_kernel(
-                    spyrecode_dir,
-                    profiler_name=self.profiler_event_name,
-                )
+
+    @property
+    def jobplan(self):
+        if self._jobplan is None:
+            logger.debug(
+                "Initialising jobplan for %s from %s", self.kernel_name, self.code_dir
+            )
+            # _lazy_init() ensures the C++ RuntimeContext is initialised before
+            # prepare_kernel(), which calls into JobPlanBuilder/getDefaultStream().
+            torch.spyre._impl._lazy_init()
+            spyrecode_dir = self.code_dir + "/spyreCodeDir"
+            if self.profiler_event_name is None:
+                self._jobplan = prepare_kernel(spyrecode_dir)
+            else:
+                with torch.profiler.record_function(
+                    f"prepare_kernel:{self.kernel_name}"
+                ):
+                    self._jobplan = prepare_kernel(
+                        spyrecode_dir,
+                        profiler_name=self.profiler_event_name,
+                    )
+        return self._jobplan
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, symbolic_args: list[SymbolicArg] | None = None, **kw_args):
