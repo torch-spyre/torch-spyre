@@ -389,6 +389,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
         # can correctly isolate each loop variable's contribution.
+        print(f"In create_tensor_arg: name: {name} tensor: {tensor}")
 
         index = concretize_index(tensor.index, set(it_space.keys()))
         device_coords = compute_coordinates(
@@ -397,6 +398,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             it_space,
             index,
         )
+        print(f"device_coords: {device_coords}")
         tensor_arg = TensorArg(
             is_input,
             -1,

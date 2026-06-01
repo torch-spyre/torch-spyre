@@ -240,6 +240,8 @@ def get_per_core_span(
         per_core_max = 0
         per_core_min = 0
         for v in coord.free_symbols:
+            if v not in it_space_orig:
+                continue
             term = coord.subs({u: 0 for u in coord.free_symbols - {v}})
             # Concretize the iteration-space size so R (and therefore the
             # ``int(term.subs(...))`` cast below) is a Python int.  Per-core

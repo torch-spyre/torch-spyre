@@ -180,7 +180,13 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
-        return next(iter(rw.reads)).ranges.copy()
+        write_ranges = next(iter(rw.writes)).ranges.copy()
+        red_node = op.data
+        if hasattr(red_node, 'reduction_ranges') and red_node.reduction_ranges:
+            for i, red_size in enumerate(red_node.reduction_ranges):
+                red_sym = sympy.Symbol(f"r{i}")
+                write_ranges[red_sym] = red_size
+        return write_ranges
     else:
         raise Unsupported("Unexpected node type")
 
