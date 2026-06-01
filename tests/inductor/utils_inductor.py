@@ -691,7 +691,7 @@ def compare_with_cpu(
 
         if cpu_compile:
             cpu_other_result = _compile_and_run(
-                fn, get_args(), "cpu", needs_device=needs_device, compile=compiled
+                fn, get_args(), "cpu", needs_device=needs_device, compile=True
             )
             _assert_results_close(
                 spyre_result,

@@ -79,7 +79,6 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("coarse_tile")
@@ -109,10 +108,10 @@ def coarse_tile(
 
         * A scalar ``loop_count`` (with optional third element ``tiled_dims``)
           for a flat single-level loop — tile all ops in ``ops`` by that count.
-        * A list of ``(loop_count, tiled_dims)`` pairs for nested loops —
-          the outermost pair is first, the innermost last.  The ops end up in
-          the innermost loop body; each level's count and dims are stamped on
-          the op and the corresponding iteration ranges are divided.
+        * A list of ``(hint_id, loop_count, tiled_dims)`` triples for nested
+          loops — outermost first.  The ops end up in the innermost loop body;
+          each level's count and dims are stamped on the op and the
+          corresponding iteration ranges are divided.
     tiled_dims:
         Default ``tiled_dims`` for flat groups that do not supply their own.
         ``None`` means tile only dimension 0.  Ignored for nested-spec groups.
@@ -127,13 +126,13 @@ def coarse_tile(
         group_id: tuple[int, ...] = (group_idx,)
 
         if isinstance(spec, list):
-            # Nested spec: list of (loop_count, tiled_dims) pairs.
-            levels: list[tuple[Expr, list[int]]] = spec
+            # Nested spec: list of (hint_id, loop_count, tiled_dims) triples.
+            levels: list[tuple[int, Expr, list[int]]] = spec
         else:
             # Flat spec: scalar loop_count with optional tiled_dims override.
             flat_tiled = group[2] if len(group) > 2 else tiled_dims
             effective_dims: list[int] = [0] if flat_tiled is None else flat_tiled
-            levels = [(spec, effective_dims)]
+            levels = [(0, spec, effective_dims)]
 
         _stamp_group(group_ops, group_id, levels, op_to_position)
 
@@ -151,8 +150,8 @@ def insert_tiling_propagation(
 ) -> None:
     """Insert full-sized buffers and copy/mutation ops for tiled ops.
 
-    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, matrix
-    multiply (batchmatmul) and tiled reduction dims raise RuntimeError.
+    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, tiled
+    dims that fall in the reduction_ranges index range raise RuntimeError.
 
     For each eligible ComputedBuffer in a tiling group, if its result is
     consumed by any operation outside the loop (different loop_group_id or
@@ -185,20 +184,11 @@ def insert_tiling_propagation(
 def _check_reduction_tiling_safety(op: ComputedBuffer) -> None:
     """Raise RuntimeError for unsupported Reduction-in-loop configurations.
 
-    Two cases are rejected:
-    1. Matrix multiply (batchmatmul) inside a tiling loop — not supported.
-    2. Any tiled dim that falls in the reduction_ranges index range — the
-       accumulation-buffer logic for a tiled reduction dim is not yet
-       implemented.
+    Rejects any tiled dim that falls in the reduction_ranges index range — the
+    accumulation-buffer logic for a tiled reduction dim is not yet implemented.
     """
     data = op.data
     assert isinstance(data, Reduction)
-
-    if data.reduction_type == BATCH_MATMUL_OP:
-        raise RuntimeError(
-            f"coarse_tile: matrix multiply op {op.get_name()!r} inside a "
-            "tiling loop is not supported."
-        )
 
     n_output_dims = len(data.ranges)
     loop_tiled_dims: list[list[int]] = getattr(op, "loop_tiled_dims", [])
@@ -228,6 +218,15 @@ def _propagate_tiled_op(
     outside_consumers, is_graph_output = _find_outside_consumers(
         buf_name, loop_group_id, operations
     )
+
+    # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant —
+    # mark per_tile_fixed so the unroller reuses the same address each tile.
+    if all(not dims for dims in getattr(op, "loop_tiled_dims", [[]])):
+        from .ir import FixedTiledLayout
+
+        if isinstance(op.layout, FixedTiledLayout):
+            op.layout.per_tile_fixed = True
+        return
 
     if not outside_consumers and not is_graph_output:
         # Loop-internal: the buffer is a per-tile scratch region reused every
@@ -496,6 +495,7 @@ def _insert_copy_op(
         data=copy_data,
     )
     copy_buf.origins = tiled_op.origins
+    copy_buf.operation_name = copy_name
 
     # Stamp with the same loop metadata so this op is inside the same loop.
     copy_buf.loop_group_id = tiled_op.loop_group_id  # type: ignore[attr-defined]
@@ -576,31 +576,23 @@ def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
 def _stamp_group(
     ops: list[Operation],
     group_id: tuple[int, ...],
-    levels: list[tuple[Expr, list[int]]],
+    levels: list[tuple[int, Expr, list[int]]],
     op_to_position: dict[str, int],
 ) -> None:
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
-    ``levels`` is a list of ``(loop_count, tiled_dims)`` pairs, outermost
-    first.  The op receives a ``loop_group_id`` whose length equals
-    ``len(levels)`` (one path element per nesting level).  ``loop_count`` and
-    ``loop_tiled_dims`` are stamped as lists parallel to ``levels``.
-
-    Iteration ranges are divided in outermost-first order: outer count applied
-    to outer dims, then inner count applied to inner dims.
+    ``levels`` is a list of ``(hint_id, loop_count, tiled_dims)`` triples,
+    outermost first.  Each op's ranges are divided using its own dim_hints,
+    matched to the correct level by hint_id so that op-specific dim_index
+    values are used rather than the spec op's indices.
     """
     if not ops:
         return
 
     _validate_contiguous(ops, op_to_position, group_id)
 
-    # Build full nested group_id: (group_idx, 0, 0, ...) with len == len(levels).
-    # The inner path elements are always 0 because each level contains exactly
-    # the ops from this group (no siblings at inner depths).
     nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
-
-    counts = [lvl[0] for lvl in levels]
-    dims_per_level = [lvl[1] for lvl in levels]
+    counts = [lvl[1] for lvl in levels]
 
     for op in ops:
         if not isinstance(op, ComputedBuffer):
@@ -611,19 +603,41 @@ def _stamp_group(
             )
             continue
 
-        for count, dims in levels:
-            _divide_ranges(op, count, dims)
+        # Two ways to drive coarse tiling: (1) a config-supplied groups function
+        # that assigns the same dims to every op in the group, and (2) spyre_hint
+        # annotations where each op carries its own dim_hints with per-op
+        # dim_index values (ops in the same group can have different iteration
+        # spaces, e.g. a broadcast op may lack the tiled dimension entirely).
+        # Use the op's own dim_index when dim_hints are present; fall back to
+        # spec_dims otherwise, or when the op has no matching dim for a level.
+        op_hints = getattr(op, "dim_hints", [])
+        hint_id_to_dim_index: dict[int, int] = {
+            h.hint_id: h.dim_index
+            for h in op_hints
+            if h.dim_index is not None and not h.is_reduction
+        }
+        op_tiled_dims: list[list[int]] = []
+        for hint_id, count, spec_dims in levels:
+            dim_index = hint_id_to_dim_index.get(hint_id) if op_hints else None
+            if not op_hints:
+                effective = spec_dims  # flat/legacy: no dim_hints, use spec directly
+            elif dim_index is not None:
+                effective = [dim_index]  # use this op's own dim_index
+            else:
+                effective = []  # op has no dim for this level — loop-invariant
+            op_tiled_dims.append(effective)
+            _divide_ranges(op, count, effective)
 
         op.loop_group_id = nested_group_id  # type: ignore[attr-defined]
         op.loop_count = counts  # type: ignore[attr-defined]
-        op.loop_tiled_dims = dims_per_level  # type: ignore[attr-defined]
+        op.loop_tiled_dims = op_tiled_dims  # type: ignore[attr-defined]
 
         logger.debug(
             "coarse_tile: stamped %s loop_group_id=%s loop_count=%s loop_tiled_dims=%s",
             op.get_operation_name(),
             nested_group_id,
             counts,
-            dims_per_level,
+            op_tiled_dims,
         )
 
 
@@ -664,9 +678,9 @@ def _divide_ranges(
         ):
             if int(r) % int(loop_count) != 0:
                 raise RuntimeError(
-                    f"coarse_tile: dimension {i} range {r} is not divisible by "
-                    f"loop_count {loop_count}.  All tiled dimensions must be evenly "
-                    f"divisible by the loop trip count."
+                    f"coarse_tile: op {op.get_name()!r} dimension {i} range {r} "
+                    f"is not divisible by loop_count {loop_count}.  All tiled "
+                    f"dimensions must be evenly divisible by the loop trip count."
                 )
             ranges[i] = sympy.Integer(int(r) // int(loop_count))
         else:

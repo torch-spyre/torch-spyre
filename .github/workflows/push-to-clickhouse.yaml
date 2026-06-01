@@ -35,7 +35,7 @@ jobs:
     name: Ingest XML -> ClickHouse
     runs-on:
       - x86_64
-      - spyre_pf_x1
+      - spyre_pf_x0
       - linux
       - image_torch_spyre
     timeout-minutes: 15

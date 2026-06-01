@@ -12,16 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 from torch._inductor.ir import ComputedBuffer, Operation, MutationLayoutSHOULDREMOVE
 from torch._inductor.graph import GraphLowering
 
+from torch_spyre._inductor.pass_utils import (
+    apply_splits_from_index_coeff,
+    concretize_expr,
+    iteration_space_from_op,
+    splits_by_index_coeff,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
+)
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    BestFitLayoutSolver,
+    FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
@@ -37,6 +49,8 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 
 from torch_spyre._inductor import config
+
+logger = logging.getLogger(__name__)
 
 
 class ScratchpadAllocator(ABC):
@@ -189,7 +203,16 @@ class DefaultAllocator(ScratchpadAllocator):
         """
         size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
         if layout_planning is None:
-            layout_planning = GreedyLayoutSolver(size)
+            if config.layout_solver == "greedy":
+                layout_planning = GreedyLayoutSolver(size)
+            elif config.layout_solver == "bestfit":
+                layout_planning = BestFitLayoutSolver(size)
+            elif config.layout_solver == "firstfit":
+                layout_planning = FirstFitLayoutSolver(size)
+            else:
+                raise ValueError(
+                    f"Invalid layout_solver config option '{config.layout_solver}'."
+                )
         if pre_optimization_passes is None:
             pre_optimization_passes = [CloneInputNodesPass(size)]
         if post_optimization_passes is None:
@@ -213,6 +236,179 @@ class DefaultAllocator(ScratchpadAllocator):
         self._push_allocation(graph, allocation)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
+
+
+DEFAULT_VARIANT_CAP = 6
+
+
+def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
+    """Generate split options based on the seed (current committed
+    split) by flipping the split factor onto a different output dim.
+    Returns ≤ DEFAULT_VARIANT_CAP options with the seed at index 0. If
+    the seed is unsplit or reduction-axis-only, returns the seed alone.
+    """
+    seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    output_splits, reduction_splits = seed
+    if not output_splits or not isinstance(op, ComputedBuffer):
+        return [seed]
+
+    # Recover seed's per-symbol form to mutate the slicing.
+    rw = op.get_read_writes()
+    write_index = next(iter(rw.writes)).index
+    first_read = next(iter(rw.reads), None)
+    read_index = first_read.index if first_read is not None else write_index
+    iter_space = iteration_space_from_op(op)
+    seed_per_sym = apply_splits_from_index_coeff(
+        seed, write_index, read_index, iter_space
+    )
+
+    # v1: only single output-dim splits are flipped. Reduction-axis
+    # splits are skipped (flipping would change has_partial_reduction);
+    # multi-dim splits (e.g. k_fast (1, n, k)) aren't yet handled.
+    sliced_output_syms = [
+        s for s in seed_per_sym if seed_per_sym[s] > 1 and write_index.coeff(s) != 0
+    ]
+    if len(sliced_output_syms) != 1:
+        return [seed]
+    seed_sym = sliced_output_syms[0]
+    seed_factor = int(seed_per_sym[seed_sym])
+
+    options: list[tuple[dict, dict]] = [seed]
+    seen: set[tuple] = {_canonical_key(seed)}
+    for sym, extent in iter_space.items():
+        extent_int = concretize_expr(extent)
+        if (
+            sym is seed_sym
+            or write_index.coeff(sym) == 0
+            or extent_int <= 1
+            or extent_int % seed_factor != 0
+        ):
+            continue
+        variant_per_sym = dict(seed_per_sym)
+        variant_per_sym[seed_sym] = 1
+        variant_per_sym[sym] = seed_factor
+        variant = splits_by_index_coeff(variant_per_sym, write_index, read_index)
+        key = _canonical_key(variant)
+        if key in seen:
+            continue
+        options.append(variant)
+        seen.add(key)
+        if len(options) >= DEFAULT_VARIANT_CAP:
+            break
+    return options
+
+
+def _canonical_key(splits: tuple[dict, dict]) -> tuple:
+    """Hashable key for a (output_splits, reduction_splits) pair."""
+    out, red = splits
+    return (tuple(sorted(out.items())), tuple(sorted(red.items())))
+
+
+class StrategyBCoOptimizingAllocator(DefaultAllocator):
+    """`Strategy B` assumes work_distribution committed one best option (seed). Here we
+    first add a few variants based on the seed, pick the combination that minimizes HBM
+    bytes among all, then defer to DefaultAllocator's flow. As seed is in the search
+    space, the worst case matches DefaultAllocator.
+    """
+
+    def plan_allocation(self, graph: GraphLowering):
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
+
+        # Enumerate options, run search, commit winners back to op_it_space_splits.
+        ops = graph.operations
+        options_per_op = [_enum_split_options(op) for op in ops]
+        best_chosen = self._search(graph, ops, options_per_op)
+
+        for op, opt_idx, options in zip(ops, best_chosen, options_per_op):
+            chosen = options[opt_idx]
+            if chosen != getattr(op, "op_it_space_splits", ({}, {})):
+                op.op_it_space_splits = chosen
+
+        # try insert clone again, as what was incompatible could be compatible now
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
+        # Standard downstream flow on the now-fixed winning splits. Mirrors
+        # DefaultAllocator.plan_allocation past the pre-passes.
+        buffers = self._generate_buffers(graph)
+        allocation = self.layout_planning.plan_layout(buffers)
+        self._push_allocation(graph, allocation)
+        for p in self.post_optimization_passes:
+            p.apply_pass(graph)
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def _search(
+        self,
+        graph: GraphLowering,
+        ops: list[Operation],
+        options_per_op: list[list[tuple[dict, dict]]],
+    ) -> list[int]:
+        """DFS over the option cross-product, scoring each leaf via
+        _score_layout. Returns the option index per op for the leaf
+        with minimum HBM bytes. No early-stop pruning — bounded by
+        ≤ K^N leaves where N counts ops with >1 option (most return
+        [seed]). Per-leaf cost is one full _generate_buffers +
+        plan_layout pass; the `cache` param on _per_core_view_on_buf
+        amortizes sympy work if it ever becomes hot.
+        """
+        chosen: list[int] = [0] * len(ops)
+        best_total: float = math.inf
+        best_chosen: list[int] = list(chosen)
+
+        buf_total_bytes: dict[str, int] = {
+            name: math.prod(buf.layout.device_layout.device_size[:-1]) * 128
+            for name, buf in graph.name_to_buffer.items()
+        }
+
+        def recurse(op_idx: int) -> None:
+            nonlocal best_total, best_chosen
+            if op_idx == len(ops):
+                hbm = self._score_layout(graph, buf_total_bytes)
+                if hbm < best_total:
+                    best_total = hbm
+                    best_chosen = list(chosen)  # list() makes a copy
+                return
+
+            op = ops[op_idx]
+            options = options_per_op[op_idx]
+
+            # Mutate-and-undo: stash and restore op.op_it_space_splits.
+            # If the op originally lacked the attribute, restore it as
+            # ({}, {}) — equivalent to "unset" for all readers (which use
+            # getattr(..., ({}, {})) or hasattr+empty-dict default).
+            prev_split: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+            for opt_idx, option in enumerate(options):
+                op.op_it_space_splits = option
+                chosen[op_idx] = opt_idx
+                recurse(op_idx + 1)
+            op.op_it_space_splits = prev_split
+
+        recurse(0)
+        return best_chosen
+
+    # ------------------------------------------------------------------
+    # Leaf scoring
+    # ------------------------------------------------------------------
+
+    def _score_layout(
+        self,
+        graph: GraphLowering,
+        buf_total_bytes: dict[str, int],
+    ) -> int:
+        """HBM bytes under the current split assignment: total device
+        bytes of every buffer the solver couldn't pin. Non-committing
+        (addresses land on throwaway buffers) and solver-agnostic.
+        """
+        buffers = self._generate_buffers(graph)
+        allocation = self.layout_planning.plan_layout(buffers)
+        pinned_names = {b.name for b in allocation if b.address is not None}
+
+        return sum(
+            total for name, total in buf_total_bytes.items() if name not in pinned_names
+        )
 
 
 def scratchpad_planning(

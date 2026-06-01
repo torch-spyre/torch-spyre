@@ -43,6 +43,7 @@ from oot_upstream_patcher import (
     _OOTModuleDtypePatcher,
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
+    _OOTNativeDeviceTypesPatcher,
 )
 from oot_test_config_models import (
     OOTTestConfig,
@@ -623,6 +624,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
         _OOTOnlyOnPatcher(test, _OOT_DEVICE_TYPE).patch()
+        _OOTNativeDeviceTypesPatcher.patch()
         cls._load_test_suite_config()
 
         # ------------------------------------------------------------------

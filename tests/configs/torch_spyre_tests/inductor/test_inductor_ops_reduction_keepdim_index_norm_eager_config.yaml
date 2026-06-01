@@ -1,0 +1,23 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_min_keepdim.*
+            - TestOps::test_max_keepdim.*
+            - TestOps::test_aminmax_keepdim.*
+            - TestOps::test_sum_keepdim.*
+            - TestOps::test_mean_keepdim.*
+            - TestOps::test_vector_norm_keepdim.*
+            - TestOps::test_matrix_norm_keepdim.*
+            - TestOps::test_linalg_norm_keepdim.*
+            - TestOps::test_argmin_keepdim0
+            - TestOps::test_min_tuple_output_keepdim0
+            - TestOps::test_logsumexp_keepdim0_known_xfail
+            # test_mean has a param named "3d_dim0_keepdim" whose instantiated name
+            # contains "keepdim" — the old .*keepdim.* pattern matched it here.
+            # The base method test_mean belongs to misc, but this one specific param
+            # variant was collected in the reductions shard via substring match.
+            - TestOps::test_mean_3d_dim0_keepdim
+          mode: mandatory_success
