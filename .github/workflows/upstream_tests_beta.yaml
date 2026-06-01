@@ -1,12 +1,6 @@
 name: upstream-pytorch-tests-beta
 
 on:
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - tests/docs/**
-      - docs/**
-      - README.md
   # Run automatically on every merge to main
   push:
     branches: [main]
