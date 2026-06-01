@@ -1,6 +1,7 @@
 name: upstream-pytorch-tests-beta
 
 on:
+  # Run for testing only
   pull_request:
     branches: [main]
     paths-ignore:
