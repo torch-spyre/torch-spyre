@@ -3648,14 +3648,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     64,
                 ),
-		"mistral_model": (
-		    cached_randn((1, 3, 392, 532)),
-		    cached_randn((1024, 3, 14, 14)),
-		    None,
-		    (0, 0),
-		    (1, 1),
-		    1,
-		),
+                "mistral_model": (
+                    cached_randn((1, 3, 392, 532)),
+                    cached_randn((1024, 3, 14, 14)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
                 "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
                     cached_randn((16, 32, 1, 1)),
@@ -5007,7 +5007,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
-            return torch.conv2d(x, weight, bias, stride=stride, padding=padding, groups=groups)
+            return torch.conv2d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
 
         self.compare_with_cpu(
             fn,
