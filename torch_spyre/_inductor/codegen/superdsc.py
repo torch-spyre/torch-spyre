@@ -557,23 +557,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # quantization_double_pad.ddl (used for dl16tofp32 / fp32todl16 and similar
-    # dtype-conversion ops) requires at least one outer spatial loop dimension
-    # beyond the stick dimension.  Two cases produce no outer spatial dim:
-    #
-    #   1. View case: ir.View.create changes the logical shape but does NOT
-    #      update the Spyre FixedTiledLayout, so _get_device_dim_order returns
-    #      op_dim_order=[] (no spatial symbols, only the stick).
-    #
-    #   2. Genuine 1D case: a flat tensor like (5120,) maps x0 to device
-    #      coordinates [x0//64, x0%64].  After symbol_mapping, op_dim_order=
-    #      [out_sym] but out_sym IS op_stick_dim — the same symbol covers both
-    #      the stick and the only outer iteration, leaving no separate outer dim.
-    #
-    # In both cases inject a virtual mb=1 row dimension so SDSC sees a 2D spec
-    # {mb: 1, out: N} instead of 1D {out: N}.  The physical tensors remain 1D;
-    # we post-patch each SDSCArgs with scale=1, stride=<row_stride>, offset=0
-    # for mb after _create_sdsc_tensors runs.
+    # quantization_double_pad.ddl requires an outer spatial dim beyond the stick.
+    # When all op_dim_order symbols collapse into op_stick_dim (empty list for the
+    # ir.View stale-layout case, or a singleton [out_sym] where out_sym IS
+    # op_stick_dim for a genuine 1D tensor), no outer dim exists.  Inject a
+    # virtual mb=1 row so SDSC sees {mb: 1, out: N} instead of {out: N};
+    # SDSCArgs are post-patched with scale=1, stride=row_stride, offset=0 for mb.
     mb_sym: Symbol | None = None
     if (
         DtypeOpTable.is_dtype_op(op_spec.op)
