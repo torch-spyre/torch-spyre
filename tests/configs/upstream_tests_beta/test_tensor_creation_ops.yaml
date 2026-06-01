@@ -30,3 +30,11 @@ test_suite_config:
             - TestTensorCreation::test_tensor_from_non_writable_numpy
             - TestTensorCreation::test_zeros_bounds_checking
           mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: int64
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bfloat16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
