@@ -52,6 +52,7 @@ def generate_bundle(
     specs: Sequence,
     use_symbols: bool | None = None,
     unroll_loops: bool | None = None,
+    symbolic_args: bool | None = None,
 ):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
@@ -78,6 +79,8 @@ def generate_bundle(
         use_symbols = _spyre_config.bundle_hbm_symbols
     if unroll_loops is None:
         unroll_loops = _spyre_config.unroll_loops
+    if symbolic_args is None:
+        symbolic_args = _spyre_config.bundle_symbolic_args
 
     specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
 
@@ -120,6 +123,11 @@ def generate_bundle(
     compiled_iter = iter(compiled)
     addr_counter = [0]
 
+    # Derive how many symbols correspond to kernel tensor args (symbolic_args path).
+    num_tensor_args = (
+        _count_tensor_args(specs_list) if (symbolic_args and use_symbols) else 0
+    )
+
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
 
@@ -133,7 +141,22 @@ def generate_bundle(
             )
 
         f.write("module {\n")
-        f.write("\tfunc.func @sdsc_bundle() {\n")
+
+        # Function signature: emit one !sdscbundle.input_arg<index> param per
+        # tensor arg when symbolic_args is active, otherwise no params.
+        if num_tensor_args > 0:
+            params_str = ", ".join(
+                f"%sym_0_{n}: !sdscbundle.input_arg<index>"
+                for n in range(1, num_tensor_args + 1)
+            )
+            f.write(f"\tfunc.func @sdsc_bundle({params_str}) {{\n")
+            for n in range(1, num_tensor_args + 1):
+                f.write(
+                    f"\t\t%sym_0_{n}_extracted = sdscbundle.input_arg_extract value from"
+                    f" %sym_0_{n} : !sdscbundle.input_arg<index> -> index\n"
+                )
+        else:
+            f.write("\tfunc.func @sdsc_bundle() {\n")
 
         # Standard loop constants (only emitted when there are loops).
         if loop_bounds:
@@ -143,8 +166,12 @@ def generate_bundle(
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
         # One arith.constant per symbol ID (symbols[N] → %sym_{N+1}).
-        # Skipped when use_symbols=False (symbols list is empty in that case).
+        # Tensor-arg symbols (indices 0..num_tensor_args-1) are skipped when
+        # symbolic_args is active — they are replaced by function params above.
+        # Skipped entirely when use_symbols=False (symbols list is empty).
         for sym_idx, value in enumerate(symbols):
+            if sym_idx < num_tensor_args:
+                continue
             f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
         # Recursive body emission.
@@ -160,6 +187,8 @@ def generate_bundle(
             f,
             indent=2,
             use_symbols=use_symbols,
+            symbolic_args=symbolic_args,
+            num_tensor_args=num_tensor_args,
         )
 
         f.write("\t\treturn\n")
@@ -282,8 +311,17 @@ def _emit_specs(
     f,
     indent: int,
     use_symbols: bool = False,
+    symbolic_args: bool = False,
+    num_tensor_args: int = 0,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
+
+    def _resolve_sym(sid: int) -> str:
+        n = abs(sid)
+        if symbolic_args and num_tensor_args > 0 and n <= num_tensor_args:
+            return f"%sym_0_{n}_extracted"
+        return f"%sym_{n}"
+
     tab = "\t" * indent
     for entry in specs:
         if isinstance(entry, LoopSpec):
@@ -304,6 +342,8 @@ def _emit_specs(
                 f,
                 indent + 1,
                 use_symbols=use_symbols,
+                symbolic_args=symbolic_args,
+                num_tensor_args=num_tensor_args,
             )
             f.write(f"{tab}}}\n")
 
@@ -333,7 +373,7 @@ def _emit_specs(
                     map_idx = affine_map_index[stride_key]
                     addr_name = f"%addr_{addr_counter[0]}"
                     addr_counter[0] += 1
-                    base_addr_name = _sym_id_to_mlir_name(base_sym_id)
+                    base_addr_name = _resolve_sym(base_sym_id)
                     loop_var_str = ", ".join(loop_vars)
                     f.write(
                         f"{tab}{addr_name} = affine.apply #map_{map_idx}"
@@ -344,8 +384,7 @@ def _emit_specs(
             # Each operand position matches one symbol_id entry.
             # Tiled sym_ids use the %addr_N computed above; others use %sym_N.
             operands = [
-                sym_id_to_operand.get(sid, _sym_id_to_mlir_name(sid))
-                for sid in symbol_ids
+                sym_id_to_operand.get(sid, _resolve_sym(sid)) for sid in symbol_ids
             ]
 
             operand_str = ", ".join(operands)
@@ -418,6 +457,24 @@ def _sym_id_to_mlir_name(sym_id: int) -> str:
 # ---------------------------------------------------------------------------
 # Helpers re-exported for tests
 # ---------------------------------------------------------------------------
+
+
+def _count_tensor_args(specs: list) -> int:
+    """Derive the kernel tensor-arg count from TensorArg.arg_index in the specs.
+
+    Returns max(arg_index) + 1 across all HBM-allocated TensorArgs found
+    depth-first. Returns 0 if no HBM tensor args are present.
+    """
+    max_idx = -1
+    for entry in specs:
+        if isinstance(entry, LoopSpec):
+            sub = _count_tensor_args(entry.body)
+            max_idx = max(max_idx, sub - 1)
+        elif isinstance(entry, OpSpec):
+            for arg in entry.args:
+                if "hbm" in arg.allocation and arg.arg_index >= 0:
+                    max_idx = max(max_idx, arg.arg_index)
+    return max_idx + 1
 
 
 def _collect_op_specs(specs: list, result: list) -> None:

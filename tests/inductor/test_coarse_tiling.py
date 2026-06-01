@@ -1817,5 +1817,257 @@ class TestTiledSymsForSchedNode(unittest.TestCase):
         self.assertEqual(str(result[0]), "c0")  # H, not c1 (Lq)
 
 
+class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _bundle(self, specs, symbolic_args=False, fake_compile=None):
+        if fake_compile is None:
+            fake_compile = _fake_compile_op_spec
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=fake_compile,
+        ):
+            generate_bundle(
+                "test_kernel",
+                self.tmpdir,
+                specs,
+                use_symbols=True,
+                unroll_loops=False,
+                symbolic_args=symbolic_args,
+            )
+        return _read_mlir(self.tmpdir)
+
+    def _make_op_spec_with_hbm_args(self, name: str, arg_indices: list) -> OpSpec:
+        """Minimal OpSpec whose TensorArgs have the given arg_indices and hbm allocation."""
+        c0 = Symbol("c0")
+        args = [
+            TensorArg(
+                is_input=(i == 0),
+                arg_index=idx,
+                device_dtype=_FP16,
+                device_size=[2, 64],
+                device_coordinates=[Integer(0), c0],
+                allocation={"hbm": 0x400000000 * (idx + 1)},
+            )
+            for i, idx in enumerate(arg_indices)
+        ]
+        return OpSpec(
+            op=name,
+            is_reduction=False,
+            iteration_space={c0: (Integer(128), 1)},
+            args=args,
+            op_info={},
+        )
+
+    def test_signature_accepts_symbolic_args_param(self):
+        a = _make_minimal_op_spec("a")
+        mlir = self._bundle([a], symbolic_args=False)
+        self.assertIn("sdsc_execute", mlir)
+
+    def test_func_signature_has_params_for_tensor_args(self):
+        a = self._make_op_spec_with_hbm_args("a", [0, 1])
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            for i, arg in enumerate(op_spec.args):
+                symbols.append(arg.allocation["hbm"])
+            ids = [-(symbol_id_offset + i + 1) for i in range(len(op_spec.args))]
+            json_out = {
+                f"{idx}_{op_spec.op}": {
+                    "numCoresUsed_": 1,
+                    "dscs_": [
+                        {
+                            "op": {
+                                "scheduleTree_": [
+                                    {
+                                        "component_": "hbm",
+                                        "startAddressCoreCorelet_": {
+                                            "data_": {"[0, 0, 0]": str(ids[j])}
+                                        },
+                                    }
+                                    for j in range(len(op_spec.args))
+                                ]
+                            }
+                        }
+                    ],
+                }
+            }
+            return (
+                json_out,
+                [arg.allocation["hbm"] for arg in op_spec.args],
+                [{} for _ in op_spec.args],
+            )
+
+        mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
+
+        self.assertIn(
+            "func.func @sdsc_bundle("
+            "%sym_0_1: !sdscbundle.input_arg<index>,"
+            " %sym_0_2: !sdscbundle.input_arg<index>)",
+            mlir,
+        )
+        self.assertIn(
+            "%sym_0_1_extracted = sdscbundle.input_arg_extract value from"
+            " %sym_0_1 : !sdscbundle.input_arg<index> -> index",
+            mlir,
+        )
+        self.assertIn(
+            "%sym_0_2_extracted = sdscbundle.input_arg_extract value from"
+            " %sym_0_2 : !sdscbundle.input_arg<index> -> index",
+            mlir,
+        )
+        self.assertNotIn("arith.constant 17179869184", mlir)
+        self.assertNotIn("arith.constant 34359738368", mlir)
+
+    def test_sdsc_execute_uses_extracted_names(self):
+        a = self._make_op_spec_with_hbm_args("a", [0])
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(op_spec.args[0].allocation["hbm"])
+            return (
+                _make_tiled_json(idx, sym_id),
+                [op_spec.args[0].allocation["hbm"]],
+                [{}],
+            )
+
+        mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
+
+        self.assertIn("sdscbundle.sdsc_execute (%sym_0_1_extracted)", mlir)
+        self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
+        self.assertNotIn("sdsc_execute (%sym_1)", mlir)
+
+    def test_non_tensor_arg_symbols_remain_as_constants(self):
+        c0 = Symbol("c0")
+        op_a = self._make_op_spec_with_hbm_args("a", [0])
+        # op_b: arg_index=-1, not a kernel arg (intermediate buffer)
+        op_b = OpSpec(
+            op="b",
+            is_reduction=False,
+            iteration_space={c0: (Integer(128), 1)},
+            args=[
+                TensorArg(
+                    is_input=True,
+                    arg_index=-1,
+                    device_dtype=_FP16,
+                    device_size=[2, 64],
+                    device_coordinates=[Integer(0), c0],
+                    allocation={"hbm": 0x0},
+                )
+            ],
+            op_info={},
+        )
+        call_count = [0]
+        values = [0x400000000, 0x0]
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            i = call_count[0]
+            call_count[0] += 1
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(values[i])
+            return _make_tiled_json(idx, sym_id), [values[i]], [{}]
+
+        mlir = self._bundle([op_a, op_b], symbolic_args=True, fake_compile=fake)
+
+        # First sym → parameter (tensor arg at arg_index=0)
+        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("arith.constant 17179869184", mlir)
+        # Second sym → constant (intermediate, arg_index=-1)
+        self.assertIn("arith.constant 0 : index", mlir)
+
+    def test_symbolic_args_false_no_params(self):
+        a = self._make_op_spec_with_hbm_args("a", [0])
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(op_spec.args[0].allocation["hbm"])
+            return (
+                _make_tiled_json(idx, sym_id),
+                [op_spec.args[0].allocation["hbm"]],
+                [{}],
+            )
+
+        mlir = self._bundle([a], symbolic_args=False, fake_compile=fake)
+
+        self.assertIn("func.func @sdsc_bundle()", mlir)
+        self.assertNotIn("input_arg", mlir)
+        self.assertIn("arith.constant 17179869184", mlir)
+
+    def test_multi_sdsc_two_tensor_args_snapshot(self):
+        """Two tensor args on first op; remaining ops use arith.constant symbols."""
+        op0 = self._make_op_spec_with_hbm_args("op0", [0, 1])
+        ops_rest = [_make_minimal_op_spec(f"op{i}") for i in range(1, 5)]
+        call_count = [0]
+        # sym values: first two are tensor args, rest are intermediates
+        sym_values = [
+            0x400000000,
+            0x800000000,  # op0: tensor args
+            0x0,
+            0x400000000,
+            0x800000000,  # op1
+            0x800000000,
+            0xC00000000,  # op2
+            0xC00000000,
+            0x1000000000,  # op3
+            0xC00000000,
+            0x1000000000,
+            0x1400000000,  # op4
+        ]
+        sym_counts = [2, 3, 2, 2, 3]
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            i = call_count[0]
+            call_count[0] += 1
+            n = sym_counts[i]
+            start = sum(sym_counts[:i])
+            local_ids = [-(symbol_id_offset + j + 1) for j in range(n)]
+            for v in sym_values[start : start + n]:
+                symbols.append(v)
+            json_out = {
+                f"{idx}_{op_spec.op}": {
+                    "numCoresUsed_": 1,
+                    "dscs_": [
+                        {
+                            "op": {
+                                "scheduleTree_": [
+                                    {
+                                        "component_": "hbm",
+                                        "startAddressCoreCorelet_": {
+                                            "data_": {"[0, 0, 0]": str(local_ids[j])}
+                                        },
+                                    }
+                                    for j in range(n)
+                                ]
+                            }
+                        }
+                    ],
+                }
+            }
+            return json_out, sym_values[start : start + n], [{} for _ in range(n)]
+
+        mlir = self._bundle([op0] + ops_rest, symbolic_args=True, fake_compile=fake)
+
+        # Func signature has 2 params (arg_index 0 and 1)
+        self.assertIn(
+            "func.func @sdsc_bundle("
+            "%sym_0_1: !sdscbundle.input_arg<index>,"
+            " %sym_0_2: !sdscbundle.input_arg<index>)",
+            mlir,
+        )
+        self.assertIn("%sym_0_1_extracted = sdscbundle.input_arg_extract", mlir)
+        self.assertIn("%sym_0_2_extracted = sdscbundle.input_arg_extract", mlir)
+        # First sdsc_execute uses extracted names
+        self.assertIn(
+            "sdscbundle.sdsc_execute (%sym_0_1_extracted, %sym_0_2_extracted)", mlir
+        )
+        # No %sym_0_3 — only two tensor args
+        self.assertNotIn("%sym_0_3", mlir)
+
+
 if __name__ == "__main__":
     unittest.main()
