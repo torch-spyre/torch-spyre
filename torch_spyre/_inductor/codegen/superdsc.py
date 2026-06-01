@@ -229,7 +229,6 @@ def _get_device_dim_order(
         for sym in expr.free_symbols:
             if sym not in dim_order:
                 dim_order.append(sym)
-    print(f"In _get_device_dim_order: arg: {arg} dim_order: {dim_order} stick_dim: {stick_dim}")
     return dim_order, stick_dim
 
 

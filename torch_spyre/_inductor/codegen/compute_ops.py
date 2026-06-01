@@ -351,7 +351,7 @@ def generate_sdsc(
                 "sdscFolds_": {
                     "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],
                     "dim_prop_attr": [{"factor_": 1, "label_": "time"}],
-                    #"data_": {"[0]": "0"},
+                    "data_": {"[0]": "0"},
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},

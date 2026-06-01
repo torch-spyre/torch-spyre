@@ -705,9 +705,10 @@ def conv2d_via_bmm_decomp(
     pad_h, pad_w = padding[0], padding[1]
     dil_h, dil_w = dilation[0], dilation[1]
 
-    assert C_in == groups * C_in_per_group, (
-        f"C_in ({C_in}) != groups ({groups}) * C_in_per_group ({C_in_per_group})"
-    )
+    if C_in != groups * C_in_per_group:
+        raise Unsupported(
+            f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
+        )
 
     H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
     W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
