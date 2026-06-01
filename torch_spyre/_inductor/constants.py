@@ -22,6 +22,7 @@ FP32TODL16_OP = "fp32todl16"
 
 DEVICE_NAME = "spyre"
 
+
 SEGMENT_OFFSETS = [
     0x0,
     0x400000000,
