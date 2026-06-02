@@ -763,6 +763,71 @@ def test_wrong_optimal_cost_fails():
         _compare(func, a, b, c, d, e, optimal_cost=0)
 
 
+# ------- Constant tensor STL tests ---------
+
+
+def test_constant_plus_xt():
+    """ones_like(x) + x.t() — constant tensor should adopt x.t()'s stick, cost 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda x: torch.ones_like(x) + x.t(), x, optimal_cost=0)
+
+
+def test_constant_in_conflict_chain():
+    """ones_like(x) + x.t() + y — constant adopts winning STL, doesn't add to conflict cost."""
+    x, y = _make_tensors(2, S, S)
+    _compare(lambda x, y: torch.ones_like(x) + x.t() + y, x, y, optimal_cost=S * S)
+
+
+def test_constant_matmul_x():
+    """ones_like(y) @ y — constant should get col-major STL that matmul x needs, cost 0."""
+    y = _make_tensors(1, S, S)[0]
+    _compare(lambda y: torch.ones_like(y) @ y, y, optimal_cost=0)
+
+
+def test_two_constants_plus_xt():
+    """ones_like(x) + zeros_like(x) + x.t() — two flexible constants, cost still 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(
+        lambda x: torch.ones_like(x) + torch.zeros_like(x) + x.t(), x, optimal_cost=0
+    )
+
+
+def test_full_plus_xt():
+    """torch.full + x.t() — full tensor constant should adopt x.t()'s stick, cost 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(
+        lambda x: torch.full((S, S), 0.5, dtype=torch.float16, device=x.device) + x.t(),
+        x,
+        optimal_cost=0,
+    )
+
+
+def test_fill_plus_xt():
+    """empty_like + fill_ + x.t() — mutation-based constant should adopt x.t()'s stick, cost 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+
+    def fn(x):
+        e = torch.empty_like(x)
+        e.fill_(1.0)
+        return e + x.t()
+
+    _compare(fn, x, optimal_cost=0)
+
+
+def test_arange_plus_xt():
+    """arange.view + x.t() — correctness check only.
+
+    arange lowers to FallbackKernel which gets a fixed generic layout, so the
+    downstream add may still need a restickify.  No optimal_cost asserted.
+    """
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(
+        lambda x: torch.arange(S * S, dtype=torch.float16, device=x.device).view(S, S)
+        + x.t(),
+        x,
+    )
+
+
 # ------- Unsupported stick configurations ---------
 
 
