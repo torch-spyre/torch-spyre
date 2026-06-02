@@ -43,6 +43,7 @@ from oot_upstream_patcher import (
     _OOTModuleDtypePatcher,
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
+    _OOTNativeDeviceTypesPatcher,
 )
 from oot_test_config_models import (
     OOTTestConfig,
@@ -332,6 +333,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     ] = {}  # {module_name -> config}
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
+    GLOBAL_DTYPE_FORCE_XFAIL: Set[torch.dtype] = set()
 
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
@@ -382,6 +384,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.GLOBAL_SUPPORTED_DTYPES = config.global_config.resolved_supported_dtypes()
         cls.GLOBAL_DTYPE_PRECISION = (
             config.global_config.resolved_supported_dtypes_precision()
+        )
+        cls.GLOBAL_DTYPE_FORCE_XFAIL = (
+            config.global_config.resolved_supported_dtypes_force_xfail()
         )
 
         file_entry: FileEntry = resolve_current_file(config, path)
@@ -597,6 +602,14 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             if op_cfg is not None and op_cfg.force_xfail:
                 effective_mode = MODE_XFAIL
 
+        if effective_mode == MODE_MANDATORY_SUCCESS and dtype_str:
+            try:
+                dtype = parse_dtype(dtype_str)
+                if dtype in cls.GLOBAL_DTYPE_FORCE_XFAIL:
+                    effective_mode = MODE_XFAIL
+            except ValueError:
+                pass
+
         # resolve final decision
         if effective_mode == MODE_SKIP:
             return False, "Skipped by OOT config", False, False
@@ -623,6 +636,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
         _OOTOnlyOnPatcher(test, _OOT_DEVICE_TYPE).patch()
+        _OOTNativeDeviceTypesPatcher.patch()
         cls._load_test_suite_config()
 
         # ------------------------------------------------------------------

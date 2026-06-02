@@ -61,6 +61,8 @@ IGNORED_TEST_FILES=(
 # (e.g. example/template configs that are not real test suites).
 IGNORED_CONFIGS=(
   "example_test_config.yaml"   # example template — not a real test suite
+  # "torch_spyre_tests/inductor/test_inductor_ops_config.yaml" # added now to test sharding strategies, ignore for cicd ocverage
+  # #  not delete.
 )
 
 # ── Argument parsing ──────────────────────────────────────────────────────────

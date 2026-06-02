@@ -15,7 +15,6 @@
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
-import torch_spyre._C as _C
 import warnings
 import functools
 import inspect
@@ -194,7 +193,7 @@ def spyre__copy_from(self, dst, non_blocking=False):
     if (self.device.type == "cpu" and dst.device.type == "spyre") or (
         self.device.type == "spyre" and dst.device.type == "cpu"
     ):
-        _C.copy_tensor(self, dst, non_blocking)
+        torch_spyre._C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
         torch.ops.spyre.copy_from_d2d(self, dst)
