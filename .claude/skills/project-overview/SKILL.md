@@ -220,6 +220,17 @@ python3 -m pytest tests/inductor/        # Compiled ops
 python3 -m pytest tests/tensor/           # Layout tests
 ```
 
+> **CRITICAL — Spyre device is exclusively owned per process.**
+> Importing `torch_spyre` causes the process to acquire the Spyre hardware
+> device exclusively. No second process can load `torch_spyre` until the
+> first exits. Consequences:
+>
+> - **Never run pytest with `-n`, `-n auto`, xdist, or any parallel runner.**
+> - **Never dispatch two subagents that both run tests concurrently.**
+> - In multi-agent workflows: parallelize investigation/coding; serialize all
+>   test execution through a single process. See the `spyre-subagent-testing`
+>   skill for orchestration patterns.
+
 Key test patterns:
 
 - `compare_with_cpu(fn, *inputs)` — runs fn on CPU vs Spyre via torch.compile,

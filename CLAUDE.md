@@ -27,6 +27,18 @@ python3 -m pytest tests/
 pre-commit run --all-files
 ```
 
+> **CRITICAL — Spyre device is exclusively owned per process.**
+> Loading `torch_spyre` gives the process exclusive access to the Spyre
+> device until it exits. A second process that loads `torch_spyre` cannot
+> acquire the device and will fail or hang. This affects both local runs
+> and multi-agent workflows:
+>
+> - **Never** run pytest with `-n`, `-n auto`, xdist, or any parallel runner.
+> - **Never** dispatch two subagents that both run tests concurrently.
+> - In multi-agent workflows: parallelize investigation and code changes;
+>   funnel all test execution through a single sequential process at the end.
+>   See the `spyre-subagent-testing` skill for the full orchestration pattern.
+
 Test sub-suites:
 
 | Suite | Path |
@@ -85,6 +97,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **write-spyre-op-test** — compiled-path op test framework and patterns
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
+- **spyre-subagent-testing** — orchestration rules for multi-agent workflows involving tests
 - **write-rfc** — design proposal workflow (RFCs now at https://github.com/torch-spyre/rfcs)
 
 ### Writing SKILL.md Files

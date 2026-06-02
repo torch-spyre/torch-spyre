@@ -202,6 +202,11 @@ execute the compiled binary.
 
 ## Common Debugging Workflow
 
+> **CRITICAL — never run Spyre tests in parallel.**
+> Loading `torch_spyre` gives the process **exclusive access** to the Spyre
+> device until exit. Never use `-n`, pytest-xdist, or any parallel runner —
+> a second process cannot acquire the device and will fail or hang.
+
 1. **Reproduce** with minimal model and `SENCORES=1`
 2. **Set env vars**: `TORCH_SPYRE_DEBUG=1 TORCH_COMPILE_DEBUG=1
    TORCH_LOGS="+inductor"`

@@ -198,3 +198,9 @@ python3 -m pytest tests/_inductor/test_inductor_ops.py -k "test_my_op"
 # All tests
 python3 -m pytest tests/
 ```
+
+> **CRITICAL — never run Spyre tests in parallel.**
+> Loading `torch_spyre` gives the process **exclusive access** to the Spyre
+> device until the process exits. Never use `-n`, `-n auto`, pytest-xdist,
+> or any parallel test runner — a second process cannot acquire the device
+> and will fail or hang. Always run pytest as a single sequential process.
