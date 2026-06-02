@@ -1007,6 +1007,70 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         self.assertIn("1024", src, "Expected per-tile col count 1024")
 
     # ------------------------------------------------------------------
+    # Unrolled nested loops via hints: source calls sdsc
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": True,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_unrolled_source_calls_sdsc(self):
+        """Nested K=2 × M=4 hint tiling with unroll_loops=True compiles cleanly.
+
+        The generated wrapper passes a LoopSpec to async_compile.sdsc().
+        SpyreAsyncCompile.sdsc() calls unroll_loop_specs internally before
+        invoking generate_bundle.  The source must still contain LoopSpec (it
+        is part of the sdsc() call-site), and subprocess.run must be called
+        (the dxp_standalone invocation after successful unrolling+bundling).
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 1024, 4096
+        a = torch.randn(A, B, dtype=torch.float16)
+        b = torch.randn(A, B, dtype=torch.float16)
+        c = torch.randn(A, B, dtype=torch.float16)
+
+        def fn(a, b, c):
+            with spyre_hint(slices={"A": 2}):
+                with spyre_hint(slices={"B": 4}):
+                    y = a + b
+                    z = y * c
+                    return z
+
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        c_dev = c.to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(a_dev, ["A", "B"])
+        _name_tensor_dims(b_dev, ["A", "B"])
+        _name_tensor_dims(c_dev, ["A", "B"])
+
+        cfn = torch.compile(fn)
+        subprocess_calls = []
+
+        def _record_subprocess(*args, **kwargs):
+            subprocess_calls.append(args)
+
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch("subprocess.run", side_effect=_record_subprocess),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src)
+        self.assertTrue(
+            len(subprocess_calls) > 0,
+            "Expected subprocess.run to be called (dxp_standalone invocation)",
+        )
+
+    # ------------------------------------------------------------------
     # Two ops with different slice counts -> two separate groups
     # ------------------------------------------------------------------
 
