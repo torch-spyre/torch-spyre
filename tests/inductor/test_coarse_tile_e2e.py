@@ -22,15 +22,12 @@ No Spyre hardware is required: torch.compile() exercises the full codegen path
 and run_and_get_code() captures the generated source without executing on device.
 launch_kernel is mocked to prevent actual device execution.
 
-Tested scenarios
-----------------
-- test_no_tiling_baseline: confirm LoopSpec is absent when coarse_tiling=False.
-- test_single_group_tiles_pointwise: tile a pointwise op into K=4 iterations;
-  assert LoopSpec(count=sympify('4'), ...) appears in generated source.
-- test_softmax_shaped_tiling: tile the pointwise-reduce-pointwise chain that
-  softmax lowers to; assert all stages land in a single LoopSpec.
-- test_two_groups: two separate tiling groups produce two LoopSpec entries.
-- test_generate_bundle_receives_loop_spec: verify generate_bundle sees LoopSpec.
+Test classes
+------------
+- TestCoarseTileGroupsFnResidual: tests using coarse_tiling_groups_fn that
+  have not yet been ported to spyre_hints (tiled_dims and baseline tests).
+- TestCoarseTileSpyreHints: the primary test class; all new coarse-tiling
+  tests should be added here using the spyre_hint API.
 """
 
 import sys
@@ -67,31 +64,12 @@ def _groups_all_k4(operations: list[Operation]):
     return [(ops, sympy.Integer(4))] if ops else []
 
 
-def _groups_split_k4_k8(operations: list[Operation]):
-    """Two groups: first ComputedBuffer at K=4, remainder at K=8."""
-    ops = [op for op in operations if isinstance(op, ComputedBuffer)]
-    groups = []
-    if ops[:1]:
-        groups.append((ops[:1], sympy.Integer(4)))
-    if ops[1:]:
-        groups.append((ops[1:], sympy.Integer(8)))
-    return groups
-
-
 def _groups_nested_k2_m4(operations: list[Operation]):
     """One group: all ops share nested K=2 outer (dim 0) / M=4 inner (dim 1) loops."""
     ops = [op for op in operations if isinstance(op, ComputedBuffer)]
     if not ops:
         return []
     return [(ops, [(0, sympy.Integer(2), [0]), (0, sympy.Integer(4), [1])])]
-
-
-def _groups_nested_k2_m2(operations: list[Operation]):
-    """One group: all ops share nested K=2 outer (dim 0) / M=2 inner (dim 1) loops."""
-    ops = [op for op in operations if isinstance(op, ComputedBuffer)]
-    if not ops:
-        return []
-    return [(ops, [(0, sympy.Integer(2), [0]), (0, sympy.Integer(2), [1])])]
 
 
 def _groups_per_op_tiled_dim(operations: list[Operation]):
@@ -112,12 +90,28 @@ def _groups_per_op_tiled_dim(operations: list[Operation]):
     return groups
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Residual coarse_tiling_groups_fn tests
+#
+# These tests exercise capabilities not yet expressible via spyre_hints:
+#   - test_per_group_tiled_dims: per-group tiled_dims=[0, 1] override
+#     (multi-dim flat tiling in one group, not a nested loop nest)
+#
+# test_no_tiling_baseline and the unrolled-loop tests are kept here until
+# the groups_fn config is removed; their hint-based equivalents already
+# exist in TestCoarseTileSpyreHints.
+#
+# See PR 2 for the tiled_dims extension to spyre_hints; PR 3 removes this
+# class and coarse_tiling_groups_fn entirely.
+# ===========================================================================
 
 
-class TestCoarseTileEndToEnd(InductorTestCase):
+class TestCoarseTileGroupsFnResidual(InductorTestCase):
+    """Residual tests using coarse_tiling_groups_fn.
+
+    Kept until spyre_hints covers all scenarios.  See class docstring above.
+    """
+
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
@@ -211,25 +205,8 @@ class TestCoarseTileEndToEnd(InductorTestCase):
             "Expected loop count 4 in generated source",
         )
 
-
-# ===========================================================================
-# Unrolled loop execution tests (unroll_loops=True)
-# ===========================================================================
-
-
-class TestCoarseTileUnrollEndToEnd(InductorTestCase):
-    """Tests for coarse tiling with loop unrolling (unroll_loops=True).
-
-    When unroll_loops=True, LoopSpec nodes are fully unrolled before
-    generate_bundle so no scf.for is emitted.  Each iteration becomes an
-    independent OpSpec with concrete per-iteration HBM addresses.
-    """
-
-    def setUp(self):
-        super().setUp()
-        torch.manual_seed(0xAFFE)
-
     # ------------------------------------------------------------------
+    # Unrolled loop execution tests (unroll_loops=True)
     # Source inspection: unrolling passes LoopSpec through async_compile
     # with concrete per-iteration HBM addresses in each unrolled OpSpec.
     # ------------------------------------------------------------------
