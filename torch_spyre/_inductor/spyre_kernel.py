@@ -514,7 +514,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        _ = self.args.output(name)
+        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
+        # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
+        if "pool" not in layout.allocation:
+            _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -570,7 +574,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        _ = self.args.output(name)
+        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
+        # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
+        if "pool" not in layout.allocation:
+            _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)

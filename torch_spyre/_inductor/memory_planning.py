@@ -23,6 +23,7 @@ from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout
+from .scheduler import CountedLoopSchedulerNode
 from .logging_utils import get_inductor_logger, _get_env_bool
 
 logger = get_inductor_logger("MEMORY_PLANNING")
@@ -108,9 +109,9 @@ def _compute_size_bytes(name: str) -> int:
 
 def _compute_live_ranges(
     nodes: list[BaseSchedulerNode],
-    intermediates: set[str],
+    pool_candidates: set[str],
 ) -> dict[str, tuple[int, int]]:
-    """Return {buf_name: (start_step, end_step)} for each intermediate.
+    """Return {buf_name: (start_step, end_step)} for each pool candidate.
 
     start_step: timestep of the node that writes the buffer.
     end_step: last timestep at which any node reads the buffer.
@@ -121,24 +122,30 @@ def _compute_live_ranges(
     for idx, node in enumerate(nodes):
         rw = node.read_writes
         for dep in rw.writes:
-            if dep.name in intermediates:
+            if dep.name in pool_candidates:
                 start[dep.name] = idx
         for dep in rw.reads:
-            if dep.name in intermediates:
+            if dep.name in pool_candidates:
                 end[dep.name] = idx
 
     live_ranges: dict[str, tuple[int, int]] = {}
-    for name in intermediates:
+    for name in pool_candidates:
         if name in start:
             live_ranges[name] = (start[name], end.get(name, len(nodes) + 1))
     return live_ranges
 
 
 def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-    """Assign intermediate tensors addresses in the same segment.
-    Identifies intermediate buffers (not graph inputs/outputs, not already LX-allocated), performs
-    live range analysis, and assigns layout.allocation["pool"] = address so
-    that non-overlapping intermediates share a hbm segment.
+    """Pool-allocate buffers so non-overlapping tensors share the HBM intermediates segment.
+
+    Collects pool candidates from two sources:
+    - Kernel intermediates: buffers both written and read within the graph,
+      detected via written & read sets on ComputedBuffer nodes.
+    - Buffers tagged by coarse_tile.py with allocation["pool_pending"] = True.
+      These are ExternKernel nodes invisible to the written & read path above.
+
+    For each candidate, assigns layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset.
+    Graph inputs/outputs and LX-allocated buffers are excluded.
     """
 
     if not _MEMORY_PLAN_ENABLED:
@@ -154,7 +161,22 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         ExternKernelSchedulerNode,
         NopKernelSchedulerNode,
     )
-    non_kernel_nodes = [n for n in nodes if not isinstance(n, _kernel_arg_types)]
+
+    # build_loop_scheduler_nodes may have already run in pre-fusion, wrapping
+    # tiled ops into CountedLoopSchedulerNodes.  Flatten them so individual ops
+    # are visible at distinct timesteps for written/read detection and live-range
+    # analysis.
+    def _iter_all_nodes(
+        node_list: list[BaseSchedulerNode],
+    ):
+        for n in node_list:
+            if isinstance(n, CountedLoopSchedulerNode):
+                yield from _iter_all_nodes(n.get_nodes())
+            else:
+                yield n
+
+    flat_nodes: list[BaseSchedulerNode] = list(_iter_all_nodes(nodes))
+    non_kernel_nodes = [n for n in flat_nodes if not isinstance(n, _kernel_arg_types)]
 
     written = {
         dep.name
@@ -179,7 +201,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         and isinstance(layout := io_buf.get_layout(), FixedTiledLayout)
     }
 
-    def _is_intermediate(name: str) -> bool:
+    def _is_kernel_intermediate(name: str) -> bool:
         buf = V.graph.get_buffer(name)
         if buf is None:
             return False
@@ -190,14 +212,34 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             and id(layout.allocation) not in io_alloc_ids
         )
 
-    intermediates = {
-        name for name in (written & read) - io_names if _is_intermediate(name)
+    # Source 1: buffers written and read within the graph (kernel intermediates).
+    pool_candidates: set[str] = {
+        name for name in (written & read) - io_names if _is_kernel_intermediate(name)
     }
-    if not intermediates:
+
+    # Source 2: buffers tagged by coarse_tile.py with allocation["pool_pending"].
+    # These are ExternKernel nodes excluded from non_kernel_nodes above.
+    for n in flat_nodes:
+        if n.read_writes.writes:
+            name = next(iter(n.read_writes.writes)).name
+            buf = V.graph.get_buffer(name)
+            layout = buf.layout if isinstance(buf.layout, FixedTiledLayout) else None
+            if (
+                layout is not None
+                and "pool_pending" in layout.allocation
+                and "lx" not in layout.allocation
+            ):
+                pool_candidates.add(name)
+                logger.debug(
+                    "memory_planning: adding coarse-tile full buffer %s to pool candidates",
+                    name,
+                )
+
+    if not pool_candidates:
         V.graph.pool_size = 0
         return nodes
 
-    live_ranges = _compute_live_ranges(nodes, intermediates)
+    live_ranges = _compute_live_ranges(flat_nodes, pool_candidates)
 
     # Sort by start step so the allocator processes tensors in execution order.
     sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
@@ -206,6 +248,10 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     # Track (end_step, offset, size) so we can free blocks promptly.
     pending_frees: list[tuple[int, int, int]] = []
+    # In coarse_tile case 2 (mutation), the tiled op's layout and full_buf's
+    # layout share the same allocation dict object, so both names appear in
+    # intermediates but must only be allocated once.  Track by dict id.
+    assigned_alloc_ids: set[int] = set()
 
     for name, (start, end) in sorted_bufs:
         # Free any blocks whose live range ended before this start step.
@@ -218,14 +264,23 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
                 still_live.append(entry)
         pending_frees = still_live
 
-        size = _compute_size_bytes(name)
-        offset = allocator.allocate(size)
-
-        # Assign HBM address directly to layout.allocation.
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         assert isinstance(layout, FixedTiledLayout)
+
+        if id(layout.allocation) in assigned_alloc_ids:
+            logger.debug(
+                "memory_planning: %s shares alloc dict with already-assigned buffer, skipping",
+                name,
+            )
+            continue
+
+        size = _compute_size_bytes(name)
+        offset = allocator.allocate(size)
+
+        layout.allocation.pop("pool_pending", None)
         layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
+        assigned_alloc_ids.add(id(layout.allocation))
 
         pending_frees.append((end, offset, size))
 
@@ -242,7 +297,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     pool_extent = allocator.get_pool_end()
     logger.info(
         "memory_planning: assigned %d intermediates, peak concurrent usage %.2f GB, pool extent %.2f GB / %.2f GB",
-        len(sorted_bufs),
+        len(live_ranges),
         peak / (1024**3),
         pool_extent / (1024**3),
         SEGMENT_SIZE / (1024**3),

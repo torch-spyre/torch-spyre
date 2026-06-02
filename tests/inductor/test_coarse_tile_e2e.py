@@ -1265,7 +1265,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
-    @unittest.skip("TODO: coarse tiling correctness not yet resolved")
     @config.patch({"coarse_tiling": True})
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) and Lk (2 slices) via nested spyre_hints."""
@@ -1329,7 +1328,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             result,
             ref,
             equal_nan=True,
-            atol=1.0,
+            atol=0.01,
             rtol=0.1,
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
