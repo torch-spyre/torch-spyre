@@ -121,7 +121,7 @@ PrivateUse1
   PyTorch's official extension mechanism for out-of-tree backends.
   Torch-Spyre uses it to register `"spyre"` as a first-class device
   name without forking PyTorch. See
-  [Runtime Overview](../runtime/overview.md).
+  [Runtime](../runtime/index.md).
 
 PT
   The Processing Tensor execution unit on each corelet. Backed by the

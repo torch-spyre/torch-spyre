@@ -329,4 +329,4 @@ Constraints that show up as compile-time errors or unexpected behavior:
 - Dig into a specific area:
   [Tensor Layouts](../user_guide/tensors_and_layouts.md),
   [Compiler Architecture](../compiler/architecture.md),
-  [Runtime Overview](../runtime/overview.md).
+  [Runtime](../runtime/index.md).
