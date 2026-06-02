@@ -37,6 +37,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import (
+    ElementArrangement,
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
@@ -164,11 +165,18 @@ def _single_arg_op_layout(
                 c_size = outer_sizes + [in_elems_per_stick]
                 c_stride = outer_strides + [1]
 
+                fmt = (
+                    ElementArrangement.DL16_TO_FP32
+                    if in_layout.dtype == torch.float16
+                    and output.dtype == torch.float32
+                    else ElementArrangement.STANDARD
+                )
                 return SpyreTensorLayout(
                     c_size,
                     c_stride,
                     output.dtype,
                     list(range(len(c_size))),
+                    fmt,
                 )
 
             c_size = [concretize_expr(s) for s in output.size]
@@ -236,7 +244,9 @@ def _exx2_layout(
     out_dim_order = list(range(len(output.size))) + [-1]
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
+    )
     reduction_var = _find_reduction_var(x.dep, output_dep, "exx2")
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl])
