@@ -1071,6 +1071,53 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
+    # Unrolled softmax-shaped execution via hints
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "unroll_loops": True,
+            "sencores": 1,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_unrolled_softmax_shaped_execution(self):
+        """Unrolled K=4 hint-tiled softmax-shaped pointwise+reduce chain.
+
+        Tiles the batch dimension (dim 0) of a softmax-like computation using
+        spyre_hint(slices={"B": 4}).  sencores=1 avoids core-division issues.
+        The reductions collapse dim 1 (D); the loop tiles dim 0 (B), so no
+        tiled dim overlaps with the reduction dim.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 256, 64
+        x = torch.randn(B, D, dtype=torch.float16)
+
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+
+        def softmax_fn(x):
+            _name_tensor_dims(x, ["B", "D"])
+            with spyre_hint(slices={"B": 4}):
+                max_val = x.amax(dim=-1, keepdim=True)
+                x_shifted = x - max_val
+                exp_x = x_shifted.exp()
+                sum_exp = exp_x.sum(dim=-1, keepdim=True)
+                return exp_x / sum_exp
+
+        compare_with_cpu(
+            softmax_fn,
+            x,
+            run_compile=True,
+            run_eager=False,
+            atol=0.1,
+            rtol=0.1,
+        )
+
+    # ------------------------------------------------------------------
     # Two ops with different slice counts -> two separate groups
     # ------------------------------------------------------------------
 
