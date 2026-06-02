@@ -246,7 +246,7 @@ def get_per_core_span(
             # span is a hardware-bound quantity that must be compared against
             # MAX_SPAN_BYTES, so concretization here is the right boundary.
             # TODO(issue#1372): Symbolic work division will keep this symbolic.
-            R = concretize_expr(it_space_orig[v]) // splits.get(v, 1)
+            R = concretize_expr(it_space_orig.get(v, 1)) // splits.get(v, 1)
             per_core_max += int(term.subs(v, R - 1))
             per_core_min += int(term.subs(v, 0))
         per_core_size = per_core_max - per_core_min + 1

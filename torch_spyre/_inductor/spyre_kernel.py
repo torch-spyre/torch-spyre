@@ -617,7 +617,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or (not isinstance(value.arguments[0], TensorAccess))
                 or (not isinstance(value.arguments[1], TensorAccess))
             ):
-                raise Unsupported(f"invalid bdepthwiseconv2dnative arguments {value.arguments}")
+                raise Unsupported(
+		    f"invalid depthwiseconv2dnative arguments {value.arguments}"
+                )
             x = value.arguments[0]
             w = value.arguments[1]
             print("")
