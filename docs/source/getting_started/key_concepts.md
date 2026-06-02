@@ -93,8 +93,7 @@ under explicit compiler control. There is no hardware cache.
 Two sizing constraints matter for users:
 
 - **2 MB LX scratchpad per core.** Working sets that exceed this are
-  staged in tiles. See [Working Set Reduction](../compiler/working_set_reduction.md)
-  and [Scratchpad Planning](../compiler/scratchpad_planning.md).
+  staged in tiles. See [Scratchpad Planning](../compiler/scratchpad_planning.md).
 - **Per-core addressable device memory limit.** This is a separate
   hardware address-space constraint, *not* the 2 MB LX size. Work
   division must keep each core's footprint under this limit.

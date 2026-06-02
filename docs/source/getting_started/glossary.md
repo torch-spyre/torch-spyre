@@ -38,7 +38,7 @@ decomposition
   Spyre-native or custom ops. Example: `aten.addmm` decomposes into
   `matmul + scale + add`. Decompositions are how Torch-Spyre covers
   ATen ops that have no single hardware-level equivalent. See
-  [Key concepts §6](key_concepts.md#6-graph-breaks-the-performance-footgun).
+  [Key concepts §6](key_concepts.md#6-graph-breaks).
 
 Deeptools
   IBM's proprietary backend compiler that consumes the {term}`SuperDSC`
@@ -59,9 +59,9 @@ FixedTiledLayout
   [Tensor Layouts](../user_guide/tensors_and_layouts.md).
 
 flex runtime
-  The Spyre device runtime that the C++ {term}`SpyreAllocator` wraps.
-  It owns the underlying device memory and issues kernel launches
-  without exposing raw pointers (an IBM Z security requirement).
+  The Spyre device runtime that the C++ `SpyreAllocator` wraps. It
+  owns the underlying device memory and issues kernel launches without
+  exposing raw pointers (an IBM Z security requirement).
 
 fold
   An affine-transform parameterization in {term}`SuperDSC` (`alpha *
@@ -75,7 +75,7 @@ graph break
   the unsupported op runs there, and the data comes back. A single
   graph break in the hot path can wipe out the performance gains from
   surrounding compiled code. See
-  [Key concepts §6](key_concepts.md#6-graph-breaks-the-performance-footgun).
+  [Key concepts §6](key_concepts.md#6-graph-breaks).
 
 HBM
   In SuperDSC field names (e.g. `memOrg_.hbm`), `hbm` is a legacy
@@ -104,7 +104,7 @@ LX planning
 LX scratchpad
   The 2 MB SRAM scratchpad on each Spyre core. Compiler-managed —
   there is no hardware cache. Both corelets in a core share the same
-  scratchpad. See [Key concepts §3](key_concepts.md#3-memory-hierarchy-explicit-not-cached).
+  scratchpad. See [Key concepts §3](key_concepts.md#3-memory-hierarchy).
 
 OpFunc
   A {term}`Deeptools` primitive that implements one hardware operation
@@ -194,7 +194,7 @@ SuperDSC
   artifact per scheduled kernel; encodes the per-core schedule, tensor
   descriptors, memory addresses, and the compute op. Cached through
   the standard `torch.compile` artifact system. The successor is
-  {term}`KTIR`. See [Key concepts §7](key_concepts.md#7-compilation-pipeline-at-a-glance).
+  {term}`KTIR`. See [Key concepts §7](key_concepts.md#7-compilation-pipeline).
 
 tile
   A contiguous sub-tensor assigned to a single core. On Spyre, a tile
