@@ -189,9 +189,13 @@ def adjust_it_space_for_sticks(
 
     The original it_space is not mutated.
     """
-    # Pass 1: find the largest elems_per_stick per stick variable.
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
+    # (stick_count, elems_per_stick) pairs keyed by stick variable, collected
+    # from tensors with a beyond-nearest-stick outer dim. The stride_map check
+    # (stride_map[i+1] != 1) distinguishes genuine beyond-nearest-stick
+    # allocations from flat parent buffer views.
+    allocated_sticks: dict[Symbol, list[tuple[int, int]]] = {}
     for td in tensor_deps:
         stick_expr = td.device_coords[-1]
         if len(stick_expr.free_symbols) != 1:
@@ -202,15 +206,31 @@ def adjust_it_space_for_sticks(
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
+        sm = td.layout.device_layout.stride_map
+        device_size = td.layout.device_layout.device_size
+        for dim_idx, coord in enumerate(td.device_coords[:-1]):
+            if stick_var in coord.free_symbols:
+                adj = None
+                for j in [dim_idx - 1, dim_idx + 1]:
+                    if 0 <= j < len(sm) and sm[j] not in (-1, 1):
+                        adj = sm[j]
+                        break
+                if adj is not None and device_size[dim_idx] * sm[dim_idx] != adj:
+                    allocated_sticks.setdefault(stick_var, []).append(
+                        (device_size[dim_idx], elems_per_stick)
+                    )
+                break
 
-    # Pass 2: adjust each variable once using the maximum.
     for stick_var, elems_per_stick in max_elems.items():
-        # FIXME: here we assume padding to a full stick. It may not always be
-        #        the case and we should use a more robust way of computing the
-        #        number of sticks
-        adjusted_space[stick_var] = (
-            adjusted_space[stick_var] + elems_per_stick - 1
-        ) // elems_per_stick
+        it_elems = concretize_expr(adjusted_space[stick_var])
+        min_sticks = (it_elems + elems_per_stick - 1) // elems_per_stick
+        # Convert candidates to max_elems units to handle dtype mismatches.
+        candidates = [
+            (n * eps + elems_per_stick - 1) // elems_per_stick
+            for n, eps in allocated_sticks.get(stick_var, [])
+            if (n * eps + elems_per_stick - 1) // elems_per_stick >= min_sticks
+        ]
+        adjusted_space[stick_var] = min(candidates) if candidates else min_sticks
 
     return adjusted_space, max_elems
 

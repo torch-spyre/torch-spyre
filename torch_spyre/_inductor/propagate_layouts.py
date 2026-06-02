@@ -149,35 +149,26 @@ def _single_arg_op_layout(
             )
 
         case prims.convert_element_type.default:
-            # Type conversion may require padding when input has padding due to stick
-            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
-            # which becomes 64 FP32 elements when converted. We need to reflect this
-            # in the output host size so the constructor creates the correct device layout.
-
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
-
-            if unaligned > 0:
-                outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
-                outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
-                c_size = outer_sizes + [in_elems_per_stick]
-                c_stride = outer_strides + [1]
-
-                return SpyreTensorLayout(
-                    c_size,
-                    c_stride,
-                    output.dtype,
-                    list(range(len(c_size))),
-                )
-
-            c_size = [concretize_expr(s) for s in output.size]
-            c_stride = [concretize_expr(s) for s in output.stride]
+            # Propagate the input's device layout to the output, scaling the
+            # stick-count and within-stick dims for the output dtype.
+            # This preserves beyond-nearest-stick allocations across dtype
+            # conversions (e.g. fp16 -> fp32).
+            in_eps = get_elem_in_stick(in_layout.dtype)
+            out_eps = get_elem_in_stick(output.dtype)
+            out_device_size = list(stl.device_size)
+            out_stride_map = list(stl.stride_map)
+            # Identify the stick-count dim by stride_map[i] == in_eps and
+            # scale both device_size and stride_map for the output dtype.
+            out_device_size[-1] = out_eps
+            for i, s in enumerate(stl.stride_map):
+                if s == in_eps:
+                    out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+                    out_stride_map[i] = out_eps
+                    break
             return SpyreTensorLayout(
-                c_size,
-                c_stride,
-                output.dtype,
-                list(range(len(c_size))),
+                out_device_size,
+                out_stride_map,
+                get_device_dtype(output.dtype),
             )
 
         case _:

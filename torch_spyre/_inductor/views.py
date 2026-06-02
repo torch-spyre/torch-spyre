@@ -104,6 +104,8 @@ def compute_coordinates(
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
+        outer_stride = 0
+        outer_dim = -1
         for dim in range(n):
             if size[dim] == 1:
                 continue  # ignore dim with size 1
@@ -119,6 +121,15 @@ def compute_coordinates(
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
+            elif st > concrete_step and st > concrete_limit and st > outer_stride:
+                outer_stride = st
+                outer_dim = dim
+        # Emit the (always-zero) outer-stick coord so normalize_coordinates builds
+        # the correct Term for multi-stick padded layouts.  Guard: outermost above-
+        # range dim must be the stick-count dim (stride == stick size) with no
+        # broadcast dims (all strides positive).
+        if outer_dim >= 0 and outer_stride == size[-1] and all(s != 0 for s in stride):
+            coordinates[outer_dim] += var * step // outer_stride
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
