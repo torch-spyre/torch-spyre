@@ -232,6 +232,11 @@ def ensure_default_handler(op_name):
         setattr(cls, op_name, method)
 
 
+def eager_fallback(op, *args, **kwargs):
+    handler = lowering.fallback_handler(op, add_to_fallback_set=False)
+    return handler(*args, **kwargs)
+
+
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
     x.realize()
@@ -844,3 +849,86 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
     lowering.mutate_to(sliced_output, cropped_input)
 
     return output
+
+
+@register_spyre_lowering(
+    torch.ops.prims.convert_element_type.default,
+    type_promotion_kind=None,
+)
+def to_dtype(x, dst_dtype):
+    from torch_spyre._inductor.dtype_ops import DtypeOpTable
+
+    src_dtype = x.get_dtype()
+
+    if src_dtype == dst_dtype:
+        return clone(x)
+
+    # Check if conversion is supported by backend
+    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+        # Unsupported conversion - fall back to CPU
+        op = torch.ops.spyre.to_dtype_cpu.default
+        return eager_fallback(op, x, dst_dtype)
+
+    return lowering.to_dtype(x, dst_dtype, copy=True)
+
+
+def with_int64_fallback(fn, *args, convert_output=True):
+    """
+    Helper to handle int64 operations by converting to fp32.
+
+    Args:
+        fn: The lowering function to call
+        *args: Arguments to pass to fn
+        convert_output: If True, convert output back to int64.
+                       Set to False for operations like div that should return float.
+    """
+    if not any(x.get_dtype() == torch.int64 for x in args):
+        return fn(*args)
+
+    args = [to_dtype(x, torch.float32) for x in args]
+    output = fn(*args)
+
+    if convert_output:
+        return to_dtype(output, torch.int64)
+
+    return output
+
+
+@register_spyre_lowering(
+    torch.ops.aten.add.Tensor,
+    type_promotion_kind=None,
+)
+def lower_add(x, y):
+    return with_int64_fallback(lowering.add, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.mul.Tensor,
+    type_promotion_kind=None,
+)
+def lower_mul(x, y):
+    return with_int64_fallback(lowering.mul, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.sub.Tensor,
+    type_promotion_kind=None,
+)
+def lower_sub(x, y):
+    return with_int64_fallback(lowering.sub, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.minimum.default,
+    type_promotion_kind=None,
+)
+def lower_minimum(x, y):
+    return with_int64_fallback(lowering.minimum, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.maximum.default,
+    type_promotion_kind=None,
+)
+def lower_maximum(x, y):
+    return with_int64_fallback(lowering.maximum, x, y)

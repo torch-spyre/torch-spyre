@@ -422,16 +422,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_info: dict[str, Any],
     ) -> OpSpec:
         for arg in args:
-            if DtypeOpTable.is_dtype_op(op):
-                continue
-            elif arg.device_dtype == DataFormats.IEEE_FP32 and op not in SPYRE_FP32_OPS:
+            if not (
+                op in [IDENTITY_OP, RESTICKIFY_OP]
+                or DtypeOpTable.is_dtype_op(op)
+                or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
+                or arg.device_dtype == DataFormats.SEN169_FP16
+            ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
-            elif arg.device_dtype not in [
-                DataFormats.IEEE_FP32,
-                DataFormats.SEN169_FP16,
-                DataFormats.IEEE_INT32,
-            ]:
-                raise Unsupported(f"operation on {arg.device_dtype}")
 
         it_space = iteration_space(self.current_node)
 
