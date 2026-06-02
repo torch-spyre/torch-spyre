@@ -22,7 +22,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .scheduler import CountedLoopSchedulerNode
 from .logging_utils import get_inductor_logger, _get_env_bool
 
@@ -141,7 +141,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     Collects pool candidates from two sources:
     - Kernel intermediates: buffers both written and read within the graph,
       detected via written & read sets on ComputedBuffer nodes.
-    - Buffers tagged by coarse_tile.py with allocation["pool_pending"] = True.
+    - SpyreEmptyFallback full buffers created by coarse_tile.py (non-outputs).
       These are ExternKernel nodes invisible to the written & read path above.
 
     For each candidate, assigns layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset.
@@ -217,17 +217,21 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         name for name in (written & read) - io_names if _is_kernel_intermediate(name)
     }
 
-    # Source 2: buffers tagged by coarse_tile.py with allocation["pool_pending"].
-    # These are ExternKernel nodes excluded from non_kernel_nodes above.
+    # Source 2: SpyreEmptyFallback full buffers created by coarse_tile.py.
+    # These are ExternKernel nodes excluded from non_kernel_nodes above, so they
+    # never appear in written & read.  Any non-output, non-LX SpyreEmptyFallback
+    # with a FixedTiledLayout is a coarse-tile intermediate to pool-allocate.
+    # "lx" not in allocation guards against buffers already claimed by LX scratchpad
+    # planning, which runs in CustomPreSchedulingPasses before memory_planning.
     for n in flat_nodes:
         if n.read_writes.writes:
             name = next(iter(n.read_writes.writes)).name
             buf = V.graph.get_buffer(name)
-            layout = buf.layout if isinstance(buf.layout, FixedTiledLayout) else None
             if (
-                layout is not None
-                and "pool_pending" in layout.allocation
-                and "lx" not in layout.allocation
+                isinstance(buf, SpyreEmptyFallback)
+                and isinstance(buf.layout, FixedTiledLayout)
+                and "lx" not in buf.layout.allocation
+                and name not in io_names
             ):
                 pool_candidates.add(name)
                 logger.debug(
@@ -248,9 +252,11 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
     # Track (end_step, offset, size) so we can free blocks promptly.
     pending_frees: list[tuple[int, int, int]] = []
-    # In coarse_tile case 2 (mutation), the tiled op's layout and full_buf's
-    # layout share the same allocation dict object, so both names appear in
-    # intermediates but must only be allocated once.  Track by dict id.
+    # In coarse_tile case 2 (mutation), the tiled op's layout is
+    # MutationLayoutSHOULDREMOVE whose real_layout() returns full_buf's
+    # FixedTiledLayout — the same object and allocation dict.  The tiled op's
+    # name enters pool_candidates via written & read (source 1); full_buf's name
+    # via source 2.  Only allocate the shared dict once.
     assigned_alloc_ids: set[int] = set()
 
     for name, (start, end) in sorted_bufs:
@@ -278,7 +284,6 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         size = _compute_size_bytes(name)
         offset = allocator.allocate(size)
 
-        layout.allocation.pop("pool_pending", None)
         layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
         assigned_alloc_ids.add(id(layout.allocation))
 

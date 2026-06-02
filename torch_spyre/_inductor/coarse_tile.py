@@ -254,13 +254,6 @@ def _propagate_tiled_op(
     )
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
-    if not is_graph_output:
-        # Mark as pool-eligible: this buffer is an intermediate (written inside
-        # the tiled loop, read outside it).  memory_planning will assign it a
-        # pool address, allowing it to share memory with other non-overlapping
-        # intermediates.
-        full_buf.layout.allocation["pool_pending"] = True
-
     has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
 
     if has_inside:
