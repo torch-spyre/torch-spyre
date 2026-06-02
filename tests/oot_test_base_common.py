@@ -9,7 +9,6 @@ import json
 from typing import Dict, List, Optional, Set, Tuple
 import warnings
 
-import regex as re
 import pytest  # type: ignore
 import torch
 
@@ -56,24 +55,18 @@ from oot_test_common_methods_invocations import (
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
-from oot_test_utilities import _get_privateuse1_device_type
+from oot_test_utilities import (
+    _get_privateuse1_device_type,
+    _log_warning,
+    _log_error,
+    _regex_entries_for_name,
+    _build_test_entry_map,
+    _select_entry_by_op_index,
+    _select_entry_for_variant,
+    _extract_op_name_from_method,
+)
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
-
-
-# ---------------------------------------------------------------------------
-# Logging utilities
-# ---------------------------------------------------------------------------
-
-
-def _log_warning(msg: str) -> None:
-    """Write warning message to stderr for visibility during test runs."""
-    os.write(2, f"[OOTDeviceTestBase WARNING] {msg}\n".encode())
-
-
-def _log_error(msg: str) -> None:
-    """Write error message to stderr for visibility during test runs."""
-    os.write(2, f"[OOTDeviceTestBase ERROR] {msg}\n".encode())
 
 
 # Resolve the actual backend name registered for privateuse1.
@@ -107,196 +100,6 @@ def remove_builtin_privateuse1_test_base():
 
 # Call the filter function to apply the side effect
 remove_builtin_privateuse1_test_base()
-
-
-# ---------------------------------------------------------------------------
-# Regex pattern helpers
-# ---------------------------------------------------------------------------
-
-
-def _is_regex_pattern(name: str) -> bool:
-    return any(c in name for c in r"\.^$*+?{}[]|()")
-
-
-def _regex_entries_for_name(name, regex_entries):
-    """Return all TestEntry objects whose stored regex pattern matches *name*.
-
-    *name* is the base method name as seen by ``instantiate_test`` (e.g.
-    ``"test_rope_fms_prefill_bs1"``).  Matching uses ``re.fullmatch`` so
-    the pattern must match the entire method name, not just a substring.
-
-    Examples of patterns that will match ``test_rope_fms_prefill_bs1``:
-      - ``test_rope_fms_.*``
-      - ``test_rope_fms_prefill_.*``
-      - ``test_rope_.*``
-      - ``test_(rope|qkv)_.*``
-    """
-    return [entry for pattern, entry in regex_entries if re.fullmatch(pattern, name)]
-
-
-# ---------------------------------------------------------------------------
-# Multi-entry test map helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_test_entry_map(
-    file_entry: "FileEntry",
-) -> Tuple[Dict[str, List["TestEntry"]], List[Tuple[str, "TestEntry"]]]:
-    """Build exact-name map and glob list from file_entry.tests.
-
-    A single TestEntry can cover multiple test ids via name: [list].
-    Each method_name in the list gets its own entry in the map.
-
-    This supports multiple TestEntry objects per method_name.
-    This is needed when two configs target the same test name with different tags/dtypes
-    (e.g. the same op tested for two different models).
-    The correct entry for a given variant is resolved later by ``_select_entry_for_variant``
-    once the dtype is known from the instantiated method name.
-
-    Each method_name in the list is routed to either the exact map or the
-    glob list depending on whether it contains glob metacharacters.
-
-    Returns
-    -------
-    exact_map : Dict[str, List[TestEntry]]
-        Keyed by exact base method names (no glob metacharacters).  Same
-        structure as the original return value so callers that only need
-        exact matching are unaffected.
-    regex_entries : List[Tuple[str, TestEntry]]
-        Ordered list of ``(glob_pattern, entry)`` pairs for names that
-        contain glob metacharacters (``*``, ``?``, ``[``, ``]``).
-        Patterns are bare method names — the ``ClassName::`` prefix has
-        already been stripped by ``entry.method_names()``.
-
-    Usage
-    -----
-    ::
-
-        cls.TEST_ENTRIES, cls.REGEX_ENTRIES = _build_test_entry_map(file_entry)
-    """
-    exact_map: Dict[str, List["TestEntry"]] = {}
-    regex_entries: List[Tuple[str, "TestEntry"]] = []
-
-    for entry in file_entry.tests:
-        for method_name in entry.method_names():
-            if _is_regex_pattern(method_name):
-                regex_entries.append((method_name, entry))
-            else:
-                exact_map.setdefault(method_name, []).append(entry)
-
-    return exact_map, regex_entries
-
-
-def _entry_dtype_set(
-    entry: "TestEntry",
-    global_supported_dtypes: Optional[Set[torch.dtype]],
-) -> Optional[Set[torch.dtype]]:
-    """Return the effective dtype set for *entry*.
-
-    Priority (highest to lowest):
-      1. entry.edits.dtypes.include  -- explicit per-entry dtype list
-      2. global_supported_dtypes     -- global filter from the YAML global section
-      3. None                        -- no filtering; all dtypes match
-
-    Returns None when neither the entry nor the global config restricts dtypes,
-    meaning the entry is considered compatible with any dtype.
-    """
-    included = entry.edits.dtypes.resolved_include()
-    if included:
-        return included
-    return global_supported_dtypes  # may itself be None
-
-
-# Matches "test_model_ops_db_<unique>__<idx>_<device>_<dtype>", capturing
-# the op unique_name key into model_ops_entry_by_unique_name.
-_MODEL_OPS_VARIANT_RE = re.compile(
-    r"^test_model_ops_db_(?P<unique>.+?__\d+)_[A-Za-z0-9]+_\w+$"
-)
-
-
-def _select_entry_by_op_index(method_name: str) -> Optional["TestEntry"]:
-    """Resolve the TestEntry for a test_model_ops_db variant via the
-    authoritative unique_name mapping; returns None to let callers fall
-    back to the dtype heuristic."""
-    m = _MODEL_OPS_VARIANT_RE.match(method_name)
-    if not m:
-        return None
-    try:
-        from models.test_model_ops_v2 import (  # type: ignore
-            model_ops_entry_by_unique_name,
-        )
-    except ImportError:
-        return None
-    return model_ops_entry_by_unique_name.get(m.group("unique"))
-
-
-def _select_entry_for_variant(
-    entries: List["TestEntry"],
-    method_name: str,
-    global_supported_dtypes: Optional[Set[torch.dtype]],
-) -> "TestEntry":
-    """Pick the best-matching TestEntry for a concrete variant method name.
-
-    When only one entry exists the choice is trivial.  When multiple entries
-    share the same base test name merged from different configs we select
-    by matching the dtype embedded in *method_name* against each entry's
-    effective dtype set.
-
-    Selection rules:
-      1. Entry whose effective dtype set contains the variant's dtype.
-      2. Entry with no dtype restriction (effective set is None) acts as
-         a wildcard / fallback.
-      3. First entry in the list (last-resort fallback to old behaviour).
-
-    The list order reflects YAML insertion order so config-A entries take
-    precedence over config-B entries for identical dtype sets.
-    """
-    if len(entries) == 1:
-        return entries[0]
-
-    dtype_str = extract_dtype_from_name(method_name)
-    variant_dtype: Optional[torch.dtype] = None
-    if dtype_str:
-        try:
-            variant_dtype = parse_dtype(dtype_str)
-        except ValueError:
-            pass
-
-    # Pass 1 - strict dtype match
-    if variant_dtype is not None:
-        for entry in entries:
-            eset = _entry_dtype_set(entry, global_supported_dtypes)
-            if eset is not None and variant_dtype in eset:
-                return entry
-
-    # Pass 2 - wildcard entry (no dtype restriction)
-    for entry in entries:
-        eset = _entry_dtype_set(entry, global_supported_dtypes)
-        if eset is None:
-            return entry
-
-    # Pass 3 - fallback: return first entry
-    return entries[0]
-
-
-def _extract_op_name_from_method(
-    method_name: str, base_test_name: str
-) -> Optional[str]:
-    """Extract the op name from a parametrized method name.
-
-    method_name: test_scalar_support_add_<device>_float16
-    base_test_name: test_scalar_support
-    returns: "add"
-
-    Returns None if the op name cannot be determined.
-    """
-    if not method_name.startswith(base_test_name + "_"):
-        return None
-    remainder = method_name[len(base_test_name) + 1 :]  # "add_<device>_float16"
-    # op name is the first segment before the device suffix
-    if f"_{_OOT_DEVICE_TYPE}_" in remainder:
-        return remainder.split(f"_{_OOT_DEVICE_TYPE}_")[0]
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +164,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         if not path or getattr(cls, "_yaml_loaded", False):
             return
 
-        # Reset glob store so a fresh load always starts clean.
+        # Reset regex store so a fresh load always starts clean.
         cls.REGEX_ENTRIES = []
 
         config: OOTTestConfig = load_yaml_config(path)
@@ -391,12 +194,10 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         file_entry: FileEntry = resolve_current_file(config, path)
 
-        # Build multi-entry map: same method_name can have multiple TestEntry
-        # objects when configs differ in tags/dtypes for the same test.
-
         # Build the exact-name lookup map and the regex-pattern list.
-        # Regex patterns (names containing * ? [ ]) go into REGEX_ENTRIES;
-        # everything else goes into TEST_ENTRIES keyed by exact method name.
+        # Regex patterns (names containing regex metacharacters) go into
+        # REGEX_ENTRIES; everything else goes into TEST_ENTRIES keyed by
+        # exact method name.
         cls.TEST_ENTRIES, cls.REGEX_ENTRIES = _build_test_entry_map(file_entry)
         cls.UNLISTED_TEST_MODE = file_entry.unlisted_test_mode
 
@@ -548,7 +349,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         if entry is None:
             entries = cls.TEST_ENTRIES.get(base_test_name)
             if not entries:
-                # Also check glob patterns before giving up.
+                # Also check regex patterns before giving up.
                 entries = (
                     _regex_entries_for_name(
                         base_test_name, getattr(cls, "REGEX_ENTRIES", [])
@@ -596,7 +397,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # apply force_xfail from op-level config
         # extract op name from method_name — format: test_name_opname_device_dtype
         # force_xfail only flips mandatory_success → xfail, leaves others unchanged
-        op_name = _extract_op_name_from_method(method_name, base_test_name)
+        op_name = _extract_op_name_from_method(
+            method_name, base_test_name, _OOT_DEVICE_TYPE
+        )
         if effective_mode == MODE_MANDATORY_SUCCESS:
             op_cfg = cls.SUPPORTED_OPS_CONFIG.get(op_name) if op_name else None
             if op_cfg is not None and op_cfg.force_xfail:
@@ -644,11 +447,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # There may be multiple when different configs target the same test
         # name with different tags/dtypes (e.g. same op, different models).
         #
-        #
         # 1. Exact-name lookup in TEST_ENTRIES
-        # 2. Glob-pattern lookup in GLOB_ENTRIES.  A YAML entry like
-        #    ``TestOps::test_rope_fms_*`` stores ``test_rope_fms_*`` as a
-        #    glob pattern; fnmatch is used to test whether ``name`` matches.
+        # 2. Regex-pattern lookup in REGEX_ENTRIES.  A YAML entry like
+        #    ``TestOps::test_rope_fms_.*`` stores ``test_rope_fms_.*`` as a
+        #    regex pattern; re.fullmatch is used to test whether ``name``
+        #    matches.
         #
         # When both sources return entries the exact-name entries come first,
         # preserving the original priority ordering.
@@ -814,10 +617,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         for method_name in new_methods:
             # ------------------------------------------------------------------
             # Select the correct TestEntry for THIS variant using dtype matching.
-            # Instead of using a single shared entry for
-            # all variants, we pick the entry whose dtype set covers the dtype
-            # embedded in method_name (e.g. bfloat16 -> bfloat16 entry,
-            # float16 -> float16 entry).
+            # Instead of using a single shared entry for all variants, we pick
+            # the entry whose dtype set covers the dtype embedded in method_name
+            # (e.g. bfloat16 -> bfloat16 entry, float16 -> float16 entry).
             # ------------------------------------------------------------------
             resolved_entry: Optional[TestEntry] = None
             if all_entries_for_name:
