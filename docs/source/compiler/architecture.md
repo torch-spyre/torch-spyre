@@ -28,7 +28,7 @@ The SpyreKernel code generator compiles LoopLevel IR into an OpSpec that is in t
 that are the input to the backend-compiler. In a future version, we intend to replace SDSCs with a purely MLIR-based interface that includes a new [KTIR](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) MLIR dialect.
 :::
 
-# Background
+## Background
 
 A working knowledge of PyTorch's compilers is essential for understanding our front-end compiler.
 Some useful resources are:
@@ -37,7 +37,7 @@ Some useful resources are:
 the portion on [Inductor](https://github.com/pytorch/workshops/tree/master/ASPLOS_2024/inductor.pdf)
 + General documentation on [torch.compiler](https://docs.pytorch.org/docs/stable/torch.compiler.html#)
 
-# Front-end Compiler Overview
+## Front-end Compiler Overview
 
 The front-end compiler works by registering itself with PyTorch as the Inductor backend
 for the `spyre` device.  This causes compilation of any FX Graphs that are targeted
@@ -79,7 +79,7 @@ Some key entry points to the front-end compiler are:
 high-level description of a single operation to be performed on the device.
 + [codegen](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/) defines the compilation from an `OpSpec` into a lower-level SuperDSC json file which is the input to the backend compiler.
 
-## Additional Topics
+### Additional Topics
 
 + [Inductor Front-End: Deep Dive](inductor_frontend.md) — detailed reference for passes, lowerings, decompositions, and codegen.
 + [Back-End Compiler](backend.md) — the DeepTools back-end and SuperDSC format.

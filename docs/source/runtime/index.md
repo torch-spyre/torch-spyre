@@ -1,7 +1,9 @@
-# Runtime Overview
+# Runtime
 
 The Torch-Spyre runtime layer manages device lifecycle, memory
-allocation, and kernel execution at inference time.
+allocation, and kernel execution at inference time. This section
+covers the device-registration plumbing, the C++ tensor and allocator
+machinery, eager-mode dispatch, streams, and multi-card support.
 
 ## Responsibilities
 
