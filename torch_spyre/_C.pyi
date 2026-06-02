@@ -10,6 +10,7 @@ import typing
 __all__: list[str] = [
     "DataFormats",
     "JobPlan",
+    "ElementArrangement",
     "SpyreTensorLayout",
     "_SpyreStreamBase",
     "current_stream",
@@ -117,6 +118,37 @@ class DataFormats:
     @property
     def value(self) -> int: ...
 
+class ElementArrangement:
+    """
+    Members:
+
+      STANDARD
+
+      DL16_TO_FP32
+
+      DL16_TO_FP8
+
+      EXX2
+    """
+
+    DL16_TO_FP32: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.DL16_TO_FP32: 1>
+    DL16_TO_FP8: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.DL16_TO_FP8: 2>
+    EXX2: typing.ClassVar[ElementArrangement]  # value = <ElementArrangement.EXX2: 3>
+    STANDARD: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.STANDARD: 0>
+    __members__: typing.ClassVar[
+        dict[str, ElementArrangement]
+    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'DL16_TO_FP8': <ElementArrangement.DL16_TO_FP8: 2>, 'EXX2': <ElementArrangement.EXX2: 3>}
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class SpyreTensorLayout:
     def __hash__(self) -> int: ...
     def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore[override]
@@ -133,6 +165,7 @@ class SpyreTensorLayout:
         host_strides: collections.abc.Sequence[typing.SupportsInt],
         dtype: torch.dtype,
         dim_order: collections.abc.Sequence[typing.SupportsInt],
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     @typing.overload
     def __init__(
@@ -140,14 +173,20 @@ class SpyreTensorLayout:
         device_size: collections.abc.Sequence[typing.SupportsInt],
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
     def elems_per_stick(self) -> int: ...
+    def with_element_arrangement(
+        self, element_arrangement: ElementArrangement
+    ) -> SpyreTensorLayout: ...
     @property
     def device_dtype(self) -> DataFormats: ...
     @property
     def device_size(self) -> list[int]: ...
+    @property
+    def element_arrangement(self) -> ElementArrangement: ...
     @property
     def stride_map(self) -> list[int]: ...
 

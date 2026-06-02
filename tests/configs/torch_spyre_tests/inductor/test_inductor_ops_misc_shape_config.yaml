@@ -1,0 +1,58 @@
+# This config covers the "misc" shard: every test in test_inductor_ops.py
+# that is NOT covered by the other three shards:
+#   - test_inductor_ops_matmul_config.yaml
+#   - test_inductor_ops_reduction_config_1.yaml
+#   - test_inductor_ops_reduction_config_2.yaml
+#   - test_inductor_ops_pointwise_config.yaml
+#
+# When a new test is added to test_inductor_ops.py, check which shard it
+# belongs to, then add it here if it matches none of the other three.
+
+# Misc shard A: shape / tensor / memory ops
+# These are ops that primarily test tensor layout, indexing, creation,
+# and dtype conversion — typically fast and independent of compute hardware.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # tensor creation / factory
+            - TestOps::test_arange.*
+            - TestOps::test_full.*
+            - TestOps::test_new_ones.*
+            - TestOps::test_numel.*
+            - TestOps::test_ones.*
+            - TestOps::test_zeros.*
+            # empty_like family (covers test_empty_like, test_empty_like_dtype_override,
+            # test_empty_like_memory_format)
+            - TestOps::test_empty_like.*
+            # copy / clone
+            - TestOps::test_clone.*
+            - TestOps::test_copy_roundtrip.*
+            # concat / split / slice / pad
+            - TestOps::test_cat.*
+            - TestOps::test_pad.*
+            - TestOps::test_slice.*
+            - TestOps::test_split.*
+            # shape ops
+            - TestOps::test_flatten.*
+            - TestOps::test_permute.*
+            - TestOps::test_size_one.*
+            # squeeze covers test_squeeze and test_squeeze_reduction
+            - TestOps::test_squeeze.*
+            # unsqueeze covers test_unsqueeze and test_unsqueeze_broadcast
+            - TestOps::test_unsqueeze.*
+            # t / transpose — each prefix covers the contiguous variant too
+            - TestOps::test_t_1d.*
+            - TestOps::test_t_2d.*
+            - TestOps::test_transpose_2d.*
+            - TestOps::test_transpose_3d.*
+            - TestOps::test_transpose_4d.*
+            # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
+            - TestOps::test_to_dtype.*
+            - TestOps::test_round_trip_to_dtype.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

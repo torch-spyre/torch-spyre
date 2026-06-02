@@ -4,7 +4,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            # k_expr: keepdim or test_reduce or test_max_default or test_topk
+            # k_expr: test_max_default or test_topk
             #         or test_argmin or test_count_nonzero or test_logsumexp
             #         or test_nanmean or test_nansum or test_all_dim or test_any_dim
             #         or test_prod_dim or test_std_ or test_var_ or test_cumprod
@@ -13,15 +13,12 @@ test_suite_config:
             #         or test_nanmedian or test_mode_ or test_sum_eager
             #         or test_mean_eager or test_max_eager or test_min_eager
             #
-            # Any name containing "keepdim" (covers all *_keepdim* variants)
-            - TestOps::.*keepdim.*
-            # All test_reduce_* variants
-            - TestOps::test_reduce.*
-            # All remaining reduction base names
             # "test_sum_eager" as substring --> test_sum_keepdim0, test_sum_keepdim1
             # k_expr "test_sum_eager" matches the eager test class names
             # but the base method names are test_sum_keepdim0/1 from test file
-            - TestOps::test_(all_dim|any_dim|argmin|count_nonzero|cummax|cummin|cumprod|logcumsumexp|logsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|prod_dim|quantile|std_|topk|var_).*
+            # Note: argmin and logsumexp are excluded here because their base
+            # names contain "keepdim" and are covered by the keepdim shard.
+            - TestOps::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|prod_dim|quantile|std_|topk|var_).*
 
           mode: mandatory_success
           tags:

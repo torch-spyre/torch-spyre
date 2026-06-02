@@ -1400,6 +1400,9 @@ _run_xdist_fallback() {
     shift 5
     local _extra=("$@")
 
+    export SPYRE_TEST_FILE="${_dir}/${_base}"
+    export OOT_TEST_FILE="${_dir}/${_base}"
+
     echo ""
     echo "[torch_oot_device_tests_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
     echo "[torch_oot_device_tests_run]     File: $_orig"
@@ -1541,6 +1544,7 @@ for i in "${!RUN_FILES[@]}"; do
     # invocations of run_test.sh.
     # -----------------------------------------------------------------------
     export SPYRE_TEST_FILE="$run_file"
+    export OOT_TEST_FILE="$run_file"
 
     _EXIT_TMP="/tmp/_spyre_pytest_exit_${$}_${i}.tmp"
     _exit=0

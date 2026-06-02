@@ -11,6 +11,42 @@ test_suite_config:
             - TestOldViewOps::test_contiguous
             - TestOldViewOps::test_resize_as_preserves_strides
           mode: mandatory_success
+
+        ############################################################
+        ## Tests that fail on spyre with @onlyNativeDeviceTypes ###
+        ## Previously skipped since our framework did not support 
+        ## this decorator patch at runtime. It now supports it
+        ############################################################
+        - names:
+            - TestViewOps::test_chunk_view
+            - TestViewOps::test_conj_view_with_shared_memory
+            - TestViewOps::test_flatten_nonview
+            - TestViewOps::test_split_view
+            - TestViewOps::test_view_tensor_dsplit
+            - TestViewOps::test_view_tensor_hsplit
+            - TestViewOps::test_view_tensor_vsplit
+            - TestViewOps::test_reshape
+            - TestOldViewOps::test_transpose_invalid
+            - TestViewOps::test_view_dtype_upsize_errors
+            - TestViewOps::test_view_tensor_split
+            - TestOldViewOps::test_broadcast_to
+            - TestOldViewOps::test_tensor_split_indices
+            - TestOldViewOps::test_tensor_split_sections
+          mode: xfail
+          # segmentation faults with @onlyNativeDeviceTypes
+        - names:
+            - TestViewOps::test_view_as_complex
+            - TestViewOps::test_view_dtype_new
+          mode: skip
+          # tests that pass with @onlyNativeDeviceTypes which was SKIPPED previously
+        - names:
+            - TestViewOps::test_imag_noncomplex
+            - TestViewOps::test_as_strided_overflow_storage_offset
+            - TestOldViewOps::test_resize_overflow
+            - TestOldViewOps::test_tensor_split_errors
+          mode: mandatory_success
+
+
         #######################################################################
         #### New test added in pytorch 2.11 which is failing - hence xfail ####
         #######################################################################
@@ -82,7 +118,7 @@ test_suite_config:
             # - TestViewOps::test_view_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
             - TestOldViewOps::test_T  # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226
             - TestOldViewOps::test_big_transpose  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
-            - TestOldViewOps::test_broadcast_to  # AssertionError: Tensor-likes are not close https://github.com/torch-spyre/torch-spyre/issues/1227 (float16),  NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
+            # - TestOldViewOps::test_broadcast_to  # AssertionError: Tensor-likes are not close https://github.com/torch-spyre/torch-spyre/issues/1227 (float16),  NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
             - TestOldViewOps::test_expand  # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
             - TestOldViewOps::test_flatten   # AssertionError: The length of the sequences mismatch: 1 != 0 https://github.com/torch-spyre/torch-spyre/issues/729
             - TestOldViewOps::test_memory_format_resize_   # NotImplementedError aten::resize_ https://github.com/torch-spyre/torch-spyre/issues/730 

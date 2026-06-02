@@ -156,6 +156,9 @@ class SpyreEmptyFallback(ir.ExternKernel):
         pass
 
     def should_allocate(self) -> bool:
+        layout = self.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return False
         return True
 
     def get_mutation_names(self) -> Sequence[str]:

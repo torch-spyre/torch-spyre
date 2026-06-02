@@ -1,0 +1,44 @@
+name: oot-config-checker-tool
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      test_file:
+        description: Scope check to one test file (leave blank to auto-discover all)
+        required: false
+        default: ''
+
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: read # so that gh pr view can fetch the file list
+
+jobs:
+  check-configs:
+    name: Check OOT Configs
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Run check-all-configs
+        run: |-
+          source /home/senuser/torch-spyre/.venv/bin/activate
+          make check-all-configs ${{ inputs.test_file && format('TEST_FILE={0}', inputs.test_file) || '' }}

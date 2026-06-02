@@ -35,7 +35,6 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
-    resolve_hints,
     hints_to_coarse_tile_groups,
 )
 from . import config
@@ -43,7 +42,7 @@ from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
-from .propagate_named_dims import propagate_named_dims
+from .propagate_named_dims import propagate_named_dims, assign_dim_hints
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -53,7 +52,10 @@ from .insert_restickify import insert_restickify, finalize_layouts
 from .memory_planning import memory_planning
 from .work_division import span_reduction, work_distribution, k_fast_division
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
-from .scratchpad.allocator import scratchpad_planning
+from .scratchpad.allocator import (
+    StrategyBCoOptimizingAllocator,
+    scratchpad_planning,
+)
 from .fusion import spyre_fuse_nodes
 from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
@@ -206,7 +208,12 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [propagate_mutation_layouts]
+        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
+        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
+        # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
+        # False), so loop groups survive Inductor fusion intact.
+        return [propagate_mutation_layouts, build_loop_scheduler_nodes]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
@@ -219,9 +226,7 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-        # coarse_tiling=False because no nodes carry loop_group_id attributes.
-        return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
+        return [memory_planning, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):
@@ -246,8 +251,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
         deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
-        propagate_named_dims(operations)
-        resolve_hints(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
@@ -255,6 +258,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         dedup_and_promote_constants(operations)
         if config.chunk_large_tensors:
             chunk_large_tensors(operations)
+        propagate_named_dims(operations)
+        assign_dim_hints(operations)
         if config.coarse_tiling:
             groups = hints_to_coarse_tile_groups(operations)
             if config.coarse_tiling_groups_fn is not None:
@@ -266,7 +271,12 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         )
         work_distribution(operations, k_fast_ops)
         if config.lx_planning:
-            scratchpad_planning(graph)
+            allocator = (
+                StrategyBCoOptimizingAllocator()
+                if config.co_optimizing_lx_planning
+                else None
+            )
+            scratchpad_planning(graph, allocator=allocator)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
