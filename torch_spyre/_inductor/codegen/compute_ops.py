@@ -272,13 +272,15 @@ def generate_sdsc(
     #
     # When use_symbols=False this dict stays empty (symbols is not modified).
     local_symbols: dict[int, int] = {}
-    # Parallel to local_symbols (insertion order): "kernel" if the symbol came
-    # from a kernel tensor arg (arg_index >= 0), "pool" if pool-allocated.
-    local_symbol_kind: list[str] = []
+    # Parallel to local_symbols (insertion order).  Each entry is a tuple:
+    #   ("kernel", 0)            – base address of a kernel tensor arg (input_arg param)
+    #   ("kernel_derived", off)  – per-core derived address: base_addr + off (arith.addi)
+    #   ("pool", 0)              – pool-allocated tensor address (arith.addi from pool base)
+    local_symbol_kind: list[tuple[str, int]] = []
 
     if use_symbols:
 
-        def offset_as_symbol(s, kind: str):
+        def offset_as_symbol(s, kind: tuple[str, int]):
             if s not in local_symbols:
                 local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
                 symbols.append(s)
@@ -293,15 +295,25 @@ def generate_sdsc(
             if "lx" in tensor.allocation:
                 affine_strides.append({})
                 continue
-            kind = "kernel" if tensor.arg_index >= 0 else "pool"
+            is_kernel = tensor.arg_index >= 0
+            core0_addr = tensor.start_address + core_idx_to_slice_offset(
+                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+            ) * num_bytes(tensor.data_format)
             tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
             if not tensor_tiled:
-                # Non-tiled HBM: register full per-core addresses.
+                # Non-tiled HBM: register per-core addresses.
                 for c in range(sdsc_spec.num_cores):
-                    full_addr = tensor.start_address + core_idx_to_slice_offset(
+                    addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(full_addr, kind)
+                    kind: tuple[str, int] = (
+                        ("kernel", 0)
+                        if (is_kernel and c == 0)
+                        else ("kernel_derived", addr - core0_addr)
+                        if is_kernel
+                        else ("pool", 0)
+                    )
+                    offset_as_symbol(addr, kind)
                 affine_strides.append({})
             else:
                 # Tiled HBM: symbol value = per-core iter-0 base address.
@@ -312,10 +324,17 @@ def generate_sdsc(
                         tensor, s, sdsc_spec.iteration_space
                     )
                 for c in range(sdsc_spec.num_cores):
-                    base_addr = tensor.start_address + core_idx_to_slice_offset(
+                    addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(base_addr, kind)
+                    kind = (
+                        ("kernel", 0)
+                        if (is_kernel and c == 0)
+                        else ("kernel_derived", addr - core0_addr)
+                        if is_kernel
+                        else ("pool", 0)
+                    )
+                    offset_as_symbol(addr, kind)
                 affine_strides.append(strides_for_tensor)
 
         def _start_addr_data(tensor):
@@ -324,13 +343,23 @@ def generate_sdsc(
                     f"[{c}, 0, 0]": str(tensor.start_address)
                     for c in range(sdsc_spec.num_cores)
                 }
-            kind = "kernel" if tensor.arg_index >= 0 else "pool"
+            is_kernel = tensor.arg_index >= 0
+            core0_addr = tensor.start_address + core_idx_to_slice_offset(
+                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+            ) * num_bytes(tensor.data_format)
             result = {}
             for c in range(sdsc_spec.num_cores):
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
-                result[f"[{c}, 0, 0]"] = str(offset_as_symbol(addr, kind))
+                kind_c: tuple[str, int] = (
+                    ("kernel", 0)
+                    if (is_kernel and c == 0)
+                    else ("kernel_derived", addr - core0_addr)
+                    if is_kernel
+                    else ("pool", 0)
+                )
+                result[f"[{c}, 0, 0]"] = str(offset_as_symbol(addr, kind_c))
             return result
 
     else:

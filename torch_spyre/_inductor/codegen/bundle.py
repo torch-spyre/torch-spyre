@@ -38,10 +38,11 @@ logger = get_inductor_logger("sdsc_compile")
 #   affine_strides:     list[dict] parallel to SDSCSpec.args —
 #                       {tiled_sym: stride_bytes} for tiled HBM tensors,
 #                       empty dict for non-tiled / lx tensors
-#   symbol_kinds:       list[str] parallel to base_symbol_values —
-#                       "kernel" for kernel tensor args (become input_arg params),
-#                       "pool" for pool-allocated tensors (emit as arith.addi)
-_CompiledEntry = tuple[Any, list[int], list[dict], list[str]]
+#   symbol_kinds:       list[tuple[str, int]] parallel to base_symbol_values —
+#                       ("kernel", 0)           – base addr of a kernel tensor arg
+#                       ("kernel_derived", off) – per-core addr = base + off
+#                       ("pool", 0)             – pool-allocated tensor addr
+_CompiledEntry = tuple[Any, list[int], list[dict], list[tuple[str, int]]]
 
 
 # ---------------------------------------------------------------------------
@@ -127,18 +128,19 @@ def generate_bundle(
     addr_counter = [0]
 
     # Build a per-symbol kind list from compiled entries (symbolic_args path only).
-    # symbol_kinds[i] is "kernel" if symbols[i] came from a kernel tensor arg,
-    # or "pool" if it came from a pool-allocated tensor.
-    symbol_kinds: list[str] = []
+    # Each entry is a (kind_str, aux_int) tuple from compute_ops.generate_sdsc.
+    symbol_kinds: list[tuple[str, int]] = []
     if symbolic_args and use_symbols:
         for _, _, _, local_kinds in compiled:
             symbol_kinds.extend(local_kinds)
 
     # Determine whether a pool parameter is needed (any pool symbol present).
-    has_pool = symbolic_args and use_symbols and any(k == "pool" for k in symbol_kinds)
-    # Indices of kernel-arg symbols (will become input_arg function parameters).
+    has_pool = (
+        symbolic_args and use_symbols and any(k == "pool" for k, _ in symbol_kinds)
+    )
+    # Indices of kernel-base symbols (one per kernel tensor arg; become input_arg params).
     kernel_arg_sym_indices = (
-        [i for i, k in enumerate(symbol_kinds) if k == "kernel"]
+        [i for i, (k, _) in enumerate(symbol_kinds) if k == "kernel"]
         if symbolic_args and use_symbols
         else []
     )
@@ -159,7 +161,7 @@ def generate_bundle(
 
         # Function signature when symbolic_args is active:
         #   - optional leading %pool param for pool-allocated tensors
-        #   - one !sdscbundle.input_arg<index> param per kernel tensor arg symbol
+        #   - one !sdscbundle.input_arg<index> param per kernel tensor arg base symbol
         if symbolic_args and use_symbols and (has_pool or kernel_arg_sym_indices):
             params = []
             if has_pool:
@@ -188,27 +190,76 @@ def generate_bundle(
             for lb_idx, lb in enumerate(loop_bounds):
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
-        # Emit one declaration per symbol:
-        #   - "kernel" symbols → already handled as function params above (skipped)
-        #   - "pool" symbols   → arith.addi %pool_extracted, <pool_offset>
-        #   - all others       → arith.constant (plain HBM or use_symbols=False)
+        # Emit one declaration per symbol (symbolic_args path):
+        #   - "kernel"          → skipped; already a function param + extract op above
+        #   - "kernel_derived"  → arith.addi %sym_0_N_extracted, <per_core_offset>
+        #                         deduped by (base_param_index, offset) pair
+        #   - "pool"            → arith.addi %pool_extracted, <pool_offset>
+        #                         deduped by pool offset value
+        #   - anything else     → arith.constant (use_symbols=False or non-symbolic path)
         kernel_arg_sym_set = set(kernel_arg_sym_indices)
-        pool_sym_set = (
-            {i for i, k in enumerate(symbol_kinds) if k == "pool"}
-            if symbolic_args and use_symbols
-            else set()
-        )
+        # Map kernel base sym_idx → positional parameter index (1-based name suffix).
+        kernel_base_to_pos: dict[int, int] = {
+            sym_idx: pos + 1 for pos, sym_idx in enumerate(kernel_arg_sym_indices)
+        }
+        # sym_canonical[sym_idx] → canonical SSA name for derived/pool symbols (deduped).
+        sym_canonical: dict[int, str] = {}
+        # derived_addi_emitted[(base_param_pos, offset)] → SSA name already emitted
+        derived_addi_emitted: dict[tuple[int, int], str] = {}
+        # pool_addi_emitted[pool_offset_value] → SSA name already emitted
+        pool_addi_emitted: dict[int, str] = {}
+
         for sym_idx, value in enumerate(symbols):
             if sym_idx in kernel_arg_sym_set:
                 continue  # replaced by function parameter + extract op
-            if sym_idx in pool_sym_set:
-                f.write(
-                    f"\t\t%pool_offset_{sym_idx + 1} = arith.constant {value} : index\n"
+            if not symbol_kinds:
+                # use_symbols=False path — no symbol_kinds populated
+                f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
+                continue
+            kind, aux = symbol_kinds[sym_idx]
+            if kind == "kernel_derived":
+                # Find which kernel base parameter this derives from.
+                # The base symbol has the same arg_index; its value = symbols[base_idx].
+                # We locate it by scanning backwards for the nearest "kernel" entry
+                # with value == (value - aux).
+                base_value = value - aux
+                base_sym_idx = next(
+                    (
+                        j
+                        for j in range(sym_idx - 1, -1, -1)
+                        if symbol_kinds[j][0] == "kernel" and symbols[j] == base_value
+                    ),
+                    None,
                 )
-                f.write(
-                    f"\t\t%sym_{sym_idx + 1} = arith.addi %pool_extracted,"
-                    f" %pool_offset_{sym_idx + 1} : index\n"
-                )
+                if base_sym_idx is not None and base_sym_idx in kernel_base_to_pos:
+                    base_pos = kernel_base_to_pos[base_sym_idx]
+                    key = (base_pos, aux)
+                    if key not in derived_addi_emitted:
+                        offset_ssa = f"%core_offset_{sym_idx + 1}"
+                        addi_ssa = f"%sym_{sym_idx + 1}"
+                        f.write(f"\t\t{offset_ssa} = arith.constant {aux} : index\n")
+                        f.write(
+                            f"\t\t{addi_ssa} = arith.addi"
+                            f" %sym_0_{base_pos}_extracted, {offset_ssa} : index\n"
+                        )
+                        derived_addi_emitted[key] = addi_ssa
+                    sym_canonical[sym_idx] = derived_addi_emitted[key]
+                else:
+                    # Fallback: emit as a plain constant if base not found.
+                    f.write(
+                        f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
+                    )
+            elif kind == "pool":
+                if value not in pool_addi_emitted:
+                    offset_ssa = f"%pool_offset_{sym_idx + 1}"
+                    addi_ssa = f"%sym_{sym_idx + 1}"
+                    f.write(f"\t\t{offset_ssa} = arith.constant {value} : index\n")
+                    f.write(
+                        f"\t\t{addi_ssa} = arith.addi %pool_extracted,"
+                        f" {offset_ssa} : index\n"
+                    )
+                    pool_addi_emitted[value] = addi_ssa
+                sym_canonical[sym_idx] = pool_addi_emitted[value]
             else:
                 f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
@@ -227,6 +278,7 @@ def generate_bundle(
             use_symbols=use_symbols,
             symbolic_args=symbolic_args,
             kernel_arg_sym_indices=kernel_arg_sym_indices,
+            sym_canonical=sym_canonical,
         )
 
         f.write("\t\treturn\n")
@@ -355,10 +407,13 @@ def _emit_specs(
     use_symbols: bool = False,
     symbolic_args: bool = False,
     kernel_arg_sym_indices: list | None = None,
+    sym_canonical: dict | None = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
     if kernel_arg_sym_indices is None:
         kernel_arg_sym_indices = []
+    if sym_canonical is None:
+        sym_canonical = {}
 
     # Map from 0-based symbol index to the extracted SSA name for kernel-arg symbols.
     # kernel_arg_sym_indices[pos] = sym_idx  →  %sym_0_{pos+1}_extracted
@@ -370,8 +425,11 @@ def _emit_specs(
     def _resolve_sym(sid: int) -> str:
         # sid is a negative symbol ID; abs(sid)-1 is the 0-based index into symbols[].
         sym_idx = abs(sid) - 1
-        if symbolic_args and sym_idx in kernel_arg_sym_to_name:
-            return kernel_arg_sym_to_name[sym_idx]
+        if symbolic_args:
+            if sym_idx in kernel_arg_sym_to_name:
+                return kernel_arg_sym_to_name[sym_idx]
+            if sym_idx in sym_canonical:
+                return sym_canonical[sym_idx]
         return f"%sym_{abs(sid)}"
 
     tab = "\t" * indent
@@ -396,6 +454,7 @@ def _emit_specs(
                 use_symbols=use_symbols,
                 symbolic_args=symbolic_args,
                 kernel_arg_sym_indices=kernel_arg_sym_indices,
+                sym_canonical=sym_canonical,
             )
             f.write(f"{tab}}}\n")
 

@@ -1435,7 +1435,7 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
                 [{s0: outer_stride, s1: inner_stride}],
-                ["kernel"],
+                [("kernel", 0)],
             )
 
         return fake_compile
@@ -1902,7 +1902,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 json_out,
                 [arg.allocation["hbm"] for arg in op_spec.args],
                 [{} for _ in op_spec.args],
-                ["kernel" for _ in op_spec.args],
+                [("kernel", 0) for _ in op_spec.args],
             )
 
         mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
@@ -1936,7 +1936,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [op_spec.args[0].allocation["hbm"]],
                 [{}],
-                ["kernel"],
+                [("kernel", 0)],
             )
 
         mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
@@ -1973,7 +1973,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(values[i])
-            kind = "kernel" if i == 0 else "pool"  # op_b has pool allocation
+            kind = ("kernel", 0) if i == 0 else ("pool", 0)  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
         mlir = self._bundle([op_a, op_b], symbolic_args=True, fake_compile=fake)
@@ -1995,7 +1995,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [op_spec.args[0].allocation["hbm"]],
                 [{}],
-                ["kernel"],
+                [("kernel", 0)],
             )
 
         mlir = self._bundle([a], symbolic_args=False, fake_compile=fake)
@@ -2055,7 +2055,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 }
             }
             # All symbols in this test are kernel args — all become input_arg params.
-            symbol_kind_flags = ["kernel"] * n
+            symbol_kind_flags = [("kernel", 0)] * n
             return (
                 json_out,
                 sym_values[start : start + n],
@@ -2080,6 +2080,37 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertNotIn("arith.constant", mlir)
         # No pool parameter
         self.assertNotIn("%pool:", mlir)
+
+    def test_pool_offset_constants_deduped(self):
+        """Pool symbols with the same offset share one arith.addi SSA variable."""
+        # Three pool symbols: offsets 0, 2048, 0.
+        # Expected: 2 arith.constant + 2 arith.addi; sdsc_execute for op[2] reuses %sym_1.
+        a = _make_minimal_op_spec("a")
+        b = _make_minimal_op_spec("b")
+        c = _make_minimal_op_spec("c")
+        call_count = [0]
+        pool_values = [0, 2048, 0]
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            i = call_count[0]
+            call_count[0] += 1
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(pool_values[i])
+            return _make_tiled_json(idx, sym_id), [pool_values[i]], [{}], [("pool", 0)]
+
+        mlir = self._bundle([a, b, c], symbolic_args=True, fake_compile=fake)
+
+        # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
+        self.assertEqual(mlir.count("arith.constant 0 : index"), 1)
+        self.assertEqual(mlir.count("arith.constant 2048 : index"), 1)
+        self.assertEqual(mlir.count("arith.addi %pool_extracted"), 2)
+        # op[0] and op[2] both use %sym_1 (offset 0); op[1] uses %sym_2 (offset 2048)
+        self.assertIn("sdscbundle.sdsc_execute (%sym_1)", mlir)
+        self.assertIn("sdscbundle.sdsc_execute (%sym_2)", mlir)
+        execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
+        self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%sym_1")
+        self.assertEqual(execute_lines[1].split("(")[1].split(")")[0], "%sym_2")
+        self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%sym_1")
 
 
 if __name__ == "__main__":
