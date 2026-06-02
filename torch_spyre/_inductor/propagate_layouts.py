@@ -673,18 +673,17 @@ def propagate_spyre_tensor_layouts(
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
             if not args:
-                is_constant_fill = all(
+                mem_reads = [r for r in rw.reads if isinstance(r, MemoryDep)]
+                is_constant_fill = bool(mem_reads) and all(
                     isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
-                    for r in rw.reads
-                    if isinstance(r, MemoryDep)
+                    for r in mem_reads
                 )
                 if is_constant_fill:
                     op.layouts = _all_constant_layouts(op)
                 else:
                     logger.warning(
                         f"{op.get_name()} has no propagatable args but reads non-constant "
-                        f"buffers {[r.name for r in rw.reads if isinstance(r, MemoryDep)]}; "
-                        f"falling back to generic layout"
+                        f"buffers {[r.name for r in mem_reads]}; falling back to generic layout"
                     )
                     op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
