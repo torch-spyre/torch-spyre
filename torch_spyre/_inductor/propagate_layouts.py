@@ -588,6 +588,39 @@ def compute_layouts(
     return layouts
 
 
+def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
+    """Return one STL per valid stick dimension for a constant-valued buffer.
+
+    A constant tensor (ones_like, full, zeros_like, ...) has no real memory
+    access pattern — every element is the same scalar broadcast from a
+    SpyreConstantFallback.  Because the content is uniform, any stick layout
+    is correct.  Offering all valid choices lets the optimizer pick whichever
+    is compatible with the rest of the graph at zero cost, avoiding a needless
+    restickify.
+
+    Only dimensions with at least elems_per_stick elements are valid stick
+    candidates — smaller dims produce sentinel -1 entries in stride_map that
+    insert_restickify cannot handle.
+    """
+    output: FixedLayout = op.get_layout()
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    elems_per_stick = get_elem_in_stick(output.dtype)
+    layouts = [
+        SpyreTensorLayout(
+            c_size,
+            c_stride,
+            output.dtype,
+            [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
+        )
+        for stick_dim in range(len(c_size))
+        if c_size[stick_dim] >= elems_per_stick
+    ]
+    if not layouts:
+        layouts = [generic_layout(op)]
+    return layouts
+
+
 def generic_layout(op: Operation) -> SpyreTensorLayout:
     output: FixedLayout = op.get_layout()
     # Concretize for C++ SpyreTensorLayout constructor.
@@ -640,7 +673,19 @@ def propagate_spyre_tensor_layouts(
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
             if not args:
-                op.layouts = [generic_layout(op)]
+                mem_reads = [r for r in rw.reads if isinstance(r, MemoryDep)]
+                is_constant_fill = bool(mem_reads) and all(
+                    isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
+                    for r in mem_reads
+                )
+                if is_constant_fill:
+                    op.layouts = _all_constant_layouts(op)
+                else:
+                    logger.warning(
+                        f"{op.get_name()} has no propagatable args but reads non-constant "
+                        f"buffers {[r.name for r in mem_reads]}; falling back to generic layout"
+                    )
+                    op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
             elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
