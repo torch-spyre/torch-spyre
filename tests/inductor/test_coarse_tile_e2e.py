@@ -705,6 +705,87 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
+    # Two ops in separate groups tiling different iteration dimensions
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_per_group_tiled_dims(self):
+        """Two ops in separate hint groups tile different sets of iteration dims.
+
+        Uses sub-dimension naming to map a [B, D] tensor's physical dims to
+        named sub-dims, then tiles each op independently:
+
+        op_a = abs(x): hint num_tiles_per_dim={"B": 4} tiles dim 0 only.
+          B=256 → 4 tiles of 64 rows each.  Iteration space per tile: [64, D].
+
+        op_b = neg(y): tensor named ["B0","B1","D0","D1"] with B0×B1=B and
+          D0×D1=D.  Outer hint num_tiles_per_dim={"B0": 4} tiles dim 0 (c0,
+          range 256) into 4.  Inner hint num_tiles_per_dim={"D0": 4} tiles
+          dim 1 (c1, range 128) into 4.  Iteration space per tile: [64, 32].
+
+        Both ops form separate groups → ≥2 LoopSpec entries, each with
+        count=sympify('4').
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 256, 128
+        x = torch.randn(B, D, dtype=torch.float16)
+        y = torch.randn(B, D, dtype=torch.float16)
+
+        # Sub-dims for y: B0×B1 = B, D0×D1 = D
+        B0, B1 = 4, B // 4  # 4 × 64 = 256
+        D0, D1 = 4, D // 4  # 4 × 32 = 128
+
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+
+        # abs group: simple single-dim tiling over B
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "D"])
+
+        # neg group: sub-dim decomposition to tile both dims independently
+        _declare_tensor_dim("B0", B0)
+        _declare_tensor_dim("B1", B1)
+        _declare_tensor_dim("D0", D0)
+        _declare_tensor_dim("D1", D1)
+        _name_tensor_dims(y_dev, ["B0", "B1", "D0", "D1"])
+
+        def fn(x, y):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                out_x = torch.abs(x)
+            with spyre_hint(num_tiles_per_dim={"B0": 4}):
+                with spyre_hint(num_tiles_per_dim={"D0": 4}):
+                    out_y = torch.neg(y)
+            return out_x, out_y
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        loop_spec_count = src.count("LoopSpec(")
+        self.assertGreaterEqual(
+            loop_spec_count,
+            2,
+            f"Expected ≥2 LoopSpec entries (one per group), "
+            f"got {loop_spec_count}\n\nSource:\n{src}",
+        )
+        self.assertIn(
+            "sympify('4')",
+            src,
+            "Expected loop count 4 in generated source",
+        )
+
+    # ------------------------------------------------------------------
     # Two ops with different slice counts -> two separate groups
     # ------------------------------------------------------------------
 
