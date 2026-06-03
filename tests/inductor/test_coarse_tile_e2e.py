@@ -72,44 +72,25 @@ def _groups_nested_k2_m4(operations: list[Operation]):
     return [(ops, [(0, sympy.Integer(2), [0]), (0, sympy.Integer(4), [1])])]
 
 
-def _groups_per_op_tiled_dim(operations: list[Operation]):
-    """Two groups each tiling a different iteration-space dimension.
-
-    Group 0: first ComputedBuffer, K=4, tiled_dims=[0] (tile dim 0, the default).
-    Group 1: second ComputedBuffer, K=4, tiled_dims=[0, 1] (tile both dims 0 and 1,
-             exercises the per-group tiled_dims path).
-    """
-    ops = [op for op in operations if isinstance(op, ComputedBuffer)]
-    groups = []
-    if ops[:1]:
-        groups.append((ops[:1], sympy.Integer(4)))  # default: tile dim 0
-    if ops[1:]:
-        groups.append(
-            (ops[1:], sympy.Integer(4), [0, 1])
-        )  # override: tile dims 0 and 1
-    return groups
-
-
 # ===========================================================================
 # Residual coarse_tiling_groups_fn tests
 #
-# These tests exercise capabilities not yet expressible via spyre_hints:
-#   - test_per_group_tiled_dims: per-group tiled_dims=[0, 1] override
-#     (multi-dim flat tiling in one group, not a nested loop nest)
-#
-# test_no_tiling_baseline and the unrolled-loop tests are kept here until
-# the groups_fn config is removed; their hint-based equivalents already
+# All scenarios have now been ported to TestCoarseTileSpyreHints.
+# These tests are kept until coarse_tiling_groups_fn is removed from the
+# implementation (config.py, passes.py); their hint-based equivalents already
 # exist in TestCoarseTileSpyreHints.
 #
-# See PR 2 for the tiled_dims extension to spyre_hints; PR 3 removes this
-# class and coarse_tiling_groups_fn entirely.
+# See PR 3 to remove coarse_tiling_groups_fn from the implementation and
+# delete this class entirely.
 # ===========================================================================
 
 
 class TestCoarseTileGroupsFnResidual(InductorTestCase):
     """Residual tests using coarse_tiling_groups_fn.
 
-    Kept until spyre_hints covers all scenarios.  See class docstring above.
+    All scenarios are now covered by TestCoarseTileSpyreHints.  These tests
+    remain until the coarse_tiling_groups_fn config is removed from the
+    implementation.  See the comment block above for details.
     """
 
     def setUp(self):
@@ -148,65 +129,6 @@ class TestCoarseTileGroupsFnResidual(InductorTestCase):
     # @config.patch({"coarse_tiling": True, "coarse_tiling_groups_fn": _groups_all_k4})
     # def test_generate_bundle_receives_loop_spec(self): ...
 
-    # ------------------------------------------------------------------
-    # Per-group tiled_dims: two ops tiling different iteration dimensions
-    # ------------------------------------------------------------------
-
-    @config.patch(
-        {
-            "coarse_tiling": True,
-            "coarse_tiling_groups_fn": _groups_per_op_tiled_dim,
-            "bundle_hbm_symbols": True,
-            "unroll_loops": False,
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    def test_per_group_tiled_dims(self):
-        """Two ops in separate groups tile different iteration-space dimensions.
-
-        op_a = abs(x): 2-D iteration space [B, D].
-          Group 0 uses the default tiled_dims (None → tile dim 0).
-          After tiling K=4: iteration space [B/4, D].
-
-        op_b = neg(x.T): operates on a transposed view so its natural
-          iteration space is also [B, D] but logically "D-major".
-          Group 1 uses tiled_dims=[0, 1] (tile both dims 0 and 1).
-          After tiling K=4: iteration space [B/4, D/4].
-
-        Both groups should produce separate LoopSpec(count=sympify('4'))
-        entries in the generated source, confirming that each group's
-        tiled_dims was applied independently.
-        """
-        B, D = 256, 128
-        x = torch.randn(B, D, dtype=torch.float16).to("spyre")
-        y = torch.randn(B, D, dtype=torch.float16).to("spyre")
-
-        def fn(x, y):
-            return torch.abs(x), torch.neg(y)
-
-        cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
-            _, source_codes = run_and_get_code(cfn, x, y)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-
-        # Both groups produce a LoopSpec with count=4.
-        loop_spec_count = src.count("LoopSpec(")
-        self.assertGreaterEqual(
-            loop_spec_count,
-            2,
-            f"Expected ≥2 LoopSpec entries (one per group), "
-            f"got {loop_spec_count}\n\nSource:\n{src}",
-        )
-        self.assertIn(
-            "sympify('4')",
-            src,
-            "Expected loop count 4 in generated source",
-        )
-
-    # ------------------------------------------------------------------
-    # Unrolled loop execution tests (unroll_loops=True)
     # Source inspection: unrolling passes LoopSpec through async_compile
     # with concrete per-iteration HBM addresses in each unrolled OpSpec.
     # ------------------------------------------------------------------
@@ -702,6 +624,87 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             run_eager=False,
             atol=0.1,
             rtol=0.1,
+        )
+
+    # ------------------------------------------------------------------
+    # Two ops in separate groups tiling different iteration dimensions
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_per_group_tiled_dims(self):
+        """Two ops in separate hint groups tile different sets of iteration dims.
+
+        Uses sub-dimension naming to map a [B, D] tensor's physical dims to
+        named sub-dims, then tiles each op independently:
+
+        op_a = abs(x): hint num_tiles_per_dim={"B": 4} tiles dim 0 only.
+          B=256 → 4 tiles of 64 rows each.  Iteration space per tile: [64, D].
+
+        op_b = neg(y): tensor named ["B0","B1","D0","D1"] with B0×B1=B and
+          D0×D1=D.  Outer hint num_tiles_per_dim={"B0": 4} tiles dim 0 (c0,
+          range 256) into 4.  Inner hint num_tiles_per_dim={"D0": 4} tiles
+          dim 1 (c1, range 128) into 4.  Iteration space per tile: [64, 32].
+
+        Both ops form separate groups → ≥2 LoopSpec entries, each with
+        count=sympify('4').
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 256, 128
+        x = torch.randn(B, D, dtype=torch.float16)
+        y = torch.randn(B, D, dtype=torch.float16)
+
+        # Sub-dims for y: B0×B1 = B, D0×D1 = D
+        B0, B1 = 4, B // 4  # 4 × 64 = 256
+        D0, D1 = 4, D // 4  # 4 × 32 = 128
+
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+
+        # abs group: simple single-dim tiling over B
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "D"])
+
+        # neg group: sub-dim decomposition to tile both dims independently
+        _declare_tensor_dim("B0", B0)
+        _declare_tensor_dim("B1", B1)
+        _declare_tensor_dim("D0", D0)
+        _declare_tensor_dim("D1", D1)
+        _name_tensor_dims(y_dev, ["B0", "B1", "D0", "D1"])
+
+        def fn(x, y):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                out_x = torch.abs(x)
+            with spyre_hint(num_tiles_per_dim={"B0": 4}):
+                with spyre_hint(num_tiles_per_dim={"D0": 4}):
+                    out_y = torch.neg(y)
+            return out_x, out_y
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        loop_spec_count = src.count("LoopSpec(")
+        self.assertGreaterEqual(
+            loop_spec_count,
+            2,
+            f"Expected ≥2 LoopSpec entries (one per group), "
+            f"got {loop_spec_count}\n\nSource:\n{src}",
+        )
+        self.assertIn(
+            "sympify('4')",
+            src,
+            "Expected loop count 4 in generated source",
         )
 
     # ------------------------------------------------------------------
