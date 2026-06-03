@@ -43,7 +43,7 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, REDUCTION_STICK_OPS
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .pass_utils import (
     compute_restickify_target_layout,
@@ -488,12 +488,13 @@ def _multi_arg_pointwise_layouts(
     return results
 
 
-def _topk_layouts(
+def _reduction_stick_layouts(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
+    # TODO(kavya): Fail here for non 64 dimension sizes
     x = args[0]
     x_coords = host_coordinates(x.layout, x.dep)
     out_coords = host_coordinates(output, output_dep)
@@ -560,8 +561,8 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
-        return _topk_layouts(op, output, output_dep, args)
+    if isinstance(data, Reduction) and data.reduction_type in REDUCTION_STICK_OPS:
+        return _reduction_stick_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:

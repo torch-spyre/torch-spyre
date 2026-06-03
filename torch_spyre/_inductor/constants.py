@@ -61,6 +61,8 @@ SPYRE_FP32_OPS = [
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}
+# TODO(kavya): Ensure all reduction ops are added here
+REDUCTION_STICK_OPS = {"topkvalue", "topkindex", "sum", "mean", "max", "min", "prod"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
