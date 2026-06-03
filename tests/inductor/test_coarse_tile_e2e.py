@@ -314,7 +314,7 @@ class TestCoarseTileGroupsFnResidual(InductorTestCase):
 # ===========================================================================
 # spyre_hint-driven coarse tiling
 # These tests verify that coarse tiling is driven automatically by
-# spyre_hint(slices=...) annotations, without requiring a
+# spyre_hint(num_tiles_per_dim=...) annotations, without requiring a
 # coarse_tiling_groups_fn.  Named tensor dimensions must be declared and
 # annotated on device tensors for the hint resolver to map dimension names
 # to loop variables.
@@ -326,7 +326,7 @@ _name_tensor_dims = _pnd.name_tensor_dims
 
 
 class TestCoarseTileSpyreHints(InductorTestCase):
-    """Coarse tiling driven by spyre_hint(slices=...) annotations."""
+    """Coarse tiling driven by spyre_hint(num_tiles_per_dim=...) annotations."""
 
     def setUp(self):
         super().setUp()
@@ -364,7 +364,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     def test_hint_single_group_pointwise(self):
-        """spyre_hint(slices={"A": 4}) tiles a pointwise abs into 4 iterations."""
+        """spyre_hint(num_tiles_per_dim={"A": 4}) tiles a pointwise abs into 4 iterations."""
         from torch_spyre._inductor import spyre_hint
 
         # 256 rows × 128 cols.  Tiling the outermost dim by 4 → 64 rows/iter.
@@ -372,7 +372,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(A, B, dtype=torch.float16)
 
         def fn(x):
-            with spyre_hint(slices={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
                 return torch.abs(x)
 
         x_dev = x.to("spyre")
@@ -424,7 +424,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(B, D, dtype=torch.float16)
 
         def softmax_fn(x):
-            with spyre_hint(tiles={"B": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
                 max_val = x.amax(dim=-1, keepdim=True)
                 x_shifted = x - max_val
                 exp_x = x_shifted.exp()
@@ -481,7 +481,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         c = torch.randn(A, B, dtype=torch.float16)
 
         def fn(a, b, c):
-            with spyre_hint(slices={"A": 2}):
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
                 with spyre_hint(num_tiles_per_dim={"B": 4}):
                     y = a + b
                     z = y * c
@@ -527,11 +527,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_nested_loop_with_scratchpad(self):
         """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
 
-        This is the canonical spyre_hint(slices=...) version of the small
-        example from docs/source/compiler/coarse_tiling_loops.md.
+        This is the canonical spyre_hint(num_tiles_per_dim=...) version of the
+        small example from docs/source/compiler/coarse_tiling_loops.md.
 
-        Shape [1024, 4096], outer hint slices A-dim by 2 (512 rows/iter),
-        inner hint slices B-dim by 4 (1024 cols/iter).  With lx_planning
+        Shape [1024, 4096], outer hint tiles A-dim by 2 (512 rows/iter),
+        inner hint tiles B-dim by 4 (1024 cols/iter).  With lx_planning
         enabled, the intermediate result y=a+b is allocated to LX scratchpad
         (it is only consumed within the loop body); the final output z stays
         in HBM.
@@ -550,8 +550,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         c = torch.randn(A, B, dtype=torch.float16)
 
         def fn(a, b, c):
-            with spyre_hint(slices={"A": 2}):
-                with spyre_hint(slices={"B": 4}):
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                with spyre_hint(num_tiles_per_dim={"B": 4}):
                     y = a + b
                     z = y * c
                     return z
@@ -623,8 +623,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         c = torch.randn(A, B, dtype=torch.float16)
 
         def fn(a, b, c):
-            with spyre_hint(slices={"A": 2}):
-                with spyre_hint(slices={"B": 4}):
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                with spyre_hint(num_tiles_per_dim={"B": 4}):
                     y = a + b
                     z = y * c
                     return z
@@ -674,9 +674,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """Unrolled K=4 hint-tiled softmax-shaped pointwise+reduce chain.
 
         Tiles the batch dimension (dim 0) of a softmax-like computation using
-        spyre_hint(slices={"B": 4}).  sencores=1 avoids core-division issues.
-        The reductions collapse dim 1 (D); the loop tiles dim 0 (B), so no
-        tiled dim overlaps with the reduction dim.
+        spyre_hint(num_tiles_per_dim={"B": 4}).  sencores=1 avoids
+        core-division issues.  The reductions collapse dim 1 (D); the loop
+        tiles dim 0 (B), so no tiled dim overlaps with the reduction dim.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -688,7 +688,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def softmax_fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(slices={"B": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
                 max_val = x.amax(dim=-1, keepdim=True)
                 x_shifted = x - max_val
                 exp_x = x_shifted.exp()
@@ -727,9 +727,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def fn(x, y):
             # Two independent pointwise ops: each becomes its own group.
-            with spyre_hint(slices={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
                 out_x = torch.abs(x)
-            with spyre_hint(slices={"A": 8}):
+            with spyre_hint(num_tiles_per_dim={"A": 8}):
                 out_y = torch.neg(y)
             return out_x, out_y
 
@@ -780,7 +780,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(M, K, dtype=torch.float16)
 
         def fn(x):
-            with spyre_hint(slices={"M": 4}):
+            with spyre_hint(num_tiles_per_dim={"M": 4}):
                 # torch.full produces a scalar-fill with no M/K loop dim mapping.
                 bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
                 return x + bias
@@ -830,7 +830,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         y = torch.randn(K, N, dtype=torch.float16) * 0.01
 
         def fn(x, y):
-            with spyre_hint(slices={"M": 4}):
+            with spyre_hint(num_tiles_per_dim={"M": 4}):
                 return torch.matmul(x, y)
 
         x_dev = x.to("spyre")
@@ -884,7 +884,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         scale = torch.randn(M, dtype=torch.float16)
 
         def fn(x, scale):
-            with spyre_hint(slices={"M": 4}):
+            with spyre_hint(num_tiles_per_dim={"M": 4}):
                 # transpose + contiguous forces a restickify on x before the mul
                 x_t = x.transpose(0, 1).contiguous().transpose(0, 1)
                 return x_t * scale.unsqueeze(-1)
@@ -920,7 +920,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     def test_hint_softmax_row_tiling(self):
-        """spyre_hint(slices={"NROW": 4}) tiles softmax over the row dimension."""
+        """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension."""
         from torch_spyre._inductor import spyre_hint
 
         NROW, NCOL = 16384, 4096
@@ -931,7 +931,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def fn(x, dim=-1):
             _name_tensor_dims(x, ["NROW", "NCOL"])
-            with spyre_hint(slices={"NROW": 4}):
+            with spyre_hint(num_tiles_per_dim={"NROW": 4}):
                 return torch.softmax(x, dim)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.1, rtol=0.1)
@@ -942,7 +942,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch({"coarse_tiling": True})
     def test_hint_matmul_row_tiling(self):
-        """spyre_hint(slices={"M": 4}) tiles matmul over the row (M) dimension."""
+        """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension."""
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 256, 128, 64
@@ -956,7 +956,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         def fn(x, y):
             _name_tensor_dims(x, ["M", "K"])
             _name_tensor_dims(y, ["K", "N"])
-            with spyre_hint(slices={"M": 4}):
+            with spyre_hint(num_tiles_per_dim={"M": 4}):
                 return x @ y
 
         compare_with_cpu(
@@ -985,10 +985,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
             )
             with spyre_hint(
-                slices={"B": 1}
+                num_tiles_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
-                with spyre_hint(slices={"H": 4}):
-                    with spyre_hint(slices={"Lk": lk_slices}):
+                with spyre_hint(num_tiles_per_dim={"H": 4}):
+                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                         keys_T = keys.transpose(-1, -2).contiguous()
                         denominator = torch.zeros(
                             (B, H, Lq), device=queries.device, dtype=torch.float16
@@ -1033,7 +1033,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch({"coarse_tiling": True})
     def test_hint_h_tiling_elementwise(self):
-        """spyre_hint(slices={"H": 2}) tiles elementwise multiply over the H dimension.
+        """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
         Regression test for a bug in _byte_stride_for_arg (unroll.py) where
         align_tensors rewrites device_coordinates but leaves stride_map stale,
@@ -1049,7 +1049,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         V = torch.randn(B, H, Lk, D, dtype=torch.float16)
 
         def fn(q, v):
-            with spyre_hint(slices={"H": 2}):
+            with spyre_hint(num_tiles_per_dim={"H": 2}):
                 return q * v
 
         ref = fn(Q, V)
