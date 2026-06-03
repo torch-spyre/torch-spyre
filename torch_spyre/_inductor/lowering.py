@@ -23,7 +23,7 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, COPY_BACK_CANDIDATE_ATTR
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -745,6 +745,76 @@ def lower_empty(size, device, dtype=None):
     return ir.TensorBox.create(
         SpyreEmptyFallback(op_overload, list(size), device, dtype)
     )
+
+
+def _peel(node):
+    """Unwrap TensorBox/StorageBox/MutableBox layers to reach the underlying Buffer."""
+    while isinstance(node, ir.MutableBox):
+        node = node.data
+    while isinstance(node, ir.StorageBox):
+        node = node.data
+    return node
+
+
+def _copy_back_candidate(dst, src) -> bool:
+    """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
+
+    Lowering only identifies the structural pattern.  Layout propagation later
+    proves the full safety condition and either removes the copy or leaves this
+    normal ``copy_`` mutation op intact.
+    """
+    dst_buf = _peel(dst)
+    if not isinstance(dst_buf, ir.InputBuffer):
+        return False
+    if dst_buf.get_name() not in V.graph.graph_input_names:
+        return False
+
+    if dst.get_device() != src.get_device():
+        return False
+    if dst.get_dtype() != src.get_dtype():
+        return False
+    if tuple(dst.get_size()) != tuple(src.get_size()):
+        return False
+
+    src_buf = _peel(src)
+    if not isinstance(src_buf, ir.ComputedBuffer):
+        return False
+    if not isinstance(src_buf.layout, ir.FlexibleLayout):
+        return False
+    return tuple(dst_buf.layout.stride) == tuple(src_buf.layout.stride)
+
+
+def _mark_copy_back_candidate(first_new_op: int, dst) -> None:
+    dst_name = _peel(dst).get_name()
+    for op in V.graph.operations[first_new_op:]:
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):
+            continue
+        if layout.get_buffer().get_name() == dst_name:
+            setattr(op, COPY_BACK_CANDIDATE_ATTR, True)
+
+
+@register_spyre_lowering(torch.ops.aten.copy_.default, type_promotion_kind=None)
+def spyre_copy_(dst, src, non_blocking=False):
+    """Lower ``copy_`` and mark graph-input copy-back candidates.
+
+    Do not alias at lowering time.  Candidate marking keeps the structural
+    connection to ``copy_`` while letting layout propagation make the final,
+    feasibility-aware decision after producer layouts are known.
+    """
+    if dst is src:
+        return dst
+
+    candidate = _copy_back_candidate(dst, src)
+    src = lowering.to_device(src, dst.get_device())
+    src = lowering.to_dtype(src, dst.get_dtype())
+    src = lowering.expand(src, dst.get_size())
+
+    first_new_op = len(V.graph.operations)
+    result = lowering.mutate_to(dst, src)
+    if candidate:
+        _mark_copy_back_candidate(first_new_op, dst)
+    return result
 
 
 @register_spyre_lowering(torch.ops.aten.cat.default, type_promotion_kind=None)

@@ -487,6 +487,9 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
+        scheduler = getattr(V.graph, "scheduler", None)
+        if scheduler is not None:
+            name = scheduler.mutation_real_name.get(name, name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
