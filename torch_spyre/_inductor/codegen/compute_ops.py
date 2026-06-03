@@ -14,7 +14,7 @@
 
 
 from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP, CONV2D_DIM_LABELS
+from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
 
 from sympy import Symbol
 
@@ -85,14 +85,13 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
-   conv_params = {"conv_padding": "nopad", "total_size": -1}
+    conv_params={"conv_padding": "nopad", "total_size": -1},
 ):
     return (
         {
             "spatial": 3,
             "temporal": 0,
             "elemArr": 1,
-            #"padding": "nopad",
             "padding": str(conv_params["conv_padding"]),
             "folds": {
                 "dim_prop_func": [
@@ -135,7 +134,6 @@ def gen_coord_info_value(
                         "label_": "row_fold",
                     },
                     {
-                        #"factor_": size,
                         "factor_": conv_params["total_size"],
                         "label_": "elem_arr_0",
                     },
@@ -214,15 +212,24 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size):
     conv_padding = "nopad"
     total_size = size
     if tensor_num == 0 and opfunc == DEPTHWISE_CONV2D_OP:
-        if ("pad_type" in conv_params and (str(dim) == str(conv_params["pad_dim_i"]) or str(dim) == str(conv_params["pad_dim_j"]))):
+        if "pad_type" in conv_params and (
+            str(dim) == str(conv_params["pad_dim_i"])
+            or str(dim) == str(conv_params["pad_dim_j"])
+        ):
             conv_padding = conv_params["pad_type"]
-        if ("pad_dim_i" in conv_params and str(dim) == str(conv_params["pad_dim_i"]) and  "total_size_i" in conv_params):
+        if (
+            "pad_dim_i" in conv_params
+            and str(dim) == str(conv_params["pad_dim_i"])
+            and "total_size_i" in conv_params
+        ):
             total_size = conv_params["total_size_i"]
-        elif ("pad_dim_j" in conv_params and str(dim) == str(conv_params["pad_dim_j"]) and  "total_size_j" in conv_params):
+        elif (
+            "pad_dim_j" in conv_params
+            and str(dim) == str(conv_params["pad_dim_j"])
+            and "total_size_j" in conv_params
+        ):
             total_size = conv_params["total_size_j"]
     return {"conv_padding": conv_padding, "total_size": total_size}
-
-    conv_padding=sdsc_spec.conv_params["pad_type"] if (i==0 and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP and "pad_type" in sdsc_spec.conv_params and (str(dim) == str(sdsc_spec.conv_params["pad_dim_i"]) or str(dim) == str(sdsc_spec.conv_params["pad_dim_j"]))) else "nopad"
 
 
 def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
@@ -370,7 +377,6 @@ def generate_sdsc(
                 for c in range(sdsc_spec.num_cores)
             }
 
-    print( f"In generate_sdsc: {list(local_symbols.keys())}, {affine_strides}" )
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
@@ -405,17 +411,41 @@ def generate_sdsc(
                                     for dim, size in sdsc_spec.iteration_space.items()
                                 },
                                 **(
-										{
-										"paddingSizes_" :{
-											str(CONV2D_DIM_LABELS[2]) : {"totalSize_" : sdsc_spec.conv_params["total_size_i"], "stride_" : sdsc_spec.conv_params["stride_i"], "dilation_" : sdsc_spec.conv_params["dilation_i"], "windowDim_" : sdsc_spec.conv_params["window_dim_i"]},
-											 str(CONV2D_DIM_LABELS[3]) : {"totalSize_" : sdsc_spec.conv_params["total_size_j"], "stride_" : sdsc_spec.conv_params["stride_j"], "dilation_" : sdsc_spec.conv_params["dilation_j"], "windowDim_" : sdsc_spec.conv_params["window_dim_j"]}
-											#str(CONV2D_DIM_LABELS[2]) : {"padFront_":1, "padBack_":1, "totalSize_" : sdsc_spec.conv_params["total_size_i"], "stride_" : sdsc_spec.conv_params["stride_i"], "dilation_" : sdsc_spec.conv_params["dilation_i"], "windowDim_" : sdsc_spec.conv_params["window_dim_i"]},
-											#str(CONV2D_DIM_LABELS[3]) : {"padFront_":1, "padBack_":1, "totalSize_" : sdsc_spec.conv_params["total_size_j"], "stride_" : sdsc_spec.conv_params["stride_j"], "dilation_" : sdsc_spec.conv_params["dilation_j"], "windowDim_" : sdsc_spec.conv_params["window_dim_j"]}
-											}
-										}
-										if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
-										else {}
-								),
+                                    {
+                                        "paddingSizes_": {
+                                            str(sdsc_spec.conv_params["pad_dim_i"]): {
+                                                "totalSize_": sdsc_spec.conv_params[
+                                                    "total_size_i"
+                                                ],
+                                                "stride_": sdsc_spec.conv_params[
+                                                    "stride_i"
+                                                ],
+                                                "dilation_": sdsc_spec.conv_params[
+                                                    "dilation_i"
+                                                ],
+                                                "windowDim_": sdsc_spec.conv_params[
+                                                    "window_dim_i"
+                                                ],
+                                            },
+                                            str(sdsc_spec.conv_params["pad_dim_j"]): {
+                                                "totalSize_": sdsc_spec.conv_params[
+                                                    "total_size_j"
+                                                ],
+                                                "stride_": sdsc_spec.conv_params[
+                                                    "stride_j"
+                                                ],
+                                                "dilation_": sdsc_spec.conv_params[
+                                                    "dilation_j"
+                                                ],
+                                                "windowDim_": sdsc_spec.conv_params[
+                                                    "window_dim_j"
+                                                ],
+                                            },
+                                        }
+                                    }
+                                    if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                    else {}
+                                ),
                             },
                             "coordinateMasking_": {
                                 str(dim): mask_range
@@ -433,18 +463,50 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
-										**(
-											{
-											"paddingSizes_" :{
-												str(CONV2D_DIM_LABELS[2]) : {"totalSize_" : sdsc_spec.conv_params["total_size_i"], "stride_" : sdsc_spec.conv_params["stride_i"], "dilation_" : sdsc_spec.conv_params["dilation_i"], "windowDim_" : sdsc_spec.conv_params["window_dim_i"]},
-												str(CONV2D_DIM_LABELS[3]) : {"totalSize_" : sdsc_spec.conv_params["total_size_j"], "stride_" : sdsc_spec.conv_params["stride_j"], "dilation_" : sdsc_spec.conv_params["dilation_j"], "windowDim_" : sdsc_spec.conv_params["window_dim_j"]}
-												#str(CONV2D_DIM_LABELS[2]) : {"padFront_":1, "padBack_":1, "totalSize_" : sdsc_spec.conv_params["total_size_i"], "stride_" : sdsc_spec.conv_params["stride_i"], "dilation_" : sdsc_spec.conv_params["dilation_i"], "windowDim_" : sdsc_spec.conv_params["window_dim_i"]},
-												#str(CONV2D_DIM_LABELS[3]) : {"padFront_":1, "padBack_":1, "totalSize_" : sdsc_spec.conv_params["total_size_j"], "stride_" : sdsc_spec.conv_params["stride_j"], "dilation_" : sdsc_spec.conv_params["dilation_j"], "windowDim_" : sdsc_spec.conv_params["window_dim_j"]}
-												}
-											}
-											if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
-											else {}
-										 ),
+                                        **(
+                                            {
+                                                "paddingSizes_": {
+                                                    str(
+                                                        sdsc_spec.conv_params[
+                                                            "pad_dim_i"
+                                                        ]
+                                                    ): {
+                                                        "totalSize_": sdsc_spec.conv_params[
+                                                            "total_size_i"
+                                                        ],
+                                                        "stride_": sdsc_spec.conv_params[
+                                                            "stride_i"
+                                                        ],
+                                                        "dilation_": sdsc_spec.conv_params[
+                                                            "dilation_i"
+                                                        ],
+                                                        "windowDim_": sdsc_spec.conv_params[
+                                                            "window_dim_i"
+                                                        ],
+                                                    },
+                                                    str(
+                                                        sdsc_spec.conv_params[
+                                                            "pad_dim_j"
+                                                        ]
+                                                    ): {
+                                                        "totalSize_": sdsc_spec.conv_params[
+                                                            "total_size_j"
+                                                        ],
+                                                        "stride_": sdsc_spec.conv_params[
+                                                            "stride_j"
+                                                        ],
+                                                        "dilation_": sdsc_spec.conv_params[
+                                                            "dilation_j"
+                                                        ],
+                                                        "windowDim_": sdsc_spec.conv_params[
+                                                            "window_dim_j"
+                                                        ],
+                                                    },
+                                                }
+                                            }
+                                            if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                            else {}
+                                        ),
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -453,18 +515,50 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
-										**(
-											{
-											"paddingSizes_" :{
-												str(CONV2D_DIM_LABELS[2]) : {"totalSize_" : sdsc_spec.conv_params["total_size_i"], "stride_" : sdsc_spec.conv_params["stride_i"], "dilation_" : sdsc_spec.conv_params["dilation_i"], "windowDim_" : sdsc_spec.conv_params["window_dim_i"]},
-												str(CONV2D_DIM_LABELS[3]) : {"totalSize_" : sdsc_spec.conv_params["total_size_j"], "stride_" : sdsc_spec.conv_params["stride_j"], "dilation_" : sdsc_spec.conv_params["dilation_j"], "windowDim_" : sdsc_spec.conv_params["window_dim_j"]}
-												#str(CONV2D_DIM_LABELS[2]) : {"padFront_":1, "padBack_":1, "totalSize_" : sdsc_spec.conv_params["total_size_i"], "stride_" : sdsc_spec.conv_params["stride_i"], "dilation_" : sdsc_spec.conv_params["dilation_i"], "windowDim_" : sdsc_spec.conv_params["window_dim_i"]},
-												#str(CONV2D_DIM_LABELS[3]) : {"padFront_":1, "padBack_":1, "totalSize_" : sdsc_spec.conv_params["total_size_j"], "stride_" : sdsc_spec.conv_params["stride_j"], "dilation_" : sdsc_spec.conv_params["dilation_j"], "windowDim_" : sdsc_spec.conv_params["window_dim_j"]}
-												}
-											}
-											if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
-											else {}
-										 ),
+                                        **(
+                                            {
+                                                "paddingSizes_": {
+                                                    str(
+                                                        sdsc_spec.conv_params[
+                                                            "pad_dim_i"
+                                                        ]
+                                                    ): {
+                                                        "totalSize_": sdsc_spec.conv_params[
+                                                            "total_size_i"
+                                                        ],
+                                                        "stride_": sdsc_spec.conv_params[
+                                                            "stride_i"
+                                                        ],
+                                                        "dilation_": sdsc_spec.conv_params[
+                                                            "dilation_i"
+                                                        ],
+                                                        "windowDim_": sdsc_spec.conv_params[
+                                                            "window_dim_i"
+                                                        ],
+                                                    },
+                                                    str(
+                                                        sdsc_spec.conv_params[
+                                                            "pad_dim_j"
+                                                        ]
+                                                    ): {
+                                                        "totalSize_": sdsc_spec.conv_params[
+                                                            "total_size_j"
+                                                        ],
+                                                        "stride_": sdsc_spec.conv_params[
+                                                            "stride_j"
+                                                        ],
+                                                        "dilation_": sdsc_spec.conv_params[
+                                                            "dilation_j"
+                                                        ],
+                                                        "windowDim_": sdsc_spec.conv_params[
+                                                            "window_dim_j"
+                                                        ],
+                                                    },
+                                                }
+                                            }
+                                            if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                            else {}
+                                        ),
                                     },
                                 }
                             },
@@ -491,14 +585,19 @@ def generate_sdsc(
                                     else "hbm",
                                     **(
                                         {
-                                        "padding_" :{
-                                             str(CONV2D_DIM_LABELS[2]) : sdsc_spec.conv_params["pad_type"],
-                                             str(CONV2D_DIM_LABELS[3]) : sdsc_spec.conv_params["pad_type"]
+                                            "padding_": {
+                                                str(
+                                                    sdsc_spec.conv_params["pad_dim_i"]
+                                                ): sdsc_spec.conv_params["pad_type"],
+                                                str(
+                                                    sdsc_spec.conv_params["pad_dim_j"]
+                                                ): sdsc_spec.conv_params["pad_type"],
                                             }
                                         }
-                                        if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP and i == 0
+                                        if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        and i == 0
                                         else {}
-                                     ),
+                                    ),
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if use_symbols and "lx" not in tensor.allocation
@@ -529,18 +628,19 @@ def generate_sdsc(
                                         ],
                                         "data_": _start_addr_data(tensor),
                                     },
-                                    #**(
-                                    #    {
-                                    #        "backGapCore_": {
-                                    #            str(dim): {
-                                    #                "-1": str(gap)  # HBM is -1
-                                    #            }
-                                    #            for dim, gap in tensor.backGap.items()
-                                    #        }
-                                    #    }
-                                    #    if tensor.backGap
-                                    #    else {}
-                                    #),
+                                    **(
+                                        {
+                                            "backGapCore_": {
+                                                str(dim): {
+                                                    "-1": str(gap)  # HBM is -1
+                                                }
+                                                for dim, gap in tensor.backGap.items()
+                                            }
+                                        }
+                                        if tensor.backGap
+                                        and sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP
+                                        else {}
+                                    ),
                                     "coordinates_": {
                                         "coordInfo": {
                                             str(dim): gen_coord_info_value(
@@ -560,7 +660,13 @@ def generate_sdsc(
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
                                                 ),
-												conv_params=get_conv_params(i, dim, sdsc_spec.opfunc, sdsc_spec.conv_params, sdsc_spec.iteration_space[dim]),
+                                                conv_params=get_conv_params(
+                                                    i,
+                                                    dim,
+                                                    sdsc_spec.opfunc,
+                                                    sdsc_spec.conv_params,
+                                                    sdsc_spec.iteration_space[dim],
+                                                ),
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
                                                 "dim_order"
@@ -584,30 +690,45 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
-                                    "memOrg_": ( 
-                                        {       
-                                            #"hbm": {"isPresent": 1},
-                                            #"lx": {"isPresent": 1}
-                                            "hbm": {"isPresent": 1, "isPadded": 1, "isZeroPadded": 0},
-                                            "lx": {"isPresent": 1, "isPadded": 1, "isZeroPadded": 1},
-                                        }       
-                                        if (i==0 and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP) 
+                                    "memOrg_": (
+                                        {
+                                            # "hbm": {"isPresent": 1},
+                                            # "lx": {"isPresent": 1}
+                                            "hbm": {
+                                                "isPresent": 1,
+                                                "isPadded": 1,
+                                                "isZeroPadded": 0,
+                                            },
+                                            "lx": {
+                                                "isPresent": 1,
+                                                "isPadded": 1,
+                                                "isZeroPadded": 1,
+                                            },
+                                        }
+                                        if (
+                                            i == 0
+                                            and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        )
                                         else {
                                             "hbm": {"isPresent": 1},
                                             "lx": {"isPresent": 1},
                                         }
-									)
+                                    )
                                     if "lx" not in tensor.allocation
                                     else (
-									  {
-                                        "lx": {
-                                          "isPresent": 1, "isPadded": 1
-                                          #"isPresent": 1
+                                        {
+                                            "lx": {
+                                                "isPresent": 1,
+                                                "isPadded": 1,
+                                                # "isPresent": 1
+                                            }
                                         }
-                                      }
-                                      if (i==0 and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP)
-                                      else {"lx": {"isPresent": 1}},
-								  ),
+                                        if (
+                                            i == 0
+                                            and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        )
+                                        else {"lx": {"isPresent": 1}},
+                                    ),
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],

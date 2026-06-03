@@ -192,7 +192,7 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
 
         # Get the reduction ranges from the Reduction IR node
         red_node = n.node.data
-        if hasattr(red_node, 'reduction_ranges') and red_node.reduction_ranges:
+        if hasattr(red_node, "reduction_ranges") and red_node.reduction_ranges:
             # Create symbols for reduction dimensions
             # Use the same pattern as the scheduler: r0, r1, etc.
             for i, red_size in enumerate(red_node.reduction_ranges):
@@ -216,7 +216,7 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         write_ranges = next(iter(rw.writes)).ranges.copy()
         # Get the reduction ranges from the Reduction IR node
         red_node = op.data
-        if hasattr(red_node, 'reduction_ranges') and red_node.reduction_ranges:
+        if hasattr(red_node, "reduction_ranges") and red_node.reduction_ranges:
             # Create symbols for reduction dimensions
             # Use the same pattern as the scheduler: r0, r1, etc.
             for i, red_size in enumerate(red_node.reduction_ranges):

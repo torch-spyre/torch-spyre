@@ -369,11 +369,11 @@ def lower_bmm(x, y):
 
     return result
 
-@register_spyre_lowering(torch.ops.aten.convolution.default)
-def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_padding, groups):
-    print(f"In lower_convolution: Passed in values: x: {x} w: {w}")
-    print(f"In lower_convolution: bias: {bias} stride: {stride} padding: {padding} dilation: {dilation} transposed: {transposed}, \
-                                  output_padding: {output_padding} groups: {groups}") 
+
+@register_spyre_lowering(torch.ops.spyre.conv2d.default)
+# @register_spyre_lowering(torch.ops.aten.convolution.default)
+# def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_padding, groups):
+def lower_convolution(x, w, bias, stride, padding, dilation, groups):
     x = V.graph.get_buffer(x.realize())
     w = V.graph.get_buffer(w.realize())
 
@@ -384,20 +384,17 @@ def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_
     N, C_in, H_in, W_in = x.get_size()
     C_out, G, K_h, K_w = w.get_size()
 
-    H_in_padded = H_in + 2*padding[0]
-    W_in_padded = W_in + 2*padding[1]
-    print(f"In lower_convolution: N: {N} C_in: {C_in} H_in: {H_in} W_in: {W_in} C_out: {C_out} K_h: {K_h} K_w: {K_w}")
+    H_in_padded = H_in + 2 * padding[0]
+    W_in_padded = W_in + 2 * padding[1]
 
-    assert C_out == C_in
-    #assert groups == C_in
+    if C_out != C_in or C_in != groups:
+        raise Unsupported(
+            f"Input and output channels and groups should all be equal for depthwiseconv2d: {C_in}, {C_out}, {groups}"
+        )
 
     # Output spatial sizes
     H_out = (H_in + 2 * padding[0] - K_h) // stride[0] + 1
     W_out = (W_in + 2 * padding[1] - K_w) // stride[1] + 1
-
-    # Get weight strides to manually compute index
-    w_strides = w.get_stride()  
-
 
     def inner_fn(index, reduction_index):
         # Output indices
@@ -405,11 +402,7 @@ def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_
         # Reduction indices: may be [kh, kw] or [kh, kw, g] depending on whether G is 1
         kh = reduction_index[0]
         kw = reduction_index[1]
-        g = reduction_index[2] #if len(reduction_index) > 2 else 0
-
-        # Compute input coordinates
-        hi = ho * stride[0] + kh - padding[0]
-        wi = wo * stride[1] + kw - padding[1]
+        g = reduction_index[2]  # if len(reduction_index) > 2 else 0
 
         x_val = x_loader([n, c, ho, wo])
 
@@ -419,24 +412,24 @@ def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_
         return (x_val, w_val)
 
     op_info = {
-    "conv_params": {
-        "stride_i": stride[0],
-        "stride_j": stride[1],
-        "pad_i": padding[0],
-        "pad_j": padding[1],
-        "dilation_i": dilation[0],
-        "dilation_j": dilation[1],
-        "total_size_i": H_in_padded,
-        "total_size_j": W_in_padded,
-        "pad_dim_i": CONV2D_DIM_LABELS[2],
-        "pad_dim_j": CONV2D_DIM_LABELS[3],
-        "window_dim_i": CONV2D_DIM_LABELS[-3],
-        "window_dim_j": CONV2D_DIM_LABELS[-2],
-        "pad_type": "padded_fullspan_wunneeded",
-        #"pad_type": "padded_nozeropad",
+        "conv_params": {
+            "stride_i": stride[0],
+            "stride_j": stride[1],
+            "pad_i": padding[0],
+            "pad_j": padding[1],
+            "dilation_i": dilation[0],
+            "dilation_j": dilation[1],
+            "total_size_i": H_in_padded,
+            "total_size_j": W_in_padded,
+            "pad_dim_i": CONV2D_DIM_LABELS[2],
+            "pad_dim_j": CONV2D_DIM_LABELS[3],
+            "window_dim_i": CONV2D_DIM_LABELS[-3],
+            "window_dim_j": CONV2D_DIM_LABELS[-2],
+            "pad_type": "padded_fullspan_wunneeded"
+            if (padding[0] == 0 and padding[1] == 0)
+            else "padded_nozeropad",
         }
     }
-
 
     # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway)
     red_ranges = [K_h, K_w]
@@ -451,9 +444,9 @@ def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=[N, C_out, H_out, W_out],
-        #reduction_ranges=red_ranges,
+        # reduction_ranges=red_ranges,
         reduction_ranges=[K_h, K_w, G],
-        op_info=op_info
+        op_info=op_info,
     )
 
     result.realize()

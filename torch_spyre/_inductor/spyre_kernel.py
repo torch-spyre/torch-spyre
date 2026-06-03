@@ -616,21 +616,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
         elif value.op == DEPTHWISE_CONV2D_OP:
-            print(f"In store_reduction for depthwiseconv2dnative op: arguments: {value.arguments} len: {len(value.arguments)}")
             if (
-                len(value.arguments)  < 2
+                len(value.arguments) < 2
                 or (not isinstance(value.arguments[0], TensorAccess))
                 or (not isinstance(value.arguments[1], TensorAccess))
             ):
                 raise Unsupported(
-		    f"invalid depthwiseconv2dnative arguments {value.arguments}"
+                    f"invalid depthwiseconv2dnative arguments {value.arguments}"
                 )
             x = value.arguments[0]
             w = value.arguments[1]
-            print("")
-            print("")
-            print(f"In store_reduction: x: {x} x.index: {x.index}")
-            print(f"In store_reduction: dst: {dst} real_dst_name: {real_dst_name}")
             args = [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(True, w.name, w),

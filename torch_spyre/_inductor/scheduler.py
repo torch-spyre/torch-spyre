@@ -354,7 +354,8 @@ class SuperDSCScheduling(BaseScheduling):
 
                 # Extract the actual IR node from ComputedBuffer
                 from torch._inductor.ir import Reduction, ComputedBuffer
-                if hasattr(node, 'node') and isinstance(node.node, ComputedBuffer):
+
+                if hasattr(node, "node") and isinstance(node.node, ComputedBuffer):
                     actual_ir_node = node.node.data
                 else:
                     actual_ir_node = None
@@ -370,10 +371,14 @@ class SuperDSCScheduling(BaseScheduling):
                         vars[n_output : n_output + n_reduction],
                     ]
                 else:
-                    iter_vars_len = len(node._body.iter_vars) if hasattr(node._body, 'iter_vars') else 0
+                    iter_vars_len = (
+                        len(node._body.iter_vars)
+                        if hasattr(node._body, "iter_vars")
+                        else 0
+                    )
                     index_vars = [
-                        vars[: iter_vars_len],
-                        vars[iter_vars_len :],
+                        vars[:iter_vars_len],
+                        vars[iter_vars_len:],
                     ]
 
                 node.codegen(index_vars)
