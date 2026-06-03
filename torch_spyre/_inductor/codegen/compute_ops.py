@@ -333,12 +333,6 @@ def generate_sdsc(
         affine_strides = [{} for _ in sdsc_spec.args]
 
         def _start_addr_data(tensor):
-            if "lx" in tensor.allocation:
-                # Mirrors the use_symbols=True branch above.
-                return {
-                    f"[{c}, 0, 0]": str(tensor.start_address)
-                    for c in range(sdsc_spec.num_cores)
-                }
             return {
                 f"[{c}, 0, 0]": str(
                     tensor.start_address
@@ -465,9 +459,18 @@ def generate_sdsc(
                                     **(
                                         {
                                             "backGapCore_": {
-                                                str(dim): {
-                                                    "-1": str(gap)  # HBM is -1
-                                                }
+                                                str(dim): (
+                                                    # LX: per-core keys 0..num_cores-1
+                                                    {
+                                                        str(c): str(gap)
+                                                        for c in range(
+                                                            sdsc_spec.num_cores
+                                                        )
+                                                    }
+                                                    if "lx" in tensor.allocation
+                                                    # HBM: -1 sentinel covers all cores
+                                                    else {"-1": str(gap)}
+                                                )
                                                 for dim, gap in tensor.backGap.items()
                                             }
                                         }
