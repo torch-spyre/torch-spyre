@@ -35,7 +35,7 @@ from .errors import Unsupported
 from .pass_utils import SpyreConstantFallback, host_coordinates, device_coordinates
 from .propagate_hints import get_op_hints
 from .views import matching_dim, compute_coordinates
-from .propagate_hints import DimHint, get_op_hints
+from .propagate_hints import DimHint
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
