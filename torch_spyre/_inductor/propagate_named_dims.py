@@ -33,9 +33,8 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .pass_utils import SpyreConstantFallback, host_coordinates, device_coordinates
-from .propagate_hints import get_op_hints
+from .propagate_hints import DimHint, get_op_hints
 from .views import matching_dim, compute_coordinates
-from .propagate_hints import DimHint
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
@@ -343,19 +342,22 @@ def propagate_named_dims(
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
             hint = False
-            for v in get_op_hints(op).values():
-                if "named_dims" in v:
-                    op.reduction_named_dims = None
-                    op.named_dims = v["named_dims"]
+            for hint_dict in get_op_hints(op).values():
+                if "named_dims" in hint_dict:
                     hint = True
+                    named_dims = hint_dict["named_dims"]
                     break
             if hint:
                 coords = op_out_coords(op)
-                op.loop_var_dims = {
-                    _lone_sym(k): [v]
-                    for k, v in zip(coords, op.named_dims)
-                    if len(k.free_symbols) == 1
+                loop_var_dims = {
+                    _lone_sym(coord): [dim_name]
+                    for coord, dim_name in zip(coords, named_dims)
+                    if len(coord.free_symbols) == 1
                 }
+                op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
+                    named_dims=named_dims,
+                    loop_var_dims=loop_var_dims,
+                )
                 continue
             origins: set = getattr(op.data, "origins", set())
             aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
