@@ -262,8 +262,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         assign_dim_hints(operations)
         if config.coarse_tiling:
             groups = hints_to_coarse_tile_groups(operations)
-            if config.coarse_tiling_groups_fn is not None:
-                groups = config.coarse_tiling_groups_fn(operations)
             coarse_tile(operations, groups=groups)
         span_reduction(operations)
         k_fast_ops = (
