@@ -411,16 +411,62 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     }
   }
 
-  // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
+  // Parse and validate the expected input shapes from top-level SpyreCode
+  auto expected_input_shapes = translateInputShapes(job_exec_plan);
+
   // TODO(jni): pinned buffer to be added as std::map once HostCompute provided
   // in SpyreCode Create and return the JobPlan Use brace initialization to
   // construct JobPlan with moved members
   return std::make_unique<JobPlan>(JobPlan{
       std::move(steps),                    // steps
       std::move(job_allocation_.value()),  // job_allocation
-      {},                                  // expected_input_shapes
+      std::move(expected_input_shapes),    // expected_input_shapes
       {}                                   // pinned_buffers
   });
+}
+
+std::vector<std::vector<int64_t>> JobPlanBuilder::translateInputShapes(
+    const nlohmann::json& job_exec_plan) {
+  std::vector<std::vector<int64_t>> expected_input_shapes;
+
+  // Read expected_input_shapes from top-level SpyreCode JSON
+  TORCH_CHECK(spyrecode_json_.contains("expected_input_shapes"),
+              "SpyreCode JSON missing 'expected_input_shapes' field");
+
+  const auto& input_shapes = spyrecode_json_["expected_input_shapes"];
+  TORCH_CHECK(input_shapes.is_array(),
+              "SpyreCode 'expected_input_shapes' must be an array");
+
+  for (const auto& shape : input_shapes) {
+    TORCH_CHECK(shape.is_array(),
+                "Each expected input shape in SpyreCode "
+                "'expected_input_shapes' must be an array");
+    TORCH_CHECK(!shape.empty(),
+                "SpyreCode 'expected_input_shapes' contains an empty shape");
+
+    expected_input_shapes.push_back(shape.get<std::vector<int64_t>>());
+  }
+
+  // Check if JobExecPlan contains ComputeOnDevice operations
+  bool has_compute_on_device = false;
+  for (const auto& command : job_exec_plan) {
+    if (command.contains("command") && command["command"].is_string()) {
+      const std::string command_type = command["command"].get<std::string>();
+      if (command_type == "ComputeOnDevice") {
+        has_compute_on_device = true;
+        break;
+      }
+    }
+  }
+
+  // For JobPlans with ComputeOnDevice: shapes must be non-empty
+  if (has_compute_on_device) {
+    TORCH_CHECK(!expected_input_shapes.empty(),
+                "JobPlan with ComputeOnDevice requires non-empty "
+                "'expected_input_shapes'");
+  }
+
+  return expected_input_shapes;
 }
 
 std::unique_ptr<JobPlan> JobPlanBuilder::build() {
