@@ -20,4 +20,5 @@ test_suite_config:
             # The base method test_mean belongs to misc, but this one specific param
             # variant was collected in the reductions shard via substring match.
             - TestOps::test_mean_3d_dim0_keepdim
+            - TestOps::test_index_copy_.*
           mode: mandatory_success
