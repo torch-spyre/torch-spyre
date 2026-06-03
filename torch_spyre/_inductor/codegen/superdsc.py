@@ -557,12 +557,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # quantization_double_pad.ddl requires an outer spatial dim beyond the stick.
+    # SDSC dtype ops require at least one outer spatial dim beyond the stick.
     # When all op_dim_order symbols collapse into op_stick_dim (empty list for the
-    # ir.View stale-layout case, or a singleton [out_sym] where out_sym IS
-    # op_stick_dim for a genuine 1D tensor), no outer dim exists.  Inject a
-    # virtual mb=1 row so SDSC sees {mb: 1, out: N} instead of {out: N};
-    # SDSCArgs are post-patched with scale=1, stride=row_stride, offset=0 for mb.
+    # stale-layout case, or a singleton [out_sym] where out_sym IS op_stick_dim
+    # for a genuine 1D tensor), no outer dim exists.  Inject a virtual mb=1 row
+    # so SDSC sees {mb: 1, out: N} instead of {out: N}; SDSCArgs are post-patched
+    # with scale=1, stride=row_stride, offset=0 for mb.
     mb_sym: Symbol | None = None
     if (
         DtypeOpTable.is_dtype_op(op_spec.op)
@@ -570,7 +570,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         and op_stick_dim is not None
         and all(d is op_stick_dim for d in op_dim_order)
     ):
-        mb_sym = Symbol("mb")
+        mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
         work_slices = {mb_sym: 1, **work_slices}
