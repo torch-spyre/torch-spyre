@@ -36,10 +36,11 @@ RFC 0601 lands.
 |---|---|---|
 | Compiler pipeline logs | Available | [Environment variables](environment_variables.md) |
 | CPU-side timing with `torch.profiler` | Available | [PyTorch Profiler](pytorch_profiler.md) |
-| Device telemetry (power, temperature, bandwidth) | Available (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
+| Device telemetry (power, temperature, bandwidth) | Available — PF and VF mode (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
 | Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Preview (requires [`kineto-spyre`][kineto-spyre] wheel) | [PyTorch Profiler](pytorch_profiler.md) |
 | Trace post-processing (aiu-trace-analyzer) | Available, known gaps | [Trace analysis](trace_analysis.md) |
-| `torch.spyre.memory_allocated()` / `max_memory_allocated()` | Planned | [RFC 0601][rfc-0601] |
+| `torch.spyre.memory.memory_allocated()` / `max_memory_allocated()` | Available — delegates to [`torch.accelerator.memory`][accelerator-memory] (PR [#770][pr-770]) | [PyTorch Profiler](pytorch_profiler.md) |
+| Kineto bridge (`SpyreActivityProfiler`) | In progress — wires `ProfilerActivity.PrivateUse1` into PyTorch traces via the C++ backend | upstream Kineto integration |
 | Scratchpad utilization metrics | Planned | [RFC 0601][rfc-0601] |
 | IR-instrumentation-based fine-grained profiler | Planned | [RFC 0601][rfc-0601] |
 
@@ -54,7 +55,7 @@ RFC 0601 lands.
 | Device / HW | `aiu-smi` | Device-level telemetry |
 | Post-processing | [aiu-trace-analyzer][ata] | Derived metrics |
 
-## Contents
+## Profiling topics
 
 - [Environment variables](environment_variables.md) — logging, device
   enumeration, runtime/driver variables used by `aiu-smi` and
@@ -94,3 +95,5 @@ design and may change.
 [kineto-spyre]: https://github.com/IBM/kineto-spyre
 [ata]: https://github.com/IBM/aiu-trace-analyzer
 [issue-1335]: https://github.com/torch-spyre/torch-spyre/issues/1335
+[pr-770]: https://github.com/torch-spyre/torch-spyre/pull/770
+[accelerator-memory]: https://docs.pytorch.org/docs/stable/accelerator.html
