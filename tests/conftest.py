@@ -19,6 +19,74 @@ import pytest
 
 
 import shared_config
+from oot_test_utilities import _RUNTIME_TAGS
+
+
+# Attaches per-test tags to the pytest report object after each test call.
+# Tags come from _RUNTIME_TAGS (set by print_test_tags_oot during test execution,
+# includes per-occurrence op tags) with fallback to _spyre_method_tags
+# (set at collection time, includes test-level + dynamic op__/dtype__ markers).
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if call.when == "call":
+        fn = getattr(item, "function", None) or getattr(item, "obj", None)
+
+        # Use full variant name (e.g. test_model_ops_db_torch_..._float16) for
+        # _RUNTIME_TAGS lookup. item.originalname is the base method name which
+        # misses per-variant runtime tags populated by print_test_tags_oot.
+        method_name = item.name
+        tags = _RUNTIME_TAGS.get(method_name, [])
+        if not tags:
+            # fallback: try originalname (base method name)
+            orig = getattr(item, "originalname", None)
+            if orig:
+                tags = _RUNTIME_TAGS.get(orig, [])
+        if not tags:
+            tags = getattr(fn, "_spyre_method_tags", [])
+            if not tags:
+                tags = getattr(fn, "_oot_method_tags", [])
+        if tags:
+            rep._spyre_tags = tags
+
+        # Rewrite SKIPPED/FAILED -> XFAIL for unittest.TestCase methods marked
+        # xfail by OOT config. pytest.mark.xfail is ignored by the unittest runner
+        # when the outcome is SKIPPED (e.g. pytest.skip() called inside the body or
+        # by PyTorch's test_wrapper). We detect the xfail mark directly from
+        # fn.pytestmark and rewrite the report here.
+        xfail_mark = next(
+            (m for m in getattr(fn, "pytestmark", []) if m.name == "xfail"),
+            None,
+        )
+        if xfail_mark is not None:
+            strict = xfail_mark.kwargs.get("strict", False)
+            if rep.skipped or rep.failed:
+                rep.outcome = "skipped"
+                rep.wasxfail = "expected failure (OOT xfail)"
+            elif rep.passed:
+                if strict:
+                    # Strict XPASS: test passed but was required to fail.
+                    # Set as hard failure. wasxfail is intentionally NOT set here
+                    # so pytest_report_teststatus falls through to FAILED.
+                    rep.outcome = "failed"
+                    rep.longrepr = "XPASS strict: test passed but xfail strict=True"
+                else:
+                    # Non-strict XPASS: test passed but was expected to fail.
+                    # wasxfail set so pytest_report_teststatus displays "XPASS".
+                    rep.wasxfail = "expected failure (OOT xfail)"
+
+
+# Prints [TAGS = ...] for every test alongside the result line.
+# Uses os.write(1, ...) to write directly to stdout fd, bypassing pytest's output
+# capture visible without -s. Fires after pytest_runtest_makereport so tags
+# are already attached to the report.
+def pytest_runtest_logreport(report):
+    if report.when == "call":
+        tags = getattr(report, "_spyre_tags", None)
+        if tags:
+            # Write directly to terminal
+            os.write(1, f"  [TAGS = {' '.join(tags)}]\n".encode())
 
 
 def _get_case_marks(case: dict) -> set[str]:
@@ -280,6 +348,12 @@ def compile_backend(pytestconfig):
 
 def pytest_configure(config):
     shared_config._PYTEST_CONFIG = config
+
+    config.addinivalue_line(
+        "markers",
+        "requires_spyre_profiler: test requires Spyre hardware "
+        "and USE_SPYRE_PROFILER=1",
+    )
     # auto-register model_<name> markers based on YAML files
     mdir = config.rootpath / "tests" / "resource" / "models"
     for p in mdir.glob("*.yaml"):
@@ -315,18 +389,35 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
+    # Files ignored for plain `pytest` runs (known failures outside `make tests`)
+    # When run via run_test.sh / make tests, PYTORCH_TEST_CONFIG is set so skip the ignore.
+    ignored_files = set()
+    if not os.environ.get("PYTORCH_TEST_CONFIG"):
+        ignored_files = {
+            "tests/test_modules_custom.py",
+        }
+
     selected_models = config.getoption("--model") or []
     if not selected_models:
-        return  # normal behavior
+        # Still deselect ignored files even without --model
+        deselect = [
+            i for i in items if any(i.nodeid.startswith(f) for f in ignored_files)
+        ]
+        if deselect:
+            config.hook.pytest_deselected(items=deselect)
+            items[:] = [i for i in items if i not in deselect]
+        return
 
     # Keep only model-yaml runner tests
     keep = []
     deselect = []
 
     for item in items:
+        if any(item.nodeid.startswith(f) for f in ignored_files):
+            deselect.append(item)
         # item.nodeid includes the file path, e.g. "tests/models/test_model_ops.py::test_model_ops[...]"
         # if "tests/models/test_model_ops.py::" in item.nodeid:
-        if "tests/models/test_model_ops" in item.nodeid:
+        elif "tests/models/test_model_ops" in item.nodeid:
             keep.append(item)
         else:
             deselect.append(item)
@@ -334,6 +425,39 @@ def pytest_collection_modifyitems(config, items):
     if deselect:
         config.hook.pytest_deselected(items=deselect)
         items[:] = keep
+
+
+def pytest_report_teststatus(report, config):
+    if report.when != "call":
+        return
+
+    tags = getattr(report, "_spyre_tags", [])
+    tags_msg = f" [TAGS = {' '.join(map(str, tags))}]" if tags else ""
+
+    # wasxfail is set by our pytest_runtest_makereport hook for OOT xfail rewrites.
+    # Three cases:
+    #   - rep.passed + wasxfail set   -> non-strict XPASS (unexpected pass, not a failure)
+    #   - rep.skipped + wasxfail set  -> XFAIL (expected failure, converted from skip or real failure)
+    #   - strict XPASS                -> hook sets rep.outcome="failed" but does NOT set wasxfail,
+    #                                   so wasxfail is None here and it falls through to FAILED below.
+    #                                   This is intentional: strict XPASS is a hard failure.
+    wasxfail = getattr(report, "wasxfail", None)
+    if wasxfail is not None:
+        if report.passed:
+            # Non-strict XPASS: test passed but was expected to fail. Not a hard failure.
+            return "xpassed", "X", f"XPASS{tags_msg}"
+        else:
+            # XFAIL: test failed or skipped as expected.
+            return "xfailed", "x", f"XFAIL{tags_msg}"
+    # strict XPASS falls through to FAILED below (rep.outcome="failed", wasxfail not set)
+
+    if report.failed:
+        return "failed", "F", f"FAILED{tags_msg}"
+    if report.passed:
+        return "passed", ".", f"PASSED{tags_msg}"
+    if report.skipped:
+        return "skipped", "s", f"SKIPPED{tags_msg}"
+    return None
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
@@ -347,3 +471,35 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     for rep in skipped:
         # terminalreporter.write_line(rep)
         terminalreporter.write_line(rep.nodeid)
+
+
+def _is_spyre_hardware_available() -> bool:
+    """
+    Detect whether Spyre hardware is available.
+
+    Returns True if the torch_spyre runtime and device can be initialized.
+    This function is defensive and returns False if any step fails.
+    """
+    try:
+        import torch
+
+        x = torch.empty(1, device="spyre")
+        return x.device.type == "spyre"
+    except (ImportError, RuntimeError):
+        return False
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """
+    Automatically skip tests marked with @pytest.mark.requires_spyre_profiler
+    when the Spyre profiler is not available.
+    """
+    if "requires_spyre_profiler" in item.keywords:
+        use_profiler = os.environ.get("USE_SPYRE_PROFILER") == "1"
+        hardware_available = _is_spyre_hardware_available()
+
+        if not (use_profiler and hardware_available):
+            pytest.skip(
+                "Skipping test: requires Spyre profiler "
+                "(set USE_SPYRE_PROFILER=1 and ensure Spyre hardware is available)"
+            )

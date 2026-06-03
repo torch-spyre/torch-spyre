@@ -1,0 +1,19 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_unary_ufuncs.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output
+          mode: mandatory_success
+        - names:
+            - TestUnaryUfuncs::test_polygamma_neg
+          mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: int64
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bfloat16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.

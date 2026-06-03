@@ -1,0 +1,138 @@
+<svg viewBox="0 0 860 490" xmlns="http://www.w3.org/2000/svg"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+
+  <rect width="860" height="490" fill="#FFFFFF"/>
+
+  <!-- ARROWHEAD -->
+  <defs>
+    <marker id="arrow-gray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#CBD5E1"/>
+    </marker>
+  </defs>
+
+  <!-- COLUMN HEADERS -->
+  <rect x="20"  y="18" width="220" height="28" rx="4" fill="#F3F4F6"/>
+  <text x="130" y="36" text-anchor="middle" font-size="11.5" font-weight="700" fill="#374151" letter-spacing="0.06em">SPYRE CHALLENGE</text>
+
+  <rect x="320" y="18" width="220" height="28" rx="4" fill="#FFF7F4"/>
+  <text x="430" y="36" text-anchor="middle" font-size="11.5" font-weight="700" fill="#E55B15" letter-spacing="0.06em">PYTORCH HOOK USED</text>
+
+  <rect x="620" y="18" width="220" height="28" rx="4" fill="#F3F4F6"/>
+  <text x="730" y="36" text-anchor="middle" font-size="11.5" font-weight="700" fill="#374151" letter-spacing="0.06em">WHAT IT ENABLES</text>
+
+  <!-- ROW 1 — Device Registration -->
+  <rect x="20" y="64" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="20" y="64" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="38" y="82"  font-size="11.5" font-weight="700" fill="#374151">New device identity</text>
+  <text x="38" y="97"  font-size="10.5" fill="#374151">PyTorch has no knowledge</text>
+  <text x="38" y="110" font-size="10.5" fill="#374151">of Spyre — dispatch tables,</text>
+  <text x="38" y="123" font-size="10.5" fill="#374151">.to(), device strings all fail.</text>
+  <text x="38" y="140" font-size="10.5" fill="#1f2937" font-style="italic">→ Spyre must become a real device</text>
+
+  <line x1="242" y1="107" x2="318" y2="107" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="320" y="64" width="220" height="85" rx="6" fill="#FFF7F4" stroke="#FDBA74" stroke-width="1.5"/>
+  <text x="430" y="83"  text-anchor="middle" font-size="11.5" font-weight="700" fill="#E55B15">PrivateUse1</text>
+  <text x="430" y="99"  text-anchor="middle" font-size="10.5" fill="#92400E">rename_privateuse1_backend()</text>
+  <text x="430" y="113" text-anchor="middle" font-size="10.5" fill="#92400E">_register_device_module()</text>
+  <text x="430" y="131" text-anchor="middle" font-size="10.5" fill="#B45309" font-style="italic">+ DeviceGuard, Allocator,</text>
+  <text x="430" y="143" text-anchor="middle" font-size="10.5" fill="#B45309" font-style="italic">  TensorImpl, SpyreStream</text>
+
+  <line x1="542" y1="107" x2="618" y2="107" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="620" y="64" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="834" y="64" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="730" y="82"  text-anchor="middle" font-size="11.5" font-weight="700" fill="#374151">Device Recognition</text>
+  <text x="730" y="97"  text-anchor="middle" font-size="10.5" fill="#374151">torch.device("spyre") valid</text>
+  <text x="730" y="110" text-anchor="middle" font-size="10.5" fill="#374151">model.to("spyre") works</text>
+  <text x="730" y="123" text-anchor="middle" font-size="10.5" fill="#374151">Dispatch routes to backend</text>
+  <text x="730" y="136" text-anchor="middle" font-size="10.5" fill="#374151">CPU↔Spyre async overlap</text>
+
+  <!-- ROW 2 — Tiled Layout -->
+  <rect x="20" y="164" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="20" y="164" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="38" y="182" font-size="11.5" font-weight="700" fill="#374151">Non-strided memory layout</text>
+  <text x="38" y="197" font-size="10.5" fill="#374151">Tensors stored as 128-byte</text>
+  <text x="38" y="210" font-size="10.5" fill="#374151">stick tiles — the stride</text>
+  <text x="38" y="223" font-size="10.5" fill="#374151">breaks at every tile boundary.</text>
+  <text x="38" y="240" font-size="10.5" fill="#1f2937" font-style="italic">→ PyTorch layout model fails</text>
+
+  <line x1="242" y1="207" x2="318" y2="207" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="320" y="164" width="220" height="85" rx="6" fill="#FFF7F4" stroke="#FDBA74" stroke-width="1.5"/>
+  <text x="430" y="183" text-anchor="middle" font-size="11.5" font-weight="700" fill="#E55B15">FixedTiledLayout</text>
+  <text x="430" y="199" text-anchor="middle" font-size="10.5" fill="#92400E">Subclasses Inductor's</text>
+  <text x="430" y="212" text-anchor="middle" font-size="10.5" fill="#92400E">FixedLayout with tiled</text>
+  <text x="430" y="225" text-anchor="middle" font-size="10.5" fill="#92400E">SpyreTensorLayout</text>
+  <text x="430" y="241" text-anchor="middle" font-size="10.5" fill="#B45309" font-style="italic">via CustomPreSchedulingPasses</text>
+
+  <line x1="542" y1="207" x2="618" y2="207" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="620" y="164" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="834" y="164" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="730" y="182" text-anchor="middle" font-size="11.5" font-weight="700" fill="#374151">Tensor Layout Bridge</text>
+  <text x="730" y="197" text-anchor="middle" font-size="10.5" fill="#374151">CPU strides → tiled sticks</text>
+  <text x="730" y="210" text-anchor="middle" font-size="10.5" fill="#374151">Correct DMA recipe</text>
+  <text x="730" y="223" text-anchor="middle" font-size="10.5" fill="#374151">Memory planning before</text>
+  <text x="730" y="236" text-anchor="middle" font-size="10.5" fill="#374151">codegen is possible</text>
+
+  <!-- ROW 3 — Dataflow Compilation -->
+  <rect x="20" y="264" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="20" y="264" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="38" y="282" font-size="11.5" font-weight="700" fill="#374151">Dataflow execution model</text>
+  <text x="38" y="297" font-size="10.5" fill="#374151">Inductor generates GPU</text>
+  <text x="38" y="310" font-size="10.5" fill="#374151">kernels. Spyre needs a</text>
+  <text x="38" y="323" font-size="10.5" fill="#374151">tile-level IR, compile-time</text>
+  <text x="38" y="336" font-size="10.5" fill="#374151">core partitioning.</text>
+
+  <line x1="242" y1="307" x2="318" y2="307" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="320" y="264" width="220" height="85" rx="6" fill="#FFF7F4" stroke="#FDBA74" stroke-width="1.5"/>
+  <text x="430" y="283" text-anchor="middle" font-size="11.5" font-weight="700" fill="#E55B15">Inductor Backend API</text>
+  <text x="430" y="299" text-anchor="middle" font-size="10.5" fill="#92400E">Custom scheduling class</text>
+  <text x="430" y="312" text-anchor="middle" font-size="10.5" fill="#92400E">Custom wrapper codegen</text>
+  <text x="430" y="325" text-anchor="middle" font-size="10.5" fill="#92400E">Device op overrides</text>
+  <text x="430" y="341" text-anchor="middle" font-size="10.5" fill="#B45309" font-style="italic">All out-of-tree, no core patches</text>
+
+  <line x1="542" y1="307" x2="618" y2="307" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="620" y="264" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="834" y="264" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="730" y="282" text-anchor="middle" font-size="11.5" font-weight="700" fill="#374151">Dataflow Compilation</text>
+  <text x="730" y="297" text-anchor="middle" font-size="10.5" fill="#374151">SuperDSC IR for Spyre</text>
+  <text x="730" y="310" text-anchor="middle" font-size="10.5" fill="#374151">32-core work partitioned</text>
+  <text x="730" y="323" text-anchor="middle" font-size="10.5" fill="#374151">at compile time, cached</text>
+  <text x="730" y="336" text-anchor="middle" font-size="10.5" fill="#374151">by torch.compile</text>
+
+  <!-- ROW 4 — Op Coverage -->
+  <rect x="20" y="364" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="20" y="364" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="38" y="382" font-size="11.5" font-weight="700" fill="#374151">Hundreds of ops per model</text>
+  <text x="38" y="397" font-size="10.5" fill="#374151">Every op in the forward pass</text>
+  <text x="38" y="410" font-size="10.5" fill="#374151">needs a path to hardware.</text>
+  <text x="38" y="423" font-size="10.5" fill="#374151">A missing op = graph break</text>
+  <text x="38" y="440" font-size="10.5" fill="#1f2937" font-style="italic">→ Performance collapses</text>
+
+  <line x1="242" y1="407" x2="318" y2="407" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="320" y="364" width="220" height="85" rx="6" fill="#FFF7F4" stroke="#FDBA74" stroke-width="1.5"/>
+  <text x="430" y="383" text-anchor="middle" font-size="11.5" font-weight="700" fill="#E55B15">Layered Op Strategy</text>
+  <text x="430" y="399" text-anchor="middle" font-size="10.5" fill="#92400E">Native SpyreOpFuncs</text>
+  <text x="430" y="412" text-anchor="middle" font-size="10.5" fill="#92400E">torch.library.custom_op</text>
+  <text x="430" y="425" text-anchor="middle" font-size="10.5" fill="#92400E">Decompositions</text>
+  <text x="430" y="441" text-anchor="middle" font-size="10.5" fill="#B45309" font-style="italic">CPU fallback for the rest</text>
+
+  <line x1="542" y1="407" x2="618" y2="407" stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="620" y="364" width="220" height="85" rx="6" fill="#F9FAFB" stroke="#E5E7EB" stroke-width="1.5"/>
+  <rect x="834" y="364" width="6"   height="85" rx="3" fill="#374151"/>
+  <text x="730" y="382" text-anchor="middle" font-size="11.5" font-weight="700" fill="#374151">Single-Graph Compilation</text>
+  <text x="730" y="397" text-anchor="middle" font-size="10.5" fill="#374151">No graph breaks in the</text>
+  <text x="730" y="410" text-anchor="middle" font-size="10.5" fill="#374151">forward pass hot path</text>
+  <text x="730" y="423" text-anchor="middle" font-size="10.5" fill="#374151">Granite 3.3 8B runs</text>
+  <text x="730" y="436" text-anchor="middle" font-size="10.5" fill="#374151">end-to-end on Spyre</text>
+
+  <!-- RESULT BANNER -->
+  <text x="430" y="478" text-anchor="middle" font-size="12" font-weight="700" fill="#374151" letter-spacing="0.04em">RESULT: model.to("spyre") + torch.compile(model) — no core patches, no forks</text>
+
+</svg>

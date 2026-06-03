@@ -24,13 +24,21 @@ Internal build instructions are available to IBM employees through internal docu
 
 Non-interactive, simple script:
 
-```
-python3 -m pytest tests/
-
+```bash
 python3 examples/tensor_allocate.py
 
 python3 examples/softmax.py
 ```
+
+Run torch-spyre tests
+
+```bash
+make # (or make help)
+make tests
+```
+
+You can override which configs to run and pass extra pytest flags via `TEST_CONFIGS` and `PYTEST_ARGS`:
+For full details and options to run tests see the [Test Framework Runner guide](tests/docs/test_framework_instructions.md).
 
 Interactive:
 

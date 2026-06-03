@@ -10,6 +10,7 @@ device_monitoring
 trace_analysis
 performance_analysis_methodology
 toolkit_matrix
+end_to_end_example
 ```
 
 **Stack:** torch-spyre (new, Inductor-based).
@@ -66,6 +67,8 @@ RFC 0601 lands.
 - [Performance analysis methodology](performance_analysis_methodology.md) —
   bounding a region and pairing traces with telemetry
 - [Toolkit usage matrix](toolkit_matrix.md) — which tool for which metric
+- [End-to-end example](end_to_end_example.md) — profiling a Granite
+  model on Spyre, gluing all four tools into one workflow
 
 ## See also
 

@@ -1,0 +1,1230 @@
+test_suite_config:
+  global:
+    supported_dtypes:
+      - name: float16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: float32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: float64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: bfloat16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int8
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint8
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex128
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: bool
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: half
+        precision:
+          atol: 0.005
+          rtol: 0.005
+    input_config:
+      seed: 123
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/models/test_model_ops_v2.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestSpyreModelOps::test_model_ops_db
+          mode: xfail
+          tags:
+            - model__Mistral-Small-3.2-24B-Instruct-2506
+          edits:
+            ops:
+              include:
+                - name: torch.nn.functional.embedding
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855]
+                          stride: [855, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [131072, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+                  description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
+                    **kwargs)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.embedding.1
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 3, 392, 532]
+                          stride: [3, 1, 1596, 3]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L497 in forward,
+                    code: patch_embeds = self.patch_conv(pixel_values.to(dtype=target_dtype))'
+                  tags:
+                    - bf16operation
+                    - torch.to.1
+                  kwargs:
+                    dtype: torch.bfloat16
+                - name: torch.conv2d
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 3, 392, 532]
+                          stride: [3, 1, 1596, 3]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 3, 14, 14]
+                          stride: [588, 196, 14, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                      - value: (14, 14)
+                      - value: (0, 0)
+                      - value: (1, 1)
+                      - value: 1
+                  description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
+                    **kwargs)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.conv2d.1
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.float32
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L291 in forward,
+                    code: hidden_states = hidden_states.to(torch.float32)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.to.2
+                - name: torch.pow
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L292 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.pow.1
+                - name: torch.mean
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L292 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mean.1
+                  kwargs:
+                    keepdim: true
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1]
+                          stride: [1064, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L293 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.1
+                - name: torch.rsqrt
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1]
+                          stride: [1064, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L293 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - fp32operation
+                    - torch.rsqrt.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1064, 1]
+                          stride: [1064, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L293 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - fp32operation
+                    - torch.mul.1
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L294 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.to.3
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1024]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L294 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.2
+                - name: torch.arange
+                  sample_inputs_func:
+                    args:
+                      - value: 28
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L41 in position_ids_in_meshgrid,
+                    code: mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.arange.1
+                - name: torch.functional.meshgrid
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [28]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [38]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L41 in position_ids_in_meshgrid,
+                    code: mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")'
+                  tags:
+                    - tensorsoncpu
+                    - torch.functional.meshgrid.1
+                  kwargs:
+                    indexing: ij
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [28, 38]
+                            stride: [1, 0]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                          - shape: [28, 38]
+                            stride: [0, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L41 in position_ids_in_meshgrid,
+                    code: mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.getitem.1
+                - name: torch.stack
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [28, 38]
+                            stride: [1, 0]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                          - shape: [28, 38]
+                            stride: [0, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L42 in position_ids_in_meshgrid,
+                    code: h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.stack.1
+                  kwargs:
+                    dim: -1
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [28, 38, 2]
+                          stride: [76, 2, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: (-1, 2)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L42 in position_ids_in_meshgrid,
+                    code: h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.reshape.1
+                - name: torch.chunk
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 2]
+                          stride: [2, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 2
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L42 in position_ids_in_meshgrid,
+                    code: h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.chunk.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1064, 1]
+                            stride: [2, 1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                          - shape: [1064, 1]
+                            stride: [2, 1]
+                            storage_offset: 1
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L42 in position_ids_in_meshgrid,
+                    code: h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.getitem.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 1]
+                          stride: [2, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 110
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L43 in position_ids_in_meshgrid,
+                    code: ids = h_grid * max_width + v_grid'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.mul.3
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [1064, 1]
+                          stride: [2, 1]
+                          storage_offset: 1
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L43 in position_ids_in_meshgrid,
+                    code: ids = h_grid * max_width + v_grid'
+                  tags:
+                    - tensorsoncpu
+                    - torch.add.2
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (0,)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L44 in position_ids_in_meshgrid,
+                    code: positions.append(ids[:, 0])'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.getitem.3
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1064]
+                            stride: [1]
+                            storage_offset: 0
+                            dtype: torch.int64
+                            device: cpu
+                            init: randint
+                            init_args:
+                              high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L45 in position_ids_in_meshgrid,
+                    code: return torch.cat(positions)'
+                  tags:
+                    - tensorsoncpu
+                    - torch.cat.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [12100, 64]
+                          stride: [64, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1064]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 12100
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L126 in forward,
+                    code: freqs = self.inv_freq[position_ids]'
+                  tags:
+                    - fp32operation
+                    - tensorsoncpu
+                    - torch.getitem.4
+                - name: torch.cos
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 64]
+                          stride: [64, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L130 in forward,
+                    code: cos = emb.cos()'
+                  tags:
+                    - fp32operation
+                    - torch.cos.1
+                - name: torch.sin
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 64]
+                          stride: [64, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L131 in forward,
+                    code: sin = emb.sin()'
+                  tags:
+                    - fp32operation
+                    - torch.sin.1
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 64]
+                          stride: [64, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L133 in forward,
+                    code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+                  tags:
+                    - fp32operation
+                    - torch.to.4
+                  kwargs:
+                    dtype: torch.bfloat16
+                - name: torch.full
+                  sample_inputs_func:
+                    args:
+                      - value: (1064, 1064)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L444 in generate_block_attention_mask,
+                    code: causal_mask = torch.full((seq_len, seq_len), fill_value=d_min, dtype=dtype, device=device)'
+                  tags:
+                    - constant
+                    - torch.full.1
+                  kwargs:
+                    fill_value: -3.3895313892515354e+38
+                    dtype: torch.bfloat16
+                    device: cuda:0
+                - name: torch.tensor
+                  sample_inputs_func:
+                    args:
+                      - value: [1064]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L446 in generate_block_attention_mask,
+                    code: block_end_idx = torch.tensor(patch_embeds_list).cumsum(-1)'
+                  tags:
+                    - tensorsoncpu
+                    - torch.tensor.1
+                - name: torch.cumsum
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L446 in generate_block_attention_mask,
+                    code: block_end_idx = torch.tensor(patch_embeds_list).cumsum(-1)'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.cumsum.1
+                - name: torch.tensor
+                  sample_inputs_func:
+                    args:
+                      - value: [0]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L447 in generate_block_attention_mask,
+                    code: block_start_idx = torch.tensor([0] + patch_embeds_list[:-1]).cumsum(-1)'
+                  tags:
+                    - tensorsoncpu
+                    - torch.tensor.2
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 1064
+                      - value: 16
+                      - value: 64
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L232 in torch_dynamo_resume_in_forward_at_230,
+                    code: query_states = query_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.1
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 16, 64]
+                          stride: [1089536, 1024, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L232 in torch_dynamo_resume_in_forward_at_230,
+                    code: query_states = query_states.view(batch_size, patches, self.num_heads, self.head_dim).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.transpose.1
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1064, 64]
+                          stride: [64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L162 in apply_rotary_pos_emb,
+                    code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.unsqueeze.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1064, 64]
+                          stride: [68096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L164 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.4
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 32, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L139 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.5
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 32]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 32
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L141 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - bf16operation
+                    - torch.neg.1
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 16, 1064, 32]
+                            stride: [544768, 32, 512, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 16, 1064, 32]
+                            stride: [1089536, 64, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L141 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.2
+                  kwargs:
+                    dim: -1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 68096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1064, 64]
+                          stride: [68096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L164 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.5
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 68096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L164 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.add.3
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 64, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                    code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+                  tags:
+                    - bf16operation
+                    - torch.nn.functional.scaled_dot_product_attention.1
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.125
+                    is_causal: false
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 16, 1064, 64]
+                          stride: [1089536, 68096, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.transpose.2
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 16, 64]
+                          stride: [1089536, 64, 68096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - bf16operation
+                    - torch.Tensor.contiguous.1
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 16, 64]
+                          stride: [1089536, 1024, 64, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1064, -1)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L254 in torch_dynamo_resume_in_forward_at_230,
+                    code: attn_output = attn_output.reshape(batch_size, patches, -1).contiguous()'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.reshape.2
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L254 in torch_dynamo_resume_in_forward_at_230,
+                    code: attn_output = attn_output.reshape(batch_size, patches, -1).contiguous()'
+                  tags:
+                    - bf16operation
+                    - torch.Tensor.contiguous.2
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L336 in torch_dynamo_resume_in_forward_at_329,
+                    code: hidden_states = residual + hidden_states'
+                  tags:
+                    - bf16operation
+                    - torch.add.4
+                - name: torch.squeeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1064, 1024]
+                          stride: [1089536, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L248 in torch_dynamo_resume_in_get_image_features_at_233,
+                    code: image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.squeeze.1
+                - name: torch.as_tensor
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 2]
+                          stride: [2, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L251 in torch_dynamo_resume_in_get_image_features_at_248,
+                    code: (torch.as_tensor(image_sizes, device=image_features.device) // downsample_ratio).prod(dim=-1).tolist()'
+                  tags:
+                    - torch.as_tensor.1
+                  kwargs:
+                    device: cuda:0
+                - name: torch.floordiv
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 2]
+                          stride: [2, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 28
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L251 in torch_dynamo_resume_in_get_image_features_at_248,
+                    code: (torch.as_tensor(image_sizes, device=image_features.device) // downsample_ratio).prod(dim=-1).tolist()'
+                  tags:
+                    - constant
+                    - torch.floordiv.1
+                - name: torch.prod
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 2]
+                          stride: [2, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L251 in torch_dynamo_resume_in_get_image_features_at_248,
+                    code: (torch.as_tensor(image_sizes, device=image_features.device) // downsample_ratio).prod(dim=-1).tolist()'
+                  tags:
+                    - torch.prod.1
+                  kwargs:
+                    dim: -1
+                - name: torch.squeeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [266, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L253 in torch_dynamo_resume_in_get_image_features_at_251,
+                    code: image_features = torch.split(image_features.squeeze(0), split_sizes)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.squeeze.2
+                - name: torch.functional.split
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [266, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: [266]
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L253 in torch_dynamo_resume_in_get_image_features_at_251,
+                    code: image_features = torch.split(image_features.squeeze(0), split_sizes)'
+                  tags:
+                    - bf16operation
+                    - torch.functional.split.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [266, 5120]
+                            stride: [5120, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L253 in torch_dynamo_resume_in_get_image_features_at_251,
+                    code: image_features = torch.split(image_features.squeeze(0), split_sizes)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.6
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [266, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: cuda:0
+                      - value: torch.bfloat16
+                  description: ''
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.to.5
+                - name: torch.__eq__
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855]
+                          stride: [855, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 10
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L271 in get_placeholder_mask,
+                    code: special_image_mask = input_ids == self.config.image_token_id'
+                  tags:
+                    - constant
+                    - torch.__eq__.1
+                - name: torch.sum
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855]
+                          stride: [855, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L273 in get_placeholder_mask,
+                    code: n_image_tokens = special_image_mask.sum()'
+                  tags:
+                    - torch.sum.1
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855]
+                          stride: [855, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                      - value: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L275 in get_placeholder_mask,
+                    code: special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)'
+                  tags:
+                    - constant
+                    - torch.unsqueeze.2
+                - name: torch.expand_as
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855, 1]
+                          stride: [855, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                      - tensor:
+                          shape: [1, 855, 5120]
+                          stride: [4377600, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L275 in get_placeholder_mask,
+                    code: special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)'
+                  tags:
+                    - bf16operation
+                    - torch.expand_as.1
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855, 5120]
+                          stride: [855, 1, 0]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                      - value: cuda:0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L275 in get_placeholder_mask,
+                    code: special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)'
+                  tags:
+                    - constant
+                    - torch.to.6
+                - name: torch.masked_scatter
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855, 5120]
+                          stride: [4377600, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 855, 5120]
+                          stride: [855, 1, 0]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                      - tensor:
+                          shape: [266, 5120]
+                          stride: [5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L324 in torch_dynamo_resume_in_forward_at_326,
+                    code: inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)'
+                  tags:
+                    - bf16operation
+                    - torch.masked_scatter.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 855, 5120]
+                          stride: [4377600, 5120, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in torch_dynamo_resume_in_forward_at_447,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.7

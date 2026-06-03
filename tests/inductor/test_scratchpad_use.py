@@ -12,20 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
-from typing import Any, Callable, TypeVarTuple, Unpack, Optional, override
+from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
 from unittest.mock import patch
 import torch
 
-from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 
-from torch_spyre._inductor.scratchpad import ScratchPadAllocator
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
@@ -47,14 +47,14 @@ class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
         cls.test_instance = test_instance
 
     @override
-    def __call__(self, operations: list[Operation]) -> None:
+    def __call__(self, graph: GraphLowering) -> None:
         assert self.test_instance is not None, (
             "CustomPreSchedulingPassesWithOurPasses.test_instance must be set to an instance of "
             "TestScratchpadUsage before get_passes is called"
         )
-        super().__call__(operations)
+        super().__call__(graph)
         for f in self.test_instance.our_pre_scheduling_passes:
-            f(operations)
+            f(graph)
 
 
 class TestScratchpadUsage(unittest.TestCase):
@@ -94,14 +94,13 @@ class TestScratchpadUsage(unittest.TestCase):
     @contextmanager
     def pre_scheduling_iterating_pass(
         self,
-        f: Callable[[Operation], None],
+        f: Callable[[GraphLowering], None],
     ):
         """Context manager to add a post fusion custom pass that processes each node independently
         using `f`."""
 
-        def new_pass(nodes: list[Operation]) -> None:
-            for node in nodes:
-                f(node)
+        def new_pass(graph: GraphLowering) -> None:
+            f(graph)
 
         self.our_pre_scheduling_passes.append(new_pass)
         yield
@@ -109,25 +108,22 @@ class TestScratchpadUsage(unittest.TestCase):
 
     def compile_and_collect_mem_usage(
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
-    ) -> tuple[torch.Tensor, list[dict[str, dict[str, Any]]]]:
-        mem_usages = []
-        alloc = ScratchPadAllocator()
+    ) -> tuple[torch.Tensor, dict[str, str]]:
+        mem_usages = {}
 
-        def visitor(node: Operation) -> None:
+        def visitor(graph: GraphLowering) -> None:
             nonlocal mem_usages
-            mem_usage = alloc.mem_usage_by_op(node)
-            mem_usage = {
-                key: value
-                for key, value in mem_usage.items()
-                if isinstance(value, dict)
-            }
-            for buffer_name, usage in mem_usage.items():
-                buffer = V.graph.get_buffer(buffer_name)
+            operations = graph.operations
+            for op in operations:
+                buf_name = op.name
+                buffer = graph.get_buffer(buf_name)
                 layout = buffer.get_layout()
+                device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
-                usage["location"] = "LX" if "lx" in allocation else "HBM"
-
-            mem_usages.append(mem_usage)
+                mem_usages[buf_name] = {
+                    "location": "LX" if "lx" in allocation else "HBM",
+                    "size": math.prod(device_layout.device_size[:-1]) * 128,
+                }
 
         with self.pre_scheduling_iterating_pass(visitor):
             compiled_kernel = torch.compile(f, fullgraph=True)
@@ -149,11 +145,7 @@ class TestScratchpadUsage(unittest.TestCase):
             device_result, mem_usages = self.compile_and_collect_mem_usage(model, args)
 
         self.assertTrue(
-            any(
-                usage["location"] == "LX"
-                for mem_usage in mem_usages
-                for usage in mem_usage.values()
-            ),
+            any(mem_usage["location"] == "LX" for mem_usage in mem_usages.values()),
             "Expected at least one buffer to be allocated in LX, but none were",
         )
 
@@ -190,10 +182,9 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         transfers are accurately returned by `mem_usage_by_node`."""
         result, mem_usages = self.compile_and_collect_mem_usage(model, args)
         hbm_transfers = sum(
-            usage["size"]
-            for mem_usage in mem_usages
-            for usage in mem_usage.values()
-            if usage["location"] == "HBM"
+            mem_usage["size"]
+            for mem_usage in mem_usages.values()
+            if mem_usage["location"] == "HBM"
         )
         return (result, hbm_transfers)
 
@@ -221,6 +212,79 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
             torch.allclose(result_without_lx, result_with_lx, atol=1e-5),
             "Results do not match between LX planning on and off",
         )
+
+    # TODO: Add additional ops
+
+
+@unittest.skipUnless(
+    ts_inductor_config.co_optimizing_lx_planning,
+    "CO_OPTIMIZING_LX_PLANNING is off; skipping cooptimization tests",
+)
+class TestMeasureHBMUsageCoOptimizing(TestMeasureHBMUsageScratchPad):
+    """Compares HBM transfers between DefaultAllocator and
+    StrategyBCoOptimizingAllocator. The cooptimizing allocator should be ≤ default on every shape,
+    and should strictly improve on cases where adjacent ops disagree on which
+    iteration-space dim to split — the canonical example is softmax(dim=0)
+    where work_distribution picks rows for the pointwise ops and cols for the
+    reduction ops, forcing 3 of 4 shared buffers to HBM under DefaultAllocator.
+
+    Skipped unless `CO_OPTIMIZING_LX_PLANNING=1` is set in the environment;
+    otherwise the cooptimization code path doesn't activate and there's
+    nothing to compare.
+    """
+
+    @override
+    def setUp(self):
+        super().setUp()
+        # Cooptimization needs > 1 core to have anything to optimize.
+        self.patchers.append(ts_inductor_config.patch("sencores", 4))
+        self.patchers[-1].__enter__()
+
+    @override
+    def run_test(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+        strict: bool = False,
+        **kwargs,
+    ):
+        """Compare HBM transfers with cooptimization off vs on. If
+        `strict`, asserts coopt < default; otherwise coopt ≤ default."""
+        with ts_inductor_config.patch(lx_planning=True):
+            with ts_inductor_config.patch(co_optimizing_lx_planning=False):
+                result_default, hbm_default = self.measure_hbm_transfers(model, args)
+            torch.compiler.reset()
+            with ts_inductor_config.patch(co_optimizing_lx_planning=True):
+                result_coopt, hbm_coopt = self.measure_hbm_transfers(model, args)
+
+        cmp = self.assertLess if strict else self.assertLessEqual
+        rel = "<" if strict else "≤"
+        cmp(
+            hbm_coopt,
+            hbm_default,
+            f"Expected cooptimization to be {rel} default HBM, got "
+            f"coopt={hbm_coopt} default={hbm_default}",
+        )
+        self.assertTrue(
+            torch.allclose(result_default, result_coopt, atol=1e-4),
+            "Results do not match between cooptimization on and off",
+        )
+
+    def test_softmax_dim0_strictly_lower_hbm(self):
+        """The canonical motivating case from the design doc. softmax(dim=0)
+        has every adjacent op pair disagreeing on which dim to split, so
+        DefaultAllocator only pins 1 of 4 shared buffers; Strategy B should
+        flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
+        self.common(f, (x,), strict=True)
+
+    def test_softmax_dim_neg1_no_regression(self):
+        """softmax(dim=-1) is the well-behaved baseline where DefaultAllocator
+        already pins everything pinnable. Strategy B must match (no regression)."""
+        f = functools.partial(torch.softmax, dim=-1)
+        x = self.rand_device((512, 1024))
+        self.common(f, (x,))
 
 
 if __name__ == "__main__":
