@@ -72,8 +72,6 @@ def _groups_nested_k2_m4(operations: list[Operation]):
     return [(ops, [(0, sympy.Integer(2), [0]), (0, sympy.Integer(4), [1])])]
 
 
-
-
 # ===========================================================================
 # Residual coarse_tiling_groups_fn tests
 #
