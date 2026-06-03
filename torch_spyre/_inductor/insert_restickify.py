@@ -17,6 +17,7 @@ from collections import defaultdict
 
 import torch
 
+from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import host_coordinates, device_coordinates, stick_compatible
@@ -271,6 +272,11 @@ def finalize_layouts(operations: list) -> None:
         for edge, target_stl in cost_fn.required_input_stls(committed):
             input_buf = V.graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
+            if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
+                assert getattr(input_buf, ELIDED_COPY_BACK_ATTR, False), (
+                    f"unexpected mutation layout on {edge.dep.name}"
+                )
+                in_layout = in_layout.real_layout()
             in_stl = in_layout.device_layout
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
@@ -285,6 +291,8 @@ def finalize_layouts(operations: list) -> None:
     # Handle mutation ops: check if their inputs need restickifying to match target buffer's stick.
     for op in operations:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        if getattr(op, ELIDED_COPY_BACK_ATTR, False):
             continue
         target = op.layout.target
         while isinstance(target, ReinterpretView):

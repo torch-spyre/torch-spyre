@@ -22,7 +22,8 @@ from torch._inductor.scheduler import (
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .scheduler import CountedLoopSchedulerNode
 from .logging_utils import get_inductor_logger, _get_env_bool
 
 logger = get_inductor_logger("MEMORY_PLANNING")
@@ -108,9 +109,9 @@ def _compute_size_bytes(name: str) -> int:
 
 def _compute_live_ranges(
     nodes: list[BaseSchedulerNode],
-    intermediates: set[str],
+    pool_candidates: set[str],
 ) -> dict[str, tuple[int, int]]:
-    """Return {buf_name: (start_step, end_step)} for each intermediate.
+    """Return {buf_name: (start_step, end_step)} for each pool candidate.
 
     start_step: timestep of the node that writes the buffer.
     end_step: last timestep at which any node reads the buffer.
@@ -121,24 +122,30 @@ def _compute_live_ranges(
     for idx, node in enumerate(nodes):
         rw = node.read_writes
         for dep in rw.writes:
-            if dep.name in intermediates:
+            if dep.name in pool_candidates:
                 start[dep.name] = idx
         for dep in rw.reads:
-            if dep.name in intermediates:
+            if dep.name in pool_candidates:
                 end[dep.name] = idx
 
     live_ranges: dict[str, tuple[int, int]] = {}
-    for name in intermediates:
+    for name in pool_candidates:
         if name in start:
             live_ranges[name] = (start[name], end.get(name, len(nodes) + 1))
     return live_ranges
 
 
 def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-    """Assign intermediate tensors addresses in the same segment.
-    Identifies intermediate buffers (not graph inputs/outputs, not already LX-allocated), performs
-    live range analysis, and assigns layout.allocation["pool"] = address so
-    that non-overlapping intermediates share a hbm segment.
+    """Pool-allocate buffers so non-overlapping tensors share the HBM intermediates segment.
+
+    Collects pool candidates from two sources:
+    - Kernel intermediates: buffers both written and read within the graph,
+      detected via written & read sets on ComputedBuffer nodes.
+    - SpyreEmptyFallback full buffers created by coarse_tile.py (non-outputs).
+      These are ExternKernel nodes invisible to the written & read path above.
+
+    For each candidate, assigns layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset.
+    Graph inputs/outputs and LX-allocated buffers are excluded.
     """
 
     if not _MEMORY_PLAN_ENABLED:
@@ -154,7 +161,22 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         ExternKernelSchedulerNode,
         NopKernelSchedulerNode,
     )
-    non_kernel_nodes = [n for n in nodes if not isinstance(n, _kernel_arg_types)]
+
+    # build_loop_scheduler_nodes may have already run in pre-fusion, wrapping
+    # tiled ops into CountedLoopSchedulerNodes.  Flatten them so individual ops
+    # are visible at distinct timesteps for written/read detection and live-range
+    # analysis.
+    def _iter_all_nodes(
+        node_list: list[BaseSchedulerNode],
+    ):
+        for n in node_list:
+            if isinstance(n, CountedLoopSchedulerNode):
+                yield from _iter_all_nodes(n.get_nodes())
+            else:
+                yield n
+
+    flat_nodes: list[BaseSchedulerNode] = list(_iter_all_nodes(nodes))
+    non_kernel_nodes = [n for n in flat_nodes if not isinstance(n, _kernel_arg_types)]
 
     written = {
         dep.name
@@ -162,6 +184,17 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         for dep in node.read_writes.writes
         if dep.name not in graph_outputs
     }
+
+    # SpyreEmptyFallback nodes allocate a buffer but emit no dep-tracked write
+    # so they never appear in `written` via the dep walk above.  Collect them here explicitly
+    written |= {
+        node.get_name()
+        for node in flat_nodes
+        if isinstance(node, ExternKernelSchedulerNode)
+        and isinstance(node.node, SpyreEmptyFallback)
+        and node.get_name() not in graph_outputs
+    }
+
     read = {
         dep.name
         for node in non_kernel_nodes

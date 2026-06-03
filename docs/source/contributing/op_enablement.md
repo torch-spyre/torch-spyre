@@ -10,12 +10,14 @@ This workflow guides developers from initial operator verification through full 
 6. Report failures as bug Issues
 7. Classify bugs with labels
 
-# Create an Op Enablement Issue
+## Create an Op Enablement Issue
+
 Create an op enablement Issue in GitHub for the target operator.
 This Issue will serve as the parent for all related test and bug Issues.
 https://github.com/torch-spyre/torch-spyre/issues
 
-# Verify Basic Functionality With Simple Parameters
+## Verify Basic Functionality With Simple Parameters
+
 Start by running the target op with minimal, simple parameter settings.
 The goal is to confirm that the op runs without errors under basic conditions.
 
@@ -23,11 +25,12 @@ If the op is not yet implemented, the developer must implement the op first.
 A detailed implementation procedure is available in the torch-spyre [wiki](https://github.com/torch-spyre/torch-spyre/wiki/OpFunc-development-use-cases),
 and developers should follow that guide before proceeding with testing.
 
-# Add Unit Tests to torch-spyre
+## Add Unit Tests to torch-spyre
+
 Add [unit tests](https://github.com/torch-spyre/torch-spyre/tree/main/tests) for the op in the torch-spyre repository.
 At this stage, you can keep the tests simple and focus on core behavior.
 
-# Verify your implementation with actual parameters used in target models
+## Verify your implementation with actual parameters used in target models
 
 It is important to verify your operations using the actual parameters used in the target models to meet project goals.
 Run tests for your operation as follows:
@@ -38,16 +41,16 @@ pytest -c pytest_models.ini -s -rsapd tests/models/test_model_ops.py -k  op name
 
 Specify an `op name`, for example `torch_add`. Note that the op name must use `_` instead of `.`.
 
-# Fix failures
+## Fix failures
 
 Fix failures at least for float16 and float32 if you saw the failures.
 Integer types and bfloat16 are not supported now. So, you do not have to take care of these failures.
 
-# Submit a PR
+## Submit a PR
 
 After completing the tests, submit a PR for the op implementation or the corresponding tests.
 
-# Report Test Failures as Bug Issues
+## Report Test Failures as Bug Issues
 
 For each known failing test that is not fixed:
 
@@ -56,7 +59,7 @@ For each known failing test that is not fixed:
 - Include error logs, reproduction steps, and any relevant context
 - Use IBM Bob to help summarize and organize the issues
 
-# Assign Classification Labels
+## Assign Classification Labels
 
 Once the root cause is identified, assign labels to categorize the bug.
 Example labels include:

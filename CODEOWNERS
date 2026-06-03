@@ -36,14 +36,14 @@
 /codegen/                @ani300 @moriohara @pradghos
 
 # Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos @anubhavjana @n-marion
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss @mudhakar @raghukiran1224 @viji560 @tehbone
 
 # CI/CD
-/.github/                 @ashokponkumar @jabostian
-/.pre-commit-config.yaml  @ashokponkumar @jabostian
-/pytest.ini               @ashokponkumar @jabostian
-/pytest_models.ini        @ashokponkumar @jabostian
-/Makefile                 @ashokponkumar @jabostian
+/.github/                 @ashokponkumar @jabostian @anubhavjana @n-marion
+/.pre-commit-config.yaml  @ashokponkumar @jabostian @anubhavjana @n-marion
+/pytest.ini               @ashokponkumar @jabostian @anubhavjana @n-marion
+/pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
+/Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
