@@ -270,13 +270,12 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             k_fast_division(operations) if config.core_id_k_fast_emission else []
         )
         work_distribution(operations, k_fast_ops)
-        if config.lx_planning:
-            allocator = (
-                StrategyBCoOptimizingAllocator()
-                if config.co_optimizing_lx_planning
-                else None
-            )
-            scratchpad_planning(graph, allocator=allocator)
+        allocator = (
+            StrategyBCoOptimizingAllocator()
+            if config.co_optimizing_lx_planning
+            else None
+        )
+        scratchpad_planning(graph, allocator=allocator)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
