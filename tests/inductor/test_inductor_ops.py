@@ -4957,6 +4957,97 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_cpu(self):
+        """Test torch.index_copy operation on Spyre matches CPU in eager mode.
+
+        Note: index_copy creates layout incompatibilities in compiled mode due to
+        its scatter pattern, so we only test eager mode execution.
+        """
+
+        def fn(dst, dim, index, src):
+            # Use non-mutating version
+            return torch.index_copy(dst, dim, index, src)
+
+        # Test case 1: Basic 2D tensor, copy along dim 0
+        dst1 = torch.randn(5, 3)
+        index1 = torch.tensor([0, 2, 4])
+        src1 = torch.randn(3, 3)
+        # Only run in eager mode - compiled mode has layout issues with scatter ops
+        self.compare_with_cpu(
+            fn, dst1, 0, index1, src1, run_compile=False, run_eager=True
+        )
+
+        # Test case 2: Copy along dim 1
+        dst2 = torch.randn(3, 5)
+        index2 = torch.tensor([1, 3])
+        src2 = torch.randn(3, 2)
+        self.compare_with_cpu(
+            fn, dst2, 1, index2, src2, run_compile=False, run_eager=True
+        )
+
+        # Test case 3: 3D tensor
+        dst3 = torch.randn(4, 3, 2)
+        index3 = torch.tensor([0, 2])
+        src3 = torch.randn(2, 3, 2)
+        self.compare_with_cpu(
+            fn, dst3, 0, index3, src3, run_compile=False, run_eager=True
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_inplace_prefill(self):
+        """Test Tensor.index_copy_ prefill pattern from Ministral-3-14B-Instruct-2512.
+
+        Prefill: writes 14 tokens into KV-cache at positions 0-13.
+          cache:  [1, 8, 2048, 128] float16
+          dim:    2
+          index:  [14] int64 (arange 0-13)
+          source: [1, 8, 14, 128] float16
+        """
+
+        def index_copy_fn(cache, index, source):
+            cache = cache.clone()
+            result = cache.index_copy_(2, index, source)
+            assert result.data_ptr() == cache.data_ptr(), (
+                "index_copy_: return value is not the same tensor as self"
+            )
+            return result
+
+        cache = cached_randn((1, 8, 2048, 128))
+        index = torch.arange(14, dtype=torch.int64)
+        source = cached_randn((1, 8, 14, 128), differentiation="prefill")
+
+        self.compare_with_cpu(
+            index_copy_fn, cache, index, source, run_compile=False, run_eager=True
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_inplace_decode(self):
+        """Test Tensor.index_copy_ decode pattern from Ministral-3-14B-Instruct-2512.
+
+        Decode: writes 1 token into KV-cache at position 14.
+          cache:  [1, 8, 2048, 128] float16
+          dim:    2
+          index:  [1] int64 (contains 14)
+          source: [1, 8, 1, 128] float16
+        """
+
+        def index_copy_fn(cache, index, source):
+            cache = cache.clone()
+            result = cache.index_copy_(2, index, source)
+            assert result.data_ptr() == cache.data_ptr(), (
+                "index_copy_: return value is not the same tensor as self"
+            )
+            return result
+
+        cache = cached_randn((1, 8, 2048, 128))
+        index = torch.tensor([14], dtype=torch.int64)
+        source = cached_randn((1, 8, 1, 128), differentiation="decode")
+
+        self.compare_with_cpu(
+            index_copy_fn, cache, index, source, run_compile=False, run_eager=True
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
