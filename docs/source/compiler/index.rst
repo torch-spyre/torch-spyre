@@ -20,9 +20,10 @@ The documentation is organized in four parts:
   back-end.
 * **Operations** — how to add new operations to the Spyre backend.
 * **Optimization passes** — the pre-scheduling transformations applied
-  by the front-end. These are presented in pipeline order: coarse-tiling
-  (the IR rewrite that enables working-set reduction), then
-  work-division across cores, then scratchpad placement.
+  by the front-end. These are presented in pipeline order: working set
+  reduction first (the design concept), then coarse-tiling (the IR
+  rewrite that implements it), then work-division across cores, then
+  scratchpad placement.
 
 For the project workflow around enabling and triaging new ops (issues,
 test coverage, bug classification), see :doc:`/contributing/op_enablement`.
@@ -50,6 +51,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    :maxdepth: 2
    :caption: Optimization passes
 
+   working_set_reduction
    coarse_tiling_loops
    work_division_planning
    scratchpad_planning
