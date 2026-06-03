@@ -458,7 +458,7 @@ def _(
     C_out, C_in_g, kH, kW = weight.shape
 
     H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
-    W_out = (W_in + 2 * padding[0] - dilation[0] * (kW - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
 
     output_shape = [N, C_out, H_out, W_out]
     return input.new_empty(output_shape)
