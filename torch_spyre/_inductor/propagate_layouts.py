@@ -15,6 +15,7 @@
 
 from typing import NamedTuple
 
+import sympy
 import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
@@ -36,6 +37,7 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import (
+    ElementArrangement,
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
@@ -60,6 +62,7 @@ from .views import matching_dim
 
 logger = get_inductor_logger("propagate_layouts")
 
+prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
@@ -84,6 +87,9 @@ def _get_prop_args(reads) -> list[PropArg]:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
             layout = buf.get_layout()
+            # Skip 0-d scalar constants — they have no meaningful STL to propagate.
+            if isinstance(buf, SpyreConstantFallback) and not layout.size:
+                continue
             if hasattr(buf, "layouts"):
                 res.append(PropArg(arg, layout, list(buf.layouts)))
             else:
@@ -112,35 +118,19 @@ def _single_arg_op_layout(
     data = op.data
 
     if isinstance(data, Reduction):
-        if data.reduction_type == "exx2":
-            x_coords = host_coordinates(in_layout, dep)
-            x_dev_coords = device_coordinates(stl, dep)
-            x_stick_expr = x_dev_coords[-1]
-            x_stick_dim = matching_dim(x_coords, x_stick_expr)
-            if x_stick_dim is None or x_stick_dim != len(in_layout.size) - 1:
-                # TODO: Insert a restickify to enable the operation to be performed
-                raise Unsupported(f"exx2: illegal device layout {stl}")
-            dim_order = list(range(len(output.size))) + [-1]
-            c_size = [concretize_expr(s) for s in output.size]
-            c_stride = [concretize_expr(s) for s in output.stride]
-            return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+        # Propagate input stick to output if the dim survives, else put stick last.
+        x_dev_coords = device_coordinates(stl, dep)
+        out_coords = host_coordinates(output, output_dep)
+        x_stick_expr = x_dev_coords[-1]
+        out_stick_dim = matching_dim(out_coords, x_stick_expr)
+        if out_stick_dim is None:
+            out_dim_order = list(range(len(output.size))) + [-1]
         else:
-            # Propagate input stick to output if the dim survives, else put stick last.
-            x_coords = host_coordinates(in_layout, dep)
-            x_dev_coords = device_coordinates(stl, dep)
-            out_coords = host_coordinates(output, output_dep)
-            x_stick_expr = x_dev_coords[-1]
-            out_stick_dim = matching_dim(out_coords, x_stick_expr)
-            if out_stick_dim is None:
-                out_dim_order = list(range(len(output.size))) + [-1]
-            else:
-                out_dim_order = [
-                    d for d in range(len(output.size)) if d != out_stick_dim
-                ]
-                out_dim_order = out_dim_order + [out_stick_dim]
-            c_size = [concretize_expr(s) for s in output.size]
-            c_stride = [concretize_expr(s) for s in output.stride]
-            return SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+            out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+            out_dim_order = out_dim_order + [out_stick_dim]
+        c_size = [concretize_expr(s) for s in output.size]
+        c_stride = [concretize_expr(s) for s in output.stride]
+        return SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     # Single-arg pointwise
     assert isinstance(data, Pointwise)
@@ -159,14 +149,51 @@ def _single_arg_op_layout(
                 list(range(len(output.size))),
             )
 
-        case spyreop.overwrite.default:
-            return SpyreTensorLayout(output.size, output.dtype)
+        case prims.convert_element_type.default:
+            # Type conversion may require padding when input has padding due to stick
+            # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
+            # which becomes 64 FP32 elements when converted. We need to reflect this
+            # in the output host size so the constructor creates the correct device layout.
+
+            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+            stick_dim_size = in_layout.size[-1]
+            unaligned = stick_dim_size % in_elems_per_stick
+
+            if unaligned > 0:
+                outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
+                outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
+                c_size = outer_sizes + [in_elems_per_stick]
+                c_stride = outer_strides + [1]
+
+                fmt = (
+                    ElementArrangement.DL16_TO_FP32
+                    if in_layout.dtype == torch.float16
+                    and output.dtype == torch.float32
+                    else ElementArrangement.STANDARD
+                )
+                return SpyreTensorLayout(
+                    c_size,
+                    c_stride,
+                    output.dtype,
+                    list(range(len(c_size))),
+                    fmt,
+                )
+
+            c_size = [concretize_expr(s) for s in output.size]
+            c_stride = [concretize_expr(s) for s in output.stride]
+            return SpyreTensorLayout(
+                c_size,
+                c_stride,
+                output.dtype,
+                list(range(len(c_size))),
+            )
 
         case _:
             in_coords = host_coordinates(in_layout, dep)
             out_coords = host_coordinates(output, output_dep)
             if (
                 in_coords == out_coords
+                and in_layout.size == output.size
                 and dep.index == output_dep.index
                 and same_device_size(in_layout.dtype, output.dtype)
             ):
@@ -204,6 +231,125 @@ def _single_arg_op_layout(
                 return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
 
 
+def _exx2_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """exx2 requires its input stick on the reduction dim (= last logical dim).
+    Use FixedInOutNode to schedule a restickify if the input stick is elsewhere.
+    """
+    x = args[0]
+    out_dim_order = list(range(len(output.size))) + [-1]
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
+    )
+    reduction_var = _find_reduction_var(x.dep, output_dep, "exx2")
+    req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
+    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl])
+    return [out_stl]
+
+
+def _layernormnorm_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """layernormnorm requires x's stick to match mean/norm_mean (= last logical dim).
+    Use FixedInOutNode to schedule a restickify if x's stick is elsewhere.
+    """
+    x = args[0]
+    out_dim_order = list(range(len(output.size)))
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    reduction_var = _find_reduction_var(x.dep, output_dep, "layernormnorm")
+    req_in_stl = find_stick_compatible_input_layout(
+        x, reduction_var, "layernormnorm", "x"
+    )
+    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl])
+    return [out_stl]
+
+
+def _index_symbols(dep: "MemoryDep") -> "set[sympy.Symbol]":
+    return dep.index.free_symbols
+
+
+def _find_reduction_var(x_dep, out_dep, op_name: str = "reduction") -> "sympy.Symbol":
+    """Reduction loop variable: appears in x's index but not in output's index."""
+    reduction_vars = _index_symbols(x_dep) - _index_symbols(out_dep)
+    if len(reduction_vars) != 1:
+        raise Unsupported(
+            f"{op_name}: expected 1 reduction variable, got {reduction_vars}"
+        )
+    return next(iter(reduction_vars))
+
+
+def _find_matmul_generated_var(y_dep, x_dep, out_dep) -> "sympy.Symbol":
+    """N loop variable: appears in y's and output's index but not in x's index."""
+    generated_vars = (_index_symbols(y_dep) & _index_symbols(out_dep)) - _index_symbols(
+        x_dep
+    )
+    if len(generated_vars) != 1:
+        raise Unsupported(
+            f"matmul: expected 1 generated variable, got {generated_vars}"
+        )
+    return next(iter(generated_vars))
+
+
+def _dev_coord_for_var(dev_coords, arg_host_coords, var):
+    """Return the first device coord that carries var and is resolvable via matching_dim."""
+    for c in dev_coords:
+        if var in c.free_symbols and matching_dim(arg_host_coords, c) is not None:
+            return c
+    return None
+
+
+def find_stick_compatible_input_layout(
+    arg: "PropArg",
+    reduction_var: "sympy.Symbol",
+    reduction_type: str,
+    label: str,
+) -> "SpyreTensorLayout":
+    """Find the required STL for a matmul input by iterating all candidate layouts.
+
+    1. Return the first layout whose stick already carries reduction_var (zero cost).
+    2. Else return the first layout that can be restickified to put reduction_var on the stick.
+    3. Else raise Unsupported.
+    """
+    arg_dev_coords = [device_coordinates(stl, arg.dep) for stl in arg.layouts]
+
+    # Pass 1: already stick-compatible.
+    # stick_compatible() checks cross-tensor compatibility; here we only need
+    # to know if this input's stick coord already carries the target loop variable.
+    for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
+        if reduction_var in dev_coords[-1].free_symbols:
+            return stl
+
+    # Pass 2: can be restickified — find the resolvable device coord for reduction_var
+    # and use it as target_stick_expr for compute_restickify_target_layout.
+    arg_host_coords = host_coordinates(arg.layout, arg.dep)
+    for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
+        target_stick_expr = _dev_coord_for_var(
+            dev_coords, arg_host_coords, reduction_var
+        )
+        if target_stick_expr is None:
+            continue
+        result = compute_restickify_target_layout(
+            stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
+        )
+        if result is not None:
+            return result
+
+    raise Unsupported(
+        f"{reduction_type}: cannot restickify any input layout of {label} to carry {label}_var={reduction_var}"
+    )
+
+
 def _matmul_layouts(
     op: Operation,
     output: FixedLayout,
@@ -213,84 +359,38 @@ def _matmul_layouts(
     """
     Matmul has fixed in/out stick requirements so handled specially.
     Algorithm is
-       1. For both input args, compuate a layout that is representative
-       2. For output arg, compute the output layout
-       3. Construct the FixdInOutNode cost function
+       1. Identify reduction symbol (K) and generated symbol (N) via set arithmetic
+          on the free symbols of each input's index expression — no host-dim lookup needed
+       2. For both input args, find a required STL with the correct stick symbol
+       3. Compute the output STL and construct the FixedInOutNode cost function
     """
     data = op.data
     out_coords = host_coordinates(output, output_dep)
 
     x = args[0]
     y = args[1]
-    x_stl = next(iter(x.layouts))
-    y_stl = next(iter(y.layouts))
-    x_coords = host_coordinates(x.layout, x.dep)
-    x_dev_coords = device_coordinates(x_stl, x.dep)
-    y_coords = host_coordinates(y.layout, y.dep)
-    y_dev_coords = device_coordinates(y_stl, y.dep)
-
-    x_stick_expr = x_dev_coords[-1]
-    y_stick_expr = y_dev_coords[-1]
-    if (
-        matching_dim(x_coords, x_stick_expr) is None
-        or matching_dim(y_coords, y_stick_expr) is None
-    ):
-        raise Unsupported(
-            f"{data.reduction_type}: failed to map stick_dims to host coords"
-        )
 
     # Hardware stick constraints (DF16):
-    #   Input1 (x): stick on reduction_dim (the x coord that does NOT appear in output)
-    #   Input2 (y): stick on generated_dim (the y coord that appears in output)
-    #   Output:     stick on generated_dim
-    if matching_dim(out_coords, x_stick_expr) is not None:
-        reduction_coord = next(
-            c
-            for c in x_coords
-            if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-        )
-    else:
-        reduction_coord = x_stick_expr
+    #   Input1 (x): stick on reduction_var (loop var absent from output)
+    #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
+    #   Output:     stick on generated_var
+    reduction_var = _find_reduction_var(x.dep, output_dep, data.reduction_type)
+    generated_var = _find_matmul_generated_var(y.dep, x.dep, output_dep)
 
-    if matching_dim(out_coords, y_stick_expr) is None:
-        generated_coord = next(
-            c
-            for c in y_coords
-            if len(c.free_symbols) > 0
-            and matching_dim(out_coords, c) is not None
-            and matching_dim(x_coords, c) is None
-        )
-    else:
-        generated_coord = y_stick_expr
+    x_req_stl = find_stick_compatible_input_layout(
+        x, reduction_var, data.reduction_type, "x"
+    )
+    y_req_stl = find_stick_compatible_input_layout(
+        y, generated_var, data.reduction_type, "y"
+    )
 
-    if reduction_coord == x_dev_coords[-1]:
-        x_req_stl = x_stl
-    else:
-        _x = compute_restickify_target_layout(
-            x_stl, x.layout, reduction_coord, x_coords, x_dev_coords
-        )
-        if _x is None:
-            raise Unsupported(
-                f"{data.reduction_type}: cannot restickify x to reduction_coord={reduction_coord}"
-            )
-        x_req_stl = _x
-
-    if generated_coord == y_dev_coords[-1]:
-        y_req_stl = y_stl
-    else:
-        _y = compute_restickify_target_layout(
-            y_stl, y.layout, generated_coord, y_coords, y_dev_coords
-        )
-        if _y is None:
-            raise Unsupported(
-                f"{data.reduction_type}: cannot restickify y to generated_coord={generated_coord}"
-            )
-        y_req_stl = _y
-
-    out_stick_dim = matching_dim(out_coords, generated_coord)
+    out_stick_dim = next(
+        (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
+        None,
+    )
     if out_stick_dim is None:
         raise Unsupported(
-            f"{data.reduction_type}: failed to map output stick_dim to host coords {out_coords} {generated_coord}"
+            f"{data.reduction_type}: generated_var={generated_var} not found in output coords {out_coords}"
         )
 
     out_dims = len(output.size)
@@ -346,6 +446,7 @@ def _multi_arg_pointwise_layouts(
         for arg, arg_coors in zip(args, in_coords):
             if (
                 arg_coors != out_coords
+                or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
                 or not same_device_size(arg.layout.dtype, output.dtype)
             ):
@@ -397,13 +498,8 @@ def _topk_layouts(
     x_coords = host_coordinates(x.layout, x.dep)
     out_coords = host_coordinates(output, output_dep)
 
-    # Reduction coordinate: in x's host coords but absent from output's host coords.
-    reduction_coord = next(
-        c
-        for c in x_coords
-        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-    )
-    reduction_dim = matching_dim(x_coords, reduction_coord)
+    # Reduction var: in x's index but absent from output's.
+    reduction_var = _find_reduction_var(x.dep, output_dep, "topk")
 
     # Coords that survive the reduction into the output.
     surviving_coords = [
@@ -413,12 +509,12 @@ def _topk_layouts(
     ]
 
     # Collect candidate output stick dims. A valid input stick passes through;
-    # a stick on the reduction dim requires a restickify, so every surviving
+    # a stick on the reduction var requires a restickify, so every surviving
     # coord becomes a candidate.
     out_stick_dims: set[int | None] = set()
     for stl in x.layouts:
         x_stick_expr = device_coordinates(stl, x.dep)[-1]
-        if matching_dim(x_coords, x_stick_expr) == reduction_dim:
+        if reduction_var in x_stick_expr.free_symbols:
             for c in surviving_coords:
                 out_stick_dims.add(matching_dim(out_coords, c))
         else:
@@ -461,24 +557,23 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
         return _matmul_layouts(op, output, output_dep, args)
 
+    if isinstance(data, Reduction) and data.reduction_type == "exx2":
+        return _exx2_layout(op, output, output_dep, args)
+
     if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:
-        # layernormnorm is pointwise but special: it has multiple args, input and output
-        # must have matching size/stride, but only the first arg drives the output layout.
+        # layernormnorm is pointwise but special: it has multiple args, input and
+        # output must have matching size/stride, and x's stick must match
+        # mean/norm_mean (last logical dim).
         in_layout = args[0].layout
         if in_layout.size != output.size or in_layout.stride != output.stride:
             raise Unsupported(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
-        layouts = [
-            _single_arg_op_layout(op, output, output_dep, args[0].dep, in_layout, stl)
-            for stl in args[0].layouts
-        ]
-        op.restick_cost_fn = AllSameNode.from_args(args[:1], layouts, output_dep)
-        return layouts
+        return _layernormnorm_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of
@@ -500,6 +595,39 @@ def compute_layouts(
         for stl in args[0].layouts
     ]
     op.restick_cost_fn = AllSameNode.from_args(args, layouts, output_dep)
+    return layouts
+
+
+def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
+    """Return one STL per valid stick dimension for a constant-valued buffer.
+
+    A constant tensor (ones_like, full, zeros_like, ...) has no real memory
+    access pattern — every element is the same scalar broadcast from a
+    SpyreConstantFallback.  Because the content is uniform, any stick layout
+    is correct.  Offering all valid choices lets the optimizer pick whichever
+    is compatible with the rest of the graph at zero cost, avoiding a needless
+    restickify.
+
+    Only dimensions with at least elems_per_stick elements are valid stick
+    candidates — smaller dims produce sentinel -1 entries in stride_map that
+    insert_restickify cannot handle.
+    """
+    output: FixedLayout = op.get_layout()
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    elems_per_stick = get_elem_in_stick(output.dtype)
+    layouts = [
+        SpyreTensorLayout(
+            c_size,
+            c_stride,
+            output.dtype,
+            [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
+        )
+        for stick_dim in range(len(c_size))
+        if c_size[stick_dim] >= elems_per_stick
+    ]
+    if not layouts:
+        layouts = [generic_layout(op)]
     return layouts
 
 
@@ -554,7 +682,22 @@ def propagate_spyre_tensor_layouts(
             output_dep = next(iter(rw.writes))
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
-            if isinstance(op.data, (Pointwise, Reduction)):
+            if not args:
+                mem_reads = [r for r in rw.reads if isinstance(r, MemoryDep)]
+                is_constant_fill = bool(mem_reads) and all(
+                    isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
+                    for r in mem_reads
+                )
+                if is_constant_fill:
+                    op.layouts = _all_constant_layouts(op)
+                else:
+                    logger.warning(
+                        f"{op.get_name()} has no propagatable args but reads non-constant "
+                        f"buffers {[r.name for r in mem_reads]}; falling back to generic layout"
+                    )
+                    op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
+            elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
@@ -601,6 +744,15 @@ def propagate_mutation_layouts(
                 output = n.node.get_layout()
                 layouts = list(compute_layouts(n.node, output, output_dep, args))
                 n.node.layout = layouts[0]
+        elif isinstance(n.node.data, Reduction):
+            real = n.node.layout.real_layout()
+            if isinstance(real, FixedTiledLayout):
+                n.node.layout = real
+            else:
+                logger.warning(
+                    "propagate_mutation_layouts: unhandled mutation Reduction"
+                    f" op {n.node.get_name()}: real_layout is {type(real)}"
+                )
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"

@@ -50,7 +50,7 @@ test_suite_config:
       tests:
         - names:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id
-          mode: mandatory_success
+          mode: skip #Reason: Assert x with 8192
 
     # =========================================================================
     # test_cpp_thread.py

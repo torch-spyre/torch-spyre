@@ -1,0 +1,9 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestOps::test_reduce_keepdim0.*
+            - TestOps::test_reduce_edge_keepdim0.*
+          mode: mandatory_success

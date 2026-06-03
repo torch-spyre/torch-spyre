@@ -26,6 +26,9 @@ from torch_spyre._inductor.logging_utils import (
 
 
 class TestLoggingConfiguration:
+    def setup_method(self, method):
+        torch.manual_seed(0xAFFE)
+
     def test_default_is_disabled(self):
         with patch.object(logging_utils, "_INDUCTOR_LOGGING_ENABLED", None):
             with patch.dict(os.environ, {}, clear=True):
@@ -42,6 +45,9 @@ class TestLoggingConfiguration:
 
 
 class TestLoggingOperations:
+    def setup_method(self, method):
+        torch.manual_seed(0xAFFE)
+
     def test_create_logger(self):
         logger = get_inductor_logger("test_module")
         assert logger is not None

@@ -67,6 +67,10 @@ _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cp
 
 @instantiate_parametrized_tests
 class TestSpyre(TestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
@@ -97,6 +101,15 @@ class TestSpyre(TestCase):
 
         a_cpu = a.cpu()
         self.assertTrue(a_cpu.eq(3.5).all())
+
+    def test_empty_factory_in_device_context(self):
+        # The error only repros if at least one allocation
+        # has already happened
+        _ = torch.empty(64, dtype=torch.float16, device="spyre")
+
+        with torch.device("spyre"):
+            a = torch.empty(50, dtype=torch.float16)
+        self.assertEqual(a.device.type, "spyre")
 
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)
@@ -222,16 +235,16 @@ class TestSpyre(TestCase):
         ):
             b = a.to(device="spyre").add(2.0).to(device="cpu")
 
-        self.assertEqual(b.ndim, 1)
+        self.assertEqual(b.ndim, 0)
         self.assertEqual(b.numel(), 1)
 
         expected = a + 2
         if dtype == torch.float8_e4m3fn:
-            torch.testing.assert_close(b.float(), expected.reshape(1).float())
+            torch.testing.assert_close(b.float(), expected.float())
         else:
             torch.testing.assert_close(
                 b,
-                expected.reshape(1),
+                expected,
                 rtol=2e-3,
                 atol=1e-5,
                 check_dtype=False,
@@ -545,14 +558,14 @@ class TestSpyre(TestCase):
         # This must not raise TypeError about MRO
         instantiate_device_type_tests(_TestMROCheck, ns, only_for=("privateuse1",))
 
-        # instantiate_device_type_tests should create a class named
-        # _TestMROCheckPRIVATEUSE1 in the namespace
-        assert "_TestMROCheckPRIVATEUSE1" in ns, (
-            f"Expected _TestMROCheckPRIVATEUSE1 in namespace, got {list(ns)}"
-        )
+        # instantiate_device_type_tests creates a class named either
+        # _TestMROCheckPRIVATEUSE1 (PT <=2.10) or _TestMROCheckSPYRE (PT 2.11+)
+        expected_names = ("_TestMROCheckPRIVATEUSE1", "_TestMROCheckSPYRE")
+        found = [n for n in expected_names if n in ns]
+        assert found, f"Expected one of {expected_names} in namespace, got {list(ns)}"
 
         # The generated class should be instantiable (valid MRO)
-        cls = ns["_TestMROCheckPRIVATEUSE1"]
+        cls = ns[found[0]]
         assert issubclass(cls, TestCase)
 
     def test_device_to_device(self):
@@ -652,6 +665,88 @@ class TestSpyre(TestCase):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
+
+    def test_d2h_h2d_dtype_conversion(self):
+        """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.
+
+        Tests roundtrip for each supported dtype conversion: create tensor on
+        CPU with src_dtype, transfer to Spyre with dst_dtype (H2D), then back
+        to CPU (D2H). Also tests that unsupported dtype conversions raise errors.
+        """
+        from torch_spyre._inductor.dtype_ops import DtypeOpTable
+
+        float_tols = {
+            torch.float16: (1e-3, 1e-3),
+            torch.bfloat16: (1e-2, 1.6e-2),
+            torch.float32: (1e-5, 1e-5),
+        }
+
+        def _make_cpu_tensor(dtype):
+            if dtype.is_floating_point:
+                return torch.randn(2, 2, dtype=dtype)
+            if dtype == torch.bool:
+                return torch.randint(0, 2, (2, 2), dtype=torch.int32).to(torch.bool)
+            return torch.randint(0, 10, (2, 2), dtype=dtype)
+
+        def _assert_values_equal(actual, expected, src_dtype, dst_dtype, ctx):
+            if actual.is_floating_point():
+                src_atol, src_rtol = float_tols.get(src_dtype, (1e-5, 1e-5))
+                dst_atol, dst_rtol = float_tols.get(dst_dtype, (1e-5, 1e-5))
+                atol = max(src_atol, dst_atol)
+                rtol = max(src_rtol, dst_rtol)
+                self.assertTrue(
+                    torch.allclose(actual, expected, atol=atol, rtol=rtol),
+                    msg=f"{ctx}: actual={actual}, expected={expected}",
+                )
+            else:
+                self.assertEqual(actual, expected, msg=ctx)
+
+        # D2H conversions not yet supported on the D2H path.
+        skip_d2h_conversions = {
+            (torch.float32, torch.float16),
+        }
+
+        # Test supported conversions
+        for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
+            ctx = f"H2D {src_dtype}->{dst_dtype}"
+            h2d_src = _make_cpu_tensor(src_dtype)
+            h2d_expected = h2d_src.to(dtype=dst_dtype)  # ground truth on CPU
+            h2d_spyre = h2d_src.to("spyre", dtype=dst_dtype)
+            self.assertEqual(h2d_spyre.device.type, "spyre", msg=ctx)
+            self.assertEqual(h2d_spyre.dtype, dst_dtype, msg=ctx)
+            _assert_values_equal(
+                h2d_spyre.to("cpu"), h2d_expected, src_dtype, dst_dtype, ctx
+            )
+
+            if (dst_dtype, src_dtype) in skip_d2h_conversions:
+                continue
+
+            ctx = f"D2H {dst_dtype}->{src_dtype}"
+            d2h_src = _make_cpu_tensor(dst_dtype)
+            d2h_expected = d2h_src.to(dtype=src_dtype)  # ground truth on CPU
+            d2h_spyre = d2h_src.to("spyre")
+            d2h_cpu = d2h_spyre.to("cpu", dtype=src_dtype)
+            self.assertEqual(d2h_cpu.device.type, "cpu", msg=ctx)
+            self.assertEqual(d2h_cpu.dtype, src_dtype, msg=ctx)
+            _assert_values_equal(d2h_cpu, d2h_expected, dst_dtype, src_dtype, ctx)
+
+        # Test unsupported conversions
+        unsupported_pairs = [
+            (torch.int8, torch.float16),
+            (torch.float32, torch.int32),
+            (torch.float16, torch.int64),
+        ]
+
+        for src_dtype, dst_dtype in unsupported_pairs:
+            # Create tensor on CPU with src_dtype
+            if src_dtype.is_floating_point:
+                tensor = torch.randn(2, 2, dtype=src_dtype)
+            else:
+                tensor = torch.randint(0, 10, (2, 2), dtype=src_dtype)
+
+            # H2D: Expect error when moving to Spyre with unsupported dst_dtype
+            with self.assertRaises(RuntimeError):
+                tensor.to("spyre", dtype=dst_dtype)
 
 
 if __name__ == "__main__":

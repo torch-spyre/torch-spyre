@@ -16,6 +16,10 @@ BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
+# Type casting operators from deeptools
+DL16TOFP32_OP = "dl16tofp32"
+FP32TODL16_OP = "fp32todl16"
+
 DEVICE_NAME = "spyre"
 
 
@@ -29,13 +33,16 @@ SEGMENT_OFFSETS = [
     0x1800000000,
 ]
 
+INTERMEDIATES_SEGMENT = 0x0
+SEGMENT_SIZE = 0x400000000
+
 SPYRE_FP32_OPS = [
     "add",
     "sub",
     "mul",
     "where",
     "realdiv",
-    "relu",
+    "relufwd",
     "reciprocal",
     "layernormscale",
     "abs",
@@ -45,12 +52,14 @@ SPYRE_FP32_OPS = [
     "exx2",
     "layernormnorm",
     "identity",
-    "overwrite",
     "sqrt",
     "rsqrt",
     "topkvalue",
     "topkindex",
     "floor",
+    "to_dtype",
+    "maximum",
+    "minimum",
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}

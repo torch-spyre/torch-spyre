@@ -4,9 +4,13 @@ on:
   # Run automatically on every merge to main
   push:
     branches: [main]
+    paths-ignore:
+      - tests/docs/**
+      - docs/**
+      - README.md
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -20,8 +24,23 @@ permissions:
 jobs:
   upstream-tests:
     name: ${{ matrix.suite.name }}
-    runs-on: official-aiu-x86-64-arc-runner-set-v3
-    timeout-minutes: 720
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 60
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # The new torch-spyre image already contains a pre-cloned pytorch
+      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
+      TORCH_ROOT: /home/senuser/pytorch
 
     # ---------------------------------------------------------------------------
     # To add a new upstream test suite, append an entry here:
@@ -56,103 +75,30 @@ jobs:
             config: test_unary_ufuncs.yaml
 
     steps:
-      - name: Checkout torch-spyre repository
+      # Sparse checkout into the GHA workspace so the local composite
+      # actions under .github/actions/ are available. The pre-cloned
+      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
+      # against.
+      - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          path: torch-spyre
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
 
-      # ---------------------------------------------------------------------------
-      # Derive the PyTorch release branch from pyproject.toml so there is a
-      # single source of truth — no hardcoded version in this workflow.
-      #
-      # pyproject.toml declares:  torch~=2.11.0
-      # This step extracts "2.11.0", strips the patch -> "2.11", and builds
-      # the branch name "release/2.11".
-      # ---------------------------------------------------------------------------
-      - name: Derive PyTorch release branch from pyproject.toml
-        id: pytorch-branch
-        working-directory: torch-spyre
-        run: |
-          # Extract the version constraint, e.g. "2.11.0" from "torch~=2.11.0"
-          VERSION=$(python3 - <<'PYEOF'
-          import tomllib
+      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
 
-          with open("pyproject.toml", "rb") as f:
-              data = tomllib.load(f)
+      - uses: ./.github/actions/checkout-prebuilt-pytorch
 
-          requires = data.get('build-system', {}).get('requires', [])
-          torch_dep = next(x for x in requires if x.startswith('torch'))
-          version = torch_dep.removeprefix('torch~=')   # e.g. "2.11.0"
-          print('.'.join(version.split('.')[:2]))        # --> "2.11"
-          PYEOF
-          )
-          BRANCH="release/${VERSION}"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Derived PyTorch branch: $BRANCH"
-      # ---------------------------------------------------------------------------
-      # PyTorch source caching
-      #
-      # Cloning pytorch/pytorch with all submodules is expensive.
-      # We cache the entire checkout keyed on the latest commit SHA of the branch
-      # so the clone only happens when the branch actually updates upstream.
-      #
-      # Cache hit  --> restore from cache, skip checkout (saves several minutes)
-      # Cache miss --> full clone + submodules, then save to cache for next run
-      # ---------------------------------------------------------------------------
-      - name: Get latest commit SHA of PyTorch branch
-        id: pytorch-sha
-        run: |
-          BRANCH="${{ steps.pytorch-branch.outputs.branch }}"
-          SHA=$(git ls-remote https://github.com/pytorch/pytorch.git "refs/heads/${BRANCH}" | cut -f1)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "PyTorch ${BRANCH} HEAD: $SHA"
+      - uses: ./.github/actions/gather-runner-info
 
-      - name: Restore PyTorch source from cache
-        id: pytorch-cache
-        uses: actions/cache@v4
-        with:
-          path: pytorch
-          key: pytorch-${{ steps.pytorch-branch.outputs.branch }}-${{ steps.pytorch-sha.outputs.sha }}
-
-      - name: Checkout PyTorch source
-        if: steps.pytorch-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: pytorch/pytorch
-          ref: ${{ steps.pytorch-branch.outputs.branch }}
-          submodules: recursive
-          path: pytorch
-
-      - name: Set TORCH_ROOT
-        run: echo "TORCH_ROOT=$GITHUB_WORKSPACE/pytorch" >> "$GITHUB_ENV"
-
-      - name: Gather environment info
-        run: |
-          echo 'gather info start'
-          pwd
-          ls -la
-          whoami
-          id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          echo "TORCH_ROOT $TORCH_ROOT"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
-
-      - name: Install torch-spyre package and dependencies
-        working-directory: torch-spyre
-        run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-          echo "VENV_PATH=${GITHUB_WORKSPACE}/torch-spyre/.venv" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} upstream beta test suite
-        working-directory: torch-spyre/tests
         run: |
-          source "${VENV_PATH}/bin/activate"
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
           echo 'Running ${{ matrix.suite.name }} upstream tests...'
-          bash run_test.sh configs/upstream_tests_beta/${{ matrix.suite.config }} -v
+          bash tests/run_test.sh "tests/configs/upstream_tests_beta/${{ matrix.suite.config }}" -v
           echo '${{ matrix.suite.name }} upstream tests done'

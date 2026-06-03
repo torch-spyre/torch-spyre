@@ -1,0 +1,129 @@
+<svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#1f2937"/>
+    </marker>
+    <marker id="arr-red" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <!-- ── MAIN ROW (top) ── -->
+
+  <!-- CPU Tensor box -->
+  <rect x="10" y="16" width="182" height="158" rx="5" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
+  <rect x="10" y="16" width="182" height="30" rx="5" fill="#374151"/>
+  <rect x="10" y="34" width="182" height="12" fill="#374151"/>
+  <text x="101" y="37" text-anchor="middle" font-size="12.5" font-weight="700" fill="#ffffff">CPU Tensor</text>
+  <text x="101" y="64" text-anchor="middle" font-size="11.5" fill="#1f2937">shape: (1024, 256)</text>
+  <text x="101" y="80" text-anchor="middle" font-size="11.5" fill="#1f2937">strides: (256, 1)</text>
+  <text x="101" y="96" text-anchor="middle" font-size="11" fill="#374151">row-major, contiguous</text>
+  <rect x="28" y="112" width="146" height="11" rx="2" fill="#d0daea"/>
+  <rect x="28" y="127" width="146" height="11" rx="2" fill="#c4d2e6" opacity="0.8"/>
+  <rect x="28" y="142" width="146" height="10" rx="2" fill="#b8c8e2" opacity="0.55"/>
+  <text x="101" y="167" text-anchor="middle" font-size="10.5" fill="#1f2937">uniform stride throughout</text>
+
+  <!-- stickify arrow -->
+  <text x="220" y="82" text-anchor="middle" font-size="11" fill="#374151" font-style="italic">stickify</text>
+  <line x1="194" y1="95" x2="248" y2="95" stroke="#1f2937" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- FixedTiledLayout box -->
+  <rect x="252" y="16" width="248" height="158" rx="5" fill="#ffffff" stroke="#e55b15" stroke-width="1.5"/>
+  <rect x="252" y="16" width="248" height="30" rx="5" fill="#e55b15"/>
+  <rect x="252" y="34" width="248" height="12" fill="#e55b15"/>
+  <text x="376" y="37" text-anchor="middle" font-size="12.5" font-weight="700" fill="#ffffff">FixedTiledLayout</text>
+  <text x="376" y="64" text-anchor="middle" font-size="11.5" fill="#1f2937">device shape: (4, 1024, 64)</text>
+  <text x="376" y="80" text-anchor="middle" font-size="11" fill="#374151">stick = 128 bytes = 64 fp16 elems</text>
+  <!-- 4 tile blocks -->
+  <rect x="266" y="97" width="48" height="48" rx="3" fill="#fce8d8" stroke="#e55b15" stroke-width="1"/>
+  <text x="290" y="117" text-anchor="middle" font-size="10.5" font-weight="600" fill="#b03800">Tile 0</text>
+  <text x="290" y="131" text-anchor="middle" font-size="10" fill="#c85010">64 elems</text>
+  <rect x="320" y="97" width="48" height="48" rx="3" fill="#fce8d8" stroke="#e55b15" stroke-width="1"/>
+  <text x="344" y="117" text-anchor="middle" font-size="10.5" font-weight="600" fill="#b03800">Tile 1</text>
+  <text x="344" y="131" text-anchor="middle" font-size="10" fill="#c85010">64 elems</text>
+  <rect x="374" y="97" width="48" height="48" rx="3" fill="#fce8d8" stroke="#e55b15" stroke-width="1"/>
+  <text x="398" y="117" text-anchor="middle" font-size="10.5" font-weight="600" fill="#b03800">Tile 2</text>
+  <text x="398" y="131" text-anchor="middle" font-size="10" fill="#c85010">64 elems</text>
+  <rect x="428" y="97" width="48" height="48" rx="3" fill="#fce8d8" stroke="#e55b15" stroke-width="1"/>
+  <text x="452" y="117" text-anchor="middle" font-size="10.5" font-weight="600" fill="#b03800">Tile 3</text>
+  <text x="452" y="131" text-anchor="middle" font-size="10" fill="#c85010">64 elems</text>
+  <text x="376" y="167" text-anchor="middle" font-size="10.5" fill="#1f2937">non-uniform stride between tiles</text>
+
+  <!-- DMA arrow -->
+  <text x="532" y="82" text-anchor="middle" font-size="11" fill="#374151" font-style="italic">DMA</text>
+  <line x1="503" y1="95" x2="555" y2="95" stroke="#1f2937" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- On-Device Memory box -->
+  <rect x="558" y="16" width="200" height="158" rx="5" fill="#ffffff" stroke="#374151" stroke-width="1.5"/>
+  <rect x="558" y="16" width="200" height="30" rx="5" fill="#374151"/>
+  <rect x="558" y="34" width="200" height="12" fill="#374151"/>
+  <text x="658" y="37" text-anchor="middle" font-size="12.5" font-weight="700" fill="#ffffff">On-Device Memory</text>
+  <text x="658" y="64" text-anchor="middle" font-size="11.5" fill="#1f2937">Contiguous stick tiles</text>
+  <text x="658" y="80" text-anchor="middle" font-size="11" fill="#374151">128-byte aligned in LPDDR5</text>
+  <rect x="575" y="97" width="163" height="14" rx="2" fill="#cfddf5"/>
+  <text x="658" y="109" text-anchor="middle" font-size="10.5" fill="#3a5a8a">stick[0] · 64 fp16 elems</text>
+  <rect x="575" y="115" width="163" height="14" rx="2" fill="#bdd0f0"/>
+  <text x="658" y="127" text-anchor="middle" font-size="10.5" fill="#3a5a8a">stick[1] · 64 fp16 elems</text>
+  <rect x="575" y="133" width="163" height="14" rx="2" fill="#adc3eb"/>
+  <text x="658" y="145" text-anchor="middle" font-size="10.5" fill="#3a5a8a">stick[2] · 64 fp16 elems</text>
+  <text x="658" y="165" text-anchor="middle" font-size="11.5" fill="#1f2937">…</text>
+
+  <!-- ── STRIDE BREAK VISUALIZATION (bottom) ── -->
+  <text x="10" y="196" font-size="11" font-weight="700" fill="#374151">Stride pattern — memory map view:</text>
+
+  <!-- Row label -->
+  <text x="10" y="228" font-size="10.5" fill="#374151">row i</text>
+
+  <!-- Uniform blocks for elements 0..62 inside tile (compact) -->
+  <!-- Tile 0: elements 0-63 -->
+  <rect x="45" y="215" width="148" height="20" rx="2" fill="#d0daea" stroke="#a0b4d0" stroke-width="0.8"/>
+  <text x="119" y="228" text-anchor="middle" font-size="10.5" fill="#3a5a8a">elem [i,0] … [i,63]  (stride=1)</text>
+
+  <!-- Gap / stride jump indicator -->
+  <text x="197" y="228" text-anchor="middle" font-size="16" fill="#dc2626" font-weight="700">↕</text>
+  <text x="197" y="242" text-anchor="middle" font-size="9.5" fill="#dc2626">stride</text>
+  <text x="197" y="251" text-anchor="middle" font-size="9.5" fill="#dc2626">jump</text>
+
+  <!-- Tile 1: elements 64-127 -->
+  <rect x="215" y="215" width="148" height="20" rx="2" fill="#c4d2e6" stroke="#90a8c8" stroke-width="0.8"/>
+  <text x="289" y="228" text-anchor="middle" font-size="10.5" fill="#3a5a8a">elem [i,64] … [i,127] (stride=1)</text>
+
+  <!-- Gap again -->
+  <text x="367" y="228" text-anchor="middle" font-size="16" fill="#dc2626" font-weight="700">↕</text>
+
+  <!-- Tile 2: elements 128-191 -->
+  <rect x="384" y="215" width="148" height="20" rx="2" fill="#b8c8e2" stroke="#7f9cba" stroke-width="0.8"/>
+  <text x="458" y="228" text-anchor="middle" font-size="10.5" fill="#3a5a8a">elem [i,128]…[i,191] (stride=1)</text>
+
+  <text x="536" y="228" font-size="12.5" fill="#374151">…</text>
+
+  <!-- Annotation below stride map -->
+  <text x="45" y="270" font-size="11.5" fill="#e55b15" font-weight="600">Within a tile: stride = 1.  Across tile boundary: stride breaks —</text>
+  <text x="45" y="281" font-size="11.5" fill="#e55b15">no single integer stride can represent the full tensor layout.</text>
+
+  <!-- Stick zoom inset -->
+  <rect x="586" y="196" width="200" height="88" rx="5" fill="#fff7f4" stroke="#e55b15" stroke-width="1.2"/>
+  <text x="686" y="211" text-anchor="middle" font-size="10.5" font-weight="700" fill="#e55b15">Single stick (zoom)</text>
+  <!-- 8 mini element slots representing 64 fp16 elements -->
+  <rect x="596" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="616" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="636" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="656" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="676" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="696" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="716" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <rect x="736" y="218" width="18" height="14" rx="1" fill="#fce8d8" stroke="#e55b15" stroke-width="0.8"/>
+  <text x="596" y="248" font-size="10" fill="#b03800">e₀</text>
+  <text x="616" y="248" font-size="10" fill="#b03800">e₁</text>
+  <text x="636" y="248" font-size="10" fill="#b03800">e₂</text>
+  <text x="656" y="248" font-size="9.5" fill="#b03800">…</text>
+  <text x="736" y="248" font-size="10" fill="#b03800">e₆₃</text>
+  <text x="686" y="263" text-anchor="middle" font-size="10" fill="#374151">64 × fp16 = 128 bytes</text>
+  <text x="686" y="275" text-anchor="middle" font-size="10" fill="#1f2937">128-byte aligned in DDR</text>
+
+  <!-- IMPROVED: dashed callout connecting zoom inset to Tile 1 -->
+  <line x1="586" y1="206" x2="368" y2="145" stroke="#e55b15" stroke-width="1.2"
+        stroke-dasharray="4,3" opacity="0.75"/>
+  <circle cx="368" cy="145" r="3.5" fill="#e55b15" opacity="0.75"/>
+  <circle cx="586" cy="206" r="3.5" fill="#e55b15" opacity="0.75"/>
+</svg>

@@ -13,13 +13,20 @@
 # limitations under the License.
 
 import tempfile
+from collections.abc import Sequence
 from typing import Any
 import os
 import subprocess
+import torch
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
+from torch_spyre._inductor.op_spec import (
+    LoopSpec,
+    OpSpec,
+    UnimplementedOp,
+    find_unimplemented,
+)
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
@@ -37,21 +44,23 @@ class SpyreAsyncCompile:
     def __init__(self) -> None:
         pass
 
-    def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
-        unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
-        if len(unimp) != 0:
+    def sdsc(
+        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+    ):
+        unimp = find_unimplemented(list(specs))
+        if unimp is not None:
             logger.warning(
-                f"WARNING: Compiling unimplemented {unimp[0].op} to runtime exception"
+                f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
             )
-            return SpyreUnimplementedRunner(kernel_name, unimp[0].op)
+            return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        op_specs = [s for s in specs if isinstance(s, OpSpec)]
-        generate_bundle(kernel_name, output_dir, op_specs)
+        generate_bundle(kernel_name, output_dir, specs)
 
         # Invoke backend compiler of SDSC Bundle
-        subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
+        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+            subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
 
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 

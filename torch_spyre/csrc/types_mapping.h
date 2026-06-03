@@ -21,7 +21,12 @@
 #include <module.h>
 #include <util/sendefs.h>
 
+#ifdef USE_FLEX_NAMESPACE
+#include <flex/datatype/flex_datatype.hpp>
+namespace sendnn = flex;
+#else
 #include <sendnn/tensor/sendatatype.hpp>
+#endif
 #include <string>
 #include <unordered_map>
 #include <utility>

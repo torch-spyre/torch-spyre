@@ -14,9 +14,10 @@
 
 from typing import Optional, Sequence
 import torch
+import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
-from torch_spyre.ops.fallbacks import warn_fallback
 from torch_spyre.ops.eager import compile_once
+from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
@@ -190,23 +191,22 @@ def _(
     return input.new_empty(input.size())
 
 
-@torch.library.custom_op("spyre::full", mutates_args=(), device_types="spyre")
-def spyre_full(
+@torch.library.custom_op("spyre::empty", mutates_args=(), device_types="spyre")
+def spyre_empty(
     size: Sequence[int],
-    fill_value: torch.types.Number,
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    # Fall back to CPU.
-    warn_fallback("torch.ops.spyre.full")
-    tmp = torch.full(size, fill_value, dtype=dtype, device="cpu")
+    # Eager-mode simulation: allocate on CPU and move to the Spyre device.
+    # This is not a compute fallback — on hardware the compiled kernel receives
+    # a device allocation from SpyreAllocator with no host-side initialisation.
+    tmp = torch.empty(size, dtype=dtype, device="cpu")
     return tmp.to(device)
 
 
-@spyre_full.register_fake
+@spyre_empty.register_fake
 def _(
     size: Sequence[int],
-    fill_value: torch.types.Number,
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
 ):
@@ -221,26 +221,6 @@ def logical_not(input: torch.Tensor) -> torch.Tensor:
 @logical_not.register_fake
 def _(input: torch.Tensor):
     return input.new_empty(input.size())
-
-
-@torch.library.custom_op("spyre::ones_scalar", mutates_args=(), device_types="spyre")
-def spyre_ones_scalar(
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    """Return a 1-element tensor containing 1 on Spyre. Used for ones via identity broadcast."""
-    warn_fallback("torch.ops.spyre.ones_scalar")
-    out = torch.empty(1, dtype=dtype, device=device)
-    out.fill_(1)
-    return out
-
-
-@spyre_ones_scalar.register_fake
-def _ones_scalar_fake(
-    device: torch.device,
-    dtype: Optional[torch.dtype] = None,
-):
-    return torch.empty(1, dtype=dtype, device="spyre")
 
 
 @torch.library.custom_op(
@@ -276,7 +256,19 @@ def overwrite(
     offsets: Sequence[int],
     compiled,
 ) -> None:
-    return compiled(input, output, dims, offsets)
+    # specialize_int=True installs int-equality guards on the int-list
+    # args so each unique (dims, offsets) triggers a fresh trace and a
+    # fresh SDSC binary; without this dynamo's default specialize_int=
+    # False reuses one baked binary across all values and scatters all
+    # writes to the first call's offset (see test_overwrite.py).
+    # Patch is call-scoped to leave process-wide dynamo behavior alone.
+    # Note: this gives one compiled binary per unique (input shape, dims,
+    # offsets) tuple. dynamo's cache_size_limit is bumped to 1024 in
+    # torch_spyre/__init__.py — long-running workloads that scatter into
+    # many distinct slots can blow past that. Symbolic offsets (one
+    # binary, any value) are tracked in issues #220 / #1371-3.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(input, output, dims, offsets)
 
 
 @overwrite.register_fake
@@ -298,7 +290,7 @@ def overwrite_cpu(
 ) -> None:
     sliced_t = output
     for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], input.size(dim))
     sliced_t.copy_(input)
 
 
@@ -371,6 +363,38 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
     return (values, indices)
 
 
+@torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
+def min_dim_int64_fallback(
+    input: torch.Tensor, dim: int, keepdim: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    CPU fallback for torch.min(input, dim) when input is int64.
+    This custom op will be registered with a CPU fallback in fallbacks.py.
+    Returns a tuple (values, indices) as expected by torch.min.
+    """
+    raise RuntimeError(
+        "spyre::min_dim_int64_fallback should be handled by CPU fallback registration"
+    )
+
+
+@min_dim_int64_fallback.register_fake
+def _(input: torch.Tensor, dim: int, keepdim: bool = False):
+    """
+    Fake implementation for shape inference.
+    Returns the expected output shapes for torch.min(input, dim, keepdim).
+    """
+    if keepdim:
+        output_shape = list(input.size())
+        output_shape[dim] = 1
+    else:
+        output_shape = list(input.size())
+        output_shape.pop(dim)
+
+    values = input.new_empty(output_shape)
+    indices = torch.empty(output_shape, dtype=torch.int64, device=input.device)
+    return (values, indices)
+
+
 ## TODO (imaihal): This needs scalar tensor support from Spyre to CPU. issues #1172
 #
 # @torch.library.custom_op("spyre::max_default_int64_fallback", mutates_args=())
@@ -395,6 +419,17 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
 #    return input.new_empty([])
 
 
+@torch.library.custom_op("spyre::batched_matmul", mutates_args=(), device_types="spyre")
+def batched_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@batched_matmul.register_fake
+def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    output_shape = list(x.shape[:-1]) + [y.shape[-1]]
+    return x.new_empty(output_shape)
+
+
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
 def spyre_constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
@@ -412,3 +447,14 @@ def _constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
 ) -> torch.types.Number:
     return fill_value
+
+
+@torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
+def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    warn_fallback(f"conversion from {input.dtype} to {dtype}")
+    return input.cpu().to(dtype=dtype).to(input.device)
+
+
+@to_dtype_cpu.register_fake
+def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return torch.empty_like(input, dtype=dtype)
