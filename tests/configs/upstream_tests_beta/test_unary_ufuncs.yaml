@@ -6,15 +6,14 @@ test_suite_config:
         - names:
             - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output
           mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: complex64
-                  description: complex64 unsupported on Spyre for this test. This test attempts complex type test as well.
-                - name: complex128
-                  description: complex128 unsupported on Spyre for this test. This test attempts complex type test as well.
-                - name: float64
-                  description: float64 unsupported on Spyre for this test.
         - names:
             - TestUnaryUfuncs::test_polygamma_neg
           mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: int64
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bfloat16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.

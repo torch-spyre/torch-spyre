@@ -754,6 +754,7 @@ class DtypeNamedItem(BaseModel):
     name: str
     description: Optional[str] = None
     precision: Optional[Precision] = None
+    force_xfail: bool = False
 
 
 class OpsEdits(BaseModel):
@@ -1077,6 +1078,12 @@ class GlobalConfig(BaseModel):
             parse_dtype(item.name): item.precision
             for item in self.supported_dtypes
             if item.precision is not None
+        }
+
+    def resolved_supported_dtypes_force_xfail(self) -> Set[torch.dtype]:
+        """Return the set of dtypes that have force_xfail: true."""
+        return {
+            parse_dtype(item.name) for item in self.supported_dtypes if item.force_xfail
         }
 
     def resolved_supported_ops(self) -> Optional[Set[str]]:

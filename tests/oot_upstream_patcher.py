@@ -62,6 +62,45 @@ def _extract_base_module_name(name: str) -> str:
     return name
 
 
+class _OOTNativeDeviceTypesPatcher:
+    """Patches NATIVE_DEVICES in common_device_type to include 'privateuse1'.
+
+    @onlyNativeDeviceTypes and @onlyNativeDeviceTypesAnd both check
+    self.device_type against the module-level NATIVE_DEVICES tuple at call
+    time:
+
+        if self.device_type not in NATIVE_DEVICES: raise SkipTest
+
+    Unlike @onlyOn, there is no decorator instance to mutate -- the check is
+    a plain name lookup against a module global. So we patch the module
+    global directly.
+
+    NATIVE_DEVICES already includes torch._C._get_privateuse1_backend_name()
+    but TorchTestBase.device_type is reset to the literal string "privateuse1"
+    in setUpClass when PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1 is set.
+    That means the runtime check sees "privateuse1" and misses the registered
+     name entry.
+
+    Injecting "privateuse1" into NATIVE_DEVICES (once, at module level) fixes
+    both decorators simultaneously for the lifetime of the process.
+
+    This patcher is intentionally stateless after patch() runs calling it
+    multiple times is safe because we check membership before appending.
+    """
+
+    @staticmethod
+    def patch() -> None:
+        """Append 'privateuse1' to NATIVE_DEVICES if not already present.
+
+        NATIVE_DEVICES is a tuple, so we reassign the module attribute with a
+        new tuple rather than mutating in-place.
+        """
+        import torch.testing._internal.common_device_type as _cdt
+
+        if "privateuse1" not in _cdt.NATIVE_DEVICES:
+            _cdt.NATIVE_DEVICES = _cdt.NATIVE_DEVICES + ("privateuse1",)
+
+
 class _OOTOnlyOnPatcher:
     """Patches @onlyOn decorated test methods to also allow privateuse1.
 

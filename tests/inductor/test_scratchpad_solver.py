@@ -19,23 +19,58 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
 )
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    BestFitLayoutSolver,
+    FirstFitLayoutSolver,
+    _assert_in_place_relationships,
+)
 
 LARGE_SIZE = 512
 SMALL_SIZE = 10
 ALIGNMENT = 128
 
 
-class TestGreedySolver(TestCase):
+def _two_gap_buffers():
+    """Buffers that leave two free gaps for x in a 120-byte scratchpad.
+
+    Processing order by ascending lifetime: b_mid(2), b_left(4), b_right(5), x(5).
+    b_right and x tie on lifetime; stable sort keeps b_right first.
+
+    Placements: b_mid@0, b_left@40, b_right@70.
+    b_mid lives [2,4) and x lives [4,9) — they do not overlap, so b_mid's
+    address range (0,40) is not subtracted from x's gaps. After removing
+    b_left(40,70) and b_right(70,100), x sees two gaps:
+      (0,40)   waste = 30
+      (100,120) waste = 10
+    FirstFit picks (0,40) → addr=0; BestFit picks (100,120) → addr=100.
+    """
+    return [
+        LifetimeBoundBuffer("b_mid", 40, 2, 4),
+        LifetimeBoundBuffer("b_left", 30, 1, 5),
+        LifetimeBoundBuffer("b_right", 30, 3, 8),
+        LifetimeBoundBuffer("x", 10, 4, 9),
+    ]
+
+
+class BaseLayoutSolverTests:
+    solver_class: type[FirstFitLayoutSolver] = None  # type: ignore[assignment]
+
+    def solve(self, buffers, size=LARGE_SIZE, alignment=1):
+        return self.solver_class(size, alignment).plan_layout(buffers)
+
     def verify_layout(
         self,
         buffers: list[LifetimeBoundBuffer],
-        expected_addresses: list[int | None],
+        expected_addresses: set[tuple[int | None]] | list[int | None],
         size=SMALL_SIZE,
         alignment=1,
     ):
-        result = GreedyLayoutSolver(size, alignment).plan_layout(buffers)
-        for planned, expected_addr in zip(result, expected_addresses, strict=True):
-            self.assertEqual(planned.address, expected_addr)
+        result = self.solve(buffers, size, alignment)
+        result_addresses = [p.address for p in result]
+        if isinstance(expected_addresses, set):
+            self.assertIn(tuple(result_addresses), expected_addresses)
+        else:
+            self.assertEqual(result_addresses, expected_addresses)
 
     def test_simple_layout(self):
         # Three non-overlapping buffers fill memory sequentially.
@@ -89,7 +124,7 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer2", 3, 2, 4),
             LifetimeBoundBuffer("buffer3", 3, 3, 4),
         ]
-        self.verify_layout(buffers, [0, 3, 6, 3])
+        self.verify_layout(buffers, {(0, 3, 6, 3), (6, 0, 3, 0)})
 
     def test_realloc_between_with_alignment(self):
         # Same reuse pattern as test_realloc_between, but with alignment padding applied.
@@ -99,7 +134,11 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer2", 100, 2, 4),
             LifetimeBoundBuffer("buffer3", 100, 3, 4),
         ]
-        self.verify_layout(buffers, [0, 256, 384, 256], LARGE_SIZE, ALIGNMENT)
+        if self.solver_class == GreedyLayoutSolver:
+            self.verify_layout(buffers, [0, 256, 384, 256], LARGE_SIZE, ALIGNMENT)
+        else:
+            # Other solvers are smarter than greedy
+            self.verify_layout(buffers, [256, 0, 128, 0], LARGE_SIZE, ALIGNMENT)
 
     def test_inplace_allocation(self):
         # Test that adding inplace options allows for more efficient peak usage
@@ -109,7 +148,7 @@ class TestGreedySolver(TestCase):
                 "buffer1", LARGE_SIZE, 3, 4, in_place_parents=["buffer0"]
             ),
         ]
-        self.verify_layout(buffers, [0, 0], LARGE_SIZE, ALIGNMENT)
+        self.verify_layout(buffers, [0, 0], LARGE_SIZE + 1, ALIGNMENT)
 
     def test_without_inplace_allocation(self):
         # Test that buffer gets evicted without in_place
@@ -117,7 +156,7 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer0", LARGE_SIZE, 0, 4),
             LifetimeBoundBuffer("buffer1", LARGE_SIZE, 3, 4),
         ]
-        self.verify_layout(buffers, [0, None], LARGE_SIZE, ALIGNMENT)
+        self.verify_layout(buffers, {(0, None), (None, 0)}, LARGE_SIZE, ALIGNMENT)
 
     def test_multiple_evictions_do_not_corrupt_allocation(self):
         # buffer0 fills the entire scratchpad; buffer1 and buffer2 are evicted.
@@ -138,6 +177,127 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer0", SMALL_SIZE + 1, 0, 2),
         ]
         self.verify_layout(buffers, [None], size=SMALL_SIZE)
+
+    def test_empty_returns_empty_list(self):
+        self.assertEqual(self.solve([]), [])
+
+    def test_single_buffer_placed_at_zero(self):
+        self.verify_layout([LifetimeBoundBuffer("a", 10, 0, 5)], [0])
+
+    def test_single_buffer_evicted_when_too_large(self):
+        self.verify_layout([LifetimeBoundBuffer("a", 11, 0, 5)], [None], size=10)
+
+    def test_non_overlapping_lifetimes_reuse_address(self):
+        # b1 ends at time 5 (exclusive); b2 starts at time 5 — they never coexist.
+        self.verify_layout(
+            [LifetimeBoundBuffer("b1", 20, 0, 5), LifetimeBoundBuffer("b2", 20, 5, 10)],
+            [0, 0],
+            size=LARGE_SIZE,
+        )
+
+    def test_concurrent_buffers_packed_input_order(self):
+        # Equal lifetimes: stable sort preserves input order, so a(10)@0, b(20)@10, c(30)@30.
+        self.verify_layout(
+            [
+                LifetimeBoundBuffer("a", 10, 0, 4),
+                LifetimeBoundBuffer("b", 20, 0, 4),
+                LifetimeBoundBuffer("c", 30, 0, 4),
+            ],
+            [0, 10, 30],
+            size=60,
+        )
+
+    def test_largest_buffer_evicted_when_full(self):
+        # a(10)@0 and b(20)@10 consume 30 bytes; c(30) needs 30 but only 20 remain → evicted.
+        self.verify_layout(
+            [
+                LifetimeBoundBuffer("a", 10, 0, 4),
+                LifetimeBoundBuffer("b", 20, 0, 4),
+                LifetimeBoundBuffer("c", 30, 0, 4),
+            ],
+            [0, 10, None],
+            size=50,
+        )
+
+    def test_alignment_pads_between_buffers(self):
+        # Two same-size concurrent buffers; the second is placed at the next
+        # alignment boundary after the first.
+        self.verify_layout(
+            [LifetimeBoundBuffer("a", 10, 0, 4), LifetimeBoundBuffer("b", 10, 0, 4)],
+            [0, 128],
+            alignment=128,
+            size=LARGE_SIZE,
+        )
+
+    def test_alignment_can_cause_eviction(self):
+        # a(13)@0 leaves a gap starting at 13; rounding up to alignment=10 gives
+        # addr=20, but 20+12=32 > limit=30, so b is evicted.
+        self.verify_layout(
+            [LifetimeBoundBuffer("a", 13, 0, 5), LifetimeBoundBuffer("b", 12, 0, 5)],
+            [0, None],
+            size=30,
+            alignment=10,
+        )
+
+    def test_child_reuses_parent_address(self):
+        # P ends at 5; C.start_time=4 == P.end_time - 1, so in-place is valid.
+        # Without in-place, P's [0,20) would be subtracted and C would land at 20.
+        p = LifetimeBoundBuffer("P", 20, 0, 5)
+        c = LifetimeBoundBuffer("C", 15, 4, 9, in_place_parents=["P"])
+        result = self.solve([p, c])
+        by_name = {b.name: b.address for b in result}
+        self.assertEqual(by_name["P"], 0)
+        self.assertEqual(by_name["C"], 0)
+
+    def test_child_falls_back_when_parent_evicted(self):
+        # P is too large to fit; C declared as in-place child of P.
+        # P gets evicted (address=None), so C also cannot in-place and
+        # must fall back to normal placement.
+        p = LifetimeBoundBuffer("P", 200, 0, 5)
+        c = LifetimeBoundBuffer("C", 15, 4, 9, in_place_parents=["P"])
+        result = self.solve([p, c], size=100)
+        by_name = {b.name: b.address for b in result}
+        self.assertIsNone(by_name["P"])
+        # C can still be placed independently (no overlap conflict with evicted P).
+        self.assertEqual(by_name["C"], 0)
+
+    def test_assert_rejects_wrong_end_time(self):
+        p = LifetimeBoundBuffer("P", 20, 0, 5)
+        c = LifetimeBoundBuffer(
+            "C", 15, 3, 9, in_place_parents=["P"]
+        )  # start_time=3, need P.end_time==4
+        with self.assertRaises(AssertionError):
+            _assert_in_place_relationships([p, c])
+
+    def test_assert_rejects_oversized_child(self):
+        p = LifetimeBoundBuffer("P", 10, 0, 5)
+        c = LifetimeBoundBuffer(
+            "C", 15, 4, 9, in_place_parents=["P"]
+        )  # child larger than parent
+        with self.assertRaises(AssertionError):
+            _assert_in_place_relationships([p, c])
+
+
+class TestFirstFitLayoutSolver(BaseLayoutSolverTests, TestCase):
+    solver_class = FirstFitLayoutSolver
+
+    def test_picks_first_gap_not_tightest(self):
+        result = self.solver_class(120, 1).plan_layout(_two_gap_buffers())
+        x_addr = next(b.address for b in result if b.name == "x")
+        self.assertEqual(x_addr, 0)
+
+
+class TestBestFitLayoutSolver(BaseLayoutSolverTests, TestCase):
+    solver_class = BestFitLayoutSolver
+
+    def test_picks_tightest_gap(self):
+        result = self.solver_class(120, 1).plan_layout(_two_gap_buffers())
+        x_addr = next(b.address for b in result if b.name == "x")
+        self.assertEqual(x_addr, 100)
+
+
+class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
+    solver_class = GreedyLayoutSolver
 
 
 if __name__ == "__main__":

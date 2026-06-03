@@ -19,8 +19,9 @@ Covers six areas, each in its own class group:
      TestIterOpSpecs, TestCodegenOpSpecListRoundtrip)
   2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
      (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
-  3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
-     (TestHelpers, TestBuildLoopSchedulerNodes)
+  3. CountedLoopSchedulerNode, build_loop_scheduler_nodes, and
+     _tiled_syms_for_sched_node_at_depth
+     (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestTiledByteStride, TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
@@ -657,12 +658,12 @@ class TestCoarseTile(unittest.TestCase):
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(K1, dims1), (K2, dims2)] works."""
+    """Verify that the nested group format [(hint_id, K1, dims1), ...] works."""
 
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(2), [1])])])
         self.assertEqual(op.loop_group_id, (0, 0))
         self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_tiled_dims, [[0], [1]])
@@ -670,14 +671,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [1])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(2), [1])])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(8), [1])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(8), [1])])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -691,7 +692,7 @@ class TestCoarseTileNested(unittest.TestCase):
             [op0, op1],
             [
                 ([op0], Integer(4)),
-                ([op1], [(Integer(4), [0]), (Integer(2), [1])]),
+                ([op1], [(0, Integer(4), [0]), (0, Integer(2), [1])]),
             ],
         )
         self.assertEqual(op0.loop_group_id, (0,))
@@ -708,7 +709,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_op(data, "op0")
-        coarse_tile([op], [([op], [(Integer(4), [0]), (Integer(2), [0])])])
+        coarse_tile([op], [([op], [(0, Integer(4), [0]), (0, Integer(2), [0])])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_tiled_dims, [[0], [0]])
@@ -1819,6 +1820,44 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
         )
         # Should not raise
         _check_reduction_tiling_safety(op)
+
+
+class TestTiledSymsForSchedNode(unittest.TestCase):
+    """Regression test for _tiled_syms_for_sched_node_at_depth.
+
+    loop_tiled_dims stores host-range indices (e.g. 1 for H in [B=1,H,Lq,D])
+    but the iteration space skips unit-size dims (B=1 dropped), so H is at
+    iteration-space index 0.  The function must map between the two.
+    """
+
+    def test_unit_batch_dim_skipped(self):
+        """[B=1,H=8,Lq=256,D=64] with loop_tiled_dims=[[1]] must return H (c0).
+
+        Without the fix, index 1 is used directly and returns c1 (Lq) instead.
+        """
+        from torch_spyre._inductor.scheduler import _tiled_syms_for_sched_node_at_depth
+        from torch._inductor.scheduler import SchedulerNode
+
+        host_ranges = [1, 8, 256, 64]
+        non_unit = [r for r in host_ranges if r != 1]
+        it_syms = [Symbol(f"c{i}") for i in range(len(non_unit))]
+        it_space = {s: Integer(r) for s, r in zip(it_syms, non_unit)}
+
+        ir_op = MagicMock()
+        ir_op.data.ranges = [Integer(r) for r in host_ranges]
+        ir_op.loop_tiled_dims = [[1]]
+
+        snode = MagicMock(spec=SchedulerNode)
+        snode.node = ir_op
+
+        with patch(
+            "torch_spyre._inductor.scheduler.iteration_space",
+            return_value=it_space,
+        ):
+            result = _tiled_syms_for_sched_node_at_depth(snode, 0)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(str(result[0]), "c0")  # H, not c1 (Lq)
 
 
 if __name__ == "__main__":

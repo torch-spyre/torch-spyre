@@ -8,5 +8,7 @@ shows how to run your first PyTorch model on the Spyre device.
    :maxdepth: 2
 
    how_torch_spyre_works
+   key_concepts
+   glossary
    installation
    quickstart

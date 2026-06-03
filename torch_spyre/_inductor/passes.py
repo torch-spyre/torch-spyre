@@ -35,7 +35,6 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
-    assign_dim_hints,
     hints_to_coarse_tile_groups,
 )
 from . import config
@@ -43,7 +42,7 @@ from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
-from .propagate_named_dims import propagate_named_dims
+from .propagate_named_dims import propagate_named_dims, assign_dim_hints
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -209,7 +208,12 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        return [propagate_mutation_layouts]
+        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
+        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
+        # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
+        # False), so loop groups survive Inductor fusion intact.
+        return [propagate_mutation_layouts, build_loop_scheduler_nodes]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
@@ -222,9 +226,7 @@ class CustomPostFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-        # coarse_tiling=False because no nodes carry loop_group_id attributes.
-        return [memory_planning, build_loop_scheduler_nodes, spyre_fuse_nodes]
+        return [memory_planning, spyre_fuse_nodes]
 
 
 class CustomPreSchedulingPasses(CustomGraphPass):
