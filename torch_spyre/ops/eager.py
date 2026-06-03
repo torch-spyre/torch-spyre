@@ -115,6 +115,8 @@ register_torch_compile_kernel(
         aten.minimum,
         aten.pow,
         aten.linalg_vector_norm,
+        aten.where.self,
+        aten.where.self_out,
         aten.clamp,
         aten.constant_pad_nd,
     ]

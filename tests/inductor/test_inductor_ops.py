@@ -418,14 +418,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [
                     ((256,), (67, 256)),
                 ]
-            )
+            ),
         },
         ("test_add_broadcast_cpu", "test_add_broadcast_cpu"): {
             "param_sets": make_param_dict(
                 [
                     ((256,), (67, 256)),
                 ]
-            )
+            ),
         },
         ("test_addmm", "test_addmm_cpu"): {
             "param_sets": make_param_dict(
@@ -3622,6 +3622,116 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
         },
+        ("test_where_default", "test_where_eager_default_fallback"): {
+            "ops_dict": {"where": torch.where},
+            "param_sets": {
+                "fp16_2d": (cached_randn((10, 10), dtype=torch.float16) > 1,),
+                "fp16_3d": (cached_randn((5, 10, 10), dtype=torch.float16) > 1,),
+            },
+        },
+        ("test_where_self", "test_where_eager"): {
+            "ops_dict": {"where": torch.where},
+            "param_sets": {
+                "fp16_2d": (
+                    cached_randn((10, 10), dtype=torch.float16) > 1,
+                    cached_randn((10, 10), dtype=torch.float16),
+                    cached_randn((10, 10), dtype=torch.float16),
+                ),
+                "fp16_3d": (
+                    cached_randn((5, 10, 10), dtype=torch.float16) > 1,
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                ),
+                "fp16_broadcast": (
+                    cached_randn((10,), dtype=torch.float16) > 1,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    cached_randn((5, 10), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_where_scalarother", "test_where_eager"): {
+            "ops_dict": {"where": torch.where},
+            "param_sets": {
+                "fp16_2d": (
+                    cached_randn((10, 10), dtype=torch.float16) > 1,
+                    cached_randn((10, 10), dtype=torch.float16),
+                    0,
+                ),
+                "fp16_3d": (
+                    cached_randn((5, 10, 10), dtype=torch.float16) > 1,
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                    0,
+                ),
+                "fp16_broadcast": (
+                    cached_randn((10,), dtype=torch.float16) > 1,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    0,
+                ),
+            },
+        },
+        ("test_where_scalarself", "test_where_eager"): {
+            "ops_dict": {"where": torch.where},
+            "param_sets": {
+                "fp16_2d": (
+                    cached_randn((10, 10), dtype=torch.float16) > 1,
+                    0,
+                    cached_randn((10, 10), dtype=torch.float16),
+                ),
+                "fp16_3d": (
+                    cached_randn((5, 10, 10), dtype=torch.float16) > 1,
+                    0,
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                ),
+                "fp16_broadcast": (
+                    cached_randn((10,), dtype=torch.float16) > 1,
+                    0,
+                    cached_randn((5, 10), dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_where_scalar", "test_where_eager_scalar"): {
+            "ops_dict": {"where": torch.where},
+            "param_sets": {
+                "fp16_2d": (
+                    cached_randn((10, 10), dtype=torch.float16) > 1,
+                    0,
+                    0,
+                ),
+                "fp16_3d": (
+                    cached_randn((5, 10, 10), dtype=torch.float16) > 1,
+                    0,
+                    0,
+                ),
+                "fp16_broadcast": (
+                    cached_randn((10,), dtype=torch.float16) > 1,
+                    0,
+                    0,
+                ),
+            },
+        },
+        ("test_where_self_out", "test_where_eager_selfout"): {
+            "ops_dict": {"where": torch.where},
+            "param_sets": {
+                "fp16_2d": (
+                    cached_randn((10, 10), dtype=torch.float16) > 1,
+                    cached_randn((10, 10), dtype=torch.float16),
+                    cached_randn((10, 10), dtype=torch.float16),
+                    cached_randn((10, 10), dtype=torch.float16),
+                ),
+                "fp16_3d": (
+                    cached_randn((5, 10, 10), dtype=torch.float16) > 1,
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                    cached_randn((5, 10, 10), dtype=torch.float16),
+                ),
+                "fp16_broadcast": (
+                    cached_randn((10,), dtype=torch.float16) > 1,
+                    cached_randn((5, 10), dtype=torch.float16),
+                    cached_randn((5, 10), dtype=torch.float16),
+                    cached_randn((5, 10), dtype=torch.float16),
+                ),
+            },
+        },
         ("test_to_dtype_op_map", "test_to_dtype_op_map"): {
             "param_sets": TO_DTYPE_OP_MAP_PARAMS_SETS,
         },
@@ -4883,6 +4993,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_min_eager(self, op, dim: int, keepdim: bool, x):
         self.compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim)[0], x)
+
+    def test_where_eager_default_fallback(self, op, condition):
+        self.compare_with_cpu(lambda condition: op(condition), condition)
+
+    def test_where_eager(self, op, condition, x, y):
+        self.compare_with_cpu(
+            lambda condition, x, y: op(condition, x, y), condition, x, y
+        )
+
+    def test_where_eager_scalar(self, op, condition, x, y):
+        x = torch.tensor(x, dtype=torch.float16)
+        y = torch.tensor(y, dtype=torch.float16)
+        self.compare_with_cpu(
+            lambda condition, x, y: op(condition, x, y), condition, x, y
+        )
+
+    def test_where_eager_selfout(self, op, condition, x, y, z):
+        self.compare_with_cpu(
+            lambda condition, x, y, z: op(condition, x, y, out=z), condition, x, y, z
+        )
 
     def test_attn_qkv_paths(self, q, k, v):
         # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
