@@ -685,9 +685,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
+        _name_tensor_dims(x, ["B", "D"])
 
         def softmax_fn(x):
-            _name_tensor_dims(x, ["B", "D"])
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 max_val = x.amax(dim=-1, keepdim=True)
                 x_shifted = x - max_val
