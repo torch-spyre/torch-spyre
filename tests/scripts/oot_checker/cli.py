@@ -86,17 +86,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ------- Behaviour flags -------
-    p.add_argument(
-        "--fail-on-problems",
-        action="store_true",
-        default=False,
-        help=(
-            "Exit with code 1 if any duplicates or missing tests are found. "
-            "Dead patterns are warnings and do not affect the exit code."
-        ),
-    )
-
     return p
 
 
@@ -127,7 +116,7 @@ def main() -> None:
             config_files=paths,
             test_file=args.test_file,
             test_root=test_root,
-            fail_on_problems=args.fail_on_problems,
+            fail_on_problems=True,
         )
     )
 
