@@ -90,7 +90,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -132,7 +131,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -192,7 +190,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -251,7 +248,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -333,7 +329,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": True,
             "lx_planning": True,
@@ -397,7 +392,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "unroll_loops": True,
             "sencores": 1,
             "lx_planning": True,
@@ -444,7 +438,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -525,7 +518,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -573,7 +565,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -624,7 +615,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -675,7 +665,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -729,7 +718,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -755,7 +743,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Matmul with row-tiling: tile the M dimension of x @ y
     # ------------------------------------------------------------------
 
-    @config.patch({"coarse_tiling": True})
     def test_hint_matmul_row_tiling(self):
         """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension."""
         from torch_spyre._inductor import spyre_hint
@@ -778,7 +765,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
-    @config.patch({"coarse_tiling": True})
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) and Lk (2 slices) via nested spyre_hints."""
         import math
@@ -846,7 +832,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @config.patch({"coarse_tiling": True})
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
@@ -898,7 +883,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -938,7 +922,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
