@@ -132,6 +132,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
           - name: Inductor Codegen
             config: torch_spyre_tests/inductor/test_codegen_config.yaml
+          - name: Inductor Copy Back Elision
+            config: torch_spyre_tests/inductor/test_copy_back_elision_config.yaml
           - name: Inductor Decomp
             config: torch_spyre_tests/inductor/test_decomp_config.yaml
           - name: Inductor FX Passes
