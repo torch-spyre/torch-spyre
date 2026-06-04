@@ -728,7 +728,9 @@ class CpuMoveEdits(BaseModel):
     works for assertEqual.
     """
 
-    functions: List[str] = []  # List of method names to override (e.g., ["assertEqual"])
+    functions: List[
+        str
+    ] = []  # List of method names to override (e.g., ["assertEqual"])
 
 
 class TestEdits(BaseModel):

@@ -35,7 +35,6 @@ test_suite_config:
       - name: sub
       - name: gcd
         # force_xfail: true
-    
     # Global CPU move configuration - applies to all tests
     cpu_move:
       functions:
