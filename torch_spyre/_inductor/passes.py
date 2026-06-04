@@ -265,12 +265,15 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         dedup_and_promote_constants(operations)
 
         # Working Set Reduction
+        if config.chunk_large_tensors:
+            # TODO: chunk_large_tensors needs to be integrated with hint-based working set reduction
+            chunk_large_tensors(operations)
+
         propagate_named_dims(operations)
         assign_dim_hints(operations)
         groups = hints_to_coarse_tile_groups(operations)
-        if config.chunk_large_tensors:
-            chunk_large_tensors(operations)
-        coarse_tile(operations, groups=groups)
+        if groups:
+            coarse_tile(operations, groups=groups)
 
         # Core Division and Scratchpad Allocation
         span_reduction(operations)
