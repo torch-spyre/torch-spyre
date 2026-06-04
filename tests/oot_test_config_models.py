@@ -720,24 +720,33 @@ class DtypesEdits(BaseModel):
         }
 
 
-class CpuMoveEdits(BaseModel):
-    """Per-test CPU move configuration for moving tensor arguments to CPU.
+class FunctionItem(BaseModel):
+    """A single function entry for function modification."""
 
-    This allows specific test class methods to have their tensor arguments
-    automatically moved to CPU before comparison, similar to how CpuMixin
-    works for assertEqual.
+    name: str  # Method name (e.g., "assertEqual")
+    description: Optional[str] = None  # Optional description
+
+
+class FunctionsEdits(BaseModel):
+    """Per-test function modification configuration.
+
+    Container for all function-level modifications. cpu_move is a list of
+    function names that will have their tensor arguments moved to CPU.
+    Extensible for future functionality.
     """
 
-    functions: List[
-        str
-    ] = []  # List of method names to override (e.g., ["assertEqual"])
+    cpu_move: List[FunctionItem] = []
+
+    def resolved_cpu_move_functions(self) -> List[str]:
+        """Return list of function names to patch with CPU move."""
+        return [item.name for item in self.cpu_move]
 
 
 class TestEdits(BaseModel):
     ops: OpsEdits = OpsEdits()
     dtypes: DtypesEdits = DtypesEdits()
     modules: ModulesEdits = ModulesEdits()
-    cpu_move: CpuMoveEdits = CpuMoveEdits()
+    functions: FunctionsEdits = FunctionsEdits()
 
 
 class TestEntry(BaseModel):
@@ -939,7 +948,6 @@ class GlobalConfig(BaseModel):
     supported_ops: Optional[List[SupportedOpConfig]] = None
     supported_modules: Optional[List[SupportedModuleConfig]] = None
     input_config: InputConfig = InputConfig()
-    cpu_move: CpuMoveEdits = CpuMoveEdits()  # Global CPU move config
 
     @field_validator("supported_dtypes", mode="before")
     @classmethod
