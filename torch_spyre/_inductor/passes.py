@@ -213,7 +213,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
 
     def get_passes(self):
         # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
         # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
         # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
         # False), so loop groups survive Inductor fusion intact.
@@ -264,9 +264,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             chunk_large_tensors(operations)
         propagate_named_dims(operations)
         assign_dim_hints(operations)
-        if config.coarse_tiling:
-            groups = hints_to_coarse_tile_groups(operations)
-            coarse_tile(operations, groups=groups)
+        groups = hints_to_coarse_tile_groups(operations)
+        coarse_tile(operations, groups=groups)
         span_reduction(operations)
         cost_model_ops = cost_model_matmul_division(operations)
         work_distribution(operations, cost_model_ops)
