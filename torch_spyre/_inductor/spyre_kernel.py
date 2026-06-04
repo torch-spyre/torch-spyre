@@ -33,6 +33,7 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
     IDENTITY_OP,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
@@ -427,6 +428,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
+                or arg.device_dtype == DataFormats.SEN143_FP8
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 
@@ -598,7 +600,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op == BATCH_MATMUL_OP:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
