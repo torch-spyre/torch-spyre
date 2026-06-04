@@ -92,8 +92,6 @@ logger = get_inductor_logger("coarse_tile")
 def coarse_tile(
     operations: list[Operation],
     groups: list[tuple],
-    *,
-    tiled_dims: list[int] | None = None,
 ) -> None:
     """Stamp loop_group_id / loop_count on operations and scale their ranges.
 
@@ -104,17 +102,12 @@ def coarse_tile(
         CustomPreSchedulingPasses).  Modified in-place when
         insert_tiling_propagation inserts new buffer/copy ops.
     groups:
-        Sequence of ``(ops, spec[, tiled_dims])`` tuples.  ``spec`` is either:
-
-        * A scalar ``loop_count`` (with optional third element ``tiled_dims``)
-          for a flat single-level loop — tile all ops in ``ops`` by that count.
-        * A list of ``(hint_id, loop_count, tiled_dims)`` triples for nested
-          loops — outermost first.  The ops end up in the innermost loop body;
-          each level's count and dims are stamped on the op and the
-          corresponding iteration ranges are divided.
-    tiled_dims:
-        Default ``tiled_dims`` for flat groups that do not supply their own.
-        ``None`` means tile only dimension 0.  Ignored for nested-spec groups.
+        Sequence of ``(ops, spec)`` tuples produced by
+        ``hints_to_coarse_tile_groups``.  ``spec`` is a list of
+        ``(hint_id, loop_count, tiled_dims)`` triples for nested loops —
+        outermost first.  The ops end up in the innermost loop body; each
+        level's count and dims are stamped on the op and the corresponding
+        iteration ranges are divided.
     """
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
@@ -122,17 +115,8 @@ def coarse_tile(
 
     for group_idx, group in enumerate(groups):
         group_ops = group[0]
-        spec = group[1]
+        levels: list[tuple[int, Expr, list[int]]] = group[1]
         group_id: tuple[int, ...] = (group_idx,)
-
-        if isinstance(spec, list):
-            # Nested spec: list of (hint_id, loop_count, tiled_dims) triples.
-            levels: list[tuple[int, Expr, list[int]]] = spec
-        else:
-            # Flat spec: scalar loop_count with optional tiled_dims override.
-            flat_tiled = group[2] if len(group) > 2 else tiled_dims
-            effective_dims: list[int] = [0] if flat_tiled is None else flat_tiled
-            levels = [(0, spec, effective_dims)]
 
         _stamp_group(group_ops, group_id, levels, op_to_position)
 
@@ -603,13 +587,10 @@ def _stamp_group(
             )
             continue
 
-        # Two ways to drive coarse tiling: (1) a config-supplied groups function
-        # that assigns the same dims to every op in the group, and (2) spyre_hint
-        # annotations where each op carries its own dim_hints with per-op
-        # dim_index values (ops in the same group can have different iteration
-        # spaces, e.g. a broadcast op may lack the tiled dimension entirely).
-        # Use the op's own dim_index when dim_hints are present; fall back to
-        # spec_dims otherwise, or when the op has no matching dim for a level.
+        # Each op carries its own dim_hints with per-op dim_index values (ops in
+        # the same group can have different iteration spaces, e.g. a broadcast op
+        # may lack the tiled dimension entirely).  Use the op's own dim_index;
+        # fall back to empty when the op has no matching dim for a level.
         op_hints = getattr(op, "dim_hints", [])
         hint_id_to_dim_index: dict[int, int] = {
             h.hint_id: h.dim_index
@@ -618,10 +599,8 @@ def _stamp_group(
         }
         op_tiled_dims: list[list[int]] = []
         for hint_id, count, spec_dims in levels:
-            dim_index = hint_id_to_dim_index.get(hint_id) if op_hints else None
-            if not op_hints:
-                effective = spec_dims  # flat/legacy: no dim_hints, use spec directly
-            elif dim_index is not None:
+            dim_index = hint_id_to_dim_index.get(hint_id)
+            if dim_index is not None:
                 effective = [dim_index]  # use this op's own dim_index
             else:
                 effective = []  # op has no dim for this level — loop-invariant
