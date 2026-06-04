@@ -17,6 +17,7 @@ import sympy
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_spyre._inductor.views import compute_coordinates
+from torch.utils._sympy.functions import ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
 
@@ -43,6 +44,24 @@ class TestCoordinates(TestCase):
             4096 * p0 + p1,
         )
         self.assertEqual(cx, [p0 // 256, p0 % 256, p1])
+
+        # B, S, E -> B*S, E (explicit Mod in index)
+        cx = compute_coordinates(
+            [2, 256, 4096],
+            [1048576, 4096, 1],
+            {p0: 512, p1: 4096},
+            4096 * (p0 % 256) + p1,
+        )
+        self.assertEqual(cx, [0, p0 % 256, p1])
+
+        # B, S, E -> B*S, E (via ModularIndexing)
+        cx = compute_coordinates(
+            [2, 256, 4096],
+            [1048576, 4096, 1],
+            {p0: 512, p1: 4096},
+            4096 * ModularIndexing(p0, 1, 256) + p1,
+        )
+        self.assertEqual(cx, [0, p0 % 256, p1])
 
         # dim of size 1 with stride>0
         cx = compute_coordinates(

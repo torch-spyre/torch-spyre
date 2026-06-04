@@ -6,9 +6,6 @@ Pydantic models for the OOT PyTorch test framework YAML config.
 Used by oot_test_parsing.py to validate and parse the YAML config.
 """
 
-import ast
-import regex as re
-import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
@@ -25,6 +22,11 @@ from oot_test_constants import (
     REL_PATH_TOKENS,
 )
 from oot_test_matching import parse_dtype
+from oot_test_utilities import (
+    _eval_py_literal,
+    _resolve_dtype_str,
+    _resolve_tensor_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,112 +70,6 @@ _VALID_INIT_STRATEGIES = {
 _VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
 
 _VALID_UNLISTED_MODES = {"skip", "xfail", "xfail_strict", "mandatory_success"}
-
-# ---------------------------------------------------------------------------
-# Python literal evaluator — shared by InputArgPy and InputsEdits
-# ---------------------------------------------------------------------------
-
-_PY_ALLOWED_NODES = {
-    ast.Expression,
-    ast.Constant,
-    ast.Tuple,
-    ast.List,
-    ast.Name,
-    ast.Call,
-    ast.Load,
-    ast.UnaryOp,
-    ast.USub,
-    ast.UAdd,
-}
-_PY_ALLOWED_NAMES: Dict[str, Any] = {
-    "None": None,
-    "Ellipsis": Ellipsis,
-    "slice": slice,
-    "inf": float("inf"),
-    "nan": float("nan"),
-}
-
-_TOKEN_RE = re.compile(r"\$\{([^}]+)\}")
-
-
-def _eval_py_literal(expr: str) -> Any:
-    """Safely evaluate a restricted Python literal (slice, tuple, Ellipsis, etc.)."""
-    node = ast.parse(expr, mode="eval")
-    for n in ast.walk(node):
-        if type(n) not in _PY_ALLOWED_NODES:
-            raise ValueError(
-                f"Node type {type(n).__name__!r} not allowed in py: {expr!r}"
-            )
-        if isinstance(n, ast.Call):
-            if not (isinstance(n.func, ast.Name) and n.func.id == "slice"):
-                raise ValueError(f"Only slice(...) calls are allowed in py: {expr!r}")
-        if isinstance(n, ast.Name) and n.id not in _PY_ALLOWED_NAMES:
-            raise ValueError(f"Name {n.id!r} not allowed in py: {expr!r}")
-    return eval(compile(node, "<py>", "eval"), {"__builtins__": {}}, _PY_ALLOWED_NAMES)
-
-
-# ---------------------------------------------------------------------------
-# Dtype resolution using DTYPE_STR_MAP
-# ---------------------------------------------------------------------------
-
-
-def _resolve_dtype_str(spec: str) -> torch.dtype:
-    """Resolve a dtype string using DTYPE_STR_MAP. Accepts 'float16' or 'torch.float16'."""
-    bare = spec.removeprefix("torch.")
-    if bare in DTYPE_STR_MAP:
-        return DTYPE_STR_MAP[bare]
-    try:
-        return parse_dtype(bare)
-    except ValueError:
-        pass
-    raise ValueError(
-        f"Unsupported dtype: {spec!r}. "
-        f"Supported aliases: {sorted(DTYPE_STR_MAP)} and torch.<dtype>"
-    )
-
-
-def _resolve_tensor_path(raw_path: str) -> str:
-    """Expand ``${TOKEN}`` placeholders in a tensor init_args.path and return
-    an absolute path.
-
-    Resolution order:
-    1. Replace every ``${TOKEN}`` using the env-var declared in REL_PATH_TOKENS.
-    2. If the result is already absolute, return it.
-    3. Otherwise resolve relative to the process working directory.
-
-    Raises:
-        ValueError:      Unknown token or its env-var is unset.
-        FileNotFoundError: Resolved path does not exist on disk.
-    """
-    token_map: dict[str, str] = {
-        tok.strip("${}") if tok.startswith("${") else tok: env_var
-        for tok, env_var in REL_PATH_TOKENS
-    }
-
-    def _replace(m: re.Match) -> str:
-        name = m.group(1)
-        if name not in token_map:
-            raise ValueError(
-                f"Unknown path token '${{{name}}}' in init_args.path={raw_path!r}. "
-                f"Known tokens: {sorted(token_map)}"
-            )
-        value = os.environ.get(token_map[name])
-        if value is None:
-            raise ValueError(
-                f"Environment variable '{token_map[name]}' (for token '${{{name}}}') "
-                f"is not set. Export it before running tests."
-            )
-        return value
-
-    expanded = _TOKEN_RE.sub(_replace, raw_path)
-    resolved = str(Path(expanded).resolve())
-
-    if not Path(resolved).exists():
-        raise FileNotFoundError(
-            f"Tensor file not found: {resolved!r}  (from init_args.path={raw_path!r})"
-        )
-    return resolved
-
 
 # ---------------------------
 # edits.inputs models
@@ -408,7 +304,7 @@ class InputTensorSpec(BaseModel):
 
             t = torch.from_numpy(np.load(path))
         elif path.endswith(".safetensors"):
-            from safetensors.torch import load_file
+            from safetensors.torch import load_file  # type: ignore
 
             tensors = load_file(path)
             if ia.key is None:

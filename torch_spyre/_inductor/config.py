@@ -14,7 +14,7 @@
 
 import os
 import sys
-from typing import Callable, Literal, Optional
+from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
@@ -32,14 +32,10 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
-# k_fast: a two-layer optimisation for K-split matmul work-divisions.
-#   Layer 1 (planner, core_division.py): picks (1, n, k>1) over pure-M
-#     for narrow-N small-M matmul shapes that would otherwise leave the
-#     PT array under-utilised.
-#   Layer 2 (SDSC emitter, codegen/compute_ops.py): permutes physical
-#     core IDs so K-collaborators land on adjacent ring positions,
-#     reducing PSUM chain hops from m*n to 1.
-# Set SPYRE_CORE_ID_K_FAST_EMISSION=0 to disable both layers.
+# For K-split matmuls, permute physical core IDs so the cores collaborating on a
+# K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
+# to 1. The split itself is chosen by the cost-model planner; this only reorders
+# cores at SDSC emission. Set SPYRE_CORE_ID_K_FAST_EMISSION=0 to disable.
 core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
@@ -56,19 +52,6 @@ bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
 # (used with bundle_hbm_symbols=True for the scf.for / affine.apply path).
 unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
-
-# Optional callable injected by callers to compute coarse-tiling groups.
-# Signature: (list[Operation]) -> list[tuple[list[Operation], sympy.Expr[, list[int]]]]
-# Each tuple is (ops, loop_count) or (ops, loop_count, tiled_dims).
-# tiled_dims overrides the default per-group (None = tile outermost dim only).
-# When None and coarse_tiling is True, groups are derived from spyre_hint
-# annotations via hints_to_coarse_tile_groups (a no-op if no hints are present).
-# When set, this callable overrides the hint-derived groups entirely.
-# Must be a module-level named function (not a lambda) for Inductor cache pickling.
-# This is intended to be used for interim testing of the coarse-tiling transformation
-# until the working set reduction annotation framework is being developed.
-# It will be removed once the full-fledged annotation mechanism is available.
-coarse_tiling_groups_fn: Optional[Callable] = None
 
 # Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
 # Options:
