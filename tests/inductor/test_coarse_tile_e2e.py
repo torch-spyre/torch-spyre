@@ -883,5 +883,93 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
 
 
+class TestNamedDimsHint(InductorTestCase):
+    """Tests for propagate_named_dims handling of ops with a named_dims hint.
+
+    torch.full and torch.empty lower to ops whose loop variables carry no
+    named-dim information from their inputs.  The new hint path allows
+    spyre_hint(named_dims=[...]) to supply the named-dim mapping directly,
+    enabling coarse tiling to work on these ops.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_full_with_named_dims_hint_tiles(self):
+        """spyre_hint(named_dims=[...]) on torch.full enables coarse tiling.
+
+        Without the hint, torch.full has no named-dim mapping and coarse tiling
+        cannot apply.  With named_dims supplied via the hint, propagate_named_dims
+        should set _dim_prop_info correctly so assign_dim_hints produces a
+        DimHint and LoopSpec appears in the generated source.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+
+        def fn(x):
+            with spyre_hint(slices={"M": 4}, named_dims=["M", "K"]):
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+            return x + bias
+
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+
+    @config.patch(
+        {
+            "coarse_tiling": True,
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_full_like_with_named_dims_hint_tiles(self):
+        """spyre_hint(named_dims=[...]) on torch.full_like enables coarse tiling."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 128, 64
+
+        def fn(x):
+            with spyre_hint(slices={"M": 2}, named_dims=["M", "K"]):
+                buf = torch.full_like(x, 2.0)
+            return x + buf
+
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('2')", src, "Expected loop count 2")
+
+
 if __name__ == "__main__":
     unittest.main()
