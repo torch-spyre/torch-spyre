@@ -339,7 +339,6 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
-            # mb_sym is a virtual spatial dim, not a reduction — exclude it here.
             reduced_dims = [
                 d for d in op_dim_order if d not in dim_order and d is not mb_sym
             ]
@@ -382,12 +381,8 @@ def _create_sdsc_tensors(
 
             max_dim_sizes[dim] = -1
 
-        # mb_sym has no physical device dimension (the tensor is truly 1D), so
-        # it cannot be processed by the normal stride loop above.  Prepend it
-        # to dim_order here so that _get_layout_label sees the complete order,
-        # and set its stride to the total 1-D allocation size (one virtual row
-        # that spans the whole tensor).
         if mb_sym is not None:
+            # Virtual dim with no physical device dimension; stride = full 1-D allocation size.
             dim_order = [mb_sym] + dim_order
             scales[mb_sym] = 1
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
@@ -573,12 +568,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # SDSC dtype ops require at least one outer spatial dim beyond the stick.
-    # When all op_dim_order symbols collapse into op_stick_dim (empty list for the
-    # stale-layout case, or a singleton [out_sym] where out_sym IS op_stick_dim
-    # for a genuine 1D tensor), no outer dim exists.  Inject a virtual mb=1 row
-    # so SDSC sees {mb: 1, out: N} instead of {out: N}.  mb_sym is forwarded to
-    # _create_sdsc_tensors which handles its stride/scale/offset directly.
+    # SDSC requires at least one outer spatial dim; inject a virtual mb=1 row
+    # for 1-D dtype ops that have only the stick dim.
     mb_sym: Symbol | None = None
     if (
         DtypeOpTable.is_dtype_op(op_spec.op)
