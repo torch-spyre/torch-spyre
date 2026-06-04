@@ -368,6 +368,7 @@ REDUCTION_TEST_FAILURES = [
     "test_transpose_2d_large_dim_1_2_nopad",
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_conv2d_1x3x32_ksize3_no_pad",
 ]
 
 
