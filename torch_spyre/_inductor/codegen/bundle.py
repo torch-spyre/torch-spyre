@@ -133,12 +133,24 @@ def generate_bundle(
 
     # Determine whether a pool parameter is needed (any pool symbol present).
     has_pool = symbolic_args and use_symbols and any(sk.is_pool for sk in symbol_kinds)
-    # Indices of kernel-base symbols (one per kernel tensor arg; become input_arg params).
-    kernel_arg_sym_indices = (
-        [i for i, sk in enumerate(symbol_kinds) if sk.kind == "kernel"]
-        if symbolic_args and use_symbols
-        else []
-    )
+    # Indices of kernel-base symbols that become input_arg parameters.
+    # Deduplicated by address value: multiple SDSCs may register the same kernel arg
+    # address independently (no cross-SDSC dedup in generate_sdsc), so we keep only
+    # the first sym_idx for each unique address and map subsequent duplicates to it.
+    # kernel_arg_sym_indices: list of sym_idx values, one per unique kernel arg address.
+    # kernel_dup_canonical: maps duplicate kernel sym_idx → canonical sym_idx.
+    kernel_arg_sym_indices: list[int] = []
+    kernel_dup_canonical: dict[int, int] = {}  # duplicate sym_idx → canonical sym_idx
+    if symbolic_args and use_symbols:
+        seen_kernel_addr: dict[int, int] = {}  # address → canonical sym_idx
+        for i, kind_i in enumerate(symbol_kinds):
+            if kind_i.kind == "kernel":
+                addr = symbols[i]
+                if addr not in seen_kernel_addr:
+                    seen_kernel_addr[addr] = i
+                    kernel_arg_sym_indices.append(i)
+                else:
+                    kernel_dup_canonical[i] = seen_kernel_addr[addr]
 
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
@@ -192,13 +204,23 @@ def generate_bundle(
         #   - "pool"            → arith.addi %pool_extracted, <pool_offset>
         #                         deduped by pool offset value
         #   - anything else     → arith.constant (use_symbols=False or non-symbolic path)
-        kernel_arg_sym_set = set(kernel_arg_sym_indices)
+        # All kernel sym indices to skip during emission (canonical + duplicates).
+        kernel_arg_sym_set = set(kernel_arg_sym_indices) | set(kernel_dup_canonical)
         # Map kernel base sym_idx → positional parameter index (1-based name suffix).
+        # Duplicate kernel sym indices map to the same pos as their canonical.
         kernel_base_to_pos: dict[int, int] = {
             sym_idx: pos + 1 for pos, sym_idx in enumerate(kernel_arg_sym_indices)
         }
+        for dup_idx, canon_idx in kernel_dup_canonical.items():
+            if canon_idx in kernel_base_to_pos:
+                kernel_base_to_pos[dup_idx] = kernel_base_to_pos[canon_idx]
         # sym_canonical[sym_idx] → canonical SSA name for derived/pool symbols (deduped).
-        sym_canonical: dict[int, str] = {}
+        # Also pre-populate with duplicate kernel symbols pointing to their canonical name.
+        sym_canonical: dict[int, str] = {
+            dup_idx: f"%sym_0_{kernel_base_to_pos[dup_idx]}_extracted"
+            for dup_idx in kernel_dup_canonical
+            if dup_idx in kernel_base_to_pos
+        }
         # derived_addi_emitted[(base_param_pos, offset)] → SSA name already emitted
         derived_addi_emitted: dict[tuple[int, int], str] = {}
         # pool_addi_emitted[pool_offset_value] → SSA name already emitted
@@ -206,8 +228,8 @@ def generate_bundle(
 
         for sym_idx, value in enumerate(symbols):
             if sym_idx in kernel_arg_sym_set:
-                continue  # replaced by function parameter + extract op
-            sk = symbol_kinds[sym_idx] if symbol_kinds else None
+                continue  # replaced by function parameter + extract op (or duplicate)
+            sk: SymbolKind | None = symbol_kinds[sym_idx] if symbol_kinds else None
             if sk is not None and sk.is_derived:
                 base_pos = kernel_base_to_pos.get(sk.base_sym_idx)
                 if base_pos is not None:

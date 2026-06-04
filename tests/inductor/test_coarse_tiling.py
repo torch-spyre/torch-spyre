@@ -2068,21 +2068,47 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         mlir = self._bundle([op0] + ops_rest, symbolic_args=True, fake_compile=fake)
 
-        # All 12 HBM symbols become input_arg parameters (kernel args)
+        # Symbols with the same address are deduped: 12 symbols → 6 unique params
+        # (sym_values has many repeats: 0x400000000, 0x800000000, 0x0, 0xC00000000,
+        #  0x1000000000, 0x1400000000 are the 6 distinct values)
         self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
-        self.assertIn("%sym_0_2: !sdscbundle.input_arg<index>", mlir)
-        self.assertIn("%sym_0_12: !sdscbundle.input_arg<index>", mlir)
-        # Extract ops for all params
-        self.assertIn("%sym_0_1_extracted = sdscbundle.input_arg_extract", mlir)
-        self.assertIn("%sym_0_2_extracted = sdscbundle.input_arg_extract", mlir)
+        self.assertIn("%sym_0_6: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%sym_0_7:", mlir)
         # First sdsc_execute uses first two extracted names
         self.assertIn(
             "sdscbundle.sdsc_execute (%sym_0_1_extracted, %sym_0_2_extracted)", mlir
         )
-        # No arith.constant for any symbol (all are input_arg params)
+        # Duplicate addresses reuse existing extracted SSA names
         self.assertNotIn("arith.constant", mlir)
-        # No pool parameter
         self.assertNotIn("%pool:", mlir)
+
+    def test_same_kernel_arg_across_sdsc_deduped(self):
+        """The same kernel arg address appearing in two SDSCs maps to one input_arg param."""
+        # Simulates softmax: arg_index=0 appears in both op0 and op1.
+        a = _make_minimal_op_spec("a")
+        b = _make_minimal_op_spec("b")
+        base = 0x400000000  # SEGMENT_OFFSETS[1], arg_index=0
+        call_count = [0]
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            call_count[0] += 1
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(base)
+            return _make_tiled_json(idx, sym_id), [base], [{}], [SymbolKind.kernel()]
+
+        mlir = self._bundle([a, b], symbolic_args=True, fake_compile=fake)
+
+        # Only one input_arg param (deduped cross-SDSC)
+        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%sym_0_2:", mlir)
+        # Both sdsc_execute ops reference the same extracted name
+        execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
+        self.assertEqual(
+            execute_lines[0].split("(")[1].split(")")[0], "%sym_0_1_extracted"
+        )
+        self.assertEqual(
+            execute_lines[1].split("(")[1].split(")")[0], "%sym_0_1_extracted"
+        )
 
     def test_pool_offset_constants_deduped(self):
         """Pool symbols with the same offset share one arith.addi SSA variable."""
