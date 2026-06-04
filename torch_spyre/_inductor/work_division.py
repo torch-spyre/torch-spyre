@@ -545,6 +545,47 @@ def span_reduction_pass(
         )
 
 
+def _default_split(
+    it_space_adjusted: dict[Symbol, Expr],
+    output_td: TensorDep,
+    committed_splits: dict[Symbol, int],
+    max_cores: int,
+) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
+    """Distribute max_cores by priority on top of span_reduction's commits.
+
+    Returns the chosen splits and the (output, reduction) priority dims the
+    caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
+    """
+    # TODO: The final dim committed by span_reduction_pass holds the minimum
+    #       split that gets the span under the limit, so it may have headroom
+    #       for additional parallelism (outer dims committed before it are
+    #       already maximally split and have no headroom). Excluding it here
+    #       leaves that parallelism on the table when other dims can't absorb
+    #       the remaining cores.
+    it_space_remaining = {
+        s: e for s, e in it_space_adjusted.items() if s not in committed_splits
+    }
+    output_dims, reduction_dims = prioritize_dimensions(output_td, it_space_remaining)
+
+    # If span_reduction_pass already committed a reduction split, suppress further
+    # reduction splitting so the final result never exceeds one reduction dim split.
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    if any(v not in coord_vars for v in committed_splits):
+        reduction_dims = []
+
+    # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
+    # accounts for committed_splits in its first pass, consuming those cores
+    # itself before distributing the rest by priority.
+    splits = multi_dim_iteration_space_split(
+        it_space_adjusted,
+        max_cores,
+        output_dims,
+        reduction_dims,
+        committed_splits,
+    )
+    return splits, output_dims, reduction_dims
+
+
 def work_distribution_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -577,32 +618,8 @@ def work_distribution_pass(
     # dims with actual committed splits so they don't overlap with priorities.
     committed_splits = {s: v for s, v in min_splits.items() if v > 1}
 
-    # TODO: The final dim committed by span_reduction_pass holds the minimum
-    #       split that gets the span under the limit, so it may have headroom
-    #       for additional parallelism (outer dims committed before it are
-    #       already maximally split and have no headroom). Excluding it here
-    #       leaves that parallelism on the table when other dims can't absorb
-    #       the remaining cores.
-    it_space_remaining = {
-        s: e for s, e in it_space_adjusted.items() if s not in committed_splits
-    }
-    output_dims, reduction_dims = prioritize_dimensions(output_td, it_space_remaining)
-
-    # If span_reduction_pass already committed a reduction split, suppress further
-    # reduction splitting so the final result never exceeds one reduction dim split.
-    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    if any(v not in coord_vars for v in committed_splits):
-        reduction_dims = []
-
-    # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
-    # accounts for committed_splits in its first pass, consuming those cores
-    # itself before distributing the rest by priority.
-    splits = multi_dim_iteration_space_split(
-        it_space_adjusted,
-        max_cores,
-        output_dims,
-        reduction_dims,
-        committed_splits,
+    splits, output_dims, reduction_dims = _default_split(
+        it_space_adjusted, output_td, committed_splits, max_cores
     )
 
     apply_splits(op, splits, output_td)
@@ -620,91 +637,188 @@ def work_distribution_pass(
 
 _PT_ROWS = 8  # PT block rows per corelet
 
+# Constants for the matmul cost model (_matmul_split_cost). Each is either an
+# AIU hardware limit or a coefficient fit to measured device kernel times.
+_TARGET_PT_PASSES = 8  # per-core M that keeps the PT pipeline full = this * _PT_ROWS
+_M_MIN = _PT_ROWS // 2  # below half a PT pass an m-split buys nothing
+_PEAK_MACS_US_CORE = (98.304e12 / 2 / 32) / 1e6  # DL16 peak / 32 cores, MACs/us/core
+_HBM_BW_GBS = 204.8  # LPDDR5 aggregate peak bandwidth
+_DTYPE_BYTES = 2  # fp16
+_PSUM_PER_ELEM_US = 1.4e-4  # per output element, per K-split ring reduction hop
+_COHORT_LIMIT = 8  # cores sharing a broadcast before it contends for bandwidth
+_BATCH_SPLIT_EXPONENT = 1.4  # batch-split cost grows ~ b ** this (fit to bmm sweeps)
+_TARGET_M_PENALTY_US = 50.0  # tie-break weight, per log2 step off the target m-split
 
-def _try_k_fast_split(
-    it_space: dict[Symbol, Expr],
-    output_td: TensorDep,
-    min_splits: dict[Symbol, int] | None,
+
+def _matmul_split_cost(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
     max_cores: int,
-) -> dict[Symbol, int] | None:
-    """Propose (1, n_split, k_split>1) for narrow-N small-M matmul shapes.
-
-    Caller (k_fast_division pass) gates on matmul + the feature flag.
-    Range thresholds derived from empirical hardware measurements.
+) -> float:
+    """Estimated kernel time in microseconds for ``[B,M,K]@[B,K,N]`` run with
+    the given core split. Each axis is a ``(size, split)`` pair so a dim's size
+    cannot be paired with another dim's split. Lower is better; inf if infeasible.
     """
-    dims = list(it_space.keys())
-    output_coord_vars = {v for e in output_td.device_coords for v in e.free_symbols}
-    reduction_dims = [d for d in dims if d not in output_coord_vars]
-    # k_fast emits an (m, n, k) split — only matmul's single K dim qualifies.
-    if len(reduction_dims) != 1:
-        return None
-    k_dim = reduction_dims[0]
+    (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    cores_used = b * m * n * k
+    if cores_used == 0 or cores_used > max_cores:
+        return float("inf")
 
-    output_dims = [d for d in dims if d in output_coord_vars]
-    # TODO: 2D matmul only. bmm has a B dim the planner already splits;
-    # folding it into m_dims would waste that lever. Needs a bmm-aware policy.
-    if len(output_dims) != 2:
-        return None
-    # Pick the larger of the two output dims to split across cores; "N" is
-    # convention (for the target shape M < N, max picks the conventional N).
-    n_dim = max(output_dims, key=lambda d: concretize_expr(it_space[d]))
-    m_dims = [d for d in output_dims if d != n_dim]
+    # Compute: per-core MACs over peak, derated when the per-core M tile is too
+    # short to fill the PT pipeline. The PT array streams M in passes of
+    # _PT_ROWS; below _TARGET_PT_PASSES passes its startup/drain overhead is
+    # amortised over too little work, and that overhead grows sub-linearly,
+    # hence the sqrt.
+    m_t = M // m if m else 1
+    pt_passes = max(1.0, m_t / _PT_ROWS)
+    pt_eff = min(1.0, (pt_passes / _TARGET_PT_PASSES) ** 0.5)
+    compute_us = (B * M * N * K / cores_used) / (_PEAK_MACS_US_CORE * pt_eff)
 
-    # k_fast's (1, n, k>1) shape can't sit on top of a split span_reduction
-    # already committed on K or an M dim — skip those.
-    # TODO: A span_reduction commit on K or an M dim is the minimum split that
-    #       gets the span under the limit, not necessarily the final one, so
-    #       cores may still be free after it. Returning None here hands the
-    #       whole op to the default planner instead of applying k_fast within
-    #       the cores span_reduction leaves available, leaving the k_fast
-    #       speedup on the table for those shapes.
-    if min_splits and (k_dim in min_splits or any(d in min_splits for d in m_dims)):
-        return None
+    # HBM: every input operand is broadcast to the cohort of cores splitting the
+    # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
+    # link, so effective bandwidth falls off linearly with cohort size.
+    bytes_total = (B * M * K + B * K * N + B * M * N) * _DTYPE_BYTES
+    cohort_penalty = max(1.0, max(m, n) / _COHORT_LIMIT)
+    hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
 
-    M = math.prod(concretize_expr(it_space[d]) for d in m_dims) if m_dims else 1
-    N = concretize_expr(it_space[n_dim])
-    K = concretize_expr(it_space[k_dim])
+    # PSUM: a K-split spreads the reduction over k cores, costing (k-1) partial-
+    # sum hops around the ring, each touching every output element.
+    psum_us = max(0, k - 1) * (B * M * N) * _PSUM_PER_ELEM_US
 
-    elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
-    # iteration_space carries unpadded element counts; skip ragged N/K
-    # (e.g. N=99) that the k_fast splits can't divide cleanly.
-    if N % elems_per_stick != 0 or K % elems_per_stick != 0:
-        return None
-    n_sticks = N // elems_per_stick
-    k_sticks = K // elems_per_stick
-
-    # The gates below pick shapes where pure-M underfeeds the PT array but
-    # a (1, n, k) split keeps it busy.
-    rows_per_core = M / max_cores
-    # Skip M too small to give one row per core, and M large enough that
-    # pure-M already saturates PT — k_fast wins nothing either way.
-    if rows_per_core < 1 or rows_per_core > 2 * _PT_ROWS:
-        return None
-    # Moderate M with wide N already uses cores well — only apply k_fast
-    # when N is narrow enough that PT is starved.
-    if rows_per_core > _PT_ROWS / 2 and n_sticks >= max_cores:
-        return None
-    # Need enough K to give every core at least one stick after splitting.
-    if k_sticks < max_cores:
-        return None
-
-    # n_split must divide max_cores so k_split = max_cores // n_split is an
-    # integer. Any divisor works — no power-of-2 restriction.
-    candidates = sorted(
-        (int(n) for n in divisors(max_cores) if 1 < n < max_cores), reverse=True
+    # Tie-break: among compute-equivalent splits prefer the m-split that lands
+    # per-core M near the PT sweet spot, penalising log2-distance from it.
+    target_m = max(
+        _M_MIN, min(max_cores // 2, max(1, M // (_TARGET_PT_PASSES * _PT_ROWS)))
     )
-    for n_split in candidates:
-        if n_sticks % n_split != 0:
-            continue
-        k_split = max_cores // n_split
-        if k_sticks < k_split or k_sticks % k_split != 0:
-            continue
-        result: dict[Symbol, int] = {k_dim: k_split, n_dim: n_split}
-        for d in m_dims:
-            result[d] = 1
-        return result
+    target_m_us = abs(math.log2(max(1, m) / target_m)) * _TARGET_M_PENALTY_US
 
-    return None
+    # Splitting batch across cores is strictly worse than tiling it in time on
+    # one core (each item is independent), so charge a super-linear b penalty.
+    batch_penalty = b**_BATCH_SPLIT_EXPONENT
+
+    return (compute_us + hbm_us + psum_us + target_m_us) * batch_penalty
+
+
+def _cost_model_matmul_planner(
+    op: ComputedBuffer,
+    splits: dict[Symbol, int],
+    it_space_adjusted: dict[Symbol, Expr],
+    output_td: TensorDep,
+    stick_vars: dict[Symbol, int],
+    committed_splits: dict[Symbol, int],
+    max_cores: int,
+    input_tds: list[TensorDep],
+) -> dict[Symbol, int]:
+    """Override the default split for a matmul / bmm with the lowest-cost
+    feasible (b, m, n, k) per _matmul_split_cost.
+
+    Returns ``splits`` unchanged for anything this planner does not model:
+    non-matmuls, ops with a span-committed split already in place, multi-K
+    matmuls, or a chosen split that would use fewer cores than the default.
+    """
+    if not isinstance(op.data, Reduction):
+        return splits
+    if op.data.reduction_type != BATCH_MATMUL_OP:
+        return splits
+    if committed_splits:
+        return splits
+
+    # Classify the output coord dims: the stickified one is N, the rest index
+    # rows. Of those row dims, M is the one appearing in a single input (the
+    # LHS); batch dims appear in both.
+    output_coord_vars = {
+        v for e in output_td.device_coords[:-1] for v in e.free_symbols
+    }
+    n_dims = [d for d in output_coord_vars if d in stick_vars]
+    row_dims = [d for d in output_coord_vars if d not in stick_vars]
+    if len(n_dims) != 1 or not row_dims:
+        return splits
+    n_dim = n_dims[0]
+
+    def _appears_in_one_input(dim: Symbol) -> bool:
+        hits = sum(
+            dim in {v for e in td.device_coords for v in e.free_symbols}
+            for td in input_tds
+        )
+        return hits == 1
+
+    m_candidates = [d for d in row_dims if _appears_in_one_input(d)]
+    # A bmm with a SHARED 2D weight broadcasts it across the batch, so the batch
+    # dim "appears in one input" like M and m_candidates has two entries -> we
+    # decline here and the default distributor handles it. Engaging the planner
+    # for that case needs weight-rank awareness (which also fixes the B*K*N HBM
+    # term over-counting the shared weight); tracked as a follow-up.
+    if len(m_candidates) != 1:
+        return splits
+    m_dim = m_candidates[0]
+    batch_dims = [d for d in row_dims if d is not m_dim]
+
+    # K is the lone reduction dim (anything else this planner does not model).
+    reduction = [d for d in it_space_adjusted if d not in output_coord_vars]
+    if len(reduction) != 1:
+        return splits
+    k_dim = reduction[0]
+
+    # The iteration space measures N and K in sticks; the cost model wants real
+    # elements so its byte and MAC counts are physical.
+    elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
+    M_e = concretize_expr(it_space_adjusted[m_dim])
+    n_sticks = concretize_expr(it_space_adjusted[n_dim])
+    k_sticks = concretize_expr(it_space_adjusted[k_dim])
+    N_e = n_sticks * elems_per_stick
+    K_e = k_sticks * elems_per_stick
+
+    batch_sizes = [concretize_expr(it_space_adjusted[bd]) for bd in batch_dims]
+    B_total = math.prod(batch_sizes)
+
+    b_combos = (
+        list(itertools.product(*([int(d) for d in divisors(s)] for s in batch_sizes)))
+        if batch_dims
+        else [()]
+    )
+    m_divs = [int(d) for d in divisors(M_e)]
+    n_divs = [int(d) for d in divisors(n_sticks)]
+    k_divs = [int(d) for d in divisors(k_sticks)]
+
+    best = None
+    best_cost = float("inf")
+    for b_combo in b_combos:
+        b_prod = math.prod(b_combo)
+        for mm in m_divs:
+            for nn in n_divs:
+                for kk in k_divs:
+                    if b_prod * mm * nn * kk > max_cores:
+                        continue
+                    c = _matmul_split_cost(
+                        (B_total, b_prod), (M_e, mm), (N_e, nn), (K_e, kk), max_cores
+                    )
+                    if c < best_cost:
+                        best_cost = c
+                        best = (b_combo, mm, nn, kk)
+
+    if best is None:
+        return splits
+
+    b_combo, m_s, n_s, k_s = best
+    new_splits = dict(splits)
+    for bd, bs in zip(batch_dims, b_combo):
+        new_splits[bd] = int(bs)
+    new_splits[m_dim] = m_s
+    new_splits[n_dim] = n_s
+    new_splits[k_dim] = k_s
+
+    # Never trade down to fewer cores than the default distributor already found.
+    if math.prod(new_splits.values()) < math.prod(splits.values()):
+        return splits
+
+    logger.debug(
+        f"cost_model work_division {op.get_name()}: "
+        f"b={b_combo} m={m_s} n={n_s} k={k_s} cost={best_cost:.1f}us "
+        f"[B={B_total} M={M_e} K={K_e} N={N_e}]"
+    )
+    return new_splits
 
 
 def divide_pointwise_op(
@@ -775,17 +889,17 @@ def span_reduction(operations: list[Operation]) -> None:
 
 
 def work_distribution(
-    operations: list[Operation], k_fast_ops: list[Operation] | None = None
+    operations: list[Operation], preassigned_ops: list[Operation] | None = None
 ) -> None:
     """Pass 3: distribute remaining cores across ops to maximize parallelism.
 
-    Ops in `k_fast_ops` were already divided by k_fast_division; they are
-    left untouched so every op is divided by exactly one of the two passes.
+    Ops in `preassigned_ops` were already divided by cost_model_matmul_division;
+    they are left untouched so every op is divided by exactly one pass.
     """
-    k_fast_ops = k_fast_ops or []
+    preassigned_ops = preassigned_ops or []
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
-        if op in k_fast_ops:
+        if op in preassigned_ops:
             continue
         rw = op.get_read_writes()
         args = get_mem_deps_from_rw(rw)
@@ -795,13 +909,14 @@ def work_distribution(
             divide_reduction_op(op, args, max_cores, work_distribution_pass)
 
 
-def _k_fast_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
-    """Divide one matmul op with k_fast when the heuristic fires.
+def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
+    """Re-price one matmul's split with the analytic cost model.
 
-    Runs between span_reduction and work_distribution. Reads span_reduction's
-    commits straight from op.op_it_space_splits — work_distribution has not run
-    yet, so it still holds the span-only subset. Returns True when k_fast
-    commits a split, so the caller can exclude the op from work_distribution.
+    Runs between span_reduction and work_distribution, so op.op_it_space_splits
+    still holds only span_reduction's commits. Computes the split
+    work_distribution would pick, hands it to the cost model, and commits the
+    cost model's choice when it differs — returning True so the caller excludes
+    the op from work_distribution (every op is divided by exactly one pass).
     """
     if not isinstance(op.data, Reduction):
         return False
@@ -814,51 +929,61 @@ def _k_fast_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     all_tds = input_tds + [output_td]
 
     it_space = iteration_space_from_op(op)
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
     # runs before this pass, and work_distribution — which would overwrite it —
-    # runs after and skips the ops k_fast claims.
+    # runs after and skips the ops this pass claims.
     if hasattr(op, "op_it_space_splits"):
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         span_splits = apply_splits_from_index_coeff(
             op.op_it_space_splits, write_index, read_index, it_space
         )
-        span_committed = {s: v for s, v in span_splits.items() if v > 1}
+        committed_splits = {s: v for s, v in span_splits.items() if v > 1}
     else:
-        span_committed = {}
+        committed_splits = {}
 
-    forced = _try_k_fast_split(it_space, output_td, span_committed, max_cores)
-    if forced is None:
+    default_splits, _, _ = _default_split(
+        it_space_adjusted, output_td, committed_splits, max_cores
+    )
+    splits = _cost_model_matmul_planner(
+        op,
+        default_splits,
+        it_space_adjusted,
+        output_td,
+        stick_vars,
+        committed_splits,
+        max_cores,
+        input_tds,
+    )
+    if splits == default_splits:
         return False
 
-    apply_splits(op, forced, output_td)
-    warn_if_per_core_overflow(all_tds, it_space, forced, op.get_name())
+    apply_splits(op, splits, output_td)
+    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
-            f"k_fast_division work_division {op.get_name()}: "
-            f"cores={math.prod(forced.values())}, "
+            f"cost_model_matmul_division work_division {op.get_name()}: "
+            f"cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
-            f"priorities=[], min_splits={span_committed}, "
+            f"min_splits={committed_splits}, "
             f"op_it_space_splits={op.op_it_space_splits}"
         )
     return True
 
 
-def k_fast_division(operations: list[Operation]) -> list[Operation]:
-    """Pass 2 (optional): divide narrow-N small-M matmuls with k_fast.
+def cost_model_matmul_division(operations: list[Operation]) -> list[Operation]:
+    """Pass 2: re-price matmul/bmm splits with the analytic hardware cost model.
 
-    Runs after span_reduction and before work_distribution. The
-    core_id_k_fast_emission feature-flag gate lives in passes.py; this pass
-    is only called when it is set. Returns the ops it committed a split for
-    so passes.py can exclude them from work_distribution — every op is
-    divided by exactly one of the two passes.
+    Runs after span_reduction and before work_distribution. Returns the ops it
+    re-split so passes.py can exclude them from work_distribution — every op is
+    divided by exactly one pass.
     """
     max_cores = _validate_max_cores()
-    k_fast_ops: list[Operation] = []
+    cost_model_ops: list[Operation] = []
     for op in _iter_computed_buffers(operations):
-        if _k_fast_divide_op(op, max_cores):
-            k_fast_ops.append(op)
-    return k_fast_ops
+        if _cost_model_divide_op(op, max_cores):
+            cost_model_ops.append(op)
+    return cost_model_ops
