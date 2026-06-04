@@ -820,8 +820,9 @@ def test_arange_plus_xt():
     """
     x = torch.randn((S, S), dtype=torch.float16)
     _compare(
-        lambda x: torch.arange(S * S, dtype=torch.float16, device=x.device).view(S, S)
-        + x.t(),
+        lambda x: (
+            torch.arange(S * S, dtype=torch.float16, device=x.device).view(S, S) + x.t()
+        ),
         x,
     )
 
