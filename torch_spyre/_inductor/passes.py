@@ -254,18 +254,25 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
+
+        # Tensor Layout Assignment
         propagate_spyre_tensor_layouts(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
         insert_bmm_padding(operations)
+
         dedup_and_promote_constants(operations)
-        if config.chunk_large_tensors:
-            chunk_large_tensors(operations)
+
+        # Working Set Reduction
         propagate_named_dims(operations)
         assign_dim_hints(operations)
         groups = hints_to_coarse_tile_groups(operations)
+        if config.chunk_large_tensors:
+            chunk_large_tensors(operations)
         coarse_tile(operations, groups=groups)
+
+        # Core Division and Scratchpad Allocation
         span_reduction(operations)
         cost_model_ops = cost_model_matmul_division(operations)
         work_distribution(operations, cost_model_ops)
