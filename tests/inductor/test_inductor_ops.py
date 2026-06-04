@@ -3745,6 +3745,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+<<<<<<< Updated upstream
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -3755,6 +3756,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), 4, 6),
                 "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), 1, 1),
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
+=======
+        ("test_unbind", "test_unbind_cpu"): {
+            "param_sets": {
+                # 1D — produces 0-D scalar tensors
+                "1d_dim0": (0, cached_randn((8,))),
+                # 2D — unbind along each axis
+                "2d_dim0": (0, cached_randn((4, 64))),
+                "2d_dim1": (1, cached_randn((4, 64))),
+                "2d_dimneg1": (-1, cached_randn((4, 64))),
+                # 3D — all three axes, including negative index
+                "3d_dim0": (0, cached_randn((4, 8, 64))),
+                "3d_dim1": (1, cached_randn((4, 8, 64))),
+                "3d_dim2": (2, cached_randn((4, 8, 64))),
+                "3d_dimneg1": (-1, cached_randn((4, 8, 64))),
+                # 4D — innermost and non-innermost axes
+                "4d_dim0": (0, cached_randn((2, 4, 8, 64))),
+                "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
+>>>>>>> Stashed changes
             },
         },
     }
@@ -5197,6 +5216,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
+    def test_unbind_cpu(self, dim: int, x):
+        self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
 if __name__ == "__main__":
     unittest.main()
