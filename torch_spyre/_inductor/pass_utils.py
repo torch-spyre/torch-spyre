@@ -798,8 +798,9 @@ def _per_core_view_on_buf(
     # writes / reads, not necessarily buf_name) bridge stride-keyed
     # coeff_splits back to scheduler symbols.
     rw = op.get_read_writes()
+    empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
+        result = empty_view
         if cache is not None:
             cache[key] = result
         return result
@@ -825,10 +826,13 @@ def _per_core_view_on_buf(
             continue
         splits_by_stride[host_stride] = (int(split), sym)
 
-    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
-    device_size = buf_layout.device_size
-    stride_map = buf_layout.stride_map
-    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+    buf_layout = V.graph.get_buffer(buf_name).layout
+    if not isinstance(buf_layout, FixedTiledLayout):
+        return empty_view
+    dev_layout = buf_layout.device_layout
+    device_size = dev_layout.device_size
+    stride_map = dev_layout.stride_map
+    elems_per_stick = dev_layout.device_dtype.elems_per_stick()
 
     # Step 3: place each split on a device dim via stride lookup. A host dim
     # with stride=1 is decomposed into stick_dim (dev_stride=1, dev_size=64)
