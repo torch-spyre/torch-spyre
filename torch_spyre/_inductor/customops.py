@@ -402,7 +402,6 @@ def _(
     padding: Optional[Sequence[int]] = None,
     stride: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
-
     dilation = dilation or (1, 1)
     padding = padding or (0, 0)
     stride = stride or (1, 1)
