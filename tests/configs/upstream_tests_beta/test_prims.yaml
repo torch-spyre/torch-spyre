@@ -9,9 +9,10 @@ test_suite_config:
           mode: mandatory_success
 
           edits:
-            cpu_move:
-              functions:
-                - assertEqual
+            functions:
+              cpu_move:
+                - name: assertEqual
+                
   global:
     supported_dtypes:
       - name: float16

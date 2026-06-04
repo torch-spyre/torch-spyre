@@ -71,9 +71,9 @@ class _OOTCpuMovePatcher:
     1. Moves all tensor arguments to CPU using pytree.tree_map
     2. Calls the original method with the CPU-moved arguments
 
-    Similar to CpuMixin, but configurable via YAML config per-test or globally.
+    Targeted class methods is configurable via YAML config per-test.
 
-    Usage: Configure via cpu_move.functions: ["assertEqual"] in the YAML.
+    Usage: Configure methods to wrap under edits.functions.cpu_move in the YAML configuration.
     """
 
     def __init__(
