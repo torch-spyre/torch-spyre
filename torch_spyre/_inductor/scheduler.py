@@ -70,7 +70,7 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     raw = getattr(ir_op, "loop_tiled_dims", None)
     if raw is None or not raw:
         return []
-    dims_per_level: list = raw if isinstance(raw[0], list) else [raw]
+    dims_per_level: list[list[int]] = raw
     if depth >= len(dims_per_level):
         return []
     it_space = iteration_space(sched_node)
