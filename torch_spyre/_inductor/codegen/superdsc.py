@@ -284,7 +284,7 @@ def _get_padded_iteration_space(
 
 
 def _is_matmul(op: str) -> bool:
-    return op in ("matmul", "batchmatmul")
+    return op in ("matmul", "batchmatmul", "batchmatmulfp8")
 
 
 def _is_topk(op: str) -> bool:

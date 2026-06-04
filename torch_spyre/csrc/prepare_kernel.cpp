@@ -423,12 +423,64 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   });
 }
 
+JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
+    const JobPlan& job_plan) const {
+  JobPlanBuilder::ValidationResult result;
+
+  // P2-13: expected_input_shapes validation
+  // TODO(johngontaryk): Implement once expected_input_shapes validation logic
+  // is defined
+  // - Verify expected_input_shapes is non-empty for compute JobPlans
+  // - Verify shape dimensions are positive
+  // - Verify shape count matches number of input tensors
+
+  // P2-14: JobPlan step ordering validation
+  // TODO(johngontaryk): Implement once step ordering rules are defined
+  // - Verify HostCompute steps precede their corresponding H2D steps
+  // - Verify H2D steps precede Compute steps that depend on them
+  // - Verify no circular dependencies in step ordering
+
+  // P2-15: Host compute metadata validation
+  // TODO(johngontaryk): Implement once host compute metadata structure is
+  // finalized
+  // - Verify metadata is non-null for HostCompute steps
+  // - Verify output buffer sizes match metadata specifications
+  // - Verify function pointers are valid
+
+  // P2-16: Additional structural validation
+  // TODO(johngontaryk): Implement additional validation checks as needed
+  // - Verify job_allocation is valid for compute JobPlans
+  // - Verify pinned_buffers are properly allocated
+  // - Verify CompositeAddress validity in steps
+
+  // Skeleton implementation: auto-validate (return empty message list)
+  // Full validation logic will be added once blocked dependencies are resolved
+  return result;
+}
+
 std::unique_ptr<JobPlan> JobPlanBuilder::build() {
   // Execute job preparation plan (allocate + init transfers)
   executeJobPreparationPlan();
 
   // Translate job execution plan to JobPlan
-  return translateJobExecPlan();
+  auto job_plan = translateJobExecPlan();
+
+  // Validate the JobPlan before returning
+  auto validation_result = validate(*job_plan);
+  if (!validation_result.isValid()) {
+    std::string error_msg = "JobPlan validation failed:\n";
+    for (const auto& msg : validation_result.messages) {
+      if (msg.severity == Severity::ERROR) {
+        error_msg += "  ERROR: " + msg.message + "\n";
+      } else if (msg.severity == Severity::WARNING) {
+        TORCH_WARN("JobPlan validation warning: ", msg.message);
+        error_msg += "  WARNING: " + msg.message + "\n";
+      }
+    }
+    TORCH_CHECK(false, error_msg);
+  }
+
+  return job_plan;
 }
 
 std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,

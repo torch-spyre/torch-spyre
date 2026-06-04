@@ -33,6 +33,7 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
     IDENTITY_OP,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
@@ -427,6 +428,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
+                or arg.device_dtype == DataFormats.SEN143_FP8
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 
@@ -449,15 +451,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         }
 
         # If this op is inside a coarse-tiling loop, identify which iteration-space
-        # symbols are tiled by the enclosing loop(s).  loop_tiled_dims on the IR
-        # node is either a flat list[int] (legacy single-level) or a
-        # list[list[int]] (nested multi-level, outermost first).  We flatten all
+        # symbols are tiled by the enclosing loop(s).  loop_tiled_dims is a
+        # list[list[int]] (nested multi-level, outermost first).  Flatten all
         # levels so that tiled_symbols covers every loop variable from outermost
         # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
-        raw_tiled_dims = getattr(ir_node, "loop_tiled_dims", [])
-        if raw_tiled_dims and not isinstance(raw_tiled_dims[0], list):
-            # Legacy flat list — wrap in a single-level list.
-            raw_tiled_dims = [raw_tiled_dims]
+        raw_tiled_dims: list[list[int]] = getattr(ir_node, "loop_tiled_dims", [])
         all_tiled_dims = [d for level in raw_tiled_dims for d in level]
         it_space_keys = list(it_space.keys())
         tiled_syms = [
@@ -602,7 +600,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op == BATCH_MATMUL_OP:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
