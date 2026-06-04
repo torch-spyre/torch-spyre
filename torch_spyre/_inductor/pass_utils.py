@@ -825,27 +825,31 @@ def _per_core_view_on_buf(
     stride_map = buf_layout.stride_map
     elems_per_stick = buf_layout.device_dtype.elems_per_stick()
 
-    # Step 3: place each split on a device dim via stride lookup. h=1
-    # maps to elems_per_stick when present (sticks are atomic, so a
-    # host-stride-1 split lands on the outer-stick dim, not on stick
-    # contents); otherwise it falls back to a literal stride-1 dim, as
-    # in sticked [N, 1] layouts where the mb axis itself has stride 1.
-    # Skip stride_map entries < 0 — those are sentinels for collapsed
-    # or broadcast dims and can't host a split.
+    # Step 3: place each split on a device dim via stride lookup. A host dim
+    # with stride=1 is decomposed into stick_dim (dev_stride=1, dev_size=64)
+    # and num_stick_dim (dev_stride=64); h=1 belongs on num_stick_dim since
+    # sticks are atomic. Skip stride_map entries <= 0 — sentinels for
+    # collapsed or broadcast dims.
     #
     # Example: host [64, 128] sticked to device [2, 64, 64] with
     # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
     # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
     # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dim = {s: i for i, s in enumerate(stride_map) if s > 0}
+    device_stride_to_dim: dict[int, int] = {}
+    for i, s in enumerate(stride_map):
+        if s <= 0:
+            continue
+        prev = device_stride_to_dim.get(s)
+        if prev is None or device_size[i] != 1:
+            device_stride_to_dim[s] = i
 
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}
     for h, (split, sym) in sorted(splits_by_stride.items()):
-        if h == 1 and elems_per_stick in device_stride_to_dim:
+        dev_dim = device_stride_to_dim.get(h)
+        if dev_dim is not None and (h == 1 and device_size[dev_dim] == elems_per_stick):
+            # this is stick_dim -> choose num_stick_dim instead
             dev_dim = device_stride_to_dim.get(elems_per_stick)
-        else:
-            dev_dim = device_stride_to_dim.get(h)
         assert (
             dev_dim is not None
             and dev_dim not in work_slice_dims
