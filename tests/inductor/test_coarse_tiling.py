@@ -47,6 +47,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.compute_ops import (
     _tiled_byte_stride,
     generate_sdsc,
@@ -1435,7 +1436,7 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
                 [{s0: outer_stride, s1: inner_stride}],
-                [("kernel", 0)],
+                [SymbolKind.kernel()],
             )
 
         return fake_compile
@@ -1902,7 +1903,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 json_out,
                 [arg.allocation["hbm"] for arg in op_spec.args],
                 [{} for _ in op_spec.args],
-                [("kernel", 0) for _ in op_spec.args],
+                [SymbolKind.kernel() for _ in op_spec.args],
             )
 
         mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
@@ -1936,7 +1937,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [op_spec.args[0].allocation["hbm"]],
                 [{}],
-                [("kernel", 0)],
+                [SymbolKind.kernel()],
             )
 
         mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
@@ -1973,7 +1974,9 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(values[i])
-            kind = ("kernel", 0) if i == 0 else ("pool", 0)  # op_b has pool allocation
+            kind = (
+                SymbolKind.kernel() if i == 0 else SymbolKind.pool()
+            )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
         mlir = self._bundle([op_a, op_b], symbolic_args=True, fake_compile=fake)
@@ -1995,7 +1998,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [op_spec.args[0].allocation["hbm"]],
                 [{}],
-                [("kernel", 0)],
+                [SymbolKind.kernel()],
             )
 
         mlir = self._bundle([a], symbolic_args=False, fake_compile=fake)
@@ -2055,7 +2058,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 }
             }
             # All symbols in this test are kernel args — all become input_arg params.
-            symbol_kind_flags = [("kernel", 0)] * n
+            symbol_kind_flags = [SymbolKind.kernel()] * n
             return (
                 json_out,
                 sym_values[start : start + n],
@@ -2096,7 +2099,12 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(pool_values[i])
-            return _make_tiled_json(idx, sym_id), [pool_values[i]], [{}], [("pool", 0)]
+            return (
+                _make_tiled_json(idx, sym_id),
+                [pool_values[i]],
+                [{}],
+                [SymbolKind.pool()],
+            )
 
         mlir = self._bundle([a, b, c], symbolic_args=True, fake_compile=fake)
 
@@ -2111,6 +2119,152 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%sym_1")
         self.assertEqual(execute_lines[1].split("(")[1].split(")")[0], "%sym_2")
         self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%sym_1")
+
+
+class TestSymbolKind(unittest.TestCase):
+    """Unit tests for the SymbolKind dataclass."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_import(self):
+        _ = SymbolKind  # importable as a top-level name
+
+    def test_kernel_base_kind(self):
+        sk = SymbolKind.kernel()
+        self.assertEqual(sk.kind, "kernel")
+        self.assertFalse(sk.is_derived)
+        self.assertFalse(sk.is_pool)
+
+    def test_kernel_derived_kind_carries_base_index_and_offset(self):
+        sk = SymbolKind.kernel_derived(base_sym_idx=3, offset=512)
+        self.assertEqual(sk.kind, "kernel_derived")
+        self.assertEqual(sk.base_sym_idx, 3)
+        self.assertEqual(sk.offset, 512)
+        self.assertTrue(sk.is_derived)
+        self.assertFalse(sk.is_pool)
+
+    def test_pool_kind(self):
+        sk = SymbolKind.pool()
+        self.assertEqual(sk.kind, "pool")
+        self.assertFalse(sk.is_derived)
+        self.assertTrue(sk.is_pool)
+
+    def test_generate_sdsc_two_cores_emits_kernel_derived_with_base_idx(self):
+        """With num_cores=2, the second per-core tiled symbol should be kernel_derived
+        and carry the index of the first (kernel base) symbol."""
+
+        s = Symbol("s")
+        core_id = Symbol("core_id")
+        from sympy import Mod
+
+        # Mirror the existing TestGenerateSdscTiledSymbols multi-core test but
+        # with arg_index=0 to exercise the kernel/kernel_derived kind path.
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[s],
+            data_format=_FP16,
+            scales={s: 1},
+            strides={s: 128},
+            offsets={s: 0},
+            max_dim_sizes={s: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0x1000,
+            backGap={},
+            arg_index=0,  # kernel arg → kinds should be kernel + kernel_derived
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={s: 32},
+            num_cores=2,
+            work_slices={s: 2},
+            core_id_to_work_slice={s: Mod(core_id, 2)},
+            padding={},
+            layouts={"A": {"dim_order": [s], "stick_dim_order": s, "stick_size": 64}},
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+        )
+        symbols: list[int] = []
+        _, _, _, kinds = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[s],
+            use_symbols=True,
+        )
+        self.assertEqual(len(kinds), 2)
+        self.assertIsInstance(kinds[0], SymbolKind)
+        self.assertEqual(kinds[0].kind, "kernel")
+        self.assertIsInstance(kinds[1], SymbolKind)
+        self.assertEqual(kinds[1].kind, "kernel_derived")
+        self.assertEqual(kinds[1].base_sym_idx, 0)  # base is symbols[0]
+        self.assertEqual(kinds[1].offset, symbols[1] - symbols[0])
+
+    def test_bundle_kernel_derived_no_backward_scan(self):
+        """bundle.py uses SymbolKind.base_sym_idx directly — no backward scan needed.
+        Two ops, same kernel arg but different per-core offsets share one param."""
+        a = _make_minimal_op_spec("a")
+        b = _make_minimal_op_spec("b")
+
+        call_count = [0]
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+            i = call_count[0]
+            call_count[0] += 1
+            base = 0x400000000
+            off = 1024
+            if i == 0:
+                # op0: sym 0 = kernel base, sym 1 = kernel_derived +1024
+                symbols.append(base)
+                symbols.append(base + off)
+                kinds = [SymbolKind.kernel(), SymbolKind.kernel_derived(0, off)]
+                json0 = _make_tiled_json(idx, -(symbol_id_offset + 1))
+                return json0, [base, base + off], [{}, {}], kinds
+            else:
+                # op1: reuses same derived offset — sym 2
+                symbols.append(base + off)
+                kinds = [SymbolKind.kernel_derived(0, off)]
+                json1 = _make_tiled_json(idx, -(symbol_id_offset + 1))
+                return json1, [base + off], [{}], kinds
+
+        with patch(
+            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+            side_effect=fake,
+        ):
+            generate_bundle(
+                "test_kernel",
+                self.tmpdir,
+                [a, b],
+                use_symbols=True,
+                unroll_loops=False,
+                symbolic_args=True,
+            )
+        mlir = _read_mlir(self.tmpdir)
+
+        # Only one input_arg param (the kernel base)
+        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%sym_0_2:", mlir)
+        # Derived address emitted once as arith.addi (deduped across both ops)
+        self.assertEqual(mlir.count("arith.constant 1024"), 1)
+        self.assertEqual(mlir.count("arith.addi %sym_0_1_extracted"), 1)
+        # op0's execute has the kernel base; op1's execute has the derived %sym_N
+        # Both refer to the same canonical derived SSA — no second arith.addi for op1
+        self.assertIn("sdscbundle.sdsc_execute (%sym_0_1_extracted)", mlir)
+        # op1 operand is the canonical derived var (%sym_2), not a new addi
+        execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
+        op1_operand = execute_lines[1].split("(")[1].split(")")[0].strip()
+        self.assertTrue(op1_operand.startswith("%sym_"), op1_operand)
+        self.assertNotIn("input_arg_extract", op1_operand)
 
 
 if __name__ == "__main__":

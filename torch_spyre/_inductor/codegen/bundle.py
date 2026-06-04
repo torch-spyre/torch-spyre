@@ -20,6 +20,7 @@ from typing import Any
 import sympy
 
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.codegen.unroll import unroll_loop_specs
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -38,11 +39,8 @@ logger = get_inductor_logger("sdsc_compile")
 #   affine_strides:     list[dict] parallel to SDSCSpec.args —
 #                       {tiled_sym: stride_bytes} for tiled HBM tensors,
 #                       empty dict for non-tiled / lx tensors
-#   symbol_kinds:       list[tuple[str, int]] parallel to base_symbol_values —
-#                       ("kernel", 0)           – base addr of a kernel tensor arg
-#                       ("kernel_derived", off) – per-core addr = base + off
-#                       ("pool", 0)             – pool-allocated tensor addr
-_CompiledEntry = tuple[Any, list[int], list[dict], list[tuple[str, int]]]
+#   symbol_kinds:       list[SymbolKind] parallel to base_symbol_values
+_CompiledEntry = tuple[Any, list[int], list[dict], list[SymbolKind]]
 
 
 # ---------------------------------------------------------------------------
@@ -128,19 +126,16 @@ def generate_bundle(
     addr_counter = [0]
 
     # Build a per-symbol kind list from compiled entries (symbolic_args path only).
-    # Each entry is a (kind_str, aux_int) tuple from compute_ops.generate_sdsc.
-    symbol_kinds: list[tuple[str, int]] = []
+    symbol_kinds: list[SymbolKind] = []
     if symbolic_args and use_symbols:
         for _, _, _, local_kinds in compiled:
             symbol_kinds.extend(local_kinds)
 
     # Determine whether a pool parameter is needed (any pool symbol present).
-    has_pool = (
-        symbolic_args and use_symbols and any(k == "pool" for k, _ in symbol_kinds)
-    )
+    has_pool = symbolic_args and use_symbols and any(sk.is_pool for sk in symbol_kinds)
     # Indices of kernel-base symbols (one per kernel tensor arg; become input_arg params).
     kernel_arg_sym_indices = (
-        [i for i, (k, _) in enumerate(symbol_kinds) if k == "kernel"]
+        [i for i, sk in enumerate(symbol_kinds) if sk.kind == "kernel"]
         if symbolic_args and use_symbols
         else []
     )
@@ -212,32 +207,17 @@ def generate_bundle(
         for sym_idx, value in enumerate(symbols):
             if sym_idx in kernel_arg_sym_set:
                 continue  # replaced by function parameter + extract op
-            if not symbol_kinds:
-                # use_symbols=False path — no symbol_kinds populated
-                f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
-                continue
-            kind, aux = symbol_kinds[sym_idx]
-            if kind == "kernel_derived":
-                # Find which kernel base parameter this derives from.
-                # The base symbol has the same arg_index; its value = symbols[base_idx].
-                # We locate it by scanning backwards for the nearest "kernel" entry
-                # with value == (value - aux).
-                base_value = value - aux
-                base_sym_idx = next(
-                    (
-                        j
-                        for j in range(sym_idx - 1, -1, -1)
-                        if symbol_kinds[j][0] == "kernel" and symbols[j] == base_value
-                    ),
-                    None,
-                )
-                if base_sym_idx is not None and base_sym_idx in kernel_base_to_pos:
-                    base_pos = kernel_base_to_pos[base_sym_idx]
-                    key = (base_pos, aux)
+            sk = symbol_kinds[sym_idx] if symbol_kinds else None
+            if sk is not None and sk.is_derived:
+                base_pos = kernel_base_to_pos.get(sk.base_sym_idx)
+                if base_pos is not None:
+                    key = (base_pos, sk.offset)
                     if key not in derived_addi_emitted:
                         offset_ssa = f"%core_offset_{sym_idx + 1}"
                         addi_ssa = f"%sym_{sym_idx + 1}"
-                        f.write(f"\t\t{offset_ssa} = arith.constant {aux} : index\n")
+                        f.write(
+                            f"\t\t{offset_ssa} = arith.constant {sk.offset} : index\n"
+                        )
                         f.write(
                             f"\t\t{addi_ssa} = arith.addi"
                             f" %sym_0_{base_pos}_extracted, {offset_ssa} : index\n"
@@ -245,11 +225,10 @@ def generate_bundle(
                         derived_addi_emitted[key] = addi_ssa
                     sym_canonical[sym_idx] = derived_addi_emitted[key]
                 else:
-                    # Fallback: emit as a plain constant if base not found.
                     f.write(
                         f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
                     )
-            elif kind == "pool":
+            elif sk is not None and sk.is_pool:
                 if value not in pool_addi_emitted:
                     offset_ssa = f"%pool_offset_{sym_idx + 1}"
                     addi_ssa = f"%sym_{sym_idx + 1}"
@@ -553,16 +532,6 @@ def _get_tensor_core_sym_id(sdsc_json: dict, tensor_idx: int, core: int) -> int 
                     if key in data:
                         return int(data[key])
     return None
-
-
-def _sym_id_to_mlir_name(sym_id: int) -> str:
-    """Map a negative symbol ID to a %sym_N MLIR name.
-
-    Symbol IDs are assigned sequentially across the whole bundle starting at
-    -1, and symbols[abs(id)-1] holds the corresponding value.  So %sym_N where
-    N = abs(sym_id) is always correct.
-    """
-    return f"%sym_{abs(sym_id)}"
 
 
 # ---------------------------------------------------------------------------

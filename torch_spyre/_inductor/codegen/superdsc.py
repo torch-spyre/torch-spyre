@@ -35,7 +35,7 @@ from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
-from .compute_ops import generate_sdsc
+from .compute_ops import SymbolKind, generate_sdsc
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -651,7 +651,7 @@ def compile_op_spec(
     symbols: list[int],
     symbol_id_offset: int = 0,
     use_symbols: bool = False,
-) -> tuple[Any, list[int], list[dict], list[tuple[str, int]]]:
+) -> tuple[Any, list[int], list[dict], list[SymbolKind]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
     # Translate tiled_symbols from OpSpec's inductor symbols to the renamed
