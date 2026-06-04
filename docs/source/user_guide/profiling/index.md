@@ -39,10 +39,36 @@ RFC 0601 lands.
 | Device telemetry (power, temperature, bandwidth) | Available — PF and VF mode (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
 | Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Preview (requires [`kineto-spyre`][kineto-spyre] wheel) | [PyTorch Profiler](pytorch_profiler.md) |
 | Trace post-processing (aiu-trace-analyzer) | Available, known gaps | [Trace analysis](trace_analysis.md) |
-| `torch.spyre.memory.memory_allocated()` / `max_memory_allocated()` | Available — delegates to [`torch.accelerator.memory`][accelerator-memory] (PR [#770][pr-770]) | [PyTorch Profiler](pytorch_profiler.md) |
-| Kineto bridge (`SpyreActivityProfiler`) | In progress — wires `ProfilerActivity.PrivateUse1` into PyTorch traces via the C++ backend | upstream Kineto integration |
+| `torch.spyre.memory.memory_allocated()` / `max_memory_allocated()` | Available — delegates to [`torch.accelerator.memory`][accelerator-memory] (PR [#770][pr-770]) | [Quick example](#memory-api-quick-example) |
+| Kineto bridge (`SpyreActivityProfiler`) | In progress — in-tree Kineto integration for `ProfilerActivity.PrivateUse1` device-side events (PR [#1856][pr-1856]) | upstream Kineto integration |
 | Scratchpad utilization metrics | Planned | [RFC 0601][rfc-0601] |
 | IR-instrumentation-based fine-grained profiler | Planned | [RFC 0601][rfc-0601] |
+
+### Memory API quick example
+
+`torch.spyre.memory` re-exports `torch.accelerator.memory`, so the
+same memory-query calls used on CUDA apply to Spyre. The example
+below allocates a tensor, frees it, and reads the current and peak
+allocations:
+
+```python
+import torch
+
+# Reset the peak counter so max_memory_allocated() starts from zero.
+torch.spyre.memory.reset_peak_memory_stats()
+
+# Allocate on the device; memory_allocated() reflects the new total.
+x = torch.rand((64, 64), dtype=torch.float16, device="spyre")
+print(torch.spyre.memory.memory_allocated())     # bytes currently allocated
+
+# Free the tensor. memory_allocated() drops back, but the peak persists.
+del x
+print(torch.spyre.memory.memory_allocated())     # current allocation
+print(torch.spyre.memory.max_memory_allocated()) # peak since reset
+```
+
+The module also exposes `reset_accumulated_memory_stats()` and
+`memory_stats()`.
 
 ## Toolkit layers
 
@@ -96,4 +122,5 @@ design and may change.
 [ata]: https://github.com/IBM/aiu-trace-analyzer
 [issue-1335]: https://github.com/torch-spyre/torch-spyre/issues/1335
 [pr-770]: https://github.com/torch-spyre/torch-spyre/pull/770
+[pr-1856]: https://github.com/torch-spyre/torch-spyre/pull/1856
 [accelerator-memory]: https://docs.pytorch.org/docs/stable/accelerator.html
