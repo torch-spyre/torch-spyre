@@ -314,6 +314,7 @@ def propagate_named_dims(
     operations: list[Operation],
 ) -> None:
     """Propagate named dims from annotated inputs through the op graph."""
+    global _enabled
     if not _enabled:
         return
     if len(V.graph.graph_input_names) > 0:
@@ -399,6 +400,8 @@ def propagate_named_dims(
     logger.info("OPS")
     for op in operations:
         _log_op(op)
+    # Reset _enabled so that it does not leak True into the next compilation
+    _enabled = False
 
 
 def _get_hint_scopes(op) -> list[dict[str, int]]:
