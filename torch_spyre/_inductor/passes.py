@@ -50,7 +50,11 @@ from .propagate_layouts import (
 from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import insert_restickify, finalize_layouts
 from .memory_planning import memory_planning
-from .work_division import span_reduction, work_distribution, k_fast_division
+from .work_division import (
+    span_reduction,
+    work_distribution,
+    cost_model_matmul_division,
+)
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad.allocator import (
     StrategyBCoOptimizingAllocator,
@@ -209,7 +213,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
 
     def get_passes(self):
         # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
         # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
         # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
         # False), so loop groups survive Inductor fusion intact.
@@ -250,24 +254,31 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
+
+        # Tensor Layout Assignment
         propagate_spyre_tensor_layouts(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
         insert_bmm_padding(operations)
+
         dedup_and_promote_constants(operations)
+
+        # Working Set Reduction
         if config.chunk_large_tensors:
+            # TODO: chunk_large_tensors needs to be integrated with hint-based working set reduction
             chunk_large_tensors(operations)
+
         propagate_named_dims(operations)
         assign_dim_hints(operations)
-        if config.coarse_tiling:
-            groups = hints_to_coarse_tile_groups(operations)
+        groups = hints_to_coarse_tile_groups(operations)
+        if groups:
             coarse_tile(operations, groups=groups)
+
+        # Core Division and Scratchpad Allocation
         span_reduction(operations)
-        k_fast_ops = (
-            k_fast_division(operations) if config.core_id_k_fast_emission else []
-        )
-        work_distribution(operations, k_fast_ops)
+        cost_model_ops = cost_model_matmul_division(operations)
+        work_distribution(operations, cost_model_ops)
         if config.lx_planning:
             allocator = (
                 StrategyBCoOptimizingAllocator()
@@ -291,7 +302,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(chunk_large_tensors),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
-            inspect.getfile(k_fast_division),
+            inspect.getfile(cost_model_matmul_division),
             inspect.getfile(scratchpad_planning),
             inspect.getfile(coarse_tile),
         ]

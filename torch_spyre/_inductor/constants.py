@@ -15,6 +15,7 @@
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 
 # Type casting operators from deeptools
 DL16TOFP32_OP = "dl16tofp32"

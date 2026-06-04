@@ -3744,6 +3744,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_repeat", "test_repeat_cpu"): {
+            "param_sets": {
+                "1d_1": (cached_randn((64), dtype=torch.float16), 1),
+                "1d_1_int32": (torch.randint(0, 100, (64,), dtype=torch.int32), 1),
+                "1d_1_size1": (cached_randn((1), dtype=torch.float16), 1),
+                "1d_1_size1_int32": (torch.randint(0, 100, (1,), dtype=torch.int32), 1),
+                "2d_3x2": (cached_randn((2, 64), dtype=torch.float16), 3, 2),
+                "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), 4, 6),
+                "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), 1, 1),
+                "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5177,6 +5189,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             index_copy_fn, cache, index, source, run_compile=False, run_eager=True
         )
+
+    def test_repeat_cpu(self, x, *repeat_args):
+        def fn(a):
+            return a.repeat(*repeat_args)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
 
 
 if __name__ == "__main__":

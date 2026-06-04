@@ -53,6 +53,7 @@ test_suite_config:
             # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
+            - TestOps::test_repeat.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

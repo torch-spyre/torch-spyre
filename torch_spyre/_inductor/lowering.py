@@ -23,7 +23,7 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP, COPY_BACK_CANDIDATE_ATTR
+from .constants import BATCH_MATMUL_OP, COPY_BACK_CANDIDATE_ATTR, BATCH_MATMUL_FP8_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -235,6 +235,106 @@ def ensure_default_handler(op_name):
 def eager_fallback(op, *args, **kwargs):
     handler = lowering.fallback_handler(op, add_to_fallback_set=False)
     return handler(*args, **kwargs)
+
+
+# TODO:This is just place holder now; Real implementation will follow
+@register_spyre_lowering(torch.ops.aten._scaled_mm.default)
+def lower_scaled_mm(
+    mat1,
+    mat2,
+    scale_a=None,
+    scale_b=None,
+    bias=None,
+    scale_result=None,
+    out_dtype=None,
+    use_fast_accum=False,
+):
+    if scale_a is not None:
+        raise Unsupported("scale_a parameter in _scaled_mm is not yet supported")
+    if scale_b is not None:
+        raise Unsupported("scale_b parameter in _scaled_mm is not yet supported")
+    if bias is not None:
+        raise Unsupported("bias parameter in _scaled_mm is not yet supported")
+    if scale_result is not None:
+        raise Unsupported("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        raise Unsupported("use_fast_accum parameter in _scaled_mm is not yet supported")
+
+    mat1.realize()
+    mat2.realize()
+    mat1_loader = mat1.make_loader()
+    mat2_loader = mat2.make_loader()
+
+    mat1_size = mat1.get_size()
+    mat2_size = mat2.get_size()
+    mat1_ndim = len(mat1_size)
+    mat2_ndim = len(mat2_size)
+
+    mat1_dtype = mat1.get_dtype()
+    mat2_dtype = mat2.get_dtype()
+
+    if mat1_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat1, got {mat1_dtype}")
+    if mat2_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
+
+    output_dtype = out_dtype if out_dtype is not None else torch.float16
+    reduction_numel = mat1_size[-1]
+
+    if mat1_ndim == 2 and mat2_ndim == 2:
+        # [M, K] × [K, N] → [M, N]
+        ranges = [mat1_size[0], mat2_size[1]]
+
+        def inner_fn(index, reduction_index):
+            i0, i1 = index
+            (r0,) = reduction_index
+            return (mat1_loader([i0, r0]), mat2_loader([r0, i1]))
+
+    elif mat1_ndim == 3 and mat2_ndim == 2:
+        # [B, M, K] × [K, N] → [B, M, N]
+        ranges = [mat1_size[0], mat1_size[1], mat2_size[1]]
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            return (mat1_loader([i0, i1, r0]), mat2_loader([r0, i2]))
+
+    elif mat1_ndim == 3 and mat2_ndim == 3:
+        # [B, M, K] × [B, K, N] → [B, M, N]
+        ranges = [mat1_size[0], mat1_size[1], mat2_size[2]]
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            return (mat1_loader([i0, i1, r0]), mat2_loader([i0, r0, i2]))
+
+    else:
+        raise Unsupported(
+            f"_scaled_mm with shapes {mat1_size} and {mat2_size} not supported"
+        )
+
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_FP8_OP,
+        input_node=[mat1, mat2],
+        device=mat1.get_device(),
+        dst_dtype=output_dtype,
+        src_dtype=mat1_dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=[reduction_numel],
+    )
+
+    result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"_scaled_mm (FP8): mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
+            f"-> {[int(s) for s in result_buf.get_size()]}, "
+            f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, out_dtype={output_dtype}"
+        )
+
+    return result
 
 
 @register_spyre_lowering(torch.ops.aten.mm.default)

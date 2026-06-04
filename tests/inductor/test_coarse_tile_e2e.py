@@ -90,7 +90,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -132,7 +131,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -192,7 +190,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -251,7 +248,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -333,7 +329,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": True,
             "lx_planning": True,
@@ -397,7 +392,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "unroll_loops": True,
             "sencores": 1,
             "lx_planning": True,
@@ -444,7 +438,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -525,7 +518,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -573,7 +565,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -624,7 +615,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -675,7 +665,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
@@ -729,7 +718,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "coarse_tiling": True,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -755,7 +743,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Matmul with row-tiling: tile the M dimension of x @ y
     # ------------------------------------------------------------------
 
-    @config.patch({"coarse_tiling": True})
     def test_hint_matmul_row_tiling(self):
         """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension."""
         from torch_spyre._inductor import spyre_hint
@@ -778,7 +765,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
-    @config.patch({"coarse_tiling": True})
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) and Lk (2 slices) via nested spyre_hints."""
         import math
@@ -846,7 +832,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @config.patch({"coarse_tiling": True})
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
@@ -881,6 +866,92 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
+
+
+class TestNamedDimsHint(InductorTestCase):
+    """Tests for propagate_named_dims handling of ops with a named_dims hint.
+
+    torch.full and torch.empty lower to ops whose loop variables carry no
+    named-dim information from their inputs.  The new hint path allows
+    spyre_hint(named_dims=[...]) to supply the named-dim mapping directly,
+    enabling coarse tiling to work on these ops.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    @config.patch(
+        {
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_full_with_named_dims_hint_tiles(self):
+        """spyre_hint(named_dims=[...]) on torch.full enables coarse tiling.
+
+        Without the hint, torch.full has no named-dim mapping and coarse tiling
+        cannot apply.  With named_dims supplied via the hint, propagate_named_dims
+        should set _dim_prop_info correctly so assign_dim_hints produces a
+        DimHint and LoopSpec appears in the generated source.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+
+        def fn(x):
+            with spyre_hint(slices={"M": 4}, named_dims=["M", "K"]):
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+            return x + bias
+
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+
+    @config.patch(
+        {
+            "bundle_hbm_symbols": True,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_full_like_with_named_dims_hint_tiles(self):
+        """spyre_hint(named_dims=[...]) on torch.full_like enables coarse tiling."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 128, 64
+
+        def fn(x):
+            with spyre_hint(slices={"M": 2}, named_dims=["M", "K"]):
+                buf = torch.full_like(x, 2.0)
+            return x + buf
+
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('2')", src, "Expected loop count 2")
 
 
 if __name__ == "__main__":
