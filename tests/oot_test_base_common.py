@@ -43,6 +43,7 @@ from oot_upstream_patcher import (
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
     _OOTNativeDeviceTypesPatcher,
+    _OOTCpuMovePatcher,
 )
 from oot_test_config_models import (
     OOTTestConfig,
@@ -137,6 +138,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     GLOBAL_SUPPORTED_DTYPES: Optional[Set[torch.dtype]] = None  # None = no filtering
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
     GLOBAL_DTYPE_FORCE_XFAIL: Set[torch.dtype] = set()
+    GLOBAL_CPU_MOVE_FUNCTIONS: List[str] = []  # Global CPU move function list
 
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
@@ -191,6 +193,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         cls.GLOBAL_DTYPE_FORCE_XFAIL = (
             config.global_config.resolved_supported_dtypes_force_xfail()
         )
+        cls.GLOBAL_CPU_MOVE_FUNCTIONS = config.global_config.cpu_move.functions
 
         file_entry: FileEntry = resolve_current_file(config, path)
 
@@ -612,6 +615,20 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
+
+        # ------------------------------------------------------------------
+        # Collect CPU move functions from global config and all test entries
+        # for this test name. Then apply the CPU move patcher to move tensor
+        # arguments to CPU for specified methods (e.g., assertEqual).
+        # ------------------------------------------------------------------
+        cpu_move_functions: Set[str] = set()
+        if cls.GLOBAL_CPU_MOVE_FUNCTIONS:
+            cpu_move_functions.update(cls.GLOBAL_CPU_MOVE_FUNCTIONS)
+        for _e in all_entries_for_name:
+            if _e.edits.cpu_move.functions:
+                cpu_move_functions.update(_e.edits.cpu_move.functions)
+        if cpu_move_functions:
+            _OOTCpuMovePatcher(cls, list(cpu_move_functions), test_name=name).patch()
 
         _tags_to_write: Dict[str, List[str]] = {}
         for method_name in new_methods:

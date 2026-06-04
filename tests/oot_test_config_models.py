@@ -720,10 +720,22 @@ class DtypesEdits(BaseModel):
         }
 
 
+class CpuMoveEdits(BaseModel):
+    """Per-test CPU move configuration for moving tensor arguments to CPU.
+
+    This allows specific test class methods to have their tensor arguments
+    automatically moved to CPU before comparison, similar to how CpuMixin
+    works for assertEqual.
+    """
+
+    functions: List[str] = []  # List of method names to override (e.g., ["assertEqual"])
+
+
 class TestEdits(BaseModel):
     ops: OpsEdits = OpsEdits()
     dtypes: DtypesEdits = DtypesEdits()
     modules: ModulesEdits = ModulesEdits()
+    cpu_move: CpuMoveEdits = CpuMoveEdits()
 
 
 class TestEntry(BaseModel):
@@ -925,6 +937,7 @@ class GlobalConfig(BaseModel):
     supported_ops: Optional[List[SupportedOpConfig]] = None
     supported_modules: Optional[List[SupportedModuleConfig]] = None
     input_config: InputConfig = InputConfig()
+    cpu_move: CpuMoveEdits = CpuMoveEdits()  # Global CPU move config
 
     @field_validator("supported_dtypes", mode="before")
     @classmethod

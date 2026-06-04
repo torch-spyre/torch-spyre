@@ -11,6 +11,11 @@ test_suite_config:
           tags:
             - model_1
             - model_2
+          edits:
+            cpu_move:
+              functions:
+                - assertEqual
+                - assertTrue
   global:
     supported_dtypes:
       - name: float16
@@ -30,3 +35,8 @@ test_suite_config:
       - name: sub
       - name: gcd
         # force_xfail: true
+    
+    # Global CPU move configuration - applies to all tests
+    cpu_move:
+      functions:
+        - assertEqual
