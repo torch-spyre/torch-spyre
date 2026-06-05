@@ -3757,6 +3757,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
             },
         },
+        ("test_unbind", "test_unbind_cpu"): {
+            "param_sets": {
+                # 1D — produces 0-D scalar tensors
+                "1d_dim0": (0, cached_randn((8,))),
+                # 2D — unbind along each axis
+                "2d_dim0": (0, cached_randn((4, 64))),
+                "2d_dim1": (1, cached_randn((4, 64))),
+                "2d_dimneg1": (-1, cached_randn((4, 64))),
+                # 3D — all three axes, including negative index
+                "3d_dim0": (0, cached_randn((4, 8, 64))),
+                "3d_dim1": (1, cached_randn((4, 8, 64))),
+                "3d_dim2": (2, cached_randn((4, 8, 64))),
+                "3d_dimneg1": (-1, cached_randn((4, 8, 64))),
+                # 4D — innermost and non-innermost axes
+                "4d_dim0": (0, cached_randn((2, 4, 8, 64))),
+                "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5196,6 +5214,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return a.repeat(*repeat_args)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_unbind_cpu(self, dim: int, x):
+        self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
 
 if __name__ == "__main__":
