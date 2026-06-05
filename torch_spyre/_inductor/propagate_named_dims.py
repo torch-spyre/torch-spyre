@@ -523,3 +523,5 @@ def assign_dim_hints(graph: GraphLowering) -> None:
                         f"  split_count={h.split_count}  -> {per_tile} per tile"
                         f"  loop_var={h.loop_var}{reduction_tag}"
                     )
+
+    _named_dims.clear()
