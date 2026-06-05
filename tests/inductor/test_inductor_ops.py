@@ -355,6 +355,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_sqrt_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "sqrt": torch.sqrt,  # undefined for negative input
+            },
+            "param_sets": {
+                "1d_abs_fp32": (cached_randn((64,), abs=True, dtype=torch.float32),),
+                "2d_abs_fp32": (
+                    cached_randn((67, 256), abs=True, dtype=torch.float32),
+                ),
+                "3d_abs_fp32": (
+                    cached_randn((32, 64, 128), abs=True, dtype=torch.float32),
+                ),
+            },
+        },
+        (
+            "test_rsqrt_fp32",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "rsqrt": torch.rsqrt,  # undefined for zero or negative input
+            },
+            "param_sets": {
+                "1d_abs_nz_fp32": (
+                    cached_randn((64,), abs=True, dtype=torch.float32) + FP32_EPS,
+                ),
+                "2d_abs_nz_fp32": (
+                    cached_randn((67, 256), abs=True, dtype=torch.float32) + FP32_EPS,
+                ),
+                "3d_abs_nz_fp32": (
+                    cached_randn((32, 64, 128), abs=True, dtype=torch.float32)
+                    + FP32_EPS,
+                ),
+            },
+        },
+        (
             "test_log",
             "test_unary_op",
         ): {
