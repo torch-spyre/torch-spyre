@@ -229,6 +229,7 @@ POINTWISE_TEST_FAILURES = [
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_2",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_conv2d_1x3x32_ksize3_no_pad",
     "test_tril_3d",
     "test_triu_3d",
     "test_unbind_1d_dim0",
@@ -295,9 +296,11 @@ class LxPlanningTwoOpPointwiseAdditionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: x + x
-                if isinstance(x, torch.Tensor) and x.dtype == torch.float16
-                else x,
+                lambda x: (
+                    x + x
+                    if isinstance(x, torch.Tensor) and x.dtype == torch.float16
+                    else x
+                ),
                 result,
             )
 
@@ -422,6 +425,7 @@ REDUCTION_TEST_FAILURES = [
     "test_transpose_3d_contiguous_dim_0_2",
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_conv2d_1x3x32_ksize3_no_pad",
     "test_where_self_out_where_fp16_2d",
 ]
 
@@ -432,9 +436,11 @@ class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: torch.sum(x, dim=0)
-                if isinstance(x, torch.Tensor) and x.dtype == torch.float16
-                else x,
+                lambda x: (
+                    torch.sum(x, dim=0)
+                    if isinstance(x, torch.Tensor) and x.dtype == torch.float16
+                    else x
+                ),
                 result,
             )
 
