@@ -406,28 +406,19 @@ def generate_sdsc(
                 affine_strides.append(strides_for_tensor)
 
         def _start_addr_data(tensor):
+            # All per-core addresses were already registered by the per-tensor loop
+            # above. Look them up directly rather than re-computing SymbolKind.
             if "lx" in tensor.allocation:
                 return {
                     f"[{c}, 0, 0]": str(tensor.start_address)
                     for c in range(sdsc_spec.num_cores)
                 }
-            core0_addr = tensor.start_address + core_idx_to_slice_offset(
-                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
-            ) * num_bytes(tensor.data_format)
-            base_sym_idx = symbol_id_offset + len(local_symbols)
             result = {}
             for c in range(sdsc_spec.num_cores):
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
-                result[f"[{c}, 0, 0]"] = str(
-                    offset_as_symbol(
-                        addr,
-                        _per_core_kind(
-                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
-                        ),
-                    )
-                )
+                result[f"[{c}, 0, 0]"] = str(local_symbols[addr])
             return result
 
     else:
