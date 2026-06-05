@@ -188,9 +188,8 @@ Key points:
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
 single nested `LoopSpec`.  Below is the actual output produced by running the e2e test
 `test_hint_nested_loop_with_scratchpad` (which uses `spyre_hint(slices=...)` /
-`declare_tensor_dim` / `name_tensor_dims` with `lx_planning=True` and
-`allow_all_ops_in_lx_planning=True`; concrete HBM addresses replaced with
-symbolic names for readability):
+`declare_tensor_dim` / `name_tensor_dims` with `allow_all_ops_in_lx_planning=True`;
+concrete HBM addresses replaced with symbolic names for readability):
 
 ```python
 sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
@@ -501,13 +500,12 @@ k_fast_ops = (
     k_fast_division(operations) if config.core_id_k_fast_emission else []
 )
 work_distribution(operations, k_fast_ops)
-if config.lx_planning:
-    allocator = (
-        StrategyBCoOptimizingAllocator()
-        if config.co_optimizing_lx_planning
-        else None
-    )
-    scratchpad_planning(graph, allocator=allocator)
+allocator = (
+    StrategyBCoOptimizingAllocator()
+    if config.co_optimizing_lx_planning
+    else None
+)
+scratchpad_planning(graph, allocator=allocator)
 ```
 
 This ordering is required by several constraints:

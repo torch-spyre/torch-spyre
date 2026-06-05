@@ -18,7 +18,7 @@ from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
-lx_planning: bool = os.environ.get("LX_PLANNING", "0") == "1"
+lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )

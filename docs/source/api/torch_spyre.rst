@@ -400,8 +400,6 @@ Environment Variables
      - Purpose
    * - ``SENCORES``
      - Number of Spyre cores (1--32, default 32)
-   * - ``LX_PLANNING=1``
-     - Enable LX scratchpad memory planning during the pre-scheduling pass
    * - ``DXP_LX_FRAC_AVAIL``
      - Fraction of LX scratchpad available to the planner
 
