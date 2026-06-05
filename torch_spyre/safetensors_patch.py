@@ -103,15 +103,14 @@ def _assign_one(model, name, tensor, is_param, requires_grad=False):
 
 def patch_safetensors() -> None:
     """Patch safetensors to support device="spyre". Idempotent."""
-    global _patched
-    if _patched:
-        return
-
     try:
         import safetensors
         import safetensors.torch as st_torch
     except ImportError:
         logger.warning("safetensors not installed; patch has no effect")
+        return
+
+    if getattr(st_torch.load_file, "_spyre_patched", False):
         return
 
     orig_safe_open = st_torch.safe_open
@@ -132,7 +131,7 @@ def patch_safetensors() -> None:
 
         def __init__(self, filename, framework="pt", device="cpu"):
             self._target_is_spyre = (
-            device is not None and torch.device(device).type == DEVICE_NAME
+                device is not None and torch.device(device).type == DEVICE_NAME
             )
             if self._target_is_spyre:
                 self._inner = orig_safe_open(
@@ -200,13 +199,13 @@ def patch_safetensors() -> None:
             else:
                 missing.append(name)
         for name, buf in model.named_buffers():
-            if name in spyre_tensors:
-                if name in unexpected:
-                    unexpected.discard(name)
-                    _assign_one(model, name, spyre_tensors[name],
-                            is_param=False)
-            else:
+            if name not in spyre_tensors:
                 missing.append(name)
+                continue
+            unexpected.discard(name)
+            _assign_one(
+                model, name, spyre_tensors[name], is_param=False
+            )
 
         unexpected = sorted(unexpected)
         if strict and (missing or unexpected):
@@ -224,10 +223,13 @@ def patch_safetensors() -> None:
     # --- Install patches ---------------------------------------------
 
     st_torch.safe_open = _SpyreSafeOpen
+    # safe_open is one object reachable under two module paths; callers
+    # import from either, so rebind both names
     safetensors.safe_open = _SpyreSafeOpen
+    _spyre_load_file._spyre_patched = True
+    _spyre_load_model._spyre_patched = True
     st_torch.load_file = _spyre_load_file
     st_torch.load_model = _spyre_load_model
-    _patched = True
     logger.info(
         "Patched safetensors (safe_open, load_file, load_model) "
         "for Spyre device support (issue #400)"
