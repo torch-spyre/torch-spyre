@@ -1766,6 +1766,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "tuple": (((64, 64)), 1024.0),
                 "size": (torch.Size([64, 128]), 1024.0),
             },
+            "expect_fail": ["value_2"],
         },
         (
             "test_dropout_functional",
