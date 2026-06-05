@@ -24,27 +24,36 @@ class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
 
     Three variants (constructed via class methods):
-      - ``kernel()``:                  base HBM address of a kernel tensor arg;
-                                       emitted as a ``!sdscbundle.input_arg`` param.
-      - ``kernel_derived(idx, off)``:  per-core derived address = base + offset;
-                                       emitted as ``arith.addi %sym_0_N_extracted, off``.
-                                       ``base_sym_idx`` is the 0-based index into the
-                                       global ``symbols`` list of the kernel base symbol.
-      - ``pool()``:                    pool-allocated tensor address;
-                                       emitted as ``arith.addi %pool_extracted, value``.
+      - ``kernel(arg_index)``:               base HBM address of a kernel tensor arg;
+                                             emitted as a ``!sdscbundle.input_arg`` param
+                                             named ``%arg_{arg_index}``.
+      - ``kernel_derived(idx, off, arg_i)``: per-core derived address = base + offset;
+                                             emitted as ``arith.addi %arg_{arg_i}, off``.
+                                             ``base_sym_idx`` is the 0-based index into the
+                                             global ``symbols`` list of the kernel base symbol.
+      - ``pool()``:                          pool-allocated tensor address;
+                                             emitted as ``arith.addi %pool, value``.
     """
 
     kind: str
     base_sym_idx: int = -1
     offset: int = 0
+    arg_index: int = -1
 
     @classmethod
-    def kernel(cls) -> "SymbolKind":
-        return cls(kind="kernel")
+    def kernel(cls, arg_index: int) -> "SymbolKind":
+        return cls(kind="kernel", arg_index=arg_index)
 
     @classmethod
-    def kernel_derived(cls, base_sym_idx: int, offset: int) -> "SymbolKind":
-        return cls(kind="kernel_derived", base_sym_idx=base_sym_idx, offset=offset)
+    def kernel_derived(
+        cls, base_sym_idx: int, offset: int, arg_index: int
+    ) -> "SymbolKind":
+        return cls(
+            kind="kernel_derived",
+            base_sym_idx=base_sym_idx,
+            offset=offset,
+            arg_index=arg_index,
+        )
 
     @classmethod
     def pool(cls) -> "SymbolKind":
@@ -320,22 +329,23 @@ def generate_sdsc(
     local_symbol_kind: list[SymbolKind] = []
 
     def _per_core_kind(
-        c: int, is_kernel: bool, core0_addr: int, addr: int, base_sym_idx: int
+        c: int, arg_index: int, core0_addr: int, addr: int, base_sym_idx: int
     ) -> SymbolKind:
         """Return the SymbolKind for a per-core HBM address.
 
-        Core 0 of a kernel arg is the input_arg base; subsequent cores are
-        derived from it.  ``base_sym_idx`` is the 0-based index into the global
-        ``symbols`` list where the core-0 symbol was (or will be) registered.
-        Pool tensors always use SymbolKind.pool().
+        Core 0 of a kernel arg (arg_index >= 0) is the input_arg base; subsequent
+        cores are derived from it.  ``base_sym_idx`` is the 0-based index into the
+        global ``symbols`` list where the core-0 symbol was (or will be) registered.
+        Pool tensors (arg_index < 0) always use SymbolKind.pool().
         """
-        if not is_kernel:
+        if arg_index < 0:
             return SymbolKind.pool()
         if c == 0:
-            return SymbolKind.kernel()
+            return SymbolKind.kernel(arg_index=arg_index)
         return SymbolKind.kernel_derived(
             base_sym_idx=base_sym_idx,
             offset=addr - core0_addr,
+            arg_index=arg_index,
         )
 
     if use_symbols:
@@ -355,7 +365,6 @@ def generate_sdsc(
             if "lx" in tensor.allocation:
                 affine_strides.append({})
                 continue
-            is_kernel = tensor.arg_index >= 0
             core0_addr = tensor.start_address + core_idx_to_slice_offset(
                 tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
             ) * num_bytes(tensor.data_format)
@@ -371,7 +380,9 @@ def generate_sdsc(
                     ) * num_bytes(tensor.data_format)
                     offset_as_symbol(
                         addr,
-                        _per_core_kind(c, is_kernel, core0_addr, addr, base_sym_idx),
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
                     )
                 affine_strides.append({})
             else:
@@ -388,7 +399,9 @@ def generate_sdsc(
                     ) * num_bytes(tensor.data_format)
                     offset_as_symbol(
                         addr,
-                        _per_core_kind(c, is_kernel, core0_addr, addr, base_sym_idx),
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
                     )
                 affine_strides.append(strides_for_tensor)
 
@@ -398,7 +411,6 @@ def generate_sdsc(
                     f"[{c}, 0, 0]": str(tensor.start_address)
                     for c in range(sdsc_spec.num_cores)
                 }
-            is_kernel = tensor.arg_index >= 0
             core0_addr = tensor.start_address + core_idx_to_slice_offset(
                 tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
             ) * num_bytes(tensor.data_format)
@@ -411,7 +423,9 @@ def generate_sdsc(
                 result[f"[{c}, 0, 0]"] = str(
                     offset_as_symbol(
                         addr,
-                        _per_core_kind(c, is_kernel, core0_addr, addr, base_sym_idx),
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
                     )
                 )
             return result

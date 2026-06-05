@@ -1436,7 +1436,7 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
                 [{s0: outer_stride, s1: inner_stride}],
-                [SymbolKind.kernel()],
+                [SymbolKind.kernel(0)],
             )
 
         return fake_compile
@@ -1903,25 +1903,25 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 json_out,
                 [arg.allocation["hbm"] for arg in op_spec.args],
                 [{} for _ in op_spec.args],
-                [SymbolKind.kernel() for _ in op_spec.args],
+                [SymbolKind.kernel(arg.arg_index) for arg in op_spec.args],
             )
 
         mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
 
         self.assertIn(
             "func.func @sdsc_bundle("
-            "%sym_0_1: !sdscbundle.input_arg<index>,"
-            " %sym_0_2: !sdscbundle.input_arg<index>)",
+            "%arg_0_base_addr: !sdscbundle.input_arg<index>,"
+            " %arg_1_base_addr: !sdscbundle.input_arg<index>)",
             mlir,
         )
         self.assertIn(
-            "%sym_0_1_extracted = sdscbundle.input_arg_extract value from"
-            " %sym_0_1 : !sdscbundle.input_arg<index> -> index",
+            "%arg_0 = sdscbundle.input_arg_extract value from"
+            " %arg_0_base_addr : !sdscbundle.input_arg<index> -> index",
             mlir,
         )
         self.assertIn(
-            "%sym_0_2_extracted = sdscbundle.input_arg_extract value from"
-            " %sym_0_2 : !sdscbundle.input_arg<index> -> index",
+            "%arg_1 = sdscbundle.input_arg_extract value from"
+            " %arg_1_base_addr : !sdscbundle.input_arg<index> -> index",
             mlir,
         )
         self.assertNotIn("arith.constant 17179869184", mlir)
@@ -1937,12 +1937,12 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [op_spec.args[0].allocation["hbm"]],
                 [{}],
-                [SymbolKind.kernel()],
+                [SymbolKind.kernel(0)],
             )
 
         mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
 
-        self.assertIn("sdscbundle.sdsc_execute (%sym_0_1_extracted)", mlir)
+        self.assertIn("sdscbundle.sdsc_execute (%arg_0)", mlir)
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
         self.assertNotIn("sdsc_execute (%sym_1)", mlir)
 
@@ -1975,18 +1975,18 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(values[i])
             kind = (
-                SymbolKind.kernel() if i == 0 else SymbolKind.pool()
+                SymbolKind.kernel(0) if i == 0 else SymbolKind.pool()
             )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
         mlir = self._bundle([op_a, op_b], symbolic_args=True, fake_compile=fake)
 
         # First sym → parameter (kernel tensor arg)
-        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
+        self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("arith.constant 17179869184", mlir)
-        # Second sym → pool: arith.addi %pool_extracted, <offset>
-        self.assertIn("%pool: !sdscbundle.input_arg<index>", mlir)
-        self.assertIn("%sym_2 = arith.addi %pool_extracted", mlir)
+        # Second sym → pool: arith.addi %pool, <offset>
+        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertIn("%pool_addr_0 = arith.addi %pool", mlir)
 
     def test_symbolic_args_false_no_params(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
@@ -1998,7 +1998,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 _make_tiled_json(idx, sym_id),
                 [op_spec.args[0].allocation["hbm"]],
                 [{}],
-                [SymbolKind.kernel()],
+                [SymbolKind.kernel(0)],
             )
 
         mlir = self._bundle([a], symbolic_args=False, fake_compile=fake)
@@ -2057,8 +2057,10 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                     ],
                 }
             }
-            # All symbols in this test are kernel args — all become input_arg params.
-            symbol_kind_flags = [SymbolKind.kernel()] * n
+            # All symbols are kernel args; use the running symbol index as arg_index
+            # so each unique value produces a distinct input_arg param.
+            sym_start = sum(sym_counts[:i])
+            symbol_kind_flags = [SymbolKind.kernel(sym_start + j) for j in range(n)]
             return (
                 json_out,
                 sym_values[start : start + n],
@@ -2068,16 +2070,14 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         mlir = self._bundle([op0] + ops_rest, symbolic_args=True, fake_compile=fake)
 
-        # Symbols with the same address are deduped: 12 symbols → 6 unique params
-        # (sym_values has many repeats: 0x400000000, 0x800000000, 0x0, 0xC00000000,
-        #  0x1000000000, 0x1400000000 are the 6 distinct values)
-        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
-        self.assertIn("%sym_0_6: !sdscbundle.input_arg<index>", mlir)
-        self.assertNotIn("%sym_0_7:", mlir)
+        # 12 symbols with 6 unique values → 6 unique params
+        # Param names derive from arg_index (= symbol position in sym_values list)
+        self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertIn("%arg_1_base_addr: !sdscbundle.input_arg<index>", mlir)
+        # There are exactly 6 input_arg params (each appears twice: param + extract)
+        self.assertEqual(mlir.count("!sdscbundle.input_arg<index>"), 6 * 2)
         # First sdsc_execute uses first two extracted names
-        self.assertIn(
-            "sdscbundle.sdsc_execute (%sym_0_1_extracted, %sym_0_2_extracted)", mlir
-        )
+        self.assertIn("sdscbundle.sdsc_execute (%arg_0, %arg_1)", mlir)
         # Duplicate addresses reuse existing extracted SSA names
         self.assertNotIn("arith.constant", mlir)
         self.assertNotIn("%pool:", mlir)
@@ -2094,21 +2094,17 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(base)
-            return _make_tiled_json(idx, sym_id), [base], [{}], [SymbolKind.kernel()]
+            return _make_tiled_json(idx, sym_id), [base], [{}], [SymbolKind.kernel(0)]
 
         mlir = self._bundle([a, b], symbolic_args=True, fake_compile=fake)
 
         # Only one input_arg param (deduped cross-SDSC)
-        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
+        self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("%sym_0_2:", mlir)
         # Both sdsc_execute ops reference the same extracted name
         execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
-        self.assertEqual(
-            execute_lines[0].split("(")[1].split(")")[0], "%sym_0_1_extracted"
-        )
-        self.assertEqual(
-            execute_lines[1].split("(")[1].split(")")[0], "%sym_0_1_extracted"
-        )
+        self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%arg_0")
+        self.assertEqual(execute_lines[1].split("(")[1].split(")")[0], "%arg_0")
 
     def test_pool_offset_constants_deduped(self):
         """Pool symbols with the same offset share one arith.addi SSA variable."""
@@ -2137,14 +2133,16 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
         self.assertEqual(mlir.count("arith.constant 0 : index"), 1)
         self.assertEqual(mlir.count("arith.constant 2048 : index"), 1)
-        self.assertEqual(mlir.count("arith.addi %pool_extracted"), 2)
-        # op[0] and op[2] both use %sym_1 (offset 0); op[1] uses %sym_2 (offset 2048)
-        self.assertIn("sdscbundle.sdsc_execute (%sym_1)", mlir)
-        self.assertIn("sdscbundle.sdsc_execute (%sym_2)", mlir)
+        self.assertEqual(mlir.count("arith.addi %pool"), 2)
+        # op[0] and op[2] both use %pool_addr_0; op[1] uses %pool_addr_2048
+        self.assertIn("sdscbundle.sdsc_execute (%pool_addr_0)", mlir)
+        self.assertIn("sdscbundle.sdsc_execute (%pool_addr_2048)", mlir)
         execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
-        self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%sym_1")
-        self.assertEqual(execute_lines[1].split("(")[1].split(")")[0], "%sym_2")
-        self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%sym_1")
+        self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%pool_addr_0")
+        self.assertEqual(
+            execute_lines[1].split("(")[1].split(")")[0], "%pool_addr_2048"
+        )
+        self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%pool_addr_0")
 
 
 class TestSymbolKind(unittest.TestCase):
@@ -2162,13 +2160,13 @@ class TestSymbolKind(unittest.TestCase):
         _ = SymbolKind  # importable as a top-level name
 
     def test_kernel_base_kind(self):
-        sk = SymbolKind.kernel()
+        sk = SymbolKind.kernel(0)
         self.assertEqual(sk.kind, "kernel")
         self.assertFalse(sk.is_derived)
         self.assertFalse(sk.is_pool)
 
     def test_kernel_derived_kind_carries_base_index_and_offset(self):
-        sk = SymbolKind.kernel_derived(base_sym_idx=3, offset=512)
+        sk = SymbolKind.kernel_derived(base_sym_idx=3, offset=512, arg_index=0)
         self.assertEqual(sk.kind, "kernel_derived")
         self.assertEqual(sk.base_sym_idx, 3)
         self.assertEqual(sk.offset, 512)
@@ -2253,13 +2251,13 @@ class TestSymbolKind(unittest.TestCase):
                 # op0: sym 0 = kernel base, sym 1 = kernel_derived +1024
                 symbols.append(base)
                 symbols.append(base + off)
-                kinds = [SymbolKind.kernel(), SymbolKind.kernel_derived(0, off)]
+                kinds = [SymbolKind.kernel(0), SymbolKind.kernel_derived(0, off, 0)]
                 json0 = _make_tiled_json(idx, -(symbol_id_offset + 1))
                 return json0, [base, base + off], [{}, {}], kinds
             else:
                 # op1: reuses same derived offset — sym 2
                 symbols.append(base + off)
-                kinds = [SymbolKind.kernel_derived(0, off)]
+                kinds = [SymbolKind.kernel_derived(0, off, 0)]
                 json1 = _make_tiled_json(idx, -(symbol_id_offset + 1))
                 return json1, [base + off], [{}], kinds
 
@@ -2278,18 +2276,18 @@ class TestSymbolKind(unittest.TestCase):
         mlir = _read_mlir(self.tmpdir)
 
         # Only one input_arg param (the kernel base)
-        self.assertIn("%sym_0_1: !sdscbundle.input_arg<index>", mlir)
+        self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("%sym_0_2:", mlir)
         # Derived address emitted once as arith.addi (deduped across both ops)
         self.assertEqual(mlir.count("arith.constant 1024"), 1)
-        self.assertEqual(mlir.count("arith.addi %sym_0_1_extracted"), 1)
+        self.assertEqual(mlir.count("arith.addi %arg_0"), 1)
         # op0's execute has the kernel base; op1's execute has the derived %sym_N
         # Both refer to the same canonical derived SSA — no second arith.addi for op1
-        self.assertIn("sdscbundle.sdsc_execute (%sym_0_1_extracted)", mlir)
-        # op1 operand is the canonical derived var (%sym_2), not a new addi
+        self.assertIn("sdscbundle.sdsc_execute (%arg_0)", mlir)
+        # op1 operand is the canonical derived var (%arg_0_core_1024), not a new addi
         execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
         op1_operand = execute_lines[1].split("(")[1].split(")")[0].strip()
-        self.assertTrue(op1_operand.startswith("%sym_"), op1_operand)
+        self.assertIn("arg_0_core", op1_operand)  # derived from arg_0 with offset
         self.assertNotIn("input_arg_extract", op1_operand)
 
 

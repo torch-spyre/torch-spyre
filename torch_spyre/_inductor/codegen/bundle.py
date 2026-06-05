@@ -167,25 +167,28 @@ def generate_bundle(
         f.write("module {\n")
 
         # Function signature when symbolic_args is active:
-        #   - optional leading %pool param for pool-allocated tensors
-        #   - one !sdscbundle.input_arg<index> param per kernel tensor arg base symbol
+        #   - optional leading %pool_base_addr param for pool-allocated tensors
+        #   - one !sdscbundle.input_arg<index> param per kernel tensor arg, with a
+        #     descriptive formal name %arg_{arg_index}_base_addr; the short form
+        #     %arg_{arg_index} is used in the body after input_arg_extract
         if symbolic_args and use_symbols and (has_pool or kernel_arg_sym_indices):
             params = []
             if has_pool:
-                params.append("%pool: !sdscbundle.input_arg<index>")
-            for pos, _ in enumerate(kernel_arg_sym_indices):
-                params.append(f"%sym_0_{pos + 1}: !sdscbundle.input_arg<index>")
+                params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
+            for sym_idx in kernel_arg_sym_indices:
+                ai = symbol_kinds[sym_idx].arg_index
+                params.append(f"%arg_{ai}_base_addr: !sdscbundle.input_arg<index>")
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
             if has_pool:
                 f.write(
-                    "\t\t%pool_extracted = sdscbundle.input_arg_extract value from"
-                    " %pool : !sdscbundle.input_arg<index> -> index\n"
+                    "\t\t%pool = sdscbundle.input_arg_extract value from"
+                    " %pool_base_addr : !sdscbundle.input_arg<index> -> index\n"
                 )
-            for pos, _ in enumerate(kernel_arg_sym_indices):
-                n = pos + 1
+            for sym_idx in kernel_arg_sym_indices:
+                ai = symbol_kinds[sym_idx].arg_index
                 f.write(
-                    f"\t\t%sym_0_{n}_extracted = sdscbundle.input_arg_extract value from"
-                    f" %sym_0_{n} : !sdscbundle.input_arg<index> -> index\n"
+                    f"\t\t%arg_{ai} = sdscbundle.input_arg_extract value from"
+                    f" %arg_{ai}_base_addr : !sdscbundle.input_arg<index> -> index\n"
                 )
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
@@ -199,29 +202,30 @@ def generate_bundle(
 
         # Emit one declaration per symbol (symbolic_args path):
         #   - "kernel"          → skipped; already a function param + extract op above
-        #   - "kernel_derived"  → arith.addi %sym_0_N_extracted, <per_core_offset>
-        #                         deduped by (base_param_index, offset) pair
-        #   - "pool"            → arith.addi %pool_extracted, <pool_offset>
+        #   - "kernel_derived"  → arith.addi %arg_{arg_index}, <per_core_offset>
+        #                         deduped by (arg_index, offset) pair
+        #   - "pool"            → arith.addi %pool, <pool_offset>
         #                         deduped by pool offset value
         #   - anything else     → arith.constant (use_symbols=False or non-symbolic path)
         # All kernel sym indices to skip during emission (canonical + duplicates).
         kernel_arg_sym_set = set(kernel_arg_sym_indices) | set(kernel_dup_canonical)
-        # Map kernel base sym_idx → positional parameter index (1-based name suffix).
-        # Duplicate kernel sym indices map to the same pos as their canonical.
-        kernel_base_to_pos: dict[int, int] = {
-            sym_idx: pos + 1 for pos, sym_idx in enumerate(kernel_arg_sym_indices)
+        # Map kernel sym_idx → arg_index for SSA name generation.
+        # Duplicate kernel sym indices inherit the arg_index of their canonical.
+        kernel_sym_to_arg_idx: dict[int, int] = {
+            sym_idx: symbol_kinds[sym_idx].arg_index
+            for sym_idx in kernel_arg_sym_indices
         }
         for dup_idx, canon_idx in kernel_dup_canonical.items():
-            if canon_idx in kernel_base_to_pos:
-                kernel_base_to_pos[dup_idx] = kernel_base_to_pos[canon_idx]
+            if canon_idx in kernel_sym_to_arg_idx:
+                kernel_sym_to_arg_idx[dup_idx] = kernel_sym_to_arg_idx[canon_idx]
         # sym_canonical[sym_idx] → canonical SSA name for derived/pool symbols (deduped).
-        # Also pre-populate with duplicate kernel symbols pointing to their canonical name.
+        # Also pre-populate duplicate kernel sym_idx entries with their canonical extracted name.
         sym_canonical: dict[int, str] = {
-            dup_idx: f"%sym_0_{kernel_base_to_pos[dup_idx]}_extracted"
+            dup_idx: f"%arg_{kernel_sym_to_arg_idx[dup_idx]}"
             for dup_idx in kernel_dup_canonical
-            if dup_idx in kernel_base_to_pos
+            if dup_idx in kernel_sym_to_arg_idx
         }
-        # derived_addi_emitted[(base_param_pos, offset)] → SSA name already emitted
+        # derived_addi_emitted[(arg_index, offset)] → SSA name already emitted
         derived_addi_emitted: dict[tuple[int, int], str] = {}
         # pool_addi_emitted[pool_offset_value] → SSA name already emitted
         pool_addi_emitted: dict[int, str] = {}
@@ -231,18 +235,18 @@ def generate_bundle(
                 continue  # replaced by function parameter + extract op (or duplicate)
             sk: SymbolKind | None = symbol_kinds[sym_idx] if symbol_kinds else None
             if sk is not None and sk.is_derived:
-                base_pos = kernel_base_to_pos.get(sk.base_sym_idx)
-                if base_pos is not None:
-                    key = (base_pos, sk.offset)
+                base_ai = kernel_sym_to_arg_idx.get(sk.base_sym_idx)
+                if base_ai is not None:
+                    key = (base_ai, sk.offset)
                     if key not in derived_addi_emitted:
-                        offset_ssa = f"%core_offset_{sym_idx + 1}"
-                        addi_ssa = f"%sym_{sym_idx + 1}"
+                        offset_ssa = f"%arg_{base_ai}_core_offset_{sk.offset}"
+                        addi_ssa = f"%arg_{base_ai}_core_{sk.offset}"
                         f.write(
                             f"\t\t{offset_ssa} = arith.constant {sk.offset} : index\n"
                         )
                         f.write(
                             f"\t\t{addi_ssa} = arith.addi"
-                            f" %sym_0_{base_pos}_extracted, {offset_ssa} : index\n"
+                            f" %arg_{base_ai}, {offset_ssa} : index\n"
                         )
                         derived_addi_emitted[key] = addi_ssa
                     sym_canonical[sym_idx] = derived_addi_emitted[key]
@@ -252,12 +256,11 @@ def generate_bundle(
                     )
             elif sk is not None and sk.is_pool:
                 if value not in pool_addi_emitted:
-                    offset_ssa = f"%pool_offset_{sym_idx + 1}"
-                    addi_ssa = f"%sym_{sym_idx + 1}"
+                    offset_ssa = f"%pool_offset_{value}"
+                    addi_ssa = f"%pool_addr_{value}"
                     f.write(f"\t\t{offset_ssa} = arith.constant {value} : index\n")
                     f.write(
-                        f"\t\t{addi_ssa} = arith.addi %pool_extracted,"
-                        f" {offset_ssa} : index\n"
+                        f"\t\t{addi_ssa} = arith.addi %pool, {offset_ssa} : index\n"
                     )
                     pool_addi_emitted[value] = addi_ssa
                 sym_canonical[sym_idx] = pool_addi_emitted[value]
@@ -278,7 +281,7 @@ def generate_bundle(
             indent=2,
             use_symbols=use_symbols,
             symbolic_args=symbolic_args,
-            kernel_arg_sym_indices=kernel_arg_sym_indices,
+            kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
             sym_canonical=sym_canonical,
         )
 
@@ -407,20 +410,19 @@ def _emit_specs(
     indent: int,
     use_symbols: bool = False,
     symbolic_args: bool = False,
-    kernel_arg_sym_indices: list | None = None,
+    kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
-    if kernel_arg_sym_indices is None:
-        kernel_arg_sym_indices = []
+    if kernel_sym_to_arg_idx is None:
+        kernel_sym_to_arg_idx = {}
     if sym_canonical is None:
         sym_canonical = {}
 
-    # Map from 0-based symbol index to the extracted SSA name for kernel-arg symbols.
-    # kernel_arg_sym_indices[pos] = sym_idx  →  %sym_0_{pos+1}_extracted
+    # Map from 0-based symbol index to the short SSA name for kernel-arg symbols.
+    # sym_idx → %arg_{arg_index}  (the result of input_arg_extract in the function body)
     kernel_arg_sym_to_name: dict[int, str] = {
-        sym_idx: f"%sym_0_{pos + 1}_extracted"
-        for pos, sym_idx in enumerate(kernel_arg_sym_indices)
+        sym_idx: f"%arg_{ai}" for sym_idx, ai in kernel_sym_to_arg_idx.items()
     }
 
     def _resolve_sym(sid: int) -> str:
@@ -454,7 +456,7 @@ def _emit_specs(
                 indent + 1,
                 use_symbols=use_symbols,
                 symbolic_args=symbolic_args,
-                kernel_arg_sym_indices=kernel_arg_sym_indices,
+                kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
             )
             f.write(f"{tab}}}\n")
