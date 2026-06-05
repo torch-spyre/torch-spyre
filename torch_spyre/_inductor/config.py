@@ -40,8 +40,6 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-coarse_tiling: bool = os.environ.get("COARSE_TILING", "0") == "1"
-
 # When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
 # constants) in bundle.mlir and resolved via affine.apply for tiled loops.
 # Requires backend compiler support for the sdscbundle symbol table, which is
