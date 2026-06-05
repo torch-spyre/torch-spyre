@@ -133,6 +133,12 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     return res
 
 
+def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
+    """Return host coordinates for the output dep of a ComputedBuffer."""
+    output_dep = next(iter(op.get_read_writes().writes))
+    return host_coordinates(op.get_layout(), output_dep)
+
+
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
