@@ -5163,7 +5163,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_round_trip_to_dtype_cpu(self, op, x, dst_dtype):
         def fn(op, x, dst_dtype):
-            y = x.to(dtype=dst_dtype)
+            y = x.to(dst_dtype)
             z = op(y, y)
             return z.to(x.dtype)
 
