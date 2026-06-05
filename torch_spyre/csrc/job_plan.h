@@ -16,14 +16,18 @@
 
 #pragma once
 
+#include <sys/mman.h>
 #include <torch/types.h>
 
 #include <cstdint>
 #include <flex/flex.hpp>
-#include <functional>
+#include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include "util/spyrecode.h"
 
 // Forward declarations for flex types
 namespace flex {
@@ -33,31 +37,145 @@ class RuntimeOperation;
 namespace spyre {
 
 /**
- * @brief Base class for host compute operation metadata
+ * @brief RAII wrapper for page-aligned and pinned host memory
  *
- * This polymorphic base class allows different host compute operations
- * to define their own metadata structures while maintaining type safety
- * and avoiding JSON parsing overhead.
+ * Allocates CPU memory aligned to page boundaries. Attempts to pin memory, but
+ * gracefully falls back to unpinned memory if mlock fails.
+ *
+ * Memory is automatically freed and unpinned when the object is destroyed.
  */
-struct HostComputeMetadata {
-  virtual ~HostComputeMetadata() = default;
+class HostBuffer {
+ public:
+  /**
+   * @brief Default constructor - creates empty buffer
+   */
+  HostBuffer() = default;
+
+  /**
+   * @brief Allocate aligned and optionally pinned host memory
+   * @param size Size in bytes
+   * @param alignment Alignment in bytes (default: system page size)
+   */
+  explicit HostBuffer(size_t size, size_t alignment = 0)
+      : size_(size), pinned_(false) {
+    // Use system page size if alignment not specified
+    if (alignment == 0) {
+      alignment_ = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    } else {
+      alignment_ = alignment;
+    }
+
+    // 1. Allocate aligned memory
+    int ret = posix_memalign(&ptr_, alignment_, size_);
+    if (ret != 0 || ptr_ == nullptr) {
+      throw std::bad_alloc();
+    }
+
+    // 2. Try to pin memory
+    ret = mlock(ptr_, size_);
+    if (ret == 0) {
+      pinned_ = true;
+    } else {
+      // mlock failed - log warning but continue with unpinned memory
+      // Common reasons: insufficient ulimit -l, not enough RAM
+      TORCH_WARN_ONCE(
+          "mlock failed: ", std::strerror(errno), ". ",
+          "Using unpinned memory (still aligned). ",
+          "For best performance, run 'ulimit -l unlimited' before starting.");
+    }
+  }
+
+  ~HostBuffer() {
+    if (ptr_) {
+      if (pinned_) {
+        munlock(ptr_, size_);
+      }
+      std::free(ptr_);
+    }
+  }
+
+  // Disable copy (move-only)
+  HostBuffer(const HostBuffer&) = delete;
+  HostBuffer& operator=(const HostBuffer&) = delete;
+
+  // Enable move
+  HostBuffer(HostBuffer&& other) noexcept
+      : ptr_(other.ptr_),
+        size_(other.size_),
+        alignment_(other.alignment_),
+        pinned_(other.pinned_) {
+    other.ptr_ = nullptr;
+    other.size_ = 0;
+    other.alignment_ = 0;
+    other.pinned_ = false;
+  }
+
+  HostBuffer& operator=(HostBuffer&& other) noexcept {
+    if (this != &other) {
+      // Clean up current resources
+      if (ptr_) {
+        if (pinned_) {
+          munlock(ptr_, size_);
+        }
+        std::free(ptr_);
+      }
+
+      // Move from other
+      ptr_ = other.ptr_;
+      size_ = other.size_;
+      alignment_ = other.alignment_;
+      pinned_ = other.pinned_;
+
+      // Reset other
+      other.ptr_ = nullptr;
+      other.size_ = 0;
+      other.alignment_ = 0;
+      other.pinned_ = false;
+    }
+    return *this;
+  }
+
+  /**
+   * @brief Get pointer to the allocated memory
+   * @return Pointer to aligned (and possibly pinned) memory
+   */
+  void* data() const {
+    return ptr_;
+  }
+
+  /**
+   * @brief Get size of the allocation
+   * @return Size in bytes
+   */
+  size_t size() const {
+    return size_;
+  }
+
+  /**
+   * @brief Get alignment of the allocation
+   * @return Alignment in bytes
+   */
+  size_t alignment() const {
+    return alignment_;
+  }
+
+  /**
+   * @brief Check if memory is pinned
+   * @return True if mlock succeeded, false otherwise
+   */
+  bool is_pinned() const {
+    return pinned_;
+  }
+
+ private:
+  void* ptr_ = nullptr;
+  size_t size_ = 0;
+  size_t alignment_ = 0;
+  bool pinned_ = false;
 };
 
-/**
- * @brief Function type for host-side computation operations
- *
- * This callable type represents host-side operations such as program
- * correction, collectives, and other host computations that need to be
- * executed as part of a job plan.
- *
- * @param metadata Reference to operation-specific metadata (contains buffer
- * sizes)
- * @param input_buffer Pointer to input buffer containing source data
- * @param output_buffer Pointer to output buffer for results
- */
-using HostComputeFunction =
-    std::function<void(HostComputeMetadata* metadata, void* output_buffer,
-                       const void* input_buffer)>;
+// Note: host compute metadata is defined in deeptools as Hcm, and host compute
+// function is defined as deeptools::processComputeOnHostCommand
 
 /**
  * @brief Context passed to JobPlanStep::construct() at launch time
@@ -104,6 +222,16 @@ class JobPlanStep {
       LaunchContext& ctx) const = 0;
 
   /**
+   * @brief Write step information to output stream
+   *
+   * Pure virtual method for derived classes to implement their specific
+   * output format. Called by operator<<.
+   *
+   * @param os Output stream to write to
+   */
+  virtual void write(std::ostream& os) const = 0;
+
+  /**
    * @brief Enable or disable pipeline barrier for this step
    *
    * Pipeline barriers control operation ordering within a stream. When enabled,
@@ -127,6 +255,18 @@ class JobPlanStep {
  protected:
   bool pipeline_barrier_ = false;
 };
+
+/**
+ * @brief Stream output operator for JobPlanStep
+ *
+ * @param os Output stream to write to
+ * @param step JobPlanStep to output
+ * @return Reference to the output stream
+ */
+inline std::ostream& operator<<(std::ostream& os, const JobPlanStep& step) {
+  step.write(os);
+  return os;
+}
 
 /**
  * @brief Host-to-device transfer step
@@ -155,6 +295,8 @@ class JobPlanStepH2D final : public JobPlanStep {
   std::unique_ptr<flex::RuntimeOperation> construct(
       LaunchContext& ctx) const override;
 
+  void write(std::ostream& os) const override;
+
  private:
   void* host_address_;  // Non-owning pointer (JobPlan owns the buffer)
   flex::CompositeAddress device_address_;
@@ -181,6 +323,8 @@ class JobPlanStepD2H final : public JobPlanStep {
   std::unique_ptr<flex::RuntimeOperation> construct(
       LaunchContext& ctx) const override;
 
+  void write(std::ostream& os) const override;
+
  private:
   flex::CompositeAddress device_address_;
   void* host_address_;
@@ -199,34 +343,38 @@ class JobPlanStepCompute final : public JobPlanStep {
    *
    * @param binary_address Address of the program binary on device
    * @param bind_io_addresses Whether to bind the compute operation
+   * @param bootstrap_addr Bootstrap address for program execution
    * with inputs and outputs addresses
    */
   explicit JobPlanStepCompute(flex::CompositeAddress binary_address,
-                              bool bind_io_addresses)
+                              bool bind_io_addresses,
+                              uint64_t bootstrap_addr = flex::PROG_OFFSET_BASE)
       : binary_address_(std::move(binary_address)),
-        bind_io_addresses_(bind_io_addresses) {}
+        bind_io_addresses_(bind_io_addresses),
+        bootstrap_addr_(bootstrap_addr) {}
 
   std::unique_ptr<flex::RuntimeOperation> construct(
       LaunchContext& ctx) const override;
 
+  void write(std::ostream& os) const override;
+
  private:
   flex::CompositeAddress binary_address_;
   bool bind_io_addresses_;
+  uint64_t bootstrap_addr_;
 };
 
 /**
  * @brief Host-side computation step (e.g., program correction)
  *
- * The host function, compiler metadata, and a shared output buffer are stored
- * directly as members during PrepareKernel. The host function (e.g., the
- * program correction routine) is a predefined runtime function — SpyreCode's
- * ComputeOnHost command identifies which function to invoke, and torch-spyre
- * maps it to the corresponding built-in HostComputeFunction during SpyreCode
- * translation.
+ * Stores compiler metadata (Hcm) and a shared output buffer during
+ * PrepareKernel. The host computation uses
+ * deeptools::processComputeOnHostCommand which takes Hcm metadata and performs
+ * program correction or other host-side operations.
  *
  * The output buffer is a pointer to pinned host memory, shared
  * with the subsequent JobPlanStepH2D that transfers it to device. construct()
- * builds a closure capturing the function, metadata, composite addresses, and
+ * builds a closure capturing the metadata, composite addresses, and
  * the buffer, and produces a RuntimeOperationHostCallback.
  *
  * The shared buffer is allocated once during PrepareKernel and reused across
@@ -239,26 +387,29 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   /**
    * @brief Construct host compute step
    *
-   * @param function Predefined runtime host compute function (e.g., program
-   *                 correction), selected during SpyreCode translation
-   * @param metadata Compiler-provided metadata (e.g., hcm.json / vdci.json
-   *                 describing how symbolic values must be interpreted)
+   * @param hcm Compiler-provided metadata from deeptools (contains vdci and
+   *            senConstants describing how symbolic values must be interpreted)
    * @param output_buffer Pinned host buffer (lifetime managed by JobPlan)
+   * @param input_buffer Pinned host buffer (lifetime managed by JobPlan)
+   * @param ishape used for constructing input buffer
    */
-  JobPlanStepHostCompute(HostComputeFunction function,
-                         std::unique_ptr<HostComputeMetadata> metadata,
-                         void* output_buffer)
-      : function_(std::move(function)),
-        metadata_(std::move(metadata)),
-        output_buffer_(output_buffer) {}
+  JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, void* output_buffer,
+                         const void* input_buffer, std::vector<int64_t> ishape)
+      : hcm_(std::move(hcm)),
+        output_buffer_(output_buffer),
+        input_buffer_(input_buffer),
+        ishape_(ishape) {}
 
   std::unique_ptr<flex::RuntimeOperation> construct(
       LaunchContext& ctx) const override;
 
+  void write(std::ostream& os) const override;
+
  private:
-  HostComputeFunction function_;
-  std::unique_ptr<HostComputeMetadata> metadata_;
-  void* output_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
+  std::unique_ptr<Hcm> hcm_;
+  void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
+  const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
+  std::vector<int64_t> ishape_;
 };
 
 /**
@@ -328,11 +479,22 @@ struct JobPlan {
    * buffers via raw pointers. Buffers are automatically freed when JobPlan
    * is destroyed.
    *
-   * Allocated using torch::empty() with .pinned_memory(true) during
-   * PrepareKernel. The pinned memory ensures efficient DMA transfers and
-   * prevents OS from swapping pages to disk.
    */
-  std::vector<torch::Tensor> pinned_buffers;
+  // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
+  std::vector<HostBuffer> pinned_buffers;
 };
+
+/**
+ * @brief Stream output operator for JobPlan
+ *
+ * Outputs a human-readable summary of the JobPlan including step types,
+ * addresses, and metadata. Controlled by TORCH_SPYRE_DEBUG environment
+ * variable.
+ *
+ * @param os Output stream to write to
+ * @param plan JobPlan to output
+ * @return Reference to the output stream
+ */
+std::ostream& operator<<(std::ostream& os, const JobPlan& plan);
 
 }  // namespace spyre

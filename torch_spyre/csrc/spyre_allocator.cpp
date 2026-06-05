@@ -144,6 +144,7 @@ c10::DataPtr SpyreAllocator::allocate(
   flex::CompositeAddress composite_addr =
       flex_alloc->allocate(nbytes, directive);
 
+  DEBUGINFO("allocated ", composite_addr);
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
   // accurate memory profiling.

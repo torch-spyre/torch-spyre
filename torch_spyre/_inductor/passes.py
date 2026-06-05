@@ -35,8 +35,8 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
-    hints_to_coarse_tile_groups,
 )
+from .coarse_tile import hints_to_coarse_tile_groups
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,

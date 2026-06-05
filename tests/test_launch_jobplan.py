@@ -15,58 +15,73 @@
 """Tests for launching simple compiled ops through JobPlan execution."""
 
 import os
+from contextlib import contextmanager
 
 import pytest
 import torch
 
 
+@contextmanager
+def set_env_vars(**env_vars):
+    """Context manager to temporarily set environment variables."""
+    previous = {key: os.environ.get(key) for key in env_vars}
+    try:
+        for key, value in env_vars.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, prev_value in previous.items():
+            if prev_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev_value
+
+
 class TestLaunchJobPlan:
     """Test suite for JobPlan-backed compiled op execution."""
 
-    def test_dump_spyre_code_abs_matches_cpu(self):
-        """Run a simple compiled op with `DUMP_SPYRE_CODE=1` and compare to CPU."""
+    @pytest.mark.parametrize(
+        "env_vars",
+        [
+            {"DUMP_SPYRE_CODE": "1"},
+            {"DUMP_SPYRE_CODE": "1", "BUNDLE_HBM_SYMBOLS": "1"},
+        ],
+        ids=["SpyreCode, no symbols", "SpyreCode, fake symbols"],
+    )
+    def test_abs_matches_cpu(self, env_vars):
+        """Run compiled abs op with various env settings and compare to CPU."""
         x = torch.randn(64, dtype=torch.float16)
         cpu_result = torch.abs(x)
 
-        previous = os.environ.get("DUMP_SPYRE_CODE")
-        os.environ["DUMP_SPYRE_CODE"] = "1"
-        try:
-            # Compile and run on Spyre
+        with set_env_vars(**env_vars):
             compiled_fn = torch.compile(torch.abs, backend="inductor")
             spyre_result = compiled_fn(x.to("spyre")).cpu()
 
-            # Compare results
             torch.testing.assert_close(
                 spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
             )
-        finally:
-            if previous is None:
-                del os.environ["DUMP_SPYRE_CODE"]
-            else:
-                os.environ["DUMP_SPYRE_CODE"] = previous
 
-    def test_dump_spyre_code_mul_matches_cpu(self):
-        """Run a simple compiled binary op with `DUMP_SPYRE_CODE=1` and compare to CPU."""
+    @pytest.mark.parametrize(
+        "env_vars",
+        [
+            {"DUMP_SPYRE_CODE": "1"},
+            {"DUMP_SPYRE_CODE": "1", "BUNDLE_HBM_SYMBOLS": "1"},
+        ],
+        ids=["SpyreCode, no symbols", "SpyreCode, fake symbols"],
+    )
+    def test_mul_matches_cpu(self, env_vars):
+        """Run compiled mul op with various env settings and compare to CPU."""
         x = torch.randn(64, dtype=torch.float16)
         y = torch.randn(64, dtype=torch.float16)
         cpu_result = torch.mul(x, y)
 
-        previous = os.environ.get("DUMP_SPYRE_CODE")
-        os.environ["DUMP_SPYRE_CODE"] = "1"
-        try:
-            # Compile and run on Spyre
+        with set_env_vars(**env_vars):
             compiled_fn = torch.compile(torch.mul, backend="inductor")
             spyre_result = compiled_fn(x.to("spyre"), y.to("spyre")).cpu()
 
-            # Compare results
             torch.testing.assert_close(
                 spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
             )
-        finally:
-            if previous is None:
-                del os.environ["DUMP_SPYRE_CODE"]
-            else:
-                os.environ["DUMP_SPYRE_CODE"] = previous
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
-lx_planning: bool = os.environ.get("LX_PLANNING", "0") == "1"
+lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
@@ -45,6 +45,12 @@ core_id_k_fast_emission: bool = (
 # Requires backend compiler support for the sdscbundle symbol table, which is
 # still under development.
 bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
+
+# When True, the generated func.func @sdsc_bundle takes one
+# !sdscbundle.input_arg<index> parameter per tensor argument and extracts
+# each to a local SSA value, rather than emitting arith.constant offsets.
+# Requires bundle_hbm_symbols=True to have any effect.
+bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
