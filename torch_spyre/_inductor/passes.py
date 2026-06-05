@@ -279,12 +279,13 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         span_reduction(operations)
         cost_model_ops = cost_model_matmul_division(operations)
         work_distribution(operations, cost_model_ops)
-        allocator = (
-            StrategyBCoOptimizingAllocator()
-            if config.co_optimizing_lx_planning
-            else None
-        )
-        scratchpad_planning(graph, allocator=allocator)
+        if config.lx_planning:
+            allocator = (
+                StrategyBCoOptimizingAllocator()
+                if config.co_optimizing_lx_planning
+                else None
+            )
+            scratchpad_planning(graph, allocator=allocator)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))
