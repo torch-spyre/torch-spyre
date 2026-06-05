@@ -672,6 +672,92 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+@register_spyre_decomposition([torch.ops.aten.convolution.default])
+def conv2d_via_bmm_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    groups: int,
+) -> torch.Tensor:
+    """
+    Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
+    torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
+    intermediate reshape/view/unsqueeze operations.
+    """
+    if transposed:
+        raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
+
+    if any(op != 0 for op in output_padding):
+        raise Unsupported("conv2d_via_bmm: output_padding not supported")
+
+    if input.dim() != 4:
+        raise Unsupported(f"conv2d_via_bmm: expected 4D input, got {input.dim()}D")
+
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    stride_h, stride_w = stride[0], stride[1]
+    pad_h, pad_w = padding[0], padding[1]
+    dil_h, dil_w = dilation[0], dilation[1]
+
+    if C_in != groups * C_in_per_group:
+        raise Unsupported(
+            f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
+        )
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    patches = torch.ops.spyre.unfold(
+        input,
+        kernel_size=(K_h, K_w),
+        dilation=(dil_h, dil_w),
+        padding=(pad_h, pad_w),
+        stride=(stride_h, stride_w),
+    )
+
+    if groups == 1:
+        # weight_2d = weight.reshape(C_out, C_in_per_group * K_h * K_w)
+        weight_2d = torch.ops.spyre.reshape_via_cpu(
+            weight, (C_out, C_in_per_group * K_h * K_w)
+        )
+        weight_2d_exp = weight_2d.unsqueeze(0).expand(N, -1, -1)
+        weight_2d_exp_cln = weight_2d_exp.clone()
+        # output = torch.matmul(weight_2d, patches)
+        output = torch.matmul(weight_2d_exp_cln, patches)
+    else:
+        C_out_per_group = C_out // groups
+        # patches = patches.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        patches = torch.ops.spyre.reshape_via_cpu(
+            patches, (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        )
+        # weight_grouped = weight.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
+        weight_grouped = torch.ops.spyre.reshape_via_cpu(
+            weight, (groups, C_out_per_group, C_in_per_group * K_h * K_w)
+        )
+
+        output = torch.matmul(
+            weight_grouped.unsqueeze(0),
+            patches,
+        )
+        output = output.reshape(N, C_out, H_out * W_out)
+
+    output = output.reshape(N, C_out, H_out, W_out)
+
+    if bias is not None:
+        # To ensure stick compatibility: reshape bias via reshape_via_cpu to (1, C_out, 1, 1).
+        # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
+        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
+        output = output + bias_shaped
+
+    return output
+
+
 @register_spyre_decomposition([torch.ops.aten.sub.Tensor])
 def sub_with_alpha(
     self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1

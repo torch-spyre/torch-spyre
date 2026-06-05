@@ -3782,6 +3782,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_conv2d", "test_conv2d_cpu"): {
+            "param_sets": {
+                "1x3x32_ksize3_no_pad": (
+                    cached_randn((1, 3, 32, 32)),
+                    cached_randn((16, 3, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "1x3x64_ksize3_pad1": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((16, 3, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "2x3x32_ksize1": (
+                    cached_randn((2, 3, 32, 32)),
+                    cached_randn((8, 3, 1, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "1x16x64_ksize3_pad1": (
+                    cached_randn((1, 16, 64, 64)),
+                    cached_randn((32, 16, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    1,
+                ),
+                "1x64_ksize3_depthwise": (
+                    cached_randn((1, 64, 32, 32)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    64,
+                ),
+                "mistral_model": (
+                    cached_randn((1, 3, 392, 532)),
+                    cached_randn((1024, 3, 14, 14)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    1,
+                ),
+                "2x32_ksize1_stride2": (
+                    cached_randn((2, 32, 64, 64)),
+                    cached_randn((16, 32, 1, 1)),
+                    None,
+                    (0, 0),
+                    (2, 2),
+                    1,
+                ),
+                "1x3x128_ksize5": (
+                    cached_randn((1, 3, 128, 128)),
+                    cached_randn((8, 3, 5, 5)),
+                    None,
+                    (2, 2),
+                    (1, 1),
+                    1,
+                ),
+                "8x64_ksize3_pad1": (
+                    cached_randn((8, 64, 128, 128)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    64,
+                ),
+            },
+        },
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -5153,6 +5229,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             dst_dtype,
             cpu_compile=False,
             run_eager=False,
+        )
+
+    def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
+        def fn(x, weight, bias, padding, stride, groups):
+            return torch.conv2d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        self.compare_with_cpu(
+            fn,
+            x,
+            weight,
+            bias,
+            padding,
+            stride,
+            groups,
+            atol=0.5,
+            rtol=0.1,
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
