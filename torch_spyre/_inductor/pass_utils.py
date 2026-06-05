@@ -43,7 +43,7 @@ from .codegen.superdsc import (
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
-from .loop_info import _SPYRE_METADATA_ATTRS, copy_op_metadata  # noqa: F401
+from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
 
 logger = get_inductor_logger("pass_utils")

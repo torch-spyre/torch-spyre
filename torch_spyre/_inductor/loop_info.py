@@ -23,9 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import sympy
-
 if TYPE_CHECKING:
+    import sympy
     from torch._inductor.ir import ComputedBuffer
 
 
