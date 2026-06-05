@@ -4,7 +4,7 @@
 
 Spyre's compilation pipeline runs a sequence of optimization passes over
 `ir.Operation` objects in `CustomPreSchedulingPasses`, before Inductor's
-`Scheduler` is constructed.  One planned optimization is **coarse-level
+`Scheduler` is constructed.  One optimization is **coarse-level
 tiling**: take a sequence of operations that share an iteration space
 dimension, split that dimension into K chunks (where K may be a symbolic
 shape), and emit the body operations inside a counted outer loop.  This
