@@ -53,6 +53,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     generate_sdsc,
 )
 from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec, compile_op_spec
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.coarse_tile import coarse_tile, _divide_ranges
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.scheduler import (
@@ -379,6 +380,33 @@ def _make_tiled_json(idx: int, sym_id: int) -> dict:
             ],
         }
     }
+
+
+# ===========================================================================
+# 0. CoarseTileInfo dataclass
+# ===========================================================================
+
+
+class TestCoarseTileInfo(unittest.TestCase):
+    def test_fields(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        self.assertEqual(info.loop_group_id, (0,))
+        self.assertEqual(info.loop_count, [Integer(4)])
+        self.assertEqual(info.loop_tiled_dims, [[0]])
+
+    def test_nested(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(4), Integer(2)],
+            loop_tiled_dims=[[0], [1]],
+        )
+        self.assertEqual(info.loop_group_id, (0, 0))
+        self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(info.loop_tiled_dims, [[0], [1]])
 
 
 # ===========================================================================
