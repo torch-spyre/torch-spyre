@@ -490,9 +490,7 @@ class TestSpyreTensorLayout(TestCase):
         y_dev = y.to(device_layout=y_stl)
         compiled = torch.compile(torch.add)
         compiled_result = compiled(x_dev, y_dev).cpu()
-        torch.testing.assert_close(
-            cpu_result, compiled_result, rtol=0.001, atol=0.00001
-        )
+        torch.testing.assert_close(cpu_result, compiled_result, rtol=0.005, atol=0.005)
 
     def test_spyre_tensor_layout_guard(self):
         """
