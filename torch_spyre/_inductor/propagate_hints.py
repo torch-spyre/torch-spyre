@@ -17,6 +17,7 @@ import dataclasses
 from typing import Any
 
 import regex as re
+import sympy
 
 import torch
 import torch.fx.traceback
@@ -30,9 +31,8 @@ logger = get_inductor_logger("propagate_hints")
 @dataclasses.dataclass
 class DimHint:
     dim_names: list[str]  # e.g. ["A"]
-    range_size: int  # full loop range, e.g. 256; 0 when dim not in iteration space
     split_count: int  # from slices={"A": 4}, e.g. 4
-    dim_index: int | None  # index into op.loop_var_dims / op.data.ranges;
+    loop_var: "sympy.Symbol | None"  # the loop variable (e.g. c0, c1) for this dim;
     # None when op is broadcast w.r.t. this hint scope
     is_reduction: bool
     hint_id: int = 0  # the _hint_N counter value identifying the scope
@@ -49,8 +49,8 @@ class DimHint:
 #       with spyre_hint(slices={"B": 4}):  # inner scope → larger hint ID
 #           y = a + b
 #
-# dim_hints = [DimHint(dim_names=["A"], split_count=2, dim_index=0, ...),
-#                 DimHint(dim_names=["B"], split_count=4, dim_index=1, ...)]
+# dim_hints = [DimHint(dim_names=["A"], split_count=2, loop_var=c0, ...),
+#                 DimHint(dim_names=["B"], split_count=4, loop_var=c1, ...)]
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")

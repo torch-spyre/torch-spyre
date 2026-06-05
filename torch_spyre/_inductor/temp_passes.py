@@ -14,10 +14,7 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-import logging
-import sympy
 import torch
-from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -26,13 +23,11 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
-from .propagate_hints import get_op_hints, DimHint
 from .pass_utils import copy_fx_custom_meta
 
 aten = torch.ops.aten
 
 logger = get_inductor_logger("work_division")
-hints_logger = get_inductor_logger("assign_dim_hints")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -257,136 +252,6 @@ def _unflatten_bmm_batch_dims(
                 and not expand_node.users
             ):
                 graph.erase_node(expand_node)
-
-
-def _group_spec(dim_hints: list[DimHint]) -> list[tuple]:
-    """Build the coarse_tile() spec from op.dim_hints.
-
-    Returns a list of (hint_id, K, tiled_dims) tuples, one per hinted dim,
-    outermost first.  Reduction dims are excluded.
-    """
-    return [
-        (h.hint_id, sympy.Integer(h.split_count), [h.dim_index])
-        for h in dim_hints
-        if not h.is_reduction and h.dim_index is not None
-    ]
-
-
-def _find_spec_op(ops: list[Operation]) -> Operation:
-    """Return the first op with a real (non-sentinel) DimHint, or ops[0] as fallback."""
-    return next(
-        (
-            o
-            for o in ops
-            if any(h.dim_index is not None for h in getattr(o, "dim_hints", []))
-        ),
-        ops[0],
-    )
-
-
-def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
-    """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
-
-    coarse_tile() requires ops to be grouped: all ops in a group share the same
-    tiling spec and are tiled together inside the same loop nest.  We walk
-    operations in topological order and collect consecutive ops that carry
-    identical hints into one group, breaking whenever the hint changes or an
-    op has no hint at all.
-    """
-
-    def _key(op):
-        resolved = getattr(op, "dim_hints", [])
-        if not resolved:
-            return None
-        # Key on the set of hint IDs — ops inside the same hint scope(s) group together.
-        return frozenset(h.hint_id for h in resolved)
-
-    groups = []
-    current_ops: list[Operation] = []
-    current_key = None
-
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        key = _key(op)
-
-        if key is not None and key == current_key:
-            current_ops.append(op)
-        else:
-            if current_ops and current_key is not None:
-                spec = _group_spec(_find_spec_op(current_ops).dim_hints)
-                if spec:
-                    groups.append((current_ops, spec))
-            current_ops = [op] if key is not None else []
-            current_key = key
-
-    # Flush the final group.
-    if current_ops and current_key is not None:
-        spec = _group_spec(_find_spec_op(current_ops).dim_hints)
-        if spec:
-            groups.append((current_ops, spec))
-
-    if hints_logger.isEnabledFor(logging.INFO):
-        # Build an interleaved view: walk operations in order, emit group boundaries
-        # and ungrouped ops so the reader can see what breaks each consecutive run.
-        grouped_to_group_idx = {id(o): i for i, g in enumerate(groups) for o in g[0]}
-        summary_lines = [f"coarse_tile_groups: {len(groups)} group(s) formed"]
-        pending_ungrouped: list[str] = []
-        last_group_idx: int | None = None
-        for o in operations:
-            if not isinstance(o, ComputedBuffer):
-                continue
-            g_idx = grouped_to_group_idx.get(id(o))
-            if g_idx is None:
-                hints = getattr(o, "dim_hints", [])
-                if hints:
-                    ids = sorted({h.hint_id for h in hints})
-                    reason = f"hint_ids={ids}"
-                else:
-                    reason = "no hints"
-                pending_ungrouped.append(f"{o.get_name()}({reason})")
-            else:
-                if g_idx != last_group_idx:
-                    if pending_ungrouped:
-                        summary_lines.append(
-                            f"  ungrouped: [{', '.join(pending_ungrouped)}]"
-                        )
-                        pending_ungrouped = []
-                    # Emit group header with hint scope info from the spec op.
-                    group_ops = groups[g_idx][0]
-                    spec_op = _find_spec_op(group_ops)
-                    hint_ids = sorted(
-                        {h.hint_id for h in getattr(spec_op, "dim_hints", [])}
-                    )
-                    hint_descs = []
-                    for hid in hint_ids:
-                        hints = get_op_hints(spec_op)
-                        if hid in hints:
-                            hint_descs.append(f"hint_{hid}={hints[hid]}")
-                    summary_lines.append(
-                        f"  group {g_idx} scopes=[{', '.join(hint_descs)}]:"
-                    )
-                    last_group_idx = g_idx
-                # Per-op tiling info.
-                tiling_dims = [
-                    f"{h.dim_names}x{h.split_count}"
-                    for h in getattr(o, "dim_hints", [])
-                    if h.dim_index is not None and not h.is_reduction
-                ]
-                aten_ops = [
-                    str(n.target)
-                    for n in getattr(o, "origins", [])
-                    if hasattr(n, "target")
-                ]
-                summary_lines.append(
-                    f"      {o.get_name()}  aten={aten_ops}"
-                    + (f"  tiles={tiling_dims}" if tiling_dims else "  (no tiled dims)")
-                )
-        if pending_ungrouped:
-            summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
-        hints_logger.info("%s", "\n".join(summary_lines))
-
-    return groups
 
 
 def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:

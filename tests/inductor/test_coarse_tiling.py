@@ -168,20 +168,27 @@ def _make_op(data, name="op0"):
 def _make_hinted_op(data, name="op0", hints=((0, 0),)):
     """Return a fake ComputedBuffer with DimHints for use with coarse_tile().
 
-    coarse_tile() reads op.dim_hints to resolve which dimension each spec level
-    tiles.  ``hints`` is a sequence of (hint_id, dim_index) pairs, one per
-    tiling level.  hint_id must match the hint_id in the corresponding group
-    spec triple; dim_index is the index into op.data.ranges to tile.
+    ``hints`` is a sequence of ``(hint_id, dim_index)`` pairs, one per tiling
+    level.  Each pair produces a DimHint whose ``loop_var`` is the symbol
+    ``c{dim_index}``, matching the mock output coords built by this helper
+    (``coords[i] = c{i}``).  This convention is valid for mock ops where no
+    size-1 dims precede the tiled dimension.
     """
+    import sympy
     from torch_spyre._inductor.propagate_hints import DimHint
 
     op = _make_op(data, name)
+
+    # Build loop_var symbols. coords[i] = cI so _loop_var_to_ranges_pos
+    # resolves correctly for mock ops (no size-1 dims in test data).
+    n_ranges = len(data.ranges)
+    op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_ranges)]
+
     op.dim_hints = [
         DimHint(
             dim_names=[f"dim{dim_index}"],
-            range_size=0,
             split_count=1,
-            dim_index=dim_index,
+            loop_var=sympy.Symbol(f"c{dim_index}"),
             is_reduction=False,
             hint_id=hint_id,
         )
@@ -565,7 +572,22 @@ class TestDivideRanges(unittest.TestCase):
         _divide_ranges(op, Integer(4), tiled_dims=[0])
 
 
+def _mock_op_out_coords(op):
+    """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
+    return getattr(op, "_test_out_coords", [])
+
+
 class TestCoarseTile(unittest.TestCase):
+    def setUp(self):
+        self._patch = patch(
+            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            side_effect=_mock_op_out_coords,
+        )
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+
     def test_empty_groups_list_is_noop(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data, "op0")
@@ -582,7 +604,7 @@ class TestCoarseTile(unittest.TestCase):
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile(
             [op_extern, op_computed],
-            [([op_extern, op_computed], [(0, Integer(2), [0])])],
+            [([op_extern, op_computed], [(0, Integer(2))])],
         )
         self.assertEqual(op_computed.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
@@ -592,7 +614,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile([op], [([op], [(0, k, [0])])])
+        coarse_tile([op], [([op], [(0, k)])])
         self.assertEqual(op.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -600,27 +622,39 @@ class TestCoarseTile(unittest.TestCase):
         d0 = _make_pointwise([Integer(32)])
         d1 = _make_pointwise([Integer(32)])
         d2 = _make_pointwise([Integer(32)])
-        op0 = _make_op(d0, "op0")
-        op1 = _make_op(d1, "op1")
-        op2 = _make_op(d2, "op2")
+        op0 = _make_hinted_op(d0, "op0", hints=((0, 0),))
+        op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
+        op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile([op0, op1, op2], [([op0, op2], [(0, Integer(4), [0])])])
+            coarse_tile([op0, op1, op2], [([op0, op2], [(0, Integer(4))])])
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
-        op_known = _make_op(data, "op0")
-        op_unknown = _make_op(_make_pointwise([Integer(8)]), "unknown")
+        op_known = _make_hinted_op(data, "op0", hints=((0, 0),))
+        op_unknown = _make_hinted_op(
+            _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
+        )
         with self.assertRaises(RuntimeError):
-            coarse_tile([op_known], [([op_unknown], [(0, Integer(2), [0])])])
+            coarse_tile([op_known], [([op_unknown], [(0, Integer(2))])])
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(hint_id, K1, dims1), ...] works."""
+    """Verify that the nested group format [(hint_id, K1), ...] works."""
+
+    def setUp(self):
+        self._patch = patch(
+            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            side_effect=_mock_op_out_coords,
+        )
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
 
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile([op], [([op], [(1, Integer(4), [0]), (2, Integer(2), [1])])])
+        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(op.loop_group_id, (0, 0))
         self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_tiled_dims, [[0], [1]])
@@ -628,14 +662,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile([op], [([op], [(1, Integer(4), [0]), (2, Integer(2), [1])])])
+        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile([op], [([op], [(1, Integer(4), [0]), (2, Integer(8), [1])])])
+        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(8))])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -649,8 +683,8 @@ class TestCoarseTileNested(unittest.TestCase):
         coarse_tile(
             [op0, op1],
             [
-                ([op0], [(1, Integer(4), [0])]),
-                ([op1], [(2, Integer(4), [0]), (3, Integer(2), [1])]),
+                ([op0], [(1, Integer(4))]),
+                ([op1], [(2, Integer(4)), (3, Integer(2))]),
             ],
         )
         self.assertEqual(op0.loop_group_id, (0,))
@@ -667,7 +701,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile([op], [([op], [(1, Integer(4), [0]), (2, Integer(2), [0])])])
+        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_tiled_dims, [[0], [0]])

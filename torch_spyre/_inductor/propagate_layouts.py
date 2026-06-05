@@ -27,6 +27,7 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     MultiOutput,
+    ReinterpretView,
     Operation,
     Pointwise,
     Reduction,
@@ -614,15 +615,10 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     is correct.  Offering all valid choices lets the optimizer pick whichever
     is compatible with the rest of the graph at zero cost, avoiding a needless
     restickify.
-
-    Only dimensions with at least elems_per_stick elements are valid stick
-    candidates — smaller dims produce sentinel -1 entries in stride_map that
-    insert_restickify cannot handle.
     """
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    elems_per_stick = get_elem_in_stick(output.dtype)
     layouts = [
         SpyreTensorLayout(
             c_size,
@@ -631,7 +627,6 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
-        if c_size[stick_dim] >= elems_per_stick
     ]
     if not layouts:
         layouts = [generic_layout(op)]
@@ -672,6 +667,7 @@ def _target_device_layout(target, name: str):
     # candidate layouts on the TensorBox rather than a finalized committed_stl.
     graph_input = V.graph.graph_inputs.get(name)
     layouts = getattr(graph_input, "layouts", None)
+
     if not layouts:
         return None
     return next(iter(layouts))
@@ -806,6 +802,22 @@ def propagate_spyre_tensor_layouts(
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                target = op.layout.target
+                while isinstance(target, ReinterpretView):
+                    target = target.data
+                target_stl = _target_device_layout(
+                    target,
+                    target.get_name() if hasattr(target, "get_name") else "",
+                )
+                if target_stl is None:
+                    continue
+                rw = op.get_read_writes()
+                output_dep = next(iter(rw.writes))
+                args = _get_prop_args(rw.reads)
+                op.layouts = [target_stl]
+                op.restick_cost_fn = AllSameNode.from_args(
+                    args, [target_stl], output_dep
+                )
                 continue
             op.decide_layout()
             rw = op.get_read_writes()
