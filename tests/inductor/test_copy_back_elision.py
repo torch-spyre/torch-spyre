@@ -40,7 +40,7 @@ def _assert_copy_back_elided(source: str) -> None:
 
 
 def _assert_copy_back_preserved(source: str) -> None:
-    assert "sdsc_fused_copy" in source
+    assert any("copy_" in line for line in source.splitlines() if "sdsc_fused_" in line)
 
 
 @pytest.mark.parametrize("global_stick_optimizer", [True, False])
