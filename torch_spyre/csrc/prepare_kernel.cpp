@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -26,7 +27,9 @@
 #include <vector>
 
 #include "job_plan.h"
+#include "logging.h"
 #include "spyre_allocator.h"
+#include "util/spyrecode.h"
 
 namespace spyre {
 
@@ -193,7 +196,9 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
   size_t size = std::stoull(size_str);
 
   auto& allocator = SpyreAllocator::instance();
-  c10::DataPtr allocated_ptr = allocator.allocate(size);
+  flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
+                                      std::nullopt, flex::MemoryType::Program);
+  c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
 
   job_allocation_ =
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
@@ -268,25 +273,73 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
       compute_offset_address(job_allocation_.value(), job_bin_ptr);
   // Create RuntimeOperationCompute with the allocated program address
   return std::make_unique<JobPlanStepCompute>(std::move(job_bin_addr),
-                                              bind_io_addresses_);
+                                              bind_io_addresses_, job_bin_ptr);
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
     const nlohmann::json& cmd) {
-  // TODO(jni): create JobPlanStepHostCompute
-  TORCH_CHECK(false,
-              "ComputeOnHost not yet implemented - waiting for deeptools PR to "
-              "be merged");
-  return nullptr;
+  // Parse ohandle
+  TORCH_CHECK(cmd.contains("ohandle"),
+              "ComputeOnHost command missing 'ohandle' property");
+  std::string ohandle = cmd["ohandle"].get<std::string>();
+
+  // Allocate pinned buffer
+  auto it = pinned_buffer_map_.find(ohandle);
+  TORCH_CHECK(it == pinned_buffer_map_.end(), "ohandle '", ohandle,
+              "' already exists in pinned buffer map");
+  TORCH_CHECK(cmd.contains("size"),
+              "ComputeOnHost command missing 'size' property");
+  std::string size_str = cmd["size"].get<std::string>();
+  size_t buffer_size = std::stoull(size_str);
+  pinned_buffer_map_[ohandle] = HostBuffer(buffer_size);
+
+  // Parse ishape
+  // TODO(jni): further discussion is required on "ishape". See #2522. For now,
+  // it's vector<int64_t>, and it's {0}, it's for fake symbols
+  TORCH_CHECK(cmd.contains("ishape"),
+              "ComputeOnHost command missing 'ishape' property");
+  const nlohmann::json& ishape_json = cmd["ishape"];
+  TORCH_CHECK(ishape_json.is_array(),
+              "ComputeOnHost 'ishape' must be an array");
+  std::vector<int64_t> ishape;
+  for (const auto& dim : ishape_json) {
+    TORCH_CHECK(dim.is_string(),
+                "ComputeOnHost 'ishape' elements must be strings");
+    std::string dim_str = dim.get<std::string>();
+    ishape.push_back(std::stoll(dim_str));
+  }
+
+  // Parse ihandle
+  void* inp_ptr = nullptr;
+  TORCH_CHECK(cmd.contains("ihandle"),
+              "ComputeOnHost command missing 'ihandle' property");
+  std::string ihandle = cmd["ihandle"].get<std::string>();
+  if (!ihandle.empty()) {
+    // Get input buffer from pinned_buffer_map_
+    it = pinned_buffer_map_.find(ihandle);
+    TORCH_CHECK(it != pinned_buffer_map_.end(), "ihandle '", ihandle,
+                "' not found in pinned buffer map");
+    inp_ptr = it->second.data();
+  }
+
+  // Parse hcm JSON
+  TORCH_CHECK(cmd.contains("hcm"),
+              "ComputeOnHost command missing 'hcm' property");
+  const nlohmann::json& hcm_json = cmd["hcm"];
+
+  // Create Hcm object and import from JSON string
+  auto hcm_data = std::make_unique<Hcm>();
+  std::string hcm_json_str = hcm_json.dump();
+  bool import_success = hcm_data->importJsonStr(hcm_json_str);
+  TORCH_CHECK(import_success, "Failed to import Hcm from JSON");
+
+  // Create and return JobPlanStepHostCompute
+  return std::make_unique<JobPlanStepHostCompute>(
+      std::move(hcm_data), pinned_buffer_map_[ohandle].data(), inp_ptr, ishape);
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
     const nlohmann::json& cmd) {
-  // TODO(jni): create JobPlanStepH2D or JobPlanStepD2H
-  TORCH_CHECK(false,
-              "DataTransfer not yet implemented - waiting for deeptools PR to "
-              "be merged");
-
   // Extract direction: 0 = H2D, 1 = D2H
   TORCH_CHECK(cmd.contains("dirn"),
               "DataTransfer command missing 'dirn' property");
@@ -307,12 +360,15 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       std::string dev_ptr_str = cmd["dev_ptr"].get<std::string>();
       std::string size_str = cmd["size"].get<std::string>();
 
-      // TODO(jni): host_handle should contain info about the host buffer
-      // to be copied, figure out how and connect host_addr
       TORCH_CHECK(cmd.contains("host_handle"),
                   "DataTransfer H2D missing 'host_handle' property");
       std::string host_handle_str = cmd["host_handle"].get<std::string>();
-      void* host_addr = nullptr;
+
+      // Get host buffer from pinned_buffer_map_
+      auto it = pinned_buffer_map_.find(host_handle_str);
+      TORCH_CHECK(it != pinned_buffer_map_.end(), "Host handle '",
+                  host_handle_str, "' not found in pinned buffer map");
+      void* host_addr = it->second.data();
       uint64_t device_ptr = std::stoull(dev_ptr_str);
       size_t transfer_size = std::stoull(size_str);
 
@@ -335,14 +391,20 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       std::string dev_ptr_str = cmd["dev_ptr"].get<std::string>();
       std::string size_str = cmd["size"].get<std::string>();
 
-      // TODO(jni): host_handle should contain info about the host buffer
-      // to be copied to, figure out how and connect host_addr
       TORCH_CHECK(cmd.contains("host_handle"),
                   "DataTransfer D2H missing 'host_handle' property");
       std::string host_handle_str = cmd["host_handle"].get<std::string>();
-      void* host_addr = nullptr;
+
       uint64_t device_ptr = std::stoull(dev_ptr_str);
       size_t transfer_size = std::stoull(size_str);
+
+      // Allocate pinned buffer
+      auto it = pinned_buffer_map_.find(host_handle_str);
+      TORCH_CHECK(it == pinned_buffer_map_.end(), "Host handle '",
+                  host_handle_str, "' already exists in pinned buffer map");
+
+      pinned_buffer_map_[host_handle_str] = HostBuffer(transfer_size);
+      void* host_addr = pinned_buffer_map_[host_handle_str].data();
 
       // Compute CompositeAddress with offset from device_addr
       flex::CompositeAddress comp_addr = compute_offset_address(
@@ -393,12 +455,9 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   auto job_exec_plan = spyrecode_json_["JobExecPlan"];
   TORCH_CHECK(job_exec_plan.is_array(), "JobExecPlan must be an array");
 
-  // TODO(jni): check on the condition to specialize addresses
-  if (job_exec_plan.size() > 1) {
-    bind_io_addresses_ = false;
-  } else {
-    bind_io_addresses_ = true;
-  }
+  // TODO(jni): further discussions is required on the condition to specialize
+  // addresses
+  bind_io_addresses_ = true;
 
   // Parse each command in the JobExecPlan and create JobPlanSteps
   std::vector<std::unique_ptr<JobPlanStep>> steps;
@@ -412,14 +471,21 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   }
 
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
-  // TODO(jni): pinned buffer to be added as std::map once HostCompute provided
-  // in SpyreCode Create and return the JobPlan Use brace initialization to
-  // construct JobPlan with moved members
+  // Create pinned_buffers vector from pinned_buffer_map_
+  // Move tensors from map to avoid unnecessary reference count increments
+  std::vector<HostBuffer> pinned_buffers;
+  pinned_buffers.reserve(pinned_buffer_map_.size());
+  for (auto& [ohandle, tensor] : pinned_buffer_map_) {
+    pinned_buffers.push_back(std::move(tensor));
+  }
+
+  // Create and return the JobPlan
+  // Use brace initialization to construct JobPlan with moved members
   return std::make_unique<JobPlan>(JobPlan{
       std::move(steps),                    // steps
       std::move(job_allocation_.value()),  // job_allocation
       {},                                  // expected_input_shapes
-      {}                                   // pinned_buffers
+      std::move(pinned_buffers)            // pinned_buffers
   });
 }
 
@@ -486,7 +552,12 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
 std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,
                                        const SpyreStream* stream) {
   JobPlanBuilder builder(spyrecode_dir, stream);
-  return builder.build();
+  auto jobplan = builder.build();
+
+  // Dump JobPlan if debug logging is enabled
+  DEBUGINFO("JobPlan:\n", *jobplan);
+
+  return jobplan;
 }
 
 }  // namespace spyre
