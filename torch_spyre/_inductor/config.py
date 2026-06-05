@@ -46,6 +46,12 @@ core_id_k_fast_emission: bool = (
 # still under development.
 bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
 
+# When True, the generated func.func @sdsc_bundle takes one
+# !sdscbundle.input_arg<index> parameter per tensor argument and extracts
+# each to a local SSA value, rather than emitting arith.constant offsets.
+# Requires bundle_hbm_symbols=True to have any effect.
+bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
+
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
 # (used with bundle_hbm_symbols=True for the scf.for / affine.apply path).
