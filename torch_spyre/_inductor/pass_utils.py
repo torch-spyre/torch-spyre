@@ -154,10 +154,19 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    if not (is_supported_mod or is_bare_var or is_zero):
+    
+    # Support var + constant offset (e.g., d2 + 32) for cat operations along stick dimension
+    is_var_plus_offset = (
+        isinstance(stick_expr, sympy.Add)
+        and len(stick_expr.free_symbols) == 1
+        and any(arg.is_symbol for arg in stick_expr.args)
+        and any(arg.is_number for arg in stick_expr.args)
+    )
+    
+    if not (is_supported_mod or is_bare_var or is_zero or is_var_plus_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, or 0"
+            f"Mod(var, {elems_per_stick}), a bare variable, var + offset, or 0"
         )
 
 
@@ -176,12 +185,24 @@ def device_coordinates(stl: SpyreTensorLayout, dep: MemoryDep) -> list[sympy.Exp
 
 
 def iter_var_id(stick_expr) -> int:
-    """Iteration variable index from a stick expr: Mod(d2,64) -> 2, d2 -> 2.
+    """Iteration variable index from a stick expr: Mod(d2,64) -> 2, d2 -> 2, d2 + 32 -> 2.
     Returns -1 for constant-zero (scalar/broadcast, no real stick).
     NOTE: this is the loop variable index (suffix of dN), NOT a tensor dimension index."""
     if stick_expr == sympy.S.Zero or not stick_expr.free_symbols:
         return -1
-    sym = next(iter(stick_expr.free_symbols))
+    
+    # Handle Add expressions (e.g., d2 + 32) by extracting the symbol
+    if isinstance(stick_expr, sympy.Add):
+        for arg in stick_expr.args:
+            if arg.is_symbol:
+                sym = arg
+                break
+        else:
+            # Fallback if no symbol found (shouldn't happen with valid expressions)
+            sym = next(iter(stick_expr.free_symbols))
+    else:
+        sym = next(iter(stick_expr.free_symbols))
+    
     name = str(sym)
     i = len(name) - 1
     while i >= 0 and name[i].isdigit():
