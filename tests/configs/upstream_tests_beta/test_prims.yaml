@@ -12,7 +12,7 @@ test_suite_config:
             functions:
               cpu_move:
                 - name: assertEqual
-                
+
   global:
     supported_dtypes:
       - name: float16
