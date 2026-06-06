@@ -7,6 +7,7 @@ oot_test_utilities.py -- Utility functions for the OOT PyTorch test framework.
 from __future__ import annotations
 
 import ast
+import platform as _platform
 import os
 import sys
 import tempfile
@@ -31,6 +32,12 @@ from oot_test_constants import (
     REL_PATH_TOKENS,
 )
 from oot_test_matching import parse_dtype
+
+# Normalise platform.machine() into a safe marker string once at import time.
+_OOT_PLATFORM_ARCH: str = (
+    re.sub(r"[^a-zA-Z0-9_]", "_", _platform.machine() or "unknown").strip("_")
+    or "unknown"
+)
 
 
 # ---------------------------------------------------------------------------
