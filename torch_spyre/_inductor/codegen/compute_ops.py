@@ -276,22 +276,29 @@ def generate_sdsc(
     symbols: list[int],
     symbol_id_offset: int = 0,
     tiled_symbols=None,
+    use_symbols: bool = False,
 ):
     """Generate SDSC JSON for one OpSpec.
 
     Returns a 4-tuple ``(sdsc_json, base_symbol_values, affine_strides, symbol_kinds)``:
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
-    - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``
+    - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``;
+      empty when ``use_symbols=False``
     - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of dicts
-      ``{tiled_sym: stride_bytes}`` for tiled HBM tensors.  Used by ``bundle.py``
-      to emit ``affine.apply`` ops inside ``scf.for`` loops.
-    - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``.
-      Classifies each symbol as a kernel base address, per-core derived address,
-      or pool-allocated address.
+      ``{tiled_sym: stride_bytes}`` for tiled HBM tensors; always empty when
+      ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply``
+      ops inside ``scf.for`` loops.
+    - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``;
+      empty when ``use_symbols=False``.  Classifies each symbol as a kernel base
+      address, per-core derived address, or pool-allocated address.
 
-    HBM addresses are registered as negative symbol IDs in the JSON and their
-    values appended to ``symbols``, enabling ``affine.apply`` address computation
-    in ``bundle.mlir`` for tiled loops.
+    When ``use_symbols=False``, HBM tensor addresses are baked directly as
+    concrete integers into the SDSC JSON.  No symbol IDs are registered and
+    ``symbols`` is not modified.
+
+    When ``use_symbols=True``, HBM addresses are registered as negative symbol
+    IDs in the JSON and their values appended to ``symbols``, enabling
+    ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
     """
     if tiled_symbols is None:
         tiled_symbols = []
@@ -339,72 +346,95 @@ def generate_sdsc(
             arg_index=arg_index,
         )
 
-    def offset_as_symbol(s, kind: SymbolKind):
-        if s not in local_symbols:
-            local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
-            symbols.append(s)
-            local_symbol_kind.append(kind)
-        return local_symbols[s]
+    if use_symbols:
 
-    # Compute per-tensor affine strides and register base addresses in symbols.
-    # affine_strides[i] is {tiled_sym: stride_bytes} for tensor i (empty if
-    # non-tiled/lx).
-    affine_strides: list[dict] = []
-    for tensor in sdsc_spec.args:
-        if "lx" in tensor.allocation:
-            affine_strides.append({})
-            continue
-        core0_addr = tensor.start_address + core_idx_to_slice_offset(
-            tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
-        ) * num_bytes(tensor.data_format)
-        # base_sym_idx: index in global symbols[] where core-0 will be registered.
-        # Used by kernel_derived symbols to reference their base without searching.
-        base_sym_idx = symbol_id_offset + len(local_symbols)
-        tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
-        if not tensor_tiled:
-            # Non-tiled HBM: register per-core addresses.
+        def offset_as_symbol(s, kind: SymbolKind):
+            if s not in local_symbols:
+                local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
+                symbols.append(s)
+                local_symbol_kind.append(kind)
+            return local_symbols[s]
+
+        # Compute per-tensor affine strides and register base addresses in symbols.
+        # affine_strides[i] is {tiled_sym: stride_bytes} for tensor i (empty if
+        # non-tiled/lx).
+        affine_strides: list[dict] = []
+        for tensor in sdsc_spec.args:
+            if "lx" in tensor.allocation:
+                affine_strides.append({})
+                continue
+            core0_addr = tensor.start_address + core_idx_to_slice_offset(
+                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+            ) * num_bytes(tensor.data_format)
+            # base_sym_idx: index in global symbols[] where core-0 will be registered.
+            # Used by kernel_derived symbols to reference their base without searching.
+            base_sym_idx = symbol_id_offset + len(local_symbols)
+            tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
+            if not tensor_tiled:
+                # Non-tiled HBM: register per-core addresses.
+                for c in range(sdsc_spec.num_cores):
+                    addr = tensor.start_address + core_idx_to_slice_offset(
+                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                    ) * num_bytes(tensor.data_format)
+                    offset_as_symbol(
+                        addr,
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
+                    )
+                affine_strides.append({})
+            else:
+                # Tiled HBM: symbol value = per-core iter-0 base address.
+                # The affine map adds loop_var * tile_stride on top at runtime.
+                strides_for_tensor = {}
+                for s in tensor_tiled:
+                    strides_for_tensor[s] = _tiled_byte_stride(
+                        tensor, s, sdsc_spec.iteration_space
+                    )
+                for c in range(sdsc_spec.num_cores):
+                    addr = tensor.start_address + core_idx_to_slice_offset(
+                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                    ) * num_bytes(tensor.data_format)
+                    offset_as_symbol(
+                        addr,
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
+                    )
+                affine_strides.append(strides_for_tensor)
+
+        def _start_addr_data(tensor):
+            # All per-core addresses were already registered by the per-tensor loop
+            # above. Look them up directly rather than re-computing SymbolKind.
+            if "lx" in tensor.allocation:
+                return {
+                    f"[{c}, 0, 0]": str(tensor.start_address)
+                    for c in range(sdsc_spec.num_cores)
+                }
+            result = {}
             for c in range(sdsc_spec.num_cores):
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
-                offset_as_symbol(
-                    addr,
-                    _per_core_kind(c, tensor.arg_index, core0_addr, addr, base_sym_idx),
-                )
-            affine_strides.append({})
-        else:
-            # Tiled HBM: symbol value = per-core iter-0 base address.
-            # The affine map adds loop_var * tile_stride on top at runtime.
-            strides_for_tensor = {}
-            for s in tensor_tiled:
-                strides_for_tensor[s] = _tiled_byte_stride(
-                    tensor, s, sdsc_spec.iteration_space
-                )
-            for c in range(sdsc_spec.num_cores):
-                addr = tensor.start_address + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                ) * num_bytes(tensor.data_format)
-                offset_as_symbol(
-                    addr,
-                    _per_core_kind(c, tensor.arg_index, core0_addr, addr, base_sym_idx),
-                )
-            affine_strides.append(strides_for_tensor)
+                result[f"[{c}, 0, 0]"] = str(local_symbols[addr])
+            return result
 
-    def _start_addr_data(tensor):
-        # All per-core addresses were already registered by the per-tensor loop
-        # above. Look them up directly rather than re-computing SymbolKind.
-        if "lx" in tensor.allocation:
+    else:
+        # use_symbols=False: bake concrete HBM addresses directly into the JSON.
+        # symbols and local_symbols are not modified.
+        affine_strides = [{} for _ in sdsc_spec.args]
+
+        def _start_addr_data(tensor):
             return {
-                f"[{c}, 0, 0]": str(tensor.start_address)
+                f"[{c}, 0, 0]": str(
+                    tensor.start_address
+                    + core_idx_to_slice_offset(
+                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                    )
+                    * num_bytes(tensor.data_format)
+                )
                 for c in range(sdsc_spec.num_cores)
             }
-        result = {}
-        for c in range(sdsc_spec.num_cores):
-            addr = tensor.start_address + core_idx_to_slice_offset(
-                tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-            ) * num_bytes(tensor.data_format)
-            result[f"[{c}, 0, 0]"] = str(local_symbols[addr])
-        return result
 
     return (
         {
@@ -490,7 +520,7 @@ def generate_sdsc(
                                     else "hbm",
                                     **(
                                         {"isStartAddrSymbolic_": 1}
-                                        if "lx" not in tensor.allocation
+                                        if use_symbols and "lx" not in tensor.allocation
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
