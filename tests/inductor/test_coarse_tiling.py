@@ -347,7 +347,6 @@ def _fake_compile_op_spec(
     op_spec: OpSpec,
     symbols: list,
     symbol_id_offset: int = 0,
-    use_symbols: bool = True,
 ):
     """Stub that returns (json, [], [], []) — no real SDSC compilation."""
     return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], [], []
@@ -914,7 +913,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0])
@@ -931,7 +929,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
         self.assertEqual(symbols[0], start)
@@ -946,7 +943,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -964,7 +960,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[],
-            use_symbols=True,
         )
         self.assertEqual(affine_strides, [{}])
 
@@ -981,7 +976,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         self.assertEqual(symbols, [])
         self.assertEqual(local_sym_values, [])
@@ -997,7 +991,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=5,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -1042,7 +1035,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0x1000)
@@ -1088,7 +1080,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         hbm_strides = [d for d in affine_strides if len(d) > 0]
         self.assertGreater(len(hbm_strides), 0)
         for tensor_strides in hbm_strides:
@@ -1097,7 +1089,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         for tensor_strides in affine_strides:
             for sym, stride in tensor_strides.items():
                 self.assertGreater(stride, 0)
@@ -1107,7 +1099,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
     def test_affine_strides_non_empty_for_tiled_op(self):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         has_strides = any(len(d) > 0 for d in affine_strides)
         self.assertTrue(
             has_strides,
@@ -1118,9 +1110,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
-        generate_bundle(
-            "test_kernel", tmpdir, [loop], use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", tmpdir, [loop], unroll_loops=False)
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
             mlir = f.read()
@@ -1148,9 +1138,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle(
-            "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", self.tmpdir, specs, unroll_loops=False)
         return _read_mlir(self.tmpdir)
 
     def test_flat_ops_no_loop(self):
@@ -1208,9 +1196,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         a = _make_minimal_op_spec("a")
         b = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[a, b])
-        generate_bundle(
-            "test_kernel", self.tmpdir, [loop], use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", self.tmpdir, [loop], unroll_loops=False)
         written = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".json"))
         self.assertEqual(len(written), 2)
 
@@ -1283,9 +1269,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle(
-            "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", self.tmpdir, specs, unroll_loops=False)
         return _read_mlir(self.tmpdir)
 
     def test_single_loop_snapshot(self):
@@ -1331,16 +1315,14 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=fake_compile,
         ):
-            generate_bundle(
-                "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
-            )
+            generate_bundle("test_kernel", self.tmpdir, specs, unroll_loops=False)
         return _read_mlir(self.tmpdir)
 
     def test_tiled_tensor_emits_affine_apply(self):
         s = self._s
         stride = 16384
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}], []
@@ -1360,7 +1342,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         self.assertIn('"symbol_ids"=[-1]', mlir)
 
     def test_non_tiled_tensor_in_loop_no_affine_apply(self):
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
@@ -1378,7 +1360,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 8192
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
             return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}], []
@@ -1395,7 +1377,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_affine_apply_inside_scf_for(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
             return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}], []
@@ -1414,7 +1396,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_tiled_snapshot(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
@@ -1455,15 +1437,13 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=fake_compile,
         ):
-            generate_bundle(
-                "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
-            )
+            generate_bundle("test_kernel", self.tmpdir, specs, unroll_loops=False)
         return _read_mlir(self.tmpdir)
 
     def _fake_compile_two_strides(self, outer_stride, inner_stride):
         s0, s1 = self.s0, self.s1
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return (
@@ -1535,28 +1515,6 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
             "}\n"
         )
         self.assertEqual(mlir, expected)
-
-
-class TestGenerateBundleUnrollPath(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-
-    def test_non_tiled_loop_without_use_symbols_ok(self):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=_fake_compile_op_spec,
-        ):
-            op = _make_minimal_op_spec("a")
-            loop = LoopSpec(count=Integer(2), body=[op])
-            generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=False)
-
-    def test_flat_op_without_use_symbols_ok(self):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=_fake_compile_op_spec,
-        ):
-            op = _make_minimal_op_spec("a")
-            generate_bundle("test_kernel", self.tmpdir, [op], use_symbols=False)
 
 
 # ===========================================================================
@@ -1873,7 +1831,6 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
                 unroll_loops=False,
                 symbolic_args=symbolic_args,
             )
@@ -1909,7 +1866,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_func_signature_has_params_for_tensor_args(self):
         a = self._make_op_spec_with_hbm_args("a", [0, 1])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             for i, arg in enumerate(op_spec.args):
                 symbols.append(arg.allocation["hbm"])
             ids = [-(symbol_id_offset + i + 1) for i in range(len(op_spec.args))]
@@ -1964,7 +1921,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_sdsc_execute_uses_extracted_names(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(op_spec.args[0].allocation["hbm"])
             return (
@@ -2003,7 +1960,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         values = [0x400000000, 0x0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -2025,7 +1982,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_symbolic_args_false_no_params(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(op_spec.args[0].allocation["hbm"])
             return (
@@ -2063,7 +2020,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         ]
         sym_counts = [2, 3, 2, 2, 3]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             n = sym_counts[i]
@@ -2124,7 +2081,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         base = 0x400000000  # SEGMENT_OFFSETS[1], arg_index=0
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(base)
@@ -2150,7 +2107,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         pool_values = [0, 2048, 0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -2258,7 +2215,6 @@ class TestSymbolKind(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         self.assertEqual(len(kinds), 2)
         self.assertIsInstance(kinds[0], SymbolKind)
@@ -2276,7 +2232,7 @@ class TestSymbolKind(unittest.TestCase):
 
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             base = 0x400000000
@@ -2303,7 +2259,6 @@ class TestSymbolKind(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 [a, b],
-                use_symbols=True,
                 unroll_loops=False,
                 symbolic_args=True,
             )
