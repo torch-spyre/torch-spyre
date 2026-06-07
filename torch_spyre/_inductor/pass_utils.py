@@ -42,7 +42,10 @@ from .codegen.superdsc import (
 )
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .logging_utils import get_inductor_logger
 from .views import compute_coordinates, matching_dim
+
+logger = get_inductor_logger("pass_utils")
 
 
 class SchedNodeArg(NamedTuple):
@@ -128,6 +131,12 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
             buf = V.graph.get_buffer(arg.name)
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
+
+
+def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
+    """Return host coordinates for the output dep of a ComputedBuffer."""
+    output_dep = next(iter(op.get_read_writes().writes))
+    return host_coordinates(op.get_layout(), output_dep)
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
@@ -798,8 +807,9 @@ def _per_core_view_on_buf(
     # writes / reads, not necessarily buf_name) bridge stride-keyed
     # coeff_splits back to scheduler symbols.
     rw = op.get_read_writes()
+    empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
+        result = empty_view
         if cache is not None:
             cache[key] = result
         return result
@@ -825,40 +835,93 @@ def _per_core_view_on_buf(
             continue
         splits_by_stride[host_stride] = (int(split), sym)
 
-    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
-    device_size = buf_layout.device_size
-    stride_map = buf_layout.stride_map
-    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+    buf_layout = V.graph.get_buffer(buf_name).layout
+    if not isinstance(buf_layout, FixedTiledLayout):
+        return empty_view
+    dev_layout = buf_layout.device_layout
+    device_size = dev_layout.device_size
+    stride_map = dev_layout.stride_map
+    elems_per_stick = dev_layout.device_dtype.elems_per_stick()
 
-    # Step 3: place each split on a device dim via stride lookup. h=1
-    # maps to elems_per_stick when present (sticks are atomic, so a
-    # host-stride-1 split lands on the outer-stick dim, not on stick
-    # contents); otherwise it falls back to a literal stride-1 dim, as
-    # in sticked [N, 1] layouts where the mb axis itself has stride 1.
-    # Skip stride_map entries < 0 — those are sentinels for collapsed
-    # or broadcast dims and can't host a split.
+    # Step 3: place each split on a device dim via stride lookup.
+    #
+    # stride_map[i] is a device-dim → host-stride mapping. The stickified
+    # host dim decomposes into two device dims (per dim_map_to_stride_map in C++):
+    #   - within-stick dim: always at position n-1, with
+    #     stride_map[-1] = host_stride[stick_dim] and dev_size = elems_per_stick.
+    #   - outer-stick (num_stick) dim: stride = stride_map[-1] * elems_per_stick,
+    #     dev_size = ceil(host_size[stick_dim] / elems_per_stick).
+    # A split whose host stride h equals stick_host_stride lands on the
+    # stickified host dim; sticks are atomic, so it must use the outer-stick
+    # dim. Skip stride_map entries <= 0 — sentinels for collapsed or
+    # broadcast dims.
     #
     # Example: host [64, 128] sticked to device [2, 64, 64] with
-    # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
-    # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
-    # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dim = {s: i for i, s in enumerate(stride_map) if s > 0}
+    # stride_map=[64, 128, 1] and elems_per_stick=64. stick_host_stride=1,
+    # num_stick_dim=dim 0 (stride 64). With M-split×4 (h=128) and N-split×2
+    # (h=1), N's h matches stick_host_stride → outer-stick dim 0; M's h=128
+    # → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
+    device_stride_to_dim: dict[int, int] = {}
+    for i, s in enumerate(stride_map):
+        if s <= 0:
+            continue
+        prev = device_stride_to_dim.get(s)
+        if prev is None or device_size[i] != 1:
+            device_stride_to_dim[s] = i
+
+    stick_host_stride, num_stick_dim, num_stick, num_stick_stride = None, None, 0, 0
+    if stride_map[-1] > 0:
+        stick_host_stride = stride_map[-1]
+        num_stick_dim = device_stride_to_dim.get(stick_host_stride * elems_per_stick)
+        if num_stick_dim is not None:
+            num_stick = device_size[num_stick_dim]
+            num_stick_stride = stride_map[num_stick_dim]
 
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}
     for h, (split, sym) in sorted(splits_by_stride.items()):
-        if h == 1 and elems_per_stick in device_stride_to_dim:
-            dev_dim = device_stride_to_dim.get(elems_per_stick)
-        else:
-            dev_dim = device_stride_to_dim.get(h)
-        assert (
-            dev_dim is not None
-            and dev_dim not in work_slice_dims
-            and device_size[dev_dim] % split == 0
-        ), (
-            f"could not place split h={h} factor={split} on "
-            f"stride_map={stride_map} device_size={device_size}"
-        )
+        dev_dim = device_stride_to_dim.get(h)
+        if h == stick_host_stride:
+            dev_dim = num_stick_dim
+        # Multi-stick-stride rescue: a consumer view subdivides the stickified
+        # axis at k sticks per step (h = k * num_stick_stride). Only safe when
+        # split*k fully covers num_stick_dim — partial coverage would
+        # misreport the per-dim factor. Example (test_view_unsqueeze_add):
+        # device_size=[2, 6, 1, 64], num_stick_dim=1 (stride 64); split=3,
+        # h=128, k=2, split*k=6 == device_size[1] → place on dim 1, factor 6.
+        if dev_dim is None and num_stick_stride > 0 and h % num_stick_stride == 0:
+            k = h // num_stick_stride
+            if split * k == num_stick:
+                dev_dim = num_stick_dim
+                split *= k
+        # TODO: two known unhandled failure modes fall through to the
+        # empty_view fallback (cases catalogued in
+        # per_core_view_failing_cases.md):
+        #   (A) Collapsed-axis info loss — device_layout built from a
+        #       higher-rank host tensor while dep is indexed via a lower-rank
+        #       reshape view; the work-split factor spans multiple device
+        #       dims but reaches us as a single (h, factor) (e.g.
+        #       test_matmul_tiled_y, test_qkv_attn_paths_fms_*_gqa).
+        #   (B) Multi-stick stride with partial coverage —
+        #       h = k * stride_map[num_stick_dim], k > 1, but
+        #       split * k < num_stick (rescue above only
+        #       handles the full-coverage case where they are equal).
+        # In both cases no single (dev_dim, factor) placement faithfully
+        # represents the per-core slicing; empty_view keeps the buffer on
+        # HBM via the caller's mismatch logic. Future work: extend the
+        # PerCoreView schema to express multi-dim or strided splits, or
+        # refuse the buffer earlier in scratchpad planning.
+        if (
+            dev_dim is None
+            or dev_dim in work_slice_dims
+            or device_size[dev_dim] % split != 0
+        ):
+            logger.debug(
+                f"could not place split h={h} factor={split} on "
+                f"stride_map={stride_map} device_size={device_size}; "
+                f"returning empty_view"
+            )
+            return empty_view
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
 

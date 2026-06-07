@@ -82,5 +82,4 @@ class TestSpyreConfig(InductorTestCase):
     #
     #    comp_fn = torch.compile(fn)
     #    out, source_codes = run_and_get_code(comp_fn, x)
-    #    #print(f"lx_planning {config.lx_planning}")
     #    #print(source_codes[0])

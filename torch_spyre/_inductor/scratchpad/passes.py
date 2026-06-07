@@ -228,4 +228,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
                 self.limit,
                 buf_users,
                 get_ncores_for_buffers(graph),
+                # TODO consider cache some of the Op/buf dep table for later use. Only
+                # need to refresh input/clone related entries. Because next step,
+                # allocator._generate_buffers(), aka buf_analysis, will call it again.
             )
