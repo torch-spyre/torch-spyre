@@ -159,9 +159,9 @@ class _SpyreImpl:
         return self._initialized and not self._is_in_bad_fork()
 
     def device_count(self) -> int:
-        from . import _hooks
+        from . import _C
 
-        return _hooks.device_count()
+        return _C.device_count()
 
     def current_device(self) -> int:
         return getattr(self._C, "current_device", lambda: 0)()
@@ -270,7 +270,7 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    from . import _hooks  # noqa: F401
+    from . import _C  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
