@@ -665,5 +665,4 @@ def compile_op_spec(
         symbols,
         symbol_id_offset,
         tiled_symbols=tiled_symbols,
-        use_symbols=use_symbols,
     )
