@@ -21,10 +21,11 @@ each call has its own fresh decorator instances. A one-time global patch
 would not affect these copies.
 """
 
-from typing import Set, Optional
+from typing import Set, List, Optional
 import torch
 import regex as re
 import pytest  # type: ignore
+import torch.utils._pytree as pytree
 
 from oot_test_utilities import _OOT_PLATFORM_ARCH, _get_privateuse1_device_type
 
@@ -62,6 +63,85 @@ def _extract_base_module_name(name: str) -> str:
         ):
             return base_name
     return name
+
+
+class _OOTCpuMovePatcher:
+    """Patches test class methods to move tensor arguments to CPU.
+
+    This patcher automatically wraps specified methods (like assertEqual) on the
+    test class at instantiation time. The wrapped version:
+    1. Moves all tensor arguments to CPU using pytree.tree_map
+    2. Calls the original method with the CPU-moved arguments
+
+    Targeted class methods is configurable via YAML config per-test.
+
+    Usage: Configure methods to wrap under edits.functions.cpu_move in the YAML configuration.
+    """
+
+    def __init__(
+        self, cls: type, functions: List[str], test_name: Optional[str] = None
+    ) -> None:
+        """
+        Args:
+            cls: The test class being instantiated.
+            functions: List of method names to override (e.g., ["assertEqual"]).
+            test_name: Optional test name for logging/debugging purposes.
+        """
+        self._cls = cls
+        self._functions = functions
+        self._test_name = test_name
+
+    @staticmethod
+    def _to_cpu(obj):
+        """Helper to move a single object to CPU if it's a tensor."""
+        return obj.cpu() if isinstance(obj, torch.Tensor) else obj
+
+    @classmethod
+    def _create_cpu_wrapper(cls, original_method):
+        """Create a wrapper function that moves tensor args/kwargs to CPU.
+
+        The wrapper uses pytree.tree_map to recursively traverse nested structures
+        (tuples, lists, dicts) and move any tensors to CPU before calling the
+        original method.
+        """
+
+        def _cpu_wrapper(self, *args, **kwargs):
+            # Move all positional arguments to CPU
+            cpu_args = pytree.tree_map(cls._to_cpu, args)
+            # Move all keyword arguments to CPU
+            cpu_kwargs = pytree.tree_map(cls._to_cpu, kwargs)
+            # Call the original method with CPU-moved arguments
+            return original_method(self, *cpu_args, **cpu_kwargs)
+
+        return _cpu_wrapper
+
+    def patch(self) -> None:
+        """Apply the CPU move wrappers to the specified methods on the class.
+
+        For each function in self._functions:
+        1. Check if the method exists on the class
+        2. Wrap it with the CPU move wrapper
+        3. Set the wrapped method back on the class
+        """
+        for func_name in self._functions:
+            # Get the method from the class (or its bases via MRO)
+            original_method = getattr(self._cls, func_name, None)
+            if original_method is None:
+                # Method doesn't exist on this class, skip
+                continue
+
+            # Check if already patched (avoid double-patching)
+            if getattr(original_method, "_cpu_move_patched", False):
+                continue
+
+            # Create the wrapper
+            wrapped = self._create_cpu_wrapper(original_method)
+            wrapped._cpu_move_patched = True  # type: ignore[attr-defined]
+            wrapped.__name__ = func_name
+            wrapped.__doc__ = getattr(original_method, "__doc__", None)
+
+            # Set the wrapped method on the class
+            setattr(self._cls, func_name, wrapped)
 
 
 class _OOTNativeDeviceTypesPatcher:

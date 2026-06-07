@@ -44,6 +44,7 @@ from oot_upstream_patcher import (
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
     _OOTNativeDeviceTypesPatcher,
+    _OOTCpuMovePatcher,
     _OOTPlatformMarkerPatcher,
 )
 from oot_test_config_models import (
@@ -617,6 +618,21 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
+
+        # ------------------------------------------------------------------
+        # Collect CPU move functions from global config and all test entries
+        # for this test name. Then apply the CPU move patcher to move tensor
+        # arguments to CPU for specified methods (e.g., assertEqual).
+        # ------------------------------------------------------------------
+        # Collect CPU move functions from all test entries for this test name.
+        # Then apply the CPU move patcher to move tensor arguments to CPU.
+        cpu_move_functions: Set[str] = set()
+        for _e in all_entries_for_name:
+            per_test_funcs = _e.edits.functions.resolved_cpu_move_functions()
+            if per_test_funcs:
+                cpu_move_functions.update(per_test_funcs)
+        if cpu_move_functions:
+            _OOTCpuMovePatcher(cls, list(cpu_move_functions), test_name=name).patch()
 
         _tags_to_write: Dict[str, List[str]] = {}
         for method_name in new_methods:
