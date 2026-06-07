@@ -325,7 +325,6 @@ def _compile_specs(
                     entry,
                     symbols,
                     symbol_id_offset_counter[0],
-                    use_symbols=use_symbols,
                 )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
