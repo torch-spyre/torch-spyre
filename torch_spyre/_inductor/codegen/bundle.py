@@ -81,6 +81,7 @@ def generate_bundle(
         unroll_loops = _spyre_config.unroll_loops
     if symbolic_args is None:
         symbolic_args = _spyre_config.bundle_symbolic_args
+    use_symbols = symbolic_args
 
     specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
 
@@ -102,6 +103,7 @@ def generate_bundle(
         sdsc_counter,
         symbol_id_offset_counter,
         output_dir,
+        use_symbols=use_symbols,
     )
 
     # -----------------------------------------------------------------------
@@ -278,6 +280,7 @@ def generate_bundle(
             [],
             f,
             indent=2,
+            use_symbols=use_symbols,
             symbolic_args=symbolic_args,
             kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
             sym_canonical=sym_canonical,
@@ -300,6 +303,7 @@ def _compile_specs(
     sdsc_counter: list,
     symbol_id_offset_counter: list,
     output_dir: str,
+    use_symbols: bool = False,
 ) -> None:
     """Recursively compile all OpSpecs in specs depth-first."""
     for entry in specs:
@@ -311,6 +315,7 @@ def _compile_specs(
                 sdsc_counter,
                 symbol_id_offset_counter,
                 output_dir,
+                use_symbols=use_symbols,
             )
         elif isinstance(entry, OpSpec):
             idx = sdsc_counter[0]
@@ -321,6 +326,7 @@ def _compile_specs(
                     entry,
                     symbols,
                     symbol_id_offset_counter[0],
+                    use_symbols=use_symbols,
                 )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
@@ -403,6 +409,7 @@ def _emit_specs(
     loop_vars: list,
     f,
     indent: int,
+    use_symbols: bool = False,
     symbolic_args: bool = False,
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
@@ -448,6 +455,7 @@ def _emit_specs(
                 loop_vars + [loop_var],
                 f,
                 indent + 1,
+                use_symbols=use_symbols,
                 symbolic_args=symbolic_args,
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
@@ -495,12 +503,18 @@ def _emit_specs(
             ]
 
             operand_str = ", ".join(operands)
-            symbol_ids_str = ", ".join(str(i) for i in symbol_ids)
-            f.write(
-                f"{tab}sdscbundle.sdsc_execute ({operand_str}) "
-                f'{{sdsc_filename="{sdsc_filename}", '
-                f'"symbol_ids"=[{symbol_ids_str}]}}\n'
-            )
+            if use_symbols:
+                symbol_ids_str = ", ".join(str(i) for i in symbol_ids)
+                f.write(
+                    f"{tab}sdscbundle.sdsc_execute ({operand_str}) "
+                    f'{{sdsc_filename="{sdsc_filename}", '
+                    f'"symbol_ids"=[{symbol_ids_str}]}}\n'
+                )
+            else:
+                f.write(
+                    f"{tab}sdscbundle.sdsc_execute () "
+                    f'{{sdsc_filename="{sdsc_filename}"}}\n'
+                )
 
 
 def _extract_symbol_ids(sdsc_json: dict) -> list[int]:
