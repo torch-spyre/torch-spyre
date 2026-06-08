@@ -30,6 +30,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .pass_utils import host_coordinates, device_coordinates, op_out_coords
@@ -317,16 +318,17 @@ def _log_op(op: Operation) -> None:
 
 
 def propagate_named_dims(
-    operations: list[Operation],
+    graph: GraphLowering,
 ) -> None:
     """Propagate named dims from annotated inputs through the op graph."""
     global _enabled
+    operations = graph.operations
     if not _enabled:
         return
-    if V.graph.graph_input_names:
-        for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
+    if len(graph.graph_input_names) > 0:
+        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
-                tb = V.graph.graph_inputs[name]
+                tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
                     or not isinstance(tb.data, StorageBox)
@@ -398,8 +400,8 @@ def propagate_named_dims(
             logger.info(f"  {name} = {size}")
 
         logger.info("INPUT TENSORS")
-        for name in V.graph.graph_input_names:
-            tb = V.graph.graph_inputs[name]
+        for name in graph.graph_input_names:
+            tb = graph.graph_inputs[name]
             if isinstance(tb, TensorBox):
                 dp = getattr(tb, "_dim_prop_info", None)
                 logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
@@ -410,7 +412,7 @@ def propagate_named_dims(
     _enabled = False
 
 
-def assign_dim_hints(operations: list[Operation]) -> None:
+def assign_dim_hints(graph: GraphLowering) -> None:
     """Combine spyre_hint scope annotations with propagated named dimensions.
 
     Reads the hint scopes (from spyre_hint() context managers in user code,
@@ -425,6 +427,7 @@ def assign_dim_hints(operations: list[Operation]) -> None:
 
     Deletes op._dim_prop_info when done — those fields are only needed here.
     """
+    operations = graph.operations
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
