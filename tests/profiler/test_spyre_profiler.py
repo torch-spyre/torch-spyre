@@ -66,8 +66,6 @@ class TestSpyreProfiler(TestCase):
                 json.load(f)
 
         event_list.table()
-        prof.export_chrome_trace("../../tests/trace_prof.json")
-        event_list.export_chrome_trace("../../tests/trace_event.json")
 
     @unittest.skipIf(not Test_spyre, "spyre device required")
     def test_profiler_timestamp_consistency(self):

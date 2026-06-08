@@ -30,7 +30,6 @@ from torch.autograd import (
 import tempfile
 import os
 from torch.profiler import (
-    ExecutionTraceObserver,
     supported_activities,
     record_function,
     kineto_available,
@@ -149,19 +148,11 @@ class TestExecutionTrace(TestCase):
             tempfile.NamedTemporaryFile(
                 mode="w+t", suffix=".kineto.json", delete=False
             ) as kt,
-            tempfile.NamedTemporaryFile(  # <-- A graph of operator calls and their data dependencies, capturing the logical execution structure.useful for deep dive data analysis
-                mode="w+t", suffix=".et.json", delete=False
-            ) as et,
         ):
             kt_name = kt.name
-            et_name = et.name
-
-        et_observer = ExecutionTraceObserver()
-        et_observer.register_callback(et_name)
 
         # Uncomment for debugging
         # print("Output kineto = ", kt.name)
-        # print("Output ET = ", et.name)
 
         with profile(
             activities=supported_activities(),
@@ -169,21 +160,20 @@ class TestExecutionTrace(TestCase):
                 skip_first=3, wait=1, warmup=1, active=2, repeat=1
             ),
             on_trace_ready=trace_handler,
-            execution_trace_observer=et_observer,
         ) as p:
             for idx in range(10):
                 with record_function(f"## LOOP {idx} ##"):
                     self.payload(device, use_device=use_device)
                 p.step()
 
-            p.export_chrome_trace(kt_name)
+        p.export_chrome_trace(kt_name)
 
-            et_path = p.execution_trace_observer.get_output_file_path()
+        et_path = p.execution_trace_observer.get_output_file_path()
 
-            # et_res_path should be an empty directory and for spyre pytorch 2.12 update required verfied
-            # et_res_path = p.execution_trace_observer.get_resources_dir(et_path)
-            # self.assertTrue(os.path.isdir(et_res_path))
-            # self.assertEqual(len(os.listdir(et_res_path)), 0)
+        # et_res_path should be an empty directory and for spyre pytorch 2.12 update required verfied
+        # et_res_path = p.execution_trace_observer.get_resources_dir(et_path)
+        # self.assertTrue(os.path.isdir(et_res_path))
+        # self.assertEqual(len(os.listdir(et_res_path)), 0)
 
         # only one cycle has ran
         self.assertEqual(trace_called_num, 1)
@@ -218,7 +208,6 @@ class TestExecutionTrace(TestCase):
 
         rf_ids_et = self.get_execution_trace_rf_ids(nodes)
         rf_ids_kineto = self.get_kineto_rf_ids(events)
-        print(len(rf_ids_kineto), len(rf_ids_et))
         self.assertCountEqual(rf_ids_et, rf_ids_kineto)
         self.assertListEqual(
             rf_ids_et,
