@@ -2871,5 +2871,159 @@ class TestStampGroupReductionDim(unittest.TestCase):
         self.assertEqual(pw_op.loop_info.loop_tiled_reduction_dims, [[]])
 
 
+class TestPropagateTiledReductionOp(unittest.TestCase):
+    """_propagate_tiled_reduction_op inserts fill + combine for tiled reductions."""
+
+    def _make_tiled_reduction(
+        self, name, out_ranges, reduction_ranges, reduction_type="sum", loop_count=4
+    ):
+        """Build a ComputedBuffer mock stamped for reduction-dim tiling."""
+        import torch
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,  # noqa: F401
+            Reduction,
+            ReductionHint,
+        )
+        from torch._inductor.ir import FlexibleLayout
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        data = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx, ridx: None,
+            ranges=[Integer(r) for r in out_ranges],
+            reduction_ranges=[Integer(r) for r in reduction_ranges],
+            reduction_type=reduction_type,
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        size = [Integer(r) for r in out_ranges]
+        strides = list(FlexibleLayout.contiguous_strides(size))
+        device = torch.device("cpu")
+        dtype = torch.float16
+        dim_order = list(range(len(out_ranges)))
+        stl = SpyreTensorLayout(
+            [int(s) for s in size],
+            [int(s) for s in strides] if strides else [1],
+            dtype,
+            dim_order,
+        )
+        layout = FixedTiledLayout(device, dtype, size, strides, stl)
+        op = MagicMock(spec=ComputedBuffer)
+        op.name = name
+        op.data = data
+        op.get_name.return_value = name
+        op.get_operation_name.return_value = name
+        op.get_device.return_value = device
+        op.get_dtype.return_value = dtype
+        op.layout = layout
+        op.origins = OrderedSet()
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(loop_count)],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[0]],
+        )
+        op.make_loader.return_value = lambda index: None
+        return op
+
+    def test_fill_and_combine_ops_inserted(self):
+        """_propagate_tiled_reduction_op inserts a fill op and a combine op."""
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor.coarse_tile import _propagate_tiled_reduction_op
+
+        op = self._make_tiled_reduction("red0", out_ranges=[32], reduction_ranges=[64])
+        operations = [op]
+
+        fill_buf_mock = MagicMock(spec=ComputedBuffer)
+        fill_buf_mock.get_name.return_value = "coarse_tile_accum_red0"
+
+        with (
+            patch(
+                "torch_spyre._inductor.coarse_tile._allocate_full_buffer",
+                return_value=fill_buf_mock,
+            ) as mock_alloc,
+            patch(
+                "torch_spyre._inductor.coarse_tile._find_outside_consumers",
+                return_value=([], False),
+            ),
+            patch(
+                "torch_spyre._inductor.coarse_tile._graph_output_names",
+                return_value=set(),
+            ),
+            patch("torch_spyre._inductor.coarse_tile.V") as mock_v,
+            patch("torch._inductor.ir.V"),
+        ):
+            mock_v.graph.qualify_name.side_effect = lambda n: n
+            mock_v.graph.name_to_buffer = {}
+            # Simulate _allocate_full_buffer inserting fill_buf_mock into operations
+            mock_alloc.side_effect = lambda *a, **kw: (
+                operations.insert(0, fill_buf_mock) or fill_buf_mock
+            )
+            _propagate_tiled_reduction_op(op, operations)
+
+        # The original op should be marked per_tile_fixed
+        self.assertTrue(op.layout.per_tile_fixed)
+        # A fill init op and combine op should have been inserted
+        # (2 new ops: fill_init Pointwise + combine Pointwise)
+        self.assertGreater(len(operations), 1)
+        names = [
+            o.get_name() if hasattr(o, "get_name") and callable(o.get_name) else ""
+            for o in operations
+        ]
+        self.assertTrue(any("fill" in n or "accum" in n for n in names))
+        self.assertTrue(any("combine" in n for n in names))
+
+    def test_consumers_patched_to_accum_buf(self):
+        """Outside consumers are redirected to read the accumulation buffer."""
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor.coarse_tile import _propagate_tiled_reduction_op
+
+        op = self._make_tiled_reduction("red0", out_ranges=[32], reduction_ranges=[64])
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        operations = [op, consumer]
+
+        fill_buf_mock = MagicMock(spec=ComputedBuffer)
+        fill_buf_mock.get_name.return_value = "coarse_tile_accum_red0"
+        fill_buf_mock.make_loader.return_value = lambda index: None
+
+        patched_consumers = []
+
+        def fake_patch_consumers(consumers, old, new, ops):
+            patched_consumers.extend(consumers)
+
+        with (
+            patch(
+                "torch_spyre._inductor.coarse_tile._allocate_full_buffer",
+                side_effect=lambda *a, **kw: (
+                    operations.insert(0, fill_buf_mock) or fill_buf_mock
+                ),
+            ),
+            patch(
+                "torch_spyre._inductor.coarse_tile._find_outside_consumers",
+                return_value=([consumer], False),
+            ),
+            patch(
+                "torch_spyre._inductor.coarse_tile._patch_consumers",
+                side_effect=fake_patch_consumers,
+            ),
+            patch(
+                "torch_spyre._inductor.coarse_tile._graph_output_names",
+                return_value=set(),
+            ),
+            patch("torch_spyre._inductor.coarse_tile.V") as mock_v,
+            patch("torch._inductor.ir.V"),
+        ):
+            mock_v.graph.qualify_name.side_effect = lambda n: n
+            mock_v.graph.name_to_buffer = {}
+            _propagate_tiled_reduction_op(op, operations)
+
+        self.assertIn(consumer, patched_consumers)
+
+
 if __name__ == "__main__":
     unittest.main()

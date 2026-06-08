@@ -358,6 +358,13 @@ def _propagate_tiled_op(
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
+        loop_info = getattr(op, "loop_info", None)
+        has_tiled_reduction = loop_info is not None and any(
+            dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+        )
+        if has_tiled_reduction:
+            _propagate_tiled_reduction_op(op, operations)
+            return
 
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
@@ -655,6 +662,158 @@ def _insert_copy_op(
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, copy_buf)
+
+
+# ---------------------------------------------------------------------------
+# Case: reduction-dim tiling — combine op insertion
+# ---------------------------------------------------------------------------
+
+
+def _insert_combine_op(
+    tiled_op: ComputedBuffer,
+    accum_buf: ComputedBuffer,
+    operations: list[Operation],
+) -> None:
+    """Insert a pointwise combine op that accumulates tiled_op into accum_buf.
+
+    The combine op reads both the partial result (tiled_op) and the current
+    accumulation buffer and writes the combined value back into accum_buf via
+    MutationLayoutSHOULDREMOVE.  It carries the same loop_info as tiled_op
+    so the scheduler places it inside the same CountedLoopSchedulerNode.
+    """
+    from torch._inductor.virtualized import ops as vops
+
+    reduction_type = tiled_op.data.reduction_type
+    partial_loader = tiled_op.make_loader()
+    accum_loader = accum_buf.make_loader()
+
+    def combine_inner_fn(index):
+        partial = partial_loader(index)
+        accum = accum_loader(index)
+        if reduction_type in ("sum", "xor_sum"):
+            return vops.add(accum, partial)
+        if reduction_type == "prod":
+            return vops.mul(accum, partial)
+        if reduction_type == "max":
+            return vops.maximum(accum, partial)
+        if reduction_type == "min":
+            return vops.minimum(accum, partial)
+        if reduction_type == "any":
+            return vops.logical_or(accum, partial)
+        raise RuntimeError(
+            f"coarse_tile: _insert_combine_op: unsupported reduction_type "
+            f"{reduction_type!r}"
+        )
+
+    combine_data = Pointwise(
+        device=tiled_op.get_device(),
+        dtype=tiled_op.get_dtype(),
+        inner_fn=combine_inner_fn,
+        ranges=list(tiled_op.data.ranges),
+    )
+    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{tiled_op.get_name()}")
+    combine_buf = ComputedBuffer(
+        name=combine_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
+        data=combine_data,
+    )
+    combine_buf.origins = tiled_op.origins
+    combine_buf.operation_name = combine_name
+    combine_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+    V.graph.name_to_buffer[combine_name] = combine_buf
+
+    tiled_idx = operations.index(tiled_op)
+    operations.insert(tiled_idx + 1, combine_buf)
+
+
+def _propagate_tiled_reduction_op(
+    op: ComputedBuffer,
+    operations: list[Operation],
+) -> None:
+    """Handle buffer propagation for a Reduction op tiled over a reduction dim.
+
+    Strategy: fill-initialize + per-tile combine.
+      1. Allocate a HBM accumulation buffer the size of the full output shape.
+      2. Insert a fill op (outside the loop) that writes the reduction's identity
+         value into the accumulation buffer.
+      3. Insert a combine op (inside the loop) that merges each tile's partial
+         result into the accumulation buffer using the reduction's combining fn.
+      4. Mark the tiled reduction op's output as per_tile_fixed (loop-internal
+         scratch, not advanced between iterations).
+      5. Patch outside consumers and graph outputs to read the accumulation buffer.
+    """
+    from torch._inductor.virtualized import ops as vops
+
+    loop_info = op.loop_info
+    loop_group_id = loop_info.loop_group_id
+    reduction_type = op.data.reduction_type
+    identity = _reduction_identity_value(reduction_type, op.get_dtype())
+
+    # Accumulation buffer has the full output shape.  For reduction-dim-only
+    # tiling, data.ranges is already the full output shape (only
+    # reduction_ranges was divided, not ranges).
+    full_output_ranges = list(op.data.ranges)
+
+    # Insert HBM buffer before the first op in the loop group.
+    outer_key = loop_group_id[0]
+    group_start_idx = next(
+        i
+        for i, o in enumerate(operations)
+        if isinstance(o, ComputedBuffer)
+        and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        == outer_key
+    )
+    accum_buf = _allocate_full_buffer(
+        op, full_output_ranges, operations, group_start_idx
+    )
+
+    # Insert fill op immediately after the HBM allocation (outside the loop).
+    dtype = op.get_dtype()
+    fill_data = Pointwise(
+        device=op.get_device(),
+        dtype=dtype,
+        inner_fn=lambda index, _id=identity, _dt=dtype: vops.constant(_id, _dt),
+        ranges=full_output_ranges,
+    )
+    fill_name = V.graph.qualify_name(f"coarse_tile_fill_{op.get_name()}")
+    fill_buf = ComputedBuffer(
+        name=fill_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
+        data=fill_data,
+    )
+    fill_buf.origins = op.origins
+    fill_buf.operation_name = fill_name
+    # No loop_info: fill runs once, before the loop.
+    V.graph.name_to_buffer[fill_name] = fill_buf
+    accum_idx = operations.index(accum_buf)
+    operations.insert(accum_idx + 1, fill_buf)
+
+    # Insert combine op after the tiled reduction op (inside the loop).
+    _insert_combine_op(op, accum_buf, operations)
+
+    # Mark tiled op's output as per-tile scratch (no address advance).
+    from .ir import FixedTiledLayout
+
+    if isinstance(op.layout, FixedTiledLayout):
+        op.layout.per_tile_fixed = True
+
+    # Patch consumers.
+    buf_name = op.get_name()
+    outside_consumers, is_graph_output = _find_outside_consumers(
+        buf_name, loop_group_id, operations
+    )
+    accum_name = accum_buf.get_name()
+    _patch_consumers(outside_consumers, buf_name, accum_name, operations)
+    if is_graph_output:
+        _patch_graph_outputs(buf_name, accum_buf)
+
+    logger.debug(
+        "coarse_tile: tiled reduction %s → accum %s (fill=%s, identity=%s)",
+        buf_name,
+        accum_name,
+        fill_name,
+        identity,
+    )
 
 
 # ---------------------------------------------------------------------------
