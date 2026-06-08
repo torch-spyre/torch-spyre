@@ -43,6 +43,7 @@ square matrices (M==K==N) correctly.
 """
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -181,7 +182,7 @@ def _rebuild_matmul(
     return replace_computed_buffer_body(op, reduction, operations)
 
 
-def insert_bmm_padding(operations: list[Operation]) -> None:
+def insert_bmm_padding(graph: GraphLowering) -> None:
     """
     Pad y's K (row) dimension for each BATCH_MATMUL_OP to a stick boundary.
 
@@ -199,6 +200,7 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
     """
+    operations = graph.operations
     for op in list(operations):
         if not isinstance(op, ComputedBuffer):
             continue
@@ -220,7 +222,7 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         # makes reduction_coord detection fail for both inputs.
         k_val = concretize_expr(reduction.reduction_ranges[0])
         first_buf = next(
-            (V.graph.get_buffer(d.name) for d in reads if V.graph.get_buffer(d.name)),
+            (graph.get_buffer(d.name) for d in reads if graph.get_buffer(d.name)),
             None,
         )
         assert first_buf is not None, (
@@ -243,7 +245,7 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         y_dep = None
         y_host_k_dim: int | None = None
         for dep in reads:
-            buf = V.graph.get_buffer(dep.name)
+            buf = graph.get_buffer(dep.name)
             if buf is None:
                 continue
             layout = buf.get_layout()
@@ -279,8 +281,8 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
 
         x_name = x_dep.name
         y_name = y_dep.name
-        x_buf = V.graph.get_buffer(x_name)
-        y_buf = V.graph.get_buffer(y_name)
+        x_buf = graph.get_buffer(x_name)
+        y_buf = graph.get_buffer(y_name)
         if x_buf is None or y_buf is None:
             continue
 
@@ -297,8 +299,8 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         # mm_to_bmm_pass may wrap a 2D x buffer with a 3D view; we need the
         # loader to accept x_size-dimensional indices (len(output_ranges) dims).
         x_view_fx = _find_arg_fx_node(x_name, expected_size=x_size)
-        _patch_env(V.graph)
-        x_view_buf = V.graph.env[x_view_fx]
+        _patch_env(graph)
+        x_view_buf = graph.env[x_view_fx]
 
         k_padded = k_val + pad
 

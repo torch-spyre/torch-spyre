@@ -29,12 +29,17 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     # "clone",
     "exp",
     "sub",
-    # "mul",
+    "mul",
+    "mean",
+    "add",
+    "rsqrt",
 ]
 
 OP_GOOD_FOR_LX_INPLACE = [
     "exp",
     "sub",
+    "add",
+    "rsqrt",
 ]
 
 

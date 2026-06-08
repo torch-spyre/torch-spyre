@@ -32,6 +32,7 @@ from torch._inductor.ir import (
 )
 
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
@@ -876,8 +877,9 @@ def _iter_computed_buffers(operations: list[Operation]):
             logger.warning(f"unhandled operation type {type(op)}")
 
 
-def span_reduction(operations: list[Operation]) -> None:
+def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
+    operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op.get_read_writes()
@@ -889,13 +891,14 @@ def span_reduction(operations: list[Operation]) -> None:
 
 
 def work_distribution(
-    operations: list[Operation], preassigned_ops: list[Operation] | None = None
+    graph: GraphLowering, preassigned_ops: list[Operation] | None = None
 ) -> None:
     """Pass 3: distribute remaining cores across ops to maximize parallelism.
 
     Ops in `preassigned_ops` were already divided by cost_model_matmul_division;
     they are left untouched so every op is divided by exactly one pass.
     """
+    operations = graph.operations
     preassigned_ops = preassigned_ops or []
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
@@ -974,13 +977,14 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     return True
 
 
-def cost_model_matmul_division(operations: list[Operation]) -> list[Operation]:
+def cost_model_matmul_division(graph: GraphLowering) -> list[Operation]:
     """Pass 2: re-price matmul/bmm splits with the analytic hardware cost model.
 
     Runs after span_reduction and before work_distribution. Returns the ops it
     re-split so passes.py can exclude them from work_distribution — every op is
     divided by exactly one pass.
     """
+    operations = graph.operations
     max_cores = _validate_max_cores()
     cost_model_ops: list[Operation] = []
     for op in _iter_computed_buffers(operations):
