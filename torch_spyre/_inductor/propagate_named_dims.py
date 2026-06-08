@@ -323,101 +323,103 @@ def _log_op(op: Operation) -> None:
     logger.info("")
 
 
+def _propagate_named_dims_impl(graph: GraphLowering) -> None:
+    operations = graph.operations
+    if graph.graph_input_names:
+        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
+            if isinstance(real_input, torch.Tensor):
+                tb = graph.graph_inputs[name]
+                if (
+                    not isinstance(tb, TensorBox)
+                    or not isinstance(tb.data, StorageBox)
+                    or not isinstance(tb.data.data, InputBuffer)
+                ):
+                    raise Unsupported(
+                        f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                    )
+                layout = tb.data.data.layout
+                if not isinstance(layout, FixedLayout):
+                    raise Unsupported(f"graph input {name} does not have a FixedLayout")
+                tb._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
+                    named_dims=_named_tensor_dims.get(real_input) or []
+                )
+
+    for op in operations:
+        if op.is_no_op():
+            _set_no_named_dims(op)
+        elif isinstance(op, ComputedBuffer):
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                continue
+            hint = False
+            for hint_dict in get_op_hints(op).values():
+                if "named_dims" in hint_dict:
+                    hint = True
+                    named_dims = hint_dict["named_dims"]
+                    break
+            if hint:
+                coords = op_out_coords(op)
+                loop_var_dims = {
+                    _lone_sym(coord): [dim_name]
+                    for coord, dim_name in zip(coords, named_dims)
+                    if len(coord.free_symbols) == 1
+                }
+                op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
+                    named_dims=named_dims,
+                    loop_var_dims=loop_var_dims,
+                )
+                continue
+            origins: set = getattr(op.data, "origins", set())
+            aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
+            reduction_type = getattr(op.data, "reduction_type", None)
+            logger.debug(
+                f"\n--- {op.get_operation_name()} ({type(op.data).__name__})"
+                f" aten={aten_ops} reduction_type={reduction_type}"
+            )
+            rw = op.get_read_writes()
+            inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
+            if logger.isEnabledFor(logging.DEBUG):
+                for dep in inputs:
+                    _log_dep_debug("input", dep)
+                for dep in rw.writes:
+                    if isinstance(dep, MemoryDep):
+                        _log_dep_debug("output", dep)
+            if isinstance(op.data, (Pointwise, Reduction)):
+                _compute_named_dims(op, inputs)
+            else:
+                logger.warning(f"unhandled node type {type(op.data)}")
+                _set_no_named_dims(op)
+        elif isinstance(op, SpyreConstantFallback):
+            _set_no_named_dims(op)
+        else:
+            logger.warning(f"unhandled operation type {type(op)}")
+            _set_no_named_dims(op)
+
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("DECLARED DIMS")
+        for name, size in _named_dims.items():
+            logger.info(f"  {name} = {size}")
+
+        logger.info("INPUT TENSORS")
+        for name in graph.graph_input_names:
+            tb = graph.graph_inputs[name]
+            if isinstance(tb, TensorBox):
+                dp = getattr(tb, "_dim_prop_info", None)
+                logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
+
+        logger.info("OPS")
+        for op in operations:
+            _log_op(op)
+
+
 def propagate_named_dims(
     graph: GraphLowering,
 ) -> None:
     """Propagate named dims from annotated inputs through the op graph."""
     global _enabled
-    operations = graph.operations
     if not _enabled:
         return
     try:
-        if graph.graph_input_names:
-            for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
-                if isinstance(real_input, torch.Tensor):
-                    tb = graph.graph_inputs[name]
-                    if (
-                        not isinstance(tb, TensorBox)
-                        or not isinstance(tb.data, StorageBox)
-                        or not isinstance(tb.data.data, InputBuffer)
-                    ):
-                        raise Unsupported(
-                            f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
-                        )
-                    layout = tb.data.data.layout
-                    if not isinstance(layout, FixedLayout):
-                        raise Unsupported(
-                            f"graph input {name} does not have a FixedLayout"
-                        )
-                    tb._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
-                        named_dims=_named_tensor_dims.get(real_input) or []
-                    )
-
-        for op in operations:
-            if op.is_no_op():
-                _set_no_named_dims(op)
-            elif isinstance(op, ComputedBuffer):
-                if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                    continue
-                hint = False
-                for hint_dict in get_op_hints(op).values():
-                    if "named_dims" in hint_dict:
-                        hint = True
-                        named_dims = hint_dict["named_dims"]
-                        break
-                if hint:
-                    coords = op_out_coords(op)
-                    loop_var_dims = {
-                        _lone_sym(coord): [dim_name]
-                        for coord, dim_name in zip(coords, named_dims)
-                        if len(coord.free_symbols) == 1
-                    }
-                    op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
-                        named_dims=named_dims,
-                        loop_var_dims=loop_var_dims,
-                    )
-                    continue
-                origins: set = getattr(op.data, "origins", set())
-                aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
-                reduction_type = getattr(op.data, "reduction_type", None)
-                logger.debug(
-                    f"\n--- {op.get_operation_name()} ({type(op.data).__name__})"
-                    f" aten={aten_ops} reduction_type={reduction_type}"
-                )
-                rw = op.get_read_writes()
-                inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
-                if logger.isEnabledFor(logging.DEBUG):
-                    for dep in inputs:
-                        _log_dep_debug("input", dep)
-                    for dep in rw.writes:
-                        if isinstance(dep, MemoryDep):
-                            _log_dep_debug("output", dep)
-                if isinstance(op.data, (Pointwise, Reduction)):
-                    _compute_named_dims(op, inputs)
-                else:
-                    logger.warning(f"unhandled node type {type(op.data)}")
-                    _set_no_named_dims(op)
-            elif isinstance(op, SpyreConstantFallback):
-                _set_no_named_dims(op)
-            else:
-                logger.warning(f"unhandled operation type {type(op)}")
-                _set_no_named_dims(op)
-
-        if logger.isEnabledFor(logging.INFO):
-            logger.info("DECLARED DIMS")
-            for name, size in _named_dims.items():
-                logger.info(f"  {name} = {size}")
-
-            logger.info("INPUT TENSORS")
-            for name in graph.graph_input_names:
-                tb = graph.graph_inputs[name]
-                if isinstance(tb, TensorBox):
-                    dp = getattr(tb, "_dim_prop_info", None)
-                    logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
-
-            logger.info("OPS")
-            for op in operations:
-                _log_op(op)
+        _propagate_named_dims_impl(graph)
     finally:
         _named_tensor_dims.clear()
         _enabled = False
