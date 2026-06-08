@@ -2624,5 +2624,40 @@ class TestLoopVarToReductionRangesPos(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestReductionIdentityValues(unittest.TestCase):
+    """_reduction_identity_value returns the correct monoid identity per reduction type."""
+
+    def _identity(self, reduction_type):
+        from torch_spyre._inductor.coarse_tile import _reduction_identity_value
+        import torch
+
+        return _reduction_identity_value(reduction_type, torch.float16)
+
+    def test_sum(self):
+        self.assertEqual(self._identity("sum"), 0)
+
+    def test_xor_sum(self):
+        self.assertEqual(self._identity("xor_sum"), 0)
+
+    def test_any(self):
+        self.assertEqual(self._identity("any"), 0)
+
+    def test_prod(self):
+        self.assertEqual(self._identity("prod"), 1)
+
+    def test_max(self):
+        self.assertEqual(self._identity("max"), float("-inf"))
+
+    def test_min(self):
+        self.assertEqual(self._identity("min"), float("inf"))
+
+    def test_unknown_raises(self):
+        from torch_spyre._inductor.coarse_tile import _reduction_identity_value
+        import torch
+
+        with self.assertRaises(RuntimeError):
+            _reduction_identity_value("welford_reduce", torch.float16)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -894,6 +894,27 @@ def _divide_reduction_ranges(
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
 
 
+def _reduction_identity_value(
+    reduction_type: str, dtype: "torch.dtype"
+) -> "float | int":
+    """Return the monoid identity value for the given reduction type.
+
+    Used to initialize the accumulation buffer before a tiled reduction loop.
+    """
+    if reduction_type in ("sum", "xor_sum", "any"):
+        return 0
+    if reduction_type == "prod":
+        return 1
+    if reduction_type == "max":
+        return float("-inf")
+    if reduction_type == "min":
+        return float("inf")
+    raise RuntimeError(
+        f"coarse_tile: unsupported reduction_type {reduction_type!r} for tiled "
+        "reduction — no identity value is defined for this reduction type."
+    )
+
+
 def _validate_contiguous(
     ops: list[Operation],
     op_to_position: dict[str, int],
