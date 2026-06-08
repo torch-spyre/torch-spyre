@@ -109,7 +109,7 @@ class TestExecutionTrace(TestCase):
             for e in ops_and_annoations
         )
 
-    def get_execution_trace_root(self, output_file_name) -> Json:
+    def get_execution_trace_root(self, output_file_name):  # returns List[Json]
         import gzip
 
         nodes = []
