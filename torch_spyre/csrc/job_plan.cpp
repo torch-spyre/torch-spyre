@@ -40,7 +40,7 @@ void JobPlanStepH2D::write(std::ostream& os) const {
 }
 
 void JobPlanStepD2H::construct(
-    LaunchContext&) const {
+    LaunchContext&, flex::RuntimeStream* flex_stream) const {
   flex_stream->launchOperationD2H(&device_address_, host_address_);
 }
 
@@ -53,7 +53,7 @@ void JobPlanStepD2H::write(std::ostream& os) const {
 }
 
 void JobPlanStepCompute::construct(
-    LaunchContext& ctx) const {
+    LaunchContext& ctx, flex::RuntimeStream* flex_stream) const {
   if (bind_io_addresses_) {
     std::vector<const flex::CompositeAddress*> inp;
     for (auto& tensor : ctx.inputs_outputs) {
