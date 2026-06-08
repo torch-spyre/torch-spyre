@@ -53,6 +53,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     generate_sdsc,
 )
 from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec, compile_op_spec
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.coarse_tile import coarse_tile, _divide_ranges
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.scheduler import (
@@ -160,8 +161,7 @@ def _make_op(data, name="op0"):
     op.layout = MagicMock()
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    del op.loop_group_id
-    del op.loop_count
+    del op.loop_info
     return op
 
 
@@ -220,7 +220,7 @@ def _make_scheduler():
 
 
 def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
-    """Return a fake ir.Operation optionally stamped with loop attributes.
+    """Return a fake ir.Operation optionally stamped with loop_info.
 
     loop_count must be a list of trip counts (one per nesting level), matching
     the contract stamped by coarse_tile().  A bare Expr is accepted as a
@@ -229,11 +229,14 @@ def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
     op = MagicMock()
     op.name = name
     if loop_group_id is not None:
-        op.loop_group_id = loop_group_id
-        op.loop_count = loop_count if isinstance(loop_count, list) else [loop_count]
+        counts = loop_count if isinstance(loop_count, list) else [loop_count]
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=loop_group_id,
+            loop_count=counts,
+            loop_tiled_dims=[],
+        )
     else:
-        del op.loop_group_id
-        del op.loop_count
+        del op.loop_info
     return op
 
 
@@ -379,6 +382,33 @@ def _make_tiled_json(idx: int, sym_id: int) -> dict:
             ],
         }
     }
+
+
+# ===========================================================================
+# 0. CoarseTileInfo dataclass
+# ===========================================================================
+
+
+class TestCoarseTileInfo(unittest.TestCase):
+    def test_fields(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        self.assertEqual(info.loop_group_id, (0,))
+        self.assertEqual(info.loop_count, [Integer(4)])
+        self.assertEqual(info.loop_tiled_dims, [[0]])
+
+    def test_nested(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(4), Integer(2)],
+            loop_tiled_dims=[[0], [1]],
+        )
+        self.assertEqual(info.loop_group_id, (0, 0))
+        self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(info.loop_tiled_dims, [[0], [1]])
 
 
 # ===========================================================================
@@ -593,9 +623,7 @@ class TestCoarseTile(unittest.TestCase):
         op = _make_op(data, "op0")
         original = list(data.ranges)
         coarse_tile([op], [])
-        self.assertFalse(
-            hasattr(op, "loop_group_id") and op.loop_group_id != MagicMock()
-        )
+        self.assertFalse(hasattr(op, "loop_info") and op.loop_info != MagicMock())
         self.assertEqual(data.ranges, original)
 
     def test_non_computed_buffer_skipped(self):
@@ -606,7 +634,7 @@ class TestCoarseTile(unittest.TestCase):
             [op_extern, op_computed],
             [([op_extern, op_computed], [(0, Integer(2))])],
         )
-        self.assertEqual(op_computed.loop_group_id, (0,))
+        self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
 
     def test_symbolic_count(self):
@@ -615,7 +643,7 @@ class TestCoarseTile(unittest.TestCase):
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile([op], [([op], [(0, k)])])
-        self.assertEqual(op.loop_count, [k])
+        self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
     def test_non_contiguous_group_raises(self):
@@ -655,9 +683,9 @@ class TestCoarseTileNested(unittest.TestCase):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
         coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
-        self.assertEqual(op.loop_group_id, (0, 0))
-        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
-        self.assertEqual(op.loop_tiled_dims, [[0], [1]])
+        self.assertEqual(op.loop_info.loop_group_id, (0, 0))
+        self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
 
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
@@ -687,14 +715,14 @@ class TestCoarseTileNested(unittest.TestCase):
                 ([op1], [(2, Integer(4)), (3, Integer(2))]),
             ],
         )
-        self.assertEqual(op0.loop_group_id, (0,))
-        self.assertEqual(op0.loop_count, [Integer(4)])
-        self.assertEqual(op0.loop_tiled_dims, [[0]])
+        self.assertEqual(op0.loop_info.loop_group_id, (0,))
+        self.assertEqual(op0.loop_info.loop_count, [Integer(4)])
+        self.assertEqual(op0.loop_info.loop_tiled_dims, [[0]])
         self.assertEqual(d0.ranges[0], Integer(16))
         self.assertEqual(d0.ranges[1], Integer(32))
-        self.assertEqual(op1.loop_group_id, (1, 0))
-        self.assertEqual(op1.loop_count, [Integer(4), Integer(2)])
-        self.assertEqual(op1.loop_tiled_dims, [[0], [1]])
+        self.assertEqual(op1.loop_info.loop_group_id, (1, 0))
+        self.assertEqual(op1.loop_info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op1.loop_info.loop_tiled_dims, [[0], [1]])
         self.assertEqual(d1.ranges[0], Integer(32))
         self.assertEqual(d1.ranges[1], Integer(32))
 
@@ -703,8 +731,8 @@ class TestCoarseTileNested(unittest.TestCase):
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
         coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(32))
-        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
-        self.assertEqual(op.loop_tiled_dims, [[0], [0]])
+        self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
 
 
 # ===========================================================================
@@ -1567,9 +1595,11 @@ def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_group_id = loop_group_id
-    op.loop_count = list(loop_count)
-    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=loop_group_id,
+        loop_count=list(loop_count),
+        loop_tiled_dims=[list(d) for d in loop_tiled_dims],
+    )
     op.get_read_writes.return_value = _make_rw_with_reads()
     op.origins = OrderedSet()
     return op
@@ -1587,7 +1617,7 @@ def _make_consumer_op(name, reads_buf):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    del op.loop_group_id
+    del op.loop_info
     op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
     op.origins = OrderedSet()
     return op
@@ -1605,9 +1635,11 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_group_id = loop_group_id
-    op.loop_count = [Integer(4)]
-    op.loop_tiled_dims = [[0]]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=loop_group_id,
+        loop_count=[Integer(4)],
+        loop_tiled_dims=[[0]],
+    )
     op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
     op.origins = OrderedSet()
     return op
@@ -1749,9 +1781,11 @@ def _make_tiled_reduction_op(
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_group_id = loop_group_id
-    op.loop_count = list(loop_count)
-    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=loop_group_id,
+        loop_count=list(loop_count),
+        loop_tiled_dims=[list(d) for d in loop_tiled_dims],
+    )
     op.get_read_writes.return_value = _make_rw_with_reads()
     op.origins = OrderedSet()
     return op
@@ -1816,7 +1850,11 @@ class TestTiledSymsForSchedNode(unittest.TestCase):
 
         ir_op = MagicMock()
         ir_op.data.ranges = [Integer(r) for r in host_ranges]
-        ir_op.loop_tiled_dims = [[1]]
+        ir_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[1]],
+        )
 
         snode = MagicMock(spec=SchedulerNode)
         snode.node = ir_op
