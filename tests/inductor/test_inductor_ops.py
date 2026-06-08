@@ -5349,6 +5349,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
 
+    @pytest.mark.xfail(
+        reason=(
+            "RESTICKIFY_OP does not support FP32 dtype "
+            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.IEEE_FP32)"
+        ),
+        strict=True,
+    )
+    def test_restickify_fp32_unsupported_xfail(self):
+        """Verify RESTICKIFY_OP correctly rejects FP32 dtype.
+
+        Operations that would trigger restickify (like transpose + pointwise)
+        should fail with Unsupported error when using FP32 tensors.
+        """
+        x = torch.randn((128, 128), dtype=torch.float32)
+        y = torch.randn((128, 128), dtype=torch.float32)
+        # Transpose creates layout incompatibility that triggers restickify
+        self.compare_with_cpu(
+            lambda x, y: x.t() + y,
+            x,
+            y,
+            run_eager=False,
+        )
+
+    @pytest.mark.xfail(
+        reason=(
+            "RESTICKIFY_OP does not support INT64 dtype "
+            "(stable error signature: Unsupported: ReStickifyOpHBM on DataFormats.INT32)"
+        ),
+        strict=True,
+    )
+    def test_restickify_int64_unsupported_xfail(self):
+        """Verify RESTICKIFY_OP correctly rejects INT64 dtype.
+
+        Operations that would trigger restickify (like transpose + pointwise)
+        should fail with Unsupported error when using INT64 tensors.
+        """
+        x = torch.randint(0, 100, (128, 128), dtype=torch.int64)
+        y = torch.randint(0, 100, (128, 128), dtype=torch.int64)
+        # Transpose creates layout incompatibility that triggers restickify
+        self.compare_with_cpu(
+            lambda x, y: x.t() + y,
+            x,
+            y,
+            run_eager=False,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
