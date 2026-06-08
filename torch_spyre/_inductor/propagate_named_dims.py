@@ -231,7 +231,7 @@ def _compute_named_dims(op, inputs):
     if isinstance(op.data, Reduction):
         reduction_sym = get_reduction_dim(inputs[0], out_coords)
         if reduction_sym not in loop_var_dims:
-            size = int(output_dep.ranges[reduction_sym])
+            size = int(inputs[0].ranges[reduction_sym])
             loop_var_dims[reduction_sym] = [
                 _untracked_name(op.get_name(), reduction_sym, size)
             ]
