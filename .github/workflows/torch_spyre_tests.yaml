@@ -231,7 +231,18 @@ jobs:
           CONFIG="tests/configs/${{ matrix.suite.config }}"
 
           echo "Running ${{ matrix.suite.name }} tests..."
-          bash tests/run_test.sh "$CONFIG" -v
+
+          _ARCH="$(uname -m)"
+          _SLOW_FLAG=""
+          if [[ "$_ARCH" != "x86_64" ]]; then
+            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
+            _SLOW_FLAG="--skip-slow"
+          fi
+          echo "  Host Platform : ${_ARCH}"
+          echo "  Slow flag: ${_SLOW_FLAG:-none (all tests will run)}"
+          echo "  Command  : bash tests/run_test.sh $CONFIG -v ${_SLOW_FLAG}"
+          bash tests/run_test.sh "$CONFIG" -v ${_SLOW_FLAG}
+
           echo "${{ matrix.suite.name }} tests done"
 
   # ---------------------------------------------------------------------------

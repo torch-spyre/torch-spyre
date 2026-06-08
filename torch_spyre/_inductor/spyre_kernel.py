@@ -455,7 +455,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         # list[list[int]] (nested multi-level, outermost first).  Flatten all
         # levels so that tiled_symbols covers every loop variable from outermost
         # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
-        raw_tiled_dims: list[list[int]] = getattr(ir_node, "loop_tiled_dims", [])
+        li = getattr(ir_node, "loop_info", None)
+        raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
         all_tiled_dims = [d for level in raw_tiled_dims for d in level]
         it_space_keys = list(it_space.keys())
         tiled_syms = [

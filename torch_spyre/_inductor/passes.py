@@ -89,6 +89,10 @@ def _format_operations(operations: list[Operation]) -> str:
                     splits, write_index, read_index, it_space
                 )
                 buf.write(f"\n  op_it_space_splits={readable_splits}")
+            if dim_hints := getattr(op, "dim_hints", None):
+                buf.write(f"\n  dim_hints={dim_hints}")
+            if loop_info := getattr(op, "loop_info", None):
+                buf.write(f"\n  loop_info={loop_info}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()

@@ -90,7 +90,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -131,7 +130,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -190,7 +188,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -248,7 +245,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -329,7 +325,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": True,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -438,7 +433,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -518,7 +512,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -565,7 +558,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -615,7 +607,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -665,7 +656,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -883,7 +873,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -922,7 +911,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "bundle_hbm_symbols": True,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
