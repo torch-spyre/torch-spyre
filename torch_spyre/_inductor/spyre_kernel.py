@@ -33,6 +33,7 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
     IDENTITY_OP,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
@@ -422,16 +423,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         op_info: dict[str, Any],
     ) -> OpSpec:
         for arg in args:
-            if DtypeOpTable.is_dtype_op(op):
-                continue
-            elif arg.device_dtype == DataFormats.IEEE_FP32 and op not in SPYRE_FP32_OPS:
+            if not (
+                op in [IDENTITY_OP, RESTICKIFY_OP]
+                or DtypeOpTable.is_dtype_op(op)
+                or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
+                or arg.device_dtype == DataFormats.SEN169_FP16
+                or arg.device_dtype == DataFormats.SEN143_FP8
+            ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
-            elif arg.device_dtype not in [
-                DataFormats.IEEE_FP32,
-                DataFormats.SEN169_FP16,
-                DataFormats.IEEE_INT32,
-            ]:
-                raise Unsupported(f"operation on {arg.device_dtype}")
 
         it_space = iteration_space(self.current_node)
 
@@ -452,15 +451,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         }
 
         # If this op is inside a coarse-tiling loop, identify which iteration-space
-        # symbols are tiled by the enclosing loop(s).  loop_tiled_dims on the IR
-        # node is either a flat list[int] (legacy single-level) or a
-        # list[list[int]] (nested multi-level, outermost first).  We flatten all
+        # symbols are tiled by the enclosing loop(s).  loop_tiled_dims is a
+        # list[list[int]] (nested multi-level, outermost first).  Flatten all
         # levels so that tiled_symbols covers every loop variable from outermost
         # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
-        raw_tiled_dims = getattr(ir_node, "loop_tiled_dims", [])
-        if raw_tiled_dims and not isinstance(raw_tiled_dims[0], list):
-            # Legacy flat list — wrap in a single-level list.
-            raw_tiled_dims = [raw_tiled_dims]
+        raw_tiled_dims: list[list[int]] = getattr(ir_node, "loop_tiled_dims", [])
         all_tiled_dims = [d for level in raw_tiled_dims for d in level]
         it_space_keys = list(it_space.keys())
         tiled_syms = [
@@ -490,6 +485,9 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
+        scheduler = getattr(V.graph, "scheduler", None)
+        if scheduler is not None:
+            name = scheduler.mutation_real_name.get(name, name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
@@ -517,7 +515,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        _ = self.args.output(name)
+        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
+        # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
+        if "pool" not in layout.allocation:
+            _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -573,7 +575,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        _ = self.args.output(name)
+        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
+        # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
+        if "pool" not in layout.allocation:
+            _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -594,7 +600,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op == BATCH_MATMUL_OP:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
@@ -783,5 +789,31 @@ def simplify_op_spec(op_spec):
     )
     op_spec.iteration_space = new_op_space_splits
     for arg, t in zip(op_spec.args, new_tensors):
+        old_coords = arg.device_coordinates
+        old_stride_map = arg.stride_map
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
+        # Invariant: stride_map[d] must be the host-element stride for
+        # device dimension d.  align_tensors may reorder device_coordinates
+        # without touching stride_map, breaking this invariant.  Restore it
+        # by remapping each entry: for every new coordinate at position d,
+        # locate the old position that held the same iteration symbol and
+        # carry its stride value forward.
+        if old_stride_map is not None:
+            # Extend if align_tensors added coordinate dimensions, padding
+            # with 0 (those positions will never drive a non-zero delta).
+            new_stride_map = list(old_stride_map) + [0] * max(
+                0, len(arg.device_coordinates) - len(old_stride_map)
+            )
+            old_sym_to_idx = {}
+            for j, coord in enumerate(old_coords):
+                for sym in coord.free_symbols:
+                    old_sym_to_idx.setdefault(sym, j)
+            for d, coord in enumerate(arg.device_coordinates):
+                syms = coord.free_symbols
+                if not syms:
+                    continue
+                j = old_sym_to_idx.get(next(iter(syms)))
+                if j is not None and j < len(old_stride_map):
+                    new_stride_map[d] = old_stride_map[j]
+            arg.stride_map = new_stride_map

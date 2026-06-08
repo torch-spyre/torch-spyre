@@ -40,7 +40,7 @@ from .codegen.superdsc import (
     _k_fast_core_to_slice_mapping,
     _should_use_k_fast_mapping,
 )
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .views import compute_coordinates, matching_dim
 
@@ -50,15 +50,23 @@ class SchedNodeArg(NamedTuple):
     layout: "FixedTiledLayout"
 
 
+def _fixed_read_layout(buf) -> "FixedTiledLayout":
+    layout = buf.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        if not getattr(buf, ELIDED_COPY_BACK_ATTR, False):
+            raise RuntimeError(f"unexpected mutation layout on read buffer {buf}")
+        layout = layout.real_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+    return layout
+
+
 def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in n.read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-            res.append(SchedNodeArg(arg, layout))
+            res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
 
 
@@ -118,10 +126,7 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     for arg in read_writes.reads:
         if isinstance(arg, MemoryDep):
             buf = V.graph.get_buffer(arg.name)
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-            res.append(SchedNodeArg(arg, layout))
+            res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
 
 
@@ -450,7 +455,7 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
 
 
 _SPYRE_METADATA_ATTRS = (
-    "spyre_hints",
+    "dim_hints",
     "loop_group_id",
     "loop_count",
     "loop_tiled_dims",
@@ -461,7 +466,7 @@ def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
     """Copy all Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    spyre_hints and coarse-tiling attrs are not silently dropped.
+    dim_hints and coarse-tiling attrs are not silently dropped.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):

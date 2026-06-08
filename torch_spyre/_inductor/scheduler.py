@@ -57,6 +57,12 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     Uses ``loop_tiled_dims[depth]`` from the IR node and the SchedulerNode's
     ``iteration_space`` (which produces the same symbols as ``create_op_spec``
     uses to build ``OpSpec.tiled_symbols``).
+
+    ``loop_tiled_dims`` stores *host-range* dimension indices (indices into
+    ``op.data.ranges``), which include unit-size batch dimensions that are
+    skipped in the iteration space.  We must map host-range indices to
+    iteration-space key indices by walking ``op.data.ranges`` and counting
+    only the non-unit entries.
     """
     ir_op = sched_node.node
     if ir_op is None:
@@ -64,12 +70,29 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     raw = getattr(ir_op, "loop_tiled_dims", None)
     if raw is None or not raw:
         return []
-    dims_per_level: list = raw if isinstance(raw[0], list) else [raw]
+    dims_per_level: list[list[int]] = raw
     if depth >= len(dims_per_level):
         return []
     it_space = iteration_space(sched_node)
     keys = list(it_space.keys())
-    return [keys[d] for d in dims_per_level[depth] if d < len(keys)]
+
+    # Build a map from host-range index → iteration-space key index.
+    # loop_tiled_dims is only stamped on ComputedBuffer ops (Pointwise/Reduction),
+    # so data.ranges is always present here.  The iteration space simply omits
+    # unit-size dims, so we walk ranges and count only non-unit entries.
+    host_to_it: dict[int, int] = {}
+    it_idx = 0
+    for host_idx, r in enumerate(ir_op.data.ranges):
+        if int(r) != 1:
+            host_to_it[host_idx] = it_idx
+            it_idx += 1
+
+    result = []
+    for d in dims_per_level[depth]:
+        mapped = host_to_it.get(d)
+        if mapped is not None and mapped < len(keys):
+            result.append(keys[mapped])
+    return result
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -206,7 +229,7 @@ def _build_loop_group(
 def build_loop_scheduler_nodes(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    """Post-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
+    """Pre-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
 
     Reads loop_group_id and loop_count attributes stamped on ir.Operation
     objects by the coarse-tiling IR pass.  Nodes without these attributes
@@ -218,9 +241,11 @@ def build_loop_scheduler_nodes(
     a data-flow dependency crossing the group boundary, which is a bug in
     the tiling pass.
 
-    This pass runs before spyre_fuse_nodes so that CountedLoopSchedulerNodes
-    are already formed before fusion; CountedLoopSchedulerNode.can_fuse returns
-    False, which prevents the loop groups from being merged by the fusion pass.
+    Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
+    visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
+    so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
+    protected because it only fuses plain SchedulerNodes (isinstance check), causing
+    CountedLoopSchedulerNodes to force a bundle boundary.
     """
     result = _build_loop_group(nodes, depth=0)
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from collections import Counter
 from typing import NamedTuple
 
 import sympy
@@ -37,12 +38,19 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import (
+    ElementArrangement,
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from . import config
+from .constants import (
+    BATCH_MATMUL_OP,
+    COPY_BACK_CANDIDATE_ATTR,
+    ELIDED_COPY_BACK_ATTR,
+    TOPK_OPS,
+)
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .pass_utils import (
     compute_restickify_target_layout,
@@ -164,11 +172,18 @@ def _single_arg_op_layout(
                 c_size = outer_sizes + [in_elems_per_stick]
                 c_stride = outer_strides + [1]
 
+                fmt = (
+                    ElementArrangement.DL16_TO_FP32
+                    if in_layout.dtype == torch.float16
+                    and output.dtype == torch.float32
+                    else ElementArrangement.STANDARD
+                )
                 return SpyreTensorLayout(
                     c_size,
                     c_stride,
                     output.dtype,
                     list(range(len(c_size))),
+                    fmt,
                 )
 
             c_size = [concretize_expr(s) for s in output.size]
@@ -236,7 +251,9 @@ def _exx2_layout(
     out_dim_order = list(range(len(output.size))) + [-1]
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
+    )
     reduction_var = _find_reduction_var(x.dep, output_dep, "exx2")
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl])
@@ -588,11 +605,167 @@ def compute_layouts(
     return layouts
 
 
+def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
+    """Return one STL per valid stick dimension for a constant-valued buffer.
+
+    A constant tensor (ones_like, full, zeros_like, ...) has no real memory
+    access pattern — every element is the same scalar broadcast from a
+    SpyreConstantFallback.  Because the content is uniform, any stick layout
+    is correct.  Offering all valid choices lets the optimizer pick whichever
+    is compatible with the rest of the graph at zero cost, avoiding a needless
+    restickify.
+
+    Only dimensions with at least elems_per_stick elements are valid stick
+    candidates — smaller dims produce sentinel -1 entries in stride_map that
+    insert_restickify cannot handle.
+    """
+    output: FixedLayout = op.get_layout()
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    elems_per_stick = get_elem_in_stick(output.dtype)
+    layouts = [
+        SpyreTensorLayout(
+            c_size,
+            c_stride,
+            output.dtype,
+            [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
+        )
+        for stick_dim in range(len(c_size))
+        if c_size[stick_dim] >= elems_per_stick
+    ]
+    if not layouts:
+        layouts = [generic_layout(op)]
+    return layouts
+
+
 def generic_layout(op: Operation) -> SpyreTensorLayout:
     output: FixedLayout = op.get_layout()
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
     return SpyreTensorLayout(c_size, output.dtype)
+
+
+def _one_mem_dep(deps) -> MemoryDep | None:
+    mem_deps = [dep for dep in deps if isinstance(dep, MemoryDep)]
+    if len(mem_deps) != 1:
+        return None
+    return mem_deps[0]
+
+
+def _same_host_layout(lhs, rhs) -> bool:
+    return (
+        lhs.device == rhs.device
+        and lhs.dtype == rhs.dtype
+        and tuple(lhs.size) == tuple(rhs.size)
+        and tuple(lhs.stride) == tuple(rhs.stride)
+        and lhs.offset == rhs.offset
+    )
+
+
+def _target_device_layout(target, name: str):
+    layout = target.get_layout()
+    if isinstance(layout, FixedTiledLayout):
+        return layout.device_layout
+
+    # This runs after input layout propagation but before restickify
+    # optimization/finalization, so graph inputs still carry propagated
+    # candidate layouts on the TensorBox rather than a finalized committed_stl.
+    graph_input = V.graph.graph_inputs.get(name)
+    layouts = getattr(graph_input, "layouts", None)
+    if not layouts:
+        return None
+    return next(iter(layouts))
+
+
+def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
+    """Commit safe lowering-marked copy-back candidates.
+
+    ``aten.copy_`` lowering marks structural candidates but leaves the explicit
+    copy intact.  Once layout propagation has computed producer layouts, this
+    resolver proves the full safety condition.  Failed candidates remain normal
+    copies.
+    """
+    writer_by_name: dict[str, Operation] = {}
+    write_counts: Counter[str] = Counter()
+    names_read: set[str] = set()
+
+    for op in operations:
+        read_writes = op.get_read_writes()
+        for write in read_writes.writes:
+            writer_by_name[write.name] = op
+            write_counts[write.name] += 1
+        for read in read_writes.reads:
+            if isinstance(read, MemoryDep):
+                names_read.add(read.name)
+
+    graph_inputs = set(V.graph.graph_input_names)
+    graph_outputs = set(V.graph.get_output_names())
+    removed_ops: list[Operation] = []
+    mutated_inputs: set[str] = set()
+
+    for copy_op in operations:
+        if not (
+            getattr(copy_op, COPY_BACK_CANDIDATE_ATTR, False)
+            and isinstance(copy_op, ComputedBuffer)
+            and isinstance(copy_op.layout, MutationLayoutSHOULDREMOVE)
+        ):
+            continue
+
+        read_writes = copy_op.get_read_writes()
+        source = _one_mem_dep(read_writes.reads)
+        destination = _one_mem_dep(read_writes.writes)
+        if source is None or destination is None:
+            continue
+        if source.index != destination.index:
+            continue
+
+        target = copy_op.layout.get_buffer()
+        target_name = target.get_name()
+        if target_name not in graph_inputs:
+            continue
+        if target_name in graph_outputs or source.name in graph_outputs:
+            continue
+        if target_name in names_read or target_name in mutated_inputs:
+            continue
+
+        producer = writer_by_name.get(source.name)
+        if producer is None or producer is copy_op:
+            continue
+        if not isinstance(producer, ComputedBuffer):
+            continue
+        if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        if config.chunk_large_tensors and isinstance(producer.data, Pointwise):
+            continue
+        if write_counts[source.name] != 1:
+            continue
+        if not _same_host_layout(producer.get_layout(), target.get_layout()):
+            continue
+
+        target_stl = _target_device_layout(target, target_name)
+        if target_stl is None:
+            continue
+        producer_layouts = getattr(producer, "layouts", None)
+        if not producer_layouts or target_stl not in producer_layouts:
+            continue
+
+        producer.layout = copy_op.layout
+        producer.layouts = [target_stl]
+        producer.committed_stl = target_stl
+        setattr(producer, ELIDED_COPY_BACK_ATTR, True)
+        mutated_inputs.add(target_name)
+        removed_ops.append(copy_op)
+        logger.info(
+            "removed copy-back %s; %s now writes %s",
+            copy_op.get_name(),
+            producer.get_name(),
+            target_name,
+        )
+
+    for op in removed_ops:
+        for write in op.get_read_writes().writes:
+            V.graph.removed_buffers.add(write.name)
+        operations.remove(op)
 
 
 def propagate_spyre_tensor_layouts(
@@ -640,7 +813,19 @@ def propagate_spyre_tensor_layouts(
             args = _get_prop_args(rw.reads)
             output = op.get_layout()
             if not args:
-                op.layouts = [generic_layout(op)]
+                mem_reads = [r for r in rw.reads if isinstance(r, MemoryDep)]
+                is_constant_fill = bool(mem_reads) and all(
+                    isinstance(V.graph.get_buffer(r.name), SpyreConstantFallback)
+                    for r in mem_reads
+                )
+                if is_constant_fill:
+                    op.layouts = _all_constant_layouts(op)
+                else:
+                    logger.warning(
+                        f"{op.get_name()} has no propagatable args but reads non-constant "
+                        f"buffers {[r.name for r in mem_reads]}; falling back to generic layout"
+                    )
+                    op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
             elif isinstance(op.data, (Pointwise, Reduction)):
                 op.layouts = compute_layouts(op, output, output_dep, args)
@@ -660,6 +845,8 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 
+    _resolve_copy_back_candidates(operations)
+
 
 def propagate_mutation_layouts(
     nodes: list,
@@ -678,7 +865,7 @@ def propagate_mutation_layouts(
             continue
         if not isinstance(n.node.layout, MutationLayoutSHOULDREMOVE):
             continue
-        if isinstance(n.node.data, Pointwise):
+        if isinstance(n.node.data, (Pointwise, Reduction)):
             real = n.node.layout.real_layout()
             if isinstance(real, FixedTiledLayout):
                 n.node.layout = real
