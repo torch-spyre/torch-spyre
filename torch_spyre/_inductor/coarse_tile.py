@@ -689,8 +689,10 @@ def _insert_combine_op(
     def combine_inner_fn(index):
         partial = partial_loader(index)
         accum = accum_loader(index)
-        if reduction_type in ("sum", "xor_sum"):
+        if reduction_type == "sum":
             return vops.add(accum, partial)
+        if reduction_type == "xor_sum":
+            return vops.bitwise_xor(accum, partial)
         if reduction_type == "prod":
             return vops.mul(accum, partial)
         if reduction_type == "max":
