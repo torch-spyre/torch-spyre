@@ -293,26 +293,59 @@ def insert_tiling_propagation(
             _propagate_tiled_op(op, operations)
 
 
-def _check_reduction_tiling_safety(op: ComputedBuffer) -> None:
-    """Raise RuntimeError for unsupported Reduction-in-loop configurations.
+def _validate_reduction_tiling(op: ComputedBuffer) -> None:
+    """Raise RuntimeError for Reduction tiling configurations not yet implemented.
 
-    Rejects any tiled dim that falls in the reduction_ranges index range — the
-    accumulation-buffer logic for a tiled reduction dim is not yet implemented.
+    Supported (Stage 1): a single level that tiles only a reduction dim —
+    loop_tiled_dims all empty, exactly one loop_tiled_reduction_dims sub-list
+    non-empty with a single index.
+
+    Deferred to Stage 2 (raises):
+      - Mixed output+reduction tiling at the same nesting level.
+      - Multiple nesting levels where both output-dim and reduction-dim levels
+        appear (e.g. outer tiles output dim, inner tiles reduction dim).
+      - Multiple reduction range indices tiled at one level.
     """
     data = op.data
     assert isinstance(data, Reduction)
-
-    n_output_dims = len(data.ranges)
     loop_info = getattr(op, "loop_info", None)
-    loop_tiled_dims: list[list[int]] = loop_info.loop_tiled_dims if loop_info else []
-    for dims_list in loop_tiled_dims:
-        for d in dims_list:
-            if d >= n_output_dims:
-                raise RuntimeError(
-                    f"coarse_tile: reduction op {op.get_name()!r} has "
-                    f"tiled_dim={d} which falls in the reduction dimension "
-                    "(tiled reduction dims are not yet supported)."
-                )
+    if loop_info is None:
+        return
+
+    tiled_dims = loop_info.loop_tiled_dims
+    tiled_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
+
+    # Pad both lists to the same length so zip covers all levels.
+    n = max(len(tiled_dims), len(tiled_rdims))
+    tiled_dims_padded = tiled_dims + [[]] * (n - len(tiled_dims))
+    tiled_rdims_padded = tiled_rdims + [[]] * (n - len(tiled_rdims))
+
+    for i, (out_dims, red_dims) in enumerate(
+        zip(tiled_dims_padded, tiled_rdims_padded)
+    ):
+        if out_dims and red_dims:
+            raise RuntimeError(
+                f"coarse_tile: op {op.get_name()!r} level {i} tiles both "
+                f"output dim(s) {out_dims} and reduction dim(s) {red_dims} "
+                "simultaneously (mixed output+reduction tiling at one level "
+                "is not yet implemented — Stage 2)."
+            )
+        if len(red_dims) > 1:
+            raise RuntimeError(
+                f"coarse_tile: op {op.get_name()!r} level {i} tiles multiple "
+                f"reduction dims {red_dims} (tiling more than one reduction "
+                "dim per level is not yet implemented — Stage 2)."
+            )
+
+    has_out_levels = any(d for d in tiled_dims_padded)
+    has_red_levels = any(d for d in tiled_rdims_padded)
+    if has_out_levels and has_red_levels:
+        raise RuntimeError(
+            f"coarse_tile: op {op.get_name()!r} has output-dim tiling levels "
+            f"{tiled_dims} and reduction-dim tiling levels {tiled_rdims} "
+            "across different nesting levels (mixed nested output+reduction "
+            "tiling is not yet implemented — Stage 2)."
+        )
 
 
 def _propagate_tiled_op(
@@ -321,7 +354,7 @@ def _propagate_tiled_op(
 ) -> None:
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
     if isinstance(op.data, Reduction):
-        _check_reduction_tiling_safety(op)
+        _validate_reduction_tiling(op)
 
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
