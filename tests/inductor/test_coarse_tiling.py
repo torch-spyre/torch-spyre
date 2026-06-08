@@ -53,6 +53,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     generate_sdsc,
 )
 from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec, compile_op_spec
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.coarse_tile import coarse_tile, _divide_ranges
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.scheduler import (
@@ -160,8 +161,7 @@ def _make_op(data, name="op0"):
     op.layout = MagicMock()
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    del op.loop_group_id
-    del op.loop_count
+    del op.loop_info
     return op
 
 
@@ -220,7 +220,7 @@ def _make_scheduler():
 
 
 def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
-    """Return a fake ir.Operation optionally stamped with loop attributes.
+    """Return a fake ir.Operation optionally stamped with loop_info.
 
     loop_count must be a list of trip counts (one per nesting level), matching
     the contract stamped by coarse_tile().  A bare Expr is accepted as a
@@ -229,11 +229,14 @@ def _make_ir_op(loop_group_id=None, loop_count=None, name="op"):
     op = MagicMock()
     op.name = name
     if loop_group_id is not None:
-        op.loop_group_id = loop_group_id
-        op.loop_count = loop_count if isinstance(loop_count, list) else [loop_count]
+        counts = loop_count if isinstance(loop_count, list) else [loop_count]
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=loop_group_id,
+            loop_count=counts,
+            loop_tiled_dims=[],
+        )
     else:
-        del op.loop_group_id
-        del op.loop_count
+        del op.loop_info
     return op
 
 
@@ -347,7 +350,7 @@ def _fake_compile_op_spec(
     op_spec: OpSpec,
     symbols: list,
     symbol_id_offset: int = 0,
-    use_symbols: bool = True,
+    use_symbols: bool = False,
 ):
     """Stub that returns (json, [], [], []) — no real SDSC compilation."""
     return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], [], []
@@ -379,6 +382,33 @@ def _make_tiled_json(idx: int, sym_id: int) -> dict:
             ],
         }
     }
+
+
+# ===========================================================================
+# 0. CoarseTileInfo dataclass
+# ===========================================================================
+
+
+class TestCoarseTileInfo(unittest.TestCase):
+    def test_fields(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        self.assertEqual(info.loop_group_id, (0,))
+        self.assertEqual(info.loop_count, [Integer(4)])
+        self.assertEqual(info.loop_tiled_dims, [[0]])
+
+    def test_nested(self):
+        info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(4), Integer(2)],
+            loop_tiled_dims=[[0], [1]],
+        )
+        self.assertEqual(info.loop_group_id, (0, 0))
+        self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(info.loop_tiled_dims, [[0], [1]])
 
 
 # ===========================================================================
@@ -593,9 +623,7 @@ class TestCoarseTile(unittest.TestCase):
         op = _make_op(data, "op0")
         original = list(data.ranges)
         coarse_tile([op], [])
-        self.assertFalse(
-            hasattr(op, "loop_group_id") and op.loop_group_id != MagicMock()
-        )
+        self.assertFalse(hasattr(op, "loop_info") and op.loop_info != MagicMock())
         self.assertEqual(data.ranges, original)
 
     def test_non_computed_buffer_skipped(self):
@@ -606,7 +634,7 @@ class TestCoarseTile(unittest.TestCase):
             [op_extern, op_computed],
             [([op_extern, op_computed], [(0, Integer(2))])],
         )
-        self.assertEqual(op_computed.loop_group_id, (0,))
+        self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
 
     def test_symbolic_count(self):
@@ -615,7 +643,7 @@ class TestCoarseTile(unittest.TestCase):
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile([op], [([op], [(0, k)])])
-        self.assertEqual(op.loop_count, [k])
+        self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
     def test_non_contiguous_group_raises(self):
@@ -655,9 +683,9 @@ class TestCoarseTileNested(unittest.TestCase):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
         coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
-        self.assertEqual(op.loop_group_id, (0, 0))
-        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
-        self.assertEqual(op.loop_tiled_dims, [[0], [1]])
+        self.assertEqual(op.loop_info.loop_group_id, (0, 0))
+        self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
 
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
@@ -687,14 +715,14 @@ class TestCoarseTileNested(unittest.TestCase):
                 ([op1], [(2, Integer(4)), (3, Integer(2))]),
             ],
         )
-        self.assertEqual(op0.loop_group_id, (0,))
-        self.assertEqual(op0.loop_count, [Integer(4)])
-        self.assertEqual(op0.loop_tiled_dims, [[0]])
+        self.assertEqual(op0.loop_info.loop_group_id, (0,))
+        self.assertEqual(op0.loop_info.loop_count, [Integer(4)])
+        self.assertEqual(op0.loop_info.loop_tiled_dims, [[0]])
         self.assertEqual(d0.ranges[0], Integer(16))
         self.assertEqual(d0.ranges[1], Integer(32))
-        self.assertEqual(op1.loop_group_id, (1, 0))
-        self.assertEqual(op1.loop_count, [Integer(4), Integer(2)])
-        self.assertEqual(op1.loop_tiled_dims, [[0], [1]])
+        self.assertEqual(op1.loop_info.loop_group_id, (1, 0))
+        self.assertEqual(op1.loop_info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op1.loop_info.loop_tiled_dims, [[0], [1]])
         self.assertEqual(d1.ranges[0], Integer(32))
         self.assertEqual(d1.ranges[1], Integer(32))
 
@@ -703,8 +731,8 @@ class TestCoarseTileNested(unittest.TestCase):
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
         coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(32))
-        self.assertEqual(op.loop_count, [Integer(4), Integer(2)])
-        self.assertEqual(op.loop_tiled_dims, [[0], [0]])
+        self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
+        self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
 
 
 # ===========================================================================
@@ -964,7 +992,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[],
-            use_symbols=True,
         )
         self.assertEqual(affine_strides, [{}])
 
@@ -981,7 +1008,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[s],
-            use_symbols=True,
         )
         self.assertEqual(symbols, [])
         self.assertEqual(local_sym_values, [])
@@ -1119,7 +1145,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
         generate_bundle(
-            "test_kernel", tmpdir, [loop], use_symbols=True, unroll_loops=False
+            "test_kernel", tmpdir, [loop], unroll_loops=False, symbolic_args=True
         )
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
@@ -1148,9 +1174,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle(
-            "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", self.tmpdir, specs, unroll_loops=False)
         return _read_mlir(self.tmpdir)
 
     def test_flat_ops_no_loop(self):
@@ -1208,9 +1232,7 @@ class TestGenerateBundleMlir(unittest.TestCase):
         a = _make_minimal_op_spec("a")
         b = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[a, b])
-        generate_bundle(
-            "test_kernel", self.tmpdir, [loop], use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", self.tmpdir, [loop], unroll_loops=False)
         written = sorted(f for f in os.listdir(self.tmpdir) if f.endswith(".json"))
         self.assertEqual(len(written), 2)
 
@@ -1283,9 +1305,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         self.patch.stop()
 
     def _bundle(self, specs):
-        generate_bundle(
-            "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
-        )
+        generate_bundle("test_kernel", self.tmpdir, specs, unroll_loops=False)
         return _read_mlir(self.tmpdir)
 
     def test_single_loop_snapshot(self):
@@ -1299,7 +1319,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
             "\t\t%c1 = arith.constant 1 : index\n"
             "\t\t%loop_bound_0 = arith.constant 8 : index\n"
             "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
+            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
             "\t\t}\n"
             "\t\treturn\n"
             "\t}\n"
@@ -1313,7 +1333,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         expected = (
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
-            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
+            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
             "\t\treturn\n"
             "\t}\n"
             "}\n"
@@ -1332,7 +1352,11 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             side_effect=fake_compile,
         ):
             generate_bundle(
-                "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
+                "test_kernel",
+                self.tmpdir,
+                specs,
+                unroll_loops=False,
+                symbolic_args=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -1340,7 +1364,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 16384
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}], []
@@ -1360,7 +1384,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         self.assertIn('"symbol_ids"=[-1]', mlir)
 
     def test_non_tiled_tensor_in_loop_no_affine_apply(self):
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
@@ -1378,7 +1402,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 8192
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
             return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}], []
@@ -1395,7 +1419,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_affine_apply_inside_scf_for(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
             return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}], []
@@ -1414,7 +1438,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_tiled_snapshot(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
@@ -1456,21 +1480,25 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
             side_effect=fake_compile,
         ):
             generate_bundle(
-                "test_kernel", self.tmpdir, specs, use_symbols=True, unroll_loops=False
+                "test_kernel",
+                self.tmpdir,
+                specs,
+                unroll_loops=False,
+                symbolic_args=True,
             )
         return _read_mlir(self.tmpdir)
 
     def _fake_compile_two_strides(self, outer_stride, inner_stride):
         s0, s1 = self.s0, self.s1
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return (
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
                 [{s0: outer_stride, s1: inner_stride}],
-                [SymbolKind.kernel(0)],
+                [],
             )
 
         return fake_compile
@@ -1537,28 +1565,6 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
         self.assertEqual(mlir, expected)
 
 
-class TestGenerateBundleUnrollPath(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-
-    def test_non_tiled_loop_without_use_symbols_ok(self):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=_fake_compile_op_spec,
-        ):
-            op = _make_minimal_op_spec("a")
-            loop = LoopSpec(count=Integer(2), body=[op])
-            generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=False)
-
-    def test_flat_op_without_use_symbols_ok(self):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=_fake_compile_op_spec,
-        ):
-            op = _make_minimal_op_spec("a")
-            generate_bundle("test_kernel", self.tmpdir, [op], use_symbols=False)
-
-
 # ===========================================================================
 # 6. coarse_tile buffer propagation pass
 # ===========================================================================
@@ -1589,9 +1595,11 @@ def _make_tiled_op(name, ranges, loop_group_id, loop_count, loop_tiled_dims):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_group_id = loop_group_id
-    op.loop_count = list(loop_count)
-    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=loop_group_id,
+        loop_count=list(loop_count),
+        loop_tiled_dims=[list(d) for d in loop_tiled_dims],
+    )
     op.get_read_writes.return_value = _make_rw_with_reads()
     op.origins = OrderedSet()
     return op
@@ -1609,7 +1617,7 @@ def _make_consumer_op(name, reads_buf):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    del op.loop_group_id
+    del op.loop_info
     op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
     op.origins = OrderedSet()
     return op
@@ -1627,9 +1635,11 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_group_id = loop_group_id
-    op.loop_count = [Integer(4)]
-    op.loop_tiled_dims = [[0]]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=loop_group_id,
+        loop_count=[Integer(4)],
+        loop_tiled_dims=[[0]],
+    )
     op.get_read_writes.return_value = _make_rw_with_reads(reads_buf)
     op.origins = OrderedSet()
     return op
@@ -1771,9 +1781,11 @@ def _make_tiled_reduction_op(
     op.data = data
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
-    op.loop_group_id = loop_group_id
-    op.loop_count = list(loop_count)
-    op.loop_tiled_dims = [list(d) for d in loop_tiled_dims]
+    op.loop_info = CoarseTileInfo(
+        loop_group_id=loop_group_id,
+        loop_count=list(loop_count),
+        loop_tiled_dims=[list(d) for d in loop_tiled_dims],
+    )
     op.get_read_writes.return_value = _make_rw_with_reads()
     op.origins = OrderedSet()
     return op
@@ -1838,7 +1850,11 @@ class TestTiledSymsForSchedNode(unittest.TestCase):
 
         ir_op = MagicMock()
         ir_op.data.ranges = [Integer(r) for r in host_ranges]
-        ir_op.loop_tiled_dims = [[1]]
+        ir_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[1]],
+        )
 
         snode = MagicMock(spec=SchedulerNode)
         snode.node = ir_op
@@ -1873,7 +1889,6 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
                 unroll_loops=False,
                 symbolic_args=symbolic_args,
             )
@@ -1909,7 +1924,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_func_signature_has_params_for_tensor_args(self):
         a = self._make_op_spec_with_hbm_args("a", [0, 1])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             for i, arg in enumerate(op_spec.args):
                 symbols.append(arg.allocation["hbm"])
             ids = [-(symbol_id_offset + i + 1) for i in range(len(op_spec.args))]
@@ -1964,7 +1979,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_sdsc_execute_uses_extracted_names(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(op_spec.args[0].allocation["hbm"])
             return (
@@ -2003,7 +2018,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         values = [0x400000000, 0x0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -2024,22 +2039,13 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
     def test_symbolic_args_false_no_params(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
-
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
-            sym_id = -(symbol_id_offset + 1)
-            symbols.append(op_spec.args[0].allocation["hbm"])
-            return (
-                _make_tiled_json(idx, sym_id),
-                [op_spec.args[0].allocation["hbm"]],
-                [{}],
-                [SymbolKind.kernel(0)],
-            )
-
-        mlir = self._bundle([a], symbolic_args=False, fake_compile=fake)
-
+        # When symbolic_args=False, use_symbols=False: no symbols registered,
+        # sdsc_execute has no operands.
+        mlir = self._bundle([a], symbolic_args=False)
         self.assertIn("func.func @sdsc_bundle()", mlir)
         self.assertNotIn("input_arg", mlir)
-        self.assertIn("arith.constant 17179869184", mlir)
+        self.assertNotIn("%sym_", mlir)
+        self.assertIn("sdsc_execute () {sdsc_filename=", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
         """Two tensor args on first op; remaining ops use arith.constant symbols."""
@@ -2063,7 +2069,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         ]
         sym_counts = [2, 3, 2, 2, 3]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             i = call_count[0]
             call_count[0] += 1
             n = sym_counts[i]
@@ -2124,7 +2130,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         base = 0x400000000  # SEGMENT_OFFSETS[1], arg_index=0
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(base)
@@ -2150,7 +2156,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         pool_values = [0, 2048, 0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -2276,7 +2282,7 @@ class TestSymbolKind(unittest.TestCase):
 
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=True):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             i = call_count[0]
             call_count[0] += 1
             base = 0x400000000
@@ -2303,7 +2309,6 @@ class TestSymbolKind(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 [a, b],
-                use_symbols=True,
                 unroll_loops=False,
                 symbolic_args=True,
             )

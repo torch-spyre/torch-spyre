@@ -12,6 +12,8 @@ import torch
 
 DEFAULT_FLOATING_PRECISION: float = 1e-3
 
+_DYNAMIC_TAG_PREFIXES = ("op__", "dtype__", "module__", "platform__")
+
 MODE_MANDATORY_SUCCESS = "mandatory_success"
 MODE_XFAIL = "xfail"
 MODE_XFAIL_STRICT = "xfail_strict"

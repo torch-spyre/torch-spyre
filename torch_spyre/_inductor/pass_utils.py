@@ -43,6 +43,7 @@ from .codegen.superdsc import (
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
+from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
 
 logger = get_inductor_logger("pass_utils")
@@ -122,6 +123,31 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
         return index  # No symbols concretized, return original
     result = index.subs(subs)
     return result
+
+
+def compute_max_size(expr: Union[Expr, int]) -> int:
+    """Return the maximum value a symbolic size expression can take.
+
+    Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
+    created with an explicit ``max=`` constraint using mark_dynamic API). Falls
+    back to ``size_hint`` when no finite upper bound exists.
+
+    Needed for dynamic shape support.
+
+    # TODO: To be used in size_hint call-sites in superdsc.py and work_division.py
+    #       to get the maxSize in SDSC and work planning respectively
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return int(expr)
+    shape_env = V.graph.sizevars.shape_env
+    vr = shape_env.bound_sympy(expr)
+    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
+        return int(vr.upper)
+    return V.graph.sizevars.size_hint(expr)
 
 
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
@@ -461,25 +487,6 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
     """
     if "custom" in src.meta:
         dst.meta["custom"] = src.meta["custom"]
-
-
-_SPYRE_METADATA_ATTRS = (
-    "dim_hints",
-    "loop_group_id",
-    "loop_count",
-    "loop_tiled_dims",
-)
-
-
-def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
-    """Copy all Spyre pass metadata from src to dst.
-
-    Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    dim_hints and coarse-tiling attrs are not silently dropped.
-    """
-    for attr in _SPYRE_METADATA_ATTRS:
-        if hasattr(src, attr):
-            setattr(dst, attr, getattr(src, attr))
 
 
 def replace_computed_buffer_body(

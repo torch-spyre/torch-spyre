@@ -13,6 +13,7 @@ import pytest  # type: ignore
 import torch
 
 from oot_test_constants import (
+    _DYNAMIC_TAG_PREFIXES,
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
     MODE_MANDATORY_SUCCESS,
@@ -43,6 +44,8 @@ from oot_upstream_patcher import (
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
     _OOTNativeDeviceTypesPatcher,
+    _OOTCpuMovePatcher,
+    _OOTPlatformMarkerPatcher,
 )
 from oot_test_config_models import (
     OOTTestConfig,
@@ -609,9 +612,27 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # Dynamically adds pytest marker to each of modules and dtype passed to @modules
         _OOTModuleMarkerPatcher(test).patch()
 
+        # Attaches platform__<arch> marker
+        _OOTPlatformMarkerPatcher(test).patch()
+
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
+
+        # ------------------------------------------------------------------
+        # Collect CPU move functions from global config and all test entries
+        # for this test name. Then apply the CPU move patcher to move tensor
+        # arguments to CPU for specified methods (e.g., assertEqual).
+        # ------------------------------------------------------------------
+        # Collect CPU move functions from all test entries for this test name.
+        # Then apply the CPU move patcher to move tensor arguments to CPU.
+        cpu_move_functions: Set[str] = set()
+        for _e in all_entries_for_name:
+            per_test_funcs = _e.edits.functions.resolved_cpu_move_functions()
+            if per_test_funcs:
+                cpu_move_functions.update(per_test_funcs)
+        if cpu_move_functions:
+            _OOTCpuMovePatcher(cls, list(cpu_move_functions), test_name=name).patch()
 
         _tags_to_write: Dict[str, List[str]] = {}
         for method_name in new_methods:
@@ -674,7 +695,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             # patchers attached to this specific instantiated method, and
             # union them with the variant-specific tags so _XML_INJECT_PY
             # only needs to handle one flat tag list per method.
-            _DYNAMIC_PREFIXES = ("op__", "dtype__", "module__")
+
             existing_fn = cls.__dict__.get(method_name)
             dynamic_tags: List[str] = []
             if existing_fn is not None:
@@ -682,7 +703,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                     {
                         m.name
                         for m in getattr(existing_fn, "pytestmark", [])
-                        if any(m.name.startswith(p) for p in _DYNAMIC_PREFIXES)
+                        if any(m.name.startswith(p) for p in _DYNAMIC_TAG_PREFIXES)
                     }
                 )
 

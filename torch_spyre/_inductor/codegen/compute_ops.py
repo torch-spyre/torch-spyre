@@ -322,8 +322,6 @@ def generate_sdsc(
     # that happen to share a base address will emit two separate arith.constant
     # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
     # symbols list indices: symbols[abs(id)-1] is always the value for id.
-    #
-    # When use_symbols=False this dict stays empty (symbols is not modified).
     local_symbols: dict[int, int] = {}
     # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
     local_symbol_kind: list[SymbolKind] = []
@@ -422,8 +420,8 @@ def generate_sdsc(
             return result
 
     else:
-        # use_symbols=False: bake concrete HBM addresses directly into the JSON,
-        # mirroring the LX tensor path.  symbols and local_symbols are not modified.
+        # use_symbols=False: bake concrete HBM addresses directly into the JSON.
+        # symbols and local_symbols are not modified.
         affine_strides = [{} for _ in sdsc_spec.args]
 
         def _start_addr_data(tensor):
