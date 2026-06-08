@@ -52,9 +52,6 @@ _enabled = False
 
 
 def reset():
-    # Full teardown — do NOT call between propagate_named_dims() and
-    # assign_dim_hints(), as assign_dim_hints() still needs _named_dims.
-    # The two passes split cleanup across their own finally blocks.
     global _enabled
     _named_dims.clear()
     _named_tensor_dims.clear()
@@ -533,4 +530,4 @@ def assign_dim_hints(graph: GraphLowering) -> None:
     try:
         _assign_dim_hints_impl(graph.operations)
     finally:
-        _named_dims.clear()
+        reset()
