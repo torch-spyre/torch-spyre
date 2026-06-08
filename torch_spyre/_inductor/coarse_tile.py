@@ -62,6 +62,7 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
+from torch._inductor.codegen.common import SymT
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -836,6 +837,60 @@ def _divide_ranges(
     layout.device_layout = SpyreTensorLayout(
         new_size_ints, new_strides_ints, layout.dtype, dim_order
     )
+
+
+def _loop_var_to_reduction_ranges_pos(
+    op: ComputedBuffer, sym: sympy.Symbol
+) -> int | None:
+    """Return position of loop variable sym in op.data.reduction_ranges, or None.
+
+    Mirrors _loop_var_to_ranges_pos but searches the reduction index expressions
+    (r0_0, r0_1, ...) instead of the output coords.
+    """
+    data = op.data
+    assert isinstance(data, Reduction)
+    rindex = data._index(data.reduction_ranges, SymT.R0_INDEX)
+    for i, coord in enumerate(rindex):
+        if len(coord.free_symbols) == 1 and next(iter(coord.free_symbols)) == sym:
+            return i
+    return None
+
+
+def _divide_reduction_ranges(
+    op: ComputedBuffer,
+    loop_count: Expr,
+    tiled_dims: list[int],
+) -> None:
+    """Divide the specified reduction_ranges entries of op by loop_count.
+
+    Unlike _divide_ranges, does NOT update op.layout.size/stride — the
+    output buffer shape is determined by data.ranges (non-reduction dims)
+    and is unchanged by reduction-dim tiling.
+    """
+    data = op.data
+    assert isinstance(data, Reduction)
+    if not tiled_dims:
+        return
+    reduction_ranges = list(data.reduction_ranges)
+    for i in tiled_dims:
+        assert 0 <= i < len(reduction_ranges), (
+            f"coarse_tile: op {op.get_name()!r} tiled reduction dim {i} out of bounds "
+            f"(reduction_ranges has {len(reduction_ranges)} entries)"
+        )
+        r = reduction_ranges[i]
+        if isinstance(r, (int, sympy.Integer)) and isinstance(
+            loop_count, (int, sympy.Integer)
+        ):
+            if int(r) % int(loop_count) != 0:
+                raise RuntimeError(
+                    f"coarse_tile: op {op.get_name()!r} reduction dim {i} range {r} "
+                    f"is not divisible by loop_count {loop_count}.  All tiled "
+                    f"reduction dimensions must be evenly divisible by the loop trip count."
+                )
+            reduction_ranges[i] = sympy.Integer(int(r) // int(loop_count))
+        else:
+            reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
+    object.__setattr__(data, "reduction_ranges", reduction_ranges)
 
 
 def _validate_contiguous(

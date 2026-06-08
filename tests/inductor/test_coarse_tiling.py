@@ -2514,5 +2514,115 @@ class TestCoarseTileInfoReductionField(unittest.TestCase):
         self.assertEqual(info.loop_tiled_reduction_dims[1], [0])
 
 
+class TestDivideReductionRanges(unittest.TestCase):
+    """_divide_reduction_ranges divides reduction_ranges, leaves ranges intact."""
+
+    def _make_reduction_op(self, ranges, reduction_ranges, reduction_type="sum"):
+        from torch._inductor.ir import ComputedBuffer, Reduction, ReductionHint
+        import torch
+
+        data = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx, ridx: None,
+            ranges=list(ranges),
+            reduction_ranges=list(reduction_ranges),
+            reduction_type=reduction_type,
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+        return op
+
+    def test_basic_halves_reduction_range(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(128)], reduction_ranges=[Integer(256)]
+        )
+        _divide_reduction_ranges(op, Integer(2), [0])
+        self.assertEqual(op.data.reduction_ranges[0], Integer(128))
+        self.assertEqual(op.data.ranges[0], Integer(128))  # output ranges untouched
+
+    def test_empty_tiled_dims_is_noop(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(128)], reduction_ranges=[Integer(64)]
+        )
+        _divide_reduction_ranges(op, Integer(4), [])
+        self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # unchanged
+
+    def test_not_divisible_raises(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(128)], reduction_ranges=[Integer(100)]
+        )
+        with self.assertRaises(RuntimeError, msg="not divisible should raise"):
+            _divide_reduction_ranges(op, Integer(3), [0])
+
+    def test_divides_second_reduction_dim(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(32)], reduction_ranges=[Integer(64), Integer(128)]
+        )
+        _divide_reduction_ranges(op, Integer(4), [1])
+        self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # untouched
+        self.assertEqual(op.data.reduction_ranges[1], Integer(32))  # divided
+
+
+class TestLoopVarToReductionRangesPos(unittest.TestCase):
+    """_loop_var_to_reduction_ranges_pos finds the position of a symbol in reduction_ranges."""
+
+    def _make_reduction_op(self, ranges, reduction_ranges):
+        from torch._inductor.ir import ComputedBuffer, Reduction, ReductionHint
+        import torch
+
+        data = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx, ridx: None,
+            ranges=list(ranges),
+            reduction_ranges=list(reduction_ranges),
+            reduction_type="sum",
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+        return op
+
+    def test_finds_reduction_symbol(self):
+        from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
+        from torch._inductor.codegen.common import SymT
+
+        op = self._make_reduction_op(
+            ranges=[Integer(32)], reduction_ranges=[Integer(64)]
+        )
+        # The reduction symbol for a single reduction_ranges entry is r0_0
+        rindex = op.data._index(op.data.reduction_ranges, SymT.R0_INDEX)
+        sym = next(iter(rindex[0].free_symbols))
+        result = _loop_var_to_reduction_ranges_pos(op, sym)
+        self.assertEqual(result, 0)
+
+    def test_returns_none_for_output_symbol(self):
+        from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
+        from torch._inductor.codegen.common import SymT
+        from torch._inductor.utils import sympy_index_symbol_with_prefix
+
+        op = self._make_reduction_op(
+            ranges=[Integer(32)], reduction_ranges=[Integer(64)]
+        )
+        # Use an output-dim symbol (i0_0) — should not appear in reduction_ranges
+        output_sym = sympy_index_symbol_with_prefix(SymT.INDEX, 0)
+        result = _loop_var_to_reduction_ranges_pos(op, output_sym)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
