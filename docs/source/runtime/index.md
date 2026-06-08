@@ -120,7 +120,9 @@ What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees
 
 ### SpyreAllocator
 
-`SpyreAllocator` (`csrc/spyre_allocator.cpp`) is a thin bridge between PyTorch's `c10::Allocator` and `flex::FlexAllocator`. Every `allocate(nbytes)` call passes straight through to `flex_alloc->allocate(nbytes)` and returns a `c10::DataPtr` with a `ReportAndDelete` callback wired in as its deleter. When the tensor's storage refcount hits zero, that deleter runs, updates the `DeviceStats` counters, and hands the allocation back to flex. The trigger is PyTorch's own refcount: Python's garbage collector is not in this loop at all.
+`SpyreAllocator` (`csrc/spyre_allocator.cpp`) is a thin bridge between PyTorch's `c10::Allocator` and `flex::FlexAllocator`. Every `allocate(nbytes)` call passes straight through to `flex_alloc->allocate(nbytes)` and returns a `c10::DataPtr` with a `ReportAndDelete` callback installed as its deleter. When the tensor's storage refcount hits zero, that deleter runs, updates the `DeviceStats` counters, and hands the allocation back to flex. The trigger is PyTorch's own refcount: Python's garbage collector is not in this loop at all.
+
+What `flex_alloc->allocate(nbytes)` returns is a `flex::CompositeAddress`, a handle that can describe contiguous *or* discontiguous (interleaved) device-memory regions as an ordered list of chunks. `SpyreAllocator` wraps it in a `SharedOwnerCtx` (declared in `csrc/spyre_allocator.h`) so the `ReportAndDelete` deleter can recover the original handle when freeing. The `at::DataPtr` Python sees never carries a raw pointer. Ownership stays on the C++ side through the shared owner.
 
 :::{figure} ../_static/images/spyre-tensor-lifetime.png
 :alt: Five-step flowchart showing how a Python tensor going out of scope frees a Spyre allocation
@@ -171,18 +173,115 @@ Each device keeps a fixed pool of streams (see `csrc/spyre_stream.cpp`). Stream 
 
 Note that `priority` is a binary switch: `0` selects the low-priority pool and any non-zero value selects the high-priority pool. There is no graded scale of priority levels.
 
-## Multi-Card Support
+## SpyreCode and JobPlan
 
-Ensembles of up to 8 Spyre cards deliver up to 1 TB of aggregate device
-memory.
+A compiled artifact reaches the runtime as a **SpyreCode** directory: a JSON-based
+manifest plus binary blobs produced by the deeptools backend. `prepareKernel`
+in `csrc/prepare_kernel.{h,cpp}` translates that directory into a `JobPlan`,
+the runtime's executable container for a single launch.
 
-:::{admonition} Planned
-:class: note
+```
+                  ┌──────────────────┐
+SpyreCode dir ──▶ │  prepareKernel   │ ──▶ JobPlan ──▶ SpyreStream::launch
+                  └──────────────────┘
+                    csrc/prepare_kernel
+```
 
-Multi-card collective communications (all-reduce, all-gather, reduce-scatter) using the standard PyTorch `ProcessGroup` API are planned but not yet implemented in this repository. The C++ tree currently has no `ProcessGroup` source files.
-:::
+### JobPlan structure
 
-## TODO
+A `JobPlan` (declared in `csrc/job_plan.h`) holds an ordered list of
+`JobPlanStep` instances. At launch time, each step constructs a
+`flex::RuntimeOperation` via its `construct(LaunchContext&)` method and the
+runtime queues those operations on the stream in order. The four step types
+cover every operation a launch needs:
 
-- Document kernel launch sequence and Control Block Stream design
-- Document error handling and device reset
+| Step type | Purpose |
+|---|---|
+| `JobPlanStepH2D` | Host-to-device DMA transfer |
+| `JobPlanStepD2H` | Device-to-host DMA transfer |
+| `JobPlanStepCompute` | Kernel execution on the device |
+| `JobPlanStepHostCompute` | Host-side computation (used for program correction) |
+
+`SpyreStream::launch(plan, args)` walks the steps, builds the
+`RuntimeOperation` for each one, and submits them to the underlying
+`flex::RuntimeStream`. FIFO ordering on the stream is what makes the step
+sequence safe: each step completes before the next one starts.
+
+### Program correction
+
+Compiled binaries arrive with symbolic placeholders for tensor addresses that
+are only known at launch (allocator output, padding, batch shape). The runtime
+patches them in three ordered steps:
+
+1. **`JobPlanStepHostCompute`** runs on the host. It calls into deeptools'
+   `processComputeOnHostCommand` with compiler-supplied metadata (`Hcm`) and
+   writes a small correction blob into a pinned host buffer. The closure
+   captures the metadata, the destination CompositeAddresses, and the buffer
+   pointer.
+2. **`JobPlanStepH2D`** copies that buffer into the program region on the device.
+3. **`JobPlanStepCompute`** then runs the kernel. The device-side prologue
+   reads the corrections, patches the symbolic operands, and starts execution.
+
+The pinned host buffer is allocated once during `prepareKernel` and reused
+across launches. For tiled execution the same buffer cycles through every
+iteration — FIFO ordering guarantees each iteration's H2D consumes the buffer
+before the next iteration's HostCompute overwrites it.
+
+## Multi-card and distributed execution
+
+Ensembles of up to 8 Spyre cards deliver up to 1 TB of aggregate device memory.
+Cross-card collective communication is exposed through the standard PyTorch
+`ProcessGroup` API.
+
+### The `spyreccl` backend
+
+Torch-Spyre registers a `c10d::Backend` named `spyreccl`. The class is
+`SpyreCCLBackend` in `csrc/distributed/spyre_ccl.{cpp,hpp}`, registered with the
+process-group machinery via `createSpyreCCLBackend` (called from
+`torch_spyre/__init__.py:237` when the user invokes
+`init_process_group(backend="spyreccl")`). The constant
+`DISTRIBUTED_BACKEND_NAME = "spyreccl"` is defined in `torch_spyre/constants.py`.
+
+Standard usage looks like any other PyTorch distributed setup:
+
+```python
+import torch
+import torch.distributed as dist
+
+dist.init_process_group(backend="cpu:gloo,spyre:spyreccl")
+
+x = torch.zeros(1024, dtype=torch.float16, device="spyre")
+dist.broadcast(x, src=0)
+```
+
+Internally, `SpyreCCLBackend` forwards each tensor to the closed-source
+`spyre_comms` library, which handles the wire-level transport between cards.
+The torch-spyre adapter is open. The transport library is not.
+
+### Supported collectives
+
+The following collectives are implemented today, all in synchronous (blocking)
+mode:
+
+| Collective | Status |
+|---|---|
+| `send`, `recv` | Implemented |
+| `broadcast` | Implemented |
+| `barrier` | Implemented |
+| `gather` | Implemented |
+| `allgather` | Implemented |
+| `reduce` | Implemented |
+| `allreduce` | Implemented |
+
+`asyncOp=True` is rejected uniformly across these methods. The remaining
+process-group entries (`scatter`, `reduce_scatter`, `alltoall`,
+`alltoall_base`, `_allgather_base`, `allreduce_coalesced`) raise
+`SpyreCCLNotSupportedException`. `recvAnysource` is intentionally
+unsupported — the protocol overhead is high and call sites are rare.
+
+### One device per process
+
+`SpyreCCLBackend` follows the one-device-per-process model. Each rank attaches
+to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
+in the user code). The backend reuses the rank's existing flex runtime instance
+and default stream. It does not own a separate runtime context.
