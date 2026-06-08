@@ -966,7 +966,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """x.sum(dim=-1) tiled over the reduction dim emits LoopSpec."""
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 64, 128
+        B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16) * 0.1
 
         def fn(x):
@@ -989,7 +989,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """x.sum(dim=-1) tiled over D produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 64, 128
+        B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16) * 0.1
 
         _declare_tensor_dim("B", B)
@@ -1013,7 +1013,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """torch.matmul tiled over K emits LoopSpec."""
         from torch_spyre._inductor import spyre_hint
 
-        M, K, N = 64, 128, 32
+        M, K, N = 64, 512, 32
         a = torch.randn(M, K, dtype=torch.float16) * 0.01
         b = torch.randn(K, N, dtype=torch.float16) * 0.01
 
@@ -1040,7 +1040,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """torch.matmul tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
-        M, K, N = 64, 128, 32
+        M, K, N = 64, 512, 32
         a = torch.randn(M, K, dtype=torch.float16) * 0.01
         b = torch.randn(K, N, dtype=torch.float16) * 0.01
 
@@ -1069,7 +1069,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """x.amax(dim=-1) tiled over the reduction dim emits LoopSpec."""
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 64, 128
+        B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
 
         def fn(x):
@@ -1091,7 +1091,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """x.amax(dim=-1) tiled over D produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 64, 128
+        B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
 
         _declare_tensor_dim("B", B)
@@ -1115,7 +1115,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """x.amin(dim=-1) tiled over the reduction dim emits LoopSpec."""
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 64, 128
+        B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
 
         def fn(x):
@@ -1137,7 +1137,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         """x.amin(dim=-1) tiled over D produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 64, 128
+        B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
 
         _declare_tensor_dim("B", B)
