@@ -117,6 +117,8 @@ jobs:
             config: torch_spyre_tests/test_regex_config.yaml
           - name: Test Spyre
             config: torch_spyre_tests/test_spyre_config.yaml
+          - name: Test Execution Trace
+            config: torch_spyre_tests/test_execution_trace_config.yaml
           - name: Test Spyre Lazy Silent
             config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
           - name: Test Stream

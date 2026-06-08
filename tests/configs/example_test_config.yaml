@@ -11,6 +11,11 @@ test_suite_config:
           tags:
             - model_1
             - model_2
+          edits:
+            functions:
+              cpu_move:
+                - name: assertEqual
+                - name: assertTrue
   global:
     supported_dtypes:
       - name: float16

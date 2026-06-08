@@ -32,7 +32,8 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.virtualized import V
 from .errors import Unsupported
-from .pass_utils import SpyreConstantFallback, host_coordinates, device_coordinates
+from .pass_utils import host_coordinates, device_coordinates, op_out_coords
+from .ir import SpyreConstantFallback
 from .propagate_hints import DimHint, get_op_hints
 from .views import matching_dim, compute_coordinates
 from torch_spyre._C import SpyreTensorLayout
@@ -73,6 +74,16 @@ def _get_buffer(dep):
     return V.graph.get_buffer(dep.name)
 
 
+def _get_dim_prop_info(dep):
+    buf = _get_buffer(dep)
+    if buf is not None:
+        dpi = getattr(buf, "_dim_prop_info", None)
+        if dpi is not None:
+            return dpi
+    tb = V.graph.graph_inputs.get(dep.name)
+    return getattr(tb, "_dim_prop_info", None) if tb is not None else None
+
+
 def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
     return next(iter(coord.free_symbols))
 
@@ -103,9 +114,8 @@ def _compute_named_layout(named_dims):
 
 def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     """Map loop vars to named dim names for a single input dep, using named-space coords."""
-    buf = _get_buffer(dep)
-    dp = getattr(buf, "_dim_prop_info", None)
-    buf_named_dims = dp.named_dims if dp is not None else None
+    dpi = _get_dim_prop_info(dep)
+    buf_named_dims = dpi.named_dims if dpi is not None else None
     if not buf_named_dims:
         # Scalar broadcast: constant index, contributes nothing to loop_var_dims
         if not dep.index.free_symbols:
@@ -135,11 +145,6 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
                 f"continuing using range {actual_range}"
             )
     return result
-
-
-def op_out_coords(op: ComputedBuffer) -> list:
-    output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep)
 
 
 def coords_to_named_dims(coords: list, loop_var_dims: dict) -> list:
@@ -202,7 +207,6 @@ class _DimPropInfo:
     named_dims: list = dataclasses.field(default_factory=list)
     reduction_named_dims: list | None = None
     loop_var_dims: dict = dataclasses.field(default_factory=dict)
-    loop_var_to_ranges_idx: dict = dataclasses.field(default_factory=dict)
 
 
 def _set_no_named_dims(op):
@@ -227,9 +231,6 @@ def _compute_named_dims(op, inputs):
     op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
         named_dims=named_dims,
         loop_var_dims=loop_var_dims,
-        loop_var_to_ranges_idx={
-            _lone_sym(c): i for i, c in enumerate(out_coords) if c.free_symbols
-        },
         reduction_named_dims=loop_var_dims[get_reduction_dim(inputs[0], out_coords)]
         if isinstance(op.data, Reduction)
         else None,
@@ -237,17 +238,19 @@ def _compute_named_dims(op, inputs):
 
 
 def _log_dep_debug(label: str, dep: MemoryDep) -> None:
-    buf = V.graph.get_buffer(dep.name)
-    layout = buf.get_layout() if hasattr(buf, "get_layout") else None
-    dp = getattr(buf, "_dim_prop_info", None)
-    named_dims = dp.named_dims if dp is not None else []
+    buf = _get_buffer(dep)
+    layout = (
+        buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
+    )
+    dpi = _get_dim_prop_info(dep)
+    named_dims = dpi.named_dims if dpi is not None else []
     logger.debug(f"  {label} {dep.name}: named_dims={named_dims}")
     if layout is not None:
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
         logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
-    stl = getattr(buf, "layout", None)
+    stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
         logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
@@ -257,10 +260,13 @@ def _log_dep_debug(label: str, dep: MemoryDep) -> None:
 def _log_op_inputs(op: ComputedBuffer) -> None:
     for dep in op.get_read_writes().reads:
         if isinstance(dep, MemoryDep):
+            dpi = _get_dim_prop_info(dep)
+            named_dims = dpi.named_dims if dpi is not None else "?"
             buf = _get_buffer(dep)
-            named_dims = getattr(buf, "named_dims", "?")
             host_size = (
-                list(buf.get_layout().size) if hasattr(buf, "get_layout") else "?"
+                list(buf.get_layout().size)
+                if buf is not None and hasattr(buf, "get_layout")
+                else "?"
             )
             logger.info(
                 f"    input {dep.name}: named_dims={named_dims}  host_size={host_size}"
@@ -317,7 +323,7 @@ def propagate_named_dims(
     global _enabled
     if not _enabled:
         return
-    if len(V.graph.graph_input_names) > 0:
+    if V.graph.graph_input_names:
         for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
                 tb = V.graph.graph_inputs[name]
@@ -369,15 +375,16 @@ def propagate_named_dims(
             )
             rw = op.get_read_writes()
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
-            for dep in inputs:
-                _log_dep_debug("input", dep)
-            for dep in rw.writes:
-                if isinstance(dep, MemoryDep):
-                    _log_dep_debug("output", dep)
+            if logger.isEnabledFor(logging.DEBUG):
+                for dep in inputs:
+                    _log_dep_debug("input", dep)
+                for dep in rw.writes:
+                    if isinstance(dep, MemoryDep):
+                        _log_dep_debug("output", dep)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:
-                logger.warning(f"Warning: unhandled node type {type(op.data)}")
+                logger.warning(f"unhandled node type {type(op.data)}")
                 _set_no_named_dims(op)
         elif isinstance(op, SpyreConstantFallback):
             _set_no_named_dims(op)
@@ -385,39 +392,22 @@ def propagate_named_dims(
             logger.warning(f"unhandled operation type {type(op)}")
             _set_no_named_dims(op)
 
-    # LOG THE RESULTS
-    logger.info("DECLARED DIMS")
-    for name, size in _named_dims.items():
-        logger.info(f"  {name} = {size}")
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("DECLARED DIMS")
+        for name, size in _named_dims.items():
+            logger.info(f"  {name} = {size}")
 
-    logger.info("INPUT TENSORS")
-    for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
-        if isinstance(tb, TensorBox):
-            dp = getattr(tb, "_dim_prop_info", None)
-            logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
+        logger.info("INPUT TENSORS")
+        for name in V.graph.graph_input_names:
+            tb = V.graph.graph_inputs[name]
+            if isinstance(tb, TensorBox):
+                dp = getattr(tb, "_dim_prop_info", None)
+                logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
 
-    logger.info("OPS")
     for op in operations:
         _log_op(op)
     # Reset _enabled so that it does not leak True into the next compilation
     _enabled = False
-
-
-def _get_hint_scopes(op) -> list[dict[str, int]]:
-    """Return hint scopes the op is inside, outermost first (sorted by hint ID).
-
-    Each entry is {dim_name: split_count} for one spyre_hint() scope.
-    """
-    scopes = []
-    for _, hint_dict in sorted(get_op_hints(op).items()):
-        scope: dict[str, int] = {}
-        for key in ("tiles", "slices", "num_tiles_per_dim"):
-            if isinstance(hint_dict.get(key), dict):
-                scope.update(hint_dict[key])
-        if scope:
-            scopes.append(scope)
-    return scopes
 
 
 def assign_dim_hints(operations: list[Operation]) -> None:
@@ -439,82 +429,57 @@ def assign_dim_hints(operations: list[Operation]) -> None:
         if not isinstance(op, ComputedBuffer):
             continue
         dp = getattr(op, "_dim_prop_info", None)
-        if dp is None:
+        op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
+        if not op_hints:
             op.dim_hints = []  # type: ignore[attr-defined]
-            continue
-        if not dp.loop_var_dims:
-            op.dim_hints = []  # type: ignore[attr-defined]
-            del op._dim_prop_info  # type: ignore[attr-defined]
-            continue
-        levels = _get_hint_scopes(op)
-        if not levels:
-            op.dim_hints = []  # type: ignore[attr-defined]
-            del op._dim_prop_info  # type: ignore[attr-defined]
+            if dp is not None:
+                del op._dim_prop_info  # type: ignore[attr-defined]
             continue
 
-        hint_id_map = {
-            hint_id: hint_dict
-            for hint_id, hint_dict in sorted(get_op_hints(op).items())
-        }
-        dim_to_level: dict[str, tuple[int, int, int]] = {}
-        for level_idx, (hint_id, hint_dict) in enumerate(sorted(hint_id_map.items())):
-            for key in ("tiles", "slices", "num_tiles_per_dim"):
-                for name, count in (hint_dict.get(key) or {}).items():
-                    dim_to_level[name] = (count, level_idx, hint_id)
-
-        rw = op.get_read_writes()
-        all_ranges = {
-            s: int(v) for dep in [*rw.reads, *rw.writes] for s, v in dep.ranges.items()
-        }
+        assert dp is not None  # guaranteed by op_hints check above
         reduction_dims = set(dp.reduction_named_dims or [])
-        loop_var_dims = dp.loop_var_dims
-        loop_var_to_ranges_idx = dp.loop_var_to_ranges_idx
 
-        unsorted: list[tuple[int, int, DimHint]] = []
-        for i, sym in enumerate(loop_var_dims):
-            nd = named_dims_for_sym(op, sym)
-            hinted_names = [name for name, _ in nd if name in dim_to_level]
-            if not hinted_names:
+        coord_for_name: dict[str, sympy.Symbol] = {}
+        for coord in op_out_coords(op):
+            if not coord.free_symbols:
                 continue
-            split_count, level_idx, hint_id = dim_to_level[hinted_names[0]]
-            ranges_idx = loop_var_to_ranges_idx.get(sym, i)
-            unsorted.append(
+            sym = _lone_sym(coord)
+            for name, _ in named_dims_for_sym(op, sym):
+                coord_for_name[name] = sym
+
+        dim_hints = []
+        for hint_id, hint_dict in sorted(op_hints.items()):
+            # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim.
+            dims: dict[str, int] = next(
                 (
-                    level_idx,
-                    i,
-                    DimHint(
-                        dim_names=hinted_names,
-                        range_size=all_ranges.get(sym, 0),
-                        split_count=split_count,
-                        dim_index=ranges_idx,
-                        is_reduction=any(
-                            name in reduction_dims for name in hinted_names
-                        ),
-                        hint_id=hint_id,
-                    ),
-                )
+                    v
+                    for k in ("tiles", "slices", "num_tiles_per_dim")
+                    if (v := hint_dict.get(k))
+                ),
+                {},
             )
-        op.dim_hints = [h for _, _, h in sorted(unsorted)]  # type: ignore[attr-defined]
-
-        matched_hint_ids = {h.hint_id for h in op.dim_hints}
-        for level_idx, (hint_id, hint_dict) in enumerate(sorted(hint_id_map.items())):
-            if hint_id in matched_hint_ids:
-                continue
-            for key in ("tiles", "slices", "num_tiles_per_dim"):
-                dims = hint_dict.get(key) or {}
-                if dims:
-                    name, count = next(iter(dims.items()))
-                    op.dim_hints.append(
-                        DimHint(
-                            dim_names=[name],
-                            range_size=0,
-                            split_count=count,
-                            dim_index=None,
-                            is_reduction=False,
-                            hint_id=hint_id,
-                        )
+            # TODO: support multiple dimensions per spyre_hint() call.
+            # hint_id_to_ranges_pos in _stamp_group would need to become
+            # dict[int, list[int]] and _hints_levels would need to deduplicate
+            # by hint_id.
+            if len(dims) > 1:
+                raise NotImplementedError(
+                    f"spyre_hint() argument {list(hint_dict.items())} specifies "
+                    f"{len(dims)} dimensions; only one is currently allowed per "
+                    f"spyre_hint() call (not yet implemented)"
+                )
+            for name, count in dims.items():
+                sym = coord_for_name.get(name)
+                dim_hints.append(
+                    DimHint(
+                        dim_names=[name],
+                        split_count=count,
+                        loop_var=sym,
+                        is_reduction=name in reduction_dims,
+                        hint_id=hint_id,
                     )
-                    break
+                )
+        op.dim_hints = dim_hints  # type: ignore[attr-defined]
 
         # Clean up temp intermediates — only dim_hints persists.
         del op._dim_prop_info  # type: ignore[attr-defined]
@@ -528,12 +493,19 @@ def assign_dim_hints(operations: list[Operation]) -> None:
         if ops:
             hints_logger.info("=== assign_dim_hints ===")
             for op in ops:
+                rw = op.get_read_writes()
+                all_ranges = {
+                    s: int(v)
+                    for dep in [*rw.reads, *rw.writes]
+                    for s, v in dep.ranges.items()
+                }
                 hints_logger.info(f"{op.get_operation_name()}:")
                 for h in op.dim_hints:
-                    per_tile = h.range_size // h.split_count if h.range_size else "?"
+                    r = all_ranges.get(h.loop_var, 0) if h.loop_var else 0
+                    per_tile = r // h.split_count if r else "?"
                     reduction_tag = "  [reduction]" if h.is_reduction else ""
                     hints_logger.info(
-                        f"  {h.dim_names}  range={h.range_size}"
+                        f"  {h.dim_names}  range={r}"
                         f"  split_count={h.split_count}  -> {per_tile} per tile"
-                        f"  dim_index={h.dim_index}{reduction_tag}"
+                        f"  loop_var={h.loop_var}{reduction_tag}"
                     )

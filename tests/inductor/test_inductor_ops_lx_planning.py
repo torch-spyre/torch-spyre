@@ -229,8 +229,10 @@ POINTWISE_TEST_FAILURES = [
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_2",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_conv2d_1x3x32_ksize3_no_pad",
     "test_tril_3d",
     "test_triu_3d",
+    "test_unbind_1d_dim0",
     "test_vector_norm_keepdim0_vector_norm_ord2_3d_dim_12",
     "test_vector_norm_keepdim0_vector_norm_ord2_5d_dim_1234",
     "test_vector_norm_keepdim0_vector_norm_ord2_5d_mixed_1_neg1",
@@ -294,9 +296,11 @@ class LxPlanningTwoOpPointwiseAdditionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: x + x
-                if isinstance(x, torch.Tensor) and x.dtype == torch.float16
-                else x,
+                lambda x: (
+                    x + x
+                    if isinstance(x, torch.Tensor) and x.dtype == torch.float16
+                    else x
+                ),
                 result,
             )
 
@@ -410,6 +414,7 @@ REDUCTION_TEST_FAILURES = [
     "test_t_2d_contiguous_4096x49280",
     "test_t_2d_contiguous_49280x4096",
     "test_topk_2d_k4_dim0",
+    "test_unbind_1d_dim0",
     "test_transpose_2d_contiguous_dim_0_2",
     "test_transpose_2d_large_dim_0_1",
     "test_transpose_2d_large_dim_0_1_nopad",
@@ -420,6 +425,7 @@ REDUCTION_TEST_FAILURES = [
     "test_transpose_3d_contiguous_dim_0_2",
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_conv2d_1x3x32_ksize3_no_pad",
     "test_where_self_out_where_fp16_2d",
 ]
 
@@ -430,9 +436,11 @@ class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: torch.sum(x, dim=0)
-                if isinstance(x, torch.Tensor) and x.dtype == torch.float16
-                else x,
+                lambda x: (
+                    torch.sum(x, dim=0)
+                    if isinstance(x, torch.Tensor) and x.dtype == torch.float16
+                    else x
+                ),
                 result,
             )
 

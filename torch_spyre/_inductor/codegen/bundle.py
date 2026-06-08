@@ -20,6 +20,7 @@ from typing import Any
 import sympy
 
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.codegen.unroll import unroll_loop_specs
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -32,13 +33,14 @@ logger = get_inductor_logger("sdsc_compile")
 # Types
 # ---------------------------------------------------------------------------
 
-# Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides)
+# Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides, symbol_kinds)
 #   base_symbol_values: list[int] of base HBM byte offsets for this SDSC,
 #                       one per registered symbol ID
 #   affine_strides:     list[dict] parallel to SDSCSpec.args —
 #                       {tiled_sym: stride_bytes} for tiled HBM tensors,
 #                       empty dict for non-tiled / lx tensors
-_CompiledEntry = tuple[Any, list[int], list[dict]]
+#   symbol_kinds:       list[SymbolKind] parallel to base_symbol_values
+_CompiledEntry = tuple[Any, list[int], list[dict], list[SymbolKind]]
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +54,7 @@ def generate_bundle(
     specs: Sequence,
     use_symbols: bool | None = None,
     unroll_loops: bool | None = None,
+    symbolic_args: bool | None = None,
 ):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
@@ -78,6 +81,8 @@ def generate_bundle(
         use_symbols = _spyre_config.bundle_hbm_symbols
     if unroll_loops is None:
         unroll_loops = _spyre_config.unroll_loops
+    if symbolic_args is None:
+        symbolic_args = _spyre_config.bundle_symbolic_args
 
     specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
 
@@ -120,6 +125,33 @@ def generate_bundle(
     compiled_iter = iter(compiled)
     addr_counter = [0]
 
+    # Build a per-symbol kind list from compiled entries (symbolic_args path only).
+    symbol_kinds: list[SymbolKind] = []
+    if symbolic_args and use_symbols:
+        for _, _, _, local_kinds in compiled:
+            symbol_kinds.extend(local_kinds)
+
+    # Determine whether a pool parameter is needed (any pool symbol present).
+    has_pool = symbolic_args and use_symbols and any(sk.is_pool for sk in symbol_kinds)
+    # Indices of kernel-base symbols that become input_arg parameters.
+    # Deduplicated by address value: multiple SDSCs may register the same kernel arg
+    # address independently (no cross-SDSC dedup in generate_sdsc), so we keep only
+    # the first sym_idx for each unique address and map subsequent duplicates to it.
+    # kernel_arg_sym_indices: list of sym_idx values, one per unique kernel arg address.
+    # kernel_dup_canonical: maps duplicate kernel sym_idx → canonical sym_idx.
+    kernel_arg_sym_indices: list[int] = []
+    kernel_dup_canonical: dict[int, int] = {}  # duplicate sym_idx → canonical sym_idx
+    if symbolic_args and use_symbols:
+        seen_kernel_addr: dict[int, int] = {}  # address → canonical sym_idx
+        for i, kind_i in enumerate(symbol_kinds):
+            if kind_i.kind == "kernel":
+                addr = symbols[i]
+                if addr not in seen_kernel_addr:
+                    seen_kernel_addr[addr] = i
+                    kernel_arg_sym_indices.append(i)
+                else:
+                    kernel_dup_canonical[i] = seen_kernel_addr[addr]
+
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
 
@@ -133,7 +165,33 @@ def generate_bundle(
             )
 
         f.write("module {\n")
-        f.write("\tfunc.func @sdsc_bundle() {\n")
+
+        # Function signature when symbolic_args is active:
+        #   - optional leading %pool_base_addr param for pool-allocated tensors
+        #   - one !sdscbundle.input_arg<index> param per kernel tensor arg, with a
+        #     descriptive formal name %arg_{arg_index}_base_addr; the short form
+        #     %arg_{arg_index} is used in the body after input_arg_extract
+        if symbolic_args and use_symbols and (has_pool or kernel_arg_sym_indices):
+            params = []
+            if has_pool:
+                params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
+            for sym_idx in kernel_arg_sym_indices:
+                ai = symbol_kinds[sym_idx].arg_index
+                params.append(f"%arg_{ai}_base_addr: !sdscbundle.input_arg<index>")
+            f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
+            if has_pool:
+                f.write(
+                    "\t\t%pool = sdscbundle.input_arg_extract value from"
+                    " %pool_base_addr : !sdscbundle.input_arg<index> -> index\n"
+                )
+            for sym_idx in kernel_arg_sym_indices:
+                ai = symbol_kinds[sym_idx].arg_index
+                f.write(
+                    f"\t\t%arg_{ai} = sdscbundle.input_arg_extract value from"
+                    f" %arg_{ai}_base_addr : !sdscbundle.input_arg<index> -> index\n"
+                )
+        else:
+            f.write("\tfunc.func @sdsc_bundle() {\n")
 
         # Standard loop constants (only emitted when there are loops).
         if loop_bounds:
@@ -142,10 +200,72 @@ def generate_bundle(
             for lb_idx, lb in enumerate(loop_bounds):
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
-        # One arith.constant per symbol ID (symbols[N] → %sym_{N+1}).
-        # Skipped when use_symbols=False (symbols list is empty in that case).
+        # Emit one declaration per symbol (symbolic_args path):
+        #   - "kernel"          → skipped; already a function param + extract op above
+        #   - "kernel_derived"  → arith.addi %arg_{arg_index}, <per_core_offset>
+        #                         deduped by (arg_index, offset) pair
+        #   - "pool"            → arith.addi %pool, <pool_offset>
+        #                         deduped by pool offset value
+        #   - anything else     → arith.constant (use_symbols=False or non-symbolic path)
+        # All kernel sym indices to skip during emission (canonical + duplicates).
+        kernel_arg_sym_set = set(kernel_arg_sym_indices) | set(kernel_dup_canonical)
+        # Map kernel sym_idx → arg_index for SSA name generation.
+        # Duplicate kernel sym indices inherit the arg_index of their canonical.
+        kernel_sym_to_arg_idx: dict[int, int] = {
+            sym_idx: symbol_kinds[sym_idx].arg_index
+            for sym_idx in kernel_arg_sym_indices
+        }
+        for dup_idx, canon_idx in kernel_dup_canonical.items():
+            if canon_idx in kernel_sym_to_arg_idx:
+                kernel_sym_to_arg_idx[dup_idx] = kernel_sym_to_arg_idx[canon_idx]
+        # sym_canonical[sym_idx] → canonical SSA name for derived/pool symbols (deduped).
+        # Also pre-populate duplicate kernel sym_idx entries with their canonical extracted name.
+        sym_canonical: dict[int, str] = {
+            dup_idx: f"%arg_{kernel_sym_to_arg_idx[dup_idx]}"
+            for dup_idx in kernel_dup_canonical
+            if dup_idx in kernel_sym_to_arg_idx
+        }
+        # derived_addi_emitted[(arg_index, offset)] → SSA name already emitted
+        derived_addi_emitted: dict[tuple[int, int], str] = {}
+        # pool_addi_emitted[pool_offset_value] → SSA name already emitted
+        pool_addi_emitted: dict[int, str] = {}
+
         for sym_idx, value in enumerate(symbols):
-            f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
+            if sym_idx in kernel_arg_sym_set:
+                continue  # replaced by function parameter + extract op (or duplicate)
+            sk: SymbolKind | None = symbol_kinds[sym_idx] if symbol_kinds else None
+            if sk is not None and sk.is_derived:
+                base_ai = kernel_sym_to_arg_idx.get(sk.base_sym_idx)
+                if base_ai is not None:
+                    key = (base_ai, sk.offset)
+                    if key not in derived_addi_emitted:
+                        offset_ssa = f"%arg_{base_ai}_core_offset_{sk.offset}"
+                        addi_ssa = f"%arg_{base_ai}_core_{sk.offset}"
+                        f.write(
+                            f"\t\t{offset_ssa} = arith.constant {sk.offset} : index\n"
+                        )
+                        f.write(
+                            f"\t\t{addi_ssa} = arith.addi"
+                            f" %arg_{base_ai}, {offset_ssa} : index\n"
+                        )
+                        derived_addi_emitted[key] = addi_ssa
+                    sym_canonical[sym_idx] = derived_addi_emitted[key]
+                else:
+                    f.write(
+                        f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
+                    )
+            elif sk is not None and sk.is_pool:
+                if value not in pool_addi_emitted:
+                    offset_ssa = f"%pool_offset_{value}"
+                    addi_ssa = f"%pool_addr_{value}"
+                    f.write(f"\t\t{offset_ssa} = arith.constant {value} : index\n")
+                    f.write(
+                        f"\t\t{addi_ssa} = arith.addi %pool, {offset_ssa} : index\n"
+                    )
+                    pool_addi_emitted[value] = addi_ssa
+                sym_canonical[sym_idx] = pool_addi_emitted[value]
+            else:
+                f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
         # Recursive body emission.
         loop_bound_idx = [0]
@@ -160,6 +280,9 @@ def generate_bundle(
             f,
             indent=2,
             use_symbols=use_symbols,
+            symbolic_args=symbolic_args,
+            kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
+            sym_canonical=sym_canonical,
         )
 
         f.write("\t\treturn\n")
@@ -196,15 +319,19 @@ def _compile_specs(
         elif isinstance(entry, OpSpec):
             idx = sdsc_counter[0]
             sdsc_counter[0] += 1
-            sdsc_json, local_sym_values, affine_strides = compile_op_spec(
-                idx,
-                entry,
-                symbols,
-                symbol_id_offset_counter[0],
-                use_symbols=use_symbols,
+            sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (
+                compile_op_spec(
+                    idx,
+                    entry,
+                    symbols,
+                    symbol_id_offset_counter[0],
+                    use_symbols=use_symbols,
+                )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
-            compiled.append((sdsc_json, local_sym_values, affine_strides))
+            compiled.append(
+                (sdsc_json, local_sym_values, affine_strides, local_symbol_kinds)
+            )
             file_name = f"sdsc_{idx}.json"
             with open(os.path.join(output_dir, file_name), "w") as f:
                 logger.info(f"Generating {f.name}")
@@ -246,7 +373,7 @@ def _collect_affine_maps(
                 affine_map_index,
             )
         elif isinstance(entry, OpSpec):
-            _, _, affine_strides = next(compiled_iter)
+            _, _, affine_strides, _ = next(compiled_iter)
             for tensor_strides in affine_strides:
                 if not tensor_strides:
                     continue
@@ -282,8 +409,32 @@ def _emit_specs(
     f,
     indent: int,
     use_symbols: bool = False,
+    symbolic_args: bool = False,
+    kernel_sym_to_arg_idx: dict | None = None,
+    sym_canonical: dict | None = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
+    if kernel_sym_to_arg_idx is None:
+        kernel_sym_to_arg_idx = {}
+    if sym_canonical is None:
+        sym_canonical = {}
+
+    # Map from 0-based symbol index to the short SSA name for kernel-arg symbols.
+    # sym_idx → %arg_{arg_index}  (the result of input_arg_extract in the function body)
+    kernel_arg_sym_to_name: dict[int, str] = {
+        sym_idx: f"%arg_{ai}" for sym_idx, ai in kernel_sym_to_arg_idx.items()
+    }
+
+    def _resolve_sym(sid: int) -> str:
+        # sid is a negative symbol ID; abs(sid)-1 is the 0-based index into symbols[].
+        sym_idx = abs(sid) - 1
+        if symbolic_args:
+            if sym_idx in kernel_arg_sym_to_name:
+                return kernel_arg_sym_to_name[sym_idx]
+            if sym_idx in sym_canonical:
+                return sym_canonical[sym_idx]
+        return f"%sym_{abs(sid)}"
+
     tab = "\t" * indent
     for entry in specs:
         if isinstance(entry, LoopSpec):
@@ -304,11 +455,14 @@ def _emit_specs(
                 f,
                 indent + 1,
                 use_symbols=use_symbols,
+                symbolic_args=symbolic_args,
+                kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
+                sym_canonical=sym_canonical,
             )
             f.write(f"{tab}}}\n")
 
         elif isinstance(entry, OpSpec):
-            sdsc_json, local_sym_values, affine_strides = next(compiled_iter)
+            sdsc_json, local_sym_values, affine_strides, _ = next(compiled_iter)
             # Determine the JSON filename from the sdsc_json key.
             sdsc_name = next(iter(sdsc_json))
             sdsc_idx = sdsc_name.split("_")[0]
@@ -333,7 +487,7 @@ def _emit_specs(
                     map_idx = affine_map_index[stride_key]
                     addr_name = f"%addr_{addr_counter[0]}"
                     addr_counter[0] += 1
-                    base_addr_name = _sym_id_to_mlir_name(base_sym_id)
+                    base_addr_name = _resolve_sym(base_sym_id)
                     loop_var_str = ", ".join(loop_vars)
                     f.write(
                         f"{tab}{addr_name} = affine.apply #map_{map_idx}"
@@ -344,8 +498,7 @@ def _emit_specs(
             # Each operand position matches one symbol_id entry.
             # Tiled sym_ids use the %addr_N computed above; others use %sym_N.
             operands = [
-                sym_id_to_operand.get(sid, _sym_id_to_mlir_name(sid))
-                for sid in symbol_ids
+                sym_id_to_operand.get(sid, _resolve_sym(sid)) for sid in symbol_ids
             ]
 
             operand_str = ", ".join(operands)
@@ -403,16 +556,6 @@ def _get_tensor_core_sym_id(sdsc_json: dict, tensor_idx: int, core: int) -> int 
                     if key in data:
                         return int(data[key])
     return None
-
-
-def _sym_id_to_mlir_name(sym_id: int) -> str:
-    """Map a negative symbol ID to a %sym_N MLIR name.
-
-    Symbol IDs are assigned sequentially across the whole bundle starting at
-    -1, and symbols[abs(id)-1] holds the corresponding value.  So %sym_N where
-    N = abs(sym_id) is always correct.
-    """
-    return f"%sym_{abs(sym_id)}"
 
 
 # ---------------------------------------------------------------------------
