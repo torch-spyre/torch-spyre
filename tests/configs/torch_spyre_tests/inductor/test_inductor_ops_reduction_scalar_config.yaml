@@ -18,7 +18,7 @@ test_suite_config:
             # but the base method names are test_sum_keepdim0/1 from test file
             # Note: argmin and logsumexp are excluded here because their base
             # names contain "keepdim" and are covered by the keepdim shard.
-            - TestOps::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|prod_dim|quantile|std_|topk|var_).*
+            - TestOps::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|prod_dim|quantile|std_|topk|conv2d|var_).*
 
           mode: mandatory_success
           tags:

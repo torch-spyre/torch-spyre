@@ -1,0 +1,19 @@
+### Sample YAML config for testing CpuMixin integration ###
+test_suite_config:
+  files:
+    - path: ${TORCH_ROOT}/test/test_prims.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestPrims::test_broadcast_in_dim
+          mode: mandatory_success
+
+          edits:
+            functions:
+              cpu_move:
+                - name: assertEqual
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: float32

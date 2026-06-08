@@ -39,6 +39,7 @@ test_suite_config:
             # shape ops
             - TestOps::test_flatten.*
             - TestOps::test_permute.*
+            - TestOps::test_unbind.*
             - TestOps::test_size_one.*
             # squeeze covers test_squeeze and test_squeeze_reduction
             - TestOps::test_squeeze.*
@@ -53,6 +54,7 @@ test_suite_config:
             # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
+            - TestOps::test_repeat.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

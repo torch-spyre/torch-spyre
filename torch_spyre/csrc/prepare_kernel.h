@@ -21,16 +21,14 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "flex/flex.hpp"
+#include "job_plan.h"
 #include "spyre_stream.h"
 
 namespace spyre {
-
-// Forward declarations
-class JobPlan;
-class JobPlanStep;
 
 /**
  * @brief Builder class for constructing JobPlan from SpyreCode
@@ -143,6 +141,8 @@ class JobPlanBuilder {
   std::optional<flex::CompositeAddress> job_allocation_;
   /// Whether to bind inputs and outputs addresses for compute
   bool bind_io_addresses_;
+
+  std::unordered_map<std::string, HostBuffer> pinned_buffer_map_;
 
   /// Execute the job preparation plan (allocate + init transfers)
   void executeJobPreparationPlan();

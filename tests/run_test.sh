@@ -60,6 +60,31 @@ if [[ $# -lt 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# --skip-slow / --include-slow flag parsing
+#
+# Controls whether platform-specific slow tests are skipped or run.
+# Default: include all tests (no filtering).
+#
+# --skip-slow    : skip tests tagged slow__plat_<arch> for the current platform.
+#                  On platforms with no slow tag defined, this is a no-op.
+# --include-slow : explicit no-op (default behaviour, for clarity in scripts).
+#
+# Usage:
+#   run_test.sh config.yaml                 # default: all tests run
+#   run_test.sh config.yaml --include-slow  # same, explicit
+#   run_test.sh config.yaml --skip-slow     # skip slow tests on this platform
+# ---------------------------------------------------------------------------
+_SKIP_SLOW=0
+_FILTERED_ARGS=()
+for _arg in "$@"; do
+    case "$_arg" in
+        --skip-slow)    _SKIP_SLOW=1 ;;
+        --include-slow) _SKIP_SLOW=0 ;;
+        *)              _FILTERED_ARGS+=("$_arg") ;;
+    esac
+done
+set -- "${_FILTERED_ARGS[@]+"${_FILTERED_ARGS[@]}"}"
+# ---------------------------------------------------------------------------
 # Multi-config support
 #
 # Collect all leading positional arguments that are YAML files or directories
@@ -324,6 +349,41 @@ echo "  PYTORCH_TESTING_DEVICE_ONLY_FOR = $PYTORCH_TESTING_DEVICE_ONLY_FOR"
 echo "  TORCH_TEST_DEVICES              = $TORCH_TEST_DEVICES"
 echo "  PYTORCH_TEST_CONFIG             = $PYTORCH_TEST_CONFIG"
 echo "  PYTHONPATH                      = $PYTHONPATH"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Platform-specific slow test filtering.
+#
+# Slow tests are tagged slow__plat_<arch> in the YAML config.
+# Filtering is opt-in: pass --skip-slow to activate.
+# Default behaviour (no flag): all tests run regardless of platform.
+#
+# To mark a test as slow on a platform, add the tag in the YAML config:
+#   tags: [slow__plat_ppc64]   # skipped on ppc64le when --skip-slow is passed
+# ---------------------------------------------------------------------------
+_machine="$(uname -m 2>/dev/null || true)"
+case "$_machine" in
+    ppc64*)        _PLATFORM_SLOW_TAG="slow__plat_ppc64"   ;;
+    s390x*)        _PLATFORM_SLOW_TAG="slow__plat_s390x"   ;;
+    x86_64*)        _PLATFORM_SLOW_TAG="slow__plat_x86_64"   ;;
+    aarch64|arm64) _PLATFORM_SLOW_TAG="slow__plat_aarch64" ;;
+    *)             _PLATFORM_SLOW_TAG="" ;;
+esac
+
+if [[ $_SKIP_SLOW -eq 1 ]]; then
+    if [[ -n "$_PLATFORM_SLOW_TAG" ]]; then
+        echo "[torch_oot_device_tests_run] --skip-slow: skipping tests tagged '${_PLATFORM_SLOW_TAG}' on ${_machine}"
+        EXTRA_PYTEST_ARGS+=("-m" "not ${_PLATFORM_SLOW_TAG}")
+    else
+        echo "[torch_oot_device_tests_run] --skip-slow: no slow tag defined for ${_machine}, all tests will run"
+    fi
+else
+    if [[ -n "$_PLATFORM_SLOW_TAG" ]]; then
+        echo "[torch_oot_device_tests_run] Platform ${_machine}: slow tag '${_PLATFORM_SLOW_TAG}' exists — pass --skip-slow to skip those tests"
+    else
+        echo "[torch_oot_device_tests_run] Platform ${_machine}: no slow tag defined, all tests will run"
+    fi
+fi
 echo ""
 
 # ---------------------------------------------------------------------------
