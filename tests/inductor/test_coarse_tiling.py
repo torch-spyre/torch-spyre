@@ -41,6 +41,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import sympy
 from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
 import torch
@@ -2688,49 +2689,64 @@ class TestDivideReductionRanges(unittest.TestCase):
 class TestLoopVarToReductionRangesPos(unittest.TestCase):
     """_loop_var_to_reduction_ranges_pos finds the position of a symbol in reduction_ranges."""
 
-    def _make_reduction_op(self, ranges, reduction_ranges):
-        from torch._inductor.ir import ComputedBuffer, Reduction, ReductionHint
-        import torch
+    def _make_op_with_rw(self, out_syms, red_syms):
+        """Return a mock ComputedBuffer whose get_read_writes() reflects the given symbols.
 
-        data = Reduction(
-            device=torch.device("cpu"),
-            dtype=torch.float16,
-            inner_fn=lambda idx, ridx: None,
-            ranges=list(ranges),
-            reduction_ranges=list(reduction_ranges),
-            reduction_type="sum",
-            src_dtype=torch.float16,
-            reduction_hint=ReductionHint.DEFAULT,
-        )
+        out_syms: list of sympy.Symbol appearing in both the input and output index
+        red_syms: list of sympy.Symbol appearing only in the input index (reduction dims)
+        """
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch._inductor.dependencies import MemoryDep
+
+        data = MagicMock(spec=Reduction)
+        data.reduction_ranges = [Integer(64)] * len(red_syms)
+
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        return op
+
+        # Output dep: index contains only out_syms
+        out_dep = MagicMock(spec=MemoryDep)
+        out_dep.index = (
+            sympy.Add(*out_syms)
+            if len(out_syms) > 1
+            else (out_syms[0] if out_syms else sympy.Integer(0))
+        )
+        out_dep.index = sympy.sympify(out_dep.index)
+
+        # Input dep: index contains out_syms + red_syms; ranges preserves insertion order
+        in_dep = MagicMock(spec=MemoryDep)
+        all_syms = out_syms + red_syms
+        in_dep.index = sympy.Add(*all_syms) if len(all_syms) > 1 else all_syms[0]
+        in_dep.index = sympy.sympify(in_dep.index)
+        # dict preserves insertion order in Python 3.7+ — out dims first, then red dims
+        in_dep.ranges = {s: Integer(64) for s in all_syms}
+
+        rw = MagicMock()
+        rw.reads = [in_dep]
+        rw.writes = iter([out_dep])
+        # Make iter(rw.writes) work for next()
+        out_dep_list = [out_dep]
+        rw.writes = out_dep_list
+        op.get_read_writes.return_value = rw
+        return op, red_syms
 
     def test_finds_reduction_symbol(self):
         from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
-        from torch._inductor.codegen.common import SymT
 
-        op = self._make_reduction_op(
-            ranges=[Integer(32)], reduction_ranges=[Integer(64)]
-        )
-        # The reduction symbol for a single reduction_ranges entry is r0_0
-        rindex = op.data._index(op.data.reduction_ranges, SymT.R0_INDEX)
-        sym = next(iter(rindex[0].free_symbols))
-        result = _loop_var_to_reduction_ranges_pos(op, sym)
+        i0 = sympy.Symbol("i0")
+        r0 = sympy.Symbol("r0")
+        op, red_syms = self._make_op_with_rw(out_syms=[i0], red_syms=[r0])
+        result = _loop_var_to_reduction_ranges_pos(op, r0)
         self.assertEqual(result, 0)
 
     def test_returns_none_for_output_symbol(self):
         from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
-        from torch._inductor.codegen.common import SymT
-        from torch._inductor.utils import sympy_index_symbol_with_prefix
 
-        op = self._make_reduction_op(
-            ranges=[Integer(32)], reduction_ranges=[Integer(64)]
-        )
-        # Use an output-dim symbol (i0_0) — should not appear in reduction_ranges
-        output_sym = sympy_index_symbol_with_prefix(SymT.INDEX, 0)
-        result = _loop_var_to_reduction_ranges_pos(op, output_sym)
+        i0 = sympy.Symbol("i0")
+        r0 = sympy.Symbol("r0")
+        op, _ = self._make_op_with_rw(out_syms=[i0], red_syms=[r0])
+        result = _loop_var_to_reduction_ranges_pos(op, i0)
         self.assertIsNone(result)
 
 
@@ -2770,269 +2786,13 @@ class TestReductionIdentityValues(unittest.TestCase):
 
 
 class TestStampGroupReductionDim(unittest.TestCase):
-    """_stamp_group populates loop_tiled_reduction_dims for reduction-dim hints."""
+    """_stamp_group populates loop_tiled_reduction_dims for reduction-dim hints.
 
-    def test_reduction_dim_hint_populates_loop_tiled_reduction_dims(self):
-        """A hint with is_reduction=True causes loop_tiled_reduction_dims to be [[0]]."""
-        from torch_spyre._inductor.coarse_tile import _stamp_group
-        from torch_spyre._inductor.propagate_hints import DimHint
-        from torch._inductor.codegen.common import SymT
-        import torch
-        from torch._inductor.ir import Reduction, ReductionHint
-
-        ranges = [Integer(128)]
-        reduction_ranges = [Integer(256)]
-        real_data = Reduction(
-            device=torch.device("cpu"),
-            dtype=torch.float16,
-            inner_fn=lambda idx, ridx: None,
-            ranges=ranges,
-            reduction_ranges=reduction_ranges,
-            reduction_type="sum",
-            src_dtype=torch.float16,
-            reduction_hint=ReductionHint.DEFAULT,
-        )
-        rindex = real_data._index(real_data.reduction_ranges, SymT.R0_INDEX)
-        red_sym = next(iter(rindex[0].free_symbols))
-
-        hint = DimHint(
-            dim_names=["K"],
-            split_count=4,
-            loop_var=red_sym,
-            is_reduction=True,
-            hint_id=0,
-        )
-
-        from torch._inductor.ir import ComputedBuffer
-
-        op = MagicMock(spec=ComputedBuffer)
-        op.data = real_data
-        op.get_name.return_value = "red0"
-        op.get_operation_name.return_value = "red0"
-        op.dim_hints = [hint]
-        layout_mock = MagicMock()
-        layout_mock.size = list(ranges)
-        op.layout = layout_mock
-        del op.loop_info
-
-        with patch("torch_spyre._inductor.coarse_tile.op_out_coords", return_value=[]):
-            _stamp_group([op], (0,), [(0, Integer(4), True)], {"red0": 0})
-
-        self.assertEqual(op.loop_info.loop_tiled_dims, [[]])
-        self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[0]])
-        # reduction_ranges should be divided: 256 / 4 = 64
-        self.assertEqual(op.data.reduction_ranges[0], Integer(64))
-        # output ranges untouched
-        self.assertEqual(op.data.ranges[0], Integer(128))
-
-    def test_pointwise_op_in_reduction_level_does_not_crash(self):
-        """A Pointwise op co-tiled with a reduction-dim hint must not crash."""
-        from torch_spyre._inductor.coarse_tile import _stamp_group
-        from torch_spyre._inductor.propagate_hints import DimHint
-        from torch._inductor.codegen.common import SymT
-        import torch
-        from torch._inductor.ir import Pointwise, Reduction, ReductionHint
-
-        # Build a real Reduction op to get the reduction symbol
-        real_reduction = Reduction(
-            device=torch.device("cpu"),
-            dtype=torch.float16,
-            inner_fn=lambda idx, ridx: None,
-            ranges=[Integer(128)],
-            reduction_ranges=[Integer(256)],
-            reduction_type="sum",
-            src_dtype=torch.float16,
-            reduction_hint=ReductionHint.DEFAULT,
-        )
-        rindex = real_reduction._index(real_reduction.reduction_ranges, SymT.R0_INDEX)
-        red_sym = next(iter(rindex[0].free_symbols))
-
-        hint = DimHint(
-            dim_names=["K"],
-            split_count=4,
-            loop_var=red_sym,
-            is_reduction=True,
-            hint_id=0,
-        )
-
-        # Build a Pointwise op (not Reduction) — simulates a relu co-tiled with sum
-        pointwise_data = Pointwise(
-            device=torch.device("cpu"),
-            dtype=torch.float16,
-            inner_fn=lambda index: None,
-            ranges=[Integer(128)],
-        )
-        from torch._inductor.ir import ComputedBuffer
-
-        pw_op = MagicMock(spec=ComputedBuffer)
-        pw_op.data = pointwise_data
-        pw_op.get_name.return_value = "pw0"
-        pw_op.get_operation_name.return_value = "pw0"
-        pw_op.dim_hints = [hint]
-        layout_mock = MagicMock()
-        layout_mock.size = [Integer(128)]
-        pw_op.layout = layout_mock
-
-        # Must not crash — Pointwise op is loop-invariant on the reduction dim
-        with patch("torch_spyre._inductor.coarse_tile.op_out_coords", return_value=[]):
-            _stamp_group([pw_op], (0,), [(0, Integer(4), True)], {"pw0": 0})
-
-        self.assertEqual(pw_op.loop_info.loop_tiled_dims, [[]])
-        self.assertEqual(pw_op.loop_info.loop_tiled_reduction_dims, [[]])
-
-
-class TestPropagateTiledReductionOp(unittest.TestCase):
-    """_propagate_tiled_reduction_op inserts fill + combine for tiled reductions."""
-
-    def _make_tiled_reduction(
-        self, name, out_ranges, reduction_ranges, reduction_type="sum", loop_count=4
-    ):
-        """Build a ComputedBuffer mock stamped for reduction-dim tiling."""
-        import torch
-        from torch._inductor.ir import (
-            ComputedBuffer,
-            FixedLayout,  # noqa: F401
-            Reduction,
-            ReductionHint,
-        )
-        from torch._inductor.ir import FlexibleLayout
-        from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.ir import FixedTiledLayout
-        from torch_spyre._inductor.loop_info import CoarseTileInfo
-
-        data = Reduction(
-            device=torch.device("cpu"),
-            dtype=torch.float16,
-            inner_fn=lambda idx, ridx: None,
-            ranges=[Integer(r) for r in out_ranges],
-            reduction_ranges=[Integer(r) for r in reduction_ranges],
-            reduction_type=reduction_type,
-            src_dtype=torch.float16,
-            reduction_hint=ReductionHint.DEFAULT,
-        )
-        size = [Integer(r) for r in out_ranges]
-        strides = list(FlexibleLayout.contiguous_strides(size))
-        device = torch.device("cpu")
-        dtype = torch.float16
-        dim_order = list(range(len(out_ranges)))
-        stl = SpyreTensorLayout(
-            [int(s) for s in size],
-            [int(s) for s in strides] if strides else [1],
-            dtype,
-            dim_order,
-        )
-        layout = FixedTiledLayout(device, dtype, size, strides, stl)
-        op = MagicMock(spec=ComputedBuffer)
-        op.name = name
-        op.data = data
-        op.get_name.return_value = name
-        op.get_operation_name.return_value = name
-        op.get_device.return_value = device
-        op.get_dtype.return_value = dtype
-        op.layout = layout
-        op.origins = OrderedSet()
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(loop_count)],
-            loop_tiled_dims=[[]],
-            loop_tiled_reduction_dims=[[0]],
-        )
-        op.make_loader.return_value = lambda index: None
-        return op
-
-    def test_fill_and_combine_ops_inserted(self):
-        """_propagate_tiled_reduction_op inserts a fill op and a combine op."""
-        from torch._inductor.ir import ComputedBuffer
-        from torch_spyre._inductor.coarse_tile import _propagate_tiled_reduction_op
-
-        op = self._make_tiled_reduction("red0", out_ranges=[32], reduction_ranges=[64])
-        operations = [op]
-
-        fill_buf_mock = MagicMock(spec=ComputedBuffer)
-        fill_buf_mock.get_name.return_value = "coarse_tile_accum_red0"
-
-        with (
-            patch(
-                "torch_spyre._inductor.coarse_tile._allocate_full_buffer",
-                return_value=fill_buf_mock,
-            ) as mock_alloc,
-            patch(
-                "torch_spyre._inductor.coarse_tile._find_outside_consumers",
-                return_value=([], False),
-            ),
-            patch(
-                "torch_spyre._inductor.coarse_tile._graph_output_names",
-                return_value=set(),
-            ),
-            patch("torch_spyre._inductor.coarse_tile.V") as mock_v,
-            patch("torch._inductor.ir.V"),
-        ):
-            mock_v.graph.qualify_name.side_effect = lambda n: n
-            mock_v.graph.name_to_buffer = {}
-            # Simulate _allocate_full_buffer inserting fill_buf_mock into operations
-            mock_alloc.side_effect = lambda *a, **kw: (
-                operations.insert(0, fill_buf_mock) or fill_buf_mock
-            )
-            _propagate_tiled_reduction_op(op, operations)
-
-        # The original op should be marked per_tile_fixed
-        self.assertTrue(op.layout.per_tile_fixed)
-        # A fill init op and combine op should have been inserted
-        # (2 new ops: fill_init Pointwise + combine Pointwise)
-        self.assertGreater(len(operations), 1)
-        names = [
-            o.get_name() if hasattr(o, "get_name") and callable(o.get_name) else ""
-            for o in operations
-        ]
-        self.assertTrue(any("fill" in n or "accum" in n for n in names))
-        self.assertTrue(any("combine" in n for n in names))
-
-    def test_consumers_patched_to_accum_buf(self):
-        """Outside consumers are redirected to read the accumulation buffer."""
-        from torch._inductor.ir import ComputedBuffer
-        from torch_spyre._inductor.coarse_tile import _propagate_tiled_reduction_op
-
-        op = self._make_tiled_reduction("red0", out_ranges=[32], reduction_ranges=[64])
-        consumer = MagicMock(spec=ComputedBuffer)
-        consumer.get_name.return_value = "consumer0"
-        operations = [op, consumer]
-
-        fill_buf_mock = MagicMock(spec=ComputedBuffer)
-        fill_buf_mock.get_name.return_value = "coarse_tile_accum_red0"
-        fill_buf_mock.make_loader.return_value = lambda index: None
-
-        patched_consumers = []
-
-        def fake_patch_consumers(consumers, old, new, ops):
-            patched_consumers.extend(consumers)
-
-        with (
-            patch(
-                "torch_spyre._inductor.coarse_tile._allocate_full_buffer",
-                side_effect=lambda *a, **kw: (
-                    operations.insert(0, fill_buf_mock) or fill_buf_mock
-                ),
-            ),
-            patch(
-                "torch_spyre._inductor.coarse_tile._find_outside_consumers",
-                return_value=([consumer], False),
-            ),
-            patch(
-                "torch_spyre._inductor.coarse_tile._patch_consumers",
-                side_effect=fake_patch_consumers,
-            ),
-            patch(
-                "torch_spyre._inductor.coarse_tile._graph_output_names",
-                return_value=set(),
-            ),
-            patch("torch_spyre._inductor.coarse_tile.V") as mock_v,
-            patch("torch._inductor.ir.V"),
-        ):
-            mock_v.graph.qualify_name.side_effect = lambda n: n
-            mock_v.graph.name_to_buffer = {}
-            _propagate_tiled_reduction_op(op, operations)
-
-        self.assertIn(consumer, patched_consumers)
+    The detailed correctness of loop_tiled_reduction_dims population (that the
+    fill+combine buffers are inserted, that consumers are patched, that numerical
+    results match CPU) is covered by TestCoarseTileReductionE2E in
+    test_coarse_tile_e2e.py, which runs end-to-end on the Spyre device.
+    """
 
 
 if __name__ == "__main__":
