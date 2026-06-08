@@ -52,6 +52,7 @@ import sympy
 from sympy import Expr
 
 import torch
+from torch._inductor.codegen.common import SymT
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -62,7 +63,6 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch._inductor.codegen.common import SymT
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -890,6 +890,7 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.Integer(int(r) // int(loop_count))
         else:
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
+    # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
 
 
