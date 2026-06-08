@@ -942,5 +942,214 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("sympify('2')", src, "Expected loop count 2")
 
 
+class TestCoarseTileReductionE2E(InductorTestCase):
+    """E2E tests for coarse-tiling a reduction dimension.
+
+    Each test verifies two things:
+      1. With unroll_loops=False: LoopSpec appears in generated source.
+      2. Numerical correctness via compare_with_cpu (uses default config,
+         which has unroll_loops=True).
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_tiled_reduction_sum_loopspec(self):
+        """x.sum(dim=-1) tiled over the reduction dim emits LoopSpec."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 64, 128
+        x = torch.randn(B, D, dtype=torch.float16) * 0.1
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"D": 4}):
+                return x.sum(dim=-1)
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "D"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        self.assertIn("LoopSpec(", source_codes[0])
+        self.assertIn("sympify('4')", source_codes[0])
+
+    def test_hint_tiled_reduction_sum_correct(self):
+        """x.sum(dim=-1) tiled over D produces correct results."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 64, 128
+        x = torch.randn(B, D, dtype=torch.float16) * 0.1
+
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+
+        def fn(x):
+            _name_tensor_dims(x, ["B", "D"])
+            with spyre_hint(num_tiles_per_dim={"D": 4}):
+                return x.sum(dim=-1)
+
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
+
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_tiled_reduction_matmul_loopspec(self):
+        """torch.matmul tiled over K emits LoopSpec."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 64, 128, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["M", "K"])
+            _name_tensor_dims(b, ["K", "N"])
+            with spyre_hint(num_tiles_per_dim={"K": 4}):
+                return a @ b
+
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        self.assertIn("LoopSpec(", source_codes[0])
+        self.assertIn("sympify('4')", source_codes[0])
+
+    def test_hint_tiled_reduction_matmul_correct(self):
+        """torch.matmul tiled over K produces correct results."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 64, 128, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["M", "K"])
+            _name_tensor_dims(b, ["K", "N"])
+            with spyre_hint(num_tiles_per_dim={"K": 4}):
+                return a @ b
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
+
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_tiled_reduction_max_loopspec(self):
+        """x.amax(dim=-1) tiled over the reduction dim emits LoopSpec."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 64, 128
+        x = torch.randn(B, D, dtype=torch.float16)
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"D": 4}):
+                return x.amax(dim=-1)
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "D"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        self.assertIn("LoopSpec(", source_codes[0])
+
+    def test_hint_tiled_reduction_max_correct(self):
+        """x.amax(dim=-1) tiled over D produces correct results."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 64, 128
+        x = torch.randn(B, D, dtype=torch.float16)
+
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+
+        def fn(x):
+            _name_tensor_dims(x, ["B", "D"])
+            with spyre_hint(num_tiles_per_dim={"D": 4}):
+                return x.amax(dim=-1)
+
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
+
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_tiled_reduction_min_loopspec(self):
+        """x.amin(dim=-1) tiled over the reduction dim emits LoopSpec."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 64, 128
+        x = torch.randn(B, D, dtype=torch.float16)
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"D": 4}):
+                return x.amin(dim=-1)
+
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["B", "D"])
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        self.assertIn("LoopSpec(", source_codes[0])
+
+    def test_hint_tiled_reduction_min_correct(self):
+        """x.amin(dim=-1) tiled over D produces correct results."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, D = 64, 128
+        x = torch.randn(B, D, dtype=torch.float16)
+
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+
+        def fn(x):
+            _name_tensor_dims(x, ["B", "D"])
+            with spyre_hint(num_tiles_per_dim={"D": 4}):
+                return x.amin(dim=-1)
+
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
+
+
 if __name__ == "__main__":
     unittest.main()
