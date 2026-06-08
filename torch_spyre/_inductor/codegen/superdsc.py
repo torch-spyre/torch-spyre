@@ -568,8 +568,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # SDSC requires at least one outer spatial dim; inject a virtual mb=1 row
-    # for 1-D dtype ops that have only the stick dim.
+    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
+    # require at least one outer spatial dim beyond the stick; inject a
+    # virtual mb=1 row when the op's tensor has only the stick dim.
     mb_sym: Symbol | None = None
     if (
         DtypeOpTable.is_dtype_op(op_spec.op)
