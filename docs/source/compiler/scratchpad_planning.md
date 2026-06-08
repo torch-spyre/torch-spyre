@@ -3,6 +3,20 @@
 Where LX scratchpad planning sits in torch-spyre today, and what we are
 working on next.
 
+:::{admonition} Status
+:class: note
+
+Scratchpad planning runs by default. The pass is gated by `lx_planning`,
+which has defaulted to `1` since [#2459](https://github.com/torch-spyre/torch-spyre/pull/2459).
+The greedy solver (`config.layout_solver = "greedy"`) is the default.
+First-fit and best-fit are available as opt-ins.
+
+Co-optimization with work distribution is opt-in.
+`config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
+defaults to off. The proof-of-concept handles only single-output-dim
+flips today.
+:::
+
 **Quick navigation:**
 
 - [Hardware context](#hardware-context)
@@ -108,26 +122,34 @@ extra HBM round-trips.
 
 ## Pipeline position
 
-Scratchpad planning runs as the last pass in `CustomPreSchedulingPasses`:
+Scratchpad planning runs at the end of `CustomPreSchedulingPasses`,
+after work division has stamped per-op core splits:
 
 ```
-1. deadcode_elimination
-2. propagate_spyre_tensor_layouts       # assign FixedTiledLayout
-3. optimize_restickify_locations
-4. finalize_layouts
-5. insert_restickify
-6. span_reduction                       # work division pass 1 (mandatory)
-7. work_distribution                    # work division pass 2 (optional)
-8. scratchpad_planning                  # ← THIS PASS
+deadcode_elimination
+propagate_spyre_tensor_layouts        # assign FixedTiledLayout
+optimize_restickify_locations
+finalize_layouts
+insert_restickify
+insert_bmm_padding
+dedup_and_promote_constants
+chunk_large_tensors                   # conditional on config.chunk_large_tensors
+propagate_named_dims                  # named-dimension metadata
+assign_dim_hints
+coarse_tile                           # runs when hints produce groups
+span_reduction                        # work-division: enforce 256 MB span
+cost_model_matmul_division            # work-division: matmul cost model
+work_distribution                     # work-division: default distributor
+scratchpad_planning                   # ← THIS PASS, gated by config.lx_planning
 ```
 
 Two ordering constraints fix this slot:
 
-- **Work division must run first.** Spad opt needs `op_it_space_splits`
-  to compute per-core buffer sizes. Work division also decides whether
-  adjacent ops have compatible core splits; incompatible splits trigger
-  `core_div_mismatch` and disqualify shared buffers from LX (see
-  [Current limitations](#current-limitations)).
+- **Work division must run first.** Scratchpad planning needs
+  `op_it_space_splits` to compute per-core buffer sizes. Work division
+  also decides whether adjacent ops have compatible core splits.
+  Incompatible splits trigger `core_div_mismatch` and disqualify shared
+  buffers from LX (see [Current limitations](#current-limitations)).
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
 
@@ -471,11 +493,11 @@ Three suites cover the planner:
 - `tests/inductor/test_inductor_ops_lx_planning.py`: runs the full
   Inductor op suite under `LX_PLANNING=1` to catch regressions.
 
-The auto-generated coverage suite tracked in the
-[scratchpad workshop](https://github.com/torch-spyre/torch-spyre/issues/2062)
-fans out per-op tests by composing each supported op with simple
-reduction or pointwise tails. It surfaces scratchpad-planning bugs that
-no hand-written test would catch.
+An auto-generated coverage suite expands op coverage beyond the
+hand-written patterns above. It composes each supported op with simple
+reduction or pointwise tails, so every supported op is exercised on
+the planner without a hand-written test. The suite catches planning
+bugs that the hand-written cases miss.
 
 ## Related documents
 
