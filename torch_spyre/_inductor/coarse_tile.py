@@ -356,9 +356,9 @@ def _propagate_tiled_op(
     operations: list[Operation],
 ) -> None:
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
+    loop_info = getattr(op, "loop_info", None)
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
-        loop_info = getattr(op, "loop_info", None)
         has_tiled_reduction = loop_info is not None and any(
             dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
         )
@@ -366,7 +366,6 @@ def _propagate_tiled_op(
             _propagate_tiled_reduction_op(op, operations)
             return
 
-    loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return
     loop_group_id = loop_info.loop_group_id
@@ -794,8 +793,13 @@ def _propagate_tiled_reduction_op(
     # Mark tiled op's output as per-tile scratch (no address advance).
     from .ir import FixedTiledLayout
 
-    if isinstance(op.layout, FixedTiledLayout):
-        op.layout.per_tile_fixed = True
+    if not isinstance(op.layout, FixedTiledLayout):
+        raise RuntimeError(
+            f"coarse_tile: tiled reduction op {op.get_name()!r} has layout "
+            f"{type(op.layout).__name__}, expected FixedTiledLayout; "
+            "cannot mark per_tile_fixed"
+        )
+    op.layout.per_tile_fixed = True
 
     # Patch consumers.
     buf_name = op.get_name()
