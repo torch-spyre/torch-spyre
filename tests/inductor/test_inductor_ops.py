@@ -2641,6 +2641,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 2, cached_randn((3, 3, 192), dtype=torch.float16)),
             },
         },
+        ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
+            "param_sets": {
+                "5d": (cached_randn((2, 3, 4, 5, 192), dtype=torch.float16),),
+            },
+        },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
                 "prefill_bs1": (
@@ -5110,6 +5115,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return op(dim, x[:, start:end])
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
+
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_slice_synthetic_dims_cpu(self, x):
+        def fn(x):
+            return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
