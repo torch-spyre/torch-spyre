@@ -124,6 +124,31 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     return result
 
 
+def compute_max_size(expr: Union[Expr, int]) -> int:
+    """Return the maximum value a symbolic size expression can take.
+
+    Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
+    created with an explicit ``max=`` constraint using mark_dynamic API). Falls
+    back to ``size_hint`` when no finite upper bound exists.
+
+    Needed for dynamic shape support.
+
+    # TODO: To be used in size_hint call-sites in superdsc.py and work_division.py
+    #       to get the maxSize in SDSC and work planning respectively
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return int(expr)
+    shape_env = V.graph.sizevars.shape_env
+    vr = shape_env.bound_sympy(expr)
+    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
+        return int(vr.upper)
+    return V.graph.sizevars.size_hint(expr)
+
+
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
