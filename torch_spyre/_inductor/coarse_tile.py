@@ -741,7 +741,7 @@ def _stamp_group(
     _validate_contiguous(ops, op_to_position, group_id)
 
     nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
-    counts = [lvl[1] for lvl in levels]
+    counts = [count for _, count, _ in levels]
 
     for op in ops:
         if not isinstance(op, ComputedBuffer):
@@ -780,7 +780,10 @@ def _stamp_group(
                 rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
                 op_tiled_dims.append([])
                 op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
-                _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
+                if isinstance(op.data, Reduction):
+                    _divide_reduction_ranges(
+                        op, count, [rpos] if rpos is not None else []
+                    )
             else:
                 opos = hint_id_to_ranges_pos.get(hint_id)
                 op_tiled_dims.append([opos] if opos is not None else [])

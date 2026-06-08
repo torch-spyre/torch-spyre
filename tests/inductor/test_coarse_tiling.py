@@ -2815,6 +2815,61 @@ class TestStampGroupReductionDim(unittest.TestCase):
         # output ranges untouched
         self.assertEqual(op.data.ranges[0], Integer(128))
 
+    def test_pointwise_op_in_reduction_level_does_not_crash(self):
+        """A Pointwise op co-tiled with a reduction-dim hint must not crash."""
+        from torch_spyre._inductor.coarse_tile import _stamp_group
+        from torch_spyre._inductor.propagate_hints import DimHint
+        from torch._inductor.codegen.common import SymT
+        import torch
+        from torch._inductor.ir import Pointwise, Reduction, ReductionHint
+
+        # Build a real Reduction op to get the reduction symbol
+        real_reduction = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx, ridx: None,
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        rindex = real_reduction._index(real_reduction.reduction_ranges, SymT.R0_INDEX)
+        red_sym = next(iter(rindex[0].free_symbols))
+
+        hint = DimHint(
+            dim_names=["K"],
+            split_count=4,
+            loop_var=red_sym,
+            is_reduction=True,
+            hint_id=0,
+        )
+
+        # Build a Pointwise op (not Reduction) — simulates a relu co-tiled with sum
+        pointwise_data = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda index: None,
+            ranges=[Integer(128)],
+        )
+        from torch._inductor.ir import ComputedBuffer
+
+        pw_op = MagicMock(spec=ComputedBuffer)
+        pw_op.data = pointwise_data
+        pw_op.get_name.return_value = "pw0"
+        pw_op.get_operation_name.return_value = "pw0"
+        pw_op.dim_hints = [hint]
+        layout_mock = MagicMock()
+        layout_mock.size = [Integer(128)]
+        pw_op.layout = layout_mock
+
+        # Must not crash — Pointwise op is loop-invariant on the reduction dim
+        with patch("torch_spyre._inductor.coarse_tile.op_out_coords", return_value=[]):
+            _stamp_group([pw_op], (0,), [(0, Integer(4), True)], {"pw0": 0})
+
+        self.assertEqual(pw_op.loop_info.loop_tiled_dims, [[]])
+        self.assertEqual(pw_op.loop_info.loop_tiled_reduction_dims, [[]])
+
 
 if __name__ == "__main__":
     unittest.main()
