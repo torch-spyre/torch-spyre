@@ -458,10 +458,15 @@ def align_tensors(
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
 
     new_vars: list[sympy.Symbol] = []
+    reused_new_vars: list[sympy.Symbol] = []
 
     def create_var():
-        var = sympy.symbols(f"z{len(new_vars)}")
-        new_vars.append(var)
+        if len(reused_new_vars) < len(new_vars):
+            var = new_vars[len(reused_new_vars)]
+        else:
+            var = sympy.symbols(f"z{len(new_vars)}")
+            new_vars.append(var)
+        reused_new_vars.append(var)
         return var
 
     all_terms = []  # terms for each tensor
@@ -469,12 +474,15 @@ def align_tensors(
     stick_size = []  # stick size for each tensor
 
     for tensor in tensors:
+        reused_new_vars = []  # restart from z0 for each tensor
         terms = normalize_coordinates(
             var_ranges, tensor["size"], tensor["coordinates"], create_var
         )
         stick_dim.append(terms[-1].var)
         stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
+
+    reused_new_vars = new_vars  # do not reuse vars after this point
 
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
