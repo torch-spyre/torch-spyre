@@ -685,8 +685,9 @@ class _OOTPlatformMarkerPatcher:
     replaced with ``_`` so the marker is always a valid Python identifier.
     Examples:
         x86_64  --> platform__x86_64
-        ppc64le --> platform__ppc64le
+        ppc64le --> platform__ppc64le (Power PC)
         aarch64 --> platform__aarch64
+        s390x    --> platform__s390x (IBM Z)
     """
 
     def __init__(self, test: object) -> None:
