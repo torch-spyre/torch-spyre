@@ -482,7 +482,7 @@ def align_tensors(
         stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
 
-    reused_new_vars = new_vars  # do not reuse vars after this point
+    reused_new_vars = new_vars.copy()  # do not reuse vars after this point
 
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
