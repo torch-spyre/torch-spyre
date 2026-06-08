@@ -424,7 +424,7 @@ class SpyreKernel(Kernel[CSEVariable]):
     ) -> OpSpec:
         for arg in args:
             if not (
-                op in [IDENTITY_OP, RESTICKIFY_OP]
+                op == IDENTITY_OP
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
