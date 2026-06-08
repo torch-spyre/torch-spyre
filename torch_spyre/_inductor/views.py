@@ -307,7 +307,7 @@ def normalize_coordinates(
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     size: Sequence[sympy.Expr],
     coordinates: Sequence[sympy.Expr],
-    create_var_fn: Callable[[], sympy.Symbol],
+    synthetic_var_fn: Callable[[], sympy.Symbol],
 ) -> list[Term]:
     """
     Normalize coordinate expressions obtained from compute_coordinates.
@@ -335,7 +335,7 @@ def normalize_coordinates(
             if dim_size > 1 and dim_idx != len(size) - 1:
                 # A non-stick dimension with no variables but size > 1 indicates an elided
                 # dimension with offset/gap. Create a new variable to restore this dimension.
-                var = create_var_fn()
+                var = synthetic_var_fn()
                 var_ranges[var] = 1
                 num = den = mod = sympy.S.One
                 terms.append(Term(num, den, var, mod, dim_size, offset))
@@ -458,15 +458,18 @@ def align_tensors(
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
 
     new_vars: list[sympy.Symbol] = []
-    reused_new_vars: list[sympy.Symbol] = []
+    _synthetic_var_idx: int = 0
 
-    def create_var():
-        if len(reused_new_vars) < len(new_vars):
-            var = new_vars[len(reused_new_vars)]
+    # return a synthetic variable, creating a new variable unless _synthetic_var_idx has been reset
+    # there is no need for distinct synthetic variables for dimensions of size 1 across tensors
+    def synthetic_var():
+        nonlocal _synthetic_var_idx
+        if _synthetic_var_idx < len(new_vars):
+            var = new_vars[_synthetic_var_idx]
         else:
             var = sympy.symbols(f"z{len(new_vars)}")
             new_vars.append(var)
-        reused_new_vars.append(var)
+        _synthetic_var_idx += 1
         return var
 
     all_terms = []  # terms for each tensor
@@ -474,15 +477,15 @@ def align_tensors(
     stick_size = []  # stick size for each tensor
 
     for tensor in tensors:
-        reused_new_vars = []  # restart from z0 for each tensor
+        _synthetic_var_idx = 0  # reuse synthetic_var across tensors
         terms = normalize_coordinates(
-            var_ranges, tensor["size"], tensor["coordinates"], create_var
+            var_ranges, tensor["size"], tensor["coordinates"], synthetic_var
         )
         stick_dim.append(terms[-1].var)
         stick_size.append(terms[-1].dim_size)
         all_terms.append(terms)
 
-    reused_new_vars = new_vars.copy()  # do not reuse vars after this point
+    _synthetic_var_idx = len(new_vars)  # do not reuse synthetic vars after this point
 
     # for each variable collect bounds (den and mod) for all terms involving variable
     # exclude the sick_size resulting from tiling the stick dimension
@@ -526,7 +529,7 @@ def align_tensors(
             new_var_ranges[var] = split[1] // split[0]
             remap[var] = [var]  # reuse variable name for 1st segment
             for i in range(1, len(split) - 1):
-                new_var = create_var()  # create new variable
+                new_var = synthetic_var()  # create new variable
                 new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
 
