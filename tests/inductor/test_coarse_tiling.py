@@ -663,7 +663,7 @@ class TestCoarseTile(unittest.TestCase):
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile(
             _graph([op_extern, op_computed]),
-            [([op_extern, op_computed], [(0, Integer(2))])],
+            [([op_extern, op_computed], [(0, Integer(2), False)])],
         )
         self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
@@ -673,7 +673,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(_graph([op]), [([op], [(0, k)])])
+        coarse_tile(_graph([op]), [([op], [(0, k, False)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -685,7 +685,7 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
+            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4), False)])])
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -694,11 +694,11 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
+            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2), False)])])
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(hint_id, K1), ...] works."""
+    """Verify that the nested group format [(hint_id, K1, is_reduction), ...] works."""
 
     def setUp(self):
         self._patch = patch(
@@ -713,7 +713,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])])
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -721,14 +721,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4), False), (2, Integer(8), False)])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -742,8 +742,8 @@ class TestCoarseTileNested(unittest.TestCase):
         coarse_tile(
             _graph([op0, op1]),
             [
-                ([op0], [(1, Integer(4))]),
-                ([op1], [(2, Integer(4)), (3, Integer(2))]),
+                ([op0], [(1, Integer(4), False)]),
+                ([op1], [(2, Integer(4), False), (3, Integer(2), False)]),
             ],
         )
         self.assertEqual(op0.loop_info.loop_group_id, (0,))
@@ -760,7 +760,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -2757,6 +2757,63 @@ class TestReductionIdentityValues(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             _reduction_identity_value("welford_reduce", torch.float16)
+
+
+class TestStampGroupReductionDim(unittest.TestCase):
+    """_stamp_group populates loop_tiled_reduction_dims for reduction-dim hints."""
+
+    def test_reduction_dim_hint_populates_loop_tiled_reduction_dims(self):
+        """A hint with is_reduction=True causes loop_tiled_reduction_dims to be [[0]]."""
+        from torch_spyre._inductor.coarse_tile import _stamp_group
+        from torch_spyre._inductor.propagate_hints import DimHint
+        from torch._inductor.codegen.common import SymT
+        import torch
+        from torch._inductor.ir import Reduction, ReductionHint
+
+        ranges = [Integer(128)]
+        reduction_ranges = [Integer(256)]
+        real_data = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx, ridx: None,
+            ranges=ranges,
+            reduction_ranges=reduction_ranges,
+            reduction_type="sum",
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        rindex = real_data._index(real_data.reduction_ranges, SymT.R0_INDEX)
+        red_sym = next(iter(rindex[0].free_symbols))
+
+        hint = DimHint(
+            dim_names=["K"],
+            split_count=4,
+            loop_var=red_sym,
+            is_reduction=True,
+            hint_id=0,
+        )
+
+        from torch._inductor.ir import ComputedBuffer
+
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = real_data
+        op.get_name.return_value = "red0"
+        op.get_operation_name.return_value = "red0"
+        op.dim_hints = [hint]
+        layout_mock = MagicMock()
+        layout_mock.size = list(ranges)
+        op.layout = layout_mock
+        del op.loop_info
+
+        with patch("torch_spyre._inductor.coarse_tile.op_out_coords", return_value=[]):
+            _stamp_group([op], (0,), [(0, Integer(4), True)], {"red0": 0})
+
+        self.assertEqual(op.loop_info.loop_tiled_dims, [[]])
+        self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[0]])
+        # reduction_ranges should be divided: 256 / 4 = 64
+        self.assertEqual(op.data.reduction_ranges[0], Integer(64))
+        # output ranges untouched
+        self.assertEqual(op.data.ranges[0], Integer(128))
 
 
 if __name__ == "__main__":

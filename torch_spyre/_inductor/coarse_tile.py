@@ -34,8 +34,8 @@ Entry point::
     coarse_tile(operations, groups)
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
-``(hint_id, count)`` pairs, outermost first.  Each op resolves its own tiled
-dimension from its ``loop_var`` in ``dim_hints``.
+``(hint_id, count, is_reduction_level)`` triples, outermost first.  Each op
+resolves its own tiled dimension from its ``loop_var`` in ``dim_hints``.
 
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
@@ -94,18 +94,21 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
 
 
 def _hints_levels(ops: list[Operation]) -> list[tuple]:
-    """Build (hint_id, K) level pairs from the first hinted op in the group.
+    """Build (hint_id, K, is_reduction) level triples from the first hinted op.
 
-    All ops in the group share the same hint IDs and split counts — they are
-    inside the same spyre_hint() scopes, so the counts come from the scope
-    definition, not the op.  Any op with a non-None loop_var is representative.
-    Each op reads its own loop_var from dim_hints in _stamp_group.
+    All ops in the group share the same hint IDs and split counts.  Any op
+    with a non-None loop_var is representative.  Each op reads its own
+    loop_var from dim_hints in _stamp_group.
+
+    Returns a list of (hint_id, count, is_reduction_level) triples, outermost
+    first.  Previously this skipped is_reduction hints; it now includes them so
+    that _stamp_group can divide reduction_ranges for reduction-dim tiling.
     """
     for op in ops:
         levels = [
-            (h.hint_id, sympy.Integer(h.split_count))
+            (h.hint_id, sympy.Integer(h.split_count), h.is_reduction)
             for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None and not h.is_reduction
+            if h.loop_var is not None
         ]
         if levels:
             return levels
@@ -165,7 +168,7 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
             op_hints = get_op_hints(spec_op)
             descs = [
                 f"hint_{hint_id}={op_hints[hint_id]}"
-                for hint_id, _ in group_levels
+                for hint_id, *_ in group_levels
                 if hint_id in op_hints
             ]
             group_hint_descs[g_idx] = ", ".join(descs)
@@ -238,7 +241,7 @@ def coarse_tile(
     groups:
         Sequence of ``(ops, levels)`` tuples produced by
         ``hints_to_coarse_tile_groups``.  ``levels`` is a list of
-        ``(hint_id, count)`` pairs, outermost first.
+        ``(hint_id, count, is_reduction_level)`` triples, outermost first.
     """
     operations = graph.operations
     op_to_position: dict[str, int] = {
@@ -727,9 +730,10 @@ def _stamp_group(
 ) -> None:
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
-    ``levels`` is a list of ``(hint_id, count)`` pairs, outermost first.
-    Each op resolves its own tiled dimension from its loop_var in dim_hints.
-    Ops that have no matching dim for a level are loop-invariant at that level.
+    ``levels`` is a list of ``(hint_id, count, is_reduction_level)`` triples,
+    outermost first.  Each op resolves its own tiled dimension from its
+    loop_var in dim_hints.  Ops that have no matching dim for a level are
+    loop-invariant at that level.
     """
     if not ops:
         return
@@ -749,33 +753,55 @@ def _stamp_group(
             continue
 
         op_out = op_out_coords(op)
+
+        # Build lookup: hint_id → output-ranges position (non-reduction dims).
         hint_id_to_ranges_pos: dict[int, int] = {
             h.hint_id: pos
             for h in getattr(op, "dim_hints", [])
             if h.loop_var is not None and not h.is_reduction
             if (pos := _loop_var_to_ranges_pos(op_out, h.loop_var)) is not None
         }
+
+        # Build lookup: hint_id → reduction_ranges position (reduction dims).
+        hint_id_to_reduction_ranges_pos: dict[int, int] = {}
+        if isinstance(op.data, Reduction):
+            hint_id_to_reduction_ranges_pos = {
+                h.hint_id: pos
+                for h in getattr(op, "dim_hints", [])
+                if h.loop_var is not None and h.is_reduction
+                if (pos := _loop_var_to_reduction_ranges_pos(op, h.loop_var))
+                is not None
+            }
+
         op_tiled_dims: list[list[int]] = []
-        for hint_id, count in levels:
-            if (ranges_pos := hint_id_to_ranges_pos.get(hint_id)) is not None:
-                effective = [ranges_pos]
+        op_tiled_reduction_dims: list[list[int]] = []
+        for hint_id, count, is_reduction_level in levels:
+            if is_reduction_level:
+                rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+                op_tiled_dims.append([])
+                op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+                _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
             else:
-                effective = []  # op has no dim for this level — loop-invariant
-            op_tiled_dims.append(effective)
-            _divide_ranges(op, count, effective)
+                opos = hint_id_to_ranges_pos.get(hint_id)
+                op_tiled_dims.append([opos] if opos is not None else [])
+                op_tiled_reduction_dims.append([])
+                _divide_ranges(op, count, [opos] if opos is not None else [])
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
             loop_count=counts,
             loop_tiled_dims=op_tiled_dims,
+            loop_tiled_reduction_dims=op_tiled_reduction_dims,
         )
 
         logger.debug(
-            "coarse_tile: stamped %s loop_group_id=%s loop_count=%s loop_tiled_dims=%s",
+            "coarse_tile: stamped %s loop_group_id=%s loop_count=%s "
+            "loop_tiled_dims=%s loop_tiled_reduction_dims=%s",
             op.get_operation_name(),
             nested_group_id,
             counts,
             op_tiled_dims,
+            op_tiled_reduction_dims,
         )
 
 
