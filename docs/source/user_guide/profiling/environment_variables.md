@@ -22,7 +22,6 @@ Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 | Variable | Effect |
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
-| `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 
 ## Device enumeration
 

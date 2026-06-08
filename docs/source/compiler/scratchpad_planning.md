@@ -118,8 +118,7 @@ Scratchpad planning runs as the last pass in `CustomPreSchedulingPasses`:
 5. insert_restickify
 6. span_reduction                       # work division pass 1 (mandatory)
 7. work_distribution                    # work division pass 2 (optional)
-8. if config.lx_planning:
-       scratchpad_planning              # ← THIS PASS
+8. scratchpad_planning                  # ← THIS PASS
 ```
 
 Two ordering constraints fix this slot:
@@ -131,8 +130,6 @@ Two ordering constraints fix this slot:
   [Current limitations](#current-limitations)).
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
-
-The pass is gated on `LX_PLANNING=1`. Disabled by default; experimental.
 
 ## Optimizations on softmax
 

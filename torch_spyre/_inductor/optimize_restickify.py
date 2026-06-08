@@ -28,7 +28,6 @@ from .logging_utils import get_inductor_logger
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
     InputBuffer,
-    MutationLayoutSHOULDREMOVE,
     StorageBox,
     TensorBox,
 )
@@ -498,8 +497,7 @@ def beam_global_min_cost(operations: list) -> None:
     best = frontier.best()
     for name, stl in zip(frontier.buf_names, best.assignments):
         op = V.graph.get_buffer(name)
-        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            op.committed_stl = stl
+        op.committed_stl = stl
 
 
 def optimize_restickify_locations(operations: list) -> None:

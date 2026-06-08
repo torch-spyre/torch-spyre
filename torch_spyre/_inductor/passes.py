@@ -35,8 +35,8 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
-    hints_to_coarse_tile_groups,
 )
+from .coarse_tile import hints_to_coarse_tile_groups
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -89,6 +89,10 @@ def _format_operations(operations: list[Operation]) -> str:
                     splits, write_index, read_index, it_space
                 )
                 buf.write(f"\n  op_it_space_splits={readable_splits}")
+            if dim_hints := getattr(op, "dim_hints", None):
+                buf.write(f"\n  dim_hints={dim_hints}")
+            if loop_info := getattr(op, "loop_info", None):
+                buf.write(f"\n  loop_info={loop_info}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
@@ -213,7 +217,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
 
     def get_passes(self):
         # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-        # coarse_tiling=False because no nodes carry loop_group_id attributes.
+        # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
         # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
         # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
         # False), so loop groups survive Inductor fusion intact.
@@ -254,19 +258,28 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
+
+        # Tensor Layout Assignment
         propagate_spyre_tensor_layouts(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
         insert_restickify(operations)
         insert_bmm_padding(operations)
+
         dedup_and_promote_constants(operations)
+
+        # Working Set Reduction
         if config.chunk_large_tensors:
+            # TODO: chunk_large_tensors needs to be integrated with hint-based working set reduction
             chunk_large_tensors(operations)
+
         propagate_named_dims(operations)
         assign_dim_hints(operations)
-        if config.coarse_tiling:
-            groups = hints_to_coarse_tile_groups(operations)
+        groups = hints_to_coarse_tile_groups(operations)
+        if groups:
             coarse_tile(operations, groups=groups)
+
+        # Core Division and Scratchpad Allocation
         span_reduction(operations)
         cost_model_ops = cost_model_matmul_division(operations)
         work_distribution(operations, cost_model_ops)

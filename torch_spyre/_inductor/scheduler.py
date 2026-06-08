@@ -67,8 +67,11 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     ir_op = sched_node.node
     if ir_op is None:
         return []
-    raw = getattr(ir_op, "loop_tiled_dims", None)
-    if raw is None or not raw:
+    loop_info = getattr(ir_op, "loop_info", None)
+    if loop_info is None:
+        return []
+    raw = loop_info.loop_tiled_dims
+    if not raw:
         return []
     dims_per_level: list[list[int]] = raw
     if depth >= len(dims_per_level):
@@ -99,8 +102,8 @@ class CountedLoopSchedulerNode(FusedSchedulerNode):
     """A group of SchedulerNodes to be executed inside a counted outer loop.
 
     Produced by build_loop_scheduler_nodes from SchedulerNodes whose
-    underlying ir.Operation has been stamped with loop_group_id and
-    loop_count attributes by the coarse-tiling IR pass.
+    underlying ir.Operation has been stamped with a ``loop_info``
+    (``CoarseTileInfo``) attribute by the coarse-tiling IR pass.
 
     loop_count is the trip count of the loop that directly contains this
     group's operations.  For nested loops, the snodes may themselves
@@ -145,9 +148,9 @@ def _loop_group_id(node: BaseSchedulerNode):
     """Return the loop_group_id of the ir.Operation inside node, or None."""
     for snode in node.get_nodes():
         if isinstance(snode, SchedulerNode) and snode.node is not None:
-            gid = getattr(snode.node, "loop_group_id", None)
-            if gid is not None:
-                return gid
+            loop_info = getattr(snode.node, "loop_info", None)
+            if loop_info is not None:
+                return loop_info.loop_group_id
     return None
 
 
@@ -164,10 +167,10 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     """
     for snode in node.get_nodes():
         if isinstance(snode, SchedulerNode) and snode.node is not None:
-            raw = getattr(snode.node, "loop_count", None)
-            if raw is not None:
-                counts: list = raw if isinstance(raw, list) else [raw]
-                gid = getattr(snode.node, "loop_group_id", ())
+            loop_info = getattr(snode.node, "loop_info", None)
+            if loop_info is not None:
+                counts: list = loop_info.loop_count
+                gid = loop_info.loop_group_id
                 # coarse_tile stamps one count per nesting level, so
                 # len(counts) == len(gid) always holds.
                 assert len(counts) == len(gid), (
@@ -231,8 +234,8 @@ def build_loop_scheduler_nodes(
 ) -> list[BaseSchedulerNode]:
     """Pre-fusion pass: wrap loop-group SchedulerNodes into CountedLoopSchedulerNodes.
 
-    Reads loop_group_id and loop_count attributes stamped on ir.Operation
-    objects by the coarse-tiling IR pass.  Nodes without these attributes
+    Reads the ``loop_info`` (``CoarseTileInfo``) attribute stamped on
+    ir.Operation objects by the coarse-tiling IR pass.  Nodes without these attributes
     are passed through unchanged.
 
     loop_group_id is a tuple of ints encoding the nesting path, e.g.
