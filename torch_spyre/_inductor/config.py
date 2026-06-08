@@ -40,21 +40,16 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
-# constants) in bundle.mlir and resolved via affine.apply for tiled loops.
-# Requires backend compiler support for the sdscbundle symbol table, which is
-# still under development.
-bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
-
-# When True, the generated func.func @sdsc_bundle takes one
-# !sdscbundle.input_arg<index> parameter per tensor argument and extracts
-# each to a local SSA value, rather than emitting arith.constant offsets.
-# Requires bundle_hbm_symbols=True to have any effect.
+# When False (default), HBM tensor addresses are baked as concrete integers
+# into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
+# When True, addresses are emitted as runtime symbols with
+# !sdscbundle.input_arg<index> parameters, input_arg_extract ops, and
+# affine.apply indirection for tiled loops.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
-# (used with bundle_hbm_symbols=True for the scf.for / affine.apply path).
+# for the scf.for / affine.apply path.
 unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
