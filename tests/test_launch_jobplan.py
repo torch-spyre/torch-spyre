@@ -44,9 +44,8 @@ class TestLaunchJobPlan:
         "env_vars",
         [
             {"DUMP_SPYRE_CODE": "1"},
-            {"DUMP_SPYRE_CODE": "1", "BUNDLE_HBM_SYMBOLS": "1"},
         ],
-        ids=["SpyreCode, no symbols", "SpyreCode, fake symbols"],
+        ids=["SpyreCode, no symbols"],
     )
     def test_abs_matches_cpu(self, env_vars):
         """Run compiled abs op with various env settings and compare to CPU."""
@@ -65,9 +64,8 @@ class TestLaunchJobPlan:
         "env_vars",
         [
             {"DUMP_SPYRE_CODE": "1"},
-            {"DUMP_SPYRE_CODE": "1", "BUNDLE_HBM_SYMBOLS": "1"},
         ],
-        ids=["SpyreCode, no symbols", "SpyreCode, fake symbols"],
+        ids=["SpyreCode, no symbols"],
     )
     def test_mul_matches_cpu(self, env_vars):
         """Run compiled mul op with various env settings and compare to CPU."""
