@@ -52,6 +52,9 @@ _enabled = False
 
 
 def reset():
+    # Full teardown — do NOT call between propagate_named_dims() and
+    # assign_dim_hints(), as assign_dim_hints() still needs _named_dims.
+    # The two passes split cleanup across their own finally blocks.
     global _enabled
     _named_dims.clear()
     _named_tensor_dims.clear()
@@ -425,22 +428,7 @@ def propagate_named_dims(
         _enabled = False
 
 
-def assign_dim_hints(graph: GraphLowering) -> None:
-    """Combine spyre_hint scope annotations with propagated named dimensions.
-
-    Reads the hint scopes (from spyre_hint() context managers in user code,
-    attached to FX nodes via meta["custom"]) and matches hinted dimension names
-    against the named loop variables on each op.  The named loop variables come
-    from propagate_named_dims(), which propagates name_tensor_dims() annotations
-    through the op graph — that pass must run before this one.
-
-    Produces op.dim_hints: a flat list of DimHint, one per hinted dimension,
-    ordered outermost hint scope first.  Consumed by hints_to_coarse_tile_groups
-    to form coarse tiling groups.
-
-    Deletes op._dim_prop_info when done — those fields are only needed here.
-    """
-    operations = graph.operations
+def _assign_dim_hints_impl(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -526,4 +514,23 @@ def assign_dim_hints(graph: GraphLowering) -> None:
                         f"  loop_var={h.loop_var}{reduction_tag}"
                     )
 
-    _named_dims.clear()
+
+def assign_dim_hints(graph: GraphLowering) -> None:
+    """Combine spyre_hint scope annotations with propagated named dimensions.
+
+    Reads the hint scopes (from spyre_hint() context managers in user code,
+    attached to FX nodes via meta["custom"]) and matches hinted dimension names
+    against the named loop variables on each op.  The named loop variables come
+    from propagate_named_dims(), which propagates name_tensor_dims() annotations
+    through the op graph — that pass must run before this one.
+
+    Produces op.dim_hints: a flat list of DimHint, one per hinted dimension,
+    ordered outermost hint scope first.  Consumed by hints_to_coarse_tile_groups
+    to form coarse tiling groups.
+
+    Deletes op._dim_prop_info when done — those fields are only needed here.
+    """
+    try:
+        _assign_dim_hints_impl(graph.operations)
+    finally:
+        _named_dims.clear()
