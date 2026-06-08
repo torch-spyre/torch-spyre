@@ -2474,5 +2474,45 @@ class TestSymbolKind(unittest.TestCase):
         self.assertNotIn("input_arg_extract", op1_operand)
 
 
+class TestCoarseTileInfoReductionField(unittest.TestCase):
+    """CoarseTileInfo carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
+
+    def test_field_present_and_defaults_to_empty(self):
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        self.assertEqual(info.loop_tiled_reduction_dims, [])
+
+    def test_field_can_be_set(self):
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[0]],
+        )
+        self.assertEqual(info.loop_tiled_reduction_dims, [[0]])
+
+    def test_nested_parallel_shape(self):
+        """For a two-level nest, both fields have two sub-lists."""
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+            loop_tiled_reduction_dims=[[], [0]],
+        )
+        self.assertEqual(len(info.loop_tiled_dims), 2)
+        self.assertEqual(len(info.loop_tiled_reduction_dims), 2)
+        self.assertEqual(info.loop_tiled_reduction_dims[0], [])
+        self.assertEqual(info.loop_tiled_reduction_dims[1], [0])
+
+
 if __name__ == "__main__":
     unittest.main()
