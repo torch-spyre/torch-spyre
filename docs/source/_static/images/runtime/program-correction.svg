@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .step    { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.5; }
+      .step-host { fill: #fff7e0; stroke: #b88a00; stroke-width: 1.5; }
+      .buffer  { fill: #fdf3e0; stroke: #b06600; stroke-width: 1.2; stroke-dasharray: 4 3; }
+      .label   { fill: #222; }
+      .caption { fill: #555; font-size: 11px; font-style: italic; }
+      .arrow   { stroke: #444; stroke-width: 1.5; fill: none; }
+      .arrow-buf { stroke: #b06600; stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+      .title   { fill: #222; font-size: 16px; font-weight: 700; }
+      .name    { font-weight: 600; }
+      .phase   { fill: #444; font-weight: 600; font-size: 11px; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="380" y="32" text-anchor="middle" class="title">Program correction sequence on a stream</text>
+  <text x="380" y="52" text-anchor="middle" class="caption">Three ordered RuntimeOperations resolve symbolic addresses before the kernel runs.</text>
+
+  <!-- Phase labels -->
+  <text class="phase" x="120" y="92" text-anchor="middle">CPU side</text>
+  <text class="phase" x="380" y="92" text-anchor="middle">PCIe DMA</text>
+  <text class="phase" x="640" y="92" text-anchor="middle">Device side</text>
+
+  <!-- Stream timeline -->
+  <line x1="40" y1="200" x2="720" y2="200" stroke="#888" stroke-width="1.5"/>
+  <text x="40" y="220" class="caption">stream FIFO order →</text>
+
+  <!-- Step 1: HostCompute -->
+  <rect class="step-host" x="40" y="110" width="200" height="80" rx="8"/>
+  <text class="label name" x="140" y="140" text-anchor="middle">JobPlanStepHostCompute</text>
+  <text class="caption" x="140" y="160" text-anchor="middle">CPU callback computes</text>
+  <text class="caption" x="140" y="175" text-anchor="middle">corrections from compiler Hcm</text>
+
+  <!-- Step 2: H2D -->
+  <rect class="step" x="280" y="110" width="200" height="80" rx="8"/>
+  <text class="label name" x="380" y="140" text-anchor="middle">JobPlanStepH2D</text>
+  <text class="caption" x="380" y="160" text-anchor="middle">DMAs the correction blob</text>
+  <text class="caption" x="380" y="175" text-anchor="middle">to the program region</text>
+
+  <!-- Step 3: Compute -->
+  <rect class="step" x="520" y="110" width="200" height="80" rx="8"/>
+  <text class="label name" x="620" y="140" text-anchor="middle">JobPlanStepCompute</text>
+  <text class="caption" x="620" y="160" text-anchor="middle">device patches symbolic</text>
+  <text class="caption" x="620" y="175" text-anchor="middle">addresses, then executes</text>
+
+  <!-- Arrows between steps -->
+  <path class="arrow" d="M 240 150 L 280 150" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 480 150 L 520 150" marker-end="url(#arr)"/>
+
+  <!-- Shared buffer annotation -->
+  <rect class="buffer" x="100" y="250" width="320" height="50" rx="6"/>
+  <text class="label" x="260" y="270" text-anchor="middle" font-weight="600">Pinned host buffer</text>
+  <text class="caption" x="260" y="288" text-anchor="middle">allocated once during prepareKernel; reused across iterations</text>
+
+  <!-- Buffer arrows: HostCompute writes, H2D reads -->
+  <path class="arrow-buf" d="M 140 190 L 140 250"/>
+  <text class="caption" fill="#b06600" x="148" y="225" text-anchor="start">writes</text>
+  <path class="arrow-buf" d="M 380 250 L 380 190"/>
+  <text class="caption" fill="#b06600" x="388" y="225" text-anchor="start">reads</text>
+
+  <!-- Bottom note -->
+  <text x="380" y="340" text-anchor="middle" class="caption">FIFO ordering guarantees H2D consumes the buffer before the next iteration's</text>
+  <text x="380" y="356" text-anchor="middle" class="caption">HostCompute overwrites it, so the same buffer cycles through every tile iteration.</text>
+</svg>

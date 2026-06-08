@@ -180,12 +180,13 @@ manifest plus binary blobs produced by the deeptools backend. `prepareKernel`
 in `csrc/prepare_kernel.{h,cpp}` translates that directory into a `JobPlan`,
 the runtime's executable container for a single launch.
 
-```
-                  ┌──────────────────┐
-SpyreCode dir ──▶ │  prepareKernel   │ ──▶ JobPlan ──▶ SpyreStream::launch
-                  └──────────────────┘
-                    csrc/prepare_kernel
-```
+:::{figure} ../_static/images/runtime/spyrecode-flow.svg
+:alt: SpyreCode directory flowing through prepareKernel into a JobPlan, then queued on a stream by SpyreStream::launch
+:width: 90%
+:align: center
+
+The SpyreCode directory is the compile-time handoff. `prepareKernel` translates it into a `JobPlan` of ordered `JobPlanStep` instances, and `SpyreStream::launch` queues the corresponding `RuntimeOperation`s on the stream in FIFO order.
+:::
 
 ### JobPlan structure
 
@@ -212,6 +213,14 @@ sequence safe: each step completes before the next one starts.
 Compiled binaries arrive with symbolic placeholders for tensor addresses that
 are only known at launch (allocator output, padding, batch shape). The runtime
 patches them in three ordered steps:
+
+:::{figure} ../_static/images/runtime/program-correction.svg
+:alt: HostCompute step writes a correction buffer, H2D copies it to the device, Compute runs the patched kernel
+:width: 90%
+:align: center
+
+Three ordered `RuntimeOperation`s on a stream: a CPU callback computes the corrections into a pinned host buffer, an H2D step DMAs the buffer into the program region, and the kernel runs after reading the corrections. The same pinned buffer cycles across iterations.
+:::
 
 1. **`JobPlanStepHostCompute`** runs on the host. It calls into deeptools'
    `processComputeOnHostCommand` with compiler-supplied metadata (`Hcm`) and
@@ -257,6 +266,14 @@ dist.broadcast(x, src=0)
 Internally, `SpyreCCLBackend` forwards each tensor to the closed-source
 `spyre_comms` library, which handles the wire-level transport between cards.
 The torch-spyre adapter is open. The transport library is not.
+
+:::{figure} ../_static/images/runtime/distributed-stack.svg
+:alt: User code calling dist.broadcast flows through torch.distributed, SpyreCCLBackend, and the closed-source spyre_comms library to reach the device
+:width: 70%
+:align: center
+
+The layers between user code and the device. Green boxes are in-tree (Apache-2.0). The transport library is closed source.
+:::
 
 ### Supported collectives
 
