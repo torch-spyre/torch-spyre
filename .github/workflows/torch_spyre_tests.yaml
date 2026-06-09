@@ -8,6 +8,28 @@ on:
     branches: [main]
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to check out and test
+        required: false
+        type: string
+        default: ''
+      rpm_location:
+        description: The Artifactory location where to download the RPM from
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        description: A space separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ''
+      build_torch_spyre:
+        description: Whether to re-build torch-spyre after installing the RPM
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -44,14 +66,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # On pull_request events, fetch the full list of changed files via
-          # the GitHub API. On push to main (e.g. post-merge), assume tests
-          # should always run since we don't have a PR number to query.
+          # the GitHub API. On push to main/tag or workflow_dispatch, assume
+          # tests should always run since we don't have a PR to query.
           if [[ -n "${{ github.event.pull_request.number }}" ]]; then
             FILES=$(gh pr view ${{ github.event.pull_request.number }} \
               --repo ${{ github.repository }} \
               --json files --jq '.files[].path')
           else
-            # push to main or tag -- always run tests
+            # push to main, tag, or manual dispatch -- always run tests
             FILES="non-doc-change"
           fi
 
@@ -216,12 +238,30 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
 
-      - uses: ./.github/actions/build-torch-spyre
+      - name: Download RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        uses: ./.github/actions/download-rpms
+        with:
+          rpm_location: ${{ inputs.rpm_location }}
+          rpm_names: ${{ inputs.rpm_names }}
+
+      - name: Install RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        run: |
+          ls -la
+          ls -la rpms/
+          sudo dnf install -y rpms/*.rpm
+
+      - name: Build torch-spyre
+        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+        uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} tests
         run: |
@@ -299,12 +339,30 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
 
-      - uses: ./.github/actions/build-torch-spyre
+      - name: Download RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        uses: ./.github/actions/download-rpms
+        with:
+          rpm_location: ${{ inputs.rpm_location }}
+          rpm_names: ${{ inputs.rpm_names }}
+
+      - name: Install RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        run: |
+          ls -la
+          ls -la rpms/
+          sudo dnf install -y rpms/*.rpm
+
+      - name: Build torch-spyre
+        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+        uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} tests
         run: |

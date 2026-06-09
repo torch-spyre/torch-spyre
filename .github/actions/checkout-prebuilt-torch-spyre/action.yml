@@ -11,6 +11,12 @@ inputs:
     description: Path to the pre-cloned torch-spyre directory in the image.
     required: false
     default: /home/senuser/torch-spyre
+  ref:
+    description: |
+      Branch, tag, or SHA to check out. When set, overrides the automatic
+      event-based SHA/ref detection (PR head SHA, push SHA, etc.).
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -19,6 +25,7 @@ runs:
       shell: bash
       env:
         CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
+        INPUT_REF: ${{ inputs.ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         GITHUB_SHA: ${{ github.sha }}
@@ -31,10 +38,15 @@ runs:
         # "dubious ownership" error (covers the repo and any submodules).
         git config --global --add safe.directory '*'
         cd "$CLONED_TORCH_SPYRE_DIR"
-        # Prefer the PR head SHA when triggered by pull_request, otherwise
-        # fall back to the SHA of the push/tag/schedule/merge_group event.
-        TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
-        TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
+        if [[ -n "$INPUT_REF" ]]; then
+          TARGET_SHA="$INPUT_REF"
+          TARGET_REF="$INPUT_REF"
+        else
+          # Prefer the PR head SHA when triggered by pull_request, otherwise
+          # fall back to the SHA of the push/tag/schedule/merge_group event.
+          TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+          TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
+        fi
         echo "TARGET_REF=${TARGET_REF}"
         echo "TARGET_SHA=${TARGET_SHA}"
         git fetch --tags --force origin "+${TARGET_SHA}" || \
