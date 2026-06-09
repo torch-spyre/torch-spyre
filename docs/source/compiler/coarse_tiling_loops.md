@@ -133,7 +133,7 @@ op.loop_info = CoarseTileInfo(
 ```
 
 `_divide_ranges` is applied once per level in outermost-first order (the
-`hint_id` in each `(hint_id, K, tiled_dims)` triple is used only for
+`hint_id` in each `(hint_id, K, is_reduction_level)` triple is used only for
 per-op `dim_index` lookup, not by `_divide_ranges` itself):
 
 1. Outer level `(K=2, dim 0)`: `data.ranges [1024, 4096] → [512, 4096]`
@@ -480,56 +480,53 @@ Each group tuple has the form:
 (ops, levels)
 ```
 
-where `levels` is a list of `(hint_id, K, tiled_dims)` triples, outermost
-first:
+where `levels` is a list of `(hint_id, K, is_reduction_level)` triples,
+outermost first:
 
 ```python
-(ops, [(hint_id_0, K1, [dim_0]), (hint_id_1, K2, [dim_1])])
+(ops, [(hint_id_0, K1, False), (hint_id_1, K2, True)])
 ```
 
 `hint_id` is the integer ID assigned by the enclosing `spyre_hint` scope
-(smaller IDs are outer scopes).  It is used to match each level's tiling
-against the per-op `DimHint` entries so that ops which lack a particular
-dimension (e.g. broadcast ops) get an empty `tiled_dims` for that level
-rather than an incorrect positional index.
+(smaller IDs are outer scopes).  `is_reduction_level` is `True` when the
+hinted dimension is a reduction dimension (i.e. the `DimHint` was derived
+from a reduction-ranges position).  `tiled_dims` are **not** in the triple
+— they are derived per-op inside `_stamp_group` by consulting each op's
+own `DimHint.loop_var` so that ops which lack a particular dimension
+(e.g. broadcast ops, or `Pointwise` ops in a reduction-level group) get
+an empty sub-list rather than an incorrect positional index.
 
 `_stamp_group` always receives this canonical list-of-triples
-representation; normalisation from user-facing flat syntax is performed by
-`hints_to_coarse_tile_groups` in `temp_passes.py` before `coarse_tile()`
-is called.
+representation; it is built by `_hints_levels()` inside
+`hints_to_coarse_tile_groups` in `coarse_tile.py` before `coarse_tile()`
+stamps each op.
 
 ### Groups derivation and placement in `CustomPreSchedulingPasses`
 
 Groups are derived automatically from `spyre_hint(slices=...)` annotations
-via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/temp_passes.py`),
-which is a no-op when no hints are present.  Coarse tiling runs only when
-the returned groups list is non-empty:
+via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/coarse_tile.py`),
+which is a no-op when no hints are present.  `CustomPreSchedulingPasses`
+maintains a `self.passes` list of uniform `Callable[[GraphLowering], None]`
+entries, run in order by `__call__`.  Config-gated or multi-step groups are
+wrapped in private helpers tagged with `@_runs(...)` for cache-key purposes:
 
 ```python
-deadcode_elimination(operations)
-propagate_spyre_tensor_layouts(operations)
-optimize_restickify_locations(operations)
-finalize_layouts(operations)
-insert_restickify(operations)
-insert_bmm_padding(operations)
-dedup_and_promote_constants(operations)
-if config.chunk_large_tensors:
-    chunk_large_tensors(operations)
-propagate_named_dims(operations)
-assign_dim_hints(operations)
-groups = hints_to_coarse_tile_groups(operations)
-if groups:
-    coarse_tile(operations, groups=groups)
-span_reduction(operations)
-cost_model_ops = cost_model_matmul_division(operations)
-work_distribution(operations, cost_model_ops)
-if config.lx_planning:
-    allocator = (
-        StrategyBCoOptimizingAllocator()
-        if config.co_optimizing_lx_planning
-        else None
-    )
-    scratchpad_planning(graph, allocator=allocator)
+self.passes = [
+    deadcode_elimination,
+    propagate_spyre_tensor_layouts,
+    optimize_restickify_locations,
+    finalize_layouts,
+    insert_restickify,
+    insert_bmm_padding,
+    dedup_and_promote_constants,
+    _maybe_chunk_large_tensors,   # config-gated
+    propagate_named_dims,
+    assign_dim_hints,
+    _maybe_coarse_tile,           # calls hints_to_coarse_tile_groups + coarse_tile
+    span_reduction,
+    _distribute_work,             # calls cost_model_matmul_division + work_distribution
+    _maybe_scratchpad_planning,   # config-gated; calls scratchpad_planning
+]
 ```
 
 This ordering is required by several constraints:
@@ -666,7 +663,7 @@ Identity values and combine operators by `reduction_type`:
 | `max` | −∞ (`-torch.inf`) | `maximum` |
 | `min` | +∞ (`torch.inf`) | `minimum` |
 | `xor_sum` | 0 | `bitwise_xor` |
-| `any` | `False` | `logical_or` |
+| `any` | 0 | `logical_or` |
 
 `argmin` and `argmax` do not have element-wise combine operators and raise
 `RuntimeError` when a user attempts to tile them.
@@ -1123,7 +1120,7 @@ When backend support lands, `unroll_loops` will be flipped to default
 | `torch_spyre/_inductor/passes.py` | Wires all passes into `CustomPreSchedulingPasses` and `CustomPreFusionPasses` |
 | `torch_spyre/_inductor/propagate_hints.py` | `spyre_hint()` context manager; `DimHint`; hint collection/recovery across AOT re-tracing |
 | `torch_spyre/_inductor/propagate_named_dims.py` | `propagate_named_dims()` and `assign_dim_hints()`: attach `dim_hints` to `ir.Operation` objects |
-| `torch_spyre/_inductor/temp_passes.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile()` group tuples |
+| `torch_spyre/_inductor/coarse_tile.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile()` group tuples; also `coarse_tile()` entry point |
 | `tests/inductor/test_coarse_tiling.py` | Unit tests: IR pass, propagation, scheduler node, bundle MLIR output |
 | `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests |
 | `tests/inductor/test_unroll_loop_specs.py` | Unit tests for `unroll_loop_specs` |
