@@ -160,6 +160,15 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         graph.name_to_users[buf_name] = users_of_inp
         graph.name_to_users[new_buf_name] = users_of_new_buf
 
+        # Step 3b: Propagate per-core splits to the clone.
+        # Users share the same per_core_view (pre-checked by core_div_mismatch guard).
+        # op_it_space_splits keys are stride-based coefficients, which are layout-
+        # invariant, so the first user's output_splits transfer without re-keying.
+        # Reduction splits are dropped: the clone is Pointwise with no reduction axis.
+        first_user = buf_users[buf_name][0]
+        user_out_splits, _ = getattr(first_user, "op_it_space_splits", ({}, {}))
+        new_com_buf.op_it_space_splits = (user_out_splits, {})
+
         # Step 4: Hack user nodes' inner_fn
         for old_com_buf in buf_users[buf_name]:
             # hack inner_fn with a nameSwapper ops handler and make a new LoopIR

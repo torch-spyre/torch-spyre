@@ -23,6 +23,7 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
+from .constants import SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
 from .pass_utils import copy_fx_custom_meta
 
 aten = torch.ops.aten
@@ -37,6 +38,115 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+
+def _is_static_one(value) -> bool:
+    try:
+        return int(value) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_static_multiple(value, divisor: int) -> bool:
+    try:
+        return int(value) % divisor == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_stick_aligned_matmul_dims(k, n) -> bool:
+    return _is_static_multiple(k, 64) and _is_static_multiple(n, 64)
+
+
+def _node_shape(node: torch.fx.Node) -> list[int] | None:
+    val = node.meta.get("val")
+    shape = getattr(val, "shape", None)
+    if shape is None:
+        return None
+    return list(shape)
+
+
+def _mark_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    lhs_shape = _node_shape(lhs_node)
+    rhs_shape = _node_shape(rhs_node)
+    out_shape = _node_shape(bmm_node)
+    if lhs_shape is None or rhs_shape is None or out_shape is None:
+        return
+    if len(lhs_shape) != 3 or len(rhs_shape) != 3 or len(out_shape) != 3:
+        return
+    if not (
+        _is_static_one(lhs_shape[0])
+        and _is_static_one(rhs_shape[0])
+        and _is_static_one(out_shape[0])
+    ):
+        return
+    if not (
+        lhs_shape[1] == out_shape[1]
+        and lhs_shape[2] == rhs_shape[1]
+        and rhs_shape[2] == out_shape[2]
+    ):
+        return
+    if not _has_stick_aligned_matmul_dims(lhs_shape[2], rhs_shape[2]):
+        return
+    custom = dict(bmm_node.meta.get("custom") or {})
+    custom[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY] = {"batch_dim": 0}
+    bmm_node.meta["custom"] = custom
+
+
+def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.op in ("placeholder", "get_attr"):
+        return True
+    if node.op == "call_function" and node.target == aten.expand.default:
+        base = node.args[0]
+        return isinstance(base, torch.fx.Node) and base.op in (
+            "placeholder",
+            "get_attr",
+        )
+    return False
+
+
+def _mark_direct_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    """Mark direct rank-3 B=1 BMMs without catching unflattened attention views."""
+    if not _is_direct_unit_bmm_operand(rhs_node):
+        return
+
+    for arg in (lhs_node, rhs_node):
+        if (
+            isinstance(arg, torch.fx.Node)
+            and arg.op == "call_function"
+            and arg.target in _RESHAPE_OPS
+        ):
+            return
+
+    bmm_users = list(bmm_node.users.keys())
+    if len(bmm_users) == 1:
+        output_view = bmm_users[0]
+        if (
+            isinstance(output_view, torch.fx.Node)
+            and output_view.op == "call_function"
+            and output_view.target in _RESHAPE_OPS
+        ):
+            output_shape = output_view.args[1]
+            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
+                return
+
+    _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
+
+
+def mark_direct_unit_bmm_pass(graph: torch.fx.Graph) -> None:
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target != aten.bmm.default:
+            continue
+        if len(node.args) != 2:
+            continue
+        lhs_node, rhs_node = node.args
+        _mark_direct_static_unit_batch_bmm(node, lhs_node, rhs_node)
 
 
 @register_graph_pattern(
@@ -141,6 +251,7 @@ def _unflatten_mm_to_bmm(
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
         copy_fx_custom_meta(node, bmm_node)
+        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)

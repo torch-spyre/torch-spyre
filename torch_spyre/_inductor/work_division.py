@@ -32,6 +32,7 @@ from torch._inductor.ir import (
 )
 
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
@@ -647,7 +648,7 @@ _DTYPE_BYTES = 2  # fp16
 _PSUM_PER_ELEM_US = 1.4e-4  # per output element, per K-split ring reduction hop
 _COHORT_LIMIT = 8  # cores sharing a broadcast before it contends for bandwidth
 _BATCH_SPLIT_EXPONENT = 1.4  # batch-split cost grows ~ b ** this (fit to bmm sweeps)
-_TARGET_M_PENALTY_US = 50.0  # tie-break weight, per log2 step off the target m-split
+_TARGET_M_PENALTY_US = 50.0  # tie-break weight when per-core M under-fills PT
 
 
 def _matmul_split_cost(
@@ -687,12 +688,14 @@ def _matmul_split_cost(
     # sum hops around the ring, each touching every output element.
     psum_us = max(0, k - 1) * (B * M * N) * _PSUM_PER_ELEM_US
 
-    # Tie-break: among compute-equivalent splits prefer the m-split that lands
-    # per-core M near the PT sweet spot, penalising log2-distance from it.
-    target_m = max(
-        _M_MIN, min(max_cores // 2, max(1, M // (_TARGET_PT_PASSES * _PT_ROWS)))
-    )
-    target_m_us = abs(math.log2(max(1, m) / target_m)) * _TARGET_M_PENALTY_US
+    # Tie-break: among compute-equivalent splits, penalize only M splits that
+    # make the per-core tile too short to fill the PT pipeline. Larger per-core
+    # M tiles are already compute-equivalent in this model; penalizing them
+    # incorrectly prefers M parallelism over N parallelism for wide projections.
+    if pt_passes >= _TARGET_PT_PASSES:
+        target_m_us = 0.0
+    else:
+        target_m_us = math.log2(_TARGET_PT_PASSES / pt_passes) * _TARGET_M_PENALTY_US
 
     # Splitting batch across cores is strictly worse than tiling it in time on
     # one core (each item is independent), so charge a super-linear b penalty.
@@ -876,8 +879,9 @@ def _iter_computed_buffers(operations: list[Operation]):
             logger.warning(f"unhandled operation type {type(op)}")
 
 
-def span_reduction(operations: list[Operation]) -> None:
+def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
+    operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op.get_read_writes()
@@ -889,13 +893,14 @@ def span_reduction(operations: list[Operation]) -> None:
 
 
 def work_distribution(
-    operations: list[Operation], preassigned_ops: list[Operation] | None = None
+    graph: GraphLowering, preassigned_ops: list[Operation] | None = None
 ) -> None:
     """Pass 3: distribute remaining cores across ops to maximize parallelism.
 
     Ops in `preassigned_ops` were already divided by cost_model_matmul_division;
     they are left untouched so every op is divided by exactly one pass.
     """
+    operations = graph.operations
     preassigned_ops = preassigned_ops or []
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
@@ -974,13 +979,14 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     return True
 
 
-def cost_model_matmul_division(operations: list[Operation]) -> list[Operation]:
+def cost_model_matmul_division(graph: GraphLowering) -> list[Operation]:
     """Pass 2: re-price matmul/bmm splits with the analytic hardware cost model.
 
     Runs after span_reduction and before work_distribution. Returns the ops it
     re-split so passes.py can exclude them from work_distribution — every op is
     divided by exactly one pass.
     """
+    operations = graph.operations
     max_cores = _validate_max_cores()
     cost_model_ops: list[Operation] = []
     for op in _iter_computed_buffers(operations):

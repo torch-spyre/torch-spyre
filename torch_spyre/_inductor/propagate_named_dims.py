@@ -30,6 +30,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .pass_utils import host_coordinates, device_coordinates, op_out_coords
@@ -216,24 +217,30 @@ def _set_no_named_dims(op):
 def _compute_named_dims(op, inputs):
     loop_var_dims = get_input_named_dims(inputs, op)
     out_coords = op_out_coords(op)
-    if not isinstance(op.data, Reduction):
-        # For pointwise ops, synthesize names for loop vars not covered by any input.
-        # This handles full/zeros_like: their iteration space defines named dims but
-        # their constant value contributes nothing to loop_var_dims.
-        output_dep = next(iter(op.get_read_writes().writes))
-        for coord in out_coords:
-            if coord.free_symbols:
-                sym = _lone_sym(coord)
-                if sym not in loop_var_dims:
-                    size = int(output_dep.ranges[sym])
-                    loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+    # Synthesize names for loop vars not covered by any input.
+    # This handles full/zeros_like/constant ops whose iteration space defines
+    # named dims but whose constant value contributes nothing to loop_var_dims.
+    output_dep = next(iter(op.get_read_writes().writes))
+    for coord in out_coords:
+        if coord.free_symbols:
+            sym = _lone_sym(coord)
+            if sym not in loop_var_dims:
+                size = int(output_dep.ranges[sym])
+                loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+    reduction_named_dims = None
+    if isinstance(op.data, Reduction):
+        reduction_sym = get_reduction_dim(inputs[0], out_coords)
+        if reduction_sym not in loop_var_dims:
+            size = int(inputs[0].ranges[reduction_sym])
+            loop_var_dims[reduction_sym] = [
+                _untracked_name(op.get_name(), reduction_sym, size)
+            ]
+        reduction_named_dims = loop_var_dims[reduction_sym]
     named_dims = coords_to_named_dims(out_coords, loop_var_dims)
     op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
         named_dims=named_dims,
         loop_var_dims=loop_var_dims,
-        reduction_named_dims=loop_var_dims[get_reduction_dim(inputs[0], out_coords)]
-        if isinstance(op.data, Reduction)
-        else None,
+        reduction_named_dims=reduction_named_dims,
     )
 
 
@@ -316,17 +323,12 @@ def _log_op(op: Operation) -> None:
     logger.info("")
 
 
-def propagate_named_dims(
-    operations: list[Operation],
-) -> None:
-    """Propagate named dims from annotated inputs through the op graph."""
-    global _enabled
-    if not _enabled:
-        return
-    if V.graph.graph_input_names:
-        for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
+def _propagate_named_dims_impl(graph: GraphLowering) -> None:
+    operations = graph.operations
+    if graph.graph_input_names:
+        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
-                tb = V.graph.graph_inputs[name]
+                tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
                     or not isinstance(tb.data, StorageBox)
@@ -398,33 +400,32 @@ def propagate_named_dims(
             logger.info(f"  {name} = {size}")
 
         logger.info("INPUT TENSORS")
-        for name in V.graph.graph_input_names:
-            tb = V.graph.graph_inputs[name]
+        for name in graph.graph_input_names:
+            tb = graph.graph_inputs[name]
             if isinstance(tb, TensorBox):
                 dp = getattr(tb, "_dim_prop_info", None)
                 logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
 
-    for op in operations:
-        _log_op(op)
-    # Reset _enabled so that it does not leak True into the next compilation
-    _enabled = False
+        logger.info("OPS")
+        for op in operations:
+            _log_op(op)
 
 
-def assign_dim_hints(operations: list[Operation]) -> None:
-    """Combine spyre_hint scope annotations with propagated named dimensions.
+def propagate_named_dims(
+    graph: GraphLowering,
+) -> None:
+    """Propagate named dims from annotated inputs through the op graph."""
+    global _enabled
+    if not _enabled:
+        return
+    try:
+        _propagate_named_dims_impl(graph)
+    finally:
+        _named_tensor_dims.clear()
+        _enabled = False
 
-    Reads the hint scopes (from spyre_hint() context managers in user code,
-    attached to FX nodes via meta["custom"]) and matches hinted dimension names
-    against the named loop variables on each op.  The named loop variables come
-    from propagate_named_dims(), which propagates name_tensor_dims() annotations
-    through the op graph — that pass must run before this one.
 
-    Produces op.dim_hints: a flat list of DimHint, one per hinted dimension,
-    ordered outermost hint scope first.  Consumed by hints_to_coarse_tile_groups
-    to form coarse tiling groups.
-
-    Deletes op._dim_prop_info when done — those fields are only needed here.
-    """
+def _assign_dim_hints_impl(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -446,6 +447,14 @@ def assign_dim_hints(operations: list[Operation]) -> None:
             sym = _lone_sym(coord)
             for name, _ in named_dims_for_sym(op, sym):
                 coord_for_name[name] = sym
+        # Also map reduction dim names to their loop variable.  Reduction dims
+        # don't appear in output coordinates, so they would never be found by
+        # the output-coord loop above.  dp.loop_var_dims covers all loop vars
+        # (including the reduction dim), so we invert it for reduction names.
+        for sym, names in dp.loop_var_dims.items():
+            for name in names:
+                if name in reduction_dims:
+                    coord_for_name[name] = sym
 
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):
@@ -509,3 +518,24 @@ def assign_dim_hints(operations: list[Operation]) -> None:
                         f"  split_count={h.split_count}  -> {per_tile} per tile"
                         f"  loop_var={h.loop_var}{reduction_tag}"
                     )
+
+
+def assign_dim_hints(graph: GraphLowering) -> None:
+    """Combine spyre_hint scope annotations with propagated named dimensions.
+
+    Reads the hint scopes (from spyre_hint() context managers in user code,
+    attached to FX nodes via meta["custom"]) and matches hinted dimension names
+    against the named loop variables on each op.  The named loop variables come
+    from propagate_named_dims(), which propagates name_tensor_dims() annotations
+    through the op graph — that pass must run before this one.
+
+    Produces op.dim_hints: a flat list of DimHint, one per hinted dimension,
+    ordered outermost hint scope first.  Consumed by hints_to_coarse_tile_groups
+    to form coarse tiling groups.
+
+    Deletes op._dim_prop_info when done — those fields are only needed here.
+    """
+    try:
+        _assign_dim_hints_impl(graph.operations)
+    finally:
+        reset()

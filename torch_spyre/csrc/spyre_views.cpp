@@ -185,12 +185,55 @@ at::Tensor spyre_alias(const at::Tensor& self) {
                                             self.sym_strides());
 }
 
+at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
+                        int64_t step) {
+  // Normalize negative dimension
+  auto ndim = self.dim();
+  dimension = c10::maybe_wrap_dim(dimension, ndim);
+
+  // Validate parameters
+  auto dim_size = self.size(dimension);
+  TORCH_CHECK(size > 0, "unfold: size must be positive, got ", size);
+  TORCH_CHECK(step > 0, "unfold: step must be positive, got ", step);
+  TORCH_CHECK(size <= dim_size, "unfold: maximum size for tensor at dimension ",
+              dimension, " is ", dim_size, " but size is ", size);
+
+  // Compute new sizes
+  std::vector<int64_t> new_sizes(self.sizes().begin(), self.sizes().end());
+  int64_t num_slices = (dim_size - size) / step + 1;
+  new_sizes[dimension] = num_slices;
+  new_sizes.push_back(size);
+
+  // Compute new strides
+  std::vector<int64_t> new_strides(self.strides().begin(),
+                                   self.strides().end());
+  int64_t original_stride = self.stride(dimension);
+  new_strides[dimension] = original_stride * step;
+  new_strides.push_back(original_stride);
+
+  auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  at::Tensor result = at::detail::make_tensor<SpyreTensorImpl>(
+      c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
+      self.dtype());
+  at::native::setStrided(result, c10::IntArrayRef(new_sizes),
+                         c10::IntArrayRef(new_strides), self.storage_offset());
+
+  auto* result_impl =
+      static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl());
+  result_impl->spyre_layout = orig_impl->spyre_layout;
+  result_impl->dma_sizes = orig_impl->dma_sizes;
+  result_impl->dma_strides = orig_impl->dma_strides;
+
+  return result;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("view", TORCH_FN(spyre_view));
   m.impl("_unsafe_view", TORCH_FN(spyre__unsafe_view));
   m.impl("_reshape_alias", TORCH_FN(spyre_reshape_alias));
   m.impl("alias", TORCH_FN(spyre_alias));
   m.impl("as_strided", TORCH_FN(spyre_as_strided));
+  m.impl("unfold", TORCH_FN(spyre_unfold));
 }
 
 }  // namespace spyre
