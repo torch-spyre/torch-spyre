@@ -24,10 +24,17 @@ from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("split_multi_ops")
 
+# Operations that don't perform computation but manage data flow
 _STRUCTURAL_OPS = frozenset({"load", "store", "get_index"})
+
+# Operations that involve dtype conversion or constant creation
 _DTYPE_OPS = frozenset({"to_dtype", "convert_element_type", "constant"})
+
+# Operations that accept constant values as scalars rather than buffers
+# The special case for these ops (clamp, layernormscale, softplus) are Spyre specific.
 _OPS_WITH_CONSTANT_ARGS = frozenset({"clamp", "layernormscale", "softplus"})
 
+# Mapping of operation names to their FX graph targets when there is no 1-1 mapping.
 _OP_TARGET_TABLE = {
     "to_dtype": torch.ops.prims.convert_element_type.default,
     "convert_element_type": torch.ops.prims.convert_element_type.default,
@@ -42,33 +49,57 @@ class _Val:
 
 
 class _TracingHandler:
+    """Context manager that traces operations into a list of operation records.
+
+    This handler intercepts all V.ops calls during tracing and records them
+    as tuples of (op_name, vid, input_vids, kwargs). It's used to analyze
+    the structure of fused operations before splitting them.
+
+    Attributes:
+        ops: List of traced operations as (op_name, vid, input_vids, kwargs)
+        _next_vid: Counter for generating unique value IDs
+    """
+
     def __init__(self, prev_handler):
         self._prev = prev_handler
         self.ops = []
         self._next_vid = 0
 
     def __enter__(self):
+        """Install this handler as the active V.ops handler."""
         self._saved = V.ops
         V.set_ops_handler(self)
         return self
 
     def __exit__(self, *args):
+        """Restore the previous V.ops handler."""
         V.set_ops_handler(self._saved)
 
     def __getattr__(self, name):
+        """Dynamically create recording functions for any operation name.
+
+        Args:
+            name: Operation name to record
+
+        Returns:
+            A function that records the operation and returns a _Val
+        """
         if name.startswith("_"):
             raise AttributeError(name)
 
         def _record(*args, **kwargs):
+            # Separate _Val arguments from other arguments
             vids = []
             extra = []
             for a in args:
                 if isinstance(a, _Val):
                     vids.append(a.vid)
                 elif isinstance(a, (bool, int, float)):
+                    # Special case: Wrap literals as constants
                     vids.append(self._wrap_literal(a).vid)
                 else:
                     extra.append(a)
+            # Store non _Val args with _p prefix to avoid name conflicts
             merged = dict(kwargs)
             for i, v in enumerate(extra):
                 merged[f"_p{i}"] = v
@@ -79,11 +110,31 @@ class _TracingHandler:
         return _record
 
     def load(self, name, index):
+        """Record a load operation from a named buffer.
+
+        Args:
+            name: Buffer name to load from
+            index: Index expression for the load
+
+        Returns:
+            _Val representing the loaded value
+        """
         vid = self._alloc_vid()
         self.ops.append(("load", vid, (), {"_name": name, "_index": index}))
         return _Val(self, vid)
 
     def store(self, name, index, value, mode=None):
+        """Record a store operation to a named buffer.
+
+        Args:
+            name: Buffer name to store to
+            index: Index expression for the store
+            value: _Val to store
+            mode: Optional store mode (e.g., 'atomic_add')
+
+        Returns:
+            _Val representing the store operation
+        """
         vid = self._alloc_vid()
         self.ops.append(
             (
@@ -96,6 +147,7 @@ class _TracingHandler:
         return _Val(self, vid)
 
     def constant(self, fill_value, dtype):
+        """Record a constant value creation."""
         vid = self._alloc_vid()
         self.ops.append(
             ("constant", vid, (), {"fill_value": fill_value, "dtype": dtype})
@@ -103,11 +155,13 @@ class _TracingHandler:
         return _Val(self, vid)
 
     def _alloc_vid(self):
+        """Allocate a new unique value ID."""
         v = self._next_vid
         self._next_vid += 1
         return v
 
     def _wrap_literal(self, value):
+        """Wrap a Python literal as a constant operation."""
         dtype = (
             torch.bool
             if isinstance(value, bool)
@@ -143,6 +197,24 @@ def _resolve_fx_target(op_name):
 
 
 def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
+    """Normalize operation arguments for FX graph node creation.
+
+    Special cases:
+    1. 'constant' ops: Return (fill_value, dtype, device) tuple
+    2. _DTYPE_OPS: Ensure dtype is first positional arg after input
+    3. Positional args stored with '_p' prefix are extracted and appended
+    4. Internal kwargs (starting with '_') are filtered out
+
+    Args:
+        op_name: Name of the operation
+        input_fx_nodes: List of input FX nodes
+        kwargs: Operation keyword arguments (may include _p0, _p1, etc.)
+        out_dtype: Default output dtype
+        device: Optional device for constant operations
+
+    Returns:
+        Tuple of (args, clean_kwargs, final_dtype)
+    """
     if op_name == "constant":
         fill = kwargs["fill_value"]
         dtype = kwargs.get("dtype", out_dtype)
@@ -173,10 +245,28 @@ def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
 
 
 def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant):
+    """Build an inner_fn that loads from intermediate buffers.
+
+    Special cases:
+    1. Constants in _OPS_WITH_CONSTANT_ARGS: Use scalar value directly
+    2. Other constants: Load from buffer at index 0
+    3. Regular values: Compute strided index and load
+
+    Args:
+        op_name: Name of the operation to perform
+        value_vids: List of value IDs for operation inputs
+        kwargs: Operation keyword arguments
+        vid_to_bufname: Mapping from value ID to buffer name
+        vid_to_constant: Mapping from value ID to (fill_value, dtype)
+
+    Returns:
+        Function that takes an index tuple and returns the operation result
+    """
     pos_keys = sorted(k for k in kwargs if k.startswith("_p"))
     extra = tuple(kwargs[k] for k in pos_keys)
     clean_kw = {k: v for k, v in kwargs.items() if not k.startswith("_p")}
 
+    # Pre-compute strides for non-constant inputs
     vid_to_stride = {}
     for v in value_vids:
         if v not in vid_to_constant:
@@ -187,6 +277,7 @@ def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant
         inputs = []
         for v in value_vids:
             if v in vid_to_constant:
+                # Handle constant arguments that need to be passed as scalars
                 if op_name in _OPS_WITH_CONSTANT_ARGS:
                     fill, _ = vid_to_constant[v]
                     inputs.append(fill)
@@ -202,6 +293,16 @@ def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant
 
 
 def _trace_inner_fn(op):
+    """Trace the inner_fn of an operation to extract its structure.
+
+    Returns None if tracing fails (e.g., unsupported ops)
+
+    Args:
+        op: ComputedBuffer operation to trace
+
+    Returns:
+        List of traced operations or None if tracing failed
+    """
     ranges = op.data.ranges
     syms = tuple(sympy.Symbol(f"_i{k}") for k in range(len(ranges)))
     tracer = _TracingHandler(V.ops)
@@ -214,14 +315,30 @@ def _trace_inner_fn(op):
 
 
 def _get_compute_ops(trace):
+    """Compute ops from a trace other than structural ops."""
     return [e for e in trace if e[0] not in _STRUCTURAL_OPS]
 
 
 def _propagate_dtypes(trace, fallback):
+    """Propagate dtypes through a trace of operations.
+
+    Special cases:
+    1. 'load' ops: Get dtype from buffer layout
+    2. 'store' ops: No dtype propagation needed
+    3. Other ops: Infer dtype from inputs
+
+    Args:
+        trace: List of traced operations
+        fallback: Default dtype if inference fails
+
+    Returns:
+        Dictionary mapping value IDs to their dtypes
+    """
     dtype_map = {}
     for op, vid, inputs, kwargs in trace:
         if op == "load":
-            dtype_map[vid] = V.graph.get_buffer(kwargs["_name"]).get_layout().dtype
+            buf_name = kwargs["_name"]
+            dtype_map[vid] = V.graph.get_buffer(buf_name).get_layout().dtype
         elif op == "store":
             pass
         else:
@@ -231,10 +348,26 @@ def _propagate_dtypes(trace, fallback):
 
 
 def _init_vid_to_bufname(trace):
+    """Extract buffer names from load operations in a trace.
+
+    Args:
+        trace: List of traced operations
+
+    Returns:
+        Dictionary mapping value IDs to buffer names
+    """
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
 
 
 def _init_vid_to_constant(trace):
+    """Extract constant values from constant operations in a trace.
+
+    Args:
+        trace: List of traced operations
+
+    Returns:
+        Dictionary mapping value IDs to (fill_value, dtype) tuples
+    """
     return {
         vid: (kwargs["fill_value"], kwargs["dtype"])
         for op, vid, _, kwargs in trace
@@ -243,9 +376,24 @@ def _init_vid_to_constant(trace):
 
 
 def _find_fx_node(name, gl):
+    """Find an FX node by buffer name in the graph.
+
+    Searches both gl.env and placeholder nodes
+
+    Args:
+        name: Buffer name to search for
+        gl: GraphLowering instance
+
+    Returns:
+        FX Node corresponding to the buffer name
+
+    Raises:
+        KeyError: If no FX node is found for the given name
+    """
     for n, tb in gl.env.items():
-        if isinstance(n, fx.Node) and tb is not None and tb.get_name() == name:
-            return n
+        if isinstance(n, fx.Node) and tb is not None:
+            if tb.get_name() == name:
+                return n
     for n in gl.graph.nodes:
         if n.op == "placeholder" and n.name == name:
             return n
@@ -253,6 +401,17 @@ def _find_fx_node(name, gl):
 
 
 def _lower_fx_node(node, gl, ops, idx):
+    """Lower an FX node to a buffer and insert it into operations list.
+
+    Args:
+        node: FX node to lower
+        gl: GraphLowering instance
+        ops: Operations list to insert into
+        idx: Index position for insertion
+
+    Returns:
+        The created buffer
+    """
     tb = gl.run_node(node)
     buf = tb.data.data
     gl.operations.remove(buf)
@@ -270,7 +429,29 @@ def _make_intermediate_bufs(
     insert_idx,
     gl,
     orig_node,
-):
+) -> None:
+    """Create intermediate buffers for operations.
+
+    For each intermediate operation in a fused computation, this creates:
+    1. An FX graph node with the appropriate target and arguments
+    2. A lowered buffer from that node
+    3. Updates vid_to_bufname mapping for subsequent operations
+
+    Special cases:
+    1. Metadata propagation: Copies 'val' metadata from inputs or orig_node
+    2. Node insertion: Uses inserting_before context to maintain graph order
+    3. Origins tracking: Sets OrderedSet with single new_node as origin
+
+    Args:
+        intermediate_ops: List of (op_name, vid, inputs, kwargs) tuples
+        vid_to_dtype: Mapping from value ID to dtype
+        vid_to_bufname: Mapping from value ID to buffer name (updated)
+        layout: Layout of the original fused operation
+        operations: List of operations to insert into
+        insert_idx: Starting index for insertion
+        gl: GraphLowering instance
+        orig_node: Original FX node being split
+    """
     bufs = []
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
@@ -278,34 +459,65 @@ def _make_intermediate_bufs(
         target = _resolve_fx_target(op_name)
         if target is None:
             raise RuntimeError(f"Cannot resolve target for '{op_name}'")
+
         args, clean_kw, out_dtype = _normalize_op_args(
             op_name, input_nodes, kwargs, out_dtype, layout.device
         )
+
         with gl.graph.inserting_before(orig_node):
             new_node = gl.graph.create_node("call_function", target, args, clean_kw)
+
+        # Propagate metadata for shape inference
         if input_nodes and "val" in input_nodes[0].meta:
             new_node.meta["val"] = input_nodes[0].meta["val"].to(out_dtype)
         elif "val" in orig_node.meta:
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
+
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
         new_buf.origins = OrderedSet([new_node])
         vid_to_bufname[vid] = new_buf.get_name()
         bufs.append(new_buf)
         insert_idx += 1
-    return bufs, insert_idx
 
 
-def _update_original_buf(op, final_entry, vid_to_bufname, vid_to_constant, operations):
+def _update_original_buf(
+    op, final_entry, vid_to_bufname, vid_to_constant, operations
+) -> None:
+    """Update the original buffer to use intermediate buffers.
+
+    Replaces the original fused operation's inner_fn with one that loads
+    from the newly created intermediate buffers. Preserves all metadata
+    and attributes from the original operation.
+
+    Args:
+        op: Original ComputedBuffer to update
+        final_entry: Final operation tuple (op_name, vid, inputs, kwargs)
+        vid_to_bufname: Mapping from value ID to buffer name
+        vid_to_constant: Mapping from value ID to constant values
+        operations: List of operations containing op
+    """
     op_name, _, vids, kwargs = final_entry
+
+    # New data for the new op
     new_data = dataclasses.replace(
         op.data,
         inner_fn=_build_inner_fn(
             op_name, vids, kwargs, vid_to_bufname, vid_to_constant
         ),
     )
-    for attr in ("origins", "traceback", "origin_node", "annotations", "stream_idx"):
+
+    # Preserve metadata from original's ops data in new_data
+    metadata_attrs = (
+        "origins",
+        "traceback",
+        "origin_node",
+        "annotations",
+        "stream_idx",
+    )
+    for attr in metadata_attrs:
         if hasattr(op.data, attr):
             object.__setattr__(new_data, attr, getattr(op.data, attr))
+
     new_op = ComputedBuffer(
         name=op.get_name(),
         layout=op.layout,
@@ -313,29 +525,65 @@ def _update_original_buf(op, final_entry, vid_to_bufname, vid_to_constant, opera
     )
     new_op.operation_name = op.operation_name
     new_op.origins = op.origins
-    for attr in (
+
+    # Preserve custom attributes used by other passes
+    custom_attrs = (
         "_split_size",
         "_original_inner_fn",
         "_original_ranges",
         "_original_reduction_ranges",
-    ):
+    )
+    for attr in custom_attrs:
         if hasattr(op, attr):
             object.__setattr__(new_op, attr, getattr(op, attr))
+
+    # Invalidate cached read_writes
     if hasattr(new_op, "_cached_read_writes"):
         del new_op._cached_read_writes
     _ = new_op.get_read_writes()
+
+    # Update the graph operations with the new op
     idx = operations.index(op)
     operations[idx] = new_op
     V.graph.name_to_buffer[new_op.get_name()] = new_op
     ComputedBuffer.get_default_sizes_body.clear_cache(new_op)
-    return new_op
 
 
 def split_multi_ops(graph: GraphLowering):
-    operations = graph.operations
+    """Split multi-ops in a single loop body into separate buffers.
+
+    1. Multi-op fusion: Splits multi-op loop bodies (e.g., type conversion + arithmetic)
+       into individual ops by creating FX graph nodes and lowering.
+    2. Constant arguments: creates SpyreConstantFallback IRNode.
+
+    More pytorch programming patterns that result in multi-op in a single loop body can
+    be supported by adding required handling in this pass.
+
+    Special cases:
+    1. Only processes ComputedBuffer with Pointwise data and FixedLayout
+    2. Skips operations if only 1 compute ops (nothing to split)
+    3. Skips if tracing fails or operation is not in operations list
+    4. Requires valid FX node origins for graph manipulation
+    5. Builds environment mapping from name_to_users for FX node lookup
+
+    Algorithm:
+    1. Build FX node environment from name_to_users
+    2. For each eligible operation in graph.operations:
+       a. Trace inner_fn to extract operation structure
+       b. Filter to compute operations (exclude load/store/get_index)
+       c. Propagate dtypes through the trace
+       d. Create intermediate buffers for all but last operation
+       e. Update final buffer to load from intermediates
+
+    Args:
+        graph: GraphLowering instance containing operations to process
+    """
     gl = V.graph
+    # Skip if in graph lowering context
     if not (hasattr(gl, "graph") and hasattr(gl, "run_node")):
         return
+
+    # Build environment mapping FX nodes to TensorBox for node lookup
     env = {}
     for tbs in gl.name_to_users.values():
         for tb in tbs:
@@ -344,6 +592,7 @@ def split_multi_ops(graph: GraphLowering):
                 env[fx_node] = tb
     gl.env.update(env)
 
+    operations = graph.operations
     for op in list(operations):
         if not (
             isinstance(op, ComputedBuffer)
@@ -351,10 +600,13 @@ def split_multi_ops(graph: GraphLowering):
             and isinstance(op.layout, FixedLayout)
         ):
             continue
+
         trace = _trace_inner_fn(op)
         if not trace:
             continue
+
         compute_ops = _get_compute_ops(trace)
+        # Skip if nothing to split
         if len(compute_ops) <= 1:
             continue
 
@@ -368,13 +620,16 @@ def split_multi_ops(graph: GraphLowering):
         except ValueError:
             continue
 
-        intermediate_ops, final_op = compute_ops[:-1], compute_ops[-1]
+        # Skip if no FX graph origin node
         if not op.origins:
             continue
+
         orig_node = next(iter(op.origins))
+        # Skip if orgin node is not FX graph node
         if not isinstance(orig_node, fx.Node):
             continue
 
+        intermediate_ops, final_op = compute_ops[:-1], compute_ops[-1]
         _make_intermediate_bufs(
             intermediate_ops,
             dtype_map,
@@ -387,7 +642,7 @@ def split_multi_ops(graph: GraphLowering):
         )
         _update_original_buf(op, final_op, bufname_map, const_map, operations)
         logger.info(
-            "split_multi_op: '%s' → %d intermediate buffers",
+            "split_multi_op: '%s' -> %d intermediate buffers",
             op.get_name(),
             len(intermediate_ops),
         )
