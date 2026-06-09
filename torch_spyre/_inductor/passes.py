@@ -40,6 +40,7 @@ from .logging_utils import get_inductor_logger
 from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
+    mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
 )
@@ -209,6 +210,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 recover_spyre_hints,
                 convert_constant_with_graph_node,
                 mm_to_bmm_pass.apply,
+                mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
             ]
         )
