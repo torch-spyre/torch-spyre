@@ -43,6 +43,7 @@ from .codegen.superdsc import (
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
+from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
 
 logger = get_inductor_logger("pass_utils")
@@ -486,25 +487,6 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
     """
     if "custom" in src.meta:
         dst.meta["custom"] = src.meta["custom"]
-
-
-_SPYRE_METADATA_ATTRS = (
-    "dim_hints",
-    "loop_group_id",
-    "loop_count",
-    "loop_tiled_dims",
-)
-
-
-def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
-    """Copy all Spyre pass metadata from src to dst.
-
-    Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    dim_hints and coarse-tiling attrs are not silently dropped.
-    """
-    for attr in _SPYRE_METADATA_ATTRS:
-        if hasattr(src, attr):
-            setattr(dst, attr, getattr(src, attr))
 
 
 def replace_computed_buffer_body(

@@ -34,6 +34,12 @@ COPY_BACK_CANDIDATE_ATTR = "_spyre_copy_back_candidate"
 # compute mutation op from a pure-copy mutation op.
 ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
 
+# FX ``custom`` metadata key for BMMs created from a shared 2D weight whose
+# logical batch dim is statically 1.  The downstream OpSpec key carries the same
+# fact after lowering, where FX metadata is no longer directly available.
+SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY = "_spyre_shared_weight_unit_bmm"
+SHARED_WEIGHT_UNIT_BMM_INFO_KEY = "shared_weight_unit_bmm"
+
 
 SEGMENT_OFFSETS = [
     0x0,

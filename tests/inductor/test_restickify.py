@@ -55,8 +55,8 @@ def _compile_and_run_plan_capture(fn, *args):
     captured = {}
     finalize_layouts = _passes.finalize_layouts
 
-    def capturing_finalize_layouts(operations):
-        finalize_layouts(operations)
+    def capturing_finalize_layouts(graph):
+        finalize_layouts(graph)
         captured["plan"] = dict(V.graph.restickify_plan)
 
     with patch.object(_passes, "finalize_layouts", capturing_finalize_layouts):
