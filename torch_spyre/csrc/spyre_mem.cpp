@@ -726,37 +726,33 @@ const at::Tensor& spyre_resize_(
               "Spyre backend does not support dtype ", dtype);
 
   auto* self_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
-  // Compute the new layout upfront: the device-byte count from the STL
-  // (which accounts for stick-padding) determines whether the existing
-  // allocation is large enough, not the raw logical byte count.
+  // Use STL device bytes (stick-padded) to determine if existing allocation
+  // suffices.
   auto new_layout = SpyreTensorLayout(size_int.vec(), dtype);
   const size_t new_device_bytes = get_device_size_in_bytes(new_layout);
   const size_t new_cpu_bytes =
       at::detail::computeStorageNbytesContiguous(size_int, self.itemsize());
   const size_t new_size_bytes = std::max(new_device_bytes, new_cpu_bytes);
-  // Case 2: Same-numel or shrink — reinterpret storage with a new layout.
-  //
-  // No data is moved.  The existing device bytes are reinterpreted under a
-  // fresh row-major SpyreTensorLayout for the new shape.  Consistent with
-  // upstream PyTorch, resize_() provides no element-ordering guarantee
-  // across shape changes.
+  // Case 2: Same-numel or shrink — reinterpret storage in-place, no data moved.
+  // Only valid when new last dim ≤ old last dim; otherwise D2H reads into stick
+  // padding.
   const int64_t new_numel = c10::multiply_integers(size_int);
-  if (new_size_bytes <= self.storage().nbytes() && new_numel <= self.numel()) {
+  const bool last_dim_ok = size_int.empty() || self.sizes().empty() ||
+                           size_int.back() <= self.sizes().back();
+  if (new_size_bytes <= self.storage().nbytes() && new_numel <= self.numel() &&
+      last_dim_ok) {
     self_impl->set_sizes_contiguous(size_int);
-    // self_impl->spyre_layout = new_layout;
-    // self_impl->dma_sizes = size_int.vec();
-    // self_impl->dma_strides = self_impl->strides().vec();
+    self_impl->spyre_layout = new_layout;
+    self_impl->dma_sizes = size_int.vec();
+    self_impl->dma_strides = self_impl->strides().vec();
     DEBUGINFO("resize_ to shape=", size_int,
               " layout=", self_impl->spyre_layout.toString());
     return self;
   }
-  // Case 3: Expand — allocate new storage and copy existing data via CPU.
-  //
-  // TODO(kunuruabhishek): Enhance to avoid the D2H -> CPU resize_ -> H2D
-  // round-trip once restickify supports cross-layout D2D copies (i.e., src and
-  // dst tensors with different stick dimensions).
-  // new_layout and new_size_bytes already computed above; reuse them.
-  // D2H — capture old data before storage swap.
+  // Case 3: Reallocate — D2H → CPU resize_ → H2D. Handles expand and any
+  // reshape where the new last dim > old last dim (stick-layout incompatible).
+  // TODO(kunuruabhishek): avoid round-trip once restickify supports
+  // cross-layout D2D copies.
   at::Tensor cpu_buf = self.cpu();
   cpu_buf.resize_(size_int);
   auto new_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
@@ -767,7 +763,6 @@ const at::Tensor& spyre_resize_(
   self_impl->spyre_layout = new_layout;
   self_impl->dma_sizes = size_int.vec();
   self_impl->dma_strides = self_impl->strides().vec();
-  // H2D — copy directly into self; no intermediate tensor needed.
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
   DEBUGINFO("resize_ expand to shape=", size_int,
             " layout=", self_impl->spyre_layout.toString());

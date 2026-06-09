@@ -23,11 +23,23 @@ import torch
 _tests_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_tests_dir)
 
-from inductor.utils_inductor import ParameterizedTestMeta, cached_randn  # type: ignore[attr-defined]  # noqa: E402
+from inductor.utils_inductor import ParameterizedTestMeta  # type: ignore[attr-defined]  # noqa: E402
 
 import torch_spyre  # noqa: F401, E402
 
 DTYPE = torch.float16
+
+
+def _identifiable_tensor(shape):
+    """Sequential integers 0..numel-1 reshaped to `shape`.
+
+    Unique values detect corruption after resize_() without assuming element
+    ordering. All values are exact in float16 (< 2048).
+    """
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return torch.arange(numel, dtype=DTYPE).reshape(shape)
 
 
 class TestResize(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -82,58 +94,56 @@ class TestResize(unittest.TestCase, metaclass=ParameterizedTestMeta):
     }
 
     def test_same_numel(self, orig_shape, new_shape):
-        """resize_ to a shape with the same numel updates shape and numel.
-
-        resize_() reinterprets the existing device storage with a fresh
-        row-major SpyreTensorLayout for the new shape.  PyTorch's resize_()
-        contract does not guarantee element ordering after a shape change, so
-        only shape and numel are verified here.
-        """
-        t = cached_randn(tuple(orig_shape), dtype=DTYPE).to("spyre")
+        """Same-numel resize_ reinterprets storage in-place; full element set survives."""
+        t_cpu = _identifiable_tensor(orig_shape)
+        t = t_cpu.to("spyre")
         orig_numel = t.numel()
 
         t.resize_(*new_shape)
 
         self.assertEqual(list(t.shape), new_shape)
         self.assertEqual(t.numel(), orig_numel)
-        # Verify D2H copy completes without error and returns correct shape.
-        self.assertEqual(list(t.cpu().shape), new_shape)
+        result = t.cpu()
+        self.assertEqual(list(result.shape), new_shape)
+        # Permutation of originals — no corrupted or lost elements.
+        self.assertEqual(
+            sorted(result.flatten().tolist()), sorted(t_cpu.flatten().tolist())
+        )
 
     def test_shrink(self, orig_shape, new_shape):
-        """resize_ to a smaller shape updates shape and numel.
-
-        resize_() reinterprets the existing device storage with a fresh
-        row-major SpyreTensorLayout for the new shape.  PyTorch's resize_()
-        contract does not guarantee element ordering after a shape change, so
-        only shape and numel are verified here.
-        """
-        t = cached_randn(tuple(orig_shape), dtype=DTYPE).to("spyre")
+        """Shrink resize_ reinterprets a storage slice; surviving elements are genuine."""
+        t_cpu = _identifiable_tensor(orig_shape)
+        t = t_cpu.to("spyre")
         orig_numel = t.numel()
+        orig_values = set(t_cpu.flatten().tolist())
 
         t.resize_(*new_shape)
 
         self.assertEqual(list(t.shape), new_shape)
         self.assertLessEqual(t.numel(), orig_numel)
-        # Verify D2H copy completes without error and returns correct shape.
-        self.assertEqual(list(t.cpu().shape), new_shape)
+        result = t.cpu()
+        self.assertEqual(list(result.shape), new_shape)
+        result_values = result.flatten().tolist()
+        # Subset of originals — no duplicated or corrupted elements.
+        self.assertEqual(len(result_values), len(set(result_values)))
+        self.assertTrue(set(result_values).issubset(orig_values))
 
     def test_expand(self, orig_shape, new_shape):
-        """resize_ to a larger shape updates shape and numel.
-
-        resize_() reinterprets the existing device storage with a fresh
-        row-major SpyreTensorLayout for the new shape.  PyTorch's resize_()
-        contract does not guarantee element ordering after a shape change, so
-        only shape and numel are verified here.
-        """
-        t = cached_randn(tuple(orig_shape), dtype=DTYPE).to("spyre")
+        """Expand resize_ (D2H → CPU resize_ → H2D) preserves original elements verbatim."""
+        t_cpu = _identifiable_tensor(orig_shape)
+        t = t_cpu.to("spyre")
         orig_numel = t.numel()
 
         t.resize_(*new_shape)
 
         self.assertEqual(list(t.shape), new_shape)
         self.assertGreaterEqual(t.numel(), orig_numel)
-        # Verify D2H copy completes without error and returns correct shape.
-        self.assertEqual(list(t.cpu().shape), new_shape)
+        result = t.cpu()
+        self.assertEqual(list(result.shape), new_shape)
+        # The original elements must survive at their original flat positions.
+        self.assertEqual(
+            result.flatten()[:orig_numel].tolist(), t_cpu.flatten().tolist()
+        )
 
 
 if __name__ == "__main__":
