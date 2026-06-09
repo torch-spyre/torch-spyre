@@ -2785,15 +2785,5 @@ class TestReductionIdentityValues(unittest.TestCase):
             _reduction_identity_value("welford_reduce", torch.float16)
 
 
-class TestStampGroupReductionDim(unittest.TestCase):
-    """_stamp_group populates loop_tiled_reduction_dims for reduction-dim hints.
-
-    The detailed correctness of loop_tiled_reduction_dims population (that the
-    fill+combine buffers are inserted, that consumers are patched, that numerical
-    results match CPU) is covered by TestCoarseTileReductionE2E in
-    test_coarse_tile_e2e.py, which runs end-to-end on the Spyre device.
-    """
-
-
 if __name__ == "__main__":
     unittest.main()

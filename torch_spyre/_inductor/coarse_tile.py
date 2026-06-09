@@ -310,7 +310,9 @@ def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> b
     try:
         rw = op.get_read_writes()
         out_dep = next(iter(rw.writes))
-    except (StopIteration, Exception):
+    except (StopIteration, AttributeError, TypeError):
+        # StopIteration: mocked ops in unit tests have empty rw.writes.
+        # AttributeError/TypeError: guard against partially constructed mocks.
         return False
     out_syms = set(out_dep.index.free_symbols)
     in_dep = next((d for d in rw.reads if hasattr(d, "index")), None)
@@ -965,6 +967,12 @@ def _stamp_group(
     outermost first.  Each op resolves its own tiled dimension from its
     loop_var in dim_hints.  Ops that have no matching dim for a level are
     loop-invariant at that level.
+
+    For reduction-dim levels (``is_reduction_level=True``), the resolved dim
+    index populates ``loop_tiled_reduction_dims`` and ``_divide_reduction_ranges``
+    is called instead of ``_divide_ranges``.  End-to-end correctness of this
+    path is covered by ``TestCoarseTileReductionDim0E2E`` in
+    ``tests/inductor/test_coarse_tile_e2e.py``.
     """
     if not ops:
         return

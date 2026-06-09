@@ -978,8 +978,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
             torch.compile(fn)(x_dev)
 
-    def test_hint_tiled_reduction_sum_correct(self):
-        """x.sum(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
+    def test_hint_tiled_reduction_sum_rejects(self):
+        """x.sum(dim=-1) with D hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1018,8 +1018,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
             torch.compile(fn)(a_dev, b_dev)
 
-    def test_hint_tiled_reduction_matmul_correct(self):
-        """torch.matmul tiled over K raises: stick-dim reduction not yet supported."""
+    def test_hint_tiled_reduction_matmul_rejects(self):
+        """torch.matmul with K hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 64, 512, 32
@@ -1058,8 +1058,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
             torch.compile(fn)(x_dev)
 
-    def test_hint_tiled_reduction_max_correct(self):
-        """x.amax(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
+    def test_hint_tiled_reduction_max_rejects(self):
+        """x.amax(dim=-1) with D hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1094,8 +1094,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
             torch.compile(fn)(x_dev)
 
-    def test_hint_tiled_reduction_min_correct(self):
-        """x.amin(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
+    def test_hint_tiled_reduction_min_rejects(self):
+        """x.amin(dim=-1) with D hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
