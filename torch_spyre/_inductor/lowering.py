@@ -23,7 +23,13 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP, COPY_BACK_CANDIDATE_ATTR, BATCH_MATMUL_FP8_OP
+from .constants import (
+    BATCH_MATMUL_OP,
+    COPY_BACK_CANDIDATE_ATTR,
+    BATCH_MATMUL_FP8_OP,
+    SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
+)
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -43,6 +49,15 @@ _lowerings_nesting = 0
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
 spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
+
+
+def _current_fx_custom_meta() -> dict[str, Any]:
+    node = V.get_current_node()
+    meta = getattr(node, "meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    custom = meta.get("custom")
+    return custom if isinstance(custom, dict) else {}
 
 
 def register_spyre_lowering(
@@ -444,11 +459,18 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
 
+    custom_meta = _current_fx_custom_meta()
+    op_info = {}
+    if SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY in custom_meta:
+        op_info[SHARED_WEIGHT_UNIT_BMM_INFO_KEY] = custom_meta[
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
+        ]
+
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        result = Reduction.create(
+        reduction_kwargs = dict(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -458,6 +480,10 @@ def lower_bmm(x, y):
             ranges=ranges,
             reduction_ranges=[reduction_numel],
         )
+        if op_info:
+            result = SpyreReduction.create(op_info=op_info, **reduction_kwargs)
+        else:
+            result = Reduction.create(**reduction_kwargs)
 
     result.realize()
 
