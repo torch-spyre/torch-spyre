@@ -133,7 +133,7 @@ op.loop_info = CoarseTileInfo(
 ```
 
 `_divide_ranges` is applied once per level in outermost-first order (the
-`hint_id` in each `(hint_id, K, tiled_dims)` triple is used only for
+`hint_id` in each `(hint_id, K, is_reduction_level)` triple is used only for
 per-op `dim_index` lookup, not by `_divide_ranges` itself):
 
 1. Outer level `(K=2, dim 0)`: `data.ranges [1024, 4096] → [512, 4096]`
@@ -396,23 +396,27 @@ class CoarseTileInfo:
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
+    loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
 | `loop_group_id` | `tuple[int, ...]` | Nesting-path tuple identifying which loop group this op belongs to. Its length equals the nesting depth. All ops sharing the same tuple form the body of the innermost counted loop at that path. |
 | `loop_count` | `list[sympy.Expr]` | Trip counts, one per nesting level from outermost to innermost. For a flat (depth-1) group this is a 1-element list `[K]`. For a two-level nested group it is `[K1, K2]`. All ops sharing the same `loop_group_id` must agree on the count at every level. |
-| `loop_tiled_dims` | `list[list[int]]` | Per-level positional indices into `data.ranges` that are divided by the corresponding count. For a flat group: `[[0]]` (tile only dim 0). For a two-level nested group: `[[0], [1]]` (outer loop tiles dim 0, inner loop tiles dim 1). Different ops in the same group may carry different indices if their iteration spaces are shaped differently. |
+| `loop_tiled_dims` | `list[list[int]]` | Per-level positional indices into `data.ranges` (the output iteration space) that are divided by the corresponding count. For a flat group: `[[0]]` (tile only dim 0). For a two-level nested group: `[[0], [1]]`. An empty sub-list means the op is loop-invariant at that level in the output space. |
+| `loop_tiled_reduction_dims` | `list[list[int]]` | Per-level positional indices into `data.reduction_ranges` that are tiled at that level. Parallel to `loop_tiled_dims`. An empty sub-list means no reduction dim is tiled at that level. Defaults to `[]` for backward compatibility (pure output-dim tiling). |
 
 The pass also **rewrites the op's iteration ranges**: for each level, the
 dimensions at the corresponding indices in `loop_info.loop_tiled_dims` are
 divided by the corresponding count in `loop_info.loop_count`, so that each
 inner `OpSpec` describes only the work done per innermost-loop iteration.
+For reduction-dim tiling, the indices in `loop_tiled_reduction_dims` drive
+division of `data.reduction_ranges` instead of `data.ranges`.
 
 `loop_group_id` is a tuple rather than a flat integer to support nested
 loops.  See "Nested loops and the `loop_group_id` tree" below.
 
-### Why these three fields are sufficient
+### Why these four fields are sufficient
 
 `loop_count` is redundant across all ops sharing the same `loop_group_id`
 (they must agree), but keeping it on each op means the post-fusion pass does
@@ -420,12 +424,22 @@ not need to maintain a separate side table.  The `loop_group_id` is the join
 key.  `loop_tiled_dims` is the bridge between the pre-scheduling pass (which
 operates on positional `data.ranges` indices) and the codegen phase (which
 uses named sympy Symbols) — it is read by `create_op_spec` to identify, by
-index, which scheduler-level symbols correspond to the tiled dimensions and
-should be recorded in `OpSpec.tiled_symbols`.  All levels are flattened
+index, which scheduler-level symbols correspond to the tiled output dimensions
+and should be recorded in `OpSpec.tiled_symbols`.  All levels are flattened
 (outermost first) so that `tiled_symbols` covers every loop variable for the
 op.  Using a list-of-lists of indices (rather than a count or a flag) allows
 different ops in the same loop to tile non-contiguous or differently
 positioned dimensions of their respective iteration spaces.
+
+`loop_tiled_reduction_dims` plays the same bridging role for reduction-dim
+tiling.  For a `Reduction` op, `iteration_space()` returns `reads.ranges`,
+which has output-dim symbols first and reduction-dim symbols last.
+`create_op_spec` determines the split point by counting the output-side write
+dep's ranges (`n_output_syms = len(write_dep.ranges)`), then indexes
+`it_space_keys[n_output_syms + r]` for each reduction-dim index `r` in the
+flattened `loop_tiled_reduction_dims`.  These symbols are appended to
+`tiled_syms` so the runtime correctly advances the input tensor pointer
+between tiles.
 
 Crucially, `loop_tiled_dims` is **per-op**: `_stamp_group` consults each
 op's own `DimHint.dim_index` for each nesting level rather than applying a
@@ -466,56 +480,53 @@ Each group tuple has the form:
 (ops, levels)
 ```
 
-where `levels` is a list of `(hint_id, K, tiled_dims)` triples, outermost
-first:
+where `levels` is a list of `(hint_id, K, is_reduction_level)` triples,
+outermost first:
 
 ```python
-(ops, [(hint_id_0, K1, [dim_0]), (hint_id_1, K2, [dim_1])])
+(ops, [(hint_id_0, K1, False), (hint_id_1, K2, True)])
 ```
 
 `hint_id` is the integer ID assigned by the enclosing `spyre_hint` scope
-(smaller IDs are outer scopes).  It is used to match each level's tiling
-against the per-op `DimHint` entries so that ops which lack a particular
-dimension (e.g. broadcast ops) get an empty `tiled_dims` for that level
-rather than an incorrect positional index.
+(smaller IDs are outer scopes).  `is_reduction_level` is `True` when the
+hinted dimension is a reduction dimension (i.e. the `DimHint` was derived
+from a reduction-ranges position).  `tiled_dims` are **not** in the triple
+— they are derived per-op inside `_stamp_group` by consulting each op's
+own `DimHint.loop_var` so that ops which lack a particular dimension
+(e.g. broadcast ops, or `Pointwise` ops in a reduction-level group) get
+an empty sub-list rather than an incorrect positional index.
 
 `_stamp_group` always receives this canonical list-of-triples
-representation; normalisation from user-facing flat syntax is performed by
-`hints_to_coarse_tile_groups` in `temp_passes.py` before `coarse_tile()`
-is called.
+representation; it is built by `_hints_levels()` inside
+`hints_to_coarse_tile_groups` in `coarse_tile.py` before `coarse_tile()`
+stamps each op.
 
 ### Groups derivation and placement in `CustomPreSchedulingPasses`
 
 Groups are derived automatically from `spyre_hint(slices=...)` annotations
-via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/temp_passes.py`),
-which is a no-op when no hints are present.  Coarse tiling runs only when
-the returned groups list is non-empty:
+via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/coarse_tile.py`),
+which is a no-op when no hints are present.  `CustomPreSchedulingPasses`
+maintains a `self.passes` list of uniform `Callable[[GraphLowering], None]`
+entries, run in order by `__call__`.  Config-gated or multi-step groups are
+wrapped in private helpers tagged with `@_runs(...)` for cache-key purposes:
 
 ```python
-deadcode_elimination(operations)
-propagate_spyre_tensor_layouts(operations)
-optimize_restickify_locations(operations)
-finalize_layouts(operations)
-insert_restickify(operations)
-insert_bmm_padding(operations)
-dedup_and_promote_constants(operations)
-if config.chunk_large_tensors:
-    chunk_large_tensors(operations)
-propagate_named_dims(operations)
-assign_dim_hints(operations)
-groups = hints_to_coarse_tile_groups(operations)
-if groups:
-    coarse_tile(operations, groups=groups)
-span_reduction(operations)
-cost_model_ops = cost_model_matmul_division(operations)
-work_distribution(operations, cost_model_ops)
-if config.lx_planning:
-    allocator = (
-        StrategyBCoOptimizingAllocator()
-        if config.co_optimizing_lx_planning
-        else None
-    )
-    scratchpad_planning(graph, allocator=allocator)
+self.passes = [
+    deadcode_elimination,
+    propagate_spyre_tensor_layouts,
+    optimize_restickify_locations,
+    finalize_layouts,
+    insert_restickify,
+    insert_bmm_padding,
+    dedup_and_promote_constants,
+    _maybe_chunk_large_tensors,   # config-gated
+    propagate_named_dims,
+    assign_dim_hints,
+    _maybe_coarse_tile,           # calls hints_to_coarse_tile_groups + coarse_tile
+    span_reduction,
+    _distribute_work,             # calls cost_model_matmul_division + work_distribution
+    _maybe_scratchpad_planning,   # config-gated; calls scratchpad_planning
+]
 ```
 
 This ordering is required by several constraints:
@@ -621,19 +632,65 @@ existing storage in-place.  The full buffer's address is encoded in the
 unified treatment that always inserted a copy would handle all three cases
 correctly but waste a copy op here.
 
-#### Reduction safety checks
+#### Reduction tiling: Stage 1 (non-stick reduction dims)
 
-Before running the propagation logic for a `Reduction` op, the pass calls
-`_check_reduction_tiling_safety(op)` which raises `RuntimeError` in two
-unsupported configurations:
+When a `Reduction` op has a non-empty `loop_tiled_reduction_dims`
+(i.e. the hint named a reduction dimension), `_propagate_tiled_reduction_op`
+uses a **fill-initialize + per-tile combine** pattern:
 
-- **Matrix multiply** (`reduction_type == "batchmatmul"`) inside a tiling
-  loop — the accumulation semantics are not handled.
-- **Tiled reduction dim** — if any entry in `loop_info.loop_tiled_dims` is
-  `>= len(data.ranges)`, the tiled index falls in `reduction_ranges`.
-  Accumulation-buffer support for this case is not yet implemented.
+1. **Allocate an HBM accumulation buffer** with the full output shape
+   (`data.ranges`, which is already the full output since only
+   `reduction_ranges` was divided by the tiling pass).
+2. **Insert a fill op** (outside the loop, no `loop_info`) that writes the
+   reduction's identity value into the accumulation buffer.  The identity
+   value is produced by a `SpyreConstantFallback` scalar with a manually
+   assigned `FixedTiledLayout` (necessary because `finalize_layouts` has
+   already run by the time this pass executes).
+3. **Insert a combine op** (inside the loop, same `loop_info` as the tiled
+   reduction op) that merges each tile's partial result into the accumulation
+   buffer using the appropriate pointwise binary operator.
+4. **Mark the tiled reduction op's output `per_tile_fixed`** — it is a
+   per-tile scratch buffer whose base address does not advance between
+   iterations.
+5. **Patch outside consumers** to read the accumulation buffer.
 
-Both checks happen before any buffer allocation, so the error is clean.
+Identity values and combine operators by `reduction_type`:
+
+| `reduction_type` | Identity | Combine |
+|---|---|---|
+| `sum` | 0 | `add` |
+| `prod` | 1 | `mul` |
+| `max` | −∞ (`-torch.inf`) | `maximum` |
+| `min` | +∞ (`torch.inf`) | `minimum` |
+| `xor_sum` | 0 | `bitwise_xor` |
+| `any` | 0 | `logical_or` |
+
+`argmin` and `argmax` do not have element-wise combine operators and raise
+`RuntimeError` when a user attempts to tile them.
+
+Before running propagation, the pass calls `_validate_reduction_tiling(op)`,
+which raises `RuntimeError` for configurations deferred to Stage 2:
+
+- **Stick-dim reduction** — if the tiled reduction index corresponds to the
+  within-stick dimension of the primary input (detected via
+  `device_coordinates`).
+- **Mixed output+reduction at the same nesting level** — `loop_tiled_dims[i]`
+  and `loop_tiled_reduction_dims[i]` are both non-empty for some level `i`.
+- **Mixed output+reduction across different levels** — some levels tile only
+  output dims, others tile only reduction dims.
+- **Multiple reduction indices at one level** — `len(loop_tiled_reduction_dims[i]) > 1`.
+
+The cross-level mixed check runs first (before the per-level loop) so Stage 2
+errors are raised before `_reduction_tiling_is_on_stick_dim` is called, which
+requires a real `get_read_writes()` result.
+
+**Stage 2 (not yet implemented):** Stick-dim reduction tiling requires
+handling the column-vector output addressing that arises when the tiling
+dimension is the innermost (stick) dimension of the input.  The
+`loop_tiled_reduction_dims` field is already shaped as a `list[list[int]]`
+to anticipate multi-level nesting; relaxing the Stage 2 guard in
+`_validate_reduction_tiling` and adding stick-dim output addressing is the
+only remaining work.
 
 ## Layer 2 — `CountedLoopSchedulerNode`
 
@@ -958,6 +1015,17 @@ from the scheduler-level `iteration_space` dict.  `MemoryDep.ranges`
 preserves the `data.ranges` ordering, so this positional correspondence is
 stable across the pre-scheduling to codegen boundary.
 
+For reduction-dim tiling, `create_op_spec` also consults
+`loop_info.loop_tiled_reduction_dims`.  For a `Reduction` op,
+`iteration_space()` returns `reads.ranges`, which has output-dim symbols
+first and reduction-dim symbols last.  `create_op_spec` finds the split
+point as `n_output_syms = len(write_dep.ranges)` (the number of symbols in
+the write dep's ranges), then appends `it_space_keys[n_output_syms + r]` for
+each index `r` in the flattened `loop_tiled_reduction_dims`.  Without this,
+`tiled_syms` would be empty for reduction-dim tiling (since
+`loop_tiled_dims` is `[[]]`) and the runtime would not advance the input
+tensor pointer between tiles, producing incorrect results.
+
 `tiled_symbols` is omitted from the serialized source when empty (i.e. for ops
 or loop specs where no dimension is tiled), keeping the generated output
 identical to the pre-tiling baseline for non-tiled kernels.
@@ -1052,7 +1120,7 @@ When backend support lands, `unroll_loops` will be flipped to default
 | `torch_spyre/_inductor/passes.py` | Wires all passes into `CustomPreSchedulingPasses` and `CustomPreFusionPasses` |
 | `torch_spyre/_inductor/propagate_hints.py` | `spyre_hint()` context manager; `DimHint`; hint collection/recovery across AOT re-tracing |
 | `torch_spyre/_inductor/propagate_named_dims.py` | `propagate_named_dims()` and `assign_dim_hints()`: attach `dim_hints` to `ir.Operation` objects |
-| `torch_spyre/_inductor/temp_passes.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile()` group tuples |
+| `torch_spyre/_inductor/coarse_tile.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile()` group tuples; also `coarse_tile()` entry point |
 | `tests/inductor/test_coarse_tiling.py` | Unit tests: IR pass, propagation, scheduler node, bundle MLIR output |
 | `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests |
 | `tests/inductor/test_unroll_loop_specs.py` | Unit tests for `unroll_loop_specs` |
