@@ -16,4 +16,5 @@ self-hosted-runner:
     - spyre_pf_x12
     - linux
     - image_torch_spyre
+    - sudo_image_torch_spyre
     - image_spyre_inference
