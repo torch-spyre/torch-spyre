@@ -38,10 +38,13 @@ No Spyre device or backend compiler is required.
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sympy import Integer, Symbol, simplify, sympify  # noqa: F401
+from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
+import torch
+from torch import fx
 from torch._inductor.utils import IndentedBuffer
 from torch.utils._ordered_set import OrderedSet
 
@@ -52,7 +55,16 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _tiled_byte_stride,
     generate_sdsc,
 )
-from torch_spyre._inductor.codegen.superdsc import SDSCArgs, SDSCSpec, compile_op_spec
+from torch_spyre._inductor.codegen.superdsc import (
+    SDSCArgs,
+    SDSCSpec,
+    compile_op_spec,
+    parse_op_spec,
+)
+from torch_spyre._inductor.constants import (
+    SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
+)
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.coarse_tile import coarse_tile, _divide_ranges
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -62,7 +74,13 @@ from torch_spyre._inductor.scheduler import (
     _loop_group_id,
     build_loop_scheduler_nodes,
 )
-from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list, _iter_op_specs
+from torch_spyre._inductor.spyre_kernel import (
+    _codegen_op_spec_list,
+    _iter_op_specs,
+    _preserve_shared_weight_unit_bmm_dim,
+    _shared_weight_unit_bmm_info_from_sizes,
+)
+from torch_spyre._inductor.temp_passes import bmm_unflatten_pass
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -204,6 +222,16 @@ def _make_non_computed_op(name="extern0"):
     op = MagicMock(spec=Operation)
     op.get_operation_name.return_value = name
     return op
+
+
+def _graph(operations):
+    """Wrap an ops list as the GraphLowering-like object coarse_tile() expects.
+
+    coarse_tile() only reads ``graph.operations`` and mutates that list in
+    place, so a namespace over the same list reproduces the real GraphLowering
+    behavior for these unit tests.
+    """
+    return SimpleNamespace(operations=operations)
 
 
 # ---------------------------------------------------------------------------
@@ -618,11 +646,14 @@ class TestCoarseTile(unittest.TestCase):
     def tearDown(self):
         self._patch.stop()
 
+    def _run(self, all_ops, groups, **kwargs):
+        coarse_tile(_graph(all_ops), groups, **kwargs)
+
     def test_empty_groups_list_is_noop(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data, "op0")
         original = list(data.ranges)
-        coarse_tile([op], [])
+        coarse_tile(_graph([op]), [])
         self.assertFalse(hasattr(op, "loop_info") and op.loop_info != MagicMock())
         self.assertEqual(data.ranges, original)
 
@@ -631,7 +662,7 @@ class TestCoarseTile(unittest.TestCase):
         data = _make_pointwise([Integer(16)])
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile(
-            [op_extern, op_computed],
+            _graph([op_extern, op_computed]),
             [([op_extern, op_computed], [(0, Integer(2))])],
         )
         self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
@@ -642,7 +673,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile([op], [([op], [(0, k)])])
+        coarse_tile(_graph([op]), [([op], [(0, k)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -654,7 +685,7 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile([op0, op1, op2], [([op0, op2], [(0, Integer(4))])])
+            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -663,7 +694,7 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile([op_known], [([op_unknown], [(0, Integer(2))])])
+            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
 
 
 class TestCoarseTileNested(unittest.TestCase):
@@ -682,7 +713,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -690,14 +721,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(8))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -709,7 +740,7 @@ class TestCoarseTileNested(unittest.TestCase):
         op0 = _make_hinted_op(d0, "op0", hints=((1, 0),))
         op1 = _make_hinted_op(d1, "op1", hints=((2, 0), (3, 1)))
         coarse_tile(
-            [op0, op1],
+            _graph([op0, op1]),
             [
                 ([op0], [(1, Integer(4))]),
                 ([op1], [(2, Integer(4)), (3, Integer(2))]),
@@ -729,7 +760,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile([op], [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -1154,6 +1185,119 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         self.assertIn("affine.apply", mlir)
         self.assertIn("affine_map", mlir)
         self.assertIn("scf.for", mlir)
+
+
+class TestSharedWeightUnitBmmLayout(unittest.TestCase):
+    def _static_bmm_custom_meta(self, x_shape, y_shape, out_shape):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = SimpleNamespace(shape=x_shape)
+        y = graph.placeholder("y")
+        y.meta["val"] = SimpleNamespace(shape=y_shape)
+        bmm = graph.call_function(torch.ops.aten.bmm.default, args=(x, y))
+        bmm.meta["val"] = SimpleNamespace(shape=out_shape)
+        graph.output(bmm)
+
+        bmm_unflatten_pass.apply(fx.GraphModule({}, graph).graph)
+        graph.lint()
+        return bmm.meta.get("custom") or {}
+
+    def test_marked_squeezed_unit_bmm_recovers_sendnn_like_unit_layout(self):
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[512, 64, 1, 64],
+            device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
+            allocation={"hbm": 0},
+            stride_map=[4096, 64, -1, 1],
+        )
+        kernel_arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[200, 4096, 64],
+            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
+            allocation={"hbm": 0x400000000},
+            stride_map=[64, 12800, 1],
+        )
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[512, 200, 1, 64],
+            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
+            allocation={"hbm": 0x800000000},
+            stride_map=[12800, 64, -1, 1],
+        )
+        for arg in (input_arg, output_arg):
+            del arg.device_size[-2]
+            del arg.device_coordinates[-2]
+            del arg.stride_map[-2]
+        iteration_space = {
+            c0: (Integer(512), 4),
+            c1: (Integer(12800), 8),
+            c2: (Integer(4096), 1),
+        }
+        args = [input_arg, kernel_arg, output_arg]
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
+
+        iteration_space = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul", iteration_space, args, op_info
+        )
+        sdsc_spec, _ = parse_op_spec(
+            OpSpec(
+                op="batchmatmul",
+                is_reduction=True,
+                iteration_space=iteration_space,
+                args=args,
+                op_info=op_info,
+            )
+        )
+
+        self.assertEqual(
+            [str(dim) for dim in sdsc_spec.iteration_space],
+            ["x", "mb", "out", "in"],
+        )
+        input_layout = sdsc_spec.layouts[sdsc_spec.args[0].layout]
+        output_layout = sdsc_spec.layouts[sdsc_spec.args[-1].layout]
+        self.assertEqual(
+            [str(dim) for dim in input_layout["dim_order"]],
+            ["mb", "in", "x"],
+        )
+        self.assertEqual(
+            [str(dim) for dim in output_layout["dim_order"]],
+            ["mb", "out", "x"],
+        )
+
+    def test_shared_weight_marker_requires_stick_aligned_dims(self):
+        self.assertEqual(
+            self._static_bmm_custom_meta(
+                (1, 512, 4096), (1, 4096, 12800), (1, 512, 12800)
+            )[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY],
+            {"batch_dim": 0},
+        )
+        self.assertNotIn(
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+            self._static_bmm_custom_meta(
+                (4, 512, 4096), (4, 4096, 12800), (4, 512, 12800)
+            ),
+        )
+        self.assertIsNone(
+            _shared_weight_unit_bmm_info_from_sizes(
+                [4, 512, 4096], [4, 4096, 12800], [4, 512, 12800]
+            )
+        )
+        self.assertNotIn(
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+            self._static_bmm_custom_meta((1, 55, 2), (1, 2, 99), (1, 55, 99)),
+        )
+        self.assertIsNone(
+            _shared_weight_unit_bmm_info_from_sizes([1, 55, 2], [2, 99], [1, 55, 99])
+        )
 
 
 # ===========================================================================

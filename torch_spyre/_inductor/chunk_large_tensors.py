@@ -22,6 +22,7 @@ before ``span_reduction``.  Each chunk becomes a normal
 import math
 
 from dataclasses import dataclass
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -423,7 +424,7 @@ def _chunk_op(
     return n_inserted
 
 
-def chunk_large_tensors(operations: list[Operation]) -> None:
+def chunk_large_tensors(graph: GraphLowering) -> None:
     """Split pointwise ops whose device footprint exceeds the limit.
 
     Must run **after** ``propagate_spyre_tensor_layouts`` /
@@ -435,6 +436,7 @@ def chunk_large_tensors(operations: list[Operation]) -> None:
 
     TODO: Use OpsHandler to verify output[i] only uses input[i].
     """
+    operations = graph.operations
     max_cores = config.sencores
     i = 0
     while i < len(operations):

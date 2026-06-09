@@ -80,7 +80,7 @@ test_suite_config:
             - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: Could not run 'aten::index.Tensor_out' https://github.com/torch-spyre/torch-spyre/issues/1219
             - TestViewOps::test_advanced_indexing_assignment   # NotImplementedError aten::_index_put_impl_ https://github.com/torch-spyre/torch-spyre/issues/692
             # - TestViewOps::test_flatten_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
-            - TestViewOps::test_unfold_view   # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
+            - TestViewOps::test_unfold_view   # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226
             # - TestViewOps::test_T_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             # - TestViewOps::test_as_strided_inplace_view  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             # - TestViewOps::test_as_strided_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
@@ -119,7 +119,7 @@ test_suite_config:
             - TestOldViewOps::test_T  # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226
             - TestOldViewOps::test_big_transpose  # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80
             # - TestOldViewOps::test_broadcast_to  # AssertionError: Tensor-likes are not close https://github.com/torch-spyre/torch-spyre/issues/1227 (float16),  NotImplementedError aten::random_.from https://github.com/torch-spyre/torch-spyre/issues/549 (int64)
-            - TestOldViewOps::test_expand  # NotImplementedError aten::unfold https://github.com/torch-spyre/torch-spyre/issues/688
+            - TestOldViewOps::test_expand  # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226
             - TestOldViewOps::test_flatten   # AssertionError: The length of the sequences mismatch: 1 != 0 https://github.com/torch-spyre/torch-spyre/issues/729
             - TestOldViewOps::test_memory_format_resize_   # NotImplementedError aten::resize_ https://github.com/torch-spyre/torch-spyre/issues/730 
             - TestOldViewOps::test_memory_format_resize_as   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80

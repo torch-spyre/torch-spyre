@@ -52,6 +52,7 @@ import sympy
 from sympy import Expr
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -110,7 +111,7 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     return []
 
 
-def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
+def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
 
     coarse_tile() requires ops to be grouped: all ops in a group share the same
@@ -136,6 +137,7 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     current_ops: list[Operation] = []
     current_key = None
 
+    operations = graph.operations
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -221,7 +223,7 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
 
 
 def coarse_tile(
-    operations: list[Operation],
+    graph: GraphLowering,
     groups: list[tuple],
 ) -> None:
     """Stamp loop_group_id / loop_count on operations and scale their ranges.
@@ -237,6 +239,7 @@ def coarse_tile(
         ``hints_to_coarse_tile_groups``.  ``levels`` is a list of
         ``(hint_id, count)`` pairs, outermost first.
     """
+    operations = graph.operations
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
     }
