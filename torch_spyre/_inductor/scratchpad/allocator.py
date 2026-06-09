@@ -17,6 +17,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+import torch
 from torch._inductor.ir import (
     ComputedBuffer,
     Operation,
@@ -95,7 +96,17 @@ class ScratchpadAllocator(ABC):
         )
 
     def _op_good_for_lx_inplace(self, op: Any) -> bool:
-        return self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE
+        target = getattr(getattr(op, "origin_node", None), "target", None)
+        if target is None:
+            return False
+        if self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE:
+            # If the op is in the whitelist, return true
+            return True
+        if torch.Tag.pointwise in target.tags:
+            # If the op is tagged as pointwise by pytorch upstream
+            # return True. Works only for unary ops
+            return True
+        return False
 
     def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
         core_div_mismatch = get_ncores_for_buffers(graph)
