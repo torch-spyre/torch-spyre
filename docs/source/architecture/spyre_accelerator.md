@@ -26,6 +26,8 @@ Some of the key features of the Spyre device are listed below:
 * Each card supports up to 128 GB of LPDDR5 memory, with ensembles of up to eight cards delivering 1 TB memory and massive AI performance.
 * It delivers exceptional AI compute, exceeding 300 TOPS per card, while consuming just 75W.
 * PCIe gen5 x16 host interface (PCIe form factor card).
+* Each core has a 2 MB LX scratchpad (SRAM), shared between the two corelets within the core.
+* Each core has a 256 MB limit on the contiguous device-memory span it can address. This is a hardware constraint on the addressable range, distinct from the 2 MB LX scratchpad capacity.
 
 ### Core microarchitecture
 
