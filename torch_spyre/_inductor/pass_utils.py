@@ -229,6 +229,11 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     hints so that coordinate expressions are structurally identical to static-shape
     compilation while loop variable symbols are preserved.
     """
+
+    # Handle non-symbolic index (e.g., scalar tensors with index=0)
+    if not isinstance(index, sympy.Basic):
+        return sympy.sympify(index)
+
     size_syms = index.free_symbols - loop_vars
     if not size_syms:
         return index
