@@ -95,6 +95,60 @@ def _mark_static_unit_batch_bmm(
     bmm_node.meta["custom"] = custom
 
 
+def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.op in ("placeholder", "get_attr"):
+        return True
+    if node.op == "call_function" and node.target == aten.expand.default:
+        base = node.args[0]
+        return isinstance(base, torch.fx.Node) and base.op in (
+            "placeholder",
+            "get_attr",
+        )
+    return False
+
+
+def _mark_direct_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    """Mark direct rank-3 B=1 BMMs without catching unflattened attention views."""
+    if not _is_direct_unit_bmm_operand(rhs_node):
+        return
+
+    for arg in (lhs_node, rhs_node):
+        if (
+            isinstance(arg, torch.fx.Node)
+            and arg.op == "call_function"
+            and arg.target in _RESHAPE_OPS
+        ):
+            return
+
+    bmm_users = list(bmm_node.users.keys())
+    if len(bmm_users) == 1:
+        output_view = bmm_users[0]
+        if (
+            isinstance(output_view, torch.fx.Node)
+            and output_view.op == "call_function"
+            and output_view.target in _RESHAPE_OPS
+        ):
+            output_shape = output_view.args[1]
+            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
+                return
+
+    _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
+
+
+def mark_direct_unit_bmm_pass(graph: torch.fx.Graph) -> None:
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target != aten.bmm.default:
+            continue
+        if len(node.args) != 2:
+            continue
+        lhs_node, rhs_node = node.args
+        _mark_direct_static_unit_batch_bmm(node, lhs_node, rhs_node)
+
+
 @register_graph_pattern(
     CallFunction(aten.mm.default, Arg(), Arg()),
     pass_dict=mm_to_bmm_pass,
@@ -257,8 +311,6 @@ def _unflatten_bmm_batch_dims(
     node = match.nodes[-1]
     graph = node.graph
     lhs_reshape, rhs_reshape = mat1_node, mat2_node
-
-    _mark_static_unit_batch_bmm(node, lhs_reshape, rhs_reshape)
 
     # Both inputs must be reshape/view that collapse batch dims to 3D
     if not _is_batch_collapsing_reshape(lhs_reshape):

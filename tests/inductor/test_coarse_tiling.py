@@ -78,9 +78,11 @@ from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
     _preserve_shared_weight_unit_bmm_dim,
-    _shared_weight_unit_bmm_info_from_sizes,
 )
-from torch_spyre._inductor.temp_passes import bmm_unflatten_pass
+from torch_spyre._inductor.temp_passes import (
+    _mark_static_unit_batch_bmm,
+    mark_direct_unit_bmm_pass,
+)
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -1198,7 +1200,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         bmm.meta["val"] = SimpleNamespace(shape=out_shape)
         graph.output(bmm)
 
-        bmm_unflatten_pass.apply(fx.GraphModule({}, graph).graph)
+        _mark_static_unit_batch_bmm(bmm, x, y)
         graph.lint()
         return bmm.meta.get("custom") or {}
 
@@ -1274,29 +1276,41 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         )
 
     def test_shared_weight_marker_requires_stick_aligned_dims(self):
+        m, k, n = 2, 128, 64
         self.assertEqual(
-            self._static_bmm_custom_meta(
-                (1, 512, 4096), (1, 4096, 12800), (1, 512, 12800)
-            )[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY],
+            self._static_bmm_custom_meta((1, m, k), (1, k, n), (1, m, n))[
+                SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
+            ],
             {"batch_dim": 0},
         )
         self.assertNotIn(
             SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-            self._static_bmm_custom_meta(
-                (4, 512, 4096), (4, 4096, 12800), (4, 512, 12800)
-            ),
-        )
-        self.assertIsNone(
-            _shared_weight_unit_bmm_info_from_sizes(
-                [4, 512, 4096], [4, 4096, 12800], [4, 512, 12800]
-            )
+            self._static_bmm_custom_meta((4, m, k), (4, k, n), (4, m, n)),
         )
         self.assertNotIn(
             SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
-            self._static_bmm_custom_meta((1, 55, 2), (1, 2, 99), (1, 55, 99)),
+            self._static_bmm_custom_meta((1, m, 2), (1, 2, n), (1, m, n)),
         )
-        self.assertIsNone(
-            _shared_weight_unit_bmm_info_from_sizes([1, 55, 2], [2, 99], [1, 55, 99])
+
+    def test_mark_direct_unit_bmm_pass_does_not_mark_reshape_inputs(self):
+        m, k, n = 2, 64, 128
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        y = graph.placeholder("y")
+        x_view = graph.call_function(
+            torch.ops.aten.reshape.default, args=(x, (1, m, k))
+        )
+        y_view = graph.call_function(
+            torch.ops.aten.reshape.default, args=(y, (1, k, n))
+        )
+        bmm = graph.call_function(torch.ops.aten.bmm.default, args=(x_view, y_view))
+        graph.output(bmm)
+
+        mark_direct_unit_bmm_pass(graph)
+        graph.lint()
+        self.assertNotIn(
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+            bmm.meta.get("custom") or {},
         )
 
 

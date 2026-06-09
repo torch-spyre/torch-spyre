@@ -27,42 +27,16 @@ import regex as re
 import pytest  # type: ignore
 import torch.utils._pytree as pytree
 
-from oot_test_utilities import _OOT_PLATFORM_ARCH, _get_privateuse1_device_type
+from oot_test_utilities import (
+    _OOT_PLATFORM_ARCH,
+    _extract_base_module_name,
+    _get_privateuse1_device_type,
+)
 
 # Resolve the registered backend name once at import time.
 # Used in _OOTModuleListPatcher to strip the device suffix when extracting
 # op names from parametrised method names (e.g. "add_<device>_float16").
 _OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
-
-
-def _extract_base_module_name(name: str) -> str:
-    """Extract base module name by stripping YAML-generated suffixes.
-
-    Strips suffixes like:
-    - _93b52f93 (8-char hex hash)
-    - _4096 (numeric identifier)
-    - _layer0 (layer identifier)
-
-    Examples:
-        GraniteRotaryEmbedding_93b52f93 -> GraniteRotaryEmbedding
-        GraniteRMSNorm_4096 -> GraniteRMSNorm
-        GraniteDecoderLayer_layer0 -> GraniteDecoderLayer
-
-    Args:
-        name: YAML module name with potential suffix
-
-    Returns:
-        Base module name without suffix
-    """
-    parts = name.rsplit("_", 1)
-    if len(parts) == 2:
-        base_name, suffix = parts
-        # Check if suffix looks like a hash (hex) or number or "layerN"
-        if suffix.replace("layer", "").isdigit() or all(
-            c in "0123456789abcdef" for c in suffix
-        ):
-            return base_name
-    return name
 
 
 class _OOTCpuMovePatcher:
