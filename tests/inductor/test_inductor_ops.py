@@ -5452,6 +5452,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_bool_amax_amin(self):
+        """Test amax/amin on boolean tensors"""
+        x = torch.randint(low=0, high=2, size=(256, 256)).to(torch.bool)
+
+        # Test amax and amin
+        self.compare_with_cpu(lambda a: torch.amax(a), x)
+        self.compare_with_cpu(lambda a: torch.amin(a), x)
+
 
 if __name__ == "__main__":
     unittest.main()
