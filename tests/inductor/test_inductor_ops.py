@@ -257,11 +257,14 @@ ALL_DTYPES = [
 ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
 
 TO_DTYPE_OP_SHAPES_UNALIGNED = [
+    (68,),  # 1D unaligned: 68 > 1 fp16 stick (64 elems), not a multiple of 64
     (4, 16),
     (4, 68),
 ]
 
 TO_DTYPE_OP_SHAPES_ALIGNED = [
+    (64,),  # 1D aligned: exactly 1 fp16 stick — regression for 1D dtype-conv crash
+    (5120,),  # 1D aligned: 80 fp16 sticks — exact repro shape from the bug report
     (4, 64),
     (4, 8, 128),
     (2, 4, 8, 64),
@@ -289,11 +292,17 @@ TO_DTYPE_OP_PARAMS_SETS = {
     if src != torch.bool and dst != torch.bool
 }
 
+
+_DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
+
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+    if (
+        shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
+        or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+    )
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
