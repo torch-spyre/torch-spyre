@@ -52,6 +52,7 @@ import sympy
 from sympy import Expr
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -65,6 +66,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from .logging_utils import get_inductor_logger
+from .loop_info import CoarseTileInfo
 from .propagate_hints import get_op_hints
 from .pass_utils import op_out_coords
 
@@ -109,7 +111,7 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     return []
 
 
-def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
+def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
 
     coarse_tile() requires ops to be grouped: all ops in a group share the same
@@ -135,6 +137,7 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     current_ops: list[Operation] = []
     current_key = None
 
+    operations = graph.operations
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -220,7 +223,7 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
 
 
 def coarse_tile(
-    operations: list[Operation],
+    graph: GraphLowering,
     groups: list[tuple],
 ) -> None:
     """Stamp loop_group_id / loop_count on operations and scale their ranges.
@@ -236,6 +239,7 @@ def coarse_tile(
         ``hints_to_coarse_tile_groups``.  ``levels`` is a list of
         ``(hint_id, count)`` pairs, outermost first.
     """
+    operations = graph.operations
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
     }
@@ -298,7 +302,8 @@ def _check_reduction_tiling_safety(op: ComputedBuffer) -> None:
     assert isinstance(data, Reduction)
 
     n_output_dims = len(data.ranges)
-    loop_tiled_dims: list[list[int]] = getattr(op, "loop_tiled_dims", [])
+    loop_info = getattr(op, "loop_info", None)
+    loop_tiled_dims: list[list[int]] = loop_info.loop_tiled_dims if loop_info else []
     for dims_list in loop_tiled_dims:
         for d in dims_list:
             if d >= n_output_dims:
@@ -317,9 +322,10 @@ def _propagate_tiled_op(
     if isinstance(op.data, Reduction):
         _check_reduction_tiling_safety(op)
 
-    loop_group_id = getattr(op, "loop_group_id", None)
-    if loop_group_id is None:
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
         return
+    loop_group_id = loop_info.loop_group_id
 
     buf_name = op.get_name()
     outside_consumers, is_graph_output = _find_outside_consumers(
@@ -328,7 +334,7 @@ def _propagate_tiled_op(
 
     # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant —
     # mark per_tile_fixed so the unroller reuses the same address each tile.
-    if all(not dims for dims in getattr(op, "loop_tiled_dims", [[]])):
+    if all(not dims for dims in loop_info.loop_tiled_dims):
         from .ir import FixedTiledLayout
 
         if isinstance(op.layout, FixedTiledLayout):
@@ -357,7 +363,8 @@ def _propagate_tiled_op(
         i
         for i, o in enumerate(operations)
         if isinstance(o, ComputedBuffer)
-        and getattr(o, "loop_group_id", (None,))[0] == outer_key
+        and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        == outer_key
     )
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
@@ -422,8 +429,8 @@ def _find_outside_consumers(
             continue
         if not _reads_buffer(op, buf_name):
             continue
-        gid = getattr(op, "loop_group_id", None)
-        if gid is None or gid[0] != outer_key:
+        li = getattr(op, "loop_info", None)
+        if li is None or li.loop_group_id[0] != outer_key:
             consumers.append(op)
 
     is_graph_output = buf_name in _graph_output_names()
@@ -440,8 +447,8 @@ def _has_inside_consumers(
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        gid = getattr(op, "loop_group_id", None)
-        if gid is None or gid[0] != outer_key:
+        li = getattr(op, "loop_info", None)
+        if li is None or li.loop_group_id[0] != outer_key:
             continue
         if _reads_buffer(op, buf_name):
             return True
@@ -469,8 +476,8 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
     ranges by multiplying each tiled dimension back by its loop_count.
     """
     full_ranges = list(op.data.ranges)
-    loop_count: list[Expr] = op.loop_count
-    loop_tiled_dims: list[list[int]] = op.loop_tiled_dims
+    loop_count: list[Expr] = op.loop_info.loop_count
+    loop_tiled_dims: list[list[int]] = op.loop_info.loop_tiled_dims
     for count, dims in zip(loop_count, loop_tiled_dims):
         for d in dims:
             if 0 <= d < len(full_ranges):
@@ -605,9 +612,7 @@ def _insert_copy_op(
     copy_buf.operation_name = copy_name
 
     # Stamp with the same loop metadata so this op is inside the same loop.
-    copy_buf.loop_group_id = tiled_op.loop_group_id  # type: ignore[attr-defined]
-    copy_buf.loop_count = tiled_op.loop_count  # type: ignore[attr-defined]
-    copy_buf.loop_tiled_dims = tiled_op.loop_tiled_dims  # type: ignore[attr-defined]
+    copy_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
 
     V.graph.name_to_buffer[copy_name] = copy_buf
 
@@ -725,9 +730,11 @@ def _stamp_group(
             op_tiled_dims.append(effective)
             _divide_ranges(op, count, effective)
 
-        op.loop_group_id = nested_group_id  # type: ignore[attr-defined]
-        op.loop_count = counts  # type: ignore[attr-defined]
-        op.loop_tiled_dims = op_tiled_dims  # type: ignore[attr-defined]
+        op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
+            loop_group_id=nested_group_id,
+            loop_count=counts,
+            loop_tiled_dims=op_tiled_dims,
+        )
 
         logger.debug(
             "coarse_tile: stamped %s loop_group_id=%s loop_count=%s loop_tiled_dims=%s",
