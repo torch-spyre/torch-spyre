@@ -748,6 +748,8 @@ def _insert_combine_op(
         if reduction_type == "min":
             return vops.minimum(accum, partial)
         if reduction_type == "any":
+            # TODO: add vops.logical_or to SpyreOpFuncs before enabling
+            # hardware-level 'any' support — it is currently absent.
             return vops.logical_or(accum, partial)
         raise RuntimeError(
             f"coarse_tile: _insert_combine_op: unsupported reduction_type "
@@ -1020,6 +1022,12 @@ def _stamp_group(
                 op_tiled_dims.append([])
                 op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
                 if isinstance(op.data, Reduction):
+                    # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
+                    # before _validate_reduction_tiling runs in the later
+                    # insert_tiling_propagation pass.  If validation raises (e.g.
+                    # stick-dim tiling, Stage 2), the mutated ranges are never
+                    # observed: the RuntimeError propagates uncaught through the
+                    # pass runner and aborts compilation.
                     _divide_reduction_ranges(
                         op, count, [rpos] if rpos is not None else []
                     )
