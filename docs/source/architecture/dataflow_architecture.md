@@ -216,7 +216,10 @@ The compiler generates two kinds of artifacts to drive this pipeline:
 - **SuperDSC** — JSON kernel descriptors that specify the computation
   performed on each tile once it arrives in scratchpad. SuperDSC is
   being superseded by KTIR, a tile-based MLIR intermediate
-  representation — see [RFC 0682](../rfcs/index.md).
+  representation. The specification is published as RFC 0682, and a
+  reference CPU interpreter is available at
+  [torch-spyre/ktir-cpu](https://github.com/torch-spyre/ktir-cpu).
+  See [the KTIR page](../compiler/ktir.md) for details.
 
 ## Execution Model
 

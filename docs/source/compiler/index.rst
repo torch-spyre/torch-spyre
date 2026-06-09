@@ -40,6 +40,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
 
    inductor_frontend
    backend
+   ktir
 
 .. toctree::
    :maxdepth: 2
