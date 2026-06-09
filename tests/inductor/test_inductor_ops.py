@@ -3875,6 +3875,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
             },
         },
+        ("test_unfold", "test_unfold_cpu"): {
+            "param_sets": {
+                # 1D: Basic cases
+                "1d_step1": (0, 3, 1, torch.arange(10, dtype=torch.float16)),
+                "1d_step2": (0, 3, 2, torch.arange(20, dtype=torch.float16)),
+                "1d_no_overlap": (0, 4, 4, torch.arange(16, dtype=torch.float16)),
+                "1d_large": (0, 10, 5, cached_randn((100,))),
+                # 2D: Different dimensions
+                "2d_dim0": (0, 3, 1, cached_randn((10, 8))),
+                "2d_dim1": (1, 4, 2, cached_randn((8, 16))),
+                "2d_dim_neg": (-1, 3, 1, cached_randn((8, 12))),
+                "2d_square": (0, 4, 2, cached_randn((8, 8))),
+                # 3D: Each dimension
+                "3d_dim0": (0, 3, 1, cached_randn((10, 8, 6))),
+                "3d_dim1": (1, 4, 2, cached_randn((8, 16, 6))),
+                "3d_dim2": (2, 3, 1, cached_randn((8, 6, 10))),
+                # 4D: Deep learning typical
+                "4d_batch": (0, 3, 1, cached_randn((8, 4, 6, 6))),
+                "4d_spatial": (2, 3, 1, cached_randn((4, 8, 12, 6))),
+                "4d_cnn": (2, 3, 1, cached_randn((2, 64, 28, 28))),
+                # Edge cases
+                "edge_window_1": (0, 1, 1, cached_randn((10,))),
+                "edge_single_window": (0, 5, 1, torch.arange(5, dtype=torch.float16)),
+                "edge_large_step": (0, 3, 7, cached_randn((30,))),
+                "edge_pow2_64": (0, 16, 8, cached_randn((64,))),
+                "edge_nopad_37": (0, 7, 3, cached_randn((37,))),
+                "edge_nopad_2d": (1, 5, 2, cached_randn((16, 33))),
+            },
+        },
         ("test_unbind", "test_unbind_cpu"): {
             "param_sets": {
                 # 1D — produces 0-D scalar tensors
@@ -5356,6 +5385,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return a.repeat(*repeat_args)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_unfold_cpu(self, dimension, size, step, x):
+        """Test unfold operation (view only, no contiguous).
+
+        NOTE: .contiguous() is not tested as it currently fails.
+        This test verifies the unfold VIEW operation works correctly.
+        """
+        self.compare_with_cpu(lambda x: x.unfold(dimension, size, step), x)
 
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)

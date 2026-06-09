@@ -41,6 +41,7 @@ test_suite_config:
             - TestOps::test_permute.*
             - TestOps::test_unbind.*
             - TestOps::test_size_one.*
+            - TestOps::test_unfold.*
             # squeeze covers test_squeeze and test_squeeze_reduction
             - TestOps::test_squeeze.*
             # unsqueeze covers test_unsqueeze and test_unsqueeze_broadcast
