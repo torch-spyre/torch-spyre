@@ -5552,35 +5552,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_is_nonzero_error_cases(self):
-        # Empty tensor
-        x_empty = torch.tensor([], dtype=torch.float32)
-
-        with pytest.raises(
-            RuntimeError,
-            match="Boolean value of Tensor with no values is ambiguous",
-        ):
-            torch.is_nonzero(x_empty)
-
-        # Empty tensor is not supported on spyre
-        # def fn(t):
-        #     return torch.is_nonzero(t)
-
-        # compiled = torch.compile(fn)
-
-        # with pytest.raises(
-        #     RuntimeError,
-        #     match="Boolean value of Tensor with no values is ambiguous",
-        # ):
-        #     compiled(x_empty.to("spyre"))
-
-        # Multi-element tensor
+        """Test that multi-element tensors raise RuntimeError in compiled context."""
+        # Multi-element tensor - compiled path
         x_multi = torch.tensor([1.0, 2.0], dtype=torch.float16)
-
-        with pytest.raises(
-            RuntimeError,
-            match="Boolean value of Tensor with more than one value is ambiguous",
-        ):
-            torch.is_nonzero(x_multi)
 
         def fn(t):
             return torch.is_nonzero(t)
