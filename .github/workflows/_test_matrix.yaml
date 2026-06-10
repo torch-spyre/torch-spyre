@@ -1,8 +1,15 @@
-name: Test matrix
+name: Test matrix (reusable)
 
 # ---------------------------------------------------------------------------
 # Reusable workflow — not triggered directly.
-# Called by torch_spyre_tests.yml and runtests_nightly.yml.
+# Called by tests.yml and tests-nightly.yml.
+#
+# All differences between the two callers are expressed as inputs:
+#   - runner_label      : linux_for_pr_tests (PR) vs linux (nightly)
+#   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
+#   - checkout_pytorch  : false (PR) vs true (nightly)
+#   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
+#   - ref / rpm_*       : forwarded from workflow_dispatch inputs
 # ---------------------------------------------------------------------------
 on:
   workflow_call:
@@ -310,7 +317,7 @@ jobs:
         uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} tests
-        run: |
+        run: |-
           source "$HOME/.bashrc"
 
           # Multi-Spyre tests require a fresh topology probe: clear the
@@ -338,33 +345,3 @@ jobs:
           echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
           bash tests/run_test.sh "tests/configs/${CONFIG}" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG}
           echo "${{ matrix.suite.name }} tests done"
-
-  # ---------------------------------------------------------------------------
-  # Job 3: fan-in gate
-  # ---------------------------------------------------------------------------
-  run-spyre-unit-tests:
-    name: Run Spyre unit tests
-    runs-on: ubuntu-latest
-    needs: [test, test_multi_spyre]
-    if: always()
-    steps:
-      - name: Evaluate test results
-        run: |-
-          TEST_RESULT="${{ needs.test.result }}"
-          TEST_MULTI_SPYRE_RESULT="${{ needs.test_multi_spyre.result }}"
-          echo "Test job result: ${TEST_RESULT}"
-          echo "Test Multi-Spyre job result: ${TEST_MULTI_SPYRE_RESULT}"
-
-          if [[ "${TEST_RESULT}" == "success" && "${TEST_MULTI_SPYRE_RESULT}" == "success" ]]; then
-            echo "All test suites passed."
-            exit 0
-          fi
-
-          # Skipped means the caller gated us out (e.g. docs-only PR).
-          if [[ "${TEST_RESULT}" == "skipped" && "${TEST_MULTI_SPYRE_RESULT}" == "skipped" ]]; then
-            echo "Tests skipped — no test-relevant files modified."
-            exit 0
-          fi
-
-          echo "One or more test suites failed or were cancelled."
-          exit 1
