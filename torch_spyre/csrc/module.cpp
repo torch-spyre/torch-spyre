@@ -43,6 +43,7 @@
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
@@ -293,6 +294,17 @@ PYBIND11_MODULE(_C, m) {
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // RNG functions
+  m.def("manual_seed", &spyre::manual_seed, py::arg("seed"),
+        py::arg("device") = -1);
+  m.def("manual_seed_all", &spyre::manual_seed_all, py::arg("seed"));
+  m.def("get_rng_state", &spyre::get_rng_state, py::arg("device") = -1);
+  m.def("set_rng_state", &spyre::set_rng_state, py::arg("new_state"),
+        py::arg("device") = -1);
+  m.def("initial_seed", &spyre::initial_seed, py::arg("device") = -1);
+  m.def("_get_default_generator", &spyre::detail::getDefaultSpyreGenerator,
+        py::arg("device") = -1);
 
   // Memory copy function
   m.def("copy_tensor", &spyre::spyre_copy_from,
