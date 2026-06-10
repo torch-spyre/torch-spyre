@@ -45,9 +45,7 @@ DTYPE = torch.float16
 # Shape 1: op(x) -> Tensor
 _LIB_S1 = torch.library.Library("test_fk_s1", "DEF")
 _LIB_S1.define("scale_two(Tensor x) -> Tensor")
-_LIB_S1.impl(
-    "scale_two", lambda x: x * 2, dispatch_key="CompositeExplicitAutograd"
-)
+_LIB_S1.impl("scale_two", lambda x: x * 2, dispatch_key="CompositeExplicitAutograd")
 _LIB_S1._register_fake("scale_two", lambda x: torch.empty_like(x))
 
 
@@ -73,9 +71,7 @@ def _inplace_add_impl(x, out):
     out.add_(x)
 
 
-_LIB_S3.impl(
-    "inplace_add", _inplace_add_impl, dispatch_key="CompositeExplicitAutograd"
-)
+_LIB_S3.impl("inplace_add", _inplace_add_impl, dispatch_key="CompositeExplicitAutograd")
 _LIB_S3._register_fake("inplace_add", lambda x, out: None)
 
 
