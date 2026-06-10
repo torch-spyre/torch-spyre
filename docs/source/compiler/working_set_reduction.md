@@ -81,8 +81,8 @@ declare_tensor_dim("N", N)
 
 
 def kernel(x, y, z):
-    with spyre_hint(tiles={"M": 8}):
-        with spyre_hint(tiles={"K": 4}):
+    with spyre_hint(num_tiles_per_dim={"M": 8}):
+        with spyre_hint(num_tiles_per_dim={"K": 4}):
             p = x @ y
         return p + z
 
@@ -100,27 +100,46 @@ print(torch.compile(kernel)(x, y, z))
 
 In this example, we declare three tensor dimensions `"M"`, `"K"`, and `"N"`
 using `declare_tensor_dim`, map three device tensors to these dimensions
-using `name_tensor_dims` and finally tile the `"M"` and `"K"` dimensions
-using `spyre_hint`. The matmul operation is tiled along both `"M"` and `"K"`
+using `name_tensor_dims`, and tile the `"M"` and `"K"` dimensions using
+`spyre_hint`. The matmul operation is tiled along both `"M"` and `"K"`
 whereas the final add operation is only tiled along `"M"`.
 
-Hints are introduced with the `with spyre_hint(**kwargs):` pattern. Working
-set reduction hints utilize the `tiles` keyword and consist of a dictionary
-mapping dimension names to per-dimension tile counts. The value is the number
-of tiles to split that dimension into: `tiles={"M": 8}` produces 8 tiles
-along `M`, each of size `M/8`.
+Hints are introduced with the `with spyre_hint(**kwargs):` pattern. The
+keyword takes a dictionary that maps a dimension name to a tile count. Each
+hint scope tiles exactly one named dimension. The value is the number of
+tiles to split that dimension into.
+`num_tiles_per_dim={"M": 8}` produces 8 tiles along `M`, each of size
+`M / 8`.
 
-Multiple dimensions can be tiled at once. Since `"K"` does not occur in
-tensor `z` or `p`, the example code is equivalent to:
+The keyword is `num_tiles_per_dim=`. Legacy aliases `tiles=` and `slices=`
+still parse but are deprecated and will be removed in a future release.
+
+A single `spyre_hint(...)` call accepts at most one tiling keyword, and the
+dictionary names at most one dimension. To tile two dimensions, nest two
+hint scopes, as in
+[Example 1](#example-1-naming-dimensions-and-tiling) above:
 
 ```python
 def kernel(x, y, z):
-    with spyre_hint(tiles={"M": 8, "K": 4}):
-        return x @ y + z
+    with spyre_hint(num_tiles_per_dim={"M": 8}):
+        with spyre_hint(num_tiles_per_dim={"K": 4}):
+            return x @ y + z
 ```
 
-Named tensor dimensions must be provided for inputs to `torch.compile` but are
-intended to be derived most of the time for computed tensors.
+The nested-scope order matches the resulting loop-nest order. The outer
+scope is the outer loop.
+
+For operations with no input tensors, such as `torch.full`, the
+`named_dims=` keyword supplies dimension names directly on the operation's
+output:
+
+```python
+with spyre_hint(named_dims=["M", "N"]):
+    out = torch.full((M, N), 0.0, dtype=torch.float16, device="spyre")
+```
+
+Named tensor dimensions must be provided for inputs to `torch.compile` but
+are intended to be derived most of the time for computed tensors.
 
 ## Dimensions vs. named dimensions
 
@@ -154,7 +173,7 @@ For instance, the following code is valid:
 
 ```python
 def kernel(x_1d, y, z):
-    with spyre_hint(tiles={"M": 8, "K": 4}):
+    with spyre_hint(num_tiles_per_dim={"M": 8, "K": 4}):
         return x_1d.view(M, K) @ y + z
 
 x_1d = torch.rand(M * K, dtype=torch.float16).to("spyre")

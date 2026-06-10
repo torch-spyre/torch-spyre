@@ -380,6 +380,8 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
         torch.ops.aten.mul.Tensor,
         torch.ops.aten.true_divide.Tensor,
         torch.ops.aten.div.Tensor,
+        torch.ops.aten.eq.Tensor,
+        torch.ops.aten.eq.Scalar,
     ]
 
     for node in graph.nodes:
@@ -391,13 +393,16 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
             if not isinstance(in_arg, (int, float)):
                 logger.warning(f"Warning: unhandled node type {type(in_arg)}")
                 continue
-            # Currently the dtype of the scalar tensor is set as same as the output dtype.
-            # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
-            # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
+            # Use the dtype of the tensor operand, not the output dtype.
+            # For comparison ops like eq, the output is bool but the constant
+            # must match the input tensor's dtype
             dtype = torch.float16
-            meta = node.meta.get("tensor_meta", None)
-            if meta:
-                dtype = meta.dtype
+            for other_arg in node.args:
+                if isinstance(other_arg, torch.fx.node.Node):
+                    other_meta = other_arg.meta.get("tensor_meta", None)
+                    if other_meta is not None:
+                        dtype = other_meta.dtype
+                        break
             with graph.inserting_before(node):
                 const_node = graph.create_node(
                     "call_function",

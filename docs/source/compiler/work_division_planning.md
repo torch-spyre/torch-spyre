@@ -498,13 +498,69 @@ A graph-aware co-optimisation pass is in development. It aligns splits
 across adjacent ops to grow the LX planner's legal-reuse set. The work
 is tracked in the [scratchpad planning](scratchpad_planning.md) doc.
 
+## User Work-Division Hints
+
+Users can override the automatic work-distribution choice with
+`spyre_hint(work_div={...})`. The hint dictionary maps named tensor dimensions
+to the requested number of core slices for that dimension:
+
+```python
+from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.propagate_named_dims import (
+    declare_tensor_dim,
+    name_tensor_dims,
+)
+
+declare_tensor_dim("M", M)
+declare_tensor_dim("K", K)
+declare_tensor_dim("N", N)
+name_tensor_dims(x, ["M", "K"])
+name_tensor_dims(y, ["K", "N"])
+
+def fn(x, y):
+    with spyre_hint(work_div={"M": 2, "K": 4}):
+        return x @ y
+```
+
+The compiler resolves each user-facing name onto the concrete iteration
+variables for each operation in the hint scope. Coarse-tiling hints are kept
+separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
+coexist in the same scope.
+
+When the work-division planner sees a resolved user hint, it validates the
+request and commits it directly instead of running the automatic priority-based
+distribution. For matmul reductions, a user hint also bypasses the analytic
+cost-model split selection; the hint takes ownership of the split decision.
+Validation checks that:
+
+- every split value is a positive integer
+- the product of all requested splits does not exceed `SENCORES`
+- every split evenly divides the stick-adjusted dimension size
+- at most one reduction dimension is split
+
+User work-division hints are intentionally authoritative. If Pass 1
+(`span_reduction`) already committed minimum splits for the 256 MB span limit,
+and the user hint asks for fewer splits, the compiler logs a warning and applies
+the strict user hint. `warn_if_per_core_overflow` then logs a critical message if
+the resulting per-core span exceeds the hardware limit.
+
+Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
+annotations and use the automatic work-distribution planner.
+
 ## Limitations and Future Work
 
 **Current limitations:**
 
 - Dimensions must divide evenly by the slice count (no uneven splits).
+- Named work-division hints are reliable for dimensions that remain distinct
+  iteration-space dimensions. Hints that target component names inside a
+  reshaped compound dimension, such as reshaping `[B, M, K]` to `[B*M, K]`
+  before matmul and hinting `work_div={"M": ...}`, are not guaranteed to map to
+  the requested component yet.
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work
   division. `ExternKernel` and `FallbackKernel` nodes are skipped.
+- TOPK reductions currently run single-core, so `work_div` hints on TOPK
+  operations are ignored with a warning.
 - Each pass plans one op at a time. Adjacent ops can pick incompatible
   per-core splits for a shared tensor, which the LX scratchpad planner
   then treats as a core-division mismatch.

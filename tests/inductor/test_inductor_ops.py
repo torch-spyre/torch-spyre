@@ -3611,6 +3611,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
         },
+        ("test_eq_scalar", "test_scalar_comparison_base"): {
+            "param_sets": {
+                "int_42": (
+                    42,
+                    torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float16),
+                ),
+                "int_10": (
+                    10,
+                    torch.tensor([1.0, 10.0, 5.0, 10.0, 3.0], dtype=torch.float16),
+                ),
+                "float_3_5": (
+                    3.5,
+                    torch.tensor([1.0, 3.5, 2.5, 3.1, 5.0], dtype=torch.float16),
+                ),
+                "negative_5": (
+                    -5,
+                    torch.tensor([-5, 0.0, 5.0, -5.0, 10.0], dtype=torch.float16),
+                ),
+                "zero": (
+                    0,
+                    torch.tensor([0.0, 1.0, -1.0, 0.0, 5.0], dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_eq_scalar_multidim", "test_scalar_multidim_base"): {
+            "param_sets": {
+                "2d": (
+                    7,
+                    torch.tensor(
+                        [[1.0, 7.0, 3.0], [7.0, 5.0, 7.0]], dtype=torch.float16
+                    ),
+                ),
+                "3d": (7, torch.randint(0, 15, (3, 4, 5)).to(torch.float16)),
+                "4d": (7, torch.randint(0, 15, (2, 3, 4, 5)).to(torch.float16)),
+                "large": (42, torch.randn(100, 50, dtype=torch.float16)),
+            },
+        },
+        ("test_eq_scalar_vs_tensor", "test_scalar_vs_tensor_base"): {
+            "param_sets": {
+                "mixed": (
+                    torch.tensor([1.0, 5.0, 3.0, 5.0], dtype=torch.float16),
+                    torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16),
+                    5,
+                ),
+            },
+        },
         ("test_where_default", "test_where_eager_default_fallback"): {
             "ops_dict": {"where": torch.where},
             "param_sets": {
@@ -3878,6 +3924,62 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def compare(self, *args, **kwargs):
         return utils_inductor.compare(*args, **kwargs)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_comparison_base(self, scalar, x):
+        """Base method for testing equality comparison with scalar constants"""
+
+        def fn(tensor, scalar_val):
+            return tensor == scalar_val
+
+        _compare_op_with_cpu(fn, None, x, scalar)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_multidim_base(self, scalar, x):
+        """Base method for testing equality comparison on multi-dimensional tensors"""
+
+        def fn(tensor, scalar_val):
+            return tensor == scalar_val
+
+        _compare_op_with_cpu(fn, None, x, scalar)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_vs_tensor_base(self, x, y, scalar):
+        """Base method for testing both scalar and tensor comparisons work"""
+
+        def fn(tensor_x, tensor_y, scalar_val):
+            scalar_result = tensor_x == scalar_val
+            tensor_result = tensor_x == tensor_y
+            return scalar_result, tensor_result
+
+        _compare_op_with_cpu(fn, None, x, y, scalar)
+
+    def test_scalar_comparison(self):
+        self.test_eq_scalar_int_42()
+
+    def test_eq_scalar_constant_int(self):
+        self.test_eq_scalar_int_10()
+
+    def test_eq_scalar_constant_float(self):
+        self.test_eq_scalar_float_3_5()
+
+    def test_eq_scalar_constant_negative(self):
+        self.test_eq_scalar_negative_5()
+
+    def test_eq_scalar_constant_zero(self):
+        self.test_eq_scalar_zero()
+
+    def test_eq_scalar_constant_multidim(self):
+        self.test_eq_scalar_multidim_2d()
+
+    def test_eq_scalar_constant_large_tensor(self):
+        self.test_eq_scalar_multidim_large()
+
+    def test_eq_scalar_vs_tensor_comparison(self):
+        self.test_eq_scalar_vs_tensor_mixed()
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):
