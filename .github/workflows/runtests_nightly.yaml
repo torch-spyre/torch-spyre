@@ -1,12 +1,8 @@
 name: tests-nightly
 
-# on:
-#   schedule:
-#     - cron: 0 2 * * *
-
 on:
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: 0 2 * * *
 
   workflow_dispatch:
     inputs:
@@ -226,7 +222,7 @@ jobs:
     runs-on:
       - x86_64
       - spyre_pf_x2
-      - linux_for_pr_tests
+      - linux
       - image_torch_spyre
     timeout-minutes: 60
     env:
