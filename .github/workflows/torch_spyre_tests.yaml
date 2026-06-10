@@ -214,6 +214,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
           - name: Inductor Unroll Loop Specs
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
+          - name: Inductor Work Division Hint
+            config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
