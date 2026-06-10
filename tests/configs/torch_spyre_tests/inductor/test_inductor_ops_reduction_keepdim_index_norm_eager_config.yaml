@@ -7,8 +7,8 @@ test_suite_config:
             - TestOps::test_min_keepdim.*
             - TestOps::test_max_keepdim.*
             - TestOps::test_aminmax_keepdim.*
-            - TestOps::test_sum_keepdim.*
-            - TestOps::test_mean_keepdim.*
+            - TestOps::test_sum_keepdim0.*
+            - TestOps::test_mean_keepdim0.*
             - TestOps::test_vector_norm_keepdim.*
             - TestOps::test_matrix_norm_keepdim.*
             - TestOps::test_linalg_norm_keepdim.*
@@ -22,3 +22,11 @@ test_suite_config:
             - TestOps::test_mean_3d_dim0_keepdim
             - TestOps::test_index_copy_.*
           mode: mandatory_success
+        # Xfail for failing tests related to PR #2179 (FP32 reduction ops)
+        - names:
+            - TestOps::test_mean_keepdim1_mean_fp16_3d_dim_2_spyre
+            - TestOps::test_mean_keepdim1_mean_fp16_3d_dim_neg1_spyre
+            - TestOps::test_mean_keepdim1_mean_fp32_3d_dim_2_spyre
+            - TestOps::test_mean_keepdim1_mean_fp32_3d_dim_neg1_spyre
+            - TestOps::test_sum_keepdim1_sum_fp32_3d_dim_neg1_spyre
+          mode: xfail

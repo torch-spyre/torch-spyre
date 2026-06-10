@@ -64,6 +64,7 @@ class CoarseTileInfo:
 
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
+    "work_div_loop_info",
     "loop_info",
 )
 
@@ -72,7 +73,8 @@ def copy_op_metadata(src: "ComputedBuffer", dst: "ComputedBuffer") -> None:
     """Copy all Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    dim_hints and coarse-tiling attrs are not silently dropped.
+    dim_hints, work-division hint metadata, and coarse-tiling attrs are not
+    silently dropped.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):

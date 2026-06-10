@@ -195,6 +195,10 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   // reinterpret_cast<spyre_ptr_t>(src));
 }
 
+uint32_t SpyreAllocator::segmentForRegion(uint64_t region_id) const {
+  return getFlexAllocator()->segmentForRegion(region_id);
+}
+
 // Register our custom allocator
 REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
 
