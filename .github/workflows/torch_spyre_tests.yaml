@@ -95,7 +95,6 @@ jobs:
   # reusable workflow is never invoked — no hardware runners are consumed.
   # ---------------------------------------------------------------------------
   run-tests:
-    name: Run test matrix
     needs: changes
     if: needs.changes.outputs.code_changed == 'true'
     uses: ./.github/workflows/_test_matrix.yaml
