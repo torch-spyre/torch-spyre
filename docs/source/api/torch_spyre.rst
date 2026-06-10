@@ -54,6 +54,16 @@ Device Management
 
    Returns ``True`` if the Spyre runtime has been initialized.
 
+.. function:: torch.spyre.get_amp_supported_dtype() -> list[torch.dtype]
+
+   Returns the dtypes supported by ``torch.autocast`` on Spyre. Used by the
+   PyTorch AMP machinery to validate the autocast dtype.
+
+   .. code-block:: python
+
+      >>> torch.spyre.get_amp_supported_dtype()
+      [torch.float16, torch.bfloat16]
+
 .. note::
 
    ``torch.spyre.get_device_properties()`` is not yet exposed on the public
@@ -117,6 +127,12 @@ Streams allow overlapping execution of operations. The API mirrors
        high-priority pool. Each pool has 32 streams per device,
        allocated round-robin. Default: ``0``.
 
+       The constructor input and the ``.priority`` getter use different
+       conventions: a stream constructed with ``priority=5`` is placed
+       in the high-priority pool, and its ``.priority`` attribute then
+       reports ``-1`` rather than ``5``. See the ``priority`` attribute
+       below.
+
    .. code-block:: python
 
       >>> s = torch.spyre.Stream()
@@ -146,8 +162,10 @@ Streams allow overlapping execution of operations. The API mirrors
    .. attribute:: priority
       :type: int
 
-      The stream priority class (read-only). ``0`` for low-priority,
-      anything non-zero for high-priority.
+      The stream priority class (read-only). Reports ``0`` for low-priority
+      streams (IDs 0--32) and ``-1`` for high-priority streams (IDs 33--64),
+      matching the convention used by ``torch.cuda.Stream.priority``. The
+      attribute does not echo the integer passed to the constructor.
 
 .. function:: torch.spyre.stream(stream)
 
@@ -191,6 +209,55 @@ Streams allow overlapping execution of operations. The API mirrors
 
       >>> torch.spyre.synchronize()          # sync all devices
       >>> torch.spyre.synchronize("spyre:0") # sync device 0
+
+Distributed
+-----------
+
+Torch-Spyre registers a ``c10d::Backend`` named ``spyreccl`` for cross-card
+collective communication. Standard PyTorch distributed setup applies:
+
+.. code-block:: python
+
+   import torch
+   import torch.distributed as dist
+
+   dist.init_process_group(backend="cpu:gloo,spyre:spyreccl")
+
+   x = torch.zeros(1024, dtype=torch.float16, device="spyre")
+   dist.broadcast(x, src=0)
+
+The backend follows a one-device-per-process model: each rank attaches to a
+single Spyre device and reuses the rank's existing flex runtime instance.
+Supported collectives, the list of process-group entries that raise
+``SpyreCCLNotSupportedException``, and the placement of
+``SpyreCCLBackend`` in the runtime stack are documented in
+:doc:`../runtime/index`.
+
+Memory
+------
+
+``torch.spyre.memory`` re-exports ``torch.accelerator.memory``, so the
+standard accelerator memory API is available against Spyre devices:
+
+.. code-block:: python
+
+   torch.spyre.memory.memory_allocated()        # bytes currently allocated
+   torch.spyre.memory.max_memory_allocated()    # peak since the last reset
+   torch.spyre.memory.reset_peak_memory_stats()
+
+A worked example is in :doc:`../user_guide/profiling/index`.
+
+Profiler
+--------
+
+.. function:: torch_spyre.profiler.is_available() -> bool
+
+   Returns ``True`` when the Spyre profiler integration is built into the
+   current package and the device can be profiled. Returns ``False`` in the
+   default build today; the in-tree profiler package is a scaffold whose
+   collection backends are still landing. See
+   :doc:`../user_guide/profiling/index` for the current state and the
+   profiling tooling that is available in the meantime.
 
 Tensor Operations
 -----------------
@@ -362,6 +429,12 @@ Constants
 
    The device name string used to register Spyre with PyTorch.
 
+.. data:: torch_spyre.constants.DISTRIBUTED_BACKEND_NAME
+   :value: "spyreccl"
+
+   The backend name used to register the Spyre distributed backend with
+   ``torch.distributed``. Pass this string to ``init_process_group(backend=...)``.
+
 Environment Variables
 ---------------------
 
@@ -401,7 +474,28 @@ Environment Variables
    * - ``SENCORES``
      - Number of Spyre cores (1--32, default 32)
    * - ``DXP_LX_FRAC_AVAIL``
-     - Fraction of LX scratchpad available to the planner
+     - Fraction of LX scratchpad available to the planner (default ``0.2``)
+   * - ``LX_PLANNING``
+     - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
+       ``scratchpad_planning`` pass)
+   * - ``CO_OPTIMIZING_LX_PLANNING``
+     - Use the co-optimizing LX allocator strategy (default ``0``)
+   * - ``CHUNK_LARGE_TENSORS``
+     - Run the ``chunk_large_tensors`` pass to split tensors that exceed
+       the per-core span (default ``0``)
+   * - ``GLOBAL_STICK_OPTIMIZER``
+     - Enable the global stick-dimension optimizer (default ``1``)
+   * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
+     - Permute physical core IDs at SDSC emission so K-collaborator cores
+       sit on adjacent ring positions, reducing PSUM chain hops (default
+       ``1``)
+   * - ``BUNDLE_SYMBOLIC_ARGS``
+     - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
+       integers (default ``0``)
+   * - ``UNROLL_LOOPS``
+     - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
+       generation (default ``1``; set ``0`` to keep the
+       ``scf.for`` / ``affine.apply`` path)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
