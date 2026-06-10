@@ -42,37 +42,51 @@ DEVICE = "spyre"
 DTYPE = torch.float16
 
 
+# Use FRAGMENT (not DEF) and guard against re-defining schemas, so the module
+# is safe to import more than once — the test harness re-imports test files
+# under different module names during analysis + execution, and DEF +
+# unguarded define()/impl() would trip both
+#   "Only a single TORCH_LIBRARY can be used to register the namespace ..."
+# and
+#   "Tried to register an operator ... with the same name multiple times".
+def _ns_has_op(ns: str, op: str) -> bool:
+    return hasattr(getattr(torch.ops, ns, None), op)
+
+
 # Shape 1: op(x) -> Tensor
-_LIB_S1 = torch.library.Library("test_fk_s1", "DEF")
-_LIB_S1.define("scale_two(Tensor x) -> Tensor")
-_LIB_S1.impl("scale_two", lambda x: x * 2, dispatch_key="CompositeExplicitAutograd")
-_LIB_S1._register_fake("scale_two", lambda x: torch.empty_like(x))
+_LIB_S1 = torch.library.Library("test_fk_s1", "FRAGMENT")
+if not _ns_has_op("test_fk_s1", "scale_two"):
+    _LIB_S1.define("scale_two(Tensor x) -> Tensor")
+    _LIB_S1.impl("scale_two", lambda x: x * 2, dispatch_key="CompositeExplicitAutograd")
+    _LIB_S1._register_fake("scale_two", lambda x: torch.empty_like(x))
 
 
 # Shape 2: op(x) -> (Tensor, Tensor)
-_LIB_S2 = torch.library.Library("test_fk_s2", "DEF")
-_LIB_S2.define("split_two(Tensor x) -> (Tensor, Tensor)")
-_LIB_S2.impl(
-    "split_two",
-    lambda x: (x + 1.0, x - 1.0),
-    dispatch_key="CompositeExplicitAutograd",
-)
-_LIB_S2._register_fake(
-    "split_two", lambda x: (torch.empty_like(x), torch.empty_like(x))
-)
+_LIB_S2 = torch.library.Library("test_fk_s2", "FRAGMENT")
+if not _ns_has_op("test_fk_s2", "split_two"):
+    _LIB_S2.define("split_two(Tensor x) -> (Tensor, Tensor)")
+    _LIB_S2.impl(
+        "split_two",
+        lambda x: (x + 1.0, x - 1.0),
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    _LIB_S2._register_fake(
+        "split_two", lambda x: (torch.empty_like(x), torch.empty_like(x))
+    )
 
 
 # Shape 3: op(x, out) -> ()  (void / in-place mutation)
-_LIB_S3 = torch.library.Library("test_fk_s3", "DEF")
-_LIB_S3.define("inplace_add(Tensor x, Tensor(a!) out) -> ()")
+_LIB_S3 = torch.library.Library("test_fk_s3", "FRAGMENT")
+if not _ns_has_op("test_fk_s3", "inplace_add"):
+    _LIB_S3.define("inplace_add(Tensor x, Tensor(a!) out) -> ()")
 
+    def _inplace_add_impl(x, out):
+        out.add_(x)
 
-def _inplace_add_impl(x, out):
-    out.add_(x)
-
-
-_LIB_S3.impl("inplace_add", _inplace_add_impl, dispatch_key="CompositeExplicitAutograd")
-_LIB_S3._register_fake("inplace_add", lambda x, out: None)
+    _LIB_S3.impl(
+        "inplace_add", _inplace_add_impl, dispatch_key="CompositeExplicitAutograd"
+    )
+    _LIB_S3._register_fake("inplace_add", lambda x, out: None)
 
 
 class TestFallbackKernelShape1Single(unittest.TestCase):
