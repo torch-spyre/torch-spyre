@@ -74,7 +74,7 @@ from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
-from .split_multi_ops import split_multi_ops
+from .split_multi_ops import split_multi_ops, validate_ops
 
 
 logger = get_inductor_logger("passes")
@@ -318,6 +318,7 @@ class CustomPreSchedulingPasses:
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
+            validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,

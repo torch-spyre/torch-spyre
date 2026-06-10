@@ -17,10 +17,14 @@ import sympy
 import torch
 import torch.fx as fx
 from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
+from .errors import Unsupported
+from .pass_utils import replace_computed_buffer_body
+from torch_spyre._C import SpyreTensorLayout
 
 logger = get_inductor_logger("split_multi_ops")
 
@@ -518,35 +522,54 @@ def _update_original_buf(
         if hasattr(op.data, attr):
             object.__setattr__(new_data, attr, getattr(op.data, attr))
 
-    new_op = ComputedBuffer(
-        name=op.get_name(),
-        layout=op.layout,
-        data=new_data,
-    )
-    new_op.operation_name = op.operation_name
-    new_op.origins = op.origins
-
-    # Preserve custom attributes used by other passes
-    custom_attrs = (
-        "_split_size",
-        "_original_inner_fn",
-        "_original_ranges",
-        "_original_reduction_ranges",
-    )
-    for attr in custom_attrs:
-        if hasattr(op, attr):
-            object.__setattr__(new_op, attr, getattr(op, attr))
-
-    # Invalidate cached read_writes
-    if hasattr(new_op, "_cached_read_writes"):
-        del new_op._cached_read_writes
-    _ = new_op.get_read_writes()
-
-    # Update the graph operations with the new op
-    idx = operations.index(op)
-    operations[idx] = new_op
+    new_op = replace_computed_buffer_body(op, new_data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
-    ComputedBuffer.get_default_sizes_body.clear_cache(new_op)
+
+
+def validate_ops(graph: GraphLowering) -> None:
+    """Validate inputs to ops have same ElementArrangement.
+
+    This pass need to be run after propagate_spyre_tensor_layouts so that it
+    has all the required SpyreTensorLayouts.
+    """
+    for op in graph.operations:
+        if not hasattr(op, "data"):
+            continue
+        if not isinstance(op.data, Pointwise):
+            continue
+
+        read_writes = op.get_read_writes()
+        inputs = [r for r in read_writes.reads if isinstance(r, MemoryDep)]
+
+        # Exclude single input ops
+        if len(inputs) <= 1:
+            continue
+
+        layouts = []
+        input_names = []
+        for inp in inputs:
+            buf = V.graph.get_buffer(inp.name)
+            # Skip buffers without layouts
+            if not hasattr(buf, "layouts"):
+                continue
+            for layout in buf.layouts:
+                if isinstance(layout, SpyreTensorLayout):
+                    layouts.append(layout)
+                    input_names.append(inp.name)
+
+        if len(layouts) <= 1:
+            continue
+
+        # Check all layouts have the same element_arrangement
+        stl_eas = [layout.element_arrangement for layout in layouts]
+        if len(set(stl_eas)) != 1:
+            args_str = ", ".join(
+                [f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)]
+            )
+            raise Unsupported(
+                f"All inputs to an op must have same element arrangement, "
+                f"op: {op.get_name()}, args: {args_str}"
+            )
 
 
 def split_multi_ops(graph: GraphLowering):
