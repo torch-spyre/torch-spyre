@@ -40,6 +40,7 @@ from .logging_utils import get_inductor_logger
 from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
+    mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
 )
@@ -209,6 +210,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 recover_spyre_hints,
                 convert_constant_with_graph_node,
                 mm_to_bmm_pass.apply,
+                mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
             ]
         )
@@ -313,18 +315,27 @@ class CustomPreSchedulingPasses:
     def __init__(self):
         self.passes = [
             deadcode_elimination,
+            #
+            # Tensor Layout (Stickification)
             propagate_spyre_tensor_layouts,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
             insert_bmm_padding,
+            #
             dedup_and_promote_constants,
+            #
+            # Working Set Reduction
             _maybe_chunk_large_tensors,
             propagate_named_dims,
             assign_dim_hints,
             _maybe_coarse_tile,
+            #
+            # Core Division
             span_reduction,
             _distribute_work,
+            #
+            # LX Planning
             _maybe_scratchpad_planning,
         ]
 

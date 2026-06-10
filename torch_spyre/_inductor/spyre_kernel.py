@@ -60,63 +60,6 @@ import logging
 logger = get_inductor_logger("spyre_kernel")
 
 
-def _is_static_one(value: Any) -> bool:
-    try:
-        return concretize_expr(value) == 1
-    except Exception:
-        return False
-
-
-def _is_static_multiple(value: Any, divisor: int) -> bool:
-    try:
-        return concretize_expr(value) % divisor == 0
-    except Exception:
-        return False
-
-
-def _has_stick_aligned_matmul_dims(k: Any, n: Any) -> bool:
-    return _is_static_multiple(k, 64) and _is_static_multiple(n, 64)
-
-
-def _same_static_size(lhs: Any, rhs: Any) -> bool:
-    try:
-        return concretize_expr(lhs) == concretize_expr(rhs)
-    except Exception:
-        return False
-
-
-def _shared_weight_unit_bmm_info_from_sizes(
-    x_size: Sequence[Any], y_size: Sequence[Any], out_size: Sequence[Any]
-) -> dict[str, int] | None:
-    if len(x_size) != 3 or len(out_size) != 3:
-        return None
-    if not (_is_static_one(x_size[0]) and _is_static_one(out_size[0])):
-        return None
-    if len(y_size) == 2:
-        if not (
-            _same_static_size(x_size[1], out_size[1])
-            and _same_static_size(x_size[2], y_size[0])
-            and _same_static_size(y_size[1], out_size[2])
-        ):
-            return None
-        k_dim, n_dim = x_size[2], y_size[1]
-    elif len(y_size) == 3:
-        if not _is_static_one(y_size[0]):
-            return None
-        if not (
-            _same_static_size(x_size[1], out_size[1])
-            and _same_static_size(x_size[2], y_size[1])
-            and _same_static_size(y_size[2], out_size[2])
-        ):
-            return None
-        k_dim, n_dim = x_size[2], y_size[2]
-    else:
-        return None
-    if not _has_stick_aligned_matmul_dims(k_dim, n_dim):
-        return None
-    return {"batch_dim": 0}
-
-
 class RValue(ABC):
     """
     An RValue is an expression that can appear on the right hand side of an assignment.
@@ -586,11 +529,27 @@ class SpyreKernel(Kernel[CSEVariable]):
         # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
         li = getattr(ir_node, "loop_info", None)
         raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
+        raw_tiled_red_dims: list[list[int]] = (
+            li.loop_tiled_reduction_dims if li is not None else []
+        )
         all_tiled_dims = [d for level in raw_tiled_dims for d in level]
+        all_tiled_red_dims = [d for level in raw_tiled_red_dims for d in level]
         it_space_keys = list(it_space.keys())
         tiled_syms = [
             it_space_keys[i] for i in all_tiled_dims if i < len(it_space_keys)
         ]
+        # For reduction ops tiled over a reduction dimension, it_space (from
+        # reads.ranges) has output-dim symbols first, then reduction-dim symbols.
+        # loop_tiled_reduction_dims indices are 0-based into the reduction portion,
+        # so offset them by the number of output-space symbols.
+        if all_tiled_red_dims:
+            write_dep = next(iter(self.current_node.read_writes.writes), None)
+            n_output_syms = len(write_dep.ranges) if write_dep is not None else 0
+            tiled_syms += [
+                it_space_keys[n_output_syms + r]
+                for r in all_tiled_red_dims
+                if n_output_syms + r < len(it_space_keys)
+            ]
 
         return OpSpec(
             op,
@@ -739,12 +698,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 raise Unsupported(f"invalid {value.op} arguments {value.arguments}")
             x = value.arguments[0]
             y = value.arguments[1]
-            if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
-                shared_weight_info = _shared_weight_unit_bmm_info_from_sizes(
-                    x.layout.size, y.layout.size, dst.layout.size
-                )
-                if shared_weight_info is not None:
-                    op_info[SHARED_WEIGHT_UNIT_BMM_INFO_KEY] = shared_weight_info
             args = [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(True, y.name, y),
