@@ -65,6 +65,7 @@ void JobPlanStepCompute::construct(
     }
 
     flex_stream->launchOperationCompute(&binary_address_, inp, "", bootstrap_addr_, {}, pipeline_barrier_);
+    return;
   }
   flex_stream->launchOperationCompute(&binary_address_, {}, "", flex::PROG_OFFSET_BASE, {}, pipeline_barrier_);
 }
