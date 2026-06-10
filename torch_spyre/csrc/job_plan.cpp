@@ -60,22 +60,18 @@ void JobPlanStepD2H::write(std::ostream& os) const {
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
     LaunchContext& ctx) const {
+  std::vector<const flex::CompositeAddress*> tensor_allocs;
   if (bind_io_addresses_) {
-    std::vector<const flex::CompositeAddress*> inp;
     for (auto& tensor : ctx.inputs_outputs) {
       flex::CompositeAddress* address =
           &(static_cast<SharedOwnerCtx*>(
                 tensor.storage().data_ptr().get_context())
                 ->composite_addr);
-      inp.push_back(address);
+      tensor_allocs.push_back(address);
     }
-
-    auto op = std::make_unique<flex::RuntimeOperationCompute>(
-        &binary_address_, inp, "", bootstrap_addr_);
-    op->setPipelineBarrier(pipeline_barrier_);
-    return op;
   }
-  auto op = std::make_unique<flex::RuntimeOperationCompute>(&binary_address_);
+  auto op = std::make_unique<flex::RuntimeOperationCompute>(
+      &binary_address_, tensor_allocs, "", bootstrap_addr_);
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }
@@ -89,18 +85,18 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
-// convert CompositeAddress to address that host compute function expects
-int64_t convert_address(flex::CompositeAddress& composite_address) {
+// TODO(jni): move to flex
+// convert CompositeAddress to dmva
+static int64_t composite_address_to_dmva(
+    const flex::CompositeAddress& composite_address) {
   size_t num_chunks = composite_address.chunks().size();
   TORCH_CHECK(num_chunks == 1, "Interleaved not supported yet");
 
-  // TODO(jni): update once resolved on flex support
-  // const auto& addr = composite_address.chunks().at(0).addr;
-  // int64_t address = addr.segment_id * flex::SEGMENT_SIZE + addr.offset;
-
-  TORCH_CHECK(false,
-              "convert_address not yet implemented - waiting for flex support");
-  return 0;
+  const auto& addr = composite_address.chunks()[0].addr;
+  auto& allocator = SpyreAllocator::instance();
+  auto seg_id = allocator.segmentForRegion(addr.region_id);
+  auto address = flex::SegmentByteOffset_todmva(seg_id, addr.offset);
+  return address;
 }
 
 std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
@@ -132,7 +128,7 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
   std::vector<int64_t> addresses(ctx.inputs_outputs.size());
   int addr_idx = 0;
   for (auto& tensor : ctx.inputs_outputs) {
-    int64_t addr = convert_address(
+    int64_t addr = composite_address_to_dmva(
         (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
              ->composite_addr));
     addresses[addr_idx++] = addr;
