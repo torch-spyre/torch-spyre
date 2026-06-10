@@ -811,6 +811,7 @@ def where_scalar_decomp(condition, self, other):
 
     return torch.ops.aten.where.self(condition, self_t, other_t)
 
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
