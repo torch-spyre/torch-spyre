@@ -5123,6 +5123,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "uniform_ produced all identical values"
         )
 
+    def test_random_from_cpu(self):
+        """Test that tensor.random_(-5, 5) fills a tensor with random values in [-5, 5)."""
+        gen = torch.manual_seed(42)
+        x_spyre = torch.zeros(3, 5, dtype=torch.float16, device="spyre")
+        y_cpu = torch.zeros(3, 5, dtype=torch.float16, device="cpu")
+        y_cpu.random_(-5, 5, generator=gen)
+        gen.manual_seed(42)
+        x_spyre.random_(-5, 5, generator=gen)
+        x_cpu = x_spyre.to("cpu")
+
+        assert torch.all(x_cpu >= -5) and torch.all(x_cpu < 5), (
+            f"random_ values out of range [-5, 5): {x_cpu}"
+        )
+        assert not torch.all(x_cpu == x_cpu[0]), "random_ produced all identical values"
+        torch.testing.assert_close(x_cpu, y_cpu, rtol=0.0, atol=0.0)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_tril_cpu(self, x):
         def fn(input):

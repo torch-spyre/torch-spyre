@@ -20,6 +20,7 @@
 #include <pybind11/stl.h>
 
 #include "spyre_device_enum.h"
+#include "spyre_generator_impl.h"
 
 namespace py = pybind11;
 
@@ -38,8 +39,18 @@ struct SpyreHooksInterface : public at::PrivateUse1HooksInterface {
   bool hasPrimaryContext(c10::DeviceIndex device_index) const override {
     return true;
   }
+
   bool isAvailable() const override {
     return true;
+  }
+
+  const at::Generator& getDefaultGenerator(
+      c10::DeviceIndex device) const override {
+    return spyre::detail::getDefaultSpyreGenerator(device);
+  }
+
+  at::Generator getNewGenerator(c10::DeviceIndex device) const override {
+    return spyre::detail::createSpyreGenerator(device);
   }
 };
 
