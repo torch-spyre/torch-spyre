@@ -76,7 +76,7 @@ class TestPrepareKernel:
                 {
                     "command": "DataTransfer",
                     "properties": {
-                        "dirn": "H2D",
+                        "dirn": "false",
                         "host_handle": "output_buffer",
                         "dev_ptr": "120259084288",
                         "size": "1024",
