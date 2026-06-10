@@ -541,6 +541,14 @@ def validate_ops(graph: GraphLowering) -> None:
         read_writes = op.get_read_writes()
         inputs = [r for r in read_writes.reads if isinstance(r, MemoryDep)]
 
+        # Skip layernorm operations as they have special layout requirements
+        if hasattr(op.data, "origins") and op.data.origins:
+            origin_node = next(iter(op.data.origins))
+            if hasattr(origin_node.target, "name") and "layernorm" in str(
+                origin_node.target
+            ):
+                continue
+
         # Exclude single input ops
         if len(inputs) <= 1:
             continue
