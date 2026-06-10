@@ -429,6 +429,9 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
+        # Reconstructed buffers can copy optional metadata; recompute it here.
+        if hasattr(op, "work_div_loop_info"):
+            del op.work_div_loop_info  # type: ignore[attr-defined]
         dp = getattr(op, "_dim_prop_info", None)
         op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
         if not op_hints:
@@ -438,6 +441,11 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             continue
 
         assert dp is not None  # guaranteed by op_hints check above
+        if any(hint_dict.get("work_div") for hint_dict in op_hints.values()):
+            op.work_div_loop_info = {  # type: ignore[attr-defined]
+                sym: list(names) for sym, names in dp.loop_var_dims.items()
+            }
+
         reduction_dims = set(dp.reduction_named_dims or [])
 
         coord_for_name: dict[str, sympy.Symbol] = {}
@@ -447,6 +455,14 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             sym = _lone_sym(coord)
             for name, _ in named_dims_for_sym(op, sym):
                 coord_for_name[name] = sym
+        # Also map reduction dim names to their loop variable.  Reduction dims
+        # don't appear in output coordinates, so they would never be found by
+        # the output-coord loop above.  dp.loop_var_dims covers all loop vars
+        # (including the reduction dim), so we invert it for reduction names.
+        for sym, names in dp.loop_var_dims.items():
+            for name in names:
+                if name in reduction_dims:
+                    coord_for_name[name] = sym
 
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):

@@ -13,6 +13,15 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+import regex as re
+import torch
+
+from oot_test_constants import (
+    DTYPE_STR_MAP,
+    REL_PATH_TOKENS,
+)
+from oot_test_matching import parse_dtype
+
 
 # ---------------------------------------------------------------------------
 # Optional YAML import
@@ -24,20 +33,42 @@ except ImportError as _yaml_err:  # pragma: no cover
         "PyYAML is required for oot_test_utilities. Install it with: pip install pyyaml"
     ) from _yaml_err
 
-import regex as re
-import torch
-
-from oot_test_constants import (
-    DTYPE_STR_MAP,
-    REL_PATH_TOKENS,
-)
-from oot_test_matching import parse_dtype
 
 # Normalise platform.machine() into a safe marker string once at import time.
 _OOT_PLATFORM_ARCH: str = (
     re.sub(r"[^a-zA-Z0-9_]", "_", _platform.machine() or "unknown").strip("_")
     or "unknown"
 )
+
+
+def _extract_base_module_name(name: str) -> str:
+    """Extract base module name by stripping YAML-generated suffixes.
+
+    Strips suffixes like:
+    - _93b52f93 (8-char hex hash)
+    - _4096 (numeric identifier)
+    - _layer0 (layer identifier)
+
+    Examples:
+        GraniteRotaryEmbedding_93b52f93 -> GraniteRotaryEmbedding
+        GraniteRMSNorm_4096 -> GraniteRMSNorm
+        GraniteDecoderLayer_layer0 -> GraniteDecoderLayer
+
+    Args:
+        name: YAML module name with potential suffix
+
+    Returns:
+        Base module name without suffix
+    """
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2:
+        base_name, suffix = parts
+        # Check if suffix looks like a hash (hex) or number or "layerN"
+        if suffix.replace("layer", "").isdigit() or all(
+            c in "0123456789abcdef" for c in suffix
+        ):
+            return base_name
+    return name
 
 
 # ---------------------------------------------------------------------------

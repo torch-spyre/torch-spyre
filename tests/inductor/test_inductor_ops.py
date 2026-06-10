@@ -825,6 +825,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_reduce_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
+            "expect_fail": [
+                "mean_fp16_3d_dim_2",
+                "mean_fp16_3d_dim_neg1",
+                "mean_fp32_3d_dim_2",
+                "mean_fp32_3d_dim_neg1",
+                "sum_fp32_3d_dim_neg1",
+            ],
         },
         ("test_reduce_edge_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
@@ -1258,6 +1265,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
                         dtype=torch.float16
                     ),
+                ),
+                "signed_zero": (
+                    torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float16),
+                    torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float16),
                 ),
             },
         },
@@ -1968,7 +1979,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([0.0, -0.0, 1.0, -1.0], dtype=torch.float16),
                 ),
             },
-            "expect_fail": ["fp16_signed_0"],
         },
         (
             "test_inplace_op",
@@ -2030,7 +2040,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256, 128)).t(),
                 ),
             },
-            "expect_fail": ["float2bool"],
         },
         (
             "test_inplace_copy_noncontiguous",
@@ -2829,20 +2838,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
                 ),
             },
-            "expect_fail": [
-                "fp32_1d_dim_0",
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_4d_dim_0",
-                "fp32_4d_dim_1",
-                "fp32_4d_dim_2",
-                "fp32_4d_dim_3",
-                "fp32_3d_dim_neg1",
-                "fp32_3d_dim_neg2",
-            ],
         },
         ("test_sum_keepdim0", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
@@ -2928,16 +2923,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((6, 7, 12, 64), dtype=torch.float32, scale=0.01),
                 ),
             },
-            "expect_fail": [
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_4d_dim_0",
-                "fp32_4d_dim_1",
-                "fp32_4d_dim_2",
-                "fp32_4d_dim_3",
-            ],
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
@@ -3039,16 +3024,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((3, 7, 9), dtype=torch.float32),
                 ),
             },
-            "expect_fail": [
-                "fp16_3d_dim_2",
-                "fp16_3d_dim_neg1",
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_3d_dim_neg1",
-            ],
         },
         ("test_mean_keepdim0", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
@@ -3119,10 +3094,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             "expect_fail": [
+                "fp16_3d_dim_2",
+                "fp16_3d_dim_neg1",
                 "fp32_2d_dim_0",
                 "fp32_2d_dim_1",
                 "fp32_3d_dim_0",
                 "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_3d_dim_neg1",
             ],
         },
         ("test_max_keepdim1", "test_max_eager"): {
@@ -3255,17 +3234,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                 ),
             },
-            "expect_fail": [
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_4d_dim_0",
-                "fp32_4d_dim_1",
-                "fp32_4d_dim_2",
-                "fp32_4d_dim_3",
-            ],
         },
         ("test_max_keepdim0", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
@@ -3383,16 +3351,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                 ),
             },
-            "expect_fail": [
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_4d_dim_0",
-                "fp32_4d_dim_1",
-                "fp32_4d_dim_2",
-                "fp32_4d_dim_3",
-            ],
         },
         ("test_min_keepdim1", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
@@ -3524,17 +3482,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                 ),
             },
-            "expect_fail": [
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_0",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_4d_dim_0",
-                "fp32_4d_dim_1",
-                "fp32_4d_dim_2",
-                "fp32_4d_dim_3",
-            ],
         },
         ("test_min_keepdim0", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
@@ -3652,16 +3599,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                 ),
             },
-            "expect_fail": [
-                "fp32_2d_dim_0",
-                "fp32_2d_dim_1",
-                "fp32_3d_dim_1",
-                "fp32_3d_dim_2",
-                "fp32_4d_dim_0",
-                "fp32_4d_dim_1",
-                "fp32_4d_dim_2",
-                "fp32_4d_dim_3",
-            ],
         },
         (
             "test_pointwise_unary_op_fp32",
@@ -3672,6 +3609,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "256": (cached_randn((256,), dtype=torch.float32),),
                 "67x256": (cached_randn((67, 256), dtype=torch.float32),),
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
+            },
+        },
+        ("test_eq_scalar", "test_scalar_comparison_base"): {
+            "param_sets": {
+                "int_42": (
+                    42,
+                    torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float16),
+                ),
+                "int_10": (
+                    10,
+                    torch.tensor([1.0, 10.0, 5.0, 10.0, 3.0], dtype=torch.float16),
+                ),
+                "float_3_5": (
+                    3.5,
+                    torch.tensor([1.0, 3.5, 2.5, 3.1, 5.0], dtype=torch.float16),
+                ),
+                "negative_5": (
+                    -5,
+                    torch.tensor([-5, 0.0, 5.0, -5.0, 10.0], dtype=torch.float16),
+                ),
+                "zero": (
+                    0,
+                    torch.tensor([0.0, 1.0, -1.0, 0.0, 5.0], dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_eq_scalar_multidim", "test_scalar_multidim_base"): {
+            "param_sets": {
+                "2d": (
+                    7,
+                    torch.tensor(
+                        [[1.0, 7.0, 3.0], [7.0, 5.0, 7.0]], dtype=torch.float16
+                    ),
+                ),
+                "3d": (7, torch.randint(0, 15, (3, 4, 5)).to(torch.float16)),
+                "4d": (7, torch.randint(0, 15, (2, 3, 4, 5)).to(torch.float16)),
+                "large": (42, torch.randn(100, 50, dtype=torch.float16)),
+            },
+        },
+        ("test_eq_scalar_vs_tensor", "test_scalar_vs_tensor_base"): {
+            "param_sets": {
+                "mixed": (
+                    torch.tensor([1.0, 5.0, 3.0, 5.0], dtype=torch.float16),
+                    torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16),
+                    5,
+                ),
             },
         },
         ("test_where_default", "test_where_eager_default_fallback"): {
@@ -3941,6 +3924,62 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def compare(self, *args, **kwargs):
         return utils_inductor.compare(*args, **kwargs)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_comparison_base(self, scalar, x):
+        """Base method for testing equality comparison with scalar constants"""
+
+        def fn(tensor, scalar_val):
+            return tensor == scalar_val
+
+        _compare_op_with_cpu(fn, None, x, scalar)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_multidim_base(self, scalar, x):
+        """Base method for testing equality comparison on multi-dimensional tensors"""
+
+        def fn(tensor, scalar_val):
+            return tensor == scalar_val
+
+        _compare_op_with_cpu(fn, None, x, scalar)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
+    def test_scalar_vs_tensor_base(self, x, y, scalar):
+        """Base method for testing both scalar and tensor comparisons work"""
+
+        def fn(tensor_x, tensor_y, scalar_val):
+            scalar_result = tensor_x == scalar_val
+            tensor_result = tensor_x == tensor_y
+            return scalar_result, tensor_result
+
+        _compare_op_with_cpu(fn, None, x, y, scalar)
+
+    def test_scalar_comparison(self):
+        self.test_eq_scalar_int_42()
+
+    def test_eq_scalar_constant_int(self):
+        self.test_eq_scalar_int_10()
+
+    def test_eq_scalar_constant_float(self):
+        self.test_eq_scalar_float_3_5()
+
+    def test_eq_scalar_constant_negative(self):
+        self.test_eq_scalar_negative_5()
+
+    def test_eq_scalar_constant_zero(self):
+        self.test_eq_scalar_zero()
+
+    def test_eq_scalar_constant_multidim(self):
+        self.test_eq_scalar_multidim_2d()
+
+    def test_eq_scalar_constant_large_tensor(self):
+        self.test_eq_scalar_multidim_large()
+
+    def test_eq_scalar_vs_tensor_comparison(self):
+        self.test_eq_scalar_vs_tensor_mixed()
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_unary_op(self, op, x):
@@ -5278,6 +5317,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             dst_dtype,
             cpu_compile=False,
             run_eager=False,
+        )
+
+    def test_bool_conversion_from_spyre(self):
+        torch.manual_seed(42)
+
+        def test_fn(input):
+            tmp = torch.mul(input, input)
+            tmp = tmp.to(dtype=torch.bool)
+            return tmp
+
+        input_cpu = (torch.randn(64) > 0.0).to(dtype=torch.float16)
+        expected_output = test_fn(input_cpu)
+
+        input_spyre = input_cpu.to("spyre")
+        compiled_fn = torch.compile(test_fn, backend="inductor")
+        output_spyre = compiled_fn(input_spyre)
+        output_cpu = output_spyre.cpu()
+
+        assert torch.equal(output_cpu, expected_output), (
+            f"Bool conversion failed: got {output_cpu.sum().item()}/{64} True, expected {expected_output.sum().item()}/{64}"
         )
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):

@@ -24,9 +24,9 @@ import torch
 
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.utils import OP_OUTPUT_GOOD_FOR_LX_REUSE
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
@@ -58,11 +58,14 @@ class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
 
 
 class TestScratchpadUsage(unittest.TestCase):
-    our_pre_scheduling_passes: list[Callable[[list[Operation]], None]] = []
+    our_pre_scheduling_passes: list[Callable[[GraphLowering], None]] = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.patchers = []
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
-        self.patchers = []
 
         self.patchers.append(t_inductor_config.patch("force_disable_caches", True))
         self.patchers.append(ts_inductor_config.patch("sencores", 1))
@@ -285,6 +288,139 @@ class TestMeasureHBMUsageCoOptimizing(TestMeasureHBMUsageScratchPad):
         f = functools.partial(torch.softmax, dim=-1)
         x = self.rand_device((512, 1024))
         self.common(f, (x,))
+
+
+class TestCloneAtGraphBoundaries(TestScratchpadUsage):
+    """End-to-end tests for clone insertion at graph input/output boundaries.
+
+    The allocator now inserts clone ops on-demand inside _push_allocation rather than
+    as a separate pre-scheduling pass.  These tests verify that:
+    - graph inputs read by multiple ops get a clone that lands in LX
+    - graph outputs that are also read inside the graph get a clone (for the HBM return
+      value), while the original buffer is pinned to LX
+
+    The test ensures that "clone" is one of the ops that are good for LX reuse.
+    """
+
+    @contextmanager
+    def clone_patcher(self):
+        OP_OUTPUT_GOOD_FOR_LX_REUSE.append("clone")
+        yield
+        OP_OUTPUT_GOOD_FOR_LX_REUSE.pop()
+
+    def setUp(self):
+        if "clone" not in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+            self.patchers.append(self.clone_patcher())
+        super().setUp()
+
+    def _compile_and_inspect(
+        self,
+        f: Callable,
+        args: tuple,
+    ) -> tuple:
+        """Compile f, capture op count and mem_usages after the allocator runs.
+
+        Handles both single-tensor and tuple outputs.
+        Returns (result_on_cpu, n_ops, mem_usages).
+        """
+        n_ops_captured: list[int] = []
+        mem_usages: dict[str, dict] = {}
+
+        def visitor(graph: GraphLowering) -> None:
+            n_ops_captured.append(len(graph.operations))
+            for op in graph.operations:
+                buf_name = op.name
+                buffer = graph.get_buffer(buf_name)
+                layout = buffer.get_layout()
+                device_layout = layout.device_layout
+                allocation = getattr(layout, "allocation", {})
+                mem_usages[buf_name] = {
+                    "location": "LX" if "lx" in allocation else "HBM",
+                    "size": math.prod(device_layout.device_size[:-1]) * 128,
+                }
+
+        with self.pre_scheduling_iterating_pass(visitor):
+            compiled_kernel = torch.compile(f, fullgraph=True)
+            raw = compiled_kernel(*args)
+            if isinstance(raw, tuple):
+                result = tuple(r.to("cpu") for r in raw)
+            else:
+                result = raw.to("cpu")
+
+        n_ops = n_ops_captured[0] if n_ops_captured else 0
+        return result, n_ops, mem_usages
+
+    def test_input_clone_when_read_by_multiple_ops(self):
+        """A graph input read by two different ops is cloned; the clone lands in LX."""
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # x is consumed by both exp_op and add_op → two reads → eligible for input clone
+            return torch.exp(x) + x
+
+        with ts_inductor_config.patch(lx_planning=False):
+            ref_result, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
+
+        torch.compiler.reset()
+
+        with ts_inductor_config.patch(lx_planning=True):
+            result, n_ops_with_lx, mem_usages = self._compile_and_inspect(fn, (x,))
+
+        self.assertGreater(
+            n_ops_with_lx,
+            n_ops_no_lx,
+            f"Expected the input clone to add an op: {n_ops_no_lx} ops without LX, "
+            f"{n_ops_with_lx} with LX",
+        )
+        self.assertTrue(
+            any(u["location"] == "LX" for u in mem_usages.values()),
+            "Expected at least one LX-allocated buffer after input cloning",
+        )
+        # Clone is an exact copy; LX planning must not change the numerical result.
+        self.assertTrue(
+            torch.equal(ref_result, result),
+            "LX input clone changed the numerical result",
+        )
+
+    def test_output_clone_when_intermediate_is_also_graph_output(self):
+        """A buffer that is both a graph output and read inside the graph is pinned to LX;
+        a clone of it is inserted as the actual (HBM) graph output returned to the caller."""
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # After CSE, y = exp(x) is produced once.
+            # y is a graph output AND is read by add_op → eligible for output clone.
+            y = torch.exp(x)
+            z = y + 1  # add_op reads y
+            return y, z
+
+        with ts_inductor_config.patch(lx_planning=False):
+            (ref_y, ref_z), n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
+
+        torch.compiler.reset()
+
+        with ts_inductor_config.patch(lx_planning=True):
+            (result_y, result_z), n_ops_with_lx, mem_usages = self._compile_and_inspect(
+                fn, (x,)
+            )
+
+        self.assertGreater(
+            n_ops_with_lx,
+            n_ops_no_lx,
+            f"Expected the output clone to add an op: {n_ops_no_lx} ops without LX, "
+            f"{n_ops_with_lx} with LX",
+        )
+        self.assertTrue(
+            any(u["location"] == "LX" for u in mem_usages.values()),
+            "Expected at least one LX-allocated buffer after output cloning",
+        )
+        # Clone is an exact copy; LX planning must not change the numerical result.
+        self.assertTrue(
+            torch.equal(ref_y, result_y), "LX output clone changed result y"
+        )
+        self.assertTrue(
+            torch.equal(ref_z, result_z), "LX output clone changed result z"
+        )
 
 
 if __name__ == "__main__":
