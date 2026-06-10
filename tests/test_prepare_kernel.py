@@ -66,6 +66,31 @@ class TestPrepareKernel:
                     "hcm": {"vdci": {}, "senConstants": []},
                 }
 
+        # Build JobExecPlan
+        job_exec_plan = [{"command": exec_command, "properties": exec_properties}]
+
+        # If ComputeOnHost, add required H2D and Compute steps
+        if exec_command == "ComputeOnHost":
+            # Add H2D transfer (transfers output_buffer to device)
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "H2D",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                }
+            )
+            # Add Compute step
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
+
         # Create a minimal spyrecode.json
         spyrecode_json = {
             "JobPreparationPlan": [
@@ -79,7 +104,7 @@ class TestPrepareKernel:
                     },
                 },
             ],
-            "JobExecPlan": [{"command": exec_command, "properties": exec_properties}],
+            "JobExecPlan": job_exec_plan,
         }
 
         # Write spyrecode.json
@@ -172,11 +197,13 @@ class TestPrepareKernel:
             assert job_plan is not None
             assert isinstance(job_plan, torch_spyre._C.JobPlan)
 
-            # Verify it has one step
-            assert job_plan.num_steps() == 1
+            # Verify it has 3 steps (HostCompute, H2D, Compute)
+            assert job_plan.num_steps() == 3
 
-            # Verify the step type is HostCompute
+            # Verify the step types
             assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_type(2) == "Compute"
 
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
