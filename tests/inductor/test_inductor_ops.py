@@ -2415,23 +2415,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_no_bias": (
                     cached_randn((67, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     None,
                 ),
                 "2d_bias": (
                     cached_randn((67, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     cached_randn((128,)),
                 ),
                 "3d_no_bias": (
                     cached_randn((3, 17, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     None,
                 ),
                 "3d_bias": (
                     cached_randn((3, 17, 256)),
-                    cached_randn((128, 256)),
+                    cached_xavier((128, 256)),
                     cached_randn((128,)),
+                ),
+                # down_proj-shaped cases : large reduction dim
+                # (32768) is numerically unstable with plain randn weights.
+                "down_proj_prefill_12800": (
+                    cached_randn((1, 11, 32768)),
+                    cached_xavier((12800, 32768)),
+                    cached_randn((12800,)),
+                ),
+                "down_proj_prefill_4096": (
+                    cached_randn((1, 11, 32768)),
+                    cached_xavier((4096, 32768)),
+                    cached_randn((4096,)),
+                ),
+                "down_proj_decode_12800": (
+                    cached_randn((1, 1, 32768)),
+                    cached_xavier((12800, 32768)),
+                    cached_randn((12800,)),
+                ),
+                "down_proj_decode_4096": (
+                    cached_randn((1, 1, 32768)),
+                    cached_xavier((4096, 32768)),
+                    cached_randn((4096,)),
                 ),
             }
         },
