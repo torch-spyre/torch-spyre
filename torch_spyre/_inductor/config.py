@@ -49,7 +49,7 @@ core_id_k_fast_emission: bool = (
 # When True, addresses are emitted as runtime symbols with
 # !sdscbundle.input_arg<index> parameters, input_arg_extract ops, and
 # affine.apply indirection for tiled loops.
-bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
+bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
