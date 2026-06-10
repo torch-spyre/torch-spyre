@@ -43,6 +43,12 @@ OP_GOOD_FOR_LX_INPLACE = [
 ]
 
 
+def clone_at_graph_boundaries() -> bool:
+    """True when clone ops are eligible for LX, enabling clone insertion at graph
+    input/output boundaries so those buffers can also be LX-pinned."""
+    return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+
+
 class GraphView:
     """
     Simple wrapper which allows filtering of returned operations
@@ -57,17 +63,20 @@ class GraphView:
         return getattr(self.graph, name)
 
 
-def calculate_liveness(graph: GraphLowering) -> dict:
-    liveness: dict[str, dict[str, bool | int]] = {}
+def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
+    """Return a dict mapping each buffer name to the sorted list of operation indices
+    at which that buffer is accessed (read or written).  Graph inputs are seeded with
+    an empty list; unused inputs remain empty."""
+    liveness: dict[str, list[int]] = {}
+    for input_name in graph.graph_input_names:
+        liveness[input_name] = []
     for i, op in enumerate(graph.operations):
         rw = op.get_read_writes()
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
             if buf_name not in liveness:
-                liveness[buf_name] = {}
-            if "liveness_start" not in liveness[buf_name]:
-                liveness[buf_name]["liveness_start"] = i
-            liveness[buf_name]["liveness_end"] = i + 1
+                liveness[buf_name] = []
+            liveness[buf_name].append(i)
     return liveness
 
 
