@@ -41,6 +41,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import sympy
 from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
 import torch
@@ -665,7 +666,7 @@ class TestCoarseTile(unittest.TestCase):
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile(
             _graph([op_extern, op_computed]),
-            [([op_extern, op_computed], [(0, Integer(2))])],
+            [([op_extern, op_computed], [(0, Integer(2), False)])],
         )
         self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
@@ -675,7 +676,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(_graph([op]), [([op], [(0, k)])])
+        coarse_tile(_graph([op]), [([op], [(0, k, False)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -687,7 +688,9 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
+            coarse_tile(
+                _graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4), False)])]
+            )
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -696,11 +699,11 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
+            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2), False)])])
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(hint_id, K1), ...] works."""
+    """Verify that the nested group format [(hint_id, K1, is_reduction), ...] works."""
 
     def setUp(self):
         self._patch = patch(
@@ -715,7 +718,9 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(
+            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
+        )
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -723,14 +728,18 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(
+            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
+        )
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
+        coarse_tile(
+            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(8), False)])]
+        )
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -744,8 +753,8 @@ class TestCoarseTileNested(unittest.TestCase):
         coarse_tile(
             _graph([op0, op1]),
             [
-                ([op0], [(1, Integer(4))]),
-                ([op1], [(2, Integer(4)), (3, Integer(2))]),
+                ([op0], [(1, Integer(4), False)]),
+                ([op1], [(2, Integer(4), False), (3, Integer(2), False)]),
             ],
         )
         self.assertEqual(op0.loop_info.loop_group_id, (0,))
@@ -762,7 +771,9 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile(
+            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
+        )
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -1952,24 +1963,25 @@ def _make_tiled_reduction_op(
 class TestCoarseTileReductionPropagation(unittest.TestCase):
     """Tests for insert_tiling_propagation Reduction support."""
 
-    def test_reduction_tiled_reduction_dim_raises(self):
-        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+    def test_reduction_tiled_reduction_dim_raises_stage2(self):
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
 
-        # ranges=[M], reduction_ranges=[K]; tiled_dim=1 is >= len(ranges)=1 → reduction dim
+        # Mixed nesting: outer tiles output dim, inner tiles reduction dim → Stage 2 error
         op = _make_tiled_reduction_op(
             "red0",
             ranges=[Integer(128)],
             reduction_ranges=[Integer(256)],
             reduction_type="sum",
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[1]],
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
         )
-        with self.assertRaises(RuntimeError, msg="tiled reduction dim should raise"):
-            _check_reduction_tiling_safety(op)
+        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        with self.assertRaises(RuntimeError, msg="mixed nested tiling should raise"):
+            _validate_reduction_tiling(op)
 
     def test_reduction_output_dim_tiled_ok(self):
-        from torch_spyre._inductor.coarse_tile import _check_reduction_tiling_safety
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
 
         # ranges=[M], reduction_ranges=[K]; tiled_dim=0 is an output dim → no error
         op = _make_tiled_reduction_op(
@@ -1981,8 +1993,107 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_count=[Integer(4)],
             loop_tiled_dims=[[0]],
         )
-        # Should not raise
-        _check_reduction_tiling_safety(op)
+        # output-dim-only tiling should not raise
+        _validate_reduction_tiling(op)
+
+
+class TestValidateReductionTiling(unittest.TestCase):
+    """_validate_reduction_tiling raises for unsupported Stage-2 configurations."""
+
+    def _make_op(self, loop_tiled_dims, loop_tiled_reduction_dims):
+        from torch._inductor.ir import ComputedBuffer, Reduction
+
+        data = MagicMock(spec=Reduction)
+        data.ranges = [Integer(128)]
+        data.reduction_ranges = [Integer(256)]
+        data.reduction_type = "sum"
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=loop_tiled_dims,
+            loop_tiled_reduction_dims=loop_tiled_reduction_dims,
+        )
+        return op
+
+    def test_pure_reduction_tile_ok(self):
+        """Single level, only reduction dim tiled — Stage 1 supported case."""
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+
+        op = self._make_op(loop_tiled_dims=[[]], loop_tiled_reduction_dims=[[0]])
+        _validate_reduction_tiling(op)  # must not raise
+
+    def test_pure_output_tile_ok(self):
+        """Single level, only output dim tiled — existing supported case."""
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+
+        op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]])
+        _validate_reduction_tiling(op)  # must not raise
+
+    def test_no_loop_info_ok(self):
+        """Op with no loop_info is not tiled — no error."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+
+        data = MagicMock(spec=Reduction)
+        data.ranges = [Integer(128)]
+        data.reduction_ranges = [Integer(256)]
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.loop_info = None
+        _validate_reduction_tiling(op)  # must not raise
+
+    def test_mixed_same_level_raises(self):
+        """Both output and reduction dim tiled at the same level — Stage 2, raises."""
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+
+        op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[0]])
+        with self.assertRaises(RuntimeError, msg="mixed same-level should raise"):
+            _validate_reduction_tiling(op)
+
+    def test_mixed_different_levels_raises(self):
+        """Output dim tiled at level 0, reduction dim at level 1 — Stage 2, raises."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+
+        data = MagicMock(spec=Reduction)
+        data.ranges = [Integer(128)]
+        data.reduction_ranges = [Integer(256)]
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+            loop_tiled_reduction_dims=[[], [0]],
+        )
+        with self.assertRaises(RuntimeError, msg="mixed nested levels should raise"):
+            _validate_reduction_tiling(op)
+
+    def test_multiple_reduction_dims_same_level_raises(self):
+        """Multiple reduction dims tiled at one level — Stage 2, raises."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+
+        data = MagicMock(spec=Reduction)
+        data.ranges = [Integer(128)]
+        data.reduction_ranges = [Integer(64), Integer(64)]
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[0, 1]],
+        )
+        with self.assertRaises(
+            RuntimeError, msg="multiple reduction dims should raise"
+        ):
+            _validate_reduction_tiling(op)
 
 
 class TestTiledSymsForSchedNode(unittest.TestCase):
@@ -2486,6 +2597,206 @@ class TestSymbolKind(unittest.TestCase):
         op1_operand = execute_lines[1].split("(")[1].split(")")[0].strip()
         self.assertIn("arg_0_core", op1_operand)  # derived from arg_0 with offset
         self.assertNotIn("input_arg_extract", op1_operand)
+
+
+class TestCoarseTileInfoReductionField(unittest.TestCase):
+    """CoarseTileInfo carries loop_tiled_reduction_dims parallel to loop_tiled_dims."""
+
+    def test_field_present_and_defaults_to_empty(self):
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[0]],
+        )
+        self.assertEqual(info.loop_tiled_reduction_dims, [])
+
+    def test_field_can_be_set(self):
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[0]],
+        )
+        self.assertEqual(info.loop_tiled_reduction_dims, [[0]])
+
+    def test_nested_parallel_shape(self):
+        """For a two-level nest, both fields have two sub-lists."""
+        from torch_spyre._inductor.loop_info import CoarseTileInfo
+
+        info = CoarseTileInfo(
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+            loop_tiled_reduction_dims=[[], [0]],
+        )
+        self.assertEqual(len(info.loop_tiled_dims), 2)
+        self.assertEqual(len(info.loop_tiled_reduction_dims), 2)
+        self.assertEqual(info.loop_tiled_reduction_dims[0], [])
+        self.assertEqual(info.loop_tiled_reduction_dims[1], [0])
+
+
+class TestDivideReductionRanges(unittest.TestCase):
+    """_divide_reduction_ranges divides reduction_ranges, leaves ranges intact."""
+
+    def _make_reduction_op(self, ranges, reduction_ranges, reduction_type="sum"):
+        from torch._inductor.ir import ComputedBuffer, Reduction, ReductionHint
+        import torch
+
+        data = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda idx, ridx: None,
+            ranges=list(ranges),
+            reduction_ranges=list(reduction_ranges),
+            reduction_type=reduction_type,
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+        return op
+
+    def test_basic_halves_reduction_range(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(128)], reduction_ranges=[Integer(256)]
+        )
+        _divide_reduction_ranges(op, Integer(2), [0])
+        self.assertEqual(op.data.reduction_ranges[0], Integer(128))
+        self.assertEqual(op.data.ranges[0], Integer(128))  # output ranges untouched
+
+    def test_empty_tiled_dims_is_noop(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(128)], reduction_ranges=[Integer(64)]
+        )
+        _divide_reduction_ranges(op, Integer(4), [])
+        self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # unchanged
+
+    def test_not_divisible_raises(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(128)], reduction_ranges=[Integer(100)]
+        )
+        with self.assertRaises(RuntimeError, msg="not divisible should raise"):
+            _divide_reduction_ranges(op, Integer(3), [0])
+
+    def test_divides_second_reduction_dim(self):
+        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+
+        op = self._make_reduction_op(
+            ranges=[Integer(32)], reduction_ranges=[Integer(64), Integer(128)]
+        )
+        _divide_reduction_ranges(op, Integer(4), [1])
+        self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # untouched
+        self.assertEqual(op.data.reduction_ranges[1], Integer(32))  # divided
+
+
+class TestLoopVarToReductionRangesPos(unittest.TestCase):
+    """_loop_var_to_reduction_ranges_pos finds the position of a symbol in reduction_ranges."""
+
+    def _make_op_with_rw(self, out_syms, red_syms):
+        """Return a mock ComputedBuffer whose get_read_writes() reflects the given symbols.
+
+        out_syms: list of sympy.Symbol appearing in both the input and output index
+        red_syms: list of sympy.Symbol appearing only in the input index (reduction dims)
+        """
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch._inductor.dependencies import MemoryDep
+
+        data = MagicMock(spec=Reduction)
+        data.reduction_ranges = [Integer(64)] * len(red_syms)
+
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_op"
+
+        # Output dep: index contains only out_syms
+        out_dep = MagicMock(spec=MemoryDep)
+        out_dep.index = (
+            sympy.Add(*out_syms)
+            if len(out_syms) > 1
+            else (out_syms[0] if out_syms else sympy.Integer(0))
+        )
+        out_dep.index = sympy.sympify(out_dep.index)
+
+        # Input dep: index contains out_syms + red_syms; ranges preserves insertion order
+        in_dep = MagicMock(spec=MemoryDep)
+        all_syms = out_syms + red_syms
+        in_dep.index = sympy.Add(*all_syms) if len(all_syms) > 1 else all_syms[0]
+        in_dep.index = sympy.sympify(in_dep.index)
+        # dict preserves insertion order in Python 3.7+ — out dims first, then red dims
+        in_dep.ranges = {s: Integer(64) for s in all_syms}
+
+        rw = MagicMock()
+        rw.reads = [in_dep]
+        rw.writes = iter([out_dep])
+        # Make iter(rw.writes) work for next()
+        out_dep_list = [out_dep]
+        rw.writes = out_dep_list
+        op.get_read_writes.return_value = rw
+        return op, red_syms
+
+    def test_finds_reduction_symbol(self):
+        from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
+
+        i0 = sympy.Symbol("i0")
+        r0 = sympy.Symbol("r0")
+        op, red_syms = self._make_op_with_rw(out_syms=[i0], red_syms=[r0])
+        result = _loop_var_to_reduction_ranges_pos(op, r0)
+        self.assertEqual(result, 0)
+
+    def test_returns_none_for_output_symbol(self):
+        from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
+
+        i0 = sympy.Symbol("i0")
+        r0 = sympy.Symbol("r0")
+        op, _ = self._make_op_with_rw(out_syms=[i0], red_syms=[r0])
+        result = _loop_var_to_reduction_ranges_pos(op, i0)
+        self.assertIsNone(result)
+
+
+class TestReductionIdentityValues(unittest.TestCase):
+    """_reduction_identity_value returns the correct monoid identity per reduction type."""
+
+    def _identity(self, reduction_type):
+        from torch_spyre._inductor.coarse_tile import _reduction_identity_value
+        import torch
+
+        return _reduction_identity_value(reduction_type, torch.float16)
+
+    def test_sum(self):
+        self.assertEqual(self._identity("sum"), 0)
+
+    def test_xor_sum(self):
+        self.assertEqual(self._identity("xor_sum"), 0)
+
+    def test_any(self):
+        self.assertEqual(self._identity("any"), 0)
+
+    def test_prod(self):
+        self.assertEqual(self._identity("prod"), 1)
+
+    def test_max(self):
+        self.assertEqual(self._identity("max"), float("-inf"))
+
+    def test_min(self):
+        self.assertEqual(self._identity("min"), float("inf"))
+
+    def test_unknown_raises(self):
+        from torch_spyre._inductor.coarse_tile import _reduction_identity_value
+        import torch
+
+        with self.assertRaises(RuntimeError):
+            _reduction_identity_value("welford_reduce", torch.float16)
 
 
 if __name__ == "__main__":
