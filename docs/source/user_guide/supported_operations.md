@@ -15,7 +15,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.matmul` | | Y | Spyre | |
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
+| `torch._scaled_mm` | | Y | Spyre | Compiled only; lowering in `_inductor/lowering.py` |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
+| `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
@@ -26,7 +28,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |
 | `torch.nn.functional.softplus` | Y | Y | Spyre | Custom op + lowering |
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
-| `torch.nn.functional.scaled_dot_product_attention` | | Y | Spyre | Custom decomposition (math path); compiled only |
+| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (math path); auto-registers a PrivateUse1 kernel for eager dispatch |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
@@ -37,8 +39,8 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.reciprocal` | Y | Y | Spyre | |
 | `torch.tanh` | Y | Y | Spyre | |
 | `torch.floor` | Y | Y | Spyre | |
-| `torch.ceil` | | Y | Spyre | Custom decomposition |
-| `torch.sign` | | Y | Spyre | Custom decomposition |
+| `torch.ceil` | Y | Y | Spyre | Custom decomposition |
+| `torch.sign` | Y | Y | Spyre | Custom decomposition |
 | `torch.logical_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.bitwise_not` | Y | Y | Spyre | Custom decomposition |
 | `torch.clamp` | Y | Y | Spyre | Custom op + lowering |
@@ -51,22 +53,22 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.div` | Y | Y | Spyre | |
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
-| `torch.bitwise_and` | | Y | Spyre | Custom decomposition |
-| `torch.where` | | Y | Spyre | Compiled only |
+| `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition |
+| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
 | `torch.ne` | Y | Y | Spyre | |
 | `torch.gt` | Y | Y | Spyre | |
 | `torch.lt` | Y | Y | Spyre | |
 | `torch.ge` | Y | Y | Spyre | |
-| `torch.le` | | Y | Spyre | |
+| `torch.le` | Y | Y | Spyre | |
 | **Reduction** | | | | |
 | `torch.sum` | Y | Y | Spyre | |
 | `torch.mean` | Y | Y | Spyre | |
 | `torch.amax` | | Y | Spyre | Compiled only (no eager dispatch) |
 | `torch.amin` | | Y | Spyre | Compiled only (no eager dispatch) |
-| `torch.max` | | Y | Spyre | Compiled only; `max.dim` via custom decomposition |
-| `torch.min` | | Y | Spyre | Compiled only; `min.dim` via custom decomposition (fp16) |
+| `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition |
+| `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16) |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
 | `torch.linalg.vector_norm` | Y | | Spyre | Eager only; compiled support not validated |
 | **View Ops** [^views] | | | | |
