@@ -2691,8 +2691,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_d1_mid": (1, 64, 128, cached_randn((9, 192), dtype=torch.float16)),
                 "3d_d0": (0, 0, 3, cached_randn((9, 5, 192), dtype=torch.float16)),
                 "3d_d1": (1, 1, 4, cached_randn((9, 5, 192), dtype=torch.float16)),
-                "3d_d2_begin": (2, 0, 64, cached_randn((3, 5, 192), dtype=torch.float16)),
-                "3d_d2_mid": (2, 64, 128, cached_randn((3, 5, 192), dtype=torch.float16)),
+                "3d_d2_begin": (
+                    2,
+                    0,
+                    64,
+                    cached_randn((3, 5, 192), dtype=torch.float16),
+                ),
+                "3d_d2_mid": (
+                    2,
+                    64,
+                    128,
+                    cached_randn((3, 5, 192), dtype=torch.float16),
+                ),
             },
         },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
