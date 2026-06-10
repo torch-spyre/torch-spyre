@@ -315,18 +315,27 @@ class CustomPreSchedulingPasses:
     def __init__(self):
         self.passes = [
             deadcode_elimination,
+            #
+            # Tensor Layout (Stickification)
             propagate_spyre_tensor_layouts,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
             insert_bmm_padding,
+            #
             dedup_and_promote_constants,
+            #
+            # Working Set Reduction
             _maybe_chunk_large_tensors,
             propagate_named_dims,
             assign_dim_hints,
             _maybe_coarse_tile,
+            #
+            # Core Division
             span_reduction,
             _distribute_work,
+            #
+            # LX Planning
             _maybe_scratchpad_planning,
         ]
 
