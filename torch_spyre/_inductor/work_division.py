@@ -16,7 +16,7 @@
 import dataclasses
 import math
 import itertools
-from sympy import Expr, Symbol, divisors
+from sympy import Expr, Integer, Symbol, divisors
 from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 import torch
@@ -46,6 +46,7 @@ from .pass_utils import (
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
 )
+from .propagate_hints import get_op_hints
 from typing import Callable
 
 from .logging_utils import get_inductor_logger
@@ -503,6 +504,106 @@ def apply_splits(
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
+def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
+    dim_to_split: dict[str, int] = {}
+    for _, hint_dict in sorted(get_op_hints(op).items()):
+        dim_to_split.update(hint_dict.get("work_div") or {})
+    return dim_to_split
+
+
+def _has_work_div_hint(op: ComputedBuffer) -> bool:
+    return bool(_work_div_hint_by_name(op))
+
+
+def _resolve_work_div_hint(
+    op: ComputedBuffer,
+    it_space: dict[Symbol, Expr],
+) -> dict[Symbol, int] | None:
+    dim_to_split = _work_div_hint_by_name(op)
+    if not dim_to_split:
+        return None
+
+    loop_var_dims = getattr(op, "work_div_loop_info", {})
+    splits: dict[Symbol, int] = {}
+    for sym in it_space:
+        for name in loop_var_dims.get(sym, []):
+            if name in dim_to_split:
+                splits[sym] = dim_to_split[name]
+                break
+    return splits if splits else None
+
+
+def _apply_user_hint(
+    op: ComputedBuffer,
+    user_splits: dict[Symbol, int],
+    it_space_adjusted: dict[Symbol, Expr],
+    output_td: TensorDep,
+    max_cores: int,
+) -> dict[Symbol, int]:
+    op_name = op.get_name()
+
+    splits: dict[Symbol, int] = {}
+    for sym, split_val in user_splits.items():
+        # bool is an int subclass in Python, but it is not a meaningful split.
+        if isinstance(split_val, bool) or not isinstance(split_val, (int, Integer)):
+            raise Unsupported(
+                f"work_division_hint: {op_name} split value {split_val!r} "
+                f"for dim {sym} must be an integer."
+            )
+        split = int(split_val)
+        if split < 1:
+            raise Unsupported(
+                f"work_division_hint: {op_name} split value {split!r} "
+                f"for dim {sym} must be positive."
+            )
+        if sym not in it_space_adjusted:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} is not in the "
+                f"work-division iteration space."
+            )
+        splits[sym] = split
+
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars_to_split = {
+        sym for sym, split in splits.items() if split > 1 and sym not in coord_vars
+    }
+    if len(reduction_vars_to_split) > 1:
+        raise Unsupported(
+            f"work_division_hint: {op_name} splits "
+            f"{len(reduction_vars_to_split)} reduction dimensions "
+            f"({reduction_vars_to_split}), but the backend supports at most 1."
+        )
+
+    cores_used = math.prod(splits.values())
+    if cores_used > max_cores:
+        raise Unsupported(
+            f"work_division_hint: {op_name} total cores={cores_used} "
+            f"exceeds SENCORES={max_cores}."
+        )
+
+    for sym, split in splits.items():
+        dim_size = concretize_expr(it_space_adjusted[sym])
+        if dim_size % split != 0:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} size={dim_size} "
+                f"is not evenly divisible by split={split}."
+            )
+
+    return splits
+
+
+def _commit_user_splits(
+    op: ComputedBuffer,
+    splits: dict[Symbol, int],
+    output_td: TensorDep,
+) -> None:
+    if math.prod(splits.values()) <= 1:
+        if hasattr(op, "op_it_space_splits"):
+            delattr(op, "op_it_space_splits")
+        return
+    apply_splits(op, splits, output_td)
+
+
 def span_reduction_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -618,6 +719,38 @@ def work_distribution_pass(
     # apply_splits_from_index_coeff returns 1 for every unsplit dim; keep only
     # dims with actual committed splits so they don't overlap with priorities.
     committed_splits = {s: v for s, v in min_splits.items() if v > 1}
+
+    if not config.ignore_work_division_hints:
+        user_splits = _resolve_work_div_hint(op, it_space_adjusted)
+        if user_splits is not None:
+            user_splits = _apply_user_hint(
+                op, user_splits, it_space_adjusted, output_td, max_cores
+            )
+            dropped = {
+                s: v for s, v in committed_splits.items() if user_splits.get(s, 1) < v
+            }
+            if dropped:
+                logger.warning(
+                    f"work_division_hint: {op.get_name()} user hint reduces "
+                    f"splits committed by span_reduction for dims {list(dropped)}. "
+                    f"Applying strict user hint; this may violate the hardware "
+                    f"{MAX_SPAN_BYTES // (1024 * 1024)} MB span limit."
+                )
+            _commit_user_splits(op, user_splits, output_td)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                op_splits: tuple[dict, dict] = getattr(
+                    op, "op_it_space_splits", ({}, {})
+                )
+                logger.debug(
+                    f"work_distribution(user-hint) work_division {op.get_name()}: "
+                    f"cores={math.prod(user_splits.values())}, "
+                    f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+                    f"min_splits={committed_splits}, user_splits={user_splits}, "
+                    f"op_it_space_splits={op_splits}"
+                )
+            warn_if_per_core_overflow(all_tds, it_space, user_splits, op.get_name())
+            return
 
     splits, output_dims, reduction_dims = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores
@@ -844,6 +977,11 @@ def divide_reduction_op(
     # Currently we support Topk for k<=4, which can be handled efficiently on single core
     # TODO: Modification will be required to enable Topk for k>4
     if red.reduction_type in TOPK_OPS:
+        if not config.ignore_work_division_hints and _has_work_div_hint(op):
+            logger.warning(
+                f"work_division_hint: {op.get_name()} ignores work_div hint "
+                f"because TOPK reductions run single-core."
+            )
         return
 
     pass_fn(op, args, max_cores)
@@ -935,6 +1073,12 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 
     it_space = iteration_space_from_op(op)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    if (
+        not config.ignore_work_division_hints
+        and _resolve_work_div_hint(op, it_space_adjusted) is not None
+    ):
+        # User hints take ownership of the split decision; do not override them.
+        return False
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
     # runs before this pass, and work_distribution — which would overwrite it —
