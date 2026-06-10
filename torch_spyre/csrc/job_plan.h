@@ -218,8 +218,8 @@ class JobPlanStep {
    * @param ctx Launch context containing composite addresses
    * @return Unique pointer to the constructed RuntimeOperation
    */
-  virtual std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const = 0;
+  virtual void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const = 0;
 
   /**
    * @brief Write step information to output stream
@@ -292,8 +292,8 @@ class JobPlanStepH2D final : public JobPlanStep {
       : host_address_(host_address),
         device_address_(std::move(device_address)) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -320,8 +320,8 @@ class JobPlanStepD2H final : public JobPlanStep {
       : device_address_(std::move(device_address)),
         host_address_(host_address) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -353,8 +353,8 @@ class JobPlanStepCompute final : public JobPlanStep {
         bind_io_addresses_(bind_io_addresses),
         bootstrap_addr_(bootstrap_addr) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -400,8 +400,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         input_buffer_(input_buffer),
         ishape_(ishape) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(
+      LaunchContext& ctx, flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
