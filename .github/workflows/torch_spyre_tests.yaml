@@ -35,10 +35,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash
-
 permissions:
   contents: read
   checks: write
@@ -93,340 +89,54 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Job 2: test matrix
+  # Job 2: delegate to the shared test matrix
   #
-  # Only runs when `changes.code_changed == 'true'`, i.e. when something
-  # other than documentation was modified. For docs-only PRs this job is
-  # skipped entirely -- no hardware runners are consumed.
-  #
-  # To add a new test suite, append an entry to the matrix below:
-  #   - name: <human-readable label shown in the GHA UI>
-  #     config: <path inside tests/configs/>
+  # Only runs when `changes.code_changed == 'true'`. For docs-only PRs the
+  # reusable workflow is never invoked — no hardware runners are consumed.
   # ---------------------------------------------------------------------------
-  test:
-    name: ${{ matrix.suite.name }}
+  run-tests:
     needs: changes
-    # Skip this job entirely if no test-relevant files were modified.
-    # The fan-in job below handles the skipped case and still reports green
-    # to satisfy the branch protection required check.
     if: needs.changes.outputs.code_changed == 'true'
-    runs-on:
-      - x86_64
-      - spyre_pf_x1
-      - linux_for_pr_tests
-      - image_torch_spyre
-    timeout-minutes: 60
-    env:
-      # The CI env var is very important.
-      # GitHub actions automatically sets CI=true
-      # which causes the pytest inductor tests to fail with AssertionError
-      # due to a mix of fallbacks and decompositions.
-      # Here we set it to an empty string (or we could also unset it).
-      CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-
-    strategy:
-      fail-fast: false
-      matrix:
-        suite:
-          - name: Test Device Enum
-            config: torch_spyre_tests/test_device_enum_config.yaml
-          - name: Test Fallbacks
-            config: torch_spyre_tests/test_fallbacks_config.yaml
-          - name: Test Modules
-            config: torch_spyre_tests/test_modules_config.yaml
-          - name: Test Regex
-            config: torch_spyre_tests/test_regex_config.yaml
-          - name: Test Spyre
-            config: torch_spyre_tests/test_spyre_config.yaml
-          - name: Test Execution Trace
-            config: torch_spyre_tests/test_execution_trace_config.yaml
-          - name: Test Spyre Lazy Silent
-            config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
-          - name: Test Stream
-            config: torch_spyre_tests/test_stream_config.yaml
-          - name: Test Spyre Profiler
-            config: torch_spyre_tests/test_spyre_profiler_config.yaml
-          - name: Test Prepare Kernel
-            config: torch_spyre_tests/test_prepare_kernel_config.yaml
-          - name: Test Allocator E2E
-            config: torch_spyre_tests/test_allocator_e2e_config.yaml
-          - name: Test Launch Jobplan
-            config: torch_spyre_tests/test_launch_jobplan_config.yaml
-          # Inductor tests
-          - name: Inductor Building Blocks
-            config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
-          - name: Inductor Codegen
-            config: torch_spyre_tests/inductor/test_codegen_config.yaml
-          - name: Inductor Copy Back Elision
-            config: torch_spyre_tests/inductor/test_copy_back_elision_config.yaml
-          - name: Inductor Decomp
-            config: torch_spyre_tests/inductor/test_decomp_config.yaml
-          - name: Inductor FX Passes
-            config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
-          - name: Inductor Normalization Scalars
-            config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
-          - name: Inductor Ops Matmul
-            config: torch_spyre_tests/inductor/test_inductor_ops_matmul_config.yaml
-          - name: Inductor Ops Reductions Keepdim Multidim0
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim0_config.yaml
-          - name: Inductor Ops Reductions Keepdim Multidim1
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim1_config.yaml
-          - name: Inductor Ops Reductions Keepdim Singledim0
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim0_config.yaml
-          - name: Inductor Ops Reductions Keepdim Singledim1
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim1_config.yaml
-          - name: Inductor Ops Reductions Keepdim Index Norm Eager
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_index_norm_eager_config.yaml
-          - name: Inductor Ops Reductions Scalar
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
-          - name: Inductor Ops Pointwise
-            config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc Shape
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
-          - name: Inductor Ops Misc Compute
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
-          - name: Inductor Ops LX Planning
-            config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
-          - name: Inductor Scalar
-            config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
-          - name: Inductor Logging
-            config: torch_spyre_tests/inductor/test_logging_config.yaml
-          - name: Inductor Dedup Constants
-            config: torch_spyre_tests/inductor/test_dedup_constants_config.yaml
-          - name: Inductor Padding
-            config: torch_spyre_tests/inductor/test_padding_config.yaml
-          - name: Inductor Overwrite
-            config: torch_spyre_tests/inductor/test_overwrite.yaml
-          - name: Inductor Restickify
-            config: torch_spyre_tests/inductor/test_restickify_config.yaml
-          - name: Inductor Scratchpad Patterns
-            config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
-          - name: Inductor Scratchpad Use
-            config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
-          - name: Inductor Dtype Scalars
-            config: torch_spyre_tests/inductor/test_dtype_scalars_config.yaml
-          - name: Inductor Cache
-            config: torch_spyre_tests/inductor/test_cache_config.yaml
-          - name: Inductor Scratchpad Solver
-            config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
-          - name: Inductor Coarse Tiling
-            config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
-          - name: Inductor Coarse Tile E2E
-            config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
-          - name: Inductor Unroll Loop Specs
-            config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
-          - name: Inductor Work Division Hint
-            config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
-          # Tensor tests
-          - name: Tensor Coordinates
-            config: torch_spyre_tests/tensors/test_coordinates_config.yaml
-          - name: Tensor It Space Splits
-            config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
-          - name: Tensor Layout
-            config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
-          - name: Tensor Resize
-            config: torch_spyre_tests/tensors/test_resize_config.yaml
-          - name: Tensor Memory Format
-            config: torch_spyre_tests/tensors/test_memory_format_config.yaml
-
-    steps:
-      # Sparse checkout into the GHA workspace so the local composite
-      # actions under .github/actions/ are available. The pre-cloned
-      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
-      # against.
-      - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
-
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
-        with:
-          ref: ${{ inputs.ref }}
-
-      - uses: ./.github/actions/gather-runner-info
-        with:
-          verbose: 'true'
-
-      - name: Download RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/download-rpms
-        with:
-          rpm_location: ${{ inputs.rpm_location }}
-          rpm_names: ${{ inputs.rpm_names }}
-
-      - name: Install RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        run: |
-          ls -la
-          ls -la rpms/
-          sudo dnf install -y rpms/*.rpm
-
-      - name: Build torch-spyre
-        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
-        uses: ./.github/actions/build-torch-spyre
-
-      - name: Run ${{ matrix.suite.name }} tests
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-
-          CONFIG="tests/configs/${{ matrix.suite.config }}"
-
-          echo "Running ${{ matrix.suite.name }} tests..."
-
-          _ARCH="$(uname -m)"
-          _SLOW_FLAG=""
-          if [[ "$_ARCH" != "x86_64" ]]; then
-            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
-            _SLOW_FLAG="--skip-slow"
-          fi
-          echo "  Host Platform : ${_ARCH}"
-          echo "  Slow flag: ${_SLOW_FLAG:-none (all tests will run)}"
-          echo "  Command  : bash tests/run_test.sh $CONFIG -v ${_SLOW_FLAG}"
-          bash tests/run_test.sh "$CONFIG" -v ${_SLOW_FLAG}
-
-          echo "${{ matrix.suite.name }} tests done"
+    uses: ./.github/workflows/_test_matrix.yaml
+    with:
+      runner_label: linux_for_pr_tests
+      extra_test_flags: -v
+      checkout_pytorch: false
+      torch_root: ''
+      ref: ${{ inputs.ref || '' }}
+      rpm_location: ${{ inputs.rpm_location || '' }}
+      rpm_names: ${{ inputs.rpm_names || '' }}
+      build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
 
   # ---------------------------------------------------------------------------
-  # Job 3: Multi-Spyre test matrix
-  #
-  # Only runs when `changes.code_changed == 'true'`, i.e. when something
-  # other than documentation was modified. For docs-only PRs this job is
-  # skipped entirely -- no hardware runners are consumed.
-  # ---------------------------------------------------------------------------
-  test_multi_spyre:
-    name: ${{ matrix.suite.name }}
-    needs: changes
-    # Skip this job entirely if no test-relevant files were modified.
-    # The fan-in job below handles the skipped case and still reports green
-    # to satisfy the branch protection required check.
-    if: needs.changes.outputs.code_changed == 'true'
-    runs-on:
-      - x86_64
-      - spyre_pf_x2
-      - linux_for_pr_tests
-      - image_torch_spyre
-    timeout-minutes: 60
-    env:
-      # The CI env var is very important.
-      # GitHub actions automatically sets CI=true
-      # which causes the pytest inductor tests to fail with AssertionError
-      # due to a mix of fallbacks and decompositions.
-      # Here we set it to an empty string (or we could also unset it).
-      CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-
-    strategy:
-      fail-fast: false
-      matrix:
-        suite:
-          - name: Test Multi-Spyre Setup
-            config: distributed_tests/test_general.yaml
-          - name: Test Multi-Spyre Barrier
-            config: distributed_tests/test_barrier.yaml
-          - name: Test Multi-Spyre Broadcast
-            config: distributed_tests/test_broadcast.yaml
-
-    steps:
-      # Sparse checkout into the GHA workspace so the local composite
-      # actions under .github/actions/ are available. The pre-cloned
-      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
-      # against.
-      - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
-
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
-        with:
-          ref: ${{ inputs.ref }}
-
-      - uses: ./.github/actions/gather-runner-info
-        with:
-          verbose: 'true'
-
-      - name: Download RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/download-rpms
-        with:
-          rpm_location: ${{ inputs.rpm_location }}
-          rpm_names: ${{ inputs.rpm_names }}
-
-      - name: Install RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        run: |
-          ls -la
-          ls -la rpms/
-          sudo dnf install -y rpms/*.rpm
-
-      - name: Build torch-spyre
-        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
-        uses: ./.github/actions/build-torch-spyre
-
-      - name: Run ${{ matrix.suite.name }} tests
-        run: |
-          source "$HOME/.bashrc"
-
-          # Multi-Spyre tests require a fresh topology probe: clear the
-          # cached AIU setup guard and the stale topo.json so
-          # ibm-aiu-setup.sh re-discovers all attached cards.
-          unset _IBM_AIU_SETUP
-          rm -rf /tmp/etc/ibm/spyre/topo.json
-          source /etc/profile.d/ibm-aiu-setup.sh
-
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-
-          CONFIG="${{ matrix.suite.config }}"
-
-          echo "Running ${{ matrix.suite.name }} tests..."
-          env | sort
-          bash tests/run_test.sh "tests/configs/${CONFIG}" -v
-          echo "${{ matrix.suite.name }} tests done"
-
-  # ---------------------------------------------------------------------------
-  # Job 4: run-spyre-unit-tests (required check gate)
+  # Job 3: run-spyre-unit-tests (required check gate)
   #
   # This job name MUST match the branch protection required check exactly:
   #   "tests / Run Spyre unit tests"
   #
-  # It fans in all parallel matrix jobs so a single required check covers
-  # every suite. Three outcomes are handled:
+  # It fans in the reusable workflow result. Three outcomes are handled:
   #
-  #   test result = success  -> all suites passed      -> green
-  #   test result = skipped  -> docs-only PR, no tests -> green (instant)
-  #   test result = failure  -> one or more suites bad -> red   (blocks merge)
-  #
-  # The `skipped` case is what makes this compatible with docs-only PRs:
-  # the required check always reports a status, so GitHub never gets stuck
-  # waiting for a job that never runs.
+  #   run-tests result = success -> all suites passed      -> green
+  #   run-tests result = skipped -> docs-only PR, no tests -> green (instant)
+  #   run-tests result = failure -> one or more suites bad -> red   (blocks merge)
   # ---------------------------------------------------------------------------
   run-spyre-unit-tests:
     name: Run Spyre unit tests
     runs-on: ubuntu-latest
-    needs: [changes, test, test_multi_spyre]
+    needs: [changes, run-tests]
     if: always()
     steps:
       - name: Evaluate test results
         run: |-
-          TEST_RESULT="${{ needs.test.result }}"
-          TEST_MULTI_SPYRE_RESULT="${{ needs.test_multi_spyre.result }}"
-          echo "Test job result: ${TEST_RESULT}"
-          echo "Test Multi-Spyre job result: ${TEST_MULTI_SPYRE_RESULT}"
+          RESULT="${{ needs.run-tests.result }}"
+          echo "run-tests result: ${RESULT}"
 
-          # Check if both jobs succeeded
-          if [[ "${TEST_RESULT}" == "success" && "${TEST_MULTI_SPYRE_RESULT}" == "success" ]]; then
+          if [[ "${RESULT}" == "success" ]]; then
             echo "All test suites passed."
             exit 0
           fi
 
-          # Check if both jobs were skipped (docs-only change)
-          if [[ "${TEST_RESULT}" == "skipped" && "${TEST_MULTI_SPYRE_RESULT}" == "skipped" ]]; then
+          if [[ "${RESULT}" == "skipped" ]]; then
             echo "Tests skipped — docs-only change, no test-relevant files modified."
             exit 0
           fi
