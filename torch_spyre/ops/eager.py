@@ -28,22 +28,31 @@ aten = torch.ops.aten
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
         compiled = None
+        # Only forward the resolved `op` to wrapped functions that explicitly
+        # accept it (e.g. dispatch_to_torch_compile, which uses it to do a
+        # CPU fallback for unsupported dtypes). Plain @compile_once-decorated
+        # custom ops (overwrite, copy_from_d2d, ...) keep their original
+        # signature unchanged.
+        old_signature = inspect.signature(fn)
+        accepts_op = "op" in old_signature.parameters
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             nonlocal compiled
             nonlocal op
+            if isinstance(op, str):
+                op = operator.attrgetter(op)(torch.ops)
             if compiled is None:
-                if isinstance(op, str):
-                    op = operator.attrgetter(op)(torch.ops)
                 compiled = torch.compile(op, **compile_kwargs)
+            if accepts_op:
+                return fn(*args, compiled=compiled, op=op, **kwargs)
             return fn(*args, compiled=compiled, **kwargs)
 
-        # We remove the `compiled` arg from the signature to have
+        # We remove the `compiled` and `op` args from the signature to have
         # a clean signature.
-        old_signature = inspect.signature(fn)
         params = dict(old_signature.parameters)
         params.pop("compiled", None)
+        params.pop("op", None)
         new_signature = old_signature.replace(parameters=params.values())
         wrapper.__signature__ = new_signature
 
@@ -58,7 +67,74 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
+# Spyre is fp16-only by architecture. Integer-typed inputs to registered
+# torch_compile kernels have no SDSC kernel mapping and abort the device
+# compiler (`dxp_standalone` SIGABRT with
+# "Scheduler failed to find a suitable op mapping for sdsc: 0_<op>").
+# Route those calls through CPU at dispatch time. The result is moved back
+# to the spyre device so callers that expect a spyre tensor still get one.
+# This is the broader, dispatcher-level form of the per-op CPU-fallback
+# pattern already in use elsewhere in this module (cf. PR #2590 which adds
+# CPU fallbacks for amax/amin on bool via a per-op decomposition).
+_UNSUPPORTED_INT_DTYPES = (
+    torch.int8,
+    torch.uint8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
+
+
+def _has_int_tensor(values):
+    for v in values:
+        if isinstance(v, torch.Tensor) and v.dtype in _UNSUPPORTED_INT_DTYPES:
+            return True
+    return False
+
+
+def _to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.cpu()
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_cpu(v) for v in value)
+    return value
+
+
+def _to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_device(v, device) for v in value)
+    return value
+
+
+def _pick_spyre_device(args, kwargs):
+    for v in args:
+        if isinstance(v, torch.Tensor) and v.device.type == "spyre":
+            return v.device
+    for v in kwargs.values():
+        if isinstance(v, torch.Tensor) and v.device.type == "spyre":
+            return v.device
+    return torch.device("spyre")
+
+
+def dispatch_to_torch_compile(*args, compiled=None, op=None, **kwargs):
+    if op is not None and (
+        _has_int_tensor(args) or _has_int_tensor(kwargs.values())
+    ):
+        # Late import to avoid circulars at module load.
+        from .fallbacks import FallbackWarning
+
+        warnings.warn(
+            f"{op} is falling back to cpu (integer dtype not supported on Spyre)",
+            category=FallbackWarning,
+            stacklevel=2,
+        )
+        device = _pick_spyre_device(args, kwargs)
+        cpu_args = tuple(_to_cpu(a) for a in args)
+        cpu_kwargs = {k: _to_cpu(v) for k, v in kwargs.items()}
+        result = op(*cpu_args, **cpu_kwargs)
+        return _to_device(result, device)
     return compiled(*args, **kwargs)
 
 
