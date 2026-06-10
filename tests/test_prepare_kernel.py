@@ -172,8 +172,8 @@ class TestPrepareKernel:
             assert job_plan is not None
             assert isinstance(job_plan, torch_spyre._C.JobPlan)
 
-            # Verify it has at least one step
-            assert job_plan.num_steps() >= 1
+            # Verify it has one step
+            assert job_plan.num_steps() == 1
 
             # Verify the step type is HostCompute
             assert job_plan.get_step_type(0) == "HostCompute"
@@ -321,6 +321,31 @@ class TestPrepareKernel:
 
             with pytest.raises(
                 RuntimeError, match="ComputeOnHost 'ishape' elements must be strings"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_invalid_ihandle(self):
+        """Test that invalid ihandle (non-existent buffer) raises RuntimeError.
+
+        Verifies that when ihandle references a buffer name that was never
+        created, a RuntimeError is raised with the buffer name in the error
+        message.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "nonexistent_buffer",  # References a buffer that doesn't exist
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="ihandle 'nonexistent_buffer' not found in pinned buffer map",
             ):
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
