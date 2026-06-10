@@ -408,4 +408,41 @@ PYBIND11_MODULE(_C, m) {
         "Args:\n"
         "    job_plan: The JobPlan to execute\n"
         "    args: Sequence of input/output tensors");
+
+  // Allocator statistics functions
+  m.def(
+      "_spyre_get_allocator_stats",
+      [](c10::DeviceIndex device) {
+        auto& allocator = spyre::SpyreAllocator::instance();
+        auto stats = allocator.getDeviceStats(device);
+        py::dict result;
+        result["allocated_bytes.all.current"] =
+            stats
+                .allocated_bytes[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .current;
+        result["allocation.all.current"] =
+            stats
+                .allocation[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .current;
+        return result;
+      },
+      py::arg("device"), "Get allocator statistics for a device");
+
+  m.def(
+      "_spyre_reset_accumulated_stats",
+      [](c10::DeviceIndex device) {
+        auto& allocator = spyre::SpyreAllocator::instance();
+        allocator.resetAccumulatedStats(device);
+      },
+      py::arg("device"), "Reset accumulated allocator statistics");
+
+  m.def(
+      "_spyre_reset_peak_stats",
+      [](c10::DeviceIndex device) {
+        auto& allocator = spyre::SpyreAllocator::instance();
+        allocator.resetPeakStats(device);
+      },
+      py::arg("device"), "Reset peak allocator statistics");
 }
