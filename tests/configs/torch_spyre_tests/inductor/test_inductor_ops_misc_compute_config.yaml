@@ -52,6 +52,7 @@ test_suite_config:
             - TestOps::test_fallback.*
             - TestOps::test_fill_scalar.*
             - TestOps::test_implicit_loading.*
+            - TestOps::test_is_nonzero.*
             - TestOps::test_item.*
             # exact matches — no .* to avoid leaking into other shards
             - TestOps::test_log

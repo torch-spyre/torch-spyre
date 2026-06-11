@@ -2487,6 +2487,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_is_nonzero", "test_is_nonzero_cpu"): {
+            "param_sets": {
+                "float16_true": (torch.tensor([3.14], dtype=torch.float16),),
+                "float16_false": (torch.tensor([0.0], dtype=torch.float16),),
+                "float32_true": (torch.tensor([2.71828], dtype=torch.float32),),
+                "float32_false": (torch.tensor([0.0], dtype=torch.float32),),
+                "negative_true": (torch.tensor([-1.0], dtype=torch.float32),),
+                "bf16_true": (torch.tensor([3.14], dtype=torch.bfloat16),),
+                "bf16_false": (torch.tensor([0.0], dtype=torch.bfloat16),),
+                "bool_true": (torch.tensor([True]),),
+                "bool_false": (torch.tensor([False]),),
+                "from_computation_true": (
+                    torch.tensor([2.0], dtype=torch.float16),
+                    torch.tensor([3.0], dtype=torch.float16),
+                ),
+                "int_true": (torch.tensor([1], dtype=torch.int64),),
+                "int_false": (torch.tensor([0], dtype=torch.int64),),
+            },
+            "expect_fail": ["float32_true", "float32_false", "negative_true"],
+        },
         ("test_sdpa", "test_sdpa_cpu"): {
             "param_sets": {
                 "mha_prefill": (
@@ -5548,6 +5568,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             y,
             run_eager=False,
         )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_is_nonzero_cpu(self, *args):
+        """Test torch.is_nonzero on Spyre tensors"""
+        if len(args) == 1:
+            x = args[0]
+
+            def fn(t):
+                return torch.is_nonzero(t)
+
+            self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+        elif len(args) == 2:
+            x, y = args
+
+            def fn(a, b):
+                result = a * b
+                return torch.is_nonzero(result)
+
+            self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_is_nonzero_error_cases(self):
+        """Test that multi-element tensors raise RuntimeError in compiled context."""
+        # Multi-element tensor - compiled path
+        x_multi = torch.tensor([1.0, 2.0], dtype=torch.float16)
+
+        def fn(t):
+            return torch.is_nonzero(t)
+
+        compiled = torch.compile(fn)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Boolean value of Tensor with more than one value is ambiguous",
+        ):
+            compiled(x_multi.to("spyre"))
 
 
 if __name__ == "__main__":
