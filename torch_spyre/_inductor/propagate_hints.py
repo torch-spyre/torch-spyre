@@ -60,7 +60,7 @@ _hint_counter = 0
 # by call_function node position. Used by recover_spyre_hints to restore
 # meta on nodes renamed by AOT re-tracing (e.g. mm -> mm_default), which
 # drops node.meta["custom"].
-_dim_hints: list[dict[str, Any] | None] = []
+_dim_hints: list[tuple[Any, dict[str, Any] | None]] = []
 
 
 def spyre_hint(**kwargs: Any):
@@ -96,28 +96,62 @@ def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
 
 def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     """
-    Snapshot call_function nodes' custom meta by topological position.
+    Snapshot call_function nodes' (target, custom-meta) by topological position.
     Pairs with recover_spyre_hints to survive AOT re-tracing.
+
+    Targets are stored alongside the meta so recovery can re-align even when the
+    node sequence changes between the two passes (e.g. ``x + x`` materializes the
+    shared producer as two identical nodes -> ``add(mm, mm_default)``). The node
+    *name* is renamed by AOT re-tracing (mm -> mm_default) and so is unstable, but
+    the ``target`` OpOverload is preserved and is what we align on.
     """
     global _dim_hints
 
     _dim_hints = [
-        node.meta.get("custom") for node in graph.nodes if node.op == "call_function"
+        (node.target, node.meta.get("custom"))
+        for node in graph.nodes
+        if node.op == "call_function"
     ]
 
 
 def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     """
-    Restore custom meta on AOT-renamed call_function nodes, matching the
-    snapshot taken by collect_spyre_hints by topological position.
+    Restore custom meta on AOT-renamed call_function nodes by aligning the
+    snapshot from collect_spyre_hints against the current graph on ``target``.
+
+    A simple positional zip is not robust: passes running between collect and
+    recover can insert nodes, most commonly by un-sharing a producer feeding a
+    pointwise op (``add(mm, mm)`` becomes two distinct ``aten.mm.default`` nodes).
+    We instead walk both sequences with a single cursor: a node whose target
+    matches the next snapshot entry consumes it; a node whose target repeats the
+    last consumed entry is treated as a duplicate of that computation and inherits
+    the same hint. This keeps alignment intact across such insertions, where the
+    old count check would bail and silently drop every hint.
     """
     nodes = [n for n in graph.nodes if n.op == "call_function"]
-    if len(nodes) != len(_dim_hints):
-        logger.warning("Warning: unable to recover spyre hints")
-        return
-    for node, custom in zip(nodes, _dim_hints):
+
+    cursor = 0
+    last_target = None
+    last_custom = None
+    for node in nodes:
+        custom = None
+        if cursor < len(_dim_hints) and _dim_hints[cursor][0] == node.target:
+            last_target, last_custom = _dim_hints[cursor]
+            custom = last_custom
+            cursor += 1
+        elif node.target == last_target:
+            # Duplicate of the just-consumed snapshot node (same computation,
+            # e.g. the second mm in add(mm, mm)); reuse its hint.
+            custom = last_custom
+
         if not custom:
             continue
         if node.meta.get("custom") is None:
             node.meta["custom"] = {}
         node.meta["custom"].update(custom)
+
+    if cursor != len(_dim_hints):
+        logger.warning(
+            f"Warning: unable to recover spyre hints "
+            f"(matched {cursor}/{len(_dim_hints)} snapshot entries)"
+        )
