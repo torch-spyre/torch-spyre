@@ -512,7 +512,7 @@ def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
 
 
 def _has_work_div_hint(op: ComputedBuffer) -> bool:
-    return bool(_work_div_hint_by_name(op))
+    return any(hint_dict.get("work_div") for hint_dict in get_op_hints(op).values())
 
 
 def _resolve_work_div_hint(
@@ -1065,6 +1065,9 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
     if op.data.reduction_type != BATCH_MATMUL_OP:
         return False
+    if not config.ignore_work_division_hints and _has_work_div_hint(op):
+        # User hints take ownership of the split decision; do not override them.
+        return False
 
     rw = op.get_read_writes()
     args = get_mem_deps_from_rw(rw)
@@ -1073,12 +1076,6 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 
     it_space = iteration_space_from_op(op)
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
-    if (
-        not config.ignore_work_division_hints
-        and _resolve_work_div_hint(op, it_space_adjusted) is not None
-    ):
-        # User hints take ownership of the split decision; do not override them.
-        return False
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
     # runs before this pass, and work_distribution — which would overwrite it —
