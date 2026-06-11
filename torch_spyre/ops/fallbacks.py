@@ -263,6 +263,7 @@ register_fallback_default(
 # and would leave the original Spyre tensor unfilled.
 # The kernel itself is registered in ops.py.
 fallback_ops.append(aten.normal_.default)
+fallback_ops.append(getattr(aten.random_, "from"))
 
 
 @register_fallback(["spyre::max_dim_int64_fallback"])
