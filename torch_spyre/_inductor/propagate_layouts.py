@@ -166,7 +166,7 @@ def _single_arg_op_layout(
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
+            unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
 
             if unaligned > 0:
                 outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
