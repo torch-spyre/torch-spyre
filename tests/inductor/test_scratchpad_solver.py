@@ -288,7 +288,50 @@ class BaseLayoutSolverTests:
             _assert_in_place_relationships([p, c])
 
 
-class TestFirstFitLayoutSolver(BaseLayoutSolverTests, TestCase):
+class ScoreOrderingTests:
+    """Tests for the priority-score ordering in FirstFit/BestFit.
+
+    Buffers are placed in ascending order of ``(span - discount) / len(uses)``
+    (lower = placed first), where ``discount`` is 0.25 per in-place
+    relationship. These tests isolate the two terms the old
+    shortest-lifetime-first heuristic ignored: ``len(uses)`` and the in-place
+    discount. They do not apply to the Greedy solver, whose time-stepped
+    plan_layout does not score buffers.
+    """
+
+    def test_higher_use_count_placed_first(self):
+        # Two buffers with the same span (5) fully overlap and contend for the
+        # single slot that fits one of them. Score is span / len(uses), so the
+        # buffer with more uses scores lower and is placed first, winning the
+        # slot — regardless of input order. The old span-only tiebreak would
+        # tie (both span 5) and keep input order, pinning `few` instead.
+        many = LifetimeBoundBuffer("many", 10, [0, 1, 2, 3, 4])  # 5 / 5 = 1.0
+        few = LifetimeBoundBuffer("few", 10, [0, 4])  # 5 / 2 = 2.5
+        # `few` first in input order, to prove ordering is by score not input.
+        result = self.solve([few, many], size=10)
+        by_name = {b.name: b.address for b in result}
+        self.assertEqual(by_name["many"], 0)
+        self.assertIsNone(by_name["few"])
+
+    def test_inplace_discount_raises_priority(self):
+        # `plain` and `parent` have identical span (5) and use count (2), so
+        # their base scores tie at 2.5. `parent` is an in-place parent of
+        # `child`, earning a 0.25 discount → score (5 - 0.25) / 2 = 2.375 <
+        # 2.5, so it is placed first and wins the single contested slot. The
+        # old heuristic would tie and keep input order, pinning `plain`.
+        plain = LifetimeBoundBuffer("plain", 10, [0, 4])  # 5 / 2 = 2.5
+        parent = LifetimeBoundBuffer("parent", 10, [0, 4])  # (5 - 0.25) / 2
+        child = LifetimeBoundBuffer("child", 10, [4, 8], in_place_parents=["parent"])
+        # `plain` first in input order; without the discount the tie would
+        # keep input order and pin `plain`.
+        result = self.solve([plain, parent, child], size=10)
+        by_name = {b.name: b.address for b in result}
+        self.assertEqual(by_name["parent"], 0)
+        self.assertEqual(by_name["child"], 0)  # child reuses parent's slot
+        self.assertIsNone(by_name["plain"])
+
+
+class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
     solver_class = FirstFitLayoutSolver
 
     def test_picks_first_gap_not_tightest(self):
@@ -297,7 +340,7 @@ class TestFirstFitLayoutSolver(BaseLayoutSolverTests, TestCase):
         self.assertEqual(x_addr, 0)
 
 
-class TestBestFitLayoutSolver(BaseLayoutSolverTests, TestCase):
+class TestBestFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
     solver_class = BestFitLayoutSolver
 
     def test_picks_tightest_gap(self):

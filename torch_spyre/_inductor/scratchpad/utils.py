@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-from dataclasses import dataclass, field
 import math
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -58,13 +57,6 @@ def clone_at_graph_boundaries() -> bool:
     eligibility and is set broadly (e.g. the LX-planning op suite), so coupling
     it here would silently turn on the not-yet-correct boundary clone path."""
     return config.lx_boundary_clones or "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
-
-
-@dataclass
-class Liveness:
-    start: int
-    end: int
-    reads: list[int] = field(default_factory=list)
 
 
 class GraphView:
