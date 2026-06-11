@@ -42,8 +42,10 @@ import torch_spyre._inductor.propagate_named_dims as _pnd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
 
-# Path to mock for disabling actual device kernel execution.
+# Paths to mock for disabling actual device kernel execution.
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
+_LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+_PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
 # ===========================================================================
@@ -78,7 +80,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return torch.abs(x)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x)
         self.assertTrue(len(source_codes) > 0)
         # LoopSpec appears as an import even without tiling; check for a call.
@@ -113,7 +120,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -167,7 +179,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["B", "D"])
 
         cfn = torch.compile(softmax_fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -225,7 +242,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(c_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -292,7 +314,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(c_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -370,6 +397,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         with (
             mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run", side_effect=_record_subprocess),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
@@ -489,7 +518,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return out_x, out_y
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -541,7 +575,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -589,7 +628,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -639,7 +683,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["K", "N"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -691,7 +740,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(scale_dev, ["M"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -902,7 +956,12 @@ class TestNamedDimsHint(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -934,7 +993,12 @@ class TestNamedDimsHint(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
