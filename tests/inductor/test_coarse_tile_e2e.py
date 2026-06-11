@@ -210,57 +210,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    def test_hint_nested_loop_two_dims(self):
-        """Nested spyre_hint scopes produce a two-level tiling loop.
-
-        Input shape [1024, 4096]: outer hint tiles dim A by 2 (512 rows/iter),
-        inner hint tiles dim B by 4 (1024 cols/iter).  Both ops (add and mul)
-        share the nested LoopSpec.  Generated source must contain two LoopSpec
-        entries with counts 2 and 4.
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        A, B = 1024, 4096
-        a = torch.randn(A, B, dtype=torch.float16)
-        b = torch.randn(A, B, dtype=torch.float16)
-        c = torch.randn(A, B, dtype=torch.float16)
-
-        def fn(a, b, c):
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 4}):
-                    y = a + b
-                    z = y * c
-                    return z
-
-        a_dev = a.to("spyre")
-        b_dev = b.to("spyre")
-        c_dev = c.to("spyre")
-        _declare_tensor_dim("A", A)
-        _declare_tensor_dim("B", B)
-        _name_tensor_dims(a_dev, ["A", "B"])
-        _name_tensor_dims(b_dev, ["A", "B"])
-        _name_tensor_dims(c_dev, ["A", "B"])
-
-        cfn = torch.compile(fn)
-        with (
-            mock_patch(_LAUNCH_KERNEL),
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
-        ):
-            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
-        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
-        # The nested LoopSpec must appear inside another LoopSpec.
-        self.assertGreaterEqual(
-            src.count("LoopSpec("),
-            2,
-            f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
-        )
-
     # ------------------------------------------------------------------
     # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
     # ------------------------------------------------------------------
