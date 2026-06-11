@@ -20,7 +20,6 @@ from typing import Any, Optional
 import torch
 from torch._inductor.ir import (
     TensorBox,
-    TensorBox,
     ComputedBuffer,
     Operation,
     MutationLayoutSHOULDREMOVE,
@@ -50,7 +49,6 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     OP_GOOD_FOR_LX_INPLACE,
-    clone_at_graph_boundaries,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
