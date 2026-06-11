@@ -233,14 +233,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 1, 14]
                           stride: [14, 14, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
                     forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
@@ -501,14 +501,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
                     forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
@@ -557,14 +557,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1024, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
                     forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
@@ -1181,14 +1181,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [5120, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L174 in
                     forward, code: attn_output = self.o_proj(attn_output)'
@@ -1225,14 +1225,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [16384, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
                     forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
@@ -1282,14 +1282,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [5120, 16384]
                           stride: [16384, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
                     forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
@@ -1321,14 +1321,14 @@ test_suite_config:
                           storage_offset: 66560
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [131072, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
@@ -1421,14 +1421,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 1, 1]
                           stride: [1, 1, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L334 in
                     forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
@@ -1680,14 +1680,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L140 in
                     forward, code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
@@ -1736,14 +1736,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1024, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L141 in
                     forward, code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
@@ -2328,14 +2328,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [5120, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L174 in
                     forward, code: attn_output = self.o_proj(attn_output)'
@@ -2372,14 +2372,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [16384, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
                     forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
@@ -2429,14 +2429,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [5120, 16384]
                           stride: [16384, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L190 in
                     forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
@@ -2468,17 +2468,18 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [131072, 5120]
                           stride: [5120, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - constant
                     - torch.nn.functional.linear.12_spyre
+cases: []

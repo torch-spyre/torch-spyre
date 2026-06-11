@@ -233,14 +233,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 1, 11]
                           stride: [11, 11, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L206 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
@@ -469,14 +469,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096]
                           stride: [1]
@@ -530,14 +530,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [512, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [512]
                           stride: [1]
@@ -1034,14 +1034,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 64, 128]
                           stride: [524288, 8192, 1, 64]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L257 in eager_attention_forward,
                     code: attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling'
                   tags:
@@ -1271,14 +1271,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 128, 64]
                           stride: [524288, 8192, 64, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L271 in eager_attention_forward,
                     code: attn_output = torch.matmul(attn_weights, value_states)'
                   tags:
@@ -1353,14 +1353,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [2880, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [2880]
                           stride: [1]
@@ -1418,14 +1418,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [32, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [32]
                           stride: [1]
@@ -1767,14 +1767,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [44, 2880, 5760]
                           stride: [16588800, 5760, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L91 in _batched_linear, code:
                     out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
                   tags:
@@ -1942,14 +1942,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [44, 2880, 2880]
                           stride: [8294400, 2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L91 in _batched_linear, code:
                     out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
                   tags:
@@ -2278,14 +2278,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 64, 2048]
                           stride: [8388608, 131072, 1, 64]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L257 in eager_attention_forward,
                     code: attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling'
                   tags:
@@ -2462,14 +2462,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 2048, 64]
                           stride: [8388608, 131072, 64, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L271 in eager_attention_forward,
                     code: attn_output = torch.matmul(attn_weights, value_states)'
                   tags:
@@ -2499,14 +2499,14 @@ test_suite_config:
                           storage_offset: 28800
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [201088, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L675 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
@@ -2599,14 +2599,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 1, 1]
                           stride: [1, 1, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L206 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
@@ -2835,14 +2835,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096]
                           stride: [1]
@@ -2896,14 +2896,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [512, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [512]
                           stride: [1]
@@ -3319,14 +3319,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 64, 128]
                           stride: [524288, 8192, 1, 64]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L257 in eager_attention_forward,
                     code: attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling'
                   tags:
@@ -3521,14 +3521,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 128, 64]
                           stride: [524288, 8192, 64, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L271 in eager_attention_forward,
                     code: attn_output = torch.matmul(attn_weights, value_states)'
                   tags:
@@ -3603,14 +3603,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [2880, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [2880]
                           stride: [1]
@@ -3668,14 +3668,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [32, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [32]
                           stride: [1]
@@ -4006,14 +4006,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4, 2880, 5760]
                           stride: [16588800, 5760, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L91 in _batched_linear, code:
                     out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
                   tags:
@@ -4181,14 +4181,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4, 2880, 2880]
                           stride: [8294400, 2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L91 in _batched_linear, code:
                     out = torch.bmm(input.unsqueeze(1), weight).squeeze(1)'
                   tags:
@@ -4436,14 +4436,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 64, 2048]
                           stride: [8388608, 131072, 1, 64]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L257 in eager_attention_forward,
                     code: attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling'
                   tags:
@@ -4620,14 +4620,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 64, 2048, 64]
                           stride: [8388608, 131072, 64, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L271 in eager_attention_forward,
                     code: attn_output = torch.matmul(attn_weights, value_states)'
                   tags:
@@ -4657,17 +4657,18 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [201088, 2880]
                           stride: [2880, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L675 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - constant
                     - torch.nn.functional.linear.10_spyre
+cases: []

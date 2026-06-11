@@ -85,7 +85,9 @@ def make_tensor_from_conf(
     init_args = dict(tconf.get("init_args", {}))
 
     with torch.random.fork_rng(devices=[]):
-        assert init == "rand" or init == "randint", f"Unknown init: {init}"
+        assert init == "rand" or init == "randint" or init == "xavier", (
+            f"Unknown init: {init}"
+        )
         if seed is not None:
             torch.manual_seed(int(seed))
         if init == "rand":
@@ -93,8 +95,11 @@ def make_tensor_from_conf(
             high = int(init_args.get("high", 1))
             if low > high:
                 raise ValueError(
-                    "Invalid value (high for randint): must be larger than low"
+                    "Invalid value (high for rand): must be larger than low"
                 )
+            t = torch.testing.make_tensor(
+                tuple(shape), dtype=dtype, device="cpu", high=high, low=low
+            )
         elif init == "randint":
             low = int(init_args.get("low", 0))
             high = int(init_args.get("high", -1))
@@ -102,11 +107,15 @@ def make_tensor_from_conf(
                 raise ValueError(
                     "Invalid value (high for randint): must be provided (via init_args) and must be positive"
                 )
+            t = torch.testing.make_tensor(
+                tuple(shape), dtype=dtype, device="cpu", high=high, low=low
+            )
+        elif init == "xavier":
+            t = torch.nn.init.xavier_uniform_(
+                torch.empty(tuple(shape), dtype=dtype, device="cpu")
+            )
         else:
             raise ValueError(f"Unknown init: {init}")
-        t = torch.testing.make_tensor(
-            tuple(shape), dtype=dtype, device="cpu", high=high, low=low
-        )
 
     return t
 
