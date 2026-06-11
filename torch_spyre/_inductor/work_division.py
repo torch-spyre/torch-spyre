@@ -996,10 +996,7 @@ def _validate_max_cores() -> int:
 
 def _iter_computed_buffers(operations: list[Operation]):
     """Yield ComputedBuffer ops, handling FallbackKernel/ExternKernel dispatch."""
-    i = 0
-    while i < len(operations):
-        op = operations[i]
-        i += 1
+    for op in operations:
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
@@ -1007,15 +1004,11 @@ def _iter_computed_buffers(operations: list[Operation]):
         elif isinstance(op, FallbackKernel):
             # FallbackKernel produces 0..N trailing MultiOutputs
             # (see torch_spyre/_inductor/propagate_layouts.py).
-            # Currently work division is not supported on FallbackKernel,
-            # thus their MultiOutputs are just skipped.
-            while (
-                i < len(operations)
-                and isinstance(operations[i], MultiOutput)
-                and operations[i].inputs
-                and operations[i].inputs[0] is op
-            ):
-                i += 1
+            # Work division is not supported on either; the MultiOutputs
+            # are skipped in their own branch below.
+            pass
+        elif isinstance(op, MultiOutput):
+            pass
         elif isinstance(op, ExternKernel):
             if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback)):
                 # Work division not supported on allocation/constant kernels

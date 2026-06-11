@@ -797,12 +797,7 @@ def propagate_spyre_tensor_layouts(
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
     # performed to compute the set of possible output SpyreTensorLayouts.
-    # Use index-based iteration so the FallbackKernel branch can peek and
-    # consume a variable number of trailing MultiOutputs (0, 1, or N).
-    i = 0
-    while i < len(operations):
-        op = operations[i]
-        i += 1
+    for op in operations:
         if op.is_no_op():
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
@@ -855,19 +850,12 @@ def propagate_spyre_tensor_layouts(
             #   Case 2 (tuple of N)     -> MultiOutputLayout + N MultiOutputs
             #   Case 3 (void/in-place)  -> NoneLayout       + 0 MultiOutputs
             # The FallbackKernel itself never carries a real tensor layout
-            # (MultiOutputLayout / NoneLayout both raise from get_layout()),
-            # so we only assign layouts to its trailing MultiOutputs.
+            # (MultiOutputLayout / NoneLayout both raise from get_layout()).
+            # The trailing MultiOutputs are handled in their own branch below.
+            pass
+        elif isinstance(op, MultiOutput):
+            op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
-            while (
-                i < len(operations)
-                and isinstance(operations[i], MultiOutput)
-                and operations[i].inputs
-                and operations[i].inputs[0] is op
-            ):
-                mo = operations[i]
-                mo.layouts = [generic_layout(mo)]
-                mo.restick_cost_fn = AnyInNode.from_args()
-                i += 1
         elif isinstance(op, SpyreConstantFallback):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
