@@ -309,6 +309,9 @@ class TestCloneAtGraphBoundaries(TestScratchpadUsage):
         OP_OUTPUT_GOOD_FOR_LX_REUSE.pop()
 
     def setUp(self):
+        # self.patchers is initialised in __init__ (not in the base setUp), so we can
+        # safely append here before calling super().setUp(), which enters every patcher
+        # in the list via `p.__enter__()`.
         if "clone" not in OP_OUTPUT_GOOD_FOR_LX_REUSE:
             self.patchers.append(self.clone_patcher())
         super().setUp()
