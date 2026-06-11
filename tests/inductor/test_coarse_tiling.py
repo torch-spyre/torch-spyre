@@ -2095,6 +2095,28 @@ class TestValidateReductionTiling(unittest.TestCase):
         ):
             _validate_reduction_tiling(op)
 
+    def test_batchmatmul_k_tiling_allowed(self):
+        """BATCH_MATMUL_OP tiling on the stick (K) dim is allowed — no Stage 2 error."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        data = MagicMock(spec=Reduction)
+        data.ranges = [Integer(64), Integer(32)]  # [M, N]
+        data.reduction_ranges = [Integer(512)]  # [K]
+        data.reduction_type = BATCH_MATMUL_OP
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.get_name.return_value = "test_matmul"
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+            loop_tiled_reduction_dims=[[0]],
+        )
+        # Must not raise: BATCH_MATMUL_OP is exempt from the stick-dim guard.
+        _validate_reduction_tiling(op)
+
 
 class TestTiledSymsForSchedNode(unittest.TestCase):
     """Regression test for _tiled_syms_for_sched_node_at_depth.
@@ -2797,6 +2819,12 @@ class TestReductionIdentityValues(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             _reduction_identity_value("welford_reduce", torch.float16)
+
+    def test_batchmatmul(self):
+        """BATCH_MATMUL_OP identity value is 0 — partial products are summed."""
+        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
+
+        self.assertEqual(self._identity(BATCH_MATMUL_OP), 0)
 
 
 if __name__ == "__main__":
