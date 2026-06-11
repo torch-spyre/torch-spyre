@@ -54,6 +54,16 @@ c10::Stream SpyreGuardImpl::getStream(c10::Device device) const {
   return getCurrentStream(device).unwrap();
 }
 
+c10::Stream SpyreGuardImpl::getDefaultStream(c10::Device device) const {
+  return spyre::getDefaultStream(device).unwrap();
+}
+
+c10::Stream SpyreGuardImpl::getStreamFromGlobalPool(c10::Device device,
+                                                    bool isHighPriority) const {
+  int priority = isHighPriority ? -1 : 0;
+  return getStreamFromPool(device, priority).unwrap();
+}
+
 c10::Stream SpyreGuardImpl::getNewStream(c10::Device device,
                                          int priority) const {
   return getStreamFromPool(device, priority).unwrap();
@@ -105,7 +115,9 @@ c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
 
 thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = 0;
 
-// Registration (runs at DSO load — after you import your module)
+// Registration — runs when _C.so is loaded.
+// Loading _C.so does NOT trigger device initialization; that only
+// happens when start_runtime() is called via _lazy_init().
 C10_REGISTER_GUARD_IMPL(PrivateUse1, SpyreGuardImpl);
 
 }  // namespace spyre
