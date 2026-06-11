@@ -80,7 +80,7 @@ def generate_bundle(
     ``symbolic_args`` controls the function signature of ``@sdsc_bundle``.
     When ``False`` (default), ``sdsc_execute`` has no operands.
     When ``True``, addresses are emitted as ``!sdscbundle.input_arg<index>``
-    parameters.  Requires ``use_symbols=True`` to have any effect.  When
+    parameters; this also forces ``use_symbols=True`` implicitly.  When
     ``None``, the value is read from ``config.bundle_symbolic_args``.
     """
     if use_symbols is None:
@@ -89,6 +89,9 @@ def generate_bundle(
         unroll_loops = _spyre_config.unroll_loops
     if symbolic_args is None:
         symbolic_args = _spyre_config.bundle_symbolic_args
+    # symbolic_args requires symbol emission — if it is set, ensure use_symbols is too.
+    if symbolic_args:
+        use_symbols = True
 
     specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
 

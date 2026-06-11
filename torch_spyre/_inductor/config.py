@@ -63,7 +63,7 @@ core_id_k_fast_emission: bool = (
 # Requires backend compiler support for the sdscbundle symbol table.
 # Independent of bundle_symbolic_args: you can have symbols in the SDSC JSON
 # without exposing them as function arguments (staged adoption).
-bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "0") == "1"
+bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "1") == "1"
 
 # When False (default), HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
