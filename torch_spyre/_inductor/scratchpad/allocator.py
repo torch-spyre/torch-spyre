@@ -20,6 +20,7 @@ from typing import Any, Optional
 import torch
 from torch._inductor.ir import (
     TensorBox,
+    TensorBox,
     ComputedBuffer,
     Operation,
     MutationLayoutSHOULDREMOVE,
@@ -49,6 +50,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     OP_GOOD_FOR_LX_INPLACE,
+    clone_at_graph_boundaries,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -160,13 +162,12 @@ class ScratchpadAllocator(ABC):
                 continue
             if output_name in graph_output_names and not cloning_allowed:
                 continue  # we can only allocate graph outputs if we're allowed to clone
-            uses = lifetimes[output_name]
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
                     info["size_per_core"],
-                    uses[0],
-                    uses[-1] + 1,
+                    uses,
+                    first_use_is_read=False,
                     in_place_parents=in_place.get(output_name, []),
                 )
             )
@@ -193,8 +194,8 @@ class ScratchpadAllocator(ABC):
                     LifetimeBoundBuffer(
                         input_name,
                         dev_size // num_cores,
-                        uses[0],
-                        uses[-1] + 1,
+                        uses,
+                        first_use_is_read=True,
                         in_place_parents=[],
                     )
                 )

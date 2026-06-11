@@ -59,6 +59,19 @@ def clone_at_graph_boundaries() -> bool:
     return config.lx_boundary_clones or "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
 
 
+@dataclass
+class Liveness:
+    start: int
+    end: int
+    reads: list[int] = field(default_factory=list)
+
+
+def clone_at_graph_boundaries() -> bool:
+    """True when clone ops are eligible for LX, enabling clone insertion at graph
+    input/output boundaries so those buffers can also be LX-pinned."""
+    return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+
+
 class GraphView:
     """
     Simple wrapper which allows filtering of returned operations
