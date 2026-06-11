@@ -487,15 +487,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 1024]
           stride: [1024, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L228 in forward, code: query_states
       = self.q_proj(hidden_states)'
     marks: constant
@@ -760,15 +759,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 1024]
           stride: [1024, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L275 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -811,15 +809,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L275 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -1027,15 +1024,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [5120, 1024]
           stride: [1024, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L121 in torch_dynamo_resume_in_forward_at_120,
       code: hidden_states = self.linear_1(image_features)'
     marks: constant
@@ -1059,15 +1055,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [5120, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L123 in torch_dynamo_resume_in_forward_at_120,
       code: hidden_states = self.linear_2(hidden_states)'
     marks: constant
@@ -1363,14 +1358,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 1, 855]
           stride: [855, 855, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L324 in forward, code: freqs
       = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
   - name: torch.transpose.3_spyre
@@ -1571,15 +1566,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L151 in forward, code: query_states
       = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -1621,15 +1615,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L152 in forward, code: key_states
       = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -2062,15 +2055,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [5120, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L180 in forward, code: attn_output
       = self.o_proj(attn_output)'
     marks: constant
@@ -2102,15 +2094,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [32768, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L47 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -2153,15 +2144,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [5120, 32768]
           stride: [32768, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L47 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -2188,15 +2178,14 @@ cases:
           storage_offset: 4372480
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [131072, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in torch_dynamo_resume_in_forward_at_447,
       code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
     marks: constant
@@ -2278,14 +2267,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 1, 1]
           stride: [1, 1, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L324 in forward, code: freqs
       = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
   - name: torch.transpose.7_spyre
@@ -2479,15 +2468,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L151 in forward, code: query_states
       = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -2529,15 +2517,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L152 in forward, code: key_states
       = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -2944,15 +2931,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [5120, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L180 in forward, code: attn_output
       = self.o_proj(attn_output)'
     marks: constant
@@ -2984,15 +2970,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [32768, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L47 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -3035,15 +3020,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [5120, 32768]
           stride: [32768, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral/modeling_mistral.py#L47 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -3070,15 +3054,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [131072, 5120]
           stride: [5120, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L466 in forward, code: logits
       = self.lm_head(hidden_states[:, slice_indices, :])'
     marks: constant

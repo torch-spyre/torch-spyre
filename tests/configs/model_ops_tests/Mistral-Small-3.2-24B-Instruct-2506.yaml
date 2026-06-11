@@ -1228,3 +1228,4 @@ test_suite_config:
                     - bf16operation
                     - constant
                     - torch.getitem.7
+cases: []
