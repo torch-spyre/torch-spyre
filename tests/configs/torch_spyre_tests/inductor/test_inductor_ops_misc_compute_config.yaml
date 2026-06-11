@@ -22,6 +22,8 @@ test_suite_config:
             # broadcast / scalar arithmetic
             # test_add_broadcast.* covers test_add_broadcast and test_add_broadcast_cpu
             - TestOps::test_add_broadcast.*
+            - TestOps::test_add_alpha.*
+            - TestOps::test_add_scalar.*
             - TestOps::test_max_sub_broadcast.*
             - TestOps::test_sub_alpha.*
             - TestOps::test_sub_broadcast.*

@@ -758,26 +758,6 @@ def conv2d_via_bmm_decomp(
     return output
 
 
-@register_spyre_decomposition([torch.ops.aten.sub.Tensor])
-def sub_with_alpha(
-    self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1
-) -> torch.Tensor:
-    """
-    Decompose torch.sub(a, b, alpha=alpha) into separate mul and sub operations.
-
-    The Spyre backend does not have a single operation for a - alpha * b.
-    When alpha != 1, we decompose into: a - (alpha * b)
-    This ensures the operations are not fused by Inductor's optimization passes.
-    """
-    if alpha == 1:
-        # Simple subtraction without alpha - use default behavior
-        return NotImplemented
-    else:
-        # Decompose: sub(a, b, alpha) = sub(a, mul(b, alpha))
-        scaled_other = torch.mul(other, alpha)
-        return torch.sub(self, scaled_other)
-
-
 @register_spyre_decomposition([torch.ops.aten.where.ScalarOther])
 def where_scalar_other_decomp(condition, self, other):
     other_t = torch.full_like(self, other)
