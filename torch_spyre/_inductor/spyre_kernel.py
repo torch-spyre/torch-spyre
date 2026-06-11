@@ -444,6 +444,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
+        self.uses_pool: bool = False
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -477,10 +478,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
         )
-        if (
-            "lx" not in tensor.layout.allocation
-            and "pool" not in tensor.layout.allocation
-        ):
+        if "pool" in tensor.layout.allocation:
+            self.uses_pool = True
+        elif "lx" not in tensor.layout.allocation:
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
 
@@ -764,7 +764,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if getattr(V.graph, "pool_size", 0) > 0:
+        if getattr(V.graph, "pool_size", 0) > 0 and self.uses_pool:
             call_args.append("_pool")
 
         # Add remaining kernel arguments

@@ -2339,26 +2339,20 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertIn("sdsc_execute () {sdsc_filename=", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
-        """Two tensor args on first op; remaining ops use arith.constant symbols."""
+        """Two kernel tensor args on first op; remaining ops use pool/constant symbols."""
         op0 = self._make_op_spec_with_hbm_args("op0", [0, 1])
         ops_rest = [_make_minimal_op_spec(f"op{i}") for i in range(1, 5)]
         call_count = [0]
-        # sym values: first two are tensor args, rest are intermediates
+        # op0: 2 kernel args (arg_index 0, 1); ops 1-4: pool intermediates
         sym_values = [
             0x400000000,
-            0x800000000,  # op0: tensor args
-            0x0,
-            0x400000000,
-            0x800000000,  # op1
-            0x800000000,
-            0xC00000000,  # op2
-            0xC00000000,
-            0x1000000000,  # op3
-            0xC00000000,
-            0x1000000000,
-            0x1400000000,  # op4
+            0x800000000,  # op0: tensor args (arg_index 0, 1)
+            0x0,  # op1: pool intermediate
+            0x0,  # op2: pool intermediate
+            0x0,  # op3: pool intermediate
+            0x0,  # op4: pool intermediate
         ]
-        sym_counts = [2, 3, 2, 2, 3]
+        sym_counts = [2, 1, 1, 1, 1]
 
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             i = call_count[0]
@@ -2388,10 +2382,11 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                     ],
                 }
             }
-            # All symbols are kernel args; use the running symbol index as arg_index
-            # so each unique value produces a distinct input_arg param.
-            sym_start = sum(sym_counts[:i])
-            symbol_kind_flags = [SymbolKind.kernel(sym_start + j) for j in range(n)]
+            # op0 has kernel args (arg_index 0, 1); rest are pool intermediates
+            if i == 0:
+                symbol_kind_flags = [SymbolKind.kernel(j) for j in range(n)]
+            else:
+                symbol_kind_flags = [SymbolKind.pool() for _ in range(n)]
             return (
                 json_out,
                 sym_values[start : start + n],
@@ -2401,17 +2396,49 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         mlir = self._bundle([op0] + ops_rest, symbolic_args=True, fake_compile=fake)
 
-        # 12 symbols with 6 unique values → 6 unique params
-        # Param names derive from arg_index (= symbol position in sym_values list)
+        # op0's two kernel args → exactly 2 kernel input_arg params + 1 pool param
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertIn("%arg_1_base_addr: !sdscbundle.input_arg<index>", mlir)
-        # There are exactly 6 input_arg params (each appears twice: param + extract)
-        self.assertEqual(mlir.count("!sdscbundle.input_arg<index>"), 6 * 2)
-        # First sdsc_execute uses first two extracted names
+        # 3 params (2 kernel + 1 pool), each appears twice: param decl + extract op
+        self.assertEqual(mlir.count("!sdscbundle.input_arg<index>"), 3 * 2)
+        # First sdsc_execute uses the two extracted kernel arg names
         self.assertIn("sdscbundle.sdsc_execute (%arg_0, %arg_1)", mlir)
-        # Duplicate addresses reuse existing extracted SSA names
-        self.assertNotIn("arith.constant", mlir)
-        self.assertNotIn("%pool:", mlir)
+        # Pool intermediates: pool param present, pool addi emitted
+        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertIn("arith.addi %pool", mlir)
+
+    def test_same_kernel_arg_different_address_across_sdsc_deduped(self):
+        """Same arg_index in two SDSCs at different HBM addresses maps to one param.
+
+        Regression test for a bug where address-based dedup allowed the same
+        arg_index to appear twice in the function signature when two SDSCs
+        access the same kernel argument at different physical HBM offsets
+        (e.g. different slices of the same tensor).
+        """
+        a = _make_minimal_op_spec("a")
+        b = _make_minimal_op_spec("b")
+        # Two different addresses for the same arg_index=0 (different slices)
+        addr_a = 0x400000000
+        addr_b = 0x400010000
+        call_count = [0]
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+            i = call_count[0]
+            call_count[0] += 1
+            addr = addr_a if i == 0 else addr_b
+            sym_id = -(symbol_id_offset + 1)
+            symbols.append(addr)
+            return _make_tiled_json(idx, sym_id), [addr], [{}], [SymbolKind.kernel(0)]
+
+        mlir = self._bundle([a, b], symbolic_args=True, fake_compile=fake)
+
+        # Must produce exactly one %arg_0_base_addr formal — not two
+        self.assertEqual(mlir.count("%arg_0_base_addr:"), 1)
+        self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
+        # Both sdsc_execute ops reference the same extracted name
+        execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
+        self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%arg_0")
+        self.assertEqual(execute_lines[1].split("(")[1].split(")")[0], "%arg_0")
 
     def test_same_kernel_arg_across_sdsc_deduped(self):
         """The same kernel arg address appearing in two SDSCs maps to one input_arg param."""
