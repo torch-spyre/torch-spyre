@@ -81,13 +81,16 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending
-    ``(end_time - start_time - discount) / len(uses)``, where ``discount`` is 0.25 for each
-    in-place relationship the buffer participates in (as a child, as a parent, or both, capped
-    at 0.5). Lower score = higher priority = placed first.  For each buffer, free address gaps
-    during its lifetime are computed; the buffer is placed at the start of the first gap large
-    enough to hold it (rounded up to alignment). In-place reuse is attempted first: if a declared
-    parent has already been placed and its address falls within a free gap, the child inherits
-    that address.  Buffers that cannot fit within self.limit are evicted (address=None).
+    ``(end_time - start_time - discount) / (len(uses) + write_bonus)``. ``discount`` is 0.25 for
+    each in-place relationship the buffer participates in (as a child, as a parent, or both,
+    capped at 0.5); ``write_bonus`` is 0.5 when the buffer's first use is a write (i.e.
+    ``not first_use_is_read``) and 0 otherwise, since pinning such a buffer also saves the more
+    expensive first write to HBM. Lower score = higher priority = placed first.  For each buffer,
+    free address gaps during its lifetime are computed; the buffer is placed at the start of the
+    first gap large enough to hold it (rounded up to alignment). In-place reuse is attempted
+    first: if a declared parent has already been placed and its address falls within a free gap,
+    the child inherits that address.  Buffers that cannot fit within self.limit are evicted
+    (address=None).
     """
 
     def _all_minus(
@@ -189,7 +192,13 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         def _sort_key(b: LifetimeBoundBuffer) -> tuple[float, int]:
             span = b.end_time - b.start_time
             discount = 0.25 * bool(b.in_place_parents) + 0.25 * (b.name in parent_names)
-            return (span - discount) / len(b.uses), span
+            # A buffer whose first use is a write (not first_use_is_read) also
+            # saves a *write* to HBM on its first step when pinned in LX, on top
+            # of the reads saved on later steps. Writes are more expensive than
+            # reads, so count that first write as worth 0.5 of an extra use,
+            # inflating the denominator to give such buffers a better score.
+            uses = len(b.uses) + (0.0 if b.first_use_is_read else 0.5)
+            return (span - discount) / uses, span
 
         buffers_filtered.sort(key=_sort_key)
         buffers_sorted = _topological_sort(buffers_filtered)

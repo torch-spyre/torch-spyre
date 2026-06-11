@@ -330,6 +330,21 @@ class ScoreOrderingTests:
         self.assertEqual(by_name["child"], 0)  # child reuses parent's slot
         self.assertIsNone(by_name["plain"])
 
+    def test_write_first_buffer_placed_before_read_only(self):
+        # Identical span (5) and use count (2). `writer`'s first use is a write
+        # (first_use_is_read=False), so pinning it also saves the more expensive
+        # first write to HBM; its use count is inflated by 0.5, giving score
+        # 5 / 2.5 = 2.0 vs `reader`'s 5 / 2.0 = 2.5. `writer` is placed first and
+        # wins the single contested slot. Without the write bonus the scores tie
+        # and input order would pin `reader`.
+        reader = LifetimeBoundBuffer("reader", 10, [0, 4], first_use_is_read=True)
+        writer = LifetimeBoundBuffer("writer", 10, [0, 4], first_use_is_read=False)
+        # `reader` first in input order, to prove ordering is by score not input.
+        result = self.solve([reader, writer], size=10)
+        by_name = {b.name: b.address for b in result}
+        self.assertEqual(by_name["writer"], 0)
+        self.assertIsNone(by_name["reader"])
+
 
 class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
     solver_class = FirstFitLayoutSolver

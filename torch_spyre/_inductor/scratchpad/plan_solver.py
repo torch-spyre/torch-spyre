@@ -25,7 +25,10 @@ class LifetimeBoundBuffer:
     Defines the data fields required for a plan solver.
 
     ``uses`` is the sorted list of operation indices at which the buffer is
-    accessed (as returned by ``calculate_liveness``).  ``first_use_is_read``
+    accessed (as returned by ``calculate_liveness``).  It must be non-empty:
+    the ``start_time``/``end_time`` properties index into it and the
+    FirstFit/BestFit scoring divides by ``len(uses)``, so callers must only
+    construct buffers for names that are actually used.  ``first_use_is_read``
     is True for graph inputs (all accesses are reads) and False for computed
     buffers (first access is a write, all subsequent accesses are reads).
 
