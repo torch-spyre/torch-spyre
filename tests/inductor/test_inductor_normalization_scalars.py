@@ -54,9 +54,11 @@ class TestNormalizationScalarOperations:
     def test_layernorm(self, execution_mode, eps, dtype, batch, seq, hidden):
         """Last-dim normalization (mean/var), not ``nn.LayerNorm``; various ``eps`` and shapes."""
 
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
+        # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
         if dtype == torch.float32:
-            pytest.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+            pytest.xfail(
+                reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+            )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
         if dtype == torch.float16:
             pytest.xfail(
@@ -72,10 +74,12 @@ class TestNormalizationScalarOperations:
         tol = (1e-4, 1e-3) if dtype == torch.float32 else (1e-3, 1e-2)
         _compare_modes(execution_mode, layernorm, x, atol=tol[0], rtol=tol[1])
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-    @pytest.mark.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_layernorm_affine(self, execution_mode):
         """Last-dim layernorm with gamma/beta (affine)."""
+        pytest.xfail(
+            "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+        )
 
         eps = 1e-5
         hidden_size = 768
@@ -106,9 +110,11 @@ class TestNormalizationScalarOperations:
     def test_rmsnorm(self, execution_mode, eps, dtype, batch, seq, hidden):
         """Test RMSNorm with various epsilon values and configurations."""
 
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
+        # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
         if dtype == torch.float32:
-            pytest.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+            pytest.xfail(
+                reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+            )
 
         def rmsnorm(x):
             rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
@@ -118,10 +124,12 @@ class TestNormalizationScalarOperations:
         tol = (1e-4, 1e-3) if dtype == torch.float32 else (1e-3, 1e-2)
         _compare_modes(execution_mode, rmsnorm, x, atol=tol[0], rtol=tol[1])
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-    @pytest.mark.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_rmsnorm_with_weight(self, execution_mode):
         """Test RMSNorm with learnable weight parameter."""
+        pytest.xfail(
+            "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+        )
 
         eps = 1e-6
         hidden_size = 768
@@ -252,11 +260,11 @@ class TestNormalizationScalarOperations:
         _compare_modes(execution_mode, groupnorm, x, atol=tol[0], rtol=tol[1])
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1722
-    @pytest.mark.xfail(
-        reason="view() + mean() triggers Cannot satisfy hardware memory span limit (256MB) without splitting reduction dimensions."
-    )
     def test_groupnorm_affine(self, execution_mode):
         """Test GroupNorm with affine transformation."""
+        pytest.xfail(
+            "view() + mean() triggers Cannot satisfy hardware memory span limit (256MB) without splitting reduction dimensions."
+        )
 
         eps = 1e-5
         num_groups = 32
@@ -282,9 +290,11 @@ class TestNormalizationScalarOperations:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_instancenorm_2d(self, execution_mode, dtype):
         """Test 2D InstanceNorm with epsilon constant."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
+        # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
         if dtype == torch.float32:
-            pytest.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+            pytest.xfail(
+                reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+            )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
         if dtype == torch.float16:
             pytest.xfail(
@@ -302,8 +312,10 @@ class TestNormalizationScalarOperations:
         tol = (1e-4, 1e-4) if dtype == torch.float32 else (1e-3, 1e-2)
         _compare_modes(execution_mode, instancenorm, x, atol=tol[0], rtol=tol[1])
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-    @pytest.mark.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
+    @pytest.mark.xfail(
+        reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+    )
     def test_instancenorm_1d(self, execution_mode):
         """Test 1D InstanceNorm variant."""
 
@@ -317,8 +329,10 @@ class TestNormalizationScalarOperations:
         x = cached_randn((32, 768, 100), dtype=torch.float32)
         _compare_modes(execution_mode, instancenorm_1d, x, atol=1e-4, rtol=1e-3)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-    @pytest.mark.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
+    @pytest.mark.xfail(
+        reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+    )
     def test_instancenorm_3d(self, execution_mode):
         """Test 3D InstanceNorm variant."""
 
@@ -332,10 +346,12 @@ class TestNormalizationScalarOperations:
         x = cached_randn((32, 64, 16, 16, 16), dtype=torch.float32)
         _compare_modes(execution_mode, instancenorm_3d, x, atol=1e-4, rtol=1e-3)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-    @pytest.mark.xfail(reason="Mean reduction on float32 (IEEE_FP32) not supported")
+    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_instancenorm_affine(self, execution_mode):
         """Test InstanceNorm with affine transformation."""
+        pytest.xfail(
+            "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
+        )
 
         eps = 1e-5
         num_channels = 64

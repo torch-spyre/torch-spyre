@@ -14,10 +14,7 @@
 
 # This file contains inductor passes that are only needed as temp fixes
 
-import logging
-import sympy
 import torch
-from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -26,13 +23,12 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
-from .propagate_hints import get_op_hints, DimHint
+from .constants import SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
 from .pass_utils import copy_fx_custom_meta
 
 aten = torch.ops.aten
 
 logger = get_inductor_logger("work_division")
-hints_logger = get_inductor_logger("assign_dim_hints")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -42,6 +38,115 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+
+def _is_static_one(value) -> bool:
+    try:
+        return int(value) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_static_multiple(value, divisor: int) -> bool:
+    try:
+        return int(value) % divisor == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_stick_aligned_matmul_dims(k, n) -> bool:
+    return _is_static_multiple(k, 64) and _is_static_multiple(n, 64)
+
+
+def _node_shape(node: torch.fx.Node) -> list[int] | None:
+    val = node.meta.get("val")
+    shape = getattr(val, "shape", None)
+    if shape is None:
+        return None
+    return list(shape)
+
+
+def _mark_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    lhs_shape = _node_shape(lhs_node)
+    rhs_shape = _node_shape(rhs_node)
+    out_shape = _node_shape(bmm_node)
+    if lhs_shape is None or rhs_shape is None or out_shape is None:
+        return
+    if len(lhs_shape) != 3 or len(rhs_shape) != 3 or len(out_shape) != 3:
+        return
+    if not (
+        _is_static_one(lhs_shape[0])
+        and _is_static_one(rhs_shape[0])
+        and _is_static_one(out_shape[0])
+    ):
+        return
+    if not (
+        lhs_shape[1] == out_shape[1]
+        and lhs_shape[2] == rhs_shape[1]
+        and rhs_shape[2] == out_shape[2]
+    ):
+        return
+    if not _has_stick_aligned_matmul_dims(lhs_shape[2], rhs_shape[2]):
+        return
+    custom = dict(bmm_node.meta.get("custom") or {})
+    custom[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY] = {"batch_dim": 0}
+    bmm_node.meta["custom"] = custom
+
+
+def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.op in ("placeholder", "get_attr"):
+        return True
+    if node.op == "call_function" and node.target == aten.expand.default:
+        base = node.args[0]
+        return isinstance(base, torch.fx.Node) and base.op in (
+            "placeholder",
+            "get_attr",
+        )
+    return False
+
+
+def _mark_direct_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    """Mark direct rank-3 B=1 BMMs without catching unflattened attention views."""
+    if not _is_direct_unit_bmm_operand(rhs_node):
+        return
+
+    for arg in (lhs_node, rhs_node):
+        if (
+            isinstance(arg, torch.fx.Node)
+            and arg.op == "call_function"
+            and arg.target in _RESHAPE_OPS
+        ):
+            return
+
+    bmm_users = list(bmm_node.users.keys())
+    if len(bmm_users) == 1:
+        output_view = bmm_users[0]
+        if (
+            isinstance(output_view, torch.fx.Node)
+            and output_view.op == "call_function"
+            and output_view.target in _RESHAPE_OPS
+        ):
+            output_shape = output_view.args[1]
+            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
+                return
+
+    _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
+
+
+def mark_direct_unit_bmm_pass(graph: torch.fx.Graph) -> None:
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target != aten.bmm.default:
+            continue
+        if len(node.args) != 2:
+            continue
+        lhs_node, rhs_node = node.args
+        _mark_direct_static_unit_batch_bmm(node, lhs_node, rhs_node)
 
 
 @register_graph_pattern(
@@ -146,6 +251,7 @@ def _unflatten_mm_to_bmm(
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
         copy_fx_custom_meta(node, bmm_node)
+        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -259,136 +365,6 @@ def _unflatten_bmm_batch_dims(
                 graph.erase_node(expand_node)
 
 
-def _group_spec(dim_hints: list[DimHint]) -> list[tuple]:
-    """Build the coarse_tile() spec from op.dim_hints.
-
-    Returns a list of (hint_id, K, tiled_dims) tuples, one per hinted dim,
-    outermost first.  Reduction dims are excluded.
-    """
-    return [
-        (h.hint_id, sympy.Integer(h.split_count), [h.dim_index])
-        for h in dim_hints
-        if not h.is_reduction and h.dim_index is not None
-    ]
-
-
-def _find_spec_op(ops: list[Operation]) -> Operation:
-    """Return the first op with a real (non-sentinel) DimHint, or ops[0] as fallback."""
-    return next(
-        (
-            o
-            for o in ops
-            if any(h.dim_index is not None for h in getattr(o, "dim_hints", []))
-        ),
-        ops[0],
-    )
-
-
-def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
-    """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
-
-    coarse_tile() requires ops to be grouped: all ops in a group share the same
-    tiling spec and are tiled together inside the same loop nest.  We walk
-    operations in topological order and collect consecutive ops that carry
-    identical hints into one group, breaking whenever the hint changes or an
-    op has no hint at all.
-    """
-
-    def _key(op):
-        resolved = getattr(op, "dim_hints", [])
-        if not resolved:
-            return None
-        # Key on the set of hint IDs — ops inside the same hint scope(s) group together.
-        return frozenset(h.hint_id for h in resolved)
-
-    groups = []
-    current_ops: list[Operation] = []
-    current_key = None
-
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        key = _key(op)
-
-        if key is not None and key == current_key:
-            current_ops.append(op)
-        else:
-            if current_ops and current_key is not None:
-                spec = _group_spec(_find_spec_op(current_ops).dim_hints)
-                if spec:
-                    groups.append((current_ops, spec))
-            current_ops = [op] if key is not None else []
-            current_key = key
-
-    # Flush the final group.
-    if current_ops and current_key is not None:
-        spec = _group_spec(_find_spec_op(current_ops).dim_hints)
-        if spec:
-            groups.append((current_ops, spec))
-
-    if hints_logger.isEnabledFor(logging.INFO):
-        # Build an interleaved view: walk operations in order, emit group boundaries
-        # and ungrouped ops so the reader can see what breaks each consecutive run.
-        grouped_to_group_idx = {id(o): i for i, g in enumerate(groups) for o in g[0]}
-        summary_lines = [f"coarse_tile_groups: {len(groups)} group(s) formed"]
-        pending_ungrouped: list[str] = []
-        last_group_idx: int | None = None
-        for o in operations:
-            if not isinstance(o, ComputedBuffer):
-                continue
-            g_idx = grouped_to_group_idx.get(id(o))
-            if g_idx is None:
-                hints = getattr(o, "dim_hints", [])
-                if hints:
-                    ids = sorted({h.hint_id for h in hints})
-                    reason = f"hint_ids={ids}"
-                else:
-                    reason = "no hints"
-                pending_ungrouped.append(f"{o.get_name()}({reason})")
-            else:
-                if g_idx != last_group_idx:
-                    if pending_ungrouped:
-                        summary_lines.append(
-                            f"  ungrouped: [{', '.join(pending_ungrouped)}]"
-                        )
-                        pending_ungrouped = []
-                    # Emit group header with hint scope info from the spec op.
-                    group_ops = groups[g_idx][0]
-                    spec_op = _find_spec_op(group_ops)
-                    hint_ids = sorted(
-                        {h.hint_id for h in getattr(spec_op, "dim_hints", [])}
-                    )
-                    hint_descs = []
-                    for hid in hint_ids:
-                        hints = get_op_hints(spec_op)
-                        if hid in hints:
-                            hint_descs.append(f"hint_{hid}={hints[hid]}")
-                    summary_lines.append(
-                        f"  group {g_idx} scopes=[{', '.join(hint_descs)}]:"
-                    )
-                    last_group_idx = g_idx
-                # Per-op tiling info.
-                tiling_dims = [
-                    f"{h.dim_names}x{h.split_count}"
-                    for h in getattr(o, "dim_hints", [])
-                    if h.dim_index is not None and not h.is_reduction
-                ]
-                aten_ops = [
-                    str(n.target)
-                    for n in getattr(o, "origins", [])
-                    if hasattr(n, "target")
-                ]
-                summary_lines.append(
-                    f"      {o.get_name()}  aten={aten_ops}"
-                    + (f"  tiles={tiling_dims}" if tiling_dims else "  (no tiled dims)")
-                )
-        if pending_ungrouped:
-            summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
-        hints_logger.info("%s", "\n".join(summary_lines))
-
-    return groups
-
-
 def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
     """
     Replace constant arguments to any operation with spyre.constant node.
@@ -404,6 +380,8 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
         torch.ops.aten.mul.Tensor,
         torch.ops.aten.true_divide.Tensor,
         torch.ops.aten.div.Tensor,
+        torch.ops.aten.eq.Tensor,
+        torch.ops.aten.eq.Scalar,
     ]
 
     for node in graph.nodes:
@@ -415,13 +393,16 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
             if not isinstance(in_arg, (int, float)):
                 logger.warning(f"Warning: unhandled node type {type(in_arg)}")
                 continue
-            # Currently the dtype of the scalar tensor is set as same as the output dtype.
-            # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
-            # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
+            # Use the dtype of the tensor operand, not the output dtype.
+            # For comparison ops like eq, the output is bool but the constant
+            # must match the input tensor's dtype
             dtype = torch.float16
-            meta = node.meta.get("tensor_meta", None)
-            if meta:
-                dtype = meta.dtype
+            for other_arg in node.args:
+                if isinstance(other_arg, torch.fx.node.Node):
+                    other_meta = other_arg.meta.get("tensor_meta", None)
+                    if other_meta is not None:
+                        dtype = other_meta.dtype
+                        break
             with graph.inserting_before(node):
                 const_node = graph.create_node(
                     "call_function",

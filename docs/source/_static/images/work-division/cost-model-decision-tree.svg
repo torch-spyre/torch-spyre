@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 620" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .decision { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.5; }
+      .exit     { fill: #f4f4f4; stroke: #888;    stroke-width: 1.2; }
+      .accept   { fill: #d6efd6; stroke: #2d7a2d; stroke-width: 1.5; }
+      .label    { fill: #222; }
+      .edge-yes { fill: #2d7a2d; font-weight: 600; }
+      .edge-no  { fill: #a32020; font-weight: 600; }
+      .arrow    { stroke: #444; stroke-width: 1.5; fill: none; }
+      .title    { fill: #222; font-size: 16px; font-weight: 700; }
+      .caption  { fill: #555; font-size: 12px; font-style: italic; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="380" y="28" text-anchor="middle" class="title">Cost-Model Matmul Decision Tree</text>
+  <text x="380" y="48" text-anchor="middle" class="caption">First failing gate sends the op to Pass 3. All gates passing → enumerate divisors and commit the argmin split.</text>
+
+  <!-- Decision 1 -->
+  <rect class="decision" x="100" y="70"  width="360" height="44" rx="8"/>
+  <text class="label" x="280" y="98" text-anchor="middle">op is BATCH_MATMUL Reduction?</text>
+
+  <!-- Decision 2 -->
+  <rect class="decision" x="100" y="150" width="360" height="44" rx="8"/>
+  <text class="label" x="280" y="178" text-anchor="middle">span_reduction left this op uncommitted?</text>
+
+  <!-- Decision 3 -->
+  <rect class="decision" x="100" y="230" width="360" height="44" rx="8"/>
+  <text class="label" x="280" y="258" text-anchor="middle">exactly 1 stickified output dim (N)?</text>
+
+  <!-- Decision 4 -->
+  <rect class="decision" x="100" y="310" width="360" height="44" rx="8"/>
+  <text class="label" x="280" y="338" text-anchor="middle">exactly 1 row dim in a single input (M)?</text>
+
+  <!-- Decision 5 -->
+  <rect class="decision" x="100" y="390" width="360" height="44" rx="8"/>
+  <text class="label" x="280" y="418" text-anchor="middle">exactly 1 reduction dim (K)?</text>
+
+  <!-- Decision 6 (final safety check) -->
+  <rect class="decision" x="100" y="470" width="360" height="44" rx="8"/>
+  <text class="label" x="280" y="498" text-anchor="middle">argmin uses ≥ default core count?</text>
+
+  <!-- Terminal: cost model commits -->
+  <rect class="accept" x="60" y="550" width="440" height="50" rx="8"/>
+  <text class="label" x="280" y="572" text-anchor="middle" font-weight="600">enumerate divisors of (B, M, n_sticks, k_sticks);</text>
+  <text class="label" x="280" y="590" text-anchor="middle" font-size="12">price each combo; commit the argmin (b, m, n, k)</text>
+
+  <!-- Pass 3 exits (one per decision) -->
+  <rect class="exit" x="560" y="78"  width="140" height="28" rx="6"/>
+  <text class="label" x="630" y="97"  text-anchor="middle">Pass 3</text>
+
+  <rect class="exit" x="560" y="158" width="140" height="28" rx="6"/>
+  <text class="label" x="630" y="177" text-anchor="middle">Pass 3</text>
+
+  <rect class="exit" x="560" y="238" width="140" height="28" rx="6"/>
+  <text class="label" x="630" y="257" text-anchor="middle">Pass 3</text>
+
+  <rect class="exit" x="560" y="318" width="140" height="28" rx="6"/>
+  <text class="label" x="630" y="337" text-anchor="middle">Pass 3</text>
+
+  <rect class="exit" x="560" y="398" width="140" height="28" rx="6"/>
+  <text class="label" x="630" y="417" text-anchor="middle">Pass 3</text>
+
+  <rect class="exit" x="560" y="478" width="140" height="28" rx="6"/>
+  <text class="label" x="630" y="497" text-anchor="middle">Pass 3</text>
+
+  <!-- Vertical "yes" arrows between decisions -->
+  <path class="arrow" d="M 280 114 L 280 150" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 280 194 L 280 230" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 280 274 L 280 310" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 280 354 L 280 390" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 280 434 L 280 470" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 280 514 L 280 550" marker-end="url(#arrowhead)"/>
+
+  <!-- Horizontal "no" arrows to Pass 3 exits -->
+  <path class="arrow" d="M 460 92  L 560 92"  marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 460 172 L 560 172" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 460 252 L 560 252" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 460 332 L 560 332" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 460 412 L 560 412" marker-end="url(#arrowhead)"/>
+  <path class="arrow" d="M 460 492 L 560 492" marker-end="url(#arrowhead)"/>
+
+  <!-- Yes labels -->
+  <text class="edge-yes" x="288" y="142" text-anchor="start">yes</text>
+  <text class="edge-yes" x="288" y="222" text-anchor="start">yes</text>
+  <text class="edge-yes" x="288" y="302" text-anchor="start">yes</text>
+  <text class="edge-yes" x="288" y="382" text-anchor="start">yes</text>
+  <text class="edge-yes" x="288" y="462" text-anchor="start">yes</text>
+  <text class="edge-yes" x="288" y="542" text-anchor="start">yes</text>
+
+  <!-- No labels -->
+  <text class="edge-no" x="510" y="86"  text-anchor="middle">no</text>
+  <text class="edge-no" x="510" y="166" text-anchor="middle">no</text>
+  <text class="edge-no" x="510" y="246" text-anchor="middle">no</text>
+  <text class="edge-no" x="510" y="326" text-anchor="middle">no</text>
+  <text class="edge-no" x="510" y="406" text-anchor="middle">no</text>
+  <text class="edge-no" x="510" y="486" text-anchor="middle">no</text>
+</svg>

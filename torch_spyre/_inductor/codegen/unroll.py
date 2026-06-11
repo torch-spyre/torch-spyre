@@ -14,11 +14,9 @@
 
 """Loop unrolling for coarse-tiling LoopSpec trees.
 
-When ``bundle_hbm_symbols=False`` the backend compiler does not support
-``scf.for`` loops in ``bundle.mlir``.  This module provides
-``unroll_loop_specs``, which fully unrolls a ``list[OpSpec | LoopSpec]`` tree
-into a flat list of ``OpSpec`` entries with concrete per-iteration addresses
-baked into each ``TensorArg.allocation``.
+This module provides ``unroll_loop_specs``, which fully unrolls a
+``list[OpSpec | LoopSpec]`` tree into a flat list of ``OpSpec`` entries
+with concrete per-iteration addresses baked into each ``TensorArg.allocation``.
 
 Whether a tensor's address advances per iteration is determined solely by
 ``TensorArg.per_tile_fixed`` (set by ``insert_tiling_propagation``'s use-def

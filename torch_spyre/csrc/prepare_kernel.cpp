@@ -17,6 +17,7 @@
 #include "prepare_kernel.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -271,6 +272,11 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
 
   auto job_bin_addr =
       compute_offset_address(job_allocation_.value(), job_bin_ptr);
+
+  // Verify the resulting binary address is populated
+  TORCH_CHECK(job_bin_addr.total_size() > 0,
+              "ComputeOnDevice binary address must be populated (size > 0)");
+
   // Create RuntimeOperationCompute with the allocated program address
   return std::make_unique<JobPlanStepCompute>(std::move(job_bin_addr),
                                               bind_io_addresses_, job_bin_ptr);
@@ -457,7 +463,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // TODO(jni): further discussions is required on the condition to specialize
   // addresses
-  bind_io_addresses_ = true;
+  const char* env = std::getenv("BUNDLE_SYMBOLIC_ARGS");
+  bind_io_addresses_ = (env == nullptr || std::string(env) != "1");
 
   // Parse each command in the JobExecPlan and create JobPlanSteps
   std::vector<std::unique_ptr<JobPlanStep>> steps;
@@ -501,10 +508,53 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape count matches number of input tensors
 
   // P2-14: JobPlan step ordering validation
-  // TODO(johngontaryk): Implement once step ordering rules are defined
-  // - Verify HostCompute steps precede their corresponding H2D steps
-  // - Verify H2D steps precede Compute steps that depend on them
-  // - Verify no circular dependencies in step ordering
+  // Enforces the following rule when first step is HostCallback:
+  // - HostCallback→H2D→Compute sequence must be maintained
+  if (!job_plan.steps.empty()) {
+    bool first_is_host_callback = dynamic_cast<const JobPlanStepHostCompute*>(
+                                      job_plan.steps[0].get()) != nullptr;
+
+    if (first_is_host_callback) {
+      enum class ExpectedStep {
+        H2D,      // Expecting H2D after HostCallback
+        Compute,  // Expecting Compute after H2D
+      };
+
+      // Step 0 is already verified as HostCallback; validate from step 1 onward
+      ExpectedStep expected = ExpectedStep::H2D;
+      bool sequence_complete = false;
+
+      for (size_t i = 1; i < job_plan.steps.size(); ++i) {
+        const auto& step = job_plan.steps[i];
+
+        // Check step type using dynamic_cast
+        bool is_h2d =
+            dynamic_cast<const JobPlanStepH2D*>(step.get()) != nullptr;
+        bool is_compute =
+            dynamic_cast<const JobPlanStepCompute*>(step.get()) != nullptr;
+
+        // Validate based on expected state
+        switch (expected) {
+          case ExpectedStep::H2D:
+            TORCH_CHECK(is_h2d, "Step ordering violation at step ", i,
+                        ": HostCallback must be followed by H2D transfer");
+            // H2D must be followed by Compute
+            expected = ExpectedStep::Compute;
+            break;
+
+          case ExpectedStep::Compute:
+            TORCH_CHECK(is_compute, "Step ordering violation at step ", i,
+                        ": H2D transfer must be followed by Compute");
+            sequence_complete = true;
+            break;
+        }
+      }
+
+      TORCH_CHECK(sequence_complete,
+                  "Incomplete step sequence: HostCallback must be followed "
+                  "by H2D transfer and Compute");
+    }
+  }
 
   // P2-15: Host compute metadata validation
   // TODO(johngontaryk): Implement once host compute metadata structure is

@@ -16,7 +16,7 @@
 import dataclasses
 import math
 import itertools
-from sympy import Expr, Symbol, divisors
+from sympy import Expr, Integer, Symbol, divisors
 from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 import torch
@@ -32,6 +32,7 @@ from torch._inductor.ir import (
 )
 
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
@@ -45,6 +46,7 @@ from .pass_utils import (
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
 )
+from .propagate_hints import get_op_hints
 from typing import Callable
 
 from .logging_utils import get_inductor_logger
@@ -502,6 +504,106 @@ def apply_splits(
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
+def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
+    dim_to_split: dict[str, int] = {}
+    for _, hint_dict in sorted(get_op_hints(op).items()):
+        dim_to_split.update(hint_dict.get("work_div") or {})
+    return dim_to_split
+
+
+def _has_work_div_hint(op: ComputedBuffer) -> bool:
+    return any(hint_dict.get("work_div") for hint_dict in get_op_hints(op).values())
+
+
+def _resolve_work_div_hint(
+    op: ComputedBuffer,
+    it_space: dict[Symbol, Expr],
+) -> dict[Symbol, int] | None:
+    dim_to_split = _work_div_hint_by_name(op)
+    if not dim_to_split:
+        return None
+
+    loop_var_dims = getattr(op, "work_div_loop_info", {})
+    splits: dict[Symbol, int] = {}
+    for sym in it_space:
+        for name in loop_var_dims.get(sym, []):
+            if name in dim_to_split:
+                splits[sym] = dim_to_split[name]
+                break
+    return splits if splits else None
+
+
+def _apply_user_hint(
+    op: ComputedBuffer,
+    user_splits: dict[Symbol, int],
+    it_space_adjusted: dict[Symbol, Expr],
+    output_td: TensorDep,
+    max_cores: int,
+) -> dict[Symbol, int]:
+    op_name = op.get_name()
+
+    splits: dict[Symbol, int] = {}
+    for sym, split_val in user_splits.items():
+        # bool is an int subclass in Python, but it is not a meaningful split.
+        if isinstance(split_val, bool) or not isinstance(split_val, (int, Integer)):
+            raise Unsupported(
+                f"work_division_hint: {op_name} split value {split_val!r} "
+                f"for dim {sym} must be an integer."
+            )
+        split = int(split_val)
+        if split < 1:
+            raise Unsupported(
+                f"work_division_hint: {op_name} split value {split!r} "
+                f"for dim {sym} must be positive."
+            )
+        if sym not in it_space_adjusted:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} is not in the "
+                f"work-division iteration space."
+            )
+        splits[sym] = split
+
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars_to_split = {
+        sym for sym, split in splits.items() if split > 1 and sym not in coord_vars
+    }
+    if len(reduction_vars_to_split) > 1:
+        raise Unsupported(
+            f"work_division_hint: {op_name} splits "
+            f"{len(reduction_vars_to_split)} reduction dimensions "
+            f"({reduction_vars_to_split}), but the backend supports at most 1."
+        )
+
+    cores_used = math.prod(splits.values())
+    if cores_used > max_cores:
+        raise Unsupported(
+            f"work_division_hint: {op_name} total cores={cores_used} "
+            f"exceeds SENCORES={max_cores}."
+        )
+
+    for sym, split in splits.items():
+        dim_size = concretize_expr(it_space_adjusted[sym])
+        if dim_size % split != 0:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} size={dim_size} "
+                f"is not evenly divisible by split={split}."
+            )
+
+    return splits
+
+
+def _commit_user_splits(
+    op: ComputedBuffer,
+    splits: dict[Symbol, int],
+    output_td: TensorDep,
+) -> None:
+    if math.prod(splits.values()) <= 1:
+        if hasattr(op, "op_it_space_splits"):
+            delattr(op, "op_it_space_splits")
+        return
+    apply_splits(op, splits, output_td)
+
+
 def span_reduction_pass(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -618,6 +720,38 @@ def work_distribution_pass(
     # dims with actual committed splits so they don't overlap with priorities.
     committed_splits = {s: v for s, v in min_splits.items() if v > 1}
 
+    if not config.ignore_work_division_hints:
+        user_splits = _resolve_work_div_hint(op, it_space_adjusted)
+        if user_splits is not None:
+            user_splits = _apply_user_hint(
+                op, user_splits, it_space_adjusted, output_td, max_cores
+            )
+            dropped = {
+                s: v for s, v in committed_splits.items() if user_splits.get(s, 1) < v
+            }
+            if dropped:
+                logger.warning(
+                    f"work_division_hint: {op.get_name()} user hint reduces "
+                    f"splits committed by span_reduction for dims {list(dropped)}. "
+                    f"Applying strict user hint; this may violate the hardware "
+                    f"{MAX_SPAN_BYTES // (1024 * 1024)} MB span limit."
+                )
+            _commit_user_splits(op, user_splits, output_td)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                op_splits: tuple[dict, dict] = getattr(
+                    op, "op_it_space_splits", ({}, {})
+                )
+                logger.debug(
+                    f"work_distribution(user-hint) work_division {op.get_name()}: "
+                    f"cores={math.prod(user_splits.values())}, "
+                    f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+                    f"min_splits={committed_splits}, user_splits={user_splits}, "
+                    f"op_it_space_splits={op_splits}"
+                )
+            warn_if_per_core_overflow(all_tds, it_space, user_splits, op.get_name())
+            return
+
     splits, output_dims, reduction_dims = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores
     )
@@ -647,7 +781,7 @@ _DTYPE_BYTES = 2  # fp16
 _PSUM_PER_ELEM_US = 1.4e-4  # per output element, per K-split ring reduction hop
 _COHORT_LIMIT = 8  # cores sharing a broadcast before it contends for bandwidth
 _BATCH_SPLIT_EXPONENT = 1.4  # batch-split cost grows ~ b ** this (fit to bmm sweeps)
-_TARGET_M_PENALTY_US = 50.0  # tie-break weight, per log2 step off the target m-split
+_TARGET_M_PENALTY_US = 50.0  # tie-break weight when per-core M under-fills PT
 
 
 def _matmul_split_cost(
@@ -687,12 +821,14 @@ def _matmul_split_cost(
     # sum hops around the ring, each touching every output element.
     psum_us = max(0, k - 1) * (B * M * N) * _PSUM_PER_ELEM_US
 
-    # Tie-break: among compute-equivalent splits prefer the m-split that lands
-    # per-core M near the PT sweet spot, penalising log2-distance from it.
-    target_m = max(
-        _M_MIN, min(max_cores // 2, max(1, M // (_TARGET_PT_PASSES * _PT_ROWS)))
-    )
-    target_m_us = abs(math.log2(max(1, m) / target_m)) * _TARGET_M_PENALTY_US
+    # Tie-break: among compute-equivalent splits, penalize only M splits that
+    # make the per-core tile too short to fill the PT pipeline. Larger per-core
+    # M tiles are already compute-equivalent in this model; penalizing them
+    # incorrectly prefers M parallelism over N parallelism for wide projections.
+    if pt_passes >= _TARGET_PT_PASSES:
+        target_m_us = 0.0
+    else:
+        target_m_us = math.log2(_TARGET_PT_PASSES / pt_passes) * _TARGET_M_PENALTY_US
 
     # Splitting batch across cores is strictly worse than tiling it in time on
     # one core (each item is independent), so charge a super-linear b penalty.
@@ -841,6 +977,11 @@ def divide_reduction_op(
     # Currently we support Topk for k<=4, which can be handled efficiently on single core
     # TODO: Modification will be required to enable Topk for k>4
     if red.reduction_type in TOPK_OPS:
+        if not config.ignore_work_division_hints and _has_work_div_hint(op):
+            logger.warning(
+                f"work_division_hint: {op.get_name()} ignores work_div hint "
+                f"because TOPK reductions run single-core."
+            )
         return
 
     pass_fn(op, args, max_cores)
@@ -876,8 +1017,9 @@ def _iter_computed_buffers(operations: list[Operation]):
             logger.warning(f"unhandled operation type {type(op)}")
 
 
-def span_reduction(operations: list[Operation]) -> None:
+def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
+    operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op.get_read_writes()
@@ -889,13 +1031,14 @@ def span_reduction(operations: list[Operation]) -> None:
 
 
 def work_distribution(
-    operations: list[Operation], preassigned_ops: list[Operation] | None = None
+    graph: GraphLowering, preassigned_ops: list[Operation] | None = None
 ) -> None:
     """Pass 3: distribute remaining cores across ops to maximize parallelism.
 
     Ops in `preassigned_ops` were already divided by cost_model_matmul_division;
     they are left untouched so every op is divided by exactly one pass.
     """
+    operations = graph.operations
     preassigned_ops = preassigned_ops or []
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
@@ -921,6 +1064,9 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     if not isinstance(op.data, Reduction):
         return False
     if op.data.reduction_type != BATCH_MATMUL_OP:
+        return False
+    if not config.ignore_work_division_hints and _has_work_div_hint(op):
+        # User hints take ownership of the split decision; do not override them.
         return False
 
     rw = op.get_read_writes()
@@ -974,13 +1120,14 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     return True
 
 
-def cost_model_matmul_division(operations: list[Operation]) -> list[Operation]:
+def cost_model_matmul_division(graph: GraphLowering) -> list[Operation]:
     """Pass 2: re-price matmul/bmm splits with the analytic hardware cost model.
 
     Runs after span_reduction and before work_distribution. Returns the ops it
     re-split so passes.py can exclude them from work_distribution — every op is
     divided by exactly one pass.
     """
+    operations = graph.operations
     max_cores = _validate_max_cores()
     cost_model_ops: list[Operation] = []
     for op in _iter_computed_buffers(operations):

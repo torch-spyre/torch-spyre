@@ -323,6 +323,7 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
+    mb_sym: Symbol | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
@@ -339,7 +340,9 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
-            reduced_dims = [d for d in op_dim_order if d not in dim_order]
+            reduced_dims = [
+                d for d in op_dim_order if d not in dim_order and d is not mb_sym
+            ]
             dim_order = dim_order + reduced_dims
 
         if op_stick_dim is None:
@@ -378,6 +381,14 @@ def _create_sdsc_tensors(
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
             max_dim_sizes[dim] = -1
+
+        if mb_sym is not None:
+            # Virtual dim with no physical device dimension; stride = full 1-D allocation size.
+            dim_order = [mb_sym] + dim_order
+            scales[mb_sym] = 1
+            strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
+            offsets[mb_sym] = 0
+            max_dim_sizes[mb_sym] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         label = _get_layout_label(
@@ -559,6 +570,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
+    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
+    # require at least one outer spatial dim beyond the stick; inject a
+    # virtual mb=1 row when the op's tensor has only the stick dim.
+    mb_sym: Symbol | None = None
+    if (
+        DtypeOpTable.is_dtype_op(op_spec.op)
+        and op_spec.op != IDENTITY_OP
+        and op_stick_dim is not None
+        and all(d is op_stick_dim for d in op_dim_order)
+    ):
+        mb_sym = Symbol(INPUT_DIM_LABELS[0])
+        sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
+        dim_splits = {mb_sym: 1, **dim_splits}
+        work_slices = {mb_sym: 1, **work_slices}
+        op_dim_order = [mb_sym] + op_dim_order
+
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
@@ -574,6 +601,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space,
         op_dim_order,
         op_stick_dim,
+        mb_sym,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices

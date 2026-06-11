@@ -12,6 +12,8 @@ import torch
 
 DEFAULT_FLOATING_PRECISION: float = 1e-3
 
+_DYNAMIC_TAG_PREFIXES = ("op__", "dtype__", "module__", "platform__")
+
 MODE_MANDATORY_SUCCESS = "mandatory_success"
 MODE_XFAIL = "xfail"
 MODE_XFAIL_STRICT = "xfail_strict"
@@ -26,13 +28,55 @@ UNLISTED_MODE_MANDATORY_SUCCESS = "mandatory_success"
 UNLISTED_TEST_MODE_DEFAULT = UNLISTED_MODE_XFAIL
 
 # ADD: all valid modes in one set for validation
-_VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
 _VALID_UNLISTED_MODES = {
     UNLISTED_MODE_SKIP,
     UNLISTED_MODE_XFAIL,
     UNLISTED_MODE_XFAIL_STRICT,
     UNLISTED_MODE_MANDATORY_SUCCESS,
 }
+
+# ---------------------------------------------------------------------------
+# Valid dtype strings (used in validators)
+# ---------------------------------------------------------------------------
+
+_VALID_DTYPE_STRINGS = {
+    "float16",
+    "float32",
+    "float64",
+    "bfloat16",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "complex32",
+    "complex64",
+    "complex128",
+    "bool",
+    "half",
+}
+# -------------------------------------------
+# Valid tensor generation strategies
+# -------------------------------------------
+_VALID_INIT_STRATEGIES = {
+    "rand",
+    "randn",
+    "zeros",
+    "ones",
+    "randint",
+    "arange",
+    "xavier",
+    "eye",
+    "full",
+    "file",
+}
+
+_VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
+
+# _VALID_UNLISTED_MODES = {"skip", "xfail", "xfail_strict", "mandatory_success"}
 
 # --------------------
 # Dtype defaults

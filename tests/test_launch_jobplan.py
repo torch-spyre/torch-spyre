@@ -15,73 +15,91 @@
 """Tests for launching simple compiled ops through JobPlan execution."""
 
 import os
-from contextlib import contextmanager
+import subprocess
+import sys
 
 import pytest
+
+
+def run_compiled_op_in_subprocess(op_name: str, env_vars: dict) -> bool:
+    """
+    Run a compiled op test in an isolated subprocess with specific env vars.
+
+    This ensures each test runs with a fresh torch.compile cache and config,
+    avoiding the need for torch._dynamo.reset_code_caches().
+    """
+    code = f"""
 import torch
 
+# Get the op function
+op_fn = getattr(torch, "{op_name}")
 
-@contextmanager
-def set_env_vars(**env_vars):
-    """Context manager to temporarily set environment variables."""
-    previous = {key: os.environ.get(key) for key in env_vars}
-    try:
-        for key, value in env_vars.items():
-            os.environ[key] = value
-        yield
-    finally:
-        for key, prev_value in previous.items():
-            if prev_value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = prev_value
+# Generate inputs based on op
+if "{op_name}" == "abs":
+    inputs = (torch.randn(64, dtype=torch.float16),)
+elif "{op_name}" == "mul":
+    inputs = (
+        torch.randn(64, dtype=torch.float16),
+        torch.randn(64, dtype=torch.float16),
+    )
+else:
+    raise ValueError(f"Unknown op: {{op_name}}")
+
+# Run on CPU
+cpu_result = op_fn(*inputs)
+
+# Compile and run on Spyre
+compiled_fn = torch.compile(op_fn, backend="inductor")
+spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
+spyre_result = compiled_fn(*spyre_inputs).cpu()
+
+torch.testing.assert_close(
+    spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
+)
+print("PASS")
+"""
+    env = os.environ.copy()
+    env.update(env_vars)
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Subprocess failed with code {result.returncode}\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+    return "PASS" in result.stdout
 
 
 class TestLaunchJobPlan:
     """Test suite for JobPlan-backed compiled op execution."""
 
-    @pytest.mark.parametrize(
-        "env_vars",
-        [
-            {"DUMP_SPYRE_CODE": "1"},
-            {"DUMP_SPYRE_CODE": "1", "BUNDLE_HBM_SYMBOLS": "1"},
-        ],
-        ids=["SpyreCode, no symbols", "SpyreCode, fake symbols"],
-    )
-    def test_abs_matches_cpu(self, env_vars):
-        """Run compiled abs op with various env settings and compare to CPU."""
-        x = torch.randn(64, dtype=torch.float16)
-        cpu_result = torch.abs(x)
+    def test_abs_matches_cpu_no_symbols(self):
+        """Run compiled abs op without symbolic args and compare to CPU."""
+        assert run_compiled_op_in_subprocess("abs", {"DUMP_SPYRE_CODE": "1"})
 
-        with set_env_vars(**env_vars):
-            compiled_fn = torch.compile(torch.abs, backend="inductor")
-            spyre_result = compiled_fn(x.to("spyre")).cpu()
+    def test_abs_matches_cpu_with_symbols(self):
+        """Run compiled abs op with symbolic args and compare to CPU."""
+        assert run_compiled_op_in_subprocess(
+            "abs", {"DUMP_SPYRE_CODE": "1", "BUNDLE_SYMBOLIC_ARGS": "1"}
+        )
 
-            torch.testing.assert_close(
-                spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
-            )
+    def test_mul_matches_cpu_no_symbols(self):
+        """Run compiled mul op without symbolic args and compare to CPU."""
+        assert run_compiled_op_in_subprocess("mul", {"DUMP_SPYRE_CODE": "1"})
 
-    @pytest.mark.parametrize(
-        "env_vars",
-        [
-            {"DUMP_SPYRE_CODE": "1"},
-            {"DUMP_SPYRE_CODE": "1", "BUNDLE_HBM_SYMBOLS": "1"},
-        ],
-        ids=["SpyreCode, no symbols", "SpyreCode, fake symbols"],
-    )
-    def test_mul_matches_cpu(self, env_vars):
-        """Run compiled mul op with various env settings and compare to CPU."""
-        x = torch.randn(64, dtype=torch.float16)
-        y = torch.randn(64, dtype=torch.float16)
-        cpu_result = torch.mul(x, y)
-
-        with set_env_vars(**env_vars):
-            compiled_fn = torch.compile(torch.mul, backend="inductor")
-            spyre_result = compiled_fn(x.to("spyre"), y.to("spyre")).cpu()
-
-            torch.testing.assert_close(
-                spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
-            )
+    def test_mul_matches_cpu_with_symbols(self):
+        """Run compiled mul op with symbolic args and compare to CPU."""
+        assert run_compiled_op_in_subprocess(
+            "mul", {"DUMP_SPYRE_CODE": "1", "BUNDLE_SYMBOLIC_ARGS": "1"}
+        )
 
 
 if __name__ == "__main__":
