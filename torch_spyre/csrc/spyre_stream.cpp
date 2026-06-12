@@ -206,9 +206,11 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
   // Create and launch operation
   if (host2device) {
-    flex_stream->launchOperationH2D(cpu_ptr, device_address, dci_ptr);
+    auto h2d_params = flex::createDmaParams(cpu_ptr, device_address->total_size(), host2device, device_address);
+    flex_stream->launchOperationH2D(h2d_params);
   } else {
-    flex_stream->launchOperationD2H(device_address, cpu_ptr, dci_ptr);
+    auto d2h_params = flex::createDmaParams(cpu_ptr, device_address->total_size(), host2device, device_address);
+    flex_stream->launchOperationD2H(d2h_params);
   }
 }
 
@@ -228,7 +230,8 @@ void SpyreStream::executeProgramAsync(
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
-  flex_stream->launchOperationCompute(&ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
+  auto compute_params = createComputeParams(&ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
+  flex_stream->launchOperationCompute(compute_params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,

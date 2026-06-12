@@ -29,11 +29,6 @@
 
 #include "util/spyrecode.h"
 
-// Forward declarations for flex types
-namespace flex {
-class RuntimeOperation;
-}
-
 namespace spyre {
 
 /**
@@ -199,8 +194,7 @@ struct LaunchContext {
  * This factory method pattern eliminates special-case branching in
  * SpyreStream::Launch.
  *
- * All RuntimeOperation objects are transient: constructed inside construct(),
- * ownership transferred to RuntimeStream via launchOperation(), and destroyed
+ * All RuntimeOperation objects are transient: constructed via the launchOperationXXX() call, and destroyed
  * when the stream completes the operation. No RuntimeOperation is cached in
  * the JobPlan.
  */

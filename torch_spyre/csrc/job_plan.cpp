@@ -28,7 +28,8 @@ namespace spyre {
 
 void JobPlanStepH2D::construct(
     LaunchContext&, flex::RuntimeStream* flex_stream) const {
-  flex_stream->launchOperationH2D(host_address_, &device_address_);
+  auto h2d_params = flex::createDmaParams(host_address_, device_address_.total_size(), true, &device_address_);
+  flex_stream->launchOperationH2D(h2d_params);
 }
 
 void JobPlanStepH2D::write(std::ostream& os) const {
@@ -41,7 +42,8 @@ void JobPlanStepH2D::write(std::ostream& os) const {
 
 void JobPlanStepD2H::construct(
     LaunchContext&, flex::RuntimeStream* flex_stream) const {
-  flex_stream->launchOperationD2H(&device_address_, host_address_);
+  auto d2h_params = flex::createDmaParams(host_address_, device_address_.total_size(), false, &device_address_);
+  flex_stream->launchOperationD2H(d2h_params);
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
@@ -64,7 +66,10 @@ void JobPlanStepCompute::construct(
       tensor_allocs.push_back(address);
     }
   }
-  flex_stream->launchOperationCompute(&binary_address_, tensor_allocs, "", flex::PROG_OFFSET_BASE, {}, pipeline_barrier_);
+  auto compute_params = flex::createComputeParams(&binary_address_, std::move(tensor_allocs), "", flex::PROG_OFFSET_BASE,
+                                     std::vector<uint64_t>{});
+  compute_params->pipeline_barrier = pipeline_barrier_;
+  flex_stream->launchOperationCompute(compute_params);
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -98,7 +103,8 @@ void JobPlanStepHostCompute::construct(
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
                                              input_buffer_);
     };
-    flex_stream->launchOperationHostCallback(pipeline_barrier_, std::move(callback), nullptr);
+    auto callback_params = flex::createHostCallbackParams(std::move(callback), nullptr, pipeline_barrier_);
+    flex_stream->launchOperationHostCallback(callback_params);
     return;
   }
 
@@ -109,7 +115,8 @@ void JobPlanStepHostCompute::construct(
     auto callback = [this](void*) {
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
     };
-    flex_stream->launchOperationHostCallback(pipeline_barrier_, std::move(callback), nullptr);
+    auto callback_params = flex::createHostCallbackParams(std::move(callback), nullptr, pipeline_barrier_);
+    flex_stream->launchOperationHostCallback(callback_params);
     return;
   }
 
@@ -127,7 +134,8 @@ void JobPlanStepHostCompute::construct(
     deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
   };
 
-  flex_stream->launchOperationHostCallback(pipeline_barrier_, std::move(callback), nullptr);
+  auto callback_params = flex::createHostCallbackParams(std::move(callback), nullptr, pipeline_barrier_);
+  flex_stream->launchOperationHostCallback(callback_params);
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
