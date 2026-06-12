@@ -30,6 +30,7 @@ from torch import fx
 MULTI_DIM_REDUCTION_OPS = {
     torch.ops.aten.sum.dim_IntList,
     torch.ops.aten.mean.dim,
+    torch.ops.aten.mean.default,
     torch.ops.aten.amax.default,
     torch.ops.aten.amin.default,
     torch.ops.aten.prod.dim_int,
@@ -88,6 +89,7 @@ def _get_keepdim(node: fx.Node) -> bool:
     if node.target in {
         torch.ops.aten.sum.dim_IntList,
         torch.ops.aten.mean.dim,
+        torch.ops.aten.mean.default,
         torch.ops.aten.amax.default,
         torch.ops.aten.amin.default,
         torch.ops.aten.prod.dim_int,
@@ -109,6 +111,7 @@ def _get_dtype(node: fx.Node) -> Optional[torch.dtype]:
     if node.target in {
         torch.ops.aten.sum.dim_IntList,
         torch.ops.aten.mean.dim,
+        torch.ops.aten.mean.default,
         torch.ops.aten.prod.dim_int,
     }:
         # dtype is typically the 4th argument

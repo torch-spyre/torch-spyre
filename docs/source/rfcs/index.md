@@ -20,6 +20,9 @@ and submit a pull request.
 | [0186](https://github.com/torch-spyre/rfcs/blob/main/0186-TestFrameworks/0186-TestFrameworks.md) | Test Frameworks | Testing |
 | [0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md) | Spyre Profiling Toolkit | Profiling |
 | [0682](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) | Kernel Tile Intermediate Representation | Compiler IR |
+| [1287](https://github.com/torch-spyre/rfcs/blob/main/1287-SpyreTestFramework/1287-SpyreTestFrameworkRFC.md) | Test Suite Configuration for Upstream PyTorch Tests on OOT Devices | Testing |
+| [1632](https://github.com/torch-spyre/rfcs/blob/main/1632-ModelEnablement/1632-ModelEnablement.md) | Model Enablement Tracking | Model enablement |
+| [1633](https://github.com/torch-spyre/rfcs/blob/main/1633-E2EModelPerf/1633-E2EModelPerf.md) | End-to-End Model Performance Testing | Performance |
 
 ## Summaries
 
@@ -68,3 +71,31 @@ memory and scratchpad in a hardware-independent form that DeepTools
 then lowers to device-specific code.
 
 See also: [Compiler Backend](../compiler/backend.md)
+
+### RFC 1287 — Test Suite Configuration for Upstream PyTorch Tests on OOT Devices
+
+Defines a YAML-based configuration schema (driven by `PYTORCH_TEST_CONFIG`)
+that lets out-of-tree backends like Spyre reuse PyTorch's upstream test
+suite without drowning in noise. OOT teams declare supported ops, dtypes,
+and devices, and can selectively skip or xfail upstream tests, override
+tolerances, inject custom inputs, and tag variants.
+
+### RFC 1632 — Model Enablement Tracking
+
+Describes how to systematically measure and track progress toward enabling
+models on Spyre. Recommends using vLLM (rather than HuggingFace) model
+definitions when discovering ops and modules, since vLLM definitions match
+what actually ships in production. Proposes a dashboard with two metrics
+per model — percentage of ops covered in `torch-spyre` and percentage of
+modules covered in `vllm-spyre` — supplemented by hybrid end-to-end tests
+where unenabled modules fall back to CPU.
+
+### RFC 1633 — End-to-End Model Performance Testing
+
+Consolidates fragmented performance measurement (PELE, fmwork, OLMES,
+BFCL, etc.) around vLLM as the backend so regressions, output mismatches,
+and quality issues surface systematically. Covers three measurement
+dimensions — correctness against HuggingFace references, benchmarking
+(latency, throughput, TTFT, ITL), and quality evals (GSM8K, MMLU, and
+use-case-specific benchmarks) — leaning on upstream tooling such as
+`HfRunner`, `VLLMRunner`, `vllm bench`, and `lm-evaluation-harness`.

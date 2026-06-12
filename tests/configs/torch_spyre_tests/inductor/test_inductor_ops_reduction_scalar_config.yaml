@@ -1,0 +1,25 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # k_expr: test_max_default or test_topk
+            #         or test_argmin or test_count_nonzero or test_logsumexp
+            #         or test_nanmean or test_nansum or test_all_dim or test_any_dim
+            #         or test_prod_dim or test_std_ or test_var_ or test_cumprod
+            #         or test_logcumsumexp or test_cummax or test_cummin
+            #         or test_quantile or test_nanquantile or test_median
+            #         or test_nanmedian or test_mode_ or test_sum_eager
+            #         or test_mean_eager or test_max_eager or test_min_eager
+            #
+            # "test_sum_eager" as substring --> test_sum_keepdim0, test_sum_keepdim1
+            # k_expr "test_sum_eager" matches the eager test class names
+            # but the base method names are test_sum_keepdim0/1 from test file
+            # Note: argmin and logsumexp are excluded here because their base
+            # names contain "keepdim" and are covered by the keepdim shard.
+            - TestOps::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|prod_dim|quantile|std_|topk|conv2d|var_).*
+
+          mode: mandatory_success
+          tags:
+            - ops__inductor-reduction

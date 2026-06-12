@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 280" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .input    { fill: #f0f0f0; stroke: #888; stroke-width: 1.2; }
+      .stage    { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.5; }
+      .runtime  { fill: #d6efd6; stroke: #2d7a2d; stroke-width: 1.5; }
+      .label    { fill: #222; }
+      .caption  { fill: #555; font-size: 11px; font-style: italic; }
+      .arrow    { stroke: #444; stroke-width: 1.5; fill: none; }
+      .title    { fill: #222; font-size: 16px; font-weight: 700; }
+      .name     { font-weight: 600; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="380" y="32" text-anchor="middle" class="title">SpyreCode → JobPlan → launch</text>
+  <text x="380" y="52" text-anchor="middle" class="caption">Compile-time artifact on the left, runtime operation queue on the right.</text>
+
+  <!-- Box 1: SpyreCode dir -->
+  <rect class="input" x="30" y="100" width="150" height="80" rx="8"/>
+  <text class="label name" x="105" y="135" text-anchor="middle">SpyreCode dir</text>
+  <text class="caption" x="105" y="155" text-anchor="middle">JSON manifest +</text>
+  <text class="caption" x="105" y="170" text-anchor="middle">binary blobs</text>
+
+  <!-- Box 2: prepareKernel -->
+  <rect class="stage" x="220" y="100" width="160" height="80" rx="8"/>
+  <text class="label name" x="300" y="135" text-anchor="middle">prepareKernel()</text>
+  <text class="caption" x="300" y="155" text-anchor="middle">csrc/prepare_kernel.h</text>
+  <text class="caption" x="300" y="170" text-anchor="middle">translates the manifest</text>
+
+  <!-- Box 3: JobPlan -->
+  <rect class="stage" x="420" y="100" width="160" height="80" rx="8"/>
+  <text class="label name" x="500" y="135" text-anchor="middle">JobPlan</text>
+  <text class="caption" x="500" y="155" text-anchor="middle">ordered list of</text>
+  <text class="caption" x="500" y="170" text-anchor="middle">JobPlanStep instances</text>
+
+  <!-- Box 4: SpyreStream::launch -->
+  <rect class="runtime" x="620" y="100" width="120" height="80" rx="8"/>
+  <text class="label name" x="680" y="130" text-anchor="middle">SpyreStream</text>
+  <text class="label name" x="680" y="148" text-anchor="middle">::launch</text>
+  <text class="caption" x="680" y="166" text-anchor="middle">queues RuntimeOps</text>
+
+  <!-- Arrows between boxes -->
+  <path class="arrow" d="M 180 140 L 220 140" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 380 140 L 420 140" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 580 140 L 620 140" marker-end="url(#arr)"/>
+
+  <!-- Bottom legend -->
+  <text x="380" y="225" text-anchor="middle" class="caption">JobPlanStep types: H2D, D2H, Compute, HostCompute (program correction).</text>
+  <text x="380" y="245" text-anchor="middle" class="caption">Each step builds a flex::RuntimeOperation at launch time and the stream runs them FIFO.</text>
+</svg>

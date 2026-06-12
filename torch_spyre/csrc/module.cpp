@@ -16,6 +16,7 @@
 
 #include "module.h"
 
+#include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/ScalarType.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
@@ -31,9 +32,19 @@
 #include <string>
 #include <vector>
 
+#include "job_plan.h"
+
+#ifdef USE_SPYRE_CCL
+#include <pybind11/chrono.h>
+
+#include "distributed/spyre_ccl.hpp"
+#endif
+
 #include "logging.h"
+#include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
@@ -46,7 +57,7 @@ namespace fs = std::filesystem;
 
 namespace spyre {
 
-static constexpr int32_t kSpyreTensorLayoutPickleVersion = 2;
+static constexpr int32_t kSpyreTensorLayoutPickleVersion = 3;
 
 std::atomic<bool> g_downcast_warn_enabled{true};
 
@@ -152,17 +163,56 @@ int device_count() {
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
+  // Register PrivateUse1 hooks — tells PyTorch the device exists.
+  // Loading _C.so does NOT trigger device initialization;
+  // start_runtime() must be called explicitly (via _lazy_init()).
+  {
+    struct SpyreHooksArgs : public at::PrivateUse1HooksArgs {};
+    struct SpyreHooksInterface : public at::PrivateUse1HooksInterface {
+      SpyreHooksInterface() = default;
+      explicit SpyreHooksInterface(SpyreHooksArgs) {}
+      ~SpyreHooksInterface() override = default;
+      bool hasPrimaryContext(c10::DeviceIndex) const override {
+        return true;
+      }
+      bool isAvailable() const override {
+        return true;
+      }
+      const at::Generator& getDefaultGenerator(
+          c10::DeviceIndex device) const override {
+        return spyre::detail::getDefaultSpyreGenerator(device);
+      }
+      at::Generator getNewGenerator(c10::DeviceIndex device) const override {
+        return spyre::detail::createSpyreGenerator(device);
+      }
+    };
+    static auto* hooks = new SpyreHooksInterface();
+    at::RegisterPrivateUse1HooksInterface(hooks);
+  }
+
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
+  m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
+
+  py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
+      .value("STANDARD", spyre::ElementArrangement::STANDARD)
+      .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
+      .value("DL16_TO_FP8", spyre::ElementArrangement::DL16_TO_FP8)
+      .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("stride_map", &spyre::SpyreTensorLayout::stride_map)
       .def_readonly("device_dtype", &spyre::SpyreTensorLayout::device_dtype)
+      .def_readonly("element_arrangement",
+                    &spyre::SpyreTensorLayout::element_arrangement)
+      .def("with_element_arrangement",
+           &spyre::SpyreTensorLayout::with_element_arrangement,
+           py::arg("element_arrangement"))
       .def("__str__",
            [](const spyre::SpyreTensorLayout& c) { return c.toString(); })
       .def("__repr__",
@@ -176,12 +226,15 @@ PYBIND11_MODULE(_C, m) {
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, c10::ScalarType,
-                    std::vector<int32_t>>(),
+                    std::vector<int32_t>, spyre::ElementArrangement>(),
            py::arg("host_size"), py::arg("host_strides"), py::arg("dtype"),
-           py::arg("dim_order"))
-      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats>(),
+           py::arg("dim_order"),
+           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
+      .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
+                    spyre::ElementArrangement>(),
            py::arg("device_size"), py::arg("stride_map"),
-           py::arg("device_dtype"))
+           py::arg("device_dtype"),
+           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(py::pickle(
           [](const spyre::SpyreTensorLayout& p) {  // __getstate__
             // Return a tuple that fully encodes the state of the object
@@ -190,7 +243,8 @@ PYBIND11_MODULE(_C, m) {
             // returned object and the first element to be the
             // kSpyreTensorLayoutPickleVersion
             return py::make_tuple(spyre::kSpyreTensorLayoutPickleVersion,
-                                  p.device_size, p.stride_map, p.device_dtype);
+                                  p.device_size, p.stride_map, p.device_dtype,
+                                  p.element_arrangement);
           },
           [](py::tuple t) {  // __setstate__
             int32_t version = t[0].cast<int32_t>();
@@ -213,6 +267,17 @@ PYBIND11_MODULE(_C, m) {
               return spyre::SpyreTensorLayout(t[1].cast<std::vector<int64_t>>(),
                                               t[2].cast<std::vector<int64_t>>(),
                                               t[3].cast<DataFormats>());
+            } else if (version == 3) {
+              // Version 3: (version, device_size, stride_map, device_dtype,
+              // element_arrangement)
+              if (t.size() != 5) {
+                throw py::value_error(
+                    "Invalid SpyreTensorLayout pickle v3: wrong tuple size");
+              }
+              return spyre::SpyreTensorLayout(
+                  t[1].cast<std::vector<int64_t>>(),
+                  t[2].cast<std::vector<int64_t>>(), t[3].cast<DataFormats>(),
+                  t[4].cast<spyre::ElementArrangement>());
             } else {
               throw py::value_error(
                   "Unsupported SpyreTensorLayout pickle version: " +
@@ -258,6 +323,17 @@ PYBIND11_MODULE(_C, m) {
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // RNG functions
+  m.def("manual_seed", &spyre::manual_seed, py::arg("seed"),
+        py::arg("device") = -1);
+  m.def("manual_seed_all", &spyre::manual_seed_all, py::arg("seed"));
+  m.def("get_rng_state", &spyre::get_rng_state, py::arg("device") = -1);
+  m.def("set_rng_state", &spyre::set_rng_state, py::arg("new_state"),
+        py::arg("device") = -1);
+  m.def("initial_seed", &spyre::initial_seed, py::arg("device") = -1);
+  m.def("_get_default_generator", &spyre::detail::getDefaultSpyreGenerator,
+        py::arg("device") = -1);
 
   // Memory copy function
   m.def("copy_tensor", &spyre::spyre_copy_from,
@@ -310,4 +386,104 @@ PYBIND11_MODULE(_C, m) {
         .index();
   });
   m.def("device_count", &spyre::device_count);
+
+#ifdef USE_SPYRE_CCL
+  // Spyre CCL distributed backend
+  m.def("createSpyreCCLBackend", &c10d::SpyreCCLBackend::createSpyreCCLBackend,
+        "Create the Spyre Collective Library Backend object");
+#endif
+
+  py::class_<spyre::JobPlan>(m, "JobPlan")
+      .def(
+          "num_steps",
+          [](const spyre::JobPlan& plan) { return plan.steps.size(); },
+          "Get the number of steps in the JobPlan")
+      .def(
+          "job_allocation_size",
+          [](const spyre::JobPlan& plan) {
+            return plan.job_allocation.total_size();
+          },
+          "Get the size of the job allocation")
+      .def(
+          "get_step_type",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto& step = plan.steps[idx];
+            if (dynamic_cast<const spyre::JobPlanStepH2D*>(step.get())) {
+              return "H2D";
+            } else if (dynamic_cast<const spyre::JobPlanStepD2H*>(step.get())) {
+              return "D2H";
+            } else if (dynamic_cast<const spyre::JobPlanStepCompute*>(
+                           step.get())) {
+              return "Compute";
+            } else if (dynamic_cast<const spyre::JobPlanStepHostCompute*>(
+                           step.get())) {
+              return "HostCompute";
+            } else {
+              return "Unknown";
+            }
+          },
+          py::arg("idx"), "Get the type of step at the given index")
+      .def("__repr__", [](const spyre::JobPlan& plan) {
+        return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
+               " job_allocation_size=" +
+               std::to_string(plan.job_allocation.total_size()) +
+               " expected_inputs=" +
+               std::to_string(plan.expected_input_shapes.size()) +
+               " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
+               ">";
+      });
+  m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
+        py::arg("stream") = nullptr,
+        "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
+        "Args:\n"
+        "    spyrecode_dir (str): Path to the SpyreCode directory\n"
+        "    stream (SpyreStream, optional): Stream to use for initialization "
+        "transfers.\n"
+        "        If None, uses the current stream. Defaults to None.\n\n"
+        "Returns:\n"
+        "    Prepared JobPlan ready for execution");
+  m.def("launch_jobplan", &spyre::launchJobPlan, py::arg("job_plan"),
+        py::arg("args"),
+        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+        "Args:\n"
+        "    job_plan: The JobPlan to execute\n"
+        "    args: Sequence of input/output tensors");
+
+  // Allocator statistics functions
+  m.def(
+      "_spyre_get_allocator_stats",
+      [](c10::DeviceIndex device) {
+        auto& allocator = spyre::SpyreAllocator::instance();
+        auto stats = allocator.getDeviceStats(device);
+        py::dict result;
+        result["allocated_bytes.all.current"] =
+            stats
+                .allocated_bytes[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .current;
+        result["allocation.all.current"] =
+            stats
+                .allocation[static_cast<size_t>(
+                    c10::CachingAllocator::StatType::AGGREGATE)]
+                .current;
+        return result;
+      },
+      py::arg("device"), "Get allocator statistics for a device");
+
+  m.def(
+      "_spyre_reset_accumulated_stats",
+      [](c10::DeviceIndex device) {
+        auto& allocator = spyre::SpyreAllocator::instance();
+        allocator.resetAccumulatedStats(device);
+      },
+      py::arg("device"), "Reset accumulated allocator statistics");
+
+  m.def(
+      "_spyre_reset_peak_stats",
+      [](c10::DeviceIndex device) {
+        auto& allocator = spyre::SpyreAllocator::instance();
+        allocator.resetPeakStats(device);
+      },
+      py::arg("device"), "Reset peak allocator statistics");
 }

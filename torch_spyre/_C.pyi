@@ -9,6 +9,8 @@ import typing
 
 __all__: list[str] = [
     "DataFormats",
+    "JobPlan",
+    "ElementArrangement",
     "SpyreTensorLayout",
     "_SpyreStreamBase",
     "current_stream",
@@ -25,7 +27,9 @@ __all__: list[str] = [
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "launch_jobplan",
     "launch_kernel",
+    "prepare_kernel",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_with_layout",
@@ -114,9 +118,40 @@ class DataFormats:
     @property
     def value(self) -> int: ...
 
+class ElementArrangement:
+    """
+    Members:
+
+      STANDARD
+
+      DL16_TO_FP32
+
+      DL16_TO_FP8
+
+      EXX2
+    """
+
+    DL16_TO_FP32: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.DL16_TO_FP32: 1>
+    DL16_TO_FP8: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.DL16_TO_FP8: 2>
+    EXX2: typing.ClassVar[ElementArrangement]  # value = <ElementArrangement.EXX2: 3>
+    STANDARD: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.STANDARD: 0>
+    __members__: typing.ClassVar[
+        dict[str, ElementArrangement]
+    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'DL16_TO_FP8': <ElementArrangement.DL16_TO_FP8: 2>, 'EXX2': <ElementArrangement.EXX2: 3>}
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class SpyreTensorLayout:
-    __hash__: typing.ClassVar[None] = None  # type: ignore
-    def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore
+    def __hash__(self) -> int: ...
+    def __eq__(self, arg0: SpyreTensorLayout) -> bool: ...  # type: ignore[override]
     @typing.overload
     def __init__(
         self,
@@ -130,6 +165,7 @@ class SpyreTensorLayout:
         host_strides: collections.abc.Sequence[typing.SupportsInt],
         dtype: torch.dtype,
         dim_order: collections.abc.Sequence[typing.SupportsInt],
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     @typing.overload
     def __init__(
@@ -137,14 +173,20 @@ class SpyreTensorLayout:
         device_size: collections.abc.Sequence[typing.SupportsInt],
         stride_map: collections.abc.Sequence[typing.SupportsInt],
         device_dtype: DataFormats,
+        element_arrangement: ElementArrangement = ElementArrangement.STANDARD,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
     def elems_per_stick(self) -> int: ...
+    def with_element_arrangement(
+        self, element_arrangement: ElementArrangement
+    ) -> SpyreTensorLayout: ...
     @property
     def device_dtype(self) -> DataFormats: ...
     @property
     def device_size(self) -> list[int]: ...
+    @property
+    def element_arrangement(self) -> ElementArrangement: ...
     @property
     def stride_map(self) -> list[int]: ...
 
@@ -267,9 +309,56 @@ def get_downcast_warning() -> bool:
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
+
+class JobPlan:
+    """
+    A torch-spyre internal container for executing a unit of work.
+
+    Produced by prepare_kernel() and consumed by launch_jobplan().
+    """
+    def num_steps(self) -> int:
+        """Get the number of steps in the JobPlan"""
+        ...
+
+    def job_allocation_size(self) -> int:
+        """Get the size of the job allocation"""
+        ...
+
+    def get_step_type(self, idx: int) -> str:
+        """Get the type of step at the given index (H2D, D2H, Compute, or HostCompute)"""
+        ...
+
+def launch_jobplan(
+    job_plan: JobPlan, args: collections.abc.Sequence[torch.Tensor]
+) -> None:
+    """
+    Launch a prepared JobPlan with the given tensor arguments.
+
+    Args:
+        job_plan: The JobPlan to execute
+        args: Sequence of input/output tensors
+    """
+    ...
+
 def launch_kernel(
     code_dir: str, args: collections.abc.Sequence[torch.Tensor]
 ) -> None: ...
+def prepare_kernel(
+    spyrecode_dir: str, stream: _SpyreStreamBase | None = None
+) -> JobPlan:
+    """
+    Prepare a kernel from a SpyreCode directory and return a JobPlan.
+
+    Args:
+        spyrecode_dir: Path to the SpyreCode directory
+        stream: Stream to use for initialization transfers.
+            If None, uses the current stream. Defaults to None.
+
+    Returns:
+        Prepared JobPlan ready for execution
+    """
+    ...
+
 def set_downcast_warning(arg0: bool) -> None:
     """
     Enable/disable downcast warnings for this process.

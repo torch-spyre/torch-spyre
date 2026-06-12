@@ -65,11 +65,16 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   c10::DataPtr allocate(size_t nbytes) override;
 
+  c10::DataPtr allocate(size_t nbytes,
+                        const flex::AllocationDirective& directive);
+
   static void ReportAndDelete(void* ctx_void);
 
   c10::DeleterFnPtr raw_deleter() const override;
 
   void copy_data(void* dest, const void* src, std::size_t count) const final;
+
+  uint32_t segmentForRegion(uint64_t region_id) const;
 };
 
 }  // namespace spyre

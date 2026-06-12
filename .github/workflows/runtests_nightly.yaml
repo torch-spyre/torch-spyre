@@ -1,58 +1,79 @@
-name: tests
+name: tests-nightly
 
 on:
   schedule:
     - cron: 0 2 * * *
 
-defaults:
-  run:
-    shell: bash
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to check out and test
+        required: false
+        type: string
+        default: ''
+      rpm_location:
+        description: The Artifactory location where to download the RPM from
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        description: A space separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ''
+      build_torch_spyre:
+        description: Whether to re-build torch-spyre after installing the RPM
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
   checks: write
 
 jobs:
-  test:
-    name: Run Spyre unit tests - complete version
-    # runs-on: official-aiu-x86-64-arc-runner-set-v1
-    # runs-on: official-aiu-x86-64-arc-runner-set-v2
-    runs-on: official-aiu-x86-64-arc-runner-set-v3
-    # increase timeout to 12 hours
-    timeout-minutes: 720
-    # env: {}
+  # ---------------------------------------------------------------------------
+  # Delegate entirely to the shared test matrix.
+  # Nightly always runs everything — no doc-skip logic needed.
+  # ---------------------------------------------------------------------------
+  run-tests:
+    uses: ./.github/workflows/_test_matrix.yaml
+    with:
+      runner_label: linux
+      extra_test_flags: --cpu-compile -vvv -s
+      checkout_pytorch: true
+      torch_root: /home/senuser/pytorch
+      ref: ${{ inputs.ref || '' }}
+      rpm_location: ${{ inputs.rpm_location || '' }}
+      rpm_names: ${{ inputs.rpm_names || '' }}
+      build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
+
+  # ---------------------------------------------------------------------------
+  # Job 2: run-spyre-unit-tests (fan-in gate)
+  #
+  # Fans in the reusable workflow result. Reports a single green/red status.
+  #   run-tests result = success -> all suites passed -> green
+  #   run-tests result = failure -> one or more suites bad -> red
+  # ---------------------------------------------------------------------------
+  run-spyre-unit-tests:
+    name: Run Spyre unit tests
+    runs-on: ubuntu-latest
+    needs: [run-tests]
+    if: always()
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: get some info
-        run: |
-          echo 'gather info start'
-          pwd
-          ls -la
-          whoami
-          id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
-      - name: Install the torch-spyre package and dependencies
-        run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
-          # avoid the extra step required by --no-build-isolation
-          uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-      - name: Run unit tests
-        run: |
-          echo 'Run unit tests start'
-          pytest tests/ --cpu-compile -vvv -s || EXIT_CODE=$?
-          EXIT_CODE=${EXIT_CODE:-0}
-          echo "pytest EXIT_CODE: ${EXIT_CODE}"
-          if [[ "$EXIT_CODE" == '0' ]] ; then
-            echo 'pytest success'
-          else
-            echo 'pytest failed'
+      - name: Evaluate test results
+        run: |-
+          RESULT="${{ needs.run-tests.result }}"
+          echo "run-tests result: ${RESULT}"
+
+          if [[ "${RESULT}" == "success" ]]; then
+            echo "All test suites passed."
+            exit 0
           fi
-          echo 'Run unit tests end'
-          exit "$EXIT_CODE"
+
+          echo "One or more test suites failed or were cancelled."
+          exit 1

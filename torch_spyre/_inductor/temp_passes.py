@@ -23,6 +23,8 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
+from .constants import SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
+from .pass_utils import copy_fx_custom_meta
 
 aten = torch.ops.aten
 
@@ -36,6 +38,115 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+
+def _is_static_one(value) -> bool:
+    try:
+        return int(value) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_static_multiple(value, divisor: int) -> bool:
+    try:
+        return int(value) % divisor == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_stick_aligned_matmul_dims(k, n) -> bool:
+    return _is_static_multiple(k, 64) and _is_static_multiple(n, 64)
+
+
+def _node_shape(node: torch.fx.Node) -> list[int] | None:
+    val = node.meta.get("val")
+    shape = getattr(val, "shape", None)
+    if shape is None:
+        return None
+    return list(shape)
+
+
+def _mark_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    lhs_shape = _node_shape(lhs_node)
+    rhs_shape = _node_shape(rhs_node)
+    out_shape = _node_shape(bmm_node)
+    if lhs_shape is None or rhs_shape is None or out_shape is None:
+        return
+    if len(lhs_shape) != 3 or len(rhs_shape) != 3 or len(out_shape) != 3:
+        return
+    if not (
+        _is_static_one(lhs_shape[0])
+        and _is_static_one(rhs_shape[0])
+        and _is_static_one(out_shape[0])
+    ):
+        return
+    if not (
+        lhs_shape[1] == out_shape[1]
+        and lhs_shape[2] == rhs_shape[1]
+        and rhs_shape[2] == out_shape[2]
+    ):
+        return
+    if not _has_stick_aligned_matmul_dims(lhs_shape[2], rhs_shape[2]):
+        return
+    custom = dict(bmm_node.meta.get("custom") or {})
+    custom[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY] = {"batch_dim": 0}
+    bmm_node.meta["custom"] = custom
+
+
+def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.op in ("placeholder", "get_attr"):
+        return True
+    if node.op == "call_function" and node.target == aten.expand.default:
+        base = node.args[0]
+        return isinstance(base, torch.fx.Node) and base.op in (
+            "placeholder",
+            "get_attr",
+        )
+    return False
+
+
+def _mark_direct_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    """Mark direct rank-3 B=1 BMMs without catching unflattened attention views."""
+    if not _is_direct_unit_bmm_operand(rhs_node):
+        return
+
+    for arg in (lhs_node, rhs_node):
+        if (
+            isinstance(arg, torch.fx.Node)
+            and arg.op == "call_function"
+            and arg.target in _RESHAPE_OPS
+        ):
+            return
+
+    bmm_users = list(bmm_node.users.keys())
+    if len(bmm_users) == 1:
+        output_view = bmm_users[0]
+        if (
+            isinstance(output_view, torch.fx.Node)
+            and output_view.op == "call_function"
+            and output_view.target in _RESHAPE_OPS
+        ):
+            output_shape = output_view.args[1]
+            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
+                return
+
+    _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
+
+
+def mark_direct_unit_bmm_pass(graph: torch.fx.Graph) -> None:
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target != aten.bmm.default:
+            continue
+        if len(node.args) != 2:
+            continue
+        lhs_node, rhs_node = node.args
+        _mark_direct_static_unit_batch_bmm(node, lhs_node, rhs_node)
 
 
 @register_graph_pattern(
@@ -127,12 +238,20 @@ def _unflatten_mm_to_bmm(
             expanded_shape, dtype=rhs_dtype, device="meta"
         )
 
-        # Replace mm with bmm
+        # Use spyre.batched_matmul for >3D to avoid FakeTensorUpdater crash
+        # (aten.bmm requires exactly 3D inputs)
+        target = (
+            torch.ops.spyre.batched_matmul.default
+            if len(output_shape) > 3
+            else aten.bmm.default
+        )
         bmm_node = graph.call_function(
-            aten.bmm.default,
+            target,
             args=(lhs_input, expanded),
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
+        copy_fx_custom_meta(node, bmm_node)
+        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -215,15 +334,21 @@ def _unflatten_bmm_batch_dims(
     lhs_orig = lhs_reshape.args[0]  # the expand or original tensor
     rhs_orig = rhs_reshape.args[0]
 
-    # Update bmm to take the higher-dimensional inputs directly
-    node.args = (lhs_orig, rhs_orig)
+    # Replace the 3D bmm with a spyre.batched_matmul that accepts N-D inputs.
+    # Using aten.bmm.default with >3D args would crash FakeTensorUpdater.
+    with graph.inserting_before(node):
+        matmul_node = graph.call_function(
+            torch.ops.spyre.batched_matmul.default,
+            args=(lhs_orig, rhs_orig),
+        )
+        matmul_node.meta["val"] = output_view.meta["val"]
+        copy_fx_custom_meta(node, matmul_node)
 
-    # Update bmm output shape metadata
-    node.meta["val"] = output_view.meta["val"]
-
-    # Replace all uses of the output view with the bmm itself
-    output_view.replace_all_uses_with(node)
+    # Replace all uses of the output view with the new matmul
+    output_view.replace_all_uses_with(matmul_node)
+    node.replace_all_uses_with(matmul_node)
     graph.erase_node(output_view)
+    graph.erase_node(node)
 
     # Clean up dead reshape nodes
     for reshape_node in (lhs_reshape, rhs_reshape):
@@ -245,6 +370,8 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
     Replace constant arguments to any operation with spyre.constant node.
     Scalar constants are converted to size=1 tensor and passed to the corresponding
     operations which was consuming the scalar value at lowering.
+    Deduplication of identical constants happens later at the IR level via
+    dedup_and_promote_constants.
     """
 
     ops_support_list = [
@@ -253,50 +380,39 @@ def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
         torch.ops.aten.mul.Tensor,
         torch.ops.aten.true_divide.Tensor,
         torch.ops.aten.div.Tensor,
+        torch.ops.aten.eq.Tensor,
+        torch.ops.aten.eq.Scalar,
     ]
-
-    # Created node cache for scalar values, and reuse the node when
-    # the scalar found again.
-    const_node_map: dict[int | float, torch.fx.node.Node] = {}
 
     for node in graph.nodes:
         if node.target not in ops_support_list:
             continue
-        scalar_indexes = []
-        for i in range(len(node.args)):
-            in_arg = node.args[i]
-            if not isinstance(in_arg, torch.fx.node.Node):
-                if isinstance(in_arg, (int, float)):
-                    scalar_indexes.append(i)
-                else:
-                    logger.warning(f"Warning: unhandled node type {type(in_arg)}")
-
-        if len(scalar_indexes) > 0:
-            for idx in scalar_indexes:
-                scalar_val = node.args[idx]
-
-                with graph.inserting_before(node):
-                    if scalar_val in const_node_map:
-                        const_node = const_node_map[scalar_val]
-                    else:
-                        # Currently the dtype of the scalar tensor is set as same as the output dtype.
-                        # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
-                        # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
-                        dtype = torch.float16
-                        meta = node.meta.get("tensor_meta", None)
-                        if meta:
-                            dtype = meta.dtype
-                        node_name = "py_const"
-                        node_args = [scalar_val, dtype, torch.device("spyre")]
-                        const_node = graph.create_node(
-                            "call_function",
-                            torch.ops.spyre.constant.default,
-                            tuple(node_args),
-                            {},
-                            node_name,
-                            node.type,
-                        )
-                        const_node_map[scalar_val] = const_node
-                    node.update_arg(idx, const_node)
+        for idx, in_arg in enumerate(node.args):
+            if isinstance(in_arg, torch.fx.node.Node):
+                continue
+            if not isinstance(in_arg, (int, float)):
+                logger.warning(f"Warning: unhandled node type {type(in_arg)}")
+                continue
+            # Use the dtype of the tensor operand, not the output dtype.
+            # For comparison ops like eq, the output is bool but the constant
+            # must match the input tensor's dtype
+            dtype = torch.float16
+            for other_arg in node.args:
+                if isinstance(other_arg, torch.fx.node.Node):
+                    other_meta = other_arg.meta.get("tensor_meta", None)
+                    if other_meta is not None:
+                        dtype = other_meta.dtype
+                        break
+            with graph.inserting_before(node):
+                const_node = graph.create_node(
+                    "call_function",
+                    torch.ops.spyre.constant.default,
+                    (in_arg, dtype, torch.device("spyre")),
+                    {},
+                    "py_const",
+                    node.type,
+                )
+            copy_fx_custom_meta(node, const_node)
+            node.update_arg(idx, const_node)
 
     graph.lint()

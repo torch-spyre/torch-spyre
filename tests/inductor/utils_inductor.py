@@ -14,6 +14,7 @@
 
 import copy
 import functools
+import hashlib
 import torch
 import os
 import pytest
@@ -23,6 +24,19 @@ import unittest
 DEVICE = torch.device("spyre")
 
 
+def _make_generator(*args) -> torch.Generator:
+    """Return a seeded Generator whose seed is a stable hash of ``args``.
+
+    Uses SHA-256 via hashlib so the seed is identical across Python processes
+    regardless of PYTHONHASHSEED (unlike the built-in ``hash()``).
+    """
+    key = repr(args).encode()
+    seed = int(hashlib.sha256(key).hexdigest()[:8], 16)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    return gen
+
+
 # shape is a tuple of integers representing dimension of the tensor
 # to avoid using the same cached tensor of the same shape, add a unique
 # differentiation argument
@@ -30,7 +44,8 @@ DEVICE = torch.device("spyre")
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
-    out = torch.randn(shape, dtype=dtype) * scale
+    gen = _make_generator(shape, differentiation, abs, dtype, scale)
+    out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
 
 
@@ -40,8 +55,9 @@ def cached_xavier(
     differentiation=None,
     dtype=torch.float16,
 ):
+    gen = _make_generator(shape, differentiation, dtype)
     out = torch.empty(shape, dtype=dtype)
-    torch.nn.init.xavier_uniform_(out)
+    torch.nn.init.xavier_uniform_(out, generator=gen)
     return out
 
 
@@ -76,7 +92,9 @@ def unique_randn_along_dim(
         min_val: Minimum value in the range
         max_val: Maximum value in the range
         dtype: Target data type (torch.float16, torch.float32, or integer types)
-        seed: Random seed for reproducibility
+        seed: Optional integer seed. When given, the generator is seeded with
+            this value. When omitted, a stable seed is derived from the other
+            arguments via SHA-256 so results are identical across processes.
         warn_precision: If True, warn about potential float16 precision issues
 
     Returns:
@@ -108,7 +126,10 @@ def unique_randn_along_dim(
     """
 
     if seed is not None:
-        torch.random.manual_seed(seed)
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+    else:
+        gen = _make_generator(shape, dim, min_val, max_val, dtype)
 
     # Check if dtype is an integer type
     is_integer_dtype = dtype in (
@@ -166,10 +187,12 @@ def unique_randn_along_dim(
         # Generate globally unique values
         intermediate_dtype = torch.int64 if is_integer_dtype else torch.float32
         if is_integer_dtype:
-            unique_vals = torch.randperm(unique_size, dtype=torch.int64)
+            unique_vals = torch.randperm(unique_size, dtype=torch.int64, generator=gen)
             scaled = min_val + (unique_vals * value_range) // unique_size
         else:
-            unique_vals = torch.randperm(unique_size, dtype=torch.float32)
+            unique_vals = torch.randperm(
+                unique_size, dtype=torch.float32, generator=gen
+            )
             scaled = min_val + (unique_vals / unique_size) * value_range
 
         # Reshape to target shape and convert to target dtype
@@ -247,10 +270,14 @@ def unique_randn_along_dim(
             # Generate unique values
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
 
             # Compute multi-dimensional index for this slice
@@ -270,10 +297,14 @@ def unique_randn_along_dim(
         for i in range(num_slices):
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
 
@@ -290,10 +321,14 @@ def unique_randn_along_dim(
         for i in range(num_slices):
             if is_integer_dtype:
                 # For integers, generate unique integers in range
-                unique_ints = torch.randperm(unique_size, dtype=torch.int64)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.int64, generator=gen
+                )
                 scaled = min_val + (unique_ints * value_range) // unique_size
             else:
-                unique_ints = torch.randperm(unique_size, dtype=torch.float32)
+                unique_ints = torch.randperm(
+                    unique_size, dtype=torch.float32, generator=gen
+                )
                 scaled = min_val + (unique_ints / unique_size) * value_range
             result_flat[i] = scaled
         # Reshape and permute back
@@ -593,6 +628,7 @@ def compare_with_cpu(
     run_eager=True,
     run_compile=True,
     source_check=None,
+    clone_inputs=False,
 ):
     """Compare Spyre execution against CPU for one or both Spyre execution paths.
 
@@ -618,7 +654,12 @@ def compare_with_cpu(
         # if this env var is set at all, it gets marked as true
         cpu_compile = bool(os.getenv("TEST_COMPARE_CPU_COMPILE"))
 
-    cpu_result = fn(*args)
+    def get_args():
+        if not clone_inputs:
+            return args
+        return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
+
+    cpu_result = fn(*get_args())
 
     # Order: compiled first, then eager (matches prior [True, False] when both on).
     modes = tuple(
@@ -636,7 +677,7 @@ def compare_with_cpu(
             if target is not None
             else _compile_and_run(
                 fn,
-                args,
+                get_args(),
                 DEVICE,
                 needs_device=needs_device,
                 compile=compiled,
@@ -650,7 +691,7 @@ def compare_with_cpu(
 
         if cpu_compile:
             cpu_other_result = _compile_and_run(
-                fn, args, "cpu", needs_device=needs_device, compile=compiled
+                fn, get_args(), "cpu", needs_device=needs_device, compile=True
             )
             _assert_results_close(
                 spyre_result,
@@ -669,7 +710,7 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
 
 
-def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):  # noqa: B902
+def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
     for name, value in my_cls.__dict__.items():
         if name.startswith("test_"):
             # You cannot copy functions in Python, so we use closures here to
@@ -691,6 +732,16 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None): 
                 new_test = skip_func(new_test)
 
             setattr(other_cls, f"{name}_{suffix}", new_test)
+
+    # Copy helper routines that copied tests may call on self.
+    for name in dir(my_cls):
+        value = getattr(my_cls, name)
+        if (
+            name.startswith("_get_")
+            and callable(value)
+            and not hasattr(other_cls, name)
+        ):
+            setattr(other_cls, name, value)
 
     # Special case convenience routine
     if hasattr(my_cls, "is_dtype_supported"):

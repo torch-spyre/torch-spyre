@@ -38,4 +38,7 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   std::optional<int64_t> storage_offset_,
                                   SpyreTensorLayout device_layout);
 
+at::Tensor spyre_unfold(const at::Tensor& self, int64_t dimension, int64_t size,
+                        int64_t step);
+
 }  // namespace spyre

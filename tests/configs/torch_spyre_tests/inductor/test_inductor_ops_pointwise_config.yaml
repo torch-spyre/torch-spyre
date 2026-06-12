@@ -1,0 +1,29 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # Covers pointwise ops plus PR 2180 eq-scalar tests, including
+            # parameterized variants, shared base helpers, and standalone cases.
+            - TestOps::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-pointwise
+        - names:
+            # Wrapper methods with broken implementation (call methods without _spyre suffix)
+            # Marked as xfail so they don't cause CI to fail
+            - TestOps::test_scalar_comparison
+            - TestOps::test_eq_scalar_constant_float
+            - TestOps::test_eq_scalar_constant_int
+            - TestOps::test_eq_scalar_constant_large_tensor
+            - TestOps::test_eq_scalar_constant_multidim
+            - TestOps::test_eq_scalar_constant_negative
+            - TestOps::test_eq_scalar_constant_zero
+            - TestOps::test_eq_scalar_multidim
+            - TestOps::test_eq_scalar_vs_tensor_comparison
+          mode: xfail
+          tags:
+            - ops__inductor-pointwise
+
+# Made with Bob

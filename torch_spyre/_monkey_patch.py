@@ -33,6 +33,10 @@ def _patch_tensor_for_spyre():
     if getattr(torch.Tensor, "_spyre_tensor_patched", False):
         return
 
+    from torch.utils._device import _device_constructors
+
+    _device_constructors()  # warm the cache with the original torch.empty
+
     orig_repr = torch.Tensor.__repr__
     orig_to = torch.Tensor.to
     orig_empty = torch.empty
@@ -69,9 +73,37 @@ def _patch_tensor_for_spyre():
             return None
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
-        if (
-            device_layout is None
-        ):  # use original implementation if no layout is provided
+        if device_layout is None:
+            # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in spyre_mem.cpp.
+            # For D2D data casting, split it into a D2H copy and a H2D dtype conversion.
+            _device = kwargs.get("device", None)
+            if (
+                _device is None
+                and len(args) > 0
+                and isinstance(args[0], (str, torch.device))
+            ):
+                _device = args[0]
+            _dtype = kwargs.get("dtype", None)
+            if _dtype is None and len(args) > 1 and isinstance(args[1], torch.dtype):
+                _dtype = args[1]
+
+            if (
+                _device is not None
+                and _dtype is not None
+                and self.device.type == DEVICE_NAME
+                and torch.device(_device).type == DEVICE_NAME
+            ):
+                import warnings
+
+                warnings.warn(
+                    "D2D dtype conversion on Spyre is not directly supported. "
+                    "Using CPU as an intermediate for the cast.",
+                    stacklevel=2,
+                )
+                # Step 1: plain D2H copy (no dtype change)
+                tmp = orig_to(self, "cpu")
+                # Step 2: cast dtype via H2D
+                return orig_to(tmp, _device, dtype=_dtype)
             return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
@@ -134,16 +166,17 @@ def _patch_tensor_for_spyre():
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided
-            return orig_empty(
-                *args,
+            kwargs = dict(
                 out=out,
                 dtype=dtype,
                 layout=layout,
-                device=device,
                 requires_grad=requires_grad,
                 pin_memory=pin_memory,
                 memory_format=memory_format,
             )
+            if device is not None:
+                kwargs["device"] = device
+            return orig_empty(*args, **kwargs)
         else:
             # layout_opt is omitted; c10::Layout has no pybind11 type caster,
             # so py_empty_with_layout drops that parameter and always uses
@@ -201,3 +234,55 @@ def _patch_tensor_for_spyre():
         )
 
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
+    # ───────────────────FxGraph Cache Key Extension ───────────────────
+    # Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key
+    # preventing incorrect disk cache hits across process boundaries.
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_fx_graph_hash()
+
+
+def _patch_fx_graph_hash():
+    """
+    Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key.
+    """
+    import torch
+    from torch._inductor.codecache import FxGraphHashDetails
+    from torch._inductor.virtualized import V
+
+    if getattr(FxGraphHashDetails, "_spyre_hash_patched", False):
+        return
+
+    original_init = FxGraphHashDetails.__init__
+
+    def _spyre_init(self, gm, example_inputs, fx_kwargs, inputs_to_check):
+        # run original first — populates all standard hash fields
+        original_init(self, gm, example_inputs, fx_kwargs, inputs_to_check)
+
+        # V.get_real_inputs() returns real Spyre tensors with SpyreTensorLayout
+        # before they become FakeTensors (which have no layout by design)
+
+        try:
+            real_inputs = V.get_real_inputs()
+        except RuntimeError:
+            return
+
+        # extract layout from real tensors, fallback to example_inputs
+        spyre_layouts = []
+        # Use real_inputs only if it's a valid list/tuple, otherwise use example_inputs
+        inputs_to_use = (
+            real_inputs if isinstance(real_inputs, (list, tuple)) else example_inputs
+        )
+
+        for inp in inputs_to_use:
+            if isinstance(inp, torch.Tensor):
+                layout = inp.device_tensor_layout()
+                spyre_layouts.append(layout)
+            else:
+                spyre_layouts.append(None)
+
+        # self.spyre_layouts added as field on FxGraphHashDetails
+        # PyTorch pickles ALL fields → spyre_layouts automatically in hash
+        self.spyre_layouts = spyre_layouts
+
+    FxGraphHashDetails.__init__ = _spyre_init
+    FxGraphHashDetails._spyre_hash_patched = True

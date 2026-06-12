@@ -25,6 +25,10 @@
 #include "spyre_kernel.h"
 
 namespace spyre {
+
+// Forward declaration
+struct JobPlan;
+
 class SpyreStream {
  private:
   c10::Stream stream_;
@@ -47,6 +51,8 @@ class SpyreStream {
                         const flex::CompositeAddress* device_address) const;
   void executeProgramAsync(const KernelArtifacts& arts,
                            const std::vector<at::Tensor>& args) const;
+
+  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
 
   // Conversions
   c10::Stream unwrap() const;
@@ -81,6 +87,16 @@ SpyreStream getStreamFromPool(
  * @return The default SpyreStream (stream ID 0)
  */
 SpyreStream getDefaultStream(
+    c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+/**
+ * Get the Flex-level default stream for a device.
+ * The default stream is stream ID 0 and is always available.
+ *
+ * @param device Device to get default stream for
+ * @return The default Flex RuntimeStream (stream ID 0)
+ */
+flex::RuntimeStream* getDefaultStreamRuntimeHandle(
     c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
 
 /**

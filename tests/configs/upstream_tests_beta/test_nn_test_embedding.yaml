@@ -27,3 +27,12 @@ test_suite_config:
             - TestEmbeddingNN::test_embeddingbag_include_last_offset
             - TestEmbeddingNN::test_move_sparse_half_embedding
           mode: mandatory_success
+  global:
+    supported_dtypes:
+      - name: float16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: int64
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bfloat16
+        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+

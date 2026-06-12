@@ -23,6 +23,10 @@ from torch._inductor.utils import (
 
 
 class TestSpyreConfig(InductorTestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     def test_config_default(self):
         fn = torch.abs
         x = torch.randn((256, 128, 512)).to("spyre")
@@ -78,5 +82,4 @@ class TestSpyreConfig(InductorTestCase):
     #
     #    comp_fn = torch.compile(fn)
     #    out, source_codes = run_and_get_code(comp_fn, x)
-    #    #print(f"lx_planning {config.lx_planning}")
     #    #print(source_codes[0])

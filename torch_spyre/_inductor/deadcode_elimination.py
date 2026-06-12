@@ -18,6 +18,7 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
     Operation,
 )
+from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 
 
@@ -67,19 +68,20 @@ def _has_side_effects(op: Operation) -> bool:
     return False
 
 
-def deadcode_elimination(operations: list[Operation]) -> None:
+def deadcode_elimination(graph: GraphLowering) -> None:
     """Remove dead operations from the list in-place, mirroring the
     scheduler's dead_node_elimination but running at pre-scheduler time.
 
     An operation is dead if none of its output buffers are transitively
     needed by the graph outputs and it has no side effects.  Dead output
-    buffer names are added to V.graph.removed_buffers so that downstream
+    buffer names are added to graph.removed_buffers so that downstream
     codegen skips them.
 
     Operations are expected to be in topological order.  The list is
     modified in-place; the relative order of surviving operations is
     preserved.
     """
+    operations = graph.operations
     live_ops = live_operations(operations)
 
     dead: list[Operation] = []
@@ -91,5 +93,5 @@ def deadcode_elimination(operations: list[Operation]) -> None:
     for op in dead:
         rw = op.get_read_writes()
         for dep in rw.writes:
-            V.graph.removed_buffers.add(dep.name)
+            graph.removed_buffers.add(dep.name)
         operations.remove(op)

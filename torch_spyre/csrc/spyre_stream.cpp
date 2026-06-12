@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "flex/flex.hpp"
+#include "job_plan.h"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
@@ -111,7 +112,7 @@ bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
   DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            device().index());
+            static_cast<int>(device().index()));
 
   flex::RuntimeStream* handle = getRuntimeHandle();
   return handle->query();
@@ -121,7 +122,7 @@ void SpyreStream::synchronize() const {
   c10::DeviceGuard guard(stream_.device());
 
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            device().index());
+            static_cast<int>(device().index()));
 
   flex::RuntimeStream* handle = getRuntimeHandle();
   handle->synchronize();
@@ -142,12 +143,6 @@ void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
   DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
   DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
-
-  // TODO(tmhoangt): add type conversion node
-  // Type checking - no type conversion support yet
-  TORCH_CHECK(
-      src.scalar_type() == dst.scalar_type(),
-      "Spyre backend does not support type conversion yet during copy.");
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
@@ -240,6 +235,32 @@ void SpyreStream::executeProgramAsync(
   flex_stream->launchOperation(compute_op);
 }
 
+void SpyreStream::launch(const JobPlan& plan,
+                         const std::vector<at::Tensor>& args) const {
+  // Validate all tensors are on Spyre device
+  for (size_t i = 0; i < args.size(); ++i) {
+    TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
+                " must be on Spyre device, got ", args[i].device());
+  }
+
+  // Create launch context with tensor arguments
+  LaunchContext ctx{args};
+
+  // Construct RuntimeOperations from each JobPlanStep
+  std::vector<std::unique_ptr<flex::RuntimeOperation>> operations;
+  operations.reserve(plan.steps.size());
+
+  for (const auto& step : plan.steps) {
+    operations.push_back(step->construct(ctx));
+  }
+
+  // Get the flex runtime stream handle
+  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+
+  // Submit all operations to the stream
+  flex_stream->launchOperation(operations);
+}
+
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
@@ -278,6 +299,21 @@ SpyreStream getDefaultStream(c10::Device device) {
   }
   initializeStreamPool(device.index());
   return SpyreStream(c10::Stream(c10::Stream::DEFAULT, device));
+}
+
+flex::RuntimeStream* getDefaultStreamRuntimeHandle(c10::Device device) {
+  if (device.index() == -1) {
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
+  }
+  initializeStreamPool(device.index());
+
+  auto& pool = getStreamPool();
+  std::lock_guard<std::mutex> lock(pool.mutex);
+  auto it = pool.stream_handle_map.find(0);
+  TORCH_CHECK(it != pool.stream_handle_map.end(),
+              "Default stream handle not initialized for device ",
+              device.index());
+  return it->second;
 }
 
 SpyreStream getCurrentStream(c10::Device device) {
