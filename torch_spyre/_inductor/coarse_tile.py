@@ -338,17 +338,17 @@ def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> b
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
     """Raise RuntimeError for Reduction tiling configurations not yet implemented.
 
-    Supported (Stage 1):
+    Supported:
       - A single level that tiles only a non-stick reduction dim.
       - A single level that tiles the K (reduction) dim of a BATCH_MATMUL_OP.
         K is the stick dim for operand x, but each tile's output is a full
         [M, N] matrix so no partial-stick sparsity occurs.
+      - Multiple nesting levels where outer level(s) tile output dims and the
+        innermost level tiles a reduction dim (e.g. outer M + inner K for mm).
 
-    Deferred to Stage 2 (raises):
+    Deferred (raises RuntimeError):
       - Reduction tiling on the stick dimension (except BATCH_MATMUL_OP above).
       - Mixed output+reduction tiling at the same nesting level.
-      - Multiple nesting levels where both output-dim and reduction-dim levels
-        appear (e.g. outer tiles output dim, inner tiles reduction dim).
       - Multiple reduction range indices tiled at one level.
     """
     data = op.data
@@ -364,16 +364,6 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
     n = max(len(tiled_dims), len(tiled_rdims))
     tiled_dims_padded = tiled_dims + [[]] * (n - len(tiled_dims))
     tiled_rdims_padded = tiled_rdims + [[]] * (n - len(tiled_rdims))
-
-    has_out_levels = any(d for d in tiled_dims_padded)
-    has_red_levels = any(d for d in tiled_rdims_padded)
-    if has_out_levels and has_red_levels:
-        raise RuntimeError(
-            f"coarse_tile: op {op.get_name()!r} has output-dim tiling levels "
-            f"{tiled_dims} and reduction-dim tiling levels {tiled_rdims} "
-            "across different nesting levels (mixed nested output+reduction "
-            "tiling is not yet implemented — Stage 2)."
-        )
 
     for i, (out_dims, red_dims) in enumerate(
         zip(tiled_dims_padded, tiled_rdims_padded)
