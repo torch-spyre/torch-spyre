@@ -15,6 +15,12 @@ on:
         required: false
         type: string
         default: ''
+      pr_url_hash:
+        description: |
+          Hash of the full URL of the PR that triggered this run.
+          Required when triggered by an external PR.
+        required: true
+        type: string
       rpm_location:
         description: The Artifactory location where to download the RPM from
         required: false
@@ -32,7 +38,8 @@ on:
         default: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
+    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
   cancel-in-progress: true
 
 permissions:
