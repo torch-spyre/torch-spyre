@@ -19,7 +19,6 @@ import itertools
 from sympy import Expr, Integer, Symbol, divisors
 from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
-import torch
 from torch._inductor.ir import (
     ComputedBuffer,
     ExternKernel,
@@ -57,9 +56,6 @@ logger = get_inductor_logger("work_division")
 
 # Maximum memory access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
-
-aten = torch.ops.aten
-spyreop = torch.ops.spyre
 
 
 @dataclasses.dataclass
@@ -133,7 +129,7 @@ def multi_dim_iteration_space_split(
         # Sanity check: making sure that reduction_dims list is cleared up if
         #               any reduction dim is already selected during span reduction
         assert (
-            not is_reduction_included  # not empty
+            not is_reduction_included  # empty
             or not any(v in min_splits for v in reduction_dims)  # no overlap
         )
 
@@ -306,6 +302,8 @@ def must_split_vars(
 
     Returns a dict mapping Symbol -> number of slices.
     """
+    # TODO: use compute_max_size(...) / compute_granularity(...) from pass_utils.py
+    # for symbolic path. Refer to #2287 for details.
     accumulated_splits: dict[Symbol, int] = {}
 
     for td in tensor_deps:
@@ -318,12 +316,12 @@ def must_split_vars(
             # undefined.  Span filtering here is a structural decision that
             # needs a concrete answer.
             # TODO(issue#1372): Symbolic work division will keep this symbolic.
-            vars = [
+            split_vars = [
                 v
                 for v in coord.free_symbols
                 if concretize_expr(it_space_orig.get(v, 1)) > 1
             ]
-            if not vars:
+            if not split_vars:
                 continue
 
             def valid_splits(v: Symbol) -> list[int]:
@@ -337,9 +335,9 @@ def must_split_vars(
                     if s >= current_min
                 ]
 
-            var_divisors = [valid_splits(v) for v in vars]
+            var_divisors = [valid_splits(v) for v in split_vars]
 
-            for v, candidates in zip(vars, var_divisors):
+            for v, candidates in zip(split_vars, var_divisors):
                 if not candidates:
                     raise Unsupported(
                         f"No valid split for variable {v} "
@@ -360,7 +358,7 @@ def must_split_vars(
 
             for combo in itertools.product(*var_divisors):
                 trial = dict(accumulated_splits)
-                for v, s in zip(vars, combo):
+                for v, s in zip(split_vars, combo):
                     trial[v] = s
 
                 if math.prod(trial.values()) > max_cores:
@@ -387,7 +385,7 @@ def must_split_vars(
                 break
 
             best_span, best_combo = best
-            for v, s in zip(vars, best_combo):
+            for v, s in zip(split_vars, best_combo):
                 accumulated_splits[v] = s
 
             if best_span <= MAX_SPAN_BYTES:
