@@ -816,14 +816,21 @@ def _propagate_tiled_reduction_op(
     """Handle buffer propagation for a Reduction op tiled over a reduction dim.
 
     Strategy: fill-initialize + per-tile combine.
-      1. Allocate a HBM accumulation buffer the size of the full output shape.
-      2. Insert a fill op (outside the loop) that writes the reduction's identity
-         value into the accumulation buffer.
-      3. Insert a combine op (inside the loop) that merges each tile's partial
-         result into the accumulation buffer using the reduction's combining fn.
-      4. Mark the tiled reduction op's output as per_tile_fixed (loop-internal
-         scratch, not advanced between iterations).
-      5. Patch outside consumers and graph outputs to read the accumulation buffer.
+      1. Allocate a HBM accumulation buffer sized to op.data.ranges (the
+         per-outer-tile output shape, already divided by any outer tiling).
+      2. Insert a fill op that writes the reduction's identity value into the
+         accumulation buffer.  For flat reduction tiling the fill has no
+         loop_info and runs before all loops.  For nested tiling (outer
+         output-dim loop + inner reduction loop) the fill carries the outer
+         loop's loop_info so it runs inside the outer loop — once per outer
+         tile — keeping the accumulator sized to the per-tile output shape.
+      3. Insert a combine op (inside the inner loop, same loop_info as the
+         tiled reduction op) that merges each tile's partial result into the
+         accumulation buffer using the reduction's combining fn.
+      4. Mark the tiled reduction op's output as per_tile_fixed (inner-loop
+         scratch, not advanced between inner iterations).
+      5. Patch outside consumers and graph outputs to read the accumulation
+         buffer.
     """
     loop_info = op.loop_info
     loop_group_id = loop_info.loop_group_id
@@ -884,7 +891,10 @@ def _propagate_tiled_reduction_op(
     )
     fill_buf.origins = op.origins
     fill_buf.operation_name = fill_name
-    # No loop_info: fill runs once, before the loop.
+    fill_loop_info = _compute_fill_loop_info(op)
+    if fill_loop_info is not None:
+        fill_buf.loop_info = fill_loop_info  # type: ignore[attr-defined]
+    # else: no loop_info — fill runs once before all loops (flat reduction case).
     V.graph.name_to_buffer[fill_name] = fill_buf
     accum_idx = operations.index(accum_buf)
     # scalar_op was appended to graph.operations by register_operation(); move it

@@ -1995,6 +1995,43 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
         # output-dim-only tiling should not raise
         _validate_reduction_tiling(op)
 
+    def test_nested_fill_gets_outer_loop_info(self):
+        """Fill op gets outer-level loop_info for nested output+reduction tiling."""
+        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(64)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        fill_info = _compute_fill_loop_info(op)
+        self.assertIsNotNone(fill_info)
+        self.assertEqual(fill_info.loop_group_id, (0,))
+        self.assertEqual(fill_info.loop_count, [Integer(2)])
+        self.assertEqual(fill_info.loop_tiled_dims, [[0]])
+
+    def test_flat_fill_has_no_loop_info(self):
+        """Fill op gets no loop_info for flat (pure) reduction tiling."""
+        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[0]]
+        fill_info = _compute_fill_loop_info(op)
+        self.assertIsNone(fill_info)
+
 
 class TestComputeFillLoopInfo(unittest.TestCase):
     """_compute_fill_loop_info returns trimmed CoarseTileInfo for the fill op."""
