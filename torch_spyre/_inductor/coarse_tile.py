@@ -816,8 +816,11 @@ def _propagate_tiled_reduction_op(
     """Handle buffer propagation for a Reduction op tiled over a reduction dim.
 
     Strategy: fill-initialize + per-tile combine.
-      1. Allocate a HBM accumulation buffer sized to op.data.ranges (the
-         per-outer-tile output shape, already divided by any outer tiling).
+      1. Allocate a HBM accumulation buffer sized to the full
+         (pre-outer-division) output shape (_compute_full_ranges), so that
+         address advancement across outer tiles writes each tile into the
+         correct slice.  For flat (reduction-only) tiling this equals
+         op.data.ranges.
       2. Insert a fill op that writes the reduction's identity value into the
          accumulation buffer.  For flat reduction tiling the fill has no
          loop_info and runs before all loops.  For nested tiling (outer
@@ -837,10 +840,14 @@ def _propagate_tiled_reduction_op(
     reduction_type = op.data.reduction_type
     identity = _reduction_identity_value(reduction_type, op.get_dtype())
 
-    # Accumulation buffer has the full output shape.  For reduction-dim-only
-    # tiling, data.ranges is already the full output shape (only
-    # reduction_ranges was divided, not ranges).
-    full_output_ranges = list(op.data.ranges)
+    # Per-outer-tile output shape (ranges after any outer tiling divided them).
+    per_tile_ranges = list(op.data.ranges)
+
+    # Accumulation buffer uses the full (pre-outer-division) output shape so
+    # that address advancement across outer output-dim tiles writes each tile's
+    # result into the correct slice.  For reduction-dim-only tiling there is no
+    # outer division, so full == per-tile.
+    full_output_ranges = _compute_full_ranges(op)
 
     # Insert HBM buffer before the first op in the loop group.
     outer_key = loop_group_id[0]
@@ -881,7 +888,7 @@ def _propagate_tiled_reduction_op(
         device=device,
         dtype=dtype,
         inner_fn=lambda index, _loader=scalar_loader: _loader([]),
-        ranges=full_output_ranges,
+        ranges=per_tile_ranges,
     )
     fill_name = V.graph.qualify_name(f"coarse_tile_fill_{op.get_name()}")
     fill_buf = ComputedBuffer(

@@ -1294,5 +1294,107 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
 
+class TestCoarseTileNestedReductionE2E(InductorTestCase):
+    """Correctness and LoopSpec tests for nested output-dim + reduction-dim tiling.
+
+    Pattern: outer loop tiles an output dim, inner loop tiles a reduction dim.
+    The fill op runs inside the outer loop (once per outer tile), so the
+    accumulator is per-outer-tile sized.  The full output buffer spans all outer
+    tiles; address advancement across outer iterations assembles the result.
+
+    mm shapes: M=128, K=512, N=32; outer tiles M by 2 (64 rows/tile),
+    inner tiles K by 4 (128 elements/tile = 2 sticks at fp16).
+    bmm shapes: Batch=8, M=64, K=512, N=32; outer tiles Batch by 2,
+    inner tiles K by 4.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xCAFE)
+        # Reset the named-dims registry to prevent WeakIdKeyDict aliasing
+        # with device tensors created in earlier tests.  Dims are re-declared
+        # in each test body, so this is safe.
+        _pnd.reset()
+
+    @config.patch({"lx_planning": False})
+    def test_nested_bmm_outer_Batch_inner_K_correct(self):
+        """bmm [Batch,M,K]@[Batch,K,N] outer Batch (output) + inner K (reduction) — correct."""
+        from torch_spyre._inductor import spyre_hint
+
+        # Use Batch=4 (distinct from the K-tiling tests that use B=8) to avoid
+        # any WeakIdKeyDict aliasing when named-dim annotations are looked up.
+        Batch, M, K, N = 4, 64, 512, 32
+        a = torch.randn(Batch, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(Batch, K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("Batch", Batch)
+        _declare_tensor_dim("M2", M)
+        _declare_tensor_dim("K2", K)
+        _declare_tensor_dim("N2", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["Batch", "M2", "K2"])
+            _name_tensor_dims(b, ["Batch", "K2", "N2"])
+            with spyre_hint(num_tiles_per_dim={"Batch": 2}):
+                with spyre_hint(num_tiles_per_dim={"K2": 4}):
+                    return torch.bmm(a, b)
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    @config.patch({"lx_planning": False})
+    def test_nested_matmul_outer_M_inner_K_correct(self):
+        """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["M", "K"])
+            _name_tensor_dims(b, ["K", "N"])
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    @config.patch({"lx_planning": False})
+    def test_nested_matmul_outer_M_inner_K_loopspec(self):
+        """Nested mm produces two LoopSpec levels (outer count 2, inner count 4)."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for nested mm")
+        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
+        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
+
+
 if __name__ == "__main__":
     unittest.main()
