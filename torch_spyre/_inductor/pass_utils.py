@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Optional, TypeVar, Union
 
@@ -35,6 +36,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
+from . import config
 from .codegen.superdsc import (
     _get_core_to_slice_mapping,
     _k_fast_core_to_slice_mapping,
@@ -46,6 +48,8 @@ from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
 
+# PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
+_SHAPE_ENV_DEFAULT_LOWER = 2
 logger = get_inductor_logger("pass_utils")
 
 
@@ -96,6 +100,125 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     return int(expr)
 
 
+def _user_min_or_none(expr: Expr) -> Optional[int]:
+    """Return the user-supplied ``mark_dynamic(min=...)``, or ``None``.
+
+    PyTorch initialises the lower bound for size symbols to 2 (sizes 0
+    and 1 are specialised), so a recorded lower bound of 2 is
+    indistinguishable from "user did not pass min". We treat
+    ``lower == 2`` as "no min provided".
+
+    Known limitation: a user who legitimately passes
+    ``mark_dynamic(min=2, max=...)`` will be silently treated as if
+    they had not passed min at all. The call site in
+    ``compute_granularity`` will then take the default-divisor branch
+    (and emit the "defaulting granularity to ..." warning) instead of
+    honouring the user value. There is no way to disambiguate the two
+    cases from the ShapeEnv alone -- resolving this needs PyTorch to
+    expose the user-provided min separately from the bound. See #2284
+    for the design discussion.
+    """
+    vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    if not isinstance(vr.lower, sympy.Integer):
+        return None
+    lower = int(vr.lower)
+    # min=2 collides with PyTorch's default lower bound and is treated
+    # as "unset" here
+    return None if lower == _SHAPE_ENV_DEFAULT_LOWER else lower
+
+
+def _finite_upper_or_none(expr: Expr) -> Optional[int]:
+    """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
+    A bound is usable iff it is a positive concrete
+    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
+    values all return ``None``.
+    """
+    vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
+        return int(vr.upper)
+    return None
+
+
+def compute_granularity(expr: Expr, max_size: int) -> int:
+    """Return the granularity for a symbolic dimension.
+
+    Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
+    user passed ``mark_dynamic(min=...)`` we honour it after validation;
+    otherwise we pick the smallest divisor of ``max_size`` that
+    satisfies ``config.max_buckets`` and ``config.min_default_granularity``.
+
+    Callers must only invoke this for symbolic ``expr``. See #2284,
+    #2287, #2288, #2289 for the full design.
+
+    Wiring: this helper has no call sites yet. The pointwise
+    work-division PR (#2499) will plug it into the ``size_hint`` call
+    sites in ``work_division.py`` and ``codegen/superdsc.py``,
+    alongside ``compute_max_size``.
+
+    Deferred: when the symbolic dim is the stick dim of its tensor the
+    granularity also needs to be a multiple of ``elems_per_stick(dtype)``.
+    Handled in a follow-up once the stick-dim symbolic path is enabled.
+    """
+    assert hasattr(expr, "free_symbols") and expr.free_symbols, (
+        f"compute_granularity called on non-symbolic expr={expr!r}"
+    )
+
+    max_buckets = config.max_buckets
+    min_default_g = config.min_default_granularity
+
+    # When ShapeEnv has no finite upper bound, max_size came from
+    # size_hint (via compute_max_size below, merged in #2003), not from
+    # mark_dynamic(max=...). The granularity is then only as trustworthy
+    # as that hint -- warn the user so they can pin it explicitly with
+    # mark_dynamic(max=...).
+    if _finite_upper_or_none(expr) is None:
+        warnings.warn(
+            f"max for symbolic dim {expr} came from size_hint, not from "
+            f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
+            f"best-effort estimate. Set max explicitly via mark_dynamic to "
+            f"lock the bucket structure.",
+            stacklevel=2,
+        )
+
+    user_min = _user_min_or_none(expr)
+    if user_min is not None:
+        if max_size % user_min != 0:
+            raise Unsupported(
+                f"mark_dynamic(min={user_min}) must divide max={max_size}; "
+                f"got {max_size} % {user_min} = {max_size % user_min}"
+            )
+        if max_size // user_min > max_buckets:
+            raise Unsupported(
+                f"mark_dynamic(min={user_min}) produces {max_size // user_min} "
+                f"buckets, exceeds max_buckets={max_buckets}. Increase min "
+                f"to reduce the bucket count, or raise config.max_buckets."
+            )
+        return user_min
+
+    # No user min: pick the smallest divisor d of max_size where
+    # d >= min_default_g and max_size / d <= max_buckets.
+    for divisor in sorted(sympy.divisors(max_size)):
+        if divisor < min_default_g:
+            continue
+        if max_size // divisor <= max_buckets:
+            warnings.warn(
+                f"mark_dynamic(min=...) not provided for symbolic dim "
+                f"{expr}; defaulting granularity to {divisor} "
+                f"(max={max_size}, {max_size // divisor} buckets). "
+                f"Set min explicitly to override.",
+                stacklevel=2,
+            )
+            return divisor
+
+    # Unreachable for sane inputs: max_size is always a divisor of
+    # itself and gives 1 bucket, so the loop above always finds a hit.
+    # Kept as a defensive raise.
+    raise Unsupported(
+        f"No valid granularity for max={max_size} under "
+        f"max_buckets={max_buckets}, min_default_granularity={min_default_g}"
+    )
+
+
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
@@ -143,10 +266,9 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
         return int(expr)
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return int(expr)
-    shape_env = V.graph.sizevars.shape_env
-    vr = shape_env.bound_sympy(expr)
-    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
-        return int(vr.upper)
+    bound = _finite_upper_or_none(expr)
+    if bound is not None:
+        return bound
     return V.graph.sizevars.size_hint(expr)
 
 

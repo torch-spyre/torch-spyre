@@ -302,6 +302,8 @@ def must_split_vars(
 
     Returns a dict mapping Symbol -> number of slices.
     """
+    # TODO: use compute_max_size(...) / compute_granularity(...) from pass_utils.py
+    # for symbolic path. Refer to #2287 for details.
     accumulated_splits: dict[Symbol, int] = {}
 
     for td in tensor_deps:
