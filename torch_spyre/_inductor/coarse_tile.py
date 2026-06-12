@@ -772,6 +772,43 @@ def _insert_combine_op(
     operations.insert(tiled_idx + 1, combine_buf)
 
 
+def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
+    """Return the loop_info to stamp on the fill op for a nested tiled reduction.
+
+    For a flat (pure reduction) tiling the fill has no loop_info — it runs
+    once before all loops.  Returns None.
+
+    For a nested tiling where outer level(s) tile output dims and the inner
+    level tiles a reduction dim, the fill must run inside the outer loop (once
+    per outer tile) so the accumulator is per-outer-tile sized.  Returns a
+    CoarseTileInfo covering only the outer output-dim levels.
+    """
+    loop_info = op.loop_info
+    tiled_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
+
+    outer_counts: list[sympy.Expr] = []
+    outer_tiled_dims: list[list[int]] = []
+    outer_tiled_rdims: list[list[int]] = []
+    for dims, rdims, count in zip(
+        loop_info.loop_tiled_dims, tiled_rdims, loop_info.loop_count
+    ):
+        if dims:  # non-empty output-dim list → this is an output-dim level
+            outer_counts.append(count)
+            outer_tiled_dims.append(dims)
+            outer_tiled_rdims.append([])
+
+    if not outer_counts:
+        return None  # flat: fill runs before all loops
+
+    outer_gid = loop_info.loop_group_id[: len(outer_counts)]
+    return CoarseTileInfo(
+        loop_group_id=outer_gid,
+        loop_count=outer_counts,
+        loop_tiled_dims=outer_tiled_dims,
+        loop_tiled_reduction_dims=outer_tiled_rdims,
+    )
+
+
 def _propagate_tiled_reduction_op(
     op: ComputedBuffer,
     operations: list[Operation],
