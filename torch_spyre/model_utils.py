@@ -253,8 +253,6 @@ def patch_module_to_for_spyre() -> None:
                     break
         return load_model_to_spyre(self, dtype=dtype)
 
-    _spyre_module_to._spyre_patched = True
-    nn.Module.to = _spyre_module_to
-    logger.info(
-        "Patched nn.Module.to() for automatic Spyre weight layout " "optimization"
-    )
+    _spyre_module_to._spyre_patched = True  # type: ignore[attr-defined]
+    nn.Module.to = _spyre_module_to  # type: ignore[method-assign]
+    logger.info("Patched nn.Module.to() for automatic Spyre weight layout optimization")
