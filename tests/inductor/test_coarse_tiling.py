@@ -67,7 +67,12 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
-from torch_spyre._inductor.coarse_tile import coarse_tile, _divide_ranges
+from torch_spyre._inductor.coarse_tile import (
+    _LOOPS_FREE_SYMS_KEY,
+    _REDUCTION_FREE_SYMS_KEY,
+    _divide_ranges,
+    coarse_tile,
+)
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.scheduler import (
     CountedLoopSchedulerNode,
@@ -631,6 +636,57 @@ class TestDivideRanges(unittest.TestCase):
 
         op = _make_op(MagicMock(spec=Operation))
         _divide_ranges(op, Integer(4), tiled_dims=[0])
+
+    def test_cache_invalidated_after_divide_pointwise(self):
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        N = sympy.Symbol("N", positive=True)
+        pw = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda index: sympy.Integer(1),
+            ranges=[N, Integer(32)],
+        )
+        layout = FixedLayout(torch.device("cpu"), torch.float16, [N, Integer(32)])
+        op = ComputedBuffer(name="buf0", layout=layout, data=pw)
+
+        pw.get_free_symbol_uses()  # prime the cache
+        self.assertTrue(hasattr(pw, _LOOPS_FREE_SYMS_KEY))
+
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+
+        self.assertFalse(hasattr(pw, _LOOPS_FREE_SYMS_KEY))
+
+    def test_cache_invalidated_after_divide_reduction(self):
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Reduction,
+            ReductionHint,
+        )
+
+        N = sympy.Symbol("N", positive=True)
+        red = Reduction(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda index, rindex: sympy.Integer(1),
+            ranges=[N],
+            reduction_ranges=[Integer(128)],
+            reduction_type="sum",
+            src_dtype=torch.float16,
+            reduction_hint=ReductionHint.DEFAULT,
+        )
+        layout = FixedLayout(torch.device("cpu"), torch.float16, [N])
+        op = ComputedBuffer(name="buf0", layout=layout, data=red)
+
+        red.get_free_symbol_uses()  # prime both Loops and Reduction cache entries
+        self.assertTrue(hasattr(red, _LOOPS_FREE_SYMS_KEY))
+        self.assertTrue(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
+
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+
+        self.assertFalse(hasattr(red, _LOOPS_FREE_SYMS_KEY))
+        self.assertFalse(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
 
 
 def _mock_op_out_coords(op):
