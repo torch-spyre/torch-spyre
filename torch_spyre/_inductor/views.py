@@ -254,7 +254,18 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
     Handles two cases:
     - coord == v: coord is unbounded, so any expr in v is a subset.
     - coord == Mod(v, b) and expr == Mod(v, a) with a <= b: [0,a-1] ⊆ [0,b-1].
+
+    Both coord and expr can have optional constant offsets, but they must match.
     """
+    if expr.free_symbols == {v} and coord.free_symbols == {v}:
+        # Strip constant offsets if both have them
+        expr_offset = expr.subs(v, 0)
+        coord_offset = coord.subs(v, 0)
+        if expr_offset != coord_offset:
+            return False
+        expr = expr - expr_offset
+        coord = coord - coord_offset
+
     if coord == v:
         return True
     if (

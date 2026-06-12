@@ -299,8 +299,14 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
-    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check if a stick expression is free of constant offsets.
+
+    Returns True for stick expressions with no additive offset:
+    - Mod(var, elems_per_stick) where var is a single symbol
+    - A bare variable (symbol)
+    - Zero
+    """
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
@@ -308,10 +314,28 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    if not (is_supported_mod or is_bare_var or is_zero):
+    return is_supported_mod or is_bare_var or is_zero
+
+
+def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
+    if not isinstance(stick_expr, sympy.Add):
+        return False
+    free_args = [a for a in stick_expr.args if a.free_symbols]
+    return len(free_args) == 1 and is_stick_expr_offset_free(
+        free_args[0], elems_per_stick
+    )
+
+
+def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+    offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
+    has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
+    if not (offset_free or has_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, or 0"
+            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
+            f"with a constant offset"
         )
 
 
@@ -595,10 +619,24 @@ def compute_restickify_needed(
     out_idc = device_coordinates(out_stl, out_dep)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    if stick_compatible([idc, out_idc]):
+    # Input stick with an offset always needs restickify to remove the offset.
+    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
+    if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
-    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
+    target_stick = out_idc[-1]
+
+    if target_stick == sympy.S.Zero and not in_stick_offset_free:
+        # No output dim carries the input's stick var, so compute_restickify_target_layout
+        # would fail to match. Promote the reduction var to the stick dimension so the
+        # restickify removes the offset.
+        reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
+        if reduction_vars:
+            red_var = next(iter(reduction_vars))
+            target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
+    return True, compute_restickify_target_layout(
+        in_stl, in_host, target_stick, ic, idc
+    )
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
