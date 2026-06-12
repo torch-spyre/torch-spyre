@@ -1,0 +1,414 @@
+name: Test matrix (reusable)
+
+# ---------------------------------------------------------------------------
+# Reusable workflow — not triggered directly.
+# Called by tests.yml and tests-nightly.yml.
+#
+# All differences between the two callers are expressed as inputs:
+#   - runner_label      : linux_for_pr_tests (PR) vs linux (nightly)
+#   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
+#   - checkout_pytorch  : false (PR) vs true (nightly)
+#   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
+#   - ref / rpm_*       : forwarded from workflow_dispatch inputs
+# ---------------------------------------------------------------------------
+on:
+  workflow_call:
+    inputs:
+      # Runner pool to use for both test jobs
+      runner_label:
+        description: Runner label appended to the fixed labels (linux_for_pr_tests or linux)
+        required: true
+        type: string
+
+      # Flags appended to every `bash tests/run_test.sh <config>` call
+      extra_test_flags:
+        description: Extra flags passed to run_test.sh (e.g. "-v" or "--cpu-compile -vvv -s")
+        required: true
+        type: string
+
+      # Whether to run checkout-prebuilt-pytorch (nightly only)
+      checkout_pytorch:
+        description: Whether to check out the pre-built PyTorch tree
+        required: false
+        type: boolean
+        default: false
+
+      # TORCH_ROOT value; empty string means the env var is not set
+      torch_root:
+        description: Path to the pre-cloned PyTorch repo (leave empty to omit)
+        required: false
+        type: string
+        default: ''
+
+      # workflow_dispatch pass-throughs
+      ref:
+        description: Branch, tag, or SHA to check out
+        required: false
+        type: string
+        default: ''
+      rpm_location:
+        description: Artifactory location for RPM download
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        description: Space-separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ''
+      build_torch_spyre:
+        description: Whether to re-build torch-spyre after installing the RPM
+        required: false
+        type: boolean
+        default: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: test matrix
+  # ---------------------------------------------------------------------------
+  test:
+    name: ${{ matrix.suite.name }}
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - ${{ inputs.runner_label }}
+      - image_torch_spyre
+    timeout-minutes: 60
+    env:
+      # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
+      # Explicitly clear it.
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # TORCH_ROOT is only set when the caller passes a non-empty value.
+      TORCH_ROOT: ${{ inputs.torch_root }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          # ---- torch_spyre_tests ----
+          - name: Test Device Enum
+            config: torch_spyre_tests/test_device_enum_config.yaml
+          - name: Test Fallbacks
+            config: torch_spyre_tests/test_fallbacks_config.yaml
+          - name: Test Modules
+            config: torch_spyre_tests/test_modules_config.yaml
+          - name: Test Regex
+            config: torch_spyre_tests/test_regex_config.yaml
+          - name: Test Spyre
+            config: torch_spyre_tests/test_spyre_config.yaml
+          - name: Test Execution Trace
+            config: torch_spyre_tests/test_execution_trace_config.yaml
+          - name: Test Spyre Lazy Silent
+            config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
+          - name: Test Stream
+            config: torch_spyre_tests/test_stream_config.yaml
+          - name: Test Spyre Profiler
+            config: torch_spyre_tests/test_spyre_profiler_config.yaml
+          - name: Test Prepare Kernel
+            config: torch_spyre_tests/test_prepare_kernel_config.yaml
+          - name: Test Allocator E2E
+            config: torch_spyre_tests/test_allocator_e2e_config.yaml
+          - name: Test Launch Jobplan
+            config: torch_spyre_tests/test_launch_jobplan_config.yaml
+          # ---- Inductor tests ----
+          - name: Inductor Building Blocks
+            config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
+          - name: Inductor Codegen
+            config: torch_spyre_tests/inductor/test_codegen_config.yaml
+          - name: Inductor Copy Back Elision
+            config: torch_spyre_tests/inductor/test_copy_back_elision_config.yaml
+          - name: Inductor Decomp
+            config: torch_spyre_tests/inductor/test_decomp_config.yaml
+          - name: Inductor FX Passes
+            config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
+          - name: Inductor Normalization Scalars
+            config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
+          - name: Inductor Ops Matmul
+            config: torch_spyre_tests/inductor/test_inductor_ops_matmul_config.yaml
+          - name: Inductor Ops Reductions Keepdim Multidim0
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim0_config.yaml
+          - name: Inductor Ops Reductions Keepdim Multidim1
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim1_config.yaml
+          - name: Inductor Ops Reductions Keepdim Singledim0
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim0_config.yaml
+          - name: Inductor Ops Reductions Keepdim Singledim1
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim1_config.yaml
+          - name: Inductor Ops Reductions Keepdim Index Norm Eager
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_index_norm_eager_config.yaml
+          - name: Inductor Ops Reductions Scalar
+            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
+          - name: Inductor Ops Pointwise
+            config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
+          - name: Inductor Ops Misc Shape
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
+          - name: Inductor Ops Misc Compute
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
+          - name: Inductor Ops LX Planning
+            config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
+          - name: Inductor Scalar
+            config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
+          - name: Inductor Logging
+            config: torch_spyre_tests/inductor/test_logging_config.yaml
+          - name: Inductor Dedup Constants
+            config: torch_spyre_tests/inductor/test_dedup_constants_config.yaml
+          - name: Inductor Padding
+            config: torch_spyre_tests/inductor/test_padding_config.yaml
+          - name: Inductor Overwrite
+            config: torch_spyre_tests/inductor/test_overwrite.yaml
+          - name: Inductor Restickify
+            config: torch_spyre_tests/inductor/test_restickify_config.yaml
+          - name: Inductor Scratchpad Patterns
+            config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
+          - name: Inductor Scratchpad Use
+            config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
+          - name: Inductor Dtype Scalars
+            config: torch_spyre_tests/inductor/test_dtype_scalars_config.yaml
+          - name: Inductor Cache
+            config: torch_spyre_tests/inductor/test_cache_config.yaml
+          - name: Inductor Scratchpad Solver
+            config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
+          - name: Inductor Coarse Tiling
+            config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
+          - name: Inductor Coarse Tile E2E
+            config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
+          - name: Inductor Unroll Loop Specs
+            config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
+          - name: Inductor Work Division Hint
+            config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
+          # ---- Tensor tests ----
+          - name: Tensor Coordinates
+            config: torch_spyre_tests/tensors/test_coordinates_config.yaml
+          - name: Tensor It Space Splits
+            config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
+          - name: Tensor Layout
+            config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
+          - name: Tensor Resize
+            config: torch_spyre_tests/tensors/test_resize_config.yaml
+          - name: Tensor Memory Format
+            config: torch_spyre_tests/tensors/test_memory_format_config.yaml
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check out pre-built PyTorch
+        if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-prebuilt-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Download RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        uses: ./.github/actions/download-rpms
+        with:
+          rpm_location: ${{ inputs.rpm_location }}
+          rpm_names: ${{ inputs.rpm_names }}
+
+      - name: Install RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        run: |
+          ls -la
+          ls -la rpms/
+          sudo dnf install -y rpms/*.rpm
+
+      - name: Build torch-spyre
+        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+        uses: ./.github/actions/build-torch-spyre
+
+      - name: Run ${{ matrix.suite.name }} tests
+        id: run_tests
+        env:
+          MAX_ATTEMPTS: 3
+          STALL_TIMEOUT_SECS: 300   # 5 min with no new stdout --> kill as hung
+          STALL_CHECK_INTERVAL: 30  # check every 30s
+        run: |
+          set +e
+          set +o pipefail
+
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
+          CONFIG="tests/configs/${{ matrix.suite.config }}"
+
+          _ARCH="$(uname -m)"
+          _SLOW_FLAG=""
+          if [[ "$_ARCH" != "x86_64" ]]; then
+            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
+            _SLOW_FLAG="--skip-slow"
+          fi
+
+          attempt=0
+          while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
+            attempt=$(( attempt + 1 ))
+            echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ matrix.suite.name }} ==="
+
+            LOG_FILE="$(mktemp /tmp/test_output_XXXXXX.log)"
+            STALL_FLAG="$(mktemp /tmp/stall_flag_XXXXXX.tmp)"
+
+            stall_watcher() {
+              local elapsed_stall=0
+              local prev_lines=0
+              while [[ ! -f "${STALL_FLAG}.done" ]]; do
+                sleep "$STALL_CHECK_INTERVAL"
+                current_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+                if [[ "$current_lines" -eq "$prev_lines" ]]; then
+                  elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
+                  echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
+                  if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
+                    echo "[stall-watcher] STALL DETECTED — killing process group"
+                    kill -TERM -$$ 2>/dev/null || true
+                    return
+                  fi
+                else
+                  elapsed_stall=0
+                fi
+                prev_lines=$current_lines
+              done
+            }
+
+            echo "Running ${{ matrix.suite.name }} tests..."
+            echo "  Host Platform : ${_ARCH}"
+            echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
+            echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
+
+            stall_watcher &
+            WATCHER_PID=$!
+
+            bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
+              2>&1 | tee "$LOG_FILE"
+            TEST_EXIT=${PIPESTATUS[0]}
+
+            touch "${STALL_FLAG}.done"
+            kill "$WATCHER_PID" 2>/dev/null || true
+            wait "$WATCHER_PID" 2>/dev/null || true
+
+            if [[ $TEST_EXIT -eq 0 ]]; then
+              echo "=== Attempt ${attempt} PASSED ==="
+              echo "${{ matrix.suite.name }} tests done"
+              rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+              exit 0
+            fi
+
+            echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
+            if grep -qE "ResponseTimeout|Exceeded max iterations|LX logout" "$LOG_FILE"; then
+              echo "    --> Hardware RAS timeout detected — will retry"
+            else
+              echo "    --> Non-hardware failure — will retry (up to ${MAX_ATTEMPTS} total)"
+            fi
+
+            rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+            [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
+          done
+
+          echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ matrix.suite.name }} ==="
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Multi-Spyre test matrix
+  # ---------------------------------------------------------------------------
+  test_multi_spyre:
+    name: ${{ matrix.suite.name }}
+    runs-on:
+      - x86_64
+      - spyre_pf_x2
+      - ${{ inputs.runner_label }}
+      - image_torch_spyre
+    timeout-minutes: 60
+    env:
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      TORCH_ROOT: ${{ inputs.torch_root }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: Test Multi-Spyre Setup
+            config: distributed_tests/test_general.yaml
+          - name: Test Multi-Spyre Barrier
+            config: distributed_tests/test_barrier.yaml
+          - name: Test Multi-Spyre Broadcast
+            config: distributed_tests/test_broadcast.yaml
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check out pre-built PyTorch
+        if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-prebuilt-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Download RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        uses: ./.github/actions/download-rpms
+        with:
+          rpm_location: ${{ inputs.rpm_location }}
+          rpm_names: ${{ inputs.rpm_names }}
+
+      - name: Install RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        run: |
+          ls -la
+          ls -la rpms/
+          sudo dnf install -y rpms/*.rpm
+
+      - name: Build torch-spyre
+        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+        uses: ./.github/actions/build-torch-spyre
+
+      - name: Run ${{ matrix.suite.name }} tests
+        run: |-
+          source "$HOME/.bashrc"
+
+          # Multi-Spyre tests require a fresh topology probe: clear the
+          # cached AIU setup guard and the stale topo.json so
+          # ibm-aiu-setup.sh re-discovers all attached cards.
+          unset _IBM_AIU_SETUP
+          rm -rf /tmp/etc/ibm/spyre/topo.json
+          source /etc/profile.d/ibm-aiu-setup.sh
+
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
+          CONFIG="${{ matrix.suite.config }}"
+
+          _ARCH="$(uname -m)"
+          _SLOW_FLAG=""
+          if [[ "$_ARCH" != "x86_64" ]]; then
+            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
+            _SLOW_FLAG="--skip-slow"
+          fi
+
+          echo "Running ${{ matrix.suite.name }} tests..."
+          echo "  Host Platform : ${_ARCH}"
+          echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
+          echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
+          bash tests/run_test.sh "tests/configs/${CONFIG}" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG}
+          echo "${{ matrix.suite.name }} tests done"

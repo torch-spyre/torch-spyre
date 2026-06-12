@@ -68,6 +68,7 @@ _VALID_INIT_STRATEGIES = {
     "ones",
     "randint",
     "arange",
+    "xavier",
     "eye",
     "full",
     "file",

@@ -16,6 +16,7 @@ import os
 import threading
 import types
 import importlib
+import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
 
@@ -92,18 +93,61 @@ class _SpyreImpl:
         return self._in_bad_fork
 
     def manual_seed(self, seed: int, device: int | None = None) -> None:
-        fn = getattr(self._C, "manual_seed", None)
-        if fn:
-            fn(int(seed), -1 if device is None else int(device))
+        self._lazy_init()
+        _C = self._C
+
+        idx = -1 if device is None else int(device)
+        default_generator = _C._get_default_generator(idx)
+        default_generator.manual_seed(seed)
 
     def manual_seed_all(self, seed: int) -> None:
+        self._lazy_init()
         _C = self._C
-        if hasattr(_C, "manual_seed_all"):
-            _C.manual_seed_all(int(seed))
-        else:
-            # Otherwise, fan out:
-            for idx in range(self.device_count()):
-                self.manual_seed(seed, device=idx)
+
+        for idx in range(self.device_count()):
+            default_generator = _C._get_default_generator(idx)
+            default_generator.manual_seed(seed)
+
+    def set_rng_state(
+        self, new_state: torch.Tensor, device: int | str | torch.device = "spyre"
+    ) -> None:
+        self._lazy_init()
+        _C = self._C
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        elif isinstance(device, int):
+            device = torch.device(DEVICE_NAME, device)
+
+        idx = self.current_device() if device.index is None else device.index
+        default_generator = _C._get_default_generator(idx)
+        default_generator.set_state(new_state)
+
+    def get_rng_state(self, device: int | str | torch.device = "spyre") -> torch.Tensor:
+        self._lazy_init()
+        _C = self._C
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        elif isinstance(device, int):
+            device = torch.device(DEVICE_NAME, device)
+
+        idx = self.current_device() if device.index is None else device.index
+        default_generator = _C._get_default_generator(idx)
+        return default_generator.get_state()
+
+    def initial_seed(self, device: int | str | torch.device = "spyre") -> int:
+        self._lazy_init()
+        _C = self._C
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        elif isinstance(device, int):
+            device = torch.device(DEVICE_NAME, device)
+
+        idx = self.current_device() if device.index is None else device.index
+        default_generator = _C._get_default_generator(idx)
+        return default_generator.initial_seed()
 
     def is_available(self) -> bool:
         if self._is_in_bad_fork():
@@ -115,9 +159,9 @@ class _SpyreImpl:
         return self._initialized and not self._is_in_bad_fork()
 
     def device_count(self) -> int:
-        from . import _hooks
+        from . import _C
 
-        return _hooks.device_count()
+        return _C.device_count()
 
     def current_device(self) -> int:
         return getattr(self._C, "current_device", lambda: 0)()
@@ -147,6 +191,11 @@ def make_spyre_module() -> types.ModuleType:
     mod._is_in_bad_fork = lambda: impl._is_in_bad_fork()
     mod.manual_seed = lambda s: impl.manual_seed(s)
     mod.manual_seed_all = lambda s: impl.manual_seed_all(s)
+    mod.get_rng_state = lambda device=DEVICE_NAME: impl.get_rng_state(device)
+    mod.set_rng_state = lambda new_state, device=DEVICE_NAME: impl.set_rng_state(
+        new_state, device
+    )
+    mod.initial_seed = lambda device=DEVICE_NAME: impl.initial_seed(device)
     mod.is_available = lambda: impl.is_available()
     mod.is_initialized = lambda: impl.is_initialized()
     mod.device_count = lambda: impl.device_count()
@@ -221,7 +270,7 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    from . import _hooks  # noqa: F401
+    from . import _C  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)

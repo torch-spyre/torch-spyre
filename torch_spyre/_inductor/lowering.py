@@ -1094,7 +1094,17 @@ def with_int64_fallback(fn, *args, convert_output=True):
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
 )
-def lower_add(x, y):
+def lower_add(x, y, *, alpha=1):
+    if alpha != 1:
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
     return with_int64_fallback(lowering.add, x, y)
 
 
@@ -1110,7 +1120,17 @@ def lower_mul(x, y):
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
 )
-def lower_sub(x, y):
+def lower_sub(x, y, *, alpha=1):
+    if alpha != 1:
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
     return with_int64_fallback(lowering.sub, x, y)
 
 

@@ -22,6 +22,8 @@ test_suite_config:
             # broadcast / scalar arithmetic
             # test_add_broadcast.* covers test_add_broadcast and test_add_broadcast_cpu
             - TestOps::test_add_broadcast.*
+            - TestOps::test_add_alpha.*
+            - TestOps::test_add_scalar.*
             - TestOps::test_max_sub_broadcast.*
             - TestOps::test_sub_alpha.*
             - TestOps::test_sub_broadcast.*
@@ -52,6 +54,7 @@ test_suite_config:
             - TestOps::test_fallback.*
             - TestOps::test_fill_scalar.*
             - TestOps::test_implicit_loading.*
+            - TestOps::test_is_nonzero.*
             - TestOps::test_item.*
             # exact matches — no .* to avoid leaking into other shards
             - TestOps::test_log
@@ -68,6 +71,7 @@ test_suite_config:
             - TestOps::test_triu.*
             - TestOps::test_uniform_cpu.*
             - TestOps::test_uniform_custom_range_cpu.*
+            - TestOps::test_random_from_cpu.*
             - TestOps::test_where.*
             # invalid-dim error-path tests
             - TestOps::test_core_reduction_invalid_dims_api.*

@@ -139,14 +139,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 1, 12]
           stride: [12, 12, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward, code: freqs =
       (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
   - name: torch.transpose.1_spyre
@@ -375,15 +375,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward, code: query_states
       = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -425,15 +424,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward, code: key_states
       = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -885,15 +883,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [14336, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -936,15 +933,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 14336]
           stride: [14336, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -971,15 +967,14 @@ cases:
           storage_offset: 45056
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [128256, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L501 in forward, code: logits
       = self.lm_head(hidden_states[:, slice_indices, :])'
     marks: constant
@@ -1061,14 +1056,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 1, 1]
           stride: [1, 1, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L130 in forward, code: freqs =
       (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
   - name: torch.transpose.5_spyre
@@ -1290,15 +1285,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L263 in forward, code: query_states
       = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -1340,15 +1334,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L264 in forward, code: key_states
       = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -1755,15 +1748,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L291 in forward, code: attn_output
       = self.o_proj(attn_output)'
     marks: constant
@@ -1795,15 +1787,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [14336, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -1846,15 +1837,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 14336]
           stride: [14336, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L183 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -1881,15 +1871,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [128256, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/llama/modeling_llama.py#L501 in forward, code: logits
       = self.lm_head(hidden_states[:, slice_indices, :])'
     marks: constant

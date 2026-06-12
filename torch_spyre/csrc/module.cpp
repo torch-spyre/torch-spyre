@@ -16,6 +16,7 @@
 
 #include "module.h"
 
+#include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/ScalarType.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
@@ -43,6 +44,7 @@
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
 #include "spyre_mem.h"
@@ -161,9 +163,37 @@ int device_count() {
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
+  // Register PrivateUse1 hooks — tells PyTorch the device exists.
+  // Loading _C.so does NOT trigger device initialization;
+  // start_runtime() must be called explicitly (via _lazy_init()).
+  {
+    struct SpyreHooksArgs : public at::PrivateUse1HooksArgs {};
+    struct SpyreHooksInterface : public at::PrivateUse1HooksInterface {
+      SpyreHooksInterface() = default;
+      explicit SpyreHooksInterface(SpyreHooksArgs) {}
+      ~SpyreHooksInterface() override = default;
+      bool hasPrimaryContext(c10::DeviceIndex) const override {
+        return true;
+      }
+      bool isAvailable() const override {
+        return true;
+      }
+      const at::Generator& getDefaultGenerator(
+          c10::DeviceIndex device) const override {
+        return spyre::detail::getDefaultSpyreGenerator(device);
+      }
+      at::Generator getNewGenerator(c10::DeviceIndex device) const override {
+        return spyre::detail::createSpyreGenerator(device);
+      }
+    };
+    static auto* hooks = new SpyreHooksInterface();
+    at::RegisterPrivateUse1HooksInterface(hooks);
+  }
+
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
+  m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
@@ -293,6 +323,17 @@ PYBIND11_MODULE(_C, m) {
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // RNG functions
+  m.def("manual_seed", &spyre::manual_seed, py::arg("seed"),
+        py::arg("device") = -1);
+  m.def("manual_seed_all", &spyre::manual_seed_all, py::arg("seed"));
+  m.def("get_rng_state", &spyre::get_rng_state, py::arg("device") = -1);
+  m.def("set_rng_state", &spyre::set_rng_state, py::arg("new_state"),
+        py::arg("device") = -1);
+  m.def("initial_seed", &spyre::initial_seed, py::arg("device") = -1);
+  m.def("_get_default_generator", &spyre::detail::getDefaultSpyreGenerator,
+        py::arg("device") = -1);
 
   // Memory copy function
   m.def("copy_tensor", &spyre::spyre_copy_from,

@@ -109,6 +109,8 @@ class InputTensorSpec(BaseModel):
             len(self.shape) != 2 or self.shape[0] != self.shape[1]
         ):
             raise ValueError(f"eye requires a square 2-D shape, got {self.shape}")
+        if self.init == "xavier" and len(self.shape) < 2:
+            raise ValueError(f"xavier requires 2-D or larger shape, got {self.shape}")
         if self.stride is not None and len(self.stride) != len(self.shape):
             raise ValueError(
                 f"stride length {len(self.stride)} must match shape length {len(self.shape)}"
@@ -142,6 +144,8 @@ class InputTensorSpec(BaseModel):
             return torch.arange(shape[0], dtype=dtype)
         elif init == "eye":
             return torch.eye(shape[0], dtype=dtype)
+        elif init == "xavier":
+            return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
         elif init == "full":
             return torch.full(shape, ia.fill_value, dtype=dtype)
         elif init == "zeros":
