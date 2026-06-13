@@ -15,6 +15,11 @@ on:
         required: false
         type: string
         default: ''
+      repository:
+        description: Full clone URL of the fork to check out (e.g. "https://github.com/myuser/torch-spyre.git"); leave empty for the base repo
+        required: true
+        type: string
+        default: ''
       pr_url_hash:
         description: |
           Hash of the full URL of the PR that triggered this run.
@@ -111,6 +116,7 @@ jobs:
       checkout_pytorch: false
       torch_root: ''
       ref: ${{ inputs.ref || '' }}
+      repository: ${{ inputs.repository || '' }}
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}

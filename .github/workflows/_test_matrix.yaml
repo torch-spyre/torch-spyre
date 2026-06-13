@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: ''
+      repository:
+        description: Full clone URL of the fork to check out (e.g. "https://github.example.com/myuser/torch-spyre.git"); leave empty for the base repo
+        required: false
+        type: string
+        default: ''
       rpm_location:
         description: Artifactory location for RPM download
         required: false
@@ -202,6 +207,7 @@ jobs:
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
           ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
@@ -356,6 +362,7 @@ jobs:
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
           ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
