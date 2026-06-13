@@ -648,13 +648,14 @@ def _allocate_full_buffer(
     else:
         device_layout = generic_layout(full_buf)
 
-    full_buf.layout = FixedTiledLayout(
+    layout = FixedTiledLayout(
         device,
         dtype,
         list(full_ranges),
         strides,
         device_layout,
     )
+    full_buf.layout = layout
 
     # Splice into operations at the correct position.
     operations.remove(full_buf)

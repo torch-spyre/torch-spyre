@@ -1304,38 +1304,32 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     mm shapes: M=128, K=512, N=32; outer tiles M by 2 (64 rows/tile),
     inner tiles K by 4 (128 elements/tile = 2 sticks at fp16).
-    bmm shapes: Batch=8, M=64, K=512, N=32; outer tiles Batch by 2,
+    bmm shapes: B=4, M=64, K=512, N=32; outer tiles B by 2,
     inner tiles K by 4.
     """
 
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xCAFE)
-        # Reset the named-dims registry to prevent WeakIdKeyDict aliasing
-        # with device tensors created in earlier tests.  Dims are re-declared
-        # in each test body, so this is safe.
-        _pnd.reset()
 
     @config.patch({"lx_planning": False})
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
-        """bmm [Batch,M,K]@[Batch,K,N] outer Batch (output) + inner K (reduction) — correct."""
+        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
 
-        # Use Batch=4 (distinct from the K-tiling tests that use B=8) to avoid
-        # any WeakIdKeyDict aliasing when named-dim annotations are looked up.
-        Batch, M, K, N = 4, 64, 512, 32
-        a = torch.randn(Batch, M, K, dtype=torch.float16) * 0.01
-        b = torch.randn(Batch, K, N, dtype=torch.float16) * 0.01
-        _declare_tensor_dim("Batch", Batch)
-        _declare_tensor_dim("M2", M)
-        _declare_tensor_dim("K2", K)
-        _declare_tensor_dim("N2", N)
+        B, M, K, N = 4, 64, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(B, K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
 
         def fn(a, b):
-            _name_tensor_dims(a, ["Batch", "M2", "K2"])
-            _name_tensor_dims(b, ["Batch", "K2", "N2"])
-            with spyre_hint(num_tiles_per_dim={"Batch": 2}):
-                with spyre_hint(num_tiles_per_dim={"K2": 4}):
+            _name_tensor_dims(a, ["B", "M", "K"])
+            _name_tensor_dims(b, ["B", "K", "N"])
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
                     return torch.bmm(a, b)
 
         compare_with_cpu(

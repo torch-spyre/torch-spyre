@@ -292,5 +292,304 @@ class TestUnrollLoopSpecs(unittest.TestCase):
         )
 
 
+class TestNestedReductionUnroll(unittest.TestCase):
+    """Tests for nested outer-output + inner-reduction tiling.
+
+    Models the bmm (B outer, K inner) scenario introduced in ct-stage2.  The
+    key invariant: when the inner K-loop is unrolled, the combine op's accum_buf
+    address must stay fixed (same slice for every K iteration).  Only the bmm's
+    K-dimension input should advance per K-tile.
+
+    Tensor geometry used throughout:
+      accum_buf  [B=2, M=64, N=32] fp16 per outer tile → HBM at ACCUM_BASE
+        device_size=[1, 2, 64], stride_map=[64, 64, 1]
+        device_coords=[c_col//64, c_b, c_col%64]   (c_b tiles batch within tile)
+      k_input    [M=64, K=128] fp16 per K-tile   → HBM at K_BASE (advances per K)
+        device_size=[2, 64, 64], stride_map=[64, 64, 1]
+        device_coords=[c_col//64, c_row, c_col%64]
+      pool_scratch per_tile_fixed=True (bmm intermediate output, stays fixed)
+    """
+
+    # --- Symbols ---
+    _C_B = Symbol("c_b")  # output batch symbol (appears in accum_buf coords)
+    _C_M = Symbol("c_m")  # M rows
+    _C_N = Symbol("c_n")  # N cols
+    _C_K = Symbol("c_k")  # K reduction symbol
+
+    # --- Base addresses ---
+    _ACCUM_BASE = 0x1000000000
+    _K_INPUT_BASE = 0x800000000
+    _POOL_BASE = 0  # pool allocation; per_tile_fixed
+
+    # Per-tile tensor geometry:
+    #   accum_buf: [B=2, N=32] per row — but using simplified 2D layout:
+    #     device_size=[1, 2, 64], stride_map=[64, 64, 1]
+    #     device_coords=[c_n//64, c_b, c_n%64]
+    #   k_input (K-dim): device_size=[2, 64, 64], stride_map=[64, 64, 1]
+    #     device_coords=[c_k//64, c_m, c_k%64]
+    #     per K-tile stride: 1 tile = 128 K-elems = 2 sticks
+    #       byte_stride = 2 * 64 * 2 = 256  (one stick = 64 fp16 = 128 bytes)
+
+    # For accum_buf: advancing 2 batches in c_b direction:
+    #   device_coords[1] = c_b; stride_map[1] = 64
+    #   byte_stride = 2 * 64 * 2 = 256
+
+    # K-input advance per K-tile (128 K-elems = 2 sticks along c_k):
+    #   device_coords[0] = c_k//64; stride_map[0] = 64
+    #   byte_stride = (128//64) * 64 * 2 = 256
+
+    def _make_accum_arg(self, base: int = _ACCUM_BASE, per_tile_fixed: bool = False):
+        return TensorArg(
+            is_input=False,
+            arg_index=-1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[1, 2, 64],
+            device_coordinates=[
+                self._C_N // 64,
+                self._C_B,
+                sympy.Mod(self._C_N, 64),
+            ],
+            allocation={"hbm": base},
+            stride_map=[64, 64, 1],
+            per_tile_fixed=per_tile_fixed,
+        )
+
+    def _make_k_input_arg(self, base: int = _K_INPUT_BASE):
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[2, 64, 64],
+            device_coordinates=[
+                self._C_K // 64,
+                self._C_M,
+                sympy.Mod(self._C_K, 64),
+            ],
+            allocation={"hbm": base},
+            stride_map=[64, 64, 1],
+        )
+
+    def _make_pool_scratch(self):
+        return TensorArg(
+            is_input=False,
+            arg_index=-1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[1, 64, 64],
+            device_coordinates=[
+                self._C_N // 64,
+                self._C_M,
+                sympy.Mod(self._C_N, 64),
+            ],
+            allocation={"pool": self._POOL_BASE},
+            stride_map=[64, 64, 1],
+            per_tile_fixed=True,
+        )
+
+    def _make_bmm_op(self) -> OpSpec:
+        """Model bmm partial result: reads k_input, writes pool scratch."""
+        return OpSpec(
+            op="batchmatmul",
+            is_reduction=True,
+            iteration_space={
+                self._C_B: (Integer(2), 1),
+                self._C_M: (Integer(64), 1),
+                self._C_N: (Integer(32), 1),
+                self._C_K: (Integer(128), 1),
+            },
+            args=[self._make_k_input_arg(), self._make_pool_scratch()],
+            op_info={},
+            tiled_symbols=[self._C_B, self._C_K],
+        )
+
+    def _make_combine_op(self) -> OpSpec:
+        """Model combine (add): reads pool + accum_buf, writes accum_buf.
+
+        Output-only iteration space: no K symbol.
+        """
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                self._C_B: (Integer(2), 1),
+                self._C_M: (Integer(64), 1),
+                self._C_N: (Integer(32), 1),
+            },
+            args=[
+                self._make_pool_scratch(),  # input: per_tile_fixed scratch
+                self._make_accum_arg(),  # input: accum_buf (read)
+                self._make_accum_arg(),  # output: accum_buf (write)
+            ],
+            op_info={},
+            tiled_symbols=[self._C_B],
+        )
+
+    # ------------------------------------------------------------------
+    # 11. Inner K-loop: combine's accum_buf does NOT advance per K-tile.
+    #
+    #     The LoopSpec for the K-loop carries tiled_symbols=[c_k].  The
+    #     combine op's iteration_space has only {c_b, c_m, c_n} — no c_k.
+    #     _arg_byte_strides_for_syms must produce stride=0 for accum_buf
+    #     across K iterations, so every K-tile combine writes to the same
+    #     address.
+    # ------------------------------------------------------------------
+
+    def test_combine_accum_fixed_across_k_iterations(self):
+        bmm = self._make_bmm_op()
+        combine = self._make_combine_op()
+        # Inner K-loop: LoopSpec explicitly carries the K symbol.
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
+        result = unroll_loop_specs([inner])
+
+        self.assertEqual(len(result), 8, f"Expected 4*2=8 ops, got {len(result)}")
+        combine_copies = result[1::2]  # every other op is a combine copy
+        self.assertEqual(len(combine_copies), 4)
+
+        # accum_buf is arg index 1 and 2 of the combine; both must stay at ACCUM_BASE.
+        for i, copy_op in enumerate(combine_copies):
+            for arg_idx in (1, 2):
+                addr = copy_op.args[arg_idx].allocation["hbm"]
+                self.assertEqual(
+                    addr,
+                    self._ACCUM_BASE,
+                    f"K-iter {i}, combine arg[{arg_idx}] addr={hex(addr)}, "
+                    f"expected {hex(self._ACCUM_BASE)} (must not advance per K)",
+                )
+
+    # ------------------------------------------------------------------
+    # 12. Inner K-loop: pool scratch (per_tile_fixed) stays fixed.
+    # ------------------------------------------------------------------
+
+    def test_pool_scratch_fixed_across_k_iterations(self):
+        bmm = self._make_bmm_op()
+        combine = self._make_combine_op()
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
+        result = unroll_loop_specs([inner])
+
+        for op_copy in result:
+            for arg in op_copy.args:
+                if "pool" in arg.allocation:
+                    self.assertEqual(
+                        arg.allocation["pool"],
+                        self._POOL_BASE,
+                        f"pool scratch must stay at {self._POOL_BASE}",
+                    )
+
+    # ------------------------------------------------------------------
+    # 13. Inner K-loop: bmm's K-input advances per K-tile.
+    #
+    #     k_input device_coords[0] = c_k//64; stride_map[0]=64; dtype=fp16.
+    #     Per K-tile (128 K-elems = 2 sticks):
+    #       byte_stride = (128//64) * 64 * 2 = 256
+    # ------------------------------------------------------------------
+
+    def test_bmm_k_input_advances_per_k_iteration(self):
+        K_TILE_BYTES = (128 // 64) * 64 * 2  # 256
+        bmm = self._make_bmm_op()
+        combine = self._make_combine_op()
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
+        result = unroll_loop_specs([inner])
+
+        bmm_copies = result[::2]  # every other op is a bmm copy
+        self.assertEqual(len(bmm_copies), 4)
+        for i, copy_op in enumerate(bmm_copies):
+            k_arg = copy_op.args[0]  # k_input
+            expected = self._K_INPUT_BASE + i * K_TILE_BYTES
+            self.assertEqual(
+                k_arg.allocation["hbm"],
+                expected,
+                f"K-iter {i} k_input addr={hex(k_arg.allocation['hbm'])}, "
+                f"expected {hex(expected)}",
+            )
+
+    # ------------------------------------------------------------------
+    # 14. Nested outer-B + inner-K: full 2×4 layout.
+    #
+    #     Outer B-loop (tiled_symbols=[c_b], count=2):
+    #       fill op: writes accum_buf, tiled_symbols=[c_b]
+    #       Inner K-loop (tiled_symbols=[c_k], count=4):
+    #         bmm + combine
+    #
+    #     After full unrolling:
+    #     outer=2, inner=4 → 2*(1 fill + 4*(bmm+combine)) = 2+16 = 18 ops
+    #       flat result: [fill_B0, bmm_K0, add_K0, bmm_K1, add_K1, ... x4, fill_B1, ...]
+    #
+    #     Key assertions:
+    #       - fill_B0 accum addr = ACCUM_BASE
+    #       - fill_B1 accum addr = ACCUM_BASE + B_TILE_BYTES
+    #       - all add ops in B-tile 0 write to ACCUM_BASE
+    #       - all add ops in B-tile 1 write to ACCUM_BASE + B_TILE_BYTES
+    # ------------------------------------------------------------------
+
+    def test_nested_outer_b_inner_k_full_layout(self):
+        # B-tile byte advance: 2 batches in c_b, stride_map[1]=64, dtype=fp16
+        B_TILE_BYTES = 2 * 64 * 2  # 256
+
+        fill_accum = self._make_accum_arg()
+        fill_op = OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space={
+                self._C_B: (Integer(2), 1),
+                self._C_N: (Integer(32), 1),
+            },
+            args=[fill_accum],
+            op_info={},
+            tiled_symbols=[self._C_B],
+        )
+
+        bmm = self._make_bmm_op()
+        combine = self._make_combine_op()
+
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
+        outer = LoopSpec(
+            count=Integer(2), body=[fill_op, inner], tiled_symbols=[self._C_B]
+        )
+        result = unroll_loop_specs([outer])
+
+        # Expected flat layout: 2 × (1 fill + 4 × (1 bmm + 1 combine)) = 18 ops
+        self.assertEqual(len(result), 18, f"Expected 18 ops, got {len(result)}")
+
+        # Verify fill ops (indices 0 and 9)
+        fill_b0 = result[0]
+        fill_b1 = result[9]
+        self.assertEqual(fill_b0.op, "identity")
+        self.assertEqual(fill_b1.op, "identity")
+        self.assertEqual(fill_b0.args[0].allocation["hbm"], self._ACCUM_BASE)
+        self.assertEqual(
+            fill_b1.args[0].allocation["hbm"], self._ACCUM_BASE + B_TILE_BYTES
+        )
+
+        # Verify combine ops in B-tile 0 (indices 2, 4, 6, 8 = ops 1,3,5,7 → add ops)
+        # Inner body: [bmm, combine] × 4 = ops 1..8, starting at result[1]
+        b0_adds = [result[i] for i in (2, 4, 6, 8)]
+        for i, op_copy in enumerate(b0_adds):
+            self.assertEqual(op_copy.op, "add", f"result[{2 + 2 * i}] should be add")
+            accum_write = op_copy.args[2]
+            self.assertEqual(
+                accum_write.allocation["hbm"],
+                self._ACCUM_BASE,
+                f"B-tile0 K-iter {i} combine must write to ACCUM_BASE",
+            )
+
+        # Verify combine ops in B-tile 1 (indices 11, 13, 15, 17)
+        b1_adds = [result[i] for i in (11, 13, 15, 17)]
+        for i, op_copy in enumerate(b1_adds):
+            self.assertEqual(op_copy.op, "add", f"result[{11 + 2 * i}] should be add")
+            accum_write = op_copy.args[2]
+            self.assertEqual(
+                accum_write.allocation["hbm"],
+                self._ACCUM_BASE + B_TILE_BYTES,
+                f"B-tile1 K-iter {i} combine must write to ACCUM_BASE+B_TILE_BYTES",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
