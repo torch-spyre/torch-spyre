@@ -19,7 +19,14 @@ from typing import Optional, Callable
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
+    _assert_in_place_relationships,
 )
+
+__all__ = [
+    "FirstFitLayoutSolver",
+    "BestFitLayoutSolver",
+    "_assert_in_place_relationships",
+]
 
 
 def round_up_to_alignment(arg: int, alignment: int) -> int:
@@ -31,22 +38,6 @@ class Gap:
     start: int
     end: int
     in_place_parents: list[str] = field(default_factory=list)
-
-
-def _assert_in_place_relationships(buffers: list[LifetimeBoundBuffer]) -> None:
-    """Assert that all declared in-place parent/child pairs satisfy required invariants."""
-    buf_by_name = {b.name: b for b in buffers}
-    for child in buffers:
-        for parent_name in child.in_place_parents:
-            parent = buf_by_name[parent_name]
-            assert parent.end_time == child.start_time + 1, (
-                f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
-                f"child {child.name}.start_time+1={child.start_time + 1}"
-            )
-            assert child.size <= parent.size, (
-                f"In-place child {child.name}.size={child.size} "
-                f"must be <= parent {parent_name}.size={parent.size}"
-            )
 
 
 def _topological_sort(
@@ -76,8 +67,9 @@ def _topological_sort(
         for j in children[i]:
             in_degree[j] -= 1
             if in_degree[j] == 0:
-                buf = buffers[j]
-                heapq.heappush(heap, (buf.end_time - buf.start_time, j))
+                # Use the same key function as the roots so the tie-break is
+                # consistent across the whole sort, not just the initial frontier.
+                heapq.heappush(heap, (f(buffers[j]), j))
 
     assert len(result) == len(buffers), (
         "Cycle detected in in-place parent relationships"

@@ -23,6 +23,7 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
     _assert_in_place_relationships,
+    _topological_sort,
 )
 
 LARGE_SIZE = 512
@@ -298,6 +299,64 @@ class TestBestFitLayoutSolver(BaseLayoutSolverTests, TestCase):
 
 class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
     solver_class = GreedyLayoutSolver
+
+
+class TestTopologicalSort(TestCase):
+    """Tests for the Kahn's-algorithm sort that orders in-place chains.
+
+    These call the module-level helper directly with arbitrary lifetimes/sizes;
+    the in-place invariants enforced elsewhere (parent.end_time ==
+    child.start_time + 1, child.size <= parent.size) are not required here,
+    since _topological_sort only consumes in_place_parents for edges.
+    """
+
+    @staticmethod
+    def _names(buffers, f):
+        return [b.name for b in _topological_sort(buffers, f)]
+
+    def test_multi_level_chain_orders_parents_before_children(self):
+        # A 3-level in-place chain gp -> p -> c. Each level has exactly one
+        # ready node at a time, so topology alone fixes the order regardless of
+        # the tie-break key or input order.
+        gp = LifetimeBoundBuffer("gp", 100, 0, 2)
+        p = LifetimeBoundBuffer("p", 100, 2, 4, in_place_parents=["gp"])
+        c = LifetimeBoundBuffer("c", 100, 4, 6, in_place_parents=["p"])
+        # Pass the inputs out of order to prove the result is driven by the
+        # in-place edges, not the input order.
+        self.assertEqual(self._names([c, p, gp], lambda b: 0), ["gp", "p", "c"])
+
+    def test_tie_break_key_applied_below_the_root_frontier(self):
+        # Regression test for the bug where the `f` tie-break was applied only
+        # to the initial (root) frontier; nodes unlocked deeper in the sort
+        # fell back to a hardcoded lifetime key.
+        #
+        # Chain root -> mid -> {a, b}. After root and mid are popped, a and b
+        # become ready at the SAME step (third level), so their relative order
+        # is decided purely by the tie-break key.
+        #
+        # f sorts ascending by size, so the smaller buffer `a` must come first.
+        # `a` deliberately has the LONGER lifetime, so the old lifetime-keyed
+        # tie-break would (incorrectly) emit `b` before `a`.
+        root = LifetimeBoundBuffer("root", 100, 0, 1)
+        mid = LifetimeBoundBuffer("mid", 100, 1, 2, in_place_parents=["root"])
+        a = LifetimeBoundBuffer(
+            "a", 1, 2, 102, in_place_parents=["mid"]
+        )  # size 1, lifetime 100
+        b = LifetimeBoundBuffer(
+            "b", 100, 2, 3, in_place_parents=["mid"]
+        )  # size 100, lifetime 1
+
+        self.assertEqual(
+            self._names([root, mid, a, b], lambda buf: buf.size),
+            ["root", "mid", "a", "b"],
+        )
+
+        # Reversing the key flips a and b, confirming the key — not lifetime or
+        # input order — drives the deep tie-break.
+        self.assertEqual(
+            self._names([root, mid, a, b], lambda buf: -buf.size),
+            ["root", "mid", "b", "a"],
+        )
 
 
 if __name__ == "__main__":
