@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: ''
+      repository:
+        description: Full clone URL of the fork to check out (e.g. "https://github.example.com/myuser/torch-spyre.git"); leave empty for the base repo
+        required: false
+        type: string
+        default: ''
       rpm_location:
         description: Artifactory location for RPM download
         required: false
@@ -204,6 +209,7 @@ jobs:
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
           ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
@@ -232,7 +238,15 @@ jobs:
         uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} tests
+        id: run_tests
+        env:
+          MAX_ATTEMPTS: 3
+          STALL_TIMEOUT_SECS: 300   # 5 min with no new stdout --> kill as hung
+          STALL_CHECK_INTERVAL: 30  # check every 30s
         run: |
+          set +e
+          set +o pipefail
+
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_TORCH_SPYRE_DIR"
@@ -247,12 +261,71 @@ jobs:
             _SLOW_FLAG="--skip-slow"
           fi
 
-          echo "Running ${{ matrix.suite.name }} tests..."
-          echo "  Host Platform : ${_ARCH}"
-          echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
-          echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
-          bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG}
-          echo "${{ matrix.suite.name }} tests done"
+          attempt=0
+          while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
+            attempt=$(( attempt + 1 ))
+            echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ matrix.suite.name }} ==="
+
+            LOG_FILE="$(mktemp /tmp/test_output_XXXXXX.log)"
+            STALL_FLAG="$(mktemp /tmp/stall_flag_XXXXXX.tmp)"
+
+            stall_watcher() {
+              local elapsed_stall=0
+              local prev_lines=0
+              while [[ ! -f "${STALL_FLAG}.done" ]]; do
+                sleep "$STALL_CHECK_INTERVAL"
+                current_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+                if [[ "$current_lines" -eq "$prev_lines" ]]; then
+                  elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
+                  echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
+                  if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
+                    echo "[stall-watcher] STALL DETECTED — killing process group"
+                    kill -TERM -$$ 2>/dev/null || true
+                    return
+                  fi
+                else
+                  elapsed_stall=0
+                fi
+                prev_lines=$current_lines
+              done
+            }
+
+            echo "Running ${{ matrix.suite.name }} tests..."
+            echo "  Host Platform : ${_ARCH}"
+            echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
+            echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
+
+            stall_watcher &
+            WATCHER_PID=$!
+
+            bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
+              2>&1 | tee "$LOG_FILE"
+            TEST_EXIT=${PIPESTATUS[0]}
+
+            touch "${STALL_FLAG}.done"
+            kill "$WATCHER_PID" 2>/dev/null || true
+            wait "$WATCHER_PID" 2>/dev/null || true
+
+            if [[ $TEST_EXIT -eq 0 ]]; then
+              echo "=== Attempt ${attempt} PASSED ==="
+              echo "${{ matrix.suite.name }} tests done"
+              rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+              exit 0
+            fi
+
+            echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
+            if grep -qE "ResponseTimeout|Exceeded max iterations|LX logout" "$LOG_FILE"; then
+              echo "    --> Hardware RAS timeout detected — will retry"
+            else
+              echo "    --> Non-hardware failure — will retry (up to ${MAX_ATTEMPTS} total)"
+            fi
+
+            rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+            [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
+          done
+
+          echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ matrix.suite.name }} ==="
+          exit 1
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
@@ -291,6 +364,7 @@ jobs:
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
           ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}

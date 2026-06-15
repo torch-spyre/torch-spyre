@@ -33,6 +33,22 @@ class LifetimeBoundBuffer:
     in_place_parents: list[str] = field(default_factory=list)
 
 
+def _assert_in_place_relationships(buffers: list["LifetimeBoundBuffer"]) -> None:
+    """Assert that all declared in-place parent/child pairs satisfy required invariants."""
+    buf_by_name = {b.name: b for b in buffers}
+    for child in buffers:
+        for parent_name in child.in_place_parents:
+            parent = buf_by_name[parent_name]
+            assert parent.end_time == child.start_time + 1, (
+                f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
+                f"child {child.name}.start_time+1={child.start_time + 1}"
+            )
+            assert child.size <= parent.size, (
+                f"In-place child {child.name}.size={child.size} "
+                f"must be <= parent {parent_name}.size={parent.size}"
+            )
+
+
 class MemoryPlanSolver(ABC):
     """
     An abstract class for defining algorithms which solve
@@ -51,7 +67,6 @@ class MemoryPlanSolver(ABC):
         """
         self.limit = size
         self.alignment = alignment
-        self.usage: list[LifetimeBoundBuffer] = []
 
     @abstractmethod
     def plan_layout(
@@ -72,6 +87,12 @@ class MemoryPlanSolver(ABC):
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
+    def __init__(self, size: int, alignment: int = 128):
+        super().__init__(size, alignment)
+        # `usage` tracks live placements during planning. It is specific to the
+        # greedy time-stepping algorithm; the gap-based solvers don't use it.
+        self.usage: list[LifetimeBoundBuffer] = []
+
     def _get_lowest_addr_in_use(self):
         return min(
             (rec.address for rec in self.usage if rec.address is not None),
@@ -175,6 +196,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         assert all(buf.address is None for buf in buffers), (
             "Buffers cannot be previously or partially planned"
         )
+        _assert_in_place_relationships(buffers)
 
         self.usage = []
 

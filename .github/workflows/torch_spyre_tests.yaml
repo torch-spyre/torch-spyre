@@ -15,6 +15,17 @@ on:
         required: false
         type: string
         default: ''
+      repository:
+        description: Full clone URL of the fork to check out (e.g. "https://github.com/myuser/torch-spyre.git"); leave empty for the base repo
+        required: true
+        type: string
+        default: ''
+      pr_url_hash:
+        description: |
+          Hash of the full URL of the PR that triggered this run.
+          Required when triggered by an external PR.
+        required: true
+        type: string
       rpm_location:
         description: The Artifactory location where to download the RPM from
         required: false
@@ -32,7 +43,8 @@ on:
         default: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
+    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -104,6 +116,7 @@ jobs:
       checkout_pytorch: false
       torch_root: ''
       ref: ${{ inputs.ref || '' }}
+      repository: ${{ inputs.repository || '' }}
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
