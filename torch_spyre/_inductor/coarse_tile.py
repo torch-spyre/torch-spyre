@@ -65,6 +65,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
 from .propagate_hints import get_op_hints
@@ -337,13 +338,14 @@ def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> b
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
     """Raise RuntimeError for Reduction tiling configurations not yet implemented.
 
-    Supported (Stage 1): a single level that tiles only a non-stick reduction
-    dim — loop_tiled_dims all empty, exactly one loop_tiled_reduction_dims
-    sub-list non-empty with a single index, and that index must not be the
-    within-stick dimension of the primary input.
+    Supported (Stage 1):
+      - A single level that tiles only a non-stick reduction dim.
+      - A single level that tiles the K (reduction) dim of a BATCH_MATMUL_OP.
+        K is the stick dim for operand x, but each tile's output is a full
+        [M, N] matrix so no partial-stick sparsity occurs.
 
     Deferred to Stage 2 (raises):
-      - Reduction tiling on the stick dimension.
+      - Reduction tiling on the stick dimension (except BATCH_MATMUL_OP above).
       - Mixed output+reduction tiling at the same nesting level.
       - Multiple nesting levels where both output-dim and reduction-dim levels
         appear (e.g. outer tiles output dim, inner tiles reduction dim).
@@ -390,7 +392,10 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
                 "dim per level is not yet implemented — Stage 2)."
             )
         for red_dim_idx in red_dims:
-            if _reduction_tiling_is_on_stick_dim(op, red_dim_idx):
+            if (
+                data.reduction_type != BATCH_MATMUL_OP
+                and _reduction_tiling_is_on_stick_dim(op, red_dim_idx)
+            ):
                 raise RuntimeError(
                     f"coarse_tile: op {op.get_name()!r} level {i} tiles "
                     f"reduction dim {red_dim_idx} which is the stick dimension "
@@ -737,7 +742,7 @@ def _insert_combine_op(
     def combine_inner_fn(index):
         partial = partial_loader(index)
         accum = accum_loader(index)
-        if reduction_type == "sum":
+        if reduction_type in ("sum", BATCH_MATMUL_OP):
             return vops.add(accum, partial)
         if reduction_type == "xor_sum":
             return vops.bitwise_xor(accum, partial)
@@ -1215,7 +1220,7 @@ def _reduction_identity_value(
 
     Used to initialize the accumulation buffer before a tiled reduction loop.
     """
-    if reduction_type in ("sum", "xor_sum", "any"):
+    if reduction_type in ("sum", "xor_sum", "any", BATCH_MATMUL_OP):
         return 0
     if reduction_type == "prod":
         return 1

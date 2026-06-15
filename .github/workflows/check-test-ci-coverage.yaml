@@ -1,5 +1,5 @@
 # Enforcement: every test_*.py must have a config YAML *and* be registered
-# in the torch-spyre-tests.yml workflow matrix.
+# in the _test_matrix.yaml workflow matrix.
 #
 # Runs on:
 #   - Every push that touches a test file or the workflow matrix
@@ -15,7 +15,7 @@ on:
     paths:
       - tests/**/test_*.py
       - tests/configs/**
-      - .github/workflows/torch_spyre_tests.yaml
+      - .github/workflows/_test_matrix.yaml
       - .github/workflows/check-test-ci-coverage.yaml
     branches: [main]
 
@@ -24,7 +24,7 @@ on:
     paths:
       - tests/**/test_*.py
       - tests/configs/**
-      - .github/workflows/torch_spyre_tests.yaml
+      - .github/workflows/_test_matrix.yaml
       - .github/workflows/check-test-ci-coverage.yaml
   merge_group:
     types: [checks_requested]
@@ -71,7 +71,7 @@ jobs:
           echo "                            (add as a secondary 'path:' entry)"
           echo "     For model ops test suites: tests/configs/model_ops_tests/path/to/yaml"
           echo ""
-          echo "  2. That config file referenced in a workflow matrix under .github/workflows/:"
+          echo "  2. That config file referenced in the workflow matrix in .github/workflows/_test-matrix.yml:"
           echo "       - name: <Human Readable Name>"
           echo "         config: <subdir>/<config_filename>.yaml"
           echo ""
