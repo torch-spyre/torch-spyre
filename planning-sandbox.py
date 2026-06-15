@@ -207,15 +207,21 @@ class Z3MemoryPlanSolver:
             for parent in b.in_place
         ]
 
-        for b in buffers:
-            b.end_time = b.end_time + 1
+        # Work on copies so we never mutate the caller's buffers -- mutating in
+        # place means a second plan_layout call on the same list re-applies the
+        # +1 / divide and gets garbage. end_time is bumped to an exclusive bound
+        # and size is converted to alignment units for the solver only.
+        working = [
+            replace(
+                b,
+                end_time=b.end_time + 1,
+                size=int(np.ceil(b.size / self._alignment)),
+            )
+            for b in buffers
+        ]
 
-        for b in buffers:
-            b.size = int(np.ceil(b.size / self._alignment))
-
-        offsets, spilled, chosen_div = self._run(buffers, candidates)
-        for _, o in offsets.items():
-            o *= self._alignment
+        offsets, spilled, chosen_div = self._run(working, candidates)
+        offsets = {k: v * self._alignment for k, v in offsets.items()}
 
         return [
             replace(
