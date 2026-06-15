@@ -636,23 +636,53 @@ correctly but waste a copy op here.
 
 When a `Reduction` op has a non-empty `loop_tiled_reduction_dims`
 (i.e. the hint named a reduction dimension), `_propagate_tiled_reduction_op`
-uses a **fill-initialize + per-tile combine** pattern:
+uses a **fill-initialize + per-tile combine** pattern.  The exact buffer
+allocation depends on whether tiling is flat (reduction dim only) or nested
+(outer output dim + inner reduction dim):
 
-1. **Allocate an HBM accumulation buffer** with the full output shape
-   (`data.ranges`, which is already the full output since only
-   `reduction_ranges` was divided by the tiling pass).
+**Flat (K-only) tiling** — a single `accum_full` HBM buffer is allocated.
+The fill and combine ops both target `accum_full` directly.
+
+1. **Allocate `accum_full`** with the full output shape (`data.ranges`,
+   which is already the full output since only `reduction_ranges` was
+   divided by the tiling pass).
 2. **Insert a fill op** (outside the loop, no `loop_info`) that writes the
-   reduction's identity value into the accumulation buffer.  The identity
-   value is produced by a `SpyreConstantFallback` scalar with a manually
-   assigned `FixedTiledLayout` (necessary because `finalize_layouts` has
-   already run by the time this pass executes).
+   reduction's identity value into `accum_full`.  The identity value is
+   produced by a `SpyreConstantFallback` scalar with a manually assigned
+   `FixedTiledLayout` (necessary because `finalize_layouts` has already run
+   by the time this pass executes).
 3. **Insert a combine op** (inside the loop, same `loop_info` as the tiled
-   reduction op) that merges each tile's partial result into the accumulation
-   buffer using the appropriate pointwise binary operator.
+   reduction op) that merges each tile's partial result into `accum_full`
+   using the appropriate pointwise binary operator.
 4. **Mark the tiled reduction op's output `per_tile_fixed`** — it is a
    per-tile scratch buffer whose base address does not advance between
    iterations.
-5. **Patch outside consumers** to read the accumulation buffer.
+5. **Patch outside consumers** to read `accum_full`.
+
+**Nested (outer output dim + inner reduction dim) tiling** — two buffers
+are allocated to enable LX scratchpad placement of the inner accumulator
+(e.g. outer-B + inner-K for bmm/mm):
+
+1. **Allocate `accum_full`** (full HBM output, shape matching the full
+   output across all outer tiles).
+2. **Allocate `accum_tile`** (per-tile scratch, same per-tile output shape).
+   `accum_tile.layout.per_tile_fixed = True` so the unroller never advances
+   its base address; `scratchpad_planning` can therefore place it in LX
+   scratchpad memory.
+3. **Insert a fill op** (inside the outer loop, carrying the outer
+   `loop_info`) that writes the identity value into `accum_tile` once per
+   outer-loop tile.
+4. **Insert a combine op** (inside the inner loop, same `loop_info` as the
+   tiled reduction op) that merges each inner-tile partial result into
+   `accum_tile`.
+5. **Insert a `coarse_tile_reduce_copy` op** (inside the outer loop, after
+   the inner loop) that copies `accum_tile → accum_full`.  It carries the
+   outer `loop_info` so the unroller advances `accum_full`'s HBM address
+   once per outer-loop tile.  The copy uses `MutationLayoutSHOULDREMOVE`
+   so no extra allocation is created.
+6. **Mark the tiled reduction op's output `per_tile_fixed`** (the inner
+   scratch for the reduction kernel itself).
+7. **Patch outside consumers** to read `accum_full`.
 
 Identity values and combine operators by `reduction_type`:
 
@@ -669,28 +699,23 @@ Identity values and combine operators by `reduction_type`:
 `RuntimeError` when a user attempts to tile them.
 
 Before running propagation, the pass calls `_validate_reduction_tiling(op)`,
-which raises `RuntimeError` for configurations deferred to Stage 2:
+which raises `RuntimeError` for configurations not yet implemented:
 
 - **Stick-dim reduction** — if the tiled reduction index corresponds to the
   within-stick dimension of the primary input (detected via
-  `device_coordinates`).
+  `device_coordinates`), except for `BATCH_MATMUL_OP` whose tile output is
+  always a full `[M, N]` matrix.
 - **Mixed output+reduction at the same nesting level** — `loop_tiled_dims[i]`
   and `loop_tiled_reduction_dims[i]` are both non-empty for some level `i`.
-- **Mixed output+reduction across different levels** — some levels tile only
-  output dims, others tile only reduction dims.
 - **Multiple reduction indices at one level** — `len(loop_tiled_reduction_dims[i]) > 1`.
 
-The cross-level mixed check runs first (before the per-level loop) so Stage 2
-errors are raised before `_reduction_tiling_is_on_stick_dim` is called, which
-requires a real `get_read_writes()` result.
+Nested tiling where outer level(s) tile output dims and the innermost level
+tiles a reduction dim (e.g. outer-B + inner-K for bmm) is fully supported
+and handled by the two-buffer pattern described above.
 
-**Stage 2 (not yet implemented):** Stick-dim reduction tiling requires
-handling the column-vector output addressing that arises when the tiling
-dimension is the innermost (stick) dimension of the input.  The
-`loop_tiled_reduction_dims` field is already shaped as a `list[list[int]]`
-to anticipate multi-level nesting; relaxing the Stage 2 guard in
-`_validate_reduction_tiling` and adding stick-dim output addressing is the
-only remaining work.
+**Not yet implemented:** Stick-dim reduction tiling (except `BATCH_MATMUL_OP`)
+requires handling column-vector output addressing when the tiling dimension is
+the innermost (stick) dimension of the input.
 
 ## Layer 2 — `CountedLoopSchedulerNode`
 

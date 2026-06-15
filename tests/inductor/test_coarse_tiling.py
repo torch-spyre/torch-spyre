@@ -1963,10 +1963,10 @@ def _make_tiled_reduction_op(
 class TestCoarseTileReductionPropagation(unittest.TestCase):
     """Tests for insert_tiling_propagation Reduction support."""
 
-    def test_reduction_tiled_reduction_dim_raises_stage2(self):
+    def test_reduction_tiled_reduction_dim_nested_ok(self):
         from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
 
-        # Mixed nesting: outer tiles output dim, inner tiles reduction dim → Stage 2 error
+        # Nested: outer tiles output dim, inner tiles reduction dim — now supported
         op = _make_tiled_reduction_op(
             "red0",
             ranges=[Integer(128)],
@@ -1977,8 +1977,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_tiled_dims=[[0], []],
         )
         op.loop_info.loop_tiled_reduction_dims = [[], [0]]
-        with self.assertRaises(RuntimeError, msg="mixed nested tiling should raise"):
-            _validate_reduction_tiling(op)
+        _validate_reduction_tiling(op)  # must not raise
 
     def test_reduction_output_dim_tiled_ok(self):
         from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
@@ -1996,9 +1995,89 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
         # output-dim-only tiling should not raise
         _validate_reduction_tiling(op)
 
+    def test_nested_fill_gets_outer_loop_info(self):
+        """Fill op gets outer-level loop_info for nested output+reduction tiling."""
+        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(64)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        fill_info = _compute_fill_loop_info(op)
+        self.assertIsNotNone(fill_info)
+        self.assertEqual(fill_info.loop_group_id, (0,))
+        self.assertEqual(fill_info.loop_count, [Integer(2)])
+        self.assertEqual(fill_info.loop_tiled_dims, [[0]])
+
+    def test_flat_fill_has_no_loop_info(self):
+        """Fill op gets no loop_info for flat (pure) reduction tiling."""
+        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[0]]
+        fill_info = _compute_fill_loop_info(op)
+        self.assertIsNone(fill_info)
+
+
+class TestComputeFillLoopInfo(unittest.TestCase):
+    """_compute_fill_loop_info returns trimmed CoarseTileInfo for the fill op."""
+
+    def test_flat_reduction_returns_none(self):
+        """Pure reduction tiling (no output-dim level) → None (fill before all loops)."""
+        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[0]]
+        result = _compute_fill_loop_info(op)
+        self.assertIsNone(result)
+
+    def test_nested_outer_output_inner_reduction(self):
+        """Outer tiles dim 0 (output), inner tiles reduction dim 0 → fill gets outer loop_info."""
+        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(64)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        result = _compute_fill_loop_info(op)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.loop_group_id, (0,))
+        self.assertEqual(result.loop_count, [Integer(2)])
+        self.assertEqual(result.loop_tiled_dims, [[0]])
+        self.assertEqual(result.loop_tiled_reduction_dims, [[]])
+
 
 class TestValidateReductionTiling(unittest.TestCase):
-    """_validate_reduction_tiling raises for unsupported Stage-2 configurations."""
+    """Tests for _validate_reduction_tiling: raising on unsupported cases,
+    passing on supported ones."""
 
     def _make_op(self, loop_tiled_dims, loop_tiled_reduction_dims):
         from torch._inductor.ir import ComputedBuffer, Reduction
@@ -2053,14 +2132,15 @@ class TestValidateReductionTiling(unittest.TestCase):
         with self.assertRaises(RuntimeError, msg="mixed same-level should raise"):
             _validate_reduction_tiling(op)
 
-    def test_mixed_different_levels_raises(self):
-        """Output dim tiled at level 0, reduction dim at level 1 — Stage 2, raises."""
+    def test_mixed_different_levels_allowed(self):
+        """Outer output-dim tiling + inner reduction-dim tiling — now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
         from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
         data.reduction_ranges = [Integer(256)]
+        data.reduction_type = "sum"
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
@@ -2070,8 +2150,8 @@ class TestValidateReductionTiling(unittest.TestCase):
             loop_tiled_dims=[[0], []],
             loop_tiled_reduction_dims=[[], [0]],
         )
-        with self.assertRaises(RuntimeError, msg="mixed nested levels should raise"):
-            _validate_reduction_tiling(op)
+        # Must not raise: outer output-dim + inner reduction-dim is now supported.
+        _validate_reduction_tiling(op)
 
     def test_multiple_reduction_dims_same_level_raises(self):
         """Multiple reduction dims tiled at one level — Stage 2, raises."""

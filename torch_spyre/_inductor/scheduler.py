@@ -54,15 +54,23 @@ def _find_leaf_sched_node(node: BaseSchedulerNode):
 def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -> list:
     """Return the OpSpec iteration-space symbols tiled at ``depth``.
 
-    Uses ``loop_tiled_dims[depth]`` from the IR node and the SchedulerNode's
-    ``iteration_space`` (which produces the same symbols as ``create_op_spec``
-    uses to build ``OpSpec.tiled_symbols``).
+    Uses ``loop_tiled_dims[depth]`` and ``loop_tiled_reduction_dims[depth]``
+    from the IR node and the SchedulerNode's ``iteration_space`` (which
+    produces the same symbols as ``create_op_spec`` uses to build
+    ``OpSpec.tiled_symbols``).
 
     ``loop_tiled_dims`` stores *host-range* dimension indices (indices into
     ``op.data.ranges``), which include unit-size batch dimensions that are
     skipped in the iteration space.  We must map host-range indices to
     iteration-space key indices by walking ``op.data.ranges`` and counting
     only the non-unit entries.
+
+    For reduction-dimension tiling (``loop_tiled_reduction_dims``), the
+    reduction symbols follow the output symbols in the iteration space key
+    list (the scheduler produces keys from reads.ranges for Reduction nodes,
+    which has output dims first then reduction dims).  The offset is the
+    number of non-unit output-dim ranges; indices in
+    ``loop_tiled_reduction_dims`` are 0-based into the reduction portion.
     """
     ir_op = sched_node.node
     if ir_op is None:
@@ -71,9 +79,11 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
     if loop_info is None:
         return []
     raw = loop_info.loop_tiled_dims
-    if not raw:
+    raw_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
+    if not raw and not raw_rdims:
         return []
-    dims_per_level: list[list[int]] = raw
+    dims_per_level: list[list[int]] = raw if raw else [[] for _ in raw_rdims]
+    rdims_per_level: list[list[int]] = raw_rdims if raw_rdims else [[] for _ in raw]
     if depth >= len(dims_per_level):
         return []
     it_space = iteration_space(sched_node)
@@ -95,6 +105,19 @@ def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -
         mapped = host_to_it.get(d)
         if mapped is not None and mapped < len(keys):
             result.append(keys[mapped])
+
+    # Map reduction-dimension indices to iteration-space symbols.  For
+    # Reduction nodes the iteration space (from reads.ranges) has output-dim
+    # symbols first, then reduction-dim symbols.  The offset is the count of
+    # non-unit output-dim ranges.
+    rdims_at_depth = rdims_per_level[depth] if depth < len(rdims_per_level) else []
+    if rdims_at_depth:
+        n_output_syms = sum(1 for r in ir_op.data.ranges if int(r) != 1)
+        for rd in rdims_at_depth:
+            sym_idx = n_output_syms + rd
+            if sym_idx < len(keys):
+                result.append(keys[sym_idx])
+
     return result
 
 
