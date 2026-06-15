@@ -55,6 +55,8 @@ import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    Layout,
+    Loops,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -219,6 +221,42 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
         hints_logger.info("%s", "\n".join(summary_lines))
 
     return groups
+
+
+def _cache_key(cached_method: object) -> str:
+    """Return the cache attribute name used by a cache_on_self / cache_on_self_and_args method.
+
+    cache_on_self uses key ``f"__{fn.__name__}_cache"``; cache_on_self_and_args uses
+    ``f"__{class_name}_{fn.__name__}_cache"``.  Both patterns are captured as the
+    ``key`` free variable in the method's ``.clear_cache`` closure — extract it once
+    at module load so misspellings or upstream renames fail loudly on import.
+    """
+    clear_fn = getattr(cached_method, "clear_cache")  # AttributeError if absent
+    for i, name in enumerate(clear_fn.__code__.co_freevars):
+        if name == "key":
+            return clear_fn.__closure__[i].cell_contents
+    raise AttributeError(
+        f"Cannot find 'key' in clear_cache closure of {cached_method!r}"
+    )
+
+
+# Resolve cache keys once at import time — any rename in upstream IR will raise
+# AttributeError here rather than silently no-oping at runtime.
+_LOOPS_FREE_SYMS_KEY = _cache_key(Loops.get_free_symbol_uses)
+_LOOPS_INNER_FN_STR_KEY = _cache_key(Loops.inner_fn_str)
+_LOOPS_INNER_FN_OPCOUNT_KEY = _cache_key(Loops.inner_fn_opcount)
+_REDUCTION_FREE_SYMS_KEY = _cache_key(Reduction.get_free_symbol_uses)
+_LAYOUT_FREE_SYMS_KEY = _cache_key(Layout.get_free_symbol_uses)
+_COMPUTED_BUF_FREE_SYMS_KEY = _cache_key(ComputedBuffer.get_free_symbol_uses)
+_COMPUTED_BUF_SIZES_KEY = _cache_key(ComputedBuffer.get_default_sizes_body)
+
+
+def _clear_cache(obj: object, key: str) -> None:
+    # cache_on_self/cache_on_self_and_args store results via object.__setattr__ to
+    # bypass frozen-dataclass guards (Loops, Reduction, Layout); clearing must also
+    # use object.__delattr__ — plain delattr() raises FrozenInstanceError.
+    if hasattr(obj, key):
+        object.__delattr__(obj, key)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1267,17 @@ def _divide_ranges(
     # Loops is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "ranges", ranges)
 
+    # Invalidate Loops-level caches that read ranges.
+    _clear_cache(data, _LOOPS_FREE_SYMS_KEY)
+    _clear_cache(data, _LOOPS_INNER_FN_STR_KEY)
+    _clear_cache(data, _LOOPS_INNER_FN_OPCOUNT_KEY)
+    if isinstance(data, Reduction):
+        _clear_cache(data, _REDUCTION_FREE_SYMS_KEY)
+
+    # Invalidate ComputedBuffer-level caches derived from data.ranges.
+    _clear_cache(op, _COMPUTED_BUF_SIZES_KEY)
+    _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
+
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     from torch._inductor.ir import FixedLayout, FlexibleLayout
 
@@ -1245,6 +1294,10 @@ def _divide_ranges(
 
     # Recompute contiguous strides for the smaller buffer.
     layout.stride = list(FlexibleLayout.contiguous_strides(new_size))
+
+    # Invalidate Layout- and ComputedBuffer-level caches that read size/stride.
+    _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
+    _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
     # Rebuild SpyreTensorLayout for the new host size, preserving the
     # within-stick dimension.  stride_map[-1] is the element stride of the
