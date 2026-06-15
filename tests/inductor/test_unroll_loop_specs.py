@@ -591,5 +591,187 @@ class TestNestedReductionUnroll(unittest.TestCase):
             )
 
 
+class TestNestedReductionTileAccum(unittest.TestCase):
+    """Verify unroller behaviour for the tile-sized accum buffer pattern.
+
+    Pattern (outer B=2 tiles, inner K=4 tiles):
+      outer LoopSpec(count=2, tiled_symbols=[c_b]):
+        fill: output=accum_tile (per_tile_fixed=True)
+        inner LoopSpec(count=4, tiled_symbols=[c_k]):
+          bmm partial: K-input advances; output per_tile_fixed=True
+          combine: both args=accum_tile (per_tile_fixed=True)
+        copy: input=accum_tile (per_tile_fixed=True),
+              output=accum_full (advances per outer B-tile)
+
+    After full unrolling:
+      outer=2, inner=4 → 2*(1 fill + 4*(bmm+combine) + 1 copy) = 20 ops
+    """
+
+    _C_B = Symbol("c_b")
+    _C_M = Symbol("c_m")
+    _C_N = Symbol("c_n")
+    _C_K = Symbol("c_k")
+
+    _ACCUM_TILE_BASE = 0x0  # per_tile_fixed: always stays at 0
+    _ACCUM_FULL_BASE = 0x1000000000  # advances per outer B-tile
+
+    # accum_tile: [64, 32] fp16 per tile; simple device layout
+    _TILE_DEVICE_SIZE = [1, 64, 32]  # 1 stick-group, 64 rows, 32 cols
+    _TILE_STRIDE_MAP = [2048, 32, 1]
+
+    # accum_full: [128, 32] fp16 = 2 tiles × [64, 32]; c_b in device coords
+    # stride_map[0] = 64*32 = 2048 elements per B-tile
+    # byte stride per outer tile = 1 * 2048 * 2 = 4096
+    _FULL_DEVICE_SIZE = [1, 128, 32]
+    _FULL_STRIDE_MAP = [2048, 32, 1]
+    _OUTER_TILE_STRIDE_BYTES = 1 * 2048 * 2  # 4096
+
+    def _make_accum_tile_arg(self) -> TensorArg:
+        return TensorArg(
+            is_input=True,
+            arg_index=-1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=list(self._TILE_DEVICE_SIZE),
+            device_coordinates=[Integer(0), self._C_M, self._C_N],
+            allocation={"hbm": self._ACCUM_TILE_BASE},
+            stride_map=list(self._TILE_STRIDE_MAP),
+            per_tile_fixed=True,
+        )
+
+    def _make_accum_full_arg(self) -> TensorArg:
+        # c_b in device_coordinates so outer-loop unroller can compute byte stride.
+        return TensorArg(
+            is_input=False,
+            arg_index=-1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=list(self._FULL_DEVICE_SIZE),
+            device_coordinates=[self._C_B, self._C_M, self._C_N],
+            allocation={"hbm": self._ACCUM_FULL_BASE},
+            stride_map=list(self._FULL_STRIDE_MAP),
+            per_tile_fixed=False,
+        )
+
+    def _make_fill_op(self) -> OpSpec:
+        """Fill: zeros accum_tile once per outer B-tile."""
+        return OpSpec(
+            op="fill",
+            is_reduction=False,
+            iteration_space={
+                self._C_B: (Integer(1), 1),
+                self._C_M: (Integer(64), 1),
+                self._C_N: (Integer(32), 1),
+            },
+            args=[self._make_accum_tile_arg()],
+            op_info={},
+            tiled_symbols=[],
+        )
+
+    def _make_copy_op(self) -> OpSpec:
+        """Copy: accum_tile → accum_full after inner K-loop."""
+        return OpSpec(
+            op="copy",
+            is_reduction=False,
+            iteration_space={
+                self._C_B: (Integer(1), 1),
+                self._C_M: (Integer(64), 1),
+                self._C_N: (Integer(32), 1),
+            },
+            args=[
+                self._make_accum_tile_arg(),  # input: per_tile_fixed, never advances
+                self._make_accum_full_arg(),  # output: advances per outer B-tile
+            ],
+            op_info={},
+            tiled_symbols=[],
+        )
+
+    def _make_nested_loop(self) -> LoopSpec:
+        bmm_input = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[2, 64, 64],
+            device_coordinates=[
+                self._C_K // 64,
+                self._C_M,
+                sympy.Mod(self._C_K, 64),
+            ],
+            allocation={"hbm": 0x800000000},
+            stride_map=[64, 512, 1],
+            per_tile_fixed=False,
+        )
+        bmm_output = TensorArg(
+            is_input=False,
+            arg_index=-1,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=list(self._TILE_DEVICE_SIZE),
+            device_coordinates=[Integer(0), self._C_M, self._C_N],
+            allocation={"hbm": 0x2000000000},
+            stride_map=list(self._TILE_STRIDE_MAP),
+            per_tile_fixed=True,
+        )
+        bmm_partial = OpSpec(
+            op="matmul",
+            is_reduction=True,
+            iteration_space={
+                self._C_M: (Integer(64), 1),
+                self._C_N: (Integer(32), 1),
+                self._C_K: (Integer(128), 1),
+            },
+            args=[bmm_input, bmm_output],
+            op_info={},
+            tiled_symbols=[self._C_K],
+        )
+        combine_op = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                self._C_M: (Integer(64), 1),
+                self._C_N: (Integer(32), 1),
+            },
+            args=[self._make_accum_tile_arg(), self._make_accum_tile_arg()],
+            op_info={},
+            tiled_symbols=[],
+        )
+        inner = LoopSpec(
+            count=Integer(4),
+            body=[bmm_partial, combine_op],
+            tiled_symbols=[self._C_K],
+        )
+        return LoopSpec(
+            count=Integer(2),
+            body=[self._make_fill_op(), inner, self._make_copy_op()],
+            tiled_symbols=[self._C_B],
+        )
+
+    def test_accum_tile_fixed_accum_full_advances(self):
+        """accum_tile never advances; accum_full advances by outer-tile stride each B iter."""
+        loop = self._make_nested_loop()
+        result = unroll_loop_specs([loop])
+        # 2 * (1 fill + 4*(bmm+combine) + 1 copy) = 20 ops
+        self.assertEqual(len(result), 20, f"Expected 20 ops, got {len(result)}")
+        # Positions: fill(0), bmm(1),comb(2),bmm(3),comb(4),bmm(5),comb(6),bmm(7),comb(8),
+        #            copy(9), fill(10), bmm(11)..copy(19)
+        copy_0 = result[9]
+        copy_1 = result[19]
+        # accum_tile input (index 0): per_tile_fixed, must never advance
+        self.assertEqual(copy_0.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
+        self.assertEqual(copy_1.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
+        # accum_full output (index 1): advances by one tile per outer B iteration
+        self.assertEqual(copy_0.args[1].allocation["hbm"], self._ACCUM_FULL_BASE)
+        self.assertEqual(
+            copy_1.args[1].allocation["hbm"],
+            self._ACCUM_FULL_BASE + self._OUTER_TILE_STRIDE_BYTES,
+        )
+
+    def test_fill_always_targets_tile_base(self):
+        """fill op always targets accum_tile (per_tile_fixed) regardless of outer tile."""
+        loop = self._make_nested_loop()
+        result = unroll_loop_specs([loop])
+        fill_0 = result[0]
+        fill_1 = result[10]
+        self.assertEqual(fill_0.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
+        self.assertEqual(fill_1.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
+
+
 if __name__ == "__main__":
     unittest.main()
