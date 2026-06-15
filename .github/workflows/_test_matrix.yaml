@@ -223,6 +223,10 @@ jobs:
         with:
           rpm_location: ${{ inputs.rpm_location }}
           rpm_names: ${{ inputs.rpm_names }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Install RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -378,6 +382,10 @@ jobs:
         with:
           rpm_location: ${{ inputs.rpm_location }}
           rpm_names: ${{ inputs.rpm_names }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Install RPMs
         if: ${{ inputs.rpm_names != '' }}
