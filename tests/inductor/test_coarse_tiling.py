@@ -1888,6 +1888,16 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         self.assertEqual(mlir, expected)
 
     # --- Group 2: nested outer-B + inner-K reduction ---
+    #
+    # Strides match TestNestedReductionUnroll in test_unroll_loop_specs.py:
+    #   k_input: device_size=[2,64,64], stride_map=[64,64,1], 128 K-elems/tile
+    #     byte_stride = (128//64) * 64 * 2 = 256
+    #   accum_buf: device_size=[1,2,64], stride_map=[64,64,1], 2 batches/tile
+    #     byte_stride = 2 * 64 * 2 = 256
+    # Both happen to be 256; the combine's accum_buf stride is irrelevant (not
+    # tiled on K), so only K_STRIDE=256 appears in the affine map.
+
+    _GRP2_K_STRIDE = 256  # (128//64) * 64 * 2
 
     def _fake_nested_reduction(self, k_stride):
         c_k = self._c_k
@@ -1914,15 +1924,17 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
 
     def test_nested_reduction_bmm_emits_affine_apply(self):
         mlir = self._bundle(
-            self._make_nested_reduction_specs(), self._fake_nested_reduction(256)
+            self._make_nested_reduction_specs(),
+            self._fake_nested_reduction(self._GRP2_K_STRIDE),
         )
         self.assertIn("affine.apply", mlir)
-        self.assertIn("256", mlir)
+        self.assertIn(str(self._GRP2_K_STRIDE), mlir)
 
     def test_nested_reduction_combine_no_affine_apply(self):
         """combine's accum_buf (not tiled on K) must not get an affine.apply."""
         mlir = self._bundle(
-            self._make_nested_reduction_specs(), self._fake_nested_reduction(256)
+            self._make_nested_reduction_specs(),
+            self._fake_nested_reduction(self._GRP2_K_STRIDE),
         )
         # Only one affine.apply (for the bmm); the combine uses %sym_2 directly.
         self.assertEqual(mlir.count("affine.apply"), 1)
@@ -1933,16 +1945,18 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
 
     def test_nested_reduction_loop_structure(self):
         mlir = self._bundle(
-            self._make_nested_reduction_specs(), self._fake_nested_reduction(256)
+            self._make_nested_reduction_specs(),
+            self._fake_nested_reduction(self._GRP2_K_STRIDE),
         )
         self.assertEqual(mlir.count("scf.for"), 2)
 
     def test_nested_reduction_snapshot(self):
         mlir = self._bundle(
-            self._make_nested_reduction_specs(), self._fake_nested_reduction(256)
+            self._make_nested_reduction_specs(),
+            self._fake_nested_reduction(self._GRP2_K_STRIDE),
         )
         expected = (
-            "#map_0 = affine_map<(d0)[s0] -> (s0 + 256*d0)>\n"
+            f"#map_0 = affine_map<(d0)[s0] -> (s0 + {self._GRP2_K_STRIDE}*d0)>\n"
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
             "\t\t%c0 = arith.constant 0 : index\n"
@@ -1967,6 +1981,15 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         self.assertEqual(mlir, expected)
 
     # --- Group 3: tile-accum copy pattern ---
+    #
+    # Strides match TestNestedReductionTileAccum in test_unroll_loop_specs.py:
+    #   bmm K-input: same geometry as Group 2 → K_STRIDE = 256
+    #   accum_full (copy output): device_size=[1,128,32], stride_map=[2048,32,1]
+    #     device_coords=[c_b, c_m, c_n]; 1 tile advances c_b by 1
+    #     byte_stride = 1 * 2048 * 2 = 4096  (_OUTER_TILE_STRIDE_BYTES)
+
+    _GRP3_K_STRIDE = 256  # (128//64) * 64 * 2
+    _GRP3_B_STRIDE = 4096  # 1 * 2048 * 2
 
     def _fake_tile_accum(self, k_stride, b_stride):
         c_k, c_b = self._c_k, self._c_b
@@ -2000,7 +2023,8 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
     def test_tile_accum_copy_advances_per_outer_tile(self):
         """copy op (tiled on outer B) emits affine.apply with outer loop var %i_0."""
         mlir = self._bundle(
-            self._make_tile_accum_specs(), self._fake_tile_accum(256, 512)
+            self._make_tile_accum_specs(),
+            self._fake_tile_accum(self._GRP3_K_STRIDE, self._GRP3_B_STRIDE),
         )
         apply_lines = [ln for ln in mlir.splitlines() if "affine.apply" in ln]
         # bmm uses %i_1 (inner K); copy uses %i_0 (outer B)
@@ -2016,7 +2040,8 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
     def test_tile_accum_fill_no_affine_apply(self):
         """fill op (per_tile_fixed output) must not get an affine.apply."""
         mlir = self._bundle(
-            self._make_tile_accum_specs(), self._fake_tile_accum(256, 512)
+            self._make_tile_accum_specs(),
+            self._fake_tile_accum(self._GRP3_K_STRIDE, self._GRP3_B_STRIDE),
         )
         execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
         # fill is the first sdsc_execute inside the outer loop
@@ -2026,11 +2051,12 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
 
     def test_tile_accum_snapshot(self):
         mlir = self._bundle(
-            self._make_tile_accum_specs(), self._fake_tile_accum(256, 512)
+            self._make_tile_accum_specs(),
+            self._fake_tile_accum(self._GRP3_K_STRIDE, self._GRP3_B_STRIDE),
         )
         expected = (
-            "#map_0 = affine_map<(d0)[s0] -> (s0 + 256*d0)>\n"
-            "#map_1 = affine_map<(d0)[s0] -> (s0 + 512*d0)>\n"
+            f"#map_0 = affine_map<(d0)[s0] -> (s0 + {self._GRP3_K_STRIDE}*d0)>\n"
+            f"#map_1 = affine_map<(d0)[s0] -> (s0 + {self._GRP3_B_STRIDE}*d0)>\n"
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
             "\t\t%c0 = arith.constant 0 : index\n"
