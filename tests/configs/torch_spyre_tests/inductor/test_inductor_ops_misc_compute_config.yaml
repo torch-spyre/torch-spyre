@@ -78,4 +78,6 @@ test_suite_config:
             - TestOps::test_core_reduction_invalid_dims_spyre.*
             - TestOps::test_single_dim_reduction_invalid_dims_api.*
             - TestOps::test_single_dim_reduction_invalid_dims_spyre.*
+            # restickify add on padded dim tests
+            - TestOps::test_restickify_add_transpose.*
           mode: mandatory_success
