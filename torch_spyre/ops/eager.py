@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.utils._pytree as pytree
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -73,55 +74,24 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
 # "Scheduler failed to find a suitable op mapping for sdsc: 0_<op>").
 # Route those calls through CPU at dispatch time. The result is moved back
 # to the spyre device so callers that expect a spyre tensor still get one.
-# This is the broader, dispatcher-level form of the per-op CPU-fallback
-# pattern already in use elsewhere in this module (cf. PR #2590 which adds
-# CPU fallbacks for amax/amin on bool via a per-op decomposition).
-_UNSUPPORTED_INT_DTYPES = (
-    torch.int8,
-    torch.uint8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
+_UNSUPPORTED_INT_DTYPES = frozenset(
+    {
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
 )
 
 
-def _has_int_tensor(values):
-    for v in values:
-        if isinstance(v, torch.Tensor) and v.dtype in _UNSUPPORTED_INT_DTYPES:
-            return True
-    return False
-
-
-def _to_cpu(value):
-    if isinstance(value, torch.Tensor):
-        return value.cpu()
-    if isinstance(value, (list, tuple)):
-        return type(value)(_to_cpu(v) for v in value)
-    return value
-
-
-def _to_device(value, device):
-    if isinstance(value, torch.Tensor):
-        return value.to(device)
-    if isinstance(value, (list, tuple)):
-        return type(value)(_to_device(v, device) for v in value)
-    return value
-
-
-def _pick_spyre_device(args, kwargs):
-    for v in args:
-        if isinstance(v, torch.Tensor) and v.device.type == "spyre":
-            return v.device
-    for v in kwargs.values():
-        if isinstance(v, torch.Tensor) and v.device.type == "spyre":
-            return v.device
-    return torch.device("spyre")
+def _is_unsupported_int_tensor(t):
+    return isinstance(t, torch.Tensor) and t.dtype in _UNSUPPORTED_INT_DTYPES
 
 
 def dispatch_to_torch_compile(*args, compiled=None, op=None, **kwargs):
-    if op is not None and (
-        _has_int_tensor(args) or _has_int_tensor(kwargs.values())
-    ):
+    leaves = pytree.arg_tree_leaves(*args, **kwargs)
+    if op is not None and any(_is_unsupported_int_tensor(t) for t in leaves):
         # Late import to avoid circulars at module load.
         from .fallbacks import FallbackWarning
 
@@ -130,11 +100,19 @@ def dispatch_to_torch_compile(*args, compiled=None, op=None, **kwargs):
             category=FallbackWarning,
             stacklevel=2,
         )
-        device = _pick_spyre_device(args, kwargs)
-        cpu_args = tuple(_to_cpu(a) for a in args)
-        cpu_kwargs = {k: _to_cpu(v) for k, v in kwargs.items()}
+        spyre_device = next(
+            (
+                t.device
+                for t in leaves
+                if isinstance(t, torch.Tensor) and t.device.type == "spyre"
+            ),
+            torch.device("spyre"),
+        )
+        cpu_args, cpu_kwargs = pytree.tree_map_only(
+            torch.Tensor, lambda t: t.cpu(), (args, kwargs)
+        )
         result = op(*cpu_args, **cpu_kwargs)
-        return _to_device(result, device)
+        return pytree.tree_map_only(torch.Tensor, lambda t: t.to(spyre_device), result)
     return compiled(*args, **kwargs)
 
 

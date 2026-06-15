@@ -136,5 +136,71 @@ class TestFallbacks(TestCase):
             self.assertEqual(id(buffer_spyre), id(output_spyre))
 
 
+@instantiate_parametrized_tests
+class TestIntDispatchFallback(TestCase):
+    """Integer-typed inputs to ops registered via `register_torch_compile_kernel`
+    must transparently fall back to CPU. Spyre is fp16-only and the SDSC
+    scheduler aborts with "Scheduler failed to find a suitable op mapping" on
+    integer arithmetic; without this fallback the eager dispatch SIGABRTs (or,
+    worse, returns uninitialized memory — see issue #2376).
+    """
+
+    def test_int_add_emits_fallback_warning(self):
+        # The eager dispatcher should emit FallbackWarning on int dispatch
+        # rather than reaching the SDSC compiler.
+        a = torch.arange(16, dtype=torch.int64, device="spyre")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FallbackWarning)
+            _ = a + 2
+        assert any(issubclass(w.category, FallbackWarning) for w in caught), (
+            "expected FallbackWarning when adding int64 tensors on Spyre"
+        )
+
+    @parametrize(
+        "dtype",
+        [torch.int8, torch.int16, torch.int32, torch.int64],
+    )
+    def test_int_add_matches_cpu(self, dtype):
+        a_cpu = torch.arange(16, dtype=dtype)
+        b_cpu = torch.arange(16, dtype=dtype) + 1
+        out_cpu = a_cpu + b_cpu
+        out_spyre = (a_cpu.to("spyre") + b_cpu.to("spyre")).cpu()
+        assert_close(out_spyre, out_cpu)
+
+    def test_int_add_scalar_matches_cpu(self):
+        # Covers the exact scalar-add pattern from issue #2376 — without the
+        # fallback, Spyre returned uninitialized 0xAAAAAAAA bytes rather than
+        # the correct sum.
+        a_cpu = torch.arange(16, dtype=torch.int64)
+        out_cpu = a_cpu + 2
+        out_spyre = (a_cpu.to("spyre") + 2).cpu()
+        assert_close(out_spyre, out_cpu)
+
+    def test_int_cat_with_list_arg_matches_cpu(self):
+        # `aten.cat`'s first arg is a `list[Tensor]`. The dispatcher must look
+        # through nested containers when checking for unsupported dtypes;
+        # otherwise the int tensors hide inside the list and the kernel still
+        # reaches SDSC.
+        tensors_cpu = [
+            torch.arange(16, dtype=torch.int64),
+            torch.arange(16, 32, dtype=torch.int64),
+        ]
+        out_cpu = torch.cat(tensors_cpu)
+        out_spyre = torch.cat([t.to("spyre") for t in tensors_cpu]).cpu()
+        assert_close(out_spyre, out_cpu)
+
+    def test_float_add_does_not_fall_back(self):
+        # Regression guard: fp16 add must stay on-device (no FallbackWarning).
+        # The fallback is dtype-conditional, not a blanket override.
+        a = torch.rand(16, dtype=torch.float16, device="spyre")
+        b = torch.rand(16, dtype=torch.float16, device="spyre")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FallbackWarning)
+            _ = a + b
+        assert not any(issubclass(w.category, FallbackWarning) for w in caught), (
+            "fp16 add should not fall back to cpu"
+        )
+
+
 if __name__ == "__main__":
     run_tests()
