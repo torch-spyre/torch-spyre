@@ -1389,6 +1389,76 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         self.assertIn("sympify('2')", src, "Expected outer loop count 2")
         self.assertIn("sympify('4')", src, "Expected inner loop count 4")
 
+    @config.patch({"lx_planning": False, "unroll_loops": False})
+    def test_nested_matmul_copy_after_inner_loop(self):
+        """The accum→output copy op appears in generated source for nested K-tiling."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "coarse_tile_reduce_copy",
+            src,
+            "Expected a coarse_tile_reduce_copy op in generated source for nested M+K tiling",
+        )
+
+    @config.patch(
+        {
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "unroll_loops": False,
+        }
+    )
+    def test_nested_matmul_outer_M_inner_K_accum_in_lx(self):
+        """With lx_planning enabled, the tile-sized accum buffer lands in LX scratchpad."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "allocation={'lx'",
+            src,
+            "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
