@@ -24,7 +24,7 @@ from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .pass_utils import replace_computed_buffer_body
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 
 logger = get_inductor_logger("split_multi_ops")
 
@@ -541,14 +541,6 @@ def validate_ops(graph: GraphLowering) -> None:
         read_writes = op.get_read_writes()
         inputs = [r for r in read_writes.reads if isinstance(r, MemoryDep)]
 
-        # Skip layernorm operations as they have special layout requirements
-        if hasattr(op.data, "origins") and op.data.origins:
-            origin_node = next(iter(op.data.origins))
-            if hasattr(origin_node.target, "name") and "layernorm" in str(
-                origin_node.target
-            ):
-                continue
-
         # Exclude single input ops
         if len(inputs) <= 1:
             continue
@@ -568,15 +560,28 @@ def validate_ops(graph: GraphLowering) -> None:
         if len(layouts) <= 1:
             continue
 
+        op_name = op.get_name()
+        if hasattr(op.data, "origins") and op.data.origins:
+            origin_node = next(iter(op.data.origins))
+            if hasattr(origin_node.target, "name"):
+                op_name = origin_node.target.name
+
         # Check all layouts have the same element_arrangement
         stl_eas = [layout.element_arrangement for layout in layouts]
+
+        # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
+        skip_ops = {"layernormnorm", "layernormscale"}
+        skip_eas = {ElementArrangement.EXX2}
+        if op_name in skip_ops and all(ea in skip_eas for ea in stl_eas):
+            continue
+
         if len(set(stl_eas)) != 1:
             args_str = ", ".join(
-                [f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)]
+                f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
             )
             raise Unsupported(
                 f"All inputs to an op must have same element arrangement, "
-                f"op: {op.get_name()}, args: {args_str}"
+                f"op: {op_name}, args: {args_str}"
             )
 
 
