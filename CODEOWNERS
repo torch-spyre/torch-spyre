@@ -26,7 +26,6 @@
 # Distributed / collective communication (spyre_ccl)
 /torch_spyre/csrc/distributed/  @jjhursey @JRosenkranz @thoangtrvn
 /tests/distributed/              @jjhursey @thoangtrvn @avery-blanchard
-/examples/distributed/           @jjhursey @thoangtrvn @avery-blanchard
 
 # Profiler
 /torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971

@@ -65,4 +65,4 @@ print(f"Output of matmul with torch.compile\n: {output}")
 ```
 
 # More Examples
-Refer to the [examples](https://github.com/torch-spyre/torch-spyre/tree/main/examples) directory in this repository, which provides more examples of using PyTorch on `spyre` device.
+Refer to the [examples](https://github.com/torch-spyre/torch-spyre/tree/main/docs/source/user_guide/examples) directory in this repository, which provides more examples of using PyTorch on `spyre` device.
