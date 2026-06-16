@@ -397,6 +397,7 @@ test/*.json
 
 .*env*
 stubs
+ffdc_reports/
 
 # provenance audit outputs
 provenance_capture_raw.json

@@ -16,6 +16,11 @@ import os
 import torch
 from torch_spyre._C import launch_kernel, prepare_kernel, launch_jobplan
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre.profiler._ffdc import (
+    CATEGORY_RUNTIME_LAUNCH,
+    CATEGORY_UNIMPLEMENTED,
+    collect as _ffdc_collect,
+)
 
 logger = get_inductor_logger("kernel_runner")
 
@@ -26,9 +31,19 @@ class SpyreUnimplementedRunner:
         self.op = op
 
     def run(self, *args, **kw_args):
-        raise RuntimeError(
-            f"Invoked {self.kernel_name} which contains unimplemented operation {self.op}"
+        exc = RuntimeError(
+            f"Invoked {self.kernel_name} which contains"
+            f" unimplemented operation {self.op}"
         )
+        try:
+            _ffdc_collect(
+                exc,
+                failure_category=CATEGORY_UNIMPLEMENTED,
+                kernel_name=self.kernel_name,
+            )
+        except Exception:
+            pass
+        raise exc
 
 
 class SpyreSDSCKernelRunner:
@@ -44,7 +59,19 @@ class SpyreSDSCKernelRunner:
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
 
         with torch.profiler.record_function(f"launch_kernel:{self.kernel_name}"):
-            if self.jobplan:
-                launch_jobplan(self.jobplan, args)
-            else:
-                launch_kernel(self.code_dir, args)
+            try:
+                if self.jobplan:
+                    launch_jobplan(self.jobplan, args)
+                else:
+                    launch_kernel(self.code_dir, args)
+            except Exception as exc:
+                try:
+                    _ffdc_collect(
+                        exc,
+                        failure_category=CATEGORY_RUNTIME_LAUNCH,
+                        kernel_name=self.kernel_name,
+                        code_dir=self.code_dir,
+                    )
+                except Exception:
+                    pass
+                raise

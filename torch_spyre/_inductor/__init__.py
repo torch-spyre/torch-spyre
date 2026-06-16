@@ -104,18 +104,26 @@ def enable_spyre_compile_fx_wrapper():
                 with enable_spyre_context(
                     example_inputs, decomps=decomps
                 ) as spyre_context_decompositions:
-                    # The `decomps` is the updated in the context manager
-                    # with the appropriate spyre decompositions
-                    # and yielded as `spyre_context_decompositions` from the CM
-
                     kwargs["decompositions"] = spyre_context_decompositions
 
-                    return _orig(
-                        gm,
-                        example_inputs,
-                        *args,
-                        **kwargs,
-                    )
+                    try:
+                        return _orig(
+                            gm,
+                            example_inputs,
+                            *args,
+                            **kwargs,
+                        )
+                    except Exception as exc:
+                        try:
+                            from torch_spyre.profiler._ffdc import (
+                                CATEGORY_COMPILE,
+                                collect as _ffdc_collect,
+                            )
+
+                            _ffdc_collect(exc, failure_category=CATEGORY_COMPILE)
+                        except Exception:
+                            pass
+                        raise
 
             return _orig(gm, example_inputs, *args, **kwargs)
 
