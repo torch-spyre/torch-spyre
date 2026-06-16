@@ -96,6 +96,10 @@ class ScratchpadAllocator(ABC):
             and (
                 config.allow_all_ops_in_lx_planning
                 or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+                # Clones are only pinned when the boundary-clone path is on; they
+                # are never in the whitelist, so without this they'd be ineligible
+                # and the inserted clones would not land in LX.
+                or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
             )
         )
 
@@ -156,13 +160,12 @@ class ScratchpadAllocator(ABC):
                 continue
             if output_name in graph_output_names and not cloning_allowed:
                 continue  # we can only allocate graph outputs if we're allowed to clone
-            uses = lifetimes[output_name]
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
                     info["size_per_core"],
-                    uses[0],
-                    uses[-1] + 1,
+                    uses,
+                    first_use_is_read=False,
                     in_place_parents=in_place.get(output_name, []),
                 )
             )
@@ -189,8 +192,8 @@ class ScratchpadAllocator(ABC):
                     LifetimeBoundBuffer(
                         input_name,
                         dev_size // num_cores,
-                        uses[0],
-                        uses[-1] + 1,
+                        uses,
+                        first_use_is_read=True,
                         in_place_parents=[],
                     )
                 )

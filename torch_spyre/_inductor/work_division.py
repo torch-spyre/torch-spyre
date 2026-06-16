@@ -38,6 +38,9 @@ from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
+    _finite_upper_or_none,
+    compute_granularity,
+    compute_max_size,
     concretize_expr,
     get_mem_deps_from_rw,
     device_coordinates,
@@ -70,6 +73,73 @@ class TensorDep:
         self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
 
 
+# Per-symbol (max_size, granularity) bucket metadata for symbolic iteration vars.
+# Concrete iteration vars are absent from the dict — lookups default to the
+# concrete ``concretize_expr`` path via ``_effective_size`` / ``_valid_divisor_basis``.
+SymbolMeta = dict[Symbol, tuple[int, int]]
+
+
+def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
+    """Build ``{symbol: (max_size, granularity)}`` for opted-in symbolic dims.
+
+    An iteration var is "opted in" iff the user passed
+    ``mark_dynamic(max=...)`` -- that's exactly when ShapeEnv records a
+    finite upper bound. Auto-dynamic symbols (Dynamo promoting an int on
+    retrace when a Python loop varies it) have no finite max, so we skip
+    them here and let them fall through to the existing
+    ``concretize_expr`` + ``size_hint`` path.
+
+    Concrete dims (no free symbols) are also omitted, so callers can use
+    ``v in meta`` to detect both cases.
+    """
+    meta: SymbolMeta = {}
+    for sym, expr in it_space.items():
+        if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+            continue
+        if _finite_upper_or_none(expr) is None:
+            logger.debug(
+                f"[work_division/symbolic] skipping auto-dynamic symbol "
+                f"{sym}; use mark_dynamic(max=...) to enable symbolic planning"
+            )
+            continue
+        max_size = compute_max_size(expr)
+        granularity = compute_granularity(expr, max_size)
+        meta[sym] = (max_size, granularity)
+    if meta:
+        logger.info(
+            "[work_division/symbolic] collected symbol_meta: "
+            + ", ".join(f"{sym}=(max={ms}, gran={g})" for sym, (ms, g) in meta.items())
+        )
+    return meta
+
+
+def _effective_size(v: Symbol, it_space: dict[Symbol, Expr], meta: SymbolMeta) -> int:
+    """Return the canonical size of ``v`` for ranking and the span check.
+
+    For symbolic dims, this is ``max_size`` — the worst-case runtime footprint
+    that the compiled plan must remain legal against. For concrete dims, it
+    is the concretized integer range.
+    """
+    if v in meta:
+        return meta[v][0]
+    return concretize_expr(it_space[v])
+
+
+def _valid_divisor_basis(
+    v: Symbol, it_space: dict[Symbol, Expr], meta: SymbolMeta
+) -> int:
+    """Return the integer whose divisors are valid split counts for ``v``.
+
+    For symbolic dims, this is ``granularity`` — the divisibility invariant
+    ``n | granularity`` ensures ``R / n`` stays integer for every admissible
+    runtime value ``R = granularity * k``. For concrete dims, it is just the
+    concretized size.
+    """
+    if v in meta:
+        return meta[v][1]
+    return concretize_expr(it_space[v])
+
+
 def core_split(size: int, max_cores: int) -> int:
     """
     Find the largest divisor of size that doesn't exceed max_cores.
@@ -90,14 +160,16 @@ def _most_splittable_dim(
     dims: list[Symbol],
     iteration_space: dict[Symbol, Expr],
     n_cores: int,
+    symbol_meta: SymbolMeta,
 ) -> tuple[Symbol, int] | None:
     """Return (dim, split) for the dim in dims that maximises core_split(size, n_cores).
 
-    Returns None if no dim yields a split > 1.
+    Returns None if no dim yields a split > 1. ``symbol_meta`` is required —
+    pass an empty dict for fully-concrete iteration spaces.
     """
     best_dim, best_split = None, 0
     for d in dims:
-        s = core_split(concretize_expr(iteration_space[d]), n_cores)
+        s = core_split(_valid_divisor_basis(d, iteration_space, symbol_meta), n_cores)
         if s > best_split:
             best_dim, best_split = d, s
     return (best_dim, best_split) if best_split > 1 else None
@@ -109,6 +181,7 @@ def multi_dim_iteration_space_split(
     output_dims: list[Symbol],
     reduction_dims: list[Symbol],
     min_splits: dict[Symbol, int] | None = None,
+    symbol_meta: SymbolMeta | None = None,
 ) -> dict[Symbol, int]:
     """Distribute max_cores across the iteration space.
 
@@ -118,8 +191,14 @@ def multi_dim_iteration_space_split(
       3. If this is a reduction op, pick the single most-splittable reduction dim
          for any remaining cores.
 
+    ``symbol_meta`` carries ``(max_size, granularity)`` for any symbolic dim;
+    when a dim is symbolic, ``core_split`` is fed ``granularity`` instead of
+    the concretised size so the chosen split divides every admissible runtime
+    bucket evenly.
+
     The product of all splits will be <= max_cores.
     """
+    symbol_meta = symbol_meta or {}
     is_reduction_included = bool(reduction_dims)
 
     splits = {v: 1 for v in iteration_space.keys()}
@@ -149,16 +228,27 @@ def multi_dim_iteration_space_split(
     for v in output_dims:
         if n_cores_remaining <= 1:
             break
-        # TODO(issue#1372): with symbolic work division, concretize_expr
-        #                   for core_split will not be needed.
-        best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
+        # Symbolic dims use granularity (divisibility invariant); concrete
+        # dims use the concretised size. _valid_divisor_basis picks per dim.
+        # TODO(issue#1372): remaining concrete sites use concretize_expr; once
+        #                   symbolic work division is end-to-end, this comment
+        #                   can be dropped.
+        basis = _valid_divisor_basis(v, iteration_space, symbol_meta)
+        best_split = core_split(basis, n_cores_remaining)
+        if v in symbol_meta:
+            logger.info(
+                f"[work_division/symbolic] dim {v} (symbolic, max="
+                f"{symbol_meta[v][0]}, gran={symbol_meta[v][1]}): "
+                f"core_split(basis={basis}, n_cores={n_cores_remaining}) = "
+                f"{best_split}"
+            )
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
 
     if is_reduction_included and n_cores_remaining > 1:
         result = _most_splittable_dim(
-            reduction_dims, iteration_space, n_cores_remaining
+            reduction_dims, iteration_space, n_cores_remaining, symbol_meta
         )
         if result is not None:
             best_dim, best_split = result
@@ -170,6 +260,7 @@ def multi_dim_iteration_space_split(
 def adjust_it_space_for_sticks(
     it_space: dict[Symbol, Expr],
     tensor_deps: list[TensorDep],
+    symbol_meta: SymbolMeta | None = None,
 ) -> tuple[dict[Symbol, Expr], dict[Symbol, int]]:
     """
     Return a copy of it_space with stick variables converted from elements to
@@ -185,8 +276,16 @@ def adjust_it_space_for_sticks(
     so the adjustment is conservative (fewer sticks → smaller adjusted size →
     fewer cores assigned to the stick dimension).
 
+    TODO: As of now, the stick dim cannot be symbolic. Granularity
+    on a symbolic stick var would have to additionally be a multiple of
+    ``elems_per_stick`` for the stick-count conversion to stay coherent; that
+    is out of scope here. Raises ``Unsupported`` if any tensor's stick dim
+    maps to a symbolic iteration variable.
+
     The original it_space is not mutated.
     """
+    symbol_meta = symbol_meta or {}
+
     # Pass 1: find the largest elems_per_stick per stick variable.
     adjusted_space = dict(it_space)
     max_elems: dict[Symbol, int] = {}
@@ -197,6 +296,16 @@ def adjust_it_space_for_sticks(
         stick_var = next(iter(stick_expr.free_symbols))
         if stick_var not in adjusted_space:
             continue
+        if stick_var in symbol_meta:
+            logger.info(
+                f"[work_division/symbolic] stick-dim guard raised: "
+                f"stick_var={stick_var} on tensor {td.dep.name} is symbolic"
+            )
+            raise Unsupported(
+                f"symbolic stick dim {stick_var} is not supported yet "
+                f"(tensor {td.dep.name}); symbolic dims must be non-stick "
+                f"(e.g. the leading batch dim)."
+            )
         elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
@@ -217,6 +326,7 @@ def get_per_core_span(
     td: TensorDep,
     splits: dict[Symbol, int],
     it_space_orig: dict[Symbol, Expr],
+    symbol_meta: SymbolMeta,
 ) -> int:
     """Compute per-core memory span in bytes for a tensor under the given splits.
 
@@ -229,6 +339,10 @@ def get_per_core_span(
     it_space_orig must be the original element-valued ranges, not the
     stick-adjusted copy, because device coordinate expressions are written in
     terms of element indices.
+
+    For symbolic dims, the per-dim range ``R`` is the ``max_size`` from
+    ``symbol_meta`` divided by the dim's split count — the worst-case runtime
+    footprint that any compiled plan must remain legal against.
     """
     device_size = td.layout.device_layout.device_size
     itemsize = td.layout.dtype.itemsize
@@ -239,12 +353,10 @@ def get_per_core_span(
         per_core_min = 0
         for v in coord.free_symbols:
             term = coord.subs({u: 0 for u in coord.free_symbols - {v}})
-            # Concretize the iteration-space size so R (and therefore the
-            # ``int(term.subs(...))`` cast below) is a Python int.  Per-core
-            # span is a hardware-bound quantity that must be compared against
-            # MAX_SPAN_BYTES, so concretization here is the right boundary.
-            # TODO(issue#1372): Symbolic work division will keep this symbolic.
-            R = concretize_expr(it_space_orig[v]) // splits.get(v, 1)
+            # Per-core span is a hardware-bound quantity that must be checked
+            # against MAX_SPAN_BYTES. For symbolic dims we use ``max_size``
+            # (the worst-case footprint, also the HBM allocation footprint).
+            R = _effective_size(v, it_space_orig, symbol_meta) // splits.get(v, 1)
             per_core_max += int(term.subs(v, R - 1))
             per_core_min += int(term.subs(v, 0))
         per_core_size = per_core_max - per_core_min + 1
@@ -259,10 +371,11 @@ def warn_if_per_core_overflow(
     it_space_orig: dict[Symbol, Expr],
     splits: dict[Symbol, int],
     op_name: str,
+    symbol_meta: SymbolMeta,
 ) -> None:
     """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
     for td in tensor_deps:
-        per_core_span = get_per_core_span(td, splits, it_space_orig)
+        per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
             logger.critical(
@@ -280,6 +393,7 @@ def must_split_vars(
     it_space_adjusted: dict[Symbol, Expr],
     stick_vars: dict[Symbol, int],
     max_cores: int,
+    symbol_meta: SymbolMeta,
 ) -> dict[Symbol, int]:
     """Return the minimum splits per iteration variable to keep each tensor's
     memory span within MAX_SPAN_BYTES.
@@ -293,12 +407,19 @@ def must_split_vars(
     Gives up on a dimension when the committed splits still leave it evaluating
     to > 1, meaning inner dimensions cannot reduce the span further.
 
+    For symbolic dims, ``symbol_meta`` supplies ``(max_size, granularity)``.
+    The Cartesian search enumerates ``divisors(granularity)`` (not
+    ``divisors(max_size)``) so every chosen split divides every admissible
+    runtime bucket evenly. The span check itself uses ``max_size`` as the
+    worst-case footprint.
+
     Args:
         tensor_deps: List of tensor dependencies to check
         it_space_orig: Original iteration space (element-valued)
         it_space_adjusted: Adjusted iteration space (stick-valued for stick vars)
         stick_vars: Mapping of stick variables to elements per stick
         max_cores: Maximum number of cores available
+        symbol_meta: Per-symbol (max_size, granularity) for symbolic dims
 
     Returns a dict mapping Symbol -> number of slices.
     """
@@ -307,7 +428,10 @@ def must_split_vars(
     accumulated_splits: dict[Symbol, int] = {}
 
     for td in tensor_deps:
-        if get_per_core_span(td, accumulated_splits, it_space_orig) <= MAX_SPAN_BYTES:
+        if (
+            get_per_core_span(td, accumulated_splits, it_space_orig, symbol_meta)
+            <= MAX_SPAN_BYTES
+        ):
             continue
 
         for coord in td.device_coords[:-1]:
@@ -319,13 +443,19 @@ def must_split_vars(
             split_vars = [
                 v
                 for v in coord.free_symbols
-                if concretize_expr(it_space_orig.get(v, 1)) > 1
+                if _effective_size(v, it_space_orig, symbol_meta) > 1
             ]
             if not split_vars:
                 continue
 
             def valid_splits(v: Symbol) -> list[int]:
                 current_min = accumulated_splits.get(v, 1)
+                if v in symbol_meta:
+                    # Symbolic dim: split must divide granularity for the
+                    # n | granularity divisibility invariant to hold across
+                    # every admissible runtime bucket.
+                    basis = symbol_meta[v][1]
+                    return [s for s in divisors(basis) if s >= current_min]
                 if v in stick_vars:
                     stick_count = concretize_expr(it_space_adjusted[v])
                     return [s for s in divisors(stick_count) if s >= current_min]
@@ -341,7 +471,7 @@ def must_split_vars(
                 if not candidates:
                     raise Unsupported(
                         f"No valid split for variable {v} "
-                        f"(orig_size={concretize_expr(it_space_orig[v])}, "
+                        f"(orig_size={_effective_size(v, it_space_orig, symbol_meta)}, "
                         f"min_required={accumulated_splits.get(v, 1)}) "
                         f"for tensor {td.dep.name}."
                     )
@@ -364,7 +494,7 @@ def must_split_vars(
                 if math.prod(trial.values()) > max_cores:
                     continue
 
-                span = get_per_core_span(td, trial, it_space_orig)
+                span = get_per_core_span(td, trial, it_space_orig, symbol_meta)
 
                 if span <= MAX_SPAN_BYTES:
                     if best_within is None or span > best_within[0]:
@@ -393,15 +523,14 @@ def must_split_vars(
 
             # Still above the limit. If this coord still evaluates to > 1 under
             # the committed splits, inner dimensions cannot reduce the span further.
-            # Concretize it_space_orig[v] so the ``int(coord.subs(...))`` cast
-            # below succeeds with symbolic ranges.
-            # TODO(issue#1372): Symbolic work division will keep this symbolic.
+            # Use _effective_size so symbolic dims substitute their max_size
+            # rather than a misleading size_hint.
             per_core_coord_size = (
                 max(
                     int(
                         coord.subs(
                             {
-                                v: concretize_expr(it_space_orig[v])
+                                v: _effective_size(v, it_space_orig, symbol_meta)
                                 // accumulated_splits.get(v, 1)
                                 - 1
                                 for v in coord.free_symbols
@@ -427,16 +556,21 @@ def must_split_vars(
 def prioritize_dimensions(
     output: TensorDep,
     it_space_adjusted: dict[Symbol, Expr],
+    symbol_meta: SymbolMeta | None = None,
 ) -> tuple[list[Symbol], list[Symbol]]:
     """Partition iteration variables into output dims and reduction dims.
 
     Output dims are those whose symbols appear in the output tensor's device
     coordinate expressions (excluding the stick coordinate). Reduction dims are
-    the remainder. Both lists are sorted by decreasing concrete size.
+    the remainder. Both lists are sorted by decreasing size — for symbolic
+    dims the canonical size is ``max_size`` from ``symbol_meta``, preserving
+    the existing "largest-output-dim-first" policy under the extension that a
+    symbolic dim's size is its bucket upper bound.
 
     Variables already committed as min_splits should be filtered out of
     it_space_adjusted before calling this function.
     """
+    symbol_meta = symbol_meta or {}
     coord_vars = {v for e in output.device_coords[:-1] for v in e.free_symbols}
 
     output_pairs: list[tuple[Symbol, Expr]] = []
@@ -444,13 +578,13 @@ def prioritize_dimensions(
     for s, e in it_space_adjusted.items():
         (output_pairs if s in coord_vars else reduction_pairs).append((s, e))
 
-    # Concretize sort keys: comparing two sympy Symbols returns a Relational
-    # whose truth value is undefined and would raise inside Python's sort.
-    # The priority order is a structural decision (largest dim first) that
-    # needs a concrete numeric ordering.
-    # TODO(issue#1372): Symbolic work division will keep this symbolic.
-    output_pairs.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
-    reduction_pairs.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
+    # Sort by decreasing size (concrete for static dims, max_size for symbolic).
+    def _size_key(t: tuple[Symbol, Expr]) -> int:
+        sym, _ = t
+        return _effective_size(sym, it_space_adjusted, symbol_meta)
+
+    output_pairs.sort(key=_size_key, reverse=True)
+    reduction_pairs.sort(key=_size_key, reverse=True)
 
     return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
 
@@ -616,9 +750,16 @@ def span_reduction_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
+    # Symbolic-dim bucket metadata for the iteration vars in this op. Built
+    # before stick adjustment so the stick-dim guard inside
+    # adjust_it_space_for_sticks can raise on symbolic stick dims.
+    symbol_meta = _collect_symbol_metadata(it_space)
+
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, all_tds, symbol_meta
+    )
     min_splits = must_split_vars(
-        all_tds, it_space, it_space_adjusted, stick_vars, max_cores
+        all_tds, it_space, it_space_adjusted, stick_vars, max_cores, symbol_meta
     )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
@@ -636,10 +777,17 @@ def span_reduction_pass(
 
     apply_splits(op, min_splits, output_td)
 
+    if symbol_meta and math.prod(min_splits.values()) > 1:
+        logger.info(
+            f"[work_division/symbolic] span_reduction {op.get_name()}: "
+            f"committed min_splits={ {str(k): v for k, v in min_splits.items()} }, "
+            f"cores={math.prod(min_splits.values())}"
+        )
     if logger.isEnabledFor(logging.DEBUG) and math.prod(min_splits.values()) > 1:
         logger.debug(
             f"span_reduction work_division {op.get_name()}: cores={math.prod(min_splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"symbol_meta={symbol_meta}, "
             f"priorities=[], min_splits={min_splits}, "
             f"op_it_space_splits={op.op_it_space_splits}"
         )
@@ -650,6 +798,7 @@ def _default_split(
     output_td: TensorDep,
     committed_splits: dict[Symbol, int],
     max_cores: int,
+    symbol_meta: SymbolMeta,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
     """Distribute max_cores by priority on top of span_reduction's commits.
 
@@ -665,7 +814,9 @@ def _default_split(
     it_space_remaining = {
         s: e for s, e in it_space_adjusted.items() if s not in committed_splits
     }
-    output_dims, reduction_dims = prioritize_dimensions(output_td, it_space_remaining)
+    output_dims, reduction_dims = prioritize_dimensions(
+        output_td, it_space_remaining, symbol_meta
+    )
 
     # If span_reduction_pass already committed a reduction split, suppress further
     # reduction splitting so the final result never exceeds one reduction dim split.
@@ -682,6 +833,7 @@ def _default_split(
         output_dims,
         reduction_dims,
         committed_splits,
+        symbol_meta,
     )
     return splits, output_dims, reduction_dims
 
@@ -700,7 +852,9 @@ def work_distribution_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+    symbol_meta = _collect_symbol_metadata(it_space)
+
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds, symbol_meta)
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
@@ -747,24 +901,34 @@ def work_distribution_pass(
                     f"min_splits={committed_splits}, user_splits={user_splits}, "
                     f"op_it_space_splits={op_splits}"
                 )
-            warn_if_per_core_overflow(all_tds, it_space, user_splits, op.get_name())
+            warn_if_per_core_overflow(
+                all_tds, it_space, user_splits, op.get_name(), symbol_meta
+            )
             return
 
     splits, output_dims, reduction_dims = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores
+        it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta
     )
 
     apply_splits(op, splits, output_td)
 
+    if symbol_meta and math.prod(splits.values()) > 1:
+        logger.info(
+            f"[work_division/symbolic] work_distribution {op.get_name()}: "
+            f"final splits={ {str(k): v for k, v in splits.items()} }, "
+            f"cores={math.prod(splits.values())}, "
+            f"priorities={[str(d) for d in output_dims + reduction_dims]}"
+        )
     if logger.isEnabledFor(logging.DEBUG) and math.prod(splits.values()) > 1:
         logger.debug(
             f"work_distribution work_division {op.get_name()}: cores={math.prod(splits.values())}, "
             f"iteration_space={it_space}, it_space_adjusted={it_space_adjusted}, "
+            f"symbol_meta={symbol_meta}, "
             f"priorities={output_dims + reduction_dims}, min_splits={committed_splits}, "
             f"op_it_space_splits={op.op_it_space_splits}"
         )
 
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
+    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
 _PT_ROWS = 8  # PT block rows per corelet
@@ -1073,6 +1237,22 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     all_tds = input_tds + [output_td]
 
     it_space = iteration_space_from_op(op)
+
+    symbol_meta = _collect_symbol_metadata(it_space)
+
+    # Phase 1 covers Pointwise (and incidentally non-matmul Reduction) only;
+    # symbolic batchmatmul needs symmetric changes inside the cost model
+    # (_matmul_split_cost concretises M, N, K) and is tracked as a follow-up.
+    # Raise loudly so users do not silently get a plan based on
+    # the warmup size_hint.
+    if symbol_meta:
+        raise Unsupported(
+            f"symbolic dim(s) {sorted(map(str, symbol_meta))} on batchmatmul "
+            f"op {op.get_name()} are not supported yet; symbolic work "
+            f"division currently covers pointwise (and non-matmul reduction) "
+            f"ops only."
+        )
+
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
@@ -1089,7 +1269,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         committed_splits = {}
 
     default_splits, _, _ = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores
+        it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta
     )
     splits = _cost_model_matmul_planner(
         op,
@@ -1105,7 +1285,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
 
     apply_splits(op, splits, output_td)
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name())
+    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(

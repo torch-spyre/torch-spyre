@@ -17,6 +17,12 @@ inputs:
       event-based SHA/ref detection (PR head SHA, push SHA, etc.).
     required: false
     default: ''
+  repository:
+    description: |
+      Full clone URL of the fork to fetch from
+      (e.g. "https://github.example.com/myuser/torch-spyre.git").
+      Leave empty to fetch from origin (torch-spyre/torch-spyre).
+    default: ''
 
 runs:
   using: composite
@@ -26,6 +32,7 @@ runs:
       env:
         CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
         INPUT_REF: ${{ inputs.ref }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         GITHUB_SHA: ${{ github.sha }}
@@ -49,8 +56,19 @@ runs:
         fi
         echo "TARGET_REF=${TARGET_REF}"
         echo "TARGET_SHA=${TARGET_SHA}"
-        git fetch --tags --force origin "+${TARGET_SHA}" || \
-          git fetch --tags --force origin
+        # When a fork repository is specified, add it as a remote and fetch
+        # from there; otherwise fetch from origin.
+        if [[ -n "$INPUT_REPOSITORY" ]]; then
+          FETCH_REMOTE="$INPUT_REPOSITORY"
+          echo "Fetching from fork: ${FETCH_REMOTE}"
+          git remote add fork "$FETCH_REMOTE" 2>/dev/null || \
+            git remote set-url fork "$FETCH_REMOTE"
+          git fetch --tags --force fork "+${TARGET_SHA}" || \
+            git fetch --tags --force fork
+        else
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+        fi
         git checkout --force "${TARGET_SHA}"
         git submodule sync --recursive
         git submodule update --init --recursive --force

@@ -1274,6 +1274,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             }
         },
+        ("test_restickify_add_transpose", "test_restickify_add_transpose_cpu"): {
+            "param_sets": {
+                "10x20_add_transpose": (
+                    cached_randn((10, 20)),
+                    cached_randn((20, 10)),
+                ),
+                "7x13_add_transpose": (
+                    cached_randn((7, 13)),
+                    cached_randn((13, 7)),
+                ),
+                "64x129_add_transpose": (
+                    cached_randn((64, 129)),
+                    cached_randn((129, 64)),
+                ),
+            }
+        },
         ("test_cmp", "test_binary_op_cpu"): {
             "ops_dict": {
                 "eq": torch.eq,
@@ -2235,7 +2251,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d2": (2, cached_randn((3, 4, 128)), cached_randn((3, 4))),
                 "3d3": (3, cached_randn((2, 3, 4, 128)), cached_randn((2, 3, 4))),
             },
-            "expect_fail": ["1d1", "2d2", "3d3"],
         },
         ("test_attention", "test_attention_cpu"): {
             "param_sets": {
@@ -4907,6 +4922,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_transpose_4d_contiguous_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
+
+    def test_restickify_add_transpose_cpu(self, a, b):
+        def fn(a, b):
+            return a + b.t()
+
+        self.compare_with_cpu(fn, a, b, run_eager=False)
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
