@@ -30,10 +30,11 @@ def compile_once(op, **compile_kwargs):
     def decorator(fn):
         compiled = None
         # Only forward the resolved `op` to wrapped functions that explicitly
-        # accept it (e.g. dispatch_to_torch_compile, which uses it to do a
-        # CPU fallback for unsupported dtypes). Plain @compile_once-decorated
-        # custom ops (overwrite, copy_from_d2d, ...) keep their original
-        # signature unchanged.
+        # accept it (e.g. dispatch_to_torch_compile, which uses it to invoke
+        # the original aten overload on CPU when no SDSC mapping exists for
+        # the input dtype). Plain @compile_once-decorated custom ops
+        # (overwrite, copy_from_d2d, ...) keep their original signature
+        # unchanged.
         old_signature = inspect.signature(fn)
         accepts_op = "op" in old_signature.parameters
 
@@ -68,12 +69,13 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-# Spyre is fp16-only by architecture. Integer-typed inputs to registered
-# torch_compile kernels have no SDSC kernel mapping and abort the device
-# compiler (`dxp_standalone` SIGABRT with
-# "Scheduler failed to find a suitable op mapping for sdsc: 0_<op>").
-# Route those calls through CPU at dispatch time. The result is moved back
-# to the spyre device so callers that expect a spyre tensor still get one.
+# Integer-typed inputs to ops registered via `register_torch_compile_kernel`
+# have no matching SDSC op mapping today; reaching the device compiler with
+# them aborts `dxp_standalone --bundle` with
+# "Scheduler failed to find a suitable op mapping for sdsc: 0_<op>" (and in
+# some cases silently returns uninitialized memory — see issue #2376).
+# Route those calls through CPU at dispatch time and move the result back
+# to the original device so callers that expect a device tensor still get one.
 _UNSUPPORTED_INT_DTYPES = frozenset(
     {
         torch.int8,
@@ -96,7 +98,7 @@ def dispatch_to_torch_compile(*args, compiled=None, op=None, **kwargs):
         from .fallbacks import FallbackWarning
 
         warnings.warn(
-            f"{op} is falling back to cpu (integer dtype not supported on Spyre)",
+            f"{op} is falling back to cpu (no SDSC mapping for integer dtype)",
             category=FallbackWarning,
             stacklevel=2,
         )

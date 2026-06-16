@@ -139,10 +139,11 @@ class TestFallbacks(TestCase):
 @instantiate_parametrized_tests
 class TestIntDispatchFallback(TestCase):
     """Integer-typed inputs to ops registered via `register_torch_compile_kernel`
-    must transparently fall back to CPU. Spyre is fp16-only and the SDSC
-    scheduler aborts with "Scheduler failed to find a suitable op mapping" on
-    integer arithmetic; without this fallback the eager dispatch SIGABRTs (or,
-    worse, returns uninitialized memory — see issue #2376).
+    must transparently fall back to CPU. The SDSC scheduler has no op mapping
+    for integer dtypes today and aborts with "Scheduler failed to find a
+    suitable op mapping" if one reaches the device compiler; without this
+    fallback the eager dispatch SIGABRTs (or, worse, silently returns
+    uninitialized memory — see issue #2376).
     """
 
     def test_int_add_emits_fallback_warning(self):
