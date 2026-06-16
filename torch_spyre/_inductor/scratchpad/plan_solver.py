@@ -23,14 +23,33 @@ import math
 class LifetimeBoundBuffer:
     """
     Defines the data fields required for a plan solver.
+
+    ``uses`` is the sorted list of operation indices at which the buffer is
+    accessed (as returned by ``calculate_liveness``).  It must be non-empty:
+    the ``start_time``/``end_time`` properties index into it and the
+    FirstFit/BestFit scoring divides by ``len(uses)``, so callers must only
+    construct buffers for names that are actually used.  ``first_use_is_read``
+    is True for graph inputs (all accesses are reads) and False for computed
+    buffers (first access is a write, all subsequent accesses are reads).
+
+    ``start_time`` and ``end_time`` are convenience properties derived from
+    ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
     """
 
     name: str
     size: int
-    start_time: int
-    end_time: int
+    uses: list[int]
+    first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
+
+    @property
+    def start_time(self) -> int:
+        return self.uses[0]
+
+    @property
+    def end_time(self) -> int:
+        return self.uses[-1] + 1
 
 
 def _assert_in_place_relationships(buffers: list["LifetimeBoundBuffer"]) -> None:
