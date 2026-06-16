@@ -103,6 +103,33 @@ that your code is portable across backends (CUDA, Spyre, etc.):
 
    :param int seed: The desired seed.
 
+.. function:: torch.spyre.get_rng_state(device="spyre") -> torch.Tensor
+
+   Returns the random number generator state for the given Spyre device
+   as a ``torch.ByteTensor``.
+
+   :param device: Device to query. Accepts ``int``, ``str``, or
+       ``torch.device``. Default: ``"spyre"``.
+   :type device: int or str or torch.device, optional
+
+.. function:: torch.spyre.set_rng_state(new_state, device="spyre")
+
+   Sets the random number generator state for the given Spyre device.
+
+   :param torch.Tensor new_state: The desired state (a ``ByteTensor``).
+   :param device: Target device. Accepts ``int``, ``str``, or
+       ``torch.device``. Default: ``"spyre"``.
+   :type device: int or str or torch.device, optional
+
+.. function:: torch.spyre.initial_seed(device="spyre") -> int
+
+   Returns the initial seed used to initialize the random number generator
+   on the given Spyre device.
+
+   :param device: Device to query. Accepts ``int``, ``str``, or
+       ``torch.device``. Default: ``"spyre"``.
+   :type device: int or str or torch.device, optional
+
 Streams
 -------
 
@@ -496,6 +523,15 @@ Environment Variables
      - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
        generation (default ``1``; set ``0`` to keep the
        ``scf.for`` / ``affine.apply`` path)
+   * - ``LX_BOUNDARY_CLONES``
+     - Insert boundary clones at LX scratchpad planning edges (default
+       ``0``)
+   * - ``MAX_BUCKETS``
+     - Maximum number of work division buckets (default ``32``)
+   * - ``MIN_DEFAULT_GRANULARITY``
+     - Minimum default granularity for work division (default ``4``)
+   * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
+     - Ignore ``spyre_hint(work_div={...})`` annotations (default ``0``)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
