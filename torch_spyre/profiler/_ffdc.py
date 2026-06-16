@@ -306,3 +306,29 @@ def collect(
         report["collector"]["success"] = False
 
     return report
+
+
+def get_diagnostic_report(
+    output_dir: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Return the most recent FFDC report as a dict, or None if none exist.
+
+    Args:
+        output_dir: Directory to search. Defaults to ``<repo_root>/ffdc_reports``.
+
+    Returns:
+        Parsed JSON dict of the most recent report, or None.
+    """
+    search_dir = Path(output_dir) if output_dir else _DEFAULT_OUTPUT_DIR
+    if not search_dir.exists():
+        return None
+    reports = sorted(
+        search_dir.glob("ffdc_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not reports:
+        return None
+    with open(reports[0]) as f:
+        return json.load(f)

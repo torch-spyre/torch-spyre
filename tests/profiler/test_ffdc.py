@@ -24,6 +24,7 @@ from torch_spyre.profiler._ffdc import (
     CATEGORY_UNKNOWN,
     REQUIRED_FIELDS,
     collect,
+    get_diagnostic_report,
 )
 
 
@@ -171,3 +172,23 @@ class TestFfdcCollect(unittest.TestCase):
             report = self._collect_to_tmpdir(exc, failure_category=CATEGORY_UNKNOWN)
 
         self.assertGreater(report["collector"]["capture_latency_ms"], 0)
+
+    def test_get_diagnostic_report_returns_none_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(get_diagnostic_report(output_dir=tmp))
+
+    def test_get_diagnostic_report_returns_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                raise RuntimeError("first")
+            except RuntimeError as exc:
+                collect(exc, failure_category=CATEGORY_COMPILE, output_dir=tmp)
+            try:
+                raise RuntimeError("second")
+            except RuntimeError as exc:
+                collect(exc, failure_category=CATEGORY_RUNTIME_LAUNCH, output_dir=tmp)
+
+            result = get_diagnostic_report(output_dir=tmp)
+            self.assertIsNotNone(result)
+            self.assertIn("failure", result)
+            self.assertEqual(result["failure"]["category"], CATEGORY_RUNTIME_LAUNCH)
