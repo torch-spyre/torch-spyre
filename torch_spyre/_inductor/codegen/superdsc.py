@@ -27,6 +27,7 @@ from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
+    RESTICKIFY_OP,
     TOPK_OPS,
 )
 from torch_spyre._inductor import config as _spyre_config
@@ -623,6 +624,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
+    elif op_spec.op == RESTICKIFY_OP:
+        # Pad iteration space using all args so both the old stick (input) and
+        # new stick (output) are rounded up to the nearest stick boundary.
+        pad_args, pad_sdsc_args, dim_order = (
+            list(op_spec.args),
+            args,
+            [arg.dim_order for arg in args],
+        )
     else:
         pad_args, pad_sdsc_args, dim_order = (
             [op_spec.args[-1]],
@@ -632,6 +641,34 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     padding = _get_padded_iteration_space(
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
     )
+
+    # For restickify, update backGaps based on the padded iteration space,
+    # since non-stick dimensions may now have it_dim_size > dev_dim_size.
+    if op_spec.op == RESTICKIFY_OP:
+        for sdsc_arg, op_spec_arg in zip(args, op_spec.args):
+            layout = layouts[sdsc_arg.layout]
+            stick_dim = layout["stick_dim_order"]
+            for coord_idx, coord in enumerate(op_spec_arg.device_coordinates):
+                mapped_coord = coord.subs(symbol_mapping)
+                dim_sym = next(
+                    (
+                        s
+                        for s in symbol_mapping.values()
+                        if s in mapped_coord.free_symbols
+                    ),
+                    None,
+                )
+                if dim_sym is None or dim_sym == stick_dim:
+                    continue
+                padded_it_size = sdsc_iteration_space[dim_sym]
+                dev_dim_size = op_spec_arg.device_size[coord_idx]
+                if dev_dim_size < padded_it_size:
+                    sdsc_arg.backGap[dim_sym] = padded_it_size - dev_dim_size
+        for dim in padding:
+            dim_splits[dim] = 1
+            work_slices[dim] = 1
+        num_cores = math.prod(dim_splits.values())
+
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
     if coordinate_masking:

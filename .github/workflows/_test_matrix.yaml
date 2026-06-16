@@ -223,6 +223,10 @@ jobs:
         with:
           rpm_location: ${{ inputs.rpm_location }}
           rpm_names: ${{ inputs.rpm_names }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Install RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -277,8 +281,12 @@ jobs:
                   elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
                   echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
                   if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
-                    echo "[stall-watcher] STALL DETECTED — killing process group"
-                    kill -TERM -$$ 2>/dev/null || true
+                    echo "[stall-watcher] STALL DETECTED — killing test child processes"
+                    # Kill only the direct child (run_test.sh and its children),
+                    # NOT the outer process group (which would kill the retry loop itself)
+                    kill -TERM "$TEST_PID" 2>/dev/null || true
+                    pkill -TERM -P "$TEST_PID" 2>/dev/null || true
+                    kill -TERM "$TEE_PID" 2>/dev/null || true
                     return
                   fi
                 else
@@ -293,16 +301,40 @@ jobs:
             echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
             echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
 
+
+            FIFO="$(mktemp -u /tmp/test_fifo_XXXXXX)"
+            mkfifo "$FIFO"
+
+            # Start tee reading first — it blocks until a writer opens the FIFO
+            tee "$LOG_FILE" < "$FIFO" &
+            TEE_PID=$!
+
+            # Now open the write end — guaranteed to have a reader already waiting
+            exec {FIFO_FD}>"$FIFO"
+
+            bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
+              >&"$FIFO_FD" 2>&1 &
+            TEST_PID=$!
+
+            # Close outer shell's write end — tee will now get EOF when test exits
+            exec {FIFO_FD}>&-
+
             stall_watcher &
             WATCHER_PID=$!
 
-            bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
-              2>&1 | tee "$LOG_FILE"
-            TEST_EXIT=${PIPESTATUS[0]}
+            wait "$TEST_PID"
+            TEST_EXIT=$?
 
+            # Signal watcher first, before anything that might block
             touch "${STALL_FLAG}.done"
             kill "$WATCHER_PID" 2>/dev/null || true
             wait "$WATCHER_PID" 2>/dev/null || true
+
+            # Reap tee — it exits on its own once run_test.sh closes the FIFO write end,
+            # but kill it first in case it's still running (e.g. after a stall-kill)
+            kill "$TEE_PID" 2>/dev/null || true
+            wait "$TEE_PID" 2>/dev/null || true
+            rm -f "$FIFO"
 
             if [[ $TEST_EXIT -eq 0 ]]; then
               echo "=== Attempt ${attempt} PASSED ==="
@@ -312,7 +344,7 @@ jobs:
             fi
 
             echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
-            if grep -qE "ResponseTimeout|Exceeded max iterations|LX logout" "$LOG_FILE"; then
+            if grep -qE "ResponseTimeout|Exceeded max iterations|Fatal Python error: Aborted|LX logout" "$LOG_FILE"; then
               echo "    --> Hardware RAS timeout detected — will retry"
             else
               echo "    --> Non-hardware failure — will retry (up to ${MAX_ATTEMPTS} total)"
@@ -378,6 +410,10 @@ jobs:
         with:
           rpm_location: ${{ inputs.rpm_location }}
           rpm_names: ${{ inputs.rpm_names }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Install RPMs
         if: ${{ inputs.rpm_names != '' }}
