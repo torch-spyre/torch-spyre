@@ -1,7 +1,7 @@
 # Examples
 
 The
-[examples/](https://github.com/torch-spyre/torch-spyre/tree/main/examples)
+[docs/source/user_guide/examples/](https://github.com/torch-spyre/torch-spyre/tree/main/docs/source/user_guide/examples)
 directory in this repository contains self-contained scripts demonstrating
 common Torch-Spyre use cases.
 
@@ -15,12 +15,24 @@ common Torch-Spyre use cases.
 | `mean.py` | Computing mean reduction on Spyre |
 | `mul.py` | Element-wise multiplication on Spyre |
 | `softplus.py` | Computing softplus activation on Spyre |
+| `spyre_hints.py` | Using Spyre compiler hints to control tiling |
+
+## Distributed Examples
+
+| Script | Description |
+|--------|-------------|
+| `distributed/allgather.py` | AllGather collective on Spyre |
+| `distributed/allreduce.py` | AllReduce collective on Spyre |
+| `distributed/barrier.py` | Barrier synchronization on Spyre |
+| `distributed/broadcast.py` | Broadcast collective on Spyre |
+| `distributed/gather.py` | Gather collective on Spyre |
+| `distributed/reduce.py` | Reduce collective on Spyre |
 
 ## Running an Example
 
 ```bash
-python examples/tensor_allocate.py
-python examples/softmax.py
+python docs/source/user_guide/examples/tensor_allocate.py
+python docs/source/user_guide/examples/softmax.py
 ```
 
 ## Writing Your Own Example
@@ -44,5 +56,5 @@ print(output.cpu())
 
 ## See Also
 
-- [Quickstart](../getting_started/quickstart.md)
-- [Running Models](running_models.md)
+- [Quickstart](../../getting_started/quickstart.md)
+- [Running Models](../running_models.md)
