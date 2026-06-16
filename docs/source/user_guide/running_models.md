@@ -44,7 +44,7 @@ Valid values: 1–32 (default: 32). See
 ## Examples
 
 Full working examples are in the
-[examples/](https://github.com/torch-spyre/torch-spyre/tree/main/examples)
+[examples/](https://github.com/torch-spyre/torch-spyre/tree/main/docs/source/user_guide/examples)
 directory:
 
 - `tensor_allocate.py` — tensor creation and allocation
