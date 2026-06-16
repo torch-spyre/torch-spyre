@@ -589,7 +589,7 @@ def validate_ops(graph: GraphLowering) -> None:
         # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
         skip_ops = {"layernormnorm", "layernormscale"}
         skip_eas = {ElementArrangement.EXX2}
-        if op_name in skip_ops and all(ea in skip_eas for ea in stl_eas):
+        if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
             continue
 
         if len(set(stl_eas)) != 1:
