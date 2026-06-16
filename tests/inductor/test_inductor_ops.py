@@ -1322,6 +1322,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_cmp_fp32", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "ge": torch.ge,
+                "le": torch.le,
+                "gt": torch.gt,
+                "lt": torch.lt,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float32
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float32
+                    ),
+                ),
+                "2d": (
+                    torch.ceil(cached_randn((64, 64), abs=True, scale=10.0)).to(
+                        dtype=torch.float32
+                    ),
+                    torch.ceil(cached_randn((64, 64), abs=True, scale=9.9)).to(
+                        dtype=torch.float32
+                    ),
+                ),
+            },
+        },
         ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
             "ops_dict": {
                 "ne": torch.ne,
