@@ -28,6 +28,14 @@ global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == 
 
 allow_all_ops_in_lx_planning: bool = False
 
+# Insert clone ops at graph input/output boundaries so those buffers can be
+# LX-pinned (see scratchpad.utils.clone_at_graph_boundaries). This path is not
+# yet correct for all op types (e.g. matmul/layernorm/split under multi-core
+# K-split) and is kept off by default. Deliberately separate from
+# allow_all_ops_in_lx_planning, which only widens *intermediate* output
+# eligibility and must not, on its own, enable boundary clone insertion.
+lx_boundary_clones: bool = os.environ.get("LX_BOUNDARY_CLONES", "0") == "1"
+
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))

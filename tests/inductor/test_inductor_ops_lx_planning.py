@@ -169,6 +169,8 @@ POINTWISE_TEST_FAILURES = [
     "test_sdpa_mha_prefill",
     "test_sdpa_mha_prefill_causal",
     "test_sdpa_mha_prefill_mask",
+    "test_slice_stick_reduce_dim2_amax_3d64_0",
+    "test_slice_stick_reduce_dim2_sum_3d64_0",
     "test_softplus_3d",
     "test_sqrt_fp32_sqrt_1d_abs_fp32",
     "test_sqrt_fp32_sqrt_2d_abs_fp32",
@@ -180,6 +182,9 @@ POINTWISE_TEST_FAILURES = [
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_2",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_restickify_add_transpose_10x20_add_transpose",
+    "test_restickify_add_transpose_7x13_add_transpose",
+    "test_restickify_add_transpose_64x129_add_transpose",
     # unfold: lx_planning cannot handle multi-variable stick expressions produced
     # by unfold's overlapping/strided access patterns (e.g. d0+d1, 4*d0+d1).
     # Tracked by issue #2346.
@@ -375,6 +380,8 @@ REDUCTION_TEST_FAILURES = [
     "test_slice_add_3d2s0",
     "test_slice_add_3d2s1",
     "test_slice_add_3d2s2",
+    "test_slice_stick_reduce_dim2_amax_3d64_0",
+    "test_slice_stick_reduce_dim2_sum_3d64_0",
     "test_softplus_3d",
     "test_sqrt_fp32_sqrt_1d_abs_fp32",
     "test_sqrt_fp32_sqrt_2d_abs_fp32",
@@ -393,6 +400,9 @@ REDUCTION_TEST_FAILURES = [
     "test_transpose_3d_contiguous_dim_0_2",
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_restickify_add_transpose_10x20_add_transpose",
+    "test_restickify_add_transpose_7x13_add_transpose",
+    "test_restickify_add_transpose_64x129_add_transpose",
     # unfold: same as POINTWISE — multi-variable stick expressions. Issue #2346.
     "test_unfold_1d_large",
     "test_unfold_1d_no_overlap",

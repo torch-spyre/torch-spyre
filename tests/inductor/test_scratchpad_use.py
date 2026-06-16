@@ -26,7 +26,6 @@ from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
-from torch_spyre._inductor.scratchpad.utils import OP_OUTPUT_GOOD_FOR_LX_REUSE
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
@@ -299,21 +298,13 @@ class TestCloneAtGraphBoundaries(TestScratchpadUsage):
     - graph outputs that are also read inside the graph get a clone (for the HBM return
       value), while the original buffer is pinned to LX
 
-    The test ensures that "clone" is one of the ops that are good for LX reuse.
+    Enabling ``lx_boundary_clones`` flips ``clone_at_graph_boundaries()`` on and
+    makes the inserted clone outputs LX-eligible, so the boundary clone path is
+    exercised.
     """
 
-    @contextmanager
-    def clone_patcher(self):
-        OP_OUTPUT_GOOD_FOR_LX_REUSE.append("clone")
-        yield
-        OP_OUTPUT_GOOD_FOR_LX_REUSE.pop()
-
     def setUp(self):
-        # self.patchers is initialised in __init__ (not in the base setUp), so we can
-        # safely append here before calling super().setUp(), which enters every patcher
-        # in the list via `p.__enter__()`.
-        if "clone" not in OP_OUTPUT_GOOD_FOR_LX_REUSE:
-            self.patchers.append(self.clone_patcher())
+        self.patchers.append(ts_inductor_config.patch("lx_boundary_clones", True))
         super().setUp()
 
     def _compile_and_inspect(
