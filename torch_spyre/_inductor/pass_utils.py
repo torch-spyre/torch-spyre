@@ -283,7 +283,11 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     for arg in read_writes.reads:
         # Indirect deps are index tensors (e.g. gather indices) whose access
         # pattern is data-dependent; they cannot drive work-division planning.
-        if isinstance(arg, MemoryDep) and not arg.is_indirect():
+        if (
+            isinstance(arg, MemoryDep)
+            and isinstance(arg.index, sympy.Basic)
+            and not arg.is_indirect()
+        ):
             buf = V.graph.get_buffer(arg.name)
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
@@ -360,7 +364,11 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
     from sympy import IndexedBase
 
     rw = op.get_read_writes()
-    reads = [d for d in rw.reads if isinstance(d, MemoryDep)]
+    reads = [
+        d
+        for d in rw.reads
+        if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
+    ]
     if not any(d.is_indirect() for d in reads):
         return {}
     indirect_index_buf_map = _find_indirect_index_bufs(op)
