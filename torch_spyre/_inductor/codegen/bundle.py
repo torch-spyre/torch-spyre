@@ -277,6 +277,9 @@ def generate_bundle(
                 f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
         # Recursive body emission.
+        # affine_map_lv_iter spans the entire spec tree (one entry per OpSpec,
+        # in the same depth-first order as compiled_iter) and is consumed by
+        # _emit_specs across all recursive calls — not reset per loop level.
         loop_bound_idx = [0]
         affine_map_lv_iter = iter(affine_map_loop_var_indices)
         _emit_specs(
@@ -405,8 +408,10 @@ def _collect_affine_maps(
                 if stride_key not in affine_map_index:
                     affine_map_index[stride_key] = len(affine_map_index)
                 # Record which loop-var positions (in the enclosing loop_vars
-                # list) correspond to each stride entry.  The strides come from
-                # the innermost loop levels inward, so we take the last
+                # list) correspond to each stride entry.  tiled_symbols is
+                # ordered outermost-first (see spyre_kernel.py), so a K-only
+                # tiled op at nesting depth 2 has stride_key length 1 and we
+                # want the innermost loop var — hence we take the *last*
                 # len(stride_key) entries of loop_var_depth.
                 lv_idxs = list(loop_var_depth[-len(stride_key) :])
                 per_tensor_lv_indices.append(lv_idxs)

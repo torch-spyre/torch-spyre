@@ -2087,6 +2087,69 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         )
         self.assertEqual(mlir, expected)
 
+    # --- Group 4: two-tensor op — one tiled, one not ---
+    #
+    # Directly exercises per_tensor_lv_indices[tensor_idx] for both tensor_idx=0
+    # (tiled, non-empty index list) and tensor_idx=1 (non-tiled, empty list).
+    # Uses a single flat loop so the setup stays minimal.
+
+    def test_two_tensor_op_only_tiled_tensor_gets_affine_apply(self):
+        """Op with two tensors: first tiled (affine.apply), second not (sym direct)."""
+        s = self._s
+
+        def _make_two_tensor_json(idx, sym_id0, sym_id1):
+            return {
+                f"{idx}_mm": {
+                    "numCoresUsed_": 1,
+                    "dscs_": [
+                        {
+                            "mm": {
+                                "scheduleTree_": [
+                                    {
+                                        "component_": "hbm",
+                                        "startAddressCoreCorelet_": {
+                                            "data_": {"[0, 0, 0]": str(sym_id0)}
+                                        },
+                                    },
+                                    {
+                                        "component_": "hbm",
+                                        "startAddressCoreCorelet_": {
+                                            "data_": {"[0, 0, 0]": str(sym_id1)}
+                                        },
+                                    },
+                                ]
+                            }
+                        }
+                    ],
+                }
+            }
+
+        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+            sid0 = -(symbol_id_offset + 1)
+            sid1 = -(symbol_id_offset + 2)
+            symbols.append(0x1000)
+            symbols.append(0x2000)
+            # tensor 0 tiled, tensor 1 not tiled
+            return (
+                _make_two_tensor_json(idx, sid0, sid1),
+                [0x1000, 0x2000],
+                [{s: 256}, {}],
+                [],
+            )
+
+        op = _make_minimal_op_spec("mm")
+        loop = LoopSpec(count=Integer(4), body=[op])
+        mlir = self._bundle([loop], fake)
+
+        # Exactly one affine.apply (for tensor 0 only)
+        self.assertEqual(mlir.count("affine.apply"), 1)
+        apply_line = next(ln for ln in mlir.splitlines() if "affine.apply" in ln)
+        self.assertIn("%i_0", apply_line)
+
+        # tensor 1 (sym_2) appears directly in sdsc_execute, not via an %addr_N
+        execute_line = next(ln for ln in mlir.splitlines() if "sdsc_execute" in ln)
+        self.assertIn("%sym_2", execute_line)
+
 
 # ===========================================================================
 # 6. coarse_tile buffer propagation pass
