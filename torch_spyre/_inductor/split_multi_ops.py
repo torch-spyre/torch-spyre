@@ -526,6 +526,27 @@ def _update_original_buf(
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
+def _get_op_name(op) -> str:
+    """Extract the operation name from a node for validation."""
+    if not hasattr(op.data, "origins") or not op.data.origins:
+        return ""
+
+    # Get the first origin node
+    origin_node = next(iter(op.data.origins))
+
+    # Try to get the target and its name
+    target = getattr(origin_node, "target", None)
+    if target and hasattr(target, "name"):
+        full_name = target.name()
+        if "::" in full_name:
+            # Extract just the operation name (e.g., "add" from "aten::add.Tensor")
+            return full_name.split("::")[1].split(".")[0]
+        return full_name
+
+    # If we got here, just return the target as string
+    return str(target) if target else str(origin_node)
+
+
 def validate_ops(graph: GraphLowering) -> None:
     """Validate inputs to ops have same ElementArrangement.
 
@@ -560,11 +581,7 @@ def validate_ops(graph: GraphLowering) -> None:
         if len(layouts) <= 1:
             continue
 
-        op_name = op.get_name()
-        if hasattr(op.data, "origins") and op.data.origins:
-            origin_node = next(iter(op.data.origins))
-            if hasattr(origin_node.target, "name"):
-                op_name = origin_node.target.name
+        op_name = _get_op_name(op)
 
         # Check all layouts have the same element_arrangement
         stl_eas = [layout.element_arrangement for layout in layouts]
