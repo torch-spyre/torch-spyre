@@ -29,11 +29,6 @@
 
 #include "util/spyrecode.h"
 
-// Forward declarations for flex types
-namespace flex {
-class RuntimeOperation;
-}
-
 namespace spyre {
 
 /**
@@ -199,27 +194,30 @@ struct LaunchContext {
  * This factory method pattern eliminates special-case branching in
  * SpyreStream::Launch.
  *
- * All RuntimeOperation objects are transient: constructed inside construct(),
- * ownership transferred to RuntimeStream via launchOperation(), and destroyed
- * when the stream completes the operation. No RuntimeOperation is cached in
- * the JobPlan.
+ * All RuntimeOperation objects are transient: constructed inside flex when
+ * construct() calls the matching RuntimeStream::launchOperationXXX(), and
+ * destroyed when the stream completes the operation. No RuntimeOperation is
+ * cached in the JobPlan.
  */
 class JobPlanStep {
  public:
   virtual ~JobPlanStep() = default;
 
   /**
-   * @brief Construct a RuntimeOperation for this step
+   * @brief Build this step's flex operation params and launch them on the
+   * stream
    *
-   * Called by SpyreStream during LaunchKernel. Produces a fully-populated
-   * RuntimeOperation using metadata stored during PrepareKernel and runtime
-   * data from the LaunchContext.
+   * Called by SpyreStream during LaunchKernel. Constructs the appropriate
+   * flex operation params from metadata stored during PrepareKernel and
+   * runtime data from the LaunchContext, then submits them via the matching
+   * RuntimeStream::launchOperationXXX(). flex owns the RuntimeOperation
+   * lifecycle.
    *
    * @param ctx Launch context containing composite addresses
-   * @return Unique pointer to the constructed RuntimeOperation
+   * @param flex_stream Stream to launch the operation on
    */
-  virtual std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const = 0;
+  virtual void construct(LaunchContext& ctx,
+                         flex::RuntimeStream* flex_stream) const = 0;
 
   /**
    * @brief Write step information to output stream
@@ -292,8 +290,8 @@ class JobPlanStepH2D final : public JobPlanStep {
       : host_address_(host_address),
         device_address_(std::move(device_address)) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx,
+                 flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -320,8 +318,8 @@ class JobPlanStepD2H final : public JobPlanStep {
       : device_address_(std::move(device_address)),
         host_address_(host_address) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx,
+                 flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -353,8 +351,8 @@ class JobPlanStepCompute final : public JobPlanStep {
         bind_io_addresses_(bind_io_addresses),
         bootstrap_addr_(bootstrap_addr) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx,
+                 flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -400,8 +398,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         input_buffer_(input_buffer),
         ishape_(ishape) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx,
+                 flex::RuntimeStream* flex_stream) const override;
 
   void write(std::ostream& os) const override;
 

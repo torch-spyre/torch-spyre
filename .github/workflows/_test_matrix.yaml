@@ -81,7 +81,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - image_torch_spyre_for_pr_2648
     timeout-minutes: 60
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
@@ -366,7 +366,7 @@ jobs:
       - x86_64
       - spyre_pf_x2
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - image_torch_spyre_for_pr_2648
     timeout-minutes: 60
     env:
       CI: ''

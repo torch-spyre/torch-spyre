@@ -18,3 +18,4 @@ self-hosted-runner:
     - linux_for_pr_tests
     - image_torch_spyre
     - image_spyre_inference
+    - image_torch_spyre_for_pr_2648
