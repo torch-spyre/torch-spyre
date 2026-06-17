@@ -191,6 +191,17 @@ def _patch_tensor_for_spyre():
     torch.Tensor.to = spyre_to
     torch.empty = spyre_empty
 
+    # ── Optimal weight loading (issue #1339) ──────────────
+    # Patch dim_order=[1,0] transfer + nn.Module.to override (issue #1339).
+    try:
+        from torch_spyre.model_utils import patch_module_to_for_spyre
+
+        patch_module_to_for_spyre()
+    except Exception as e:  # pragma: no cover - defensive
+        import warnings
+
+        warnings.warn(f"Failed to install optimal weight layout patches: {e}")
+
     # ── SpyreTensorLayout Guard Extension ────────────
     # Extends TENSOR_MATCH to guard on SpyreTensorLayout
     # preventing wrong compiled graph reuse when layout
