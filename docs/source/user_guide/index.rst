@@ -13,4 +13,4 @@ debugging, and worked examples.
    tensors_and_layouts
    profiling/index
    debugging/index
-   examples
+   examples/index

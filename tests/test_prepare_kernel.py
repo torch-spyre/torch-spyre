@@ -34,17 +34,62 @@ def initialize_runtime():
 class TestPrepareKernel:
     """Test suite for PrepareKernel and JobPlan bindings."""
 
-    def create_mock_spyrecode(self, tmpdir):
+    def create_mock_spyrecode(
+        self,
+        tmpdir,
+        exec_command="ComputeOnDevice",
+        exec_properties=None,
+    ):
         """Create a mock SpyreCode directory structure for testing.
 
         Args:
             tmpdir: Temporary directory path
+            exec_command: Command type for JobExecPlan (default: "ComputeOnDevice")
+            exec_properties: Properties dict for the exec command (default: auto-generated)
 
         Returns:
             Path to the SpyreCode directory
         """
         spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
         os.makedirs(spyrecode_dir, exist_ok=True)
+
+        # Auto-generate properties if not provided
+        if exec_properties is None:
+            if exec_command == "ComputeOnDevice":
+                exec_properties = {"job_bin_ptr": "120259084288"}
+            elif exec_command == "ComputeOnHost":
+                exec_properties = {
+                    "ohandle": "output_buffer",
+                    "size": "1024",
+                    "ishape": ["64", "16"],
+                    "ihandle": "",
+                    "hcm": {"vdci": {}, "senConstants": []},
+                }
+
+        # Build JobExecPlan
+        job_exec_plan = [{"command": exec_command, "properties": exec_properties}]
+
+        # If ComputeOnHost, add required H2D and Compute steps
+        if exec_command == "ComputeOnHost":
+            # Add H2D transfer (transfers output_buffer to device)
+            job_exec_plan.append(
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "false",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                }
+            )
+            # Add Compute step
+            job_exec_plan.append(
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            )
 
         # Create a minimal spyrecode.json
         spyrecode_json = {
@@ -59,12 +104,7 @@ class TestPrepareKernel:
                     },
                 },
             ],
-            "JobExecPlan": [
-                {
-                    "command": "ComputeOnDevice",
-                    "properties": {"job_bin_ptr": "120259084288"},
-                }
-            ],
+            "JobExecPlan": job_exec_plan,
         }
 
         # Write spyrecode.json
@@ -137,6 +177,204 @@ class TestPrepareKernel:
             # Should raise error for out-of-range index
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
+
+    def test_compute_on_host_valid(self):
+        """Test that a valid ComputeOnHost command builds successfully.
+
+        Verifies that a well-formed ComputeOnHost entry with all required
+        fields (ohandle, size, ishape, ihandle, hcm) successfully builds
+        a JobPlan.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+
+            # Should succeed without exceptions
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            # Verify JobPlan was created
+            assert job_plan is not None
+            assert isinstance(job_plan, torch_spyre._C.JobPlan)
+
+            # Verify it has 3 steps (HostCompute, H2D, Compute)
+            assert job_plan.num_steps() == 3
+
+            # Verify the step types
+            assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_type(2) == "Compute"
+
+    def test_compute_on_host_missing_ohandle(self):
+        """Test that missing ohandle field raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "",
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost command missing 'ohandle' property"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_missing_size(self):
+        """Test that missing size field raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "ishape": ["64", "16"],
+                "ihandle": "",
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost command missing 'size' property"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_missing_ishape(self):
+        """Test that missing ishape field raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ihandle": "",
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost command missing 'ishape' property"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_missing_ihandle(self):
+        """Test that missing ihandle field raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost command missing 'ihandle' property"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_missing_hcm(self):
+        """Test that missing hcm field raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "",
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost command missing 'hcm' property"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_malformed_hcm_string(self):
+        """Test that malformed hcm (string instead of object) raises error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "",
+                "hcm": "invalid_hcm_string",
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            # Should raise RuntimeError (exact message depends on JSON/import failure)
+            with pytest.raises(RuntimeError):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_malformed_ishape_non_array(self):
+        """Test that malformed ishape (non-array) raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": "64",
+                "ihandle": "",
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost 'ishape' must be an array"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_malformed_ishape_elements(self):
+        """Test that malformed ishape elements (non-string) raises RuntimeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": [64, 16],
+                "ihandle": "",
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="ComputeOnHost 'ishape' elements must be strings"
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_compute_on_host_invalid_ihandle(self):
+        """Test that invalid ihandle (non-existent buffer) raises RuntimeError.
+
+        Verifies that when ihandle references a buffer name that was never
+        created, a RuntimeError is raised with the buffer name in the error
+        message.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "nonexistent_buffer",  # References a buffer that doesn't exist
+                "hcm": {"vdci": {}, "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="ihandle 'nonexistent_buffer' not found in pinned buffer map",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
 
 
 if __name__ == "__main__":
