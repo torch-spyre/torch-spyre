@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -43,7 +44,7 @@ namespace {
 
 // Global stream pool (shared across all threads)
 struct StreamPool {
-  std::mutex mutex;
+  mutable std::shared_mutex mutex;
 
   // Per-device stream pools
   std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
@@ -177,7 +178,7 @@ void SpyreStream::copyAsync(const at::Tensor& src,
 
 flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::shared_lock<std::shared_mutex> lock(pool.mutex);
 
   auto it = pool.stream_handle_map.find(id());
   TORCH_CHECK(it != pool.stream_handle_map.end(),
@@ -250,7 +251,7 @@ void SpyreStream::launch(const JobPlan& plan,
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
 
   // Initialize mapping from StreamId → RuntimeStream*.
   // RuntimeStream instances are owned by GlobalRuntime.
@@ -296,7 +297,7 @@ flex::RuntimeStream* getDefaultStreamRuntimeHandle(c10::Device device) {
   initializeStreamPool(device.index());
 
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
   auto it = pool.stream_handle_map.find(0);
   TORCH_CHECK(it != pool.stream_handle_map.end(),
               "Default stream handle not initialized for device ",
@@ -336,7 +337,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   initializeStreamPool(device.index());
 
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
 
   c10::StreamId stream_id;
   if (priority == 0) {
@@ -377,7 +378,7 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
     std::vector<flex::RuntimeStream*> handles_to_sync;
     {
       auto& pool = getStreamPool();
-      std::lock_guard<std::mutex> lock(pool.mutex);
+      std::shared_lock<std::shared_mutex> lock(pool.mutex);
 
       // Default stream (ID 0) is always present when the pool is initialized
       auto default_it = pool.stream_handle_map.find(0);
