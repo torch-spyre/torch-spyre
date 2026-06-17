@@ -35,7 +35,7 @@ from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.op_spec import IndexLoad
+from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .codegen.superdsc import (
@@ -290,9 +290,56 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(op.get_layout(), output_dep)
 
 
+def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
+    """Return names of deps whose loaded values are used as indices in scatter output_indexer.
+
+    For Scatter ops the indirect index is encoded in the output_indexer closure.
+    Extract the index buffer names directly from the 'indices' closure variable.
+    """
+    from torch._inductor.ir import Scatter
+
+    if not isinstance(op.data, Scatter):
+        return set()
+
+    fn = op.data.output_indexer
+    if fn.__closure__ is None:
+        return set()
+
+    freevars = fn.__code__.co_freevars
+    try:
+        cells = {
+            name: cell.cell_contents for name, cell in zip(freevars, fn.__closure__)
+        }
+    except ValueError:
+        return set()
+
+    if "indices" not in cells:
+        logger.warning(
+            "Scatter.output_indexer closure has no 'indices' variable — "
+            "Inductor may have renamed it. Scatter index tensors will not be "
+            "excluded from stick compatibility checks. (freevars: %s)",
+            list(freevars),
+        )
+        return set()
+    indices = cells["indices"]
+    names = set()
+    for idx_tensor in indices:
+        if idx_tensor is None:
+            continue
+        # Unwrap TensorBox -> StorageBox -> Buffer to get the name
+        node = idx_tensor
+        while hasattr(node, "data"):
+            node = node.data
+        if hasattr(node, "name") and node.name is not None:
+            names.add(node.name)
+    return names
+
+
 def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in other loads."""
-    return {expr.base.name for expr in _build_indirect_load_subs(op).values()}
+    """Return names of deps whose loaded values are used as indices in loads or stores."""
+    names = {expr.base.name for expr in _build_indirect_load_subs(op).values()}
+    names |= _find_scatter_index_buf_names(op)
+    return names
 
 
 class _LoadSentinel:
@@ -376,22 +423,26 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
     return result
 
 
-def indirect_load_subs_from_op(op: ComputedBuffer) -> "dict[sympy.Symbol, sympy.Expr]":
-    """Build {indirect_sym → IndexLoad(name)} for a ComputedBuffer (pre-scheduler).
+def indirect_access_subs_from_op(
+    op: ComputedBuffer,
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Build {indirect_sym → IndirectAccess(name)} for a ComputedBuffer (pre-scheduler).
 
     Used before scheduling, when indirect_vars is not yet available.
     Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
     load produced each indirect index. The resulting subs can be passed to
-    device_coordinates() to replace indirect symbols with IndexLoad(name).
+    device_coordinates() to replace indirect symbols with IndirectAccess(name).
     """
     raw = _build_indirect_load_subs(op)
-    return {sym: IndexLoad(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()}
+    return {
+        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
+    }
 
 
-def indirect_load_subs_from_kernel(
+def indirect_access_subs_from_kernel(
     indirect_vars: "dict[sympy.Symbol, Any]",
 ) -> "dict[sympy.Symbol, sympy.Expr]":
-    """Build {indirect_sym → IndexLoad(name)} from SpyreKernel.indirect_vars (post-scheduler).
+    """Build {indirect_sym → IndirectAccess(name)} from SpyreKernel.indirect_vars (post-scheduler).
 
     Used after scheduling, where indirect_vars directly maps the fresh symbol
     returned by indirect_indexing() to its source TensorAccess.
@@ -399,7 +450,9 @@ def indirect_load_subs_from_kernel(
     The resulting subs can be passed to device_coordinates() or applied
     directly to already-computed coordinate expressions.
     """
-    return {sym: IndexLoad(sympy.Symbol(ta.name)) for sym, ta in indirect_vars.items()}
+    return {
+        sym: IndirectAccess(sympy.Symbol(ta.name)) for sym, ta in indirect_vars.items()
+    }
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
@@ -461,10 +514,10 @@ def device_coordinates(
 ) -> list[sympy.Expr]:
     """Compute device-space coordinates for a tensor access.
 
-    indirect_load_subs: optional {indirect_sym → IndexLoad(name)} mapping produced by
-        indirect_load_subs_from_op() (pre-scheduler) or indirect_load_subs_from_kernel()
+    indirect_load_subs: optional {indirect_sym → IndirectAccess(name)} mapping produced by
+        indirect_access_subs_from_op() (pre-scheduler) or indirect_access_subs_from_kernel()
         (post-scheduler). When provided, indirect symbols in the coordinates are
-        replaced with IndexLoad expressions, giving gather-aware coordinates.
+        replaced with IndirectAccess expressions, giving indirect-aware coordinates.
     """
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.

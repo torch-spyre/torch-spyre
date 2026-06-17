@@ -47,12 +47,12 @@ from .pass_utils import (
     concretize_index,
     apply_splits_from_index_coeff,
     iteration_space,
-    indirect_load_subs_from_kernel,
+    indirect_access_subs_from_kernel,
 )
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import (
-    IndexLoad,
+    IndirectAccess,
     LoopSpec,
     OpSpec,
     TensorArg,
@@ -485,7 +485,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         index = concretize_index(tensor.index, set(it_space.keys()))
         indirect_load_subs = (
-            indirect_load_subs_from_kernel(self.indirect_vars)
+            indirect_access_subs_from_kernel(self.indirect_vars)
             if self.indirect_vars
             else None
         )
@@ -683,8 +683,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             if self.indirect_vars:
-                # Gather: create_tensor_arg applies indirect_load_subs automatically
+                # Gather/scatter: create_tensor_arg applies indirect_access_subs automatically
                 # (via compute_coordinates) so all args come out with correct coordinates.
+                # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
                 args = [
                     self.create_tensor_arg(
                         True,
@@ -818,9 +819,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             simplify_op_spec(op_spec)
 
         def sympy_str(x: sympy.Expr) -> str:
-            if isinstance(x, IndexLoad):
+            if isinstance(x, IndirectAccess):
                 name_sym = x.args[0]
-                return f"IndexLoad('{name_sym}')"
+                return f"IndirectAccess('{name_sym}')"
             return "sympify('" + str(x) + "')"
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
@@ -875,7 +876,7 @@ def _is_indirect_index_arg(arg: TensorArg, args: Sequence[TensorArg]) -> bool:
     """Return True if arg is an indirect index tensor in this op spec.
 
     An arg is an indirect index tensor if it has a name and that name appears
-    as the argument of an IndexLoad in another arg's device_coordinates.
+    as the argument of an IndirectAccess in another arg's device_coordinates.
     """
     if arg.name is None:
         return False
@@ -883,7 +884,7 @@ def _is_indirect_index_arg(arg: TensorArg, args: Sequence[TensorArg]) -> bool:
         arg.name == sym.name
         for a in args
         for coord in a.device_coordinates
-        for il in coord.atoms(IndexLoad)
+        for il in coord.atoms(IndirectAccess)
         for sym in il.args
     )
 

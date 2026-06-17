@@ -9,7 +9,7 @@ value loaded at runtime from a separate index tensor.
 - [What is indirect access?](#what-is-indirect-access)
 - [How Inductor represents indirect access](#how-inductor-represents-indirect-access)
 - [The challenge: coordinates that depend on runtime values](#the-challenge-coordinates-that-depend-on-runtime-values)
-- [Solution: IndexLoad and device coordinates](#solution-indexload-and-device-coordinates)
+- [Solution: IndirectAccess and device coordinates](#solution-indirectaccess-and-device-coordinates)
 - [Pipeline walkthrough](#pipeline-walkthrough)
 - [Stick compatibility for index tensors](#stick-compatibility-for-index-tensors)
 - [Op spec layout](#op-spec-layout)
@@ -64,17 +64,17 @@ crash, silently skip the symbol, or produce wrong layout decisions.
 
 ---
 
-## Solution: IndexLoad and device coordinates
+## Solution: IndirectAccess and device coordinates
 
-The PR introduces `IndexLoad`, a sympy `Function` subclass defined in
+The PR introduces `IndirectAccess`, a sympy `Function` subclass defined in
 [`op_spec.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/op_spec.py):
 
 ```python
-class IndexLoad(Function):
-    """IndexLoad(tensor_name) — value loaded from that tensor at the current point."""
+class IndirectAccess(Function):
+    """IndirectAccess(tensor_name) — value loaded from that tensor at the current point."""
 ```
 
-`IndexLoad('arg1_1')` means *"the value loaded from the buffer named `arg1_1`
+`IndirectAccess('arg1_1')` means *"the value loaded from the buffer named `arg1_1`
 at the current iteration point"*.  It is an opaque sympy atom that survives
 `sympify` round-trips and can be carried through arithmetic expressions without
 being evaluated.
@@ -83,13 +83,13 @@ being evaluated.
 
 Two helpers in
 [`pass_utils.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
-produce a `{indirect_sym → IndexLoad(name)}` substitution dict, depending on
+produce a `{indirect_sym → IndirectAccess(name)}` substitution dict, depending on
 the pipeline stage:
 
 | Helper | When to use | How it works |
 |---|---|---|
-| `indirect_load_subs_from_op(op)` | Pre-scheduler (`propagate_layouts`) | Re-executes `inner_fn` via `_IndirectIndexFinder` to discover which buffer's load fed each indirect symbol |
-| `indirect_load_subs_from_kernel(indirect_vars)` | Post-scheduler (`SpyreKernel`) | Reads `SpyreKernel.indirect_vars`, which `SpyreKernelOpsHandler.indirect_indexing()` populates live during codegen |
+| `indirect_access_subs_from_op(op)` | Pre-scheduler (`propagate_layouts`) | Re-executes `inner_fn` via `_IndirectIndexFinder` to discover which buffer's load fed each indirect symbol |
+| `indirect_access_subs_from_kernel(indirect_vars)` | Post-scheduler (`SpyreKernel`) | Reads `SpyreKernel.indirect_vars`, which `SpyreKernelOpsHandler.indirect_indexing()` populates live during codegen |
 
 Both return the same dict shape, so every downstream caller sees a uniform
 interface regardless of when it runs.
@@ -106,7 +106,7 @@ if indirect_load_subs:
     coordinates = [c.xreplace(indirect_load_subs) for c in coordinates]
 ```
 
-This replaces `tmp0` with `IndexLoad('arg1_1')` in the affected coordinate,
+This replaces `tmp0` with `IndirectAccess('arg1_1')` in the affected coordinate,
 giving a gather-aware expression that all later stages can handle.
 
 The `device_coordinates` wrapper in `pass_utils.py` forwards the parameter
@@ -140,8 +140,8 @@ through the following stages.
 ### 1. propagate_layouts (pre-scheduler)
 
 `compute_layouts` is called for the `Pointwise` node.
-`indirect_load_subs_from_op` re-executes `inner_fn` via `_IndirectIndexFinder`
-and returns `{tmp0: IndexLoad(Symbol('arg1_1'))}`.
+`indirect_access_subs_from_op` re-executes `inner_fn` via `_IndirectIndexFinder`
+and returns `{tmp0: IndirectAccess(Symbol('arg1_1'))}`.
 
 The resulting device coordinates (logged when `TORCH_LOGS="+inductor"` is set)
 show the substitution explicitly:
@@ -149,11 +149,11 @@ show the substitution explicitly:
 ```
 input[1] name=arg0_1  (value tensor x)
   device_coordinates=[floor(d2/64), tmp0, Mod(d2, 64)]
-    ->  [floor(d2/64), IndexLoad(arg1_1), Mod(d2, 64)]
+    ->  [floor(d2/64), IndirectAccess(arg1_1), Mod(d2, 64)]
 ```
 
-The `IndexLoad` coordinate is passed through `normalize_coordinates` as an
-opaque `Term(var=None, offset=IndexLoad(...))` and through `align_tensors`
+The `IndirectAccess` coordinate is passed through `normalize_coordinates` as an
+opaque `Term(var=None, offset=IndirectAccess(...))` and through `align_tensors`
 unchanged.
 
 ### 2. SpyreKernel codegen (post-scheduler)
@@ -168,14 +168,14 @@ self.kernel._indirect_var_count += 1
 self.kernel.indirect_vars[sym] = index_var   # TensorAccess for arg1_1
 ```
 
-`indirect_load_subs_from_kernel(self.indirect_vars)` then converts this to
-`{sym: IndexLoad(Symbol('arg1_1'))}` — the same shape as the pre-scheduler
+`indirect_access_subs_from_kernel(self.indirect_vars)` then converts this to
+`{sym: IndirectAccess(Symbol('arg1_1'))}` — the same shape as the pre-scheduler
 dict, so `create_tensor_arg` can use it directly.
 
 ### 3. Op spec generation
 
 `SpyreKernel` emits the index tensor as the **first** `TensorArg` in the op
-spec with `name='arg1_1'` set.  This name is what `IndexLoad('arg1_1')` refers
+spec with `name='arg1_1'` set.  This name is what `IndirectAccess('arg1_1')` refers
 to in the value tensor's coordinates:
 
 ```python
@@ -188,25 +188,25 @@ TensorArg(
 TensorArg(
     is_input=True, arg_index=1, device_dtype=DataFormats.SEN169_FP16,
     device_size=[1, 4, 128, 64],
-    device_coordinates=[0, floor(c2/64), IndexLoad('arg1_1'), Mod(c2, 64)],
+    device_coordinates=[0, floor(c2/64), IndirectAccess('arg1_1'), Mod(c2, 64)],
 ),
 ```
 
-The backend compiler reads `IndexLoad('arg1_1')` as: *"load this tensor's row
+The backend compiler reads `IndirectAccess('arg1_1')` as: *"load this tensor's row
 index from the tensor named `arg1_1` at the current iteration point"*.
 
 ### 4. Wrapper serialization
 
-`SpyreKernel._codegen_op_spec_list` serializes `IndexLoad` expressions
+`SpyreKernel._codegen_op_spec_list` serializes `IndirectAccess` expressions
 using a dedicated branch of `sympy_str`:
 
 ```python
-if isinstance(x, IndexLoad):
+if isinstance(x, IndirectAccess):
     name_sym = x.args[0]
-    return f"IndexLoad('{name_sym}')"
+    return f"IndirectAccess('{name_sym}')"
 ```
 
-The generated wrapper imports `IndexLoad` from `op_spec` so the op spec
+The generated wrapper imports `IndirectAccess` from `op_spec` so the op spec
 survives `eval`/`sympify` round-trips at kernel load time.
 
 ---
@@ -249,7 +249,7 @@ stick_exprs = {
 For an unfused gather the scheduler produces **two** op specs:
 
 1. **identity** — copies gathered rows from the value tensor into a
-   temporary buffer using `IndexLoad` coordinates.
+   temporary buffer using `IndirectAccess` coordinates.
 2. **exp** (or whichever unary follows) — applies the unary to the temporary
    buffer using direct coordinates.
 
@@ -264,16 +264,16 @@ The argument ordering rule for op specs that contain an index tensor is:
 3. Output tensor.
 
 The helper `_is_indirect_index_arg` identifies index-role args post-hoc by
-scanning other args' coordinates for `IndexLoad` atoms whose name matches.
+scanning other args' coordinates for `IndirectAccess` atoms whose name matches.
 
 ---
 
 ## Fusion
 
 Pointwise fusion with the gather is currently **disabled** in `patches.py`
-because `IndexLoad` coordinate expressions are not yet handled in SuperDSC
+because `IndirectAccess` coordinate expressions are not yet handled in SuperDSC
 generation. When enabled, the identity op and the downstream pointwise op
-merge into one op spec with a single `IndexLoad` coordinate expression in
+merge into one op spec with a single `IndirectAccess` coordinate expression in
 the input arg.
 
 ---
@@ -281,7 +281,9 @@ the input arg.
 ## Current limitations
 
 - Only 1-D index tensors (a single indirect symbol per data dep) are supported.
-- Scatter (store-side indirect access, e.g. `aten.scatter`) is not supported;
-  only gather (load-side indirect access) is handled by this PR.
-- The fused (single op spec) path is disabled because `IndexLoad` coordinates
+- Scatter index tensors (`aten.scatter_`, `aten.index_put_`) are correctly
+  detected via `_find_scatter_index_buf_names` and excluded from stick
+  compatibility checks. However, `IndirectAccess` coordinates on output args
+  (the codegen side of scatter) are not yet wired up in SuperDSC generation.
+- The fused (single op spec) path is disabled because `IndirectAccess` coordinates
   are not yet handled in SuperDSC generation.

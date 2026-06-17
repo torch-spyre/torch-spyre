@@ -247,7 +247,9 @@ def _compute_named_dims(op, inputs):
 
 def _log_dep_debug(
     label: str, dep: MemoryDep
-) -> None:  # TODO: thread indirect_load_subs to show IndexLoad in device_coordinates
+) -> (
+    None
+):  # TODO: thread indirect_load_subs to show IndirectAccess in device_coordinates
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
