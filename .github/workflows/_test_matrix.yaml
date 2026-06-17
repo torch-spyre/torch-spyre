@@ -241,127 +241,11 @@ jobs:
 
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
-        env:
-          MAX_ATTEMPTS: 3
-          STALL_TIMEOUT_SECS: 300   # 5 min with no new stdout --> kill as hung
-          STALL_CHECK_INTERVAL: 30  # check every 30s
-        run: |
-          set +e
-          set +o pipefail
-
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-
-          CONFIG="tests/configs/${{ matrix.suite.config }}"
-
-          _ARCH="$(uname -m)"
-          _SLOW_FLAG=""
-          if [[ "$_ARCH" != "x86_64" ]]; then
-            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
-            _SLOW_FLAG="--skip-slow"
-          fi
-
-          attempt=0
-          while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
-            attempt=$(( attempt + 1 ))
-            echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ matrix.suite.name }} ==="
-
-            LOG_FILE="$(mktemp /tmp/test_output_XXXXXX.log)"
-            STALL_FLAG="$(mktemp /tmp/stall_flag_XXXXXX.tmp)"
-
-            stall_watcher() {
-              local elapsed_stall=0
-              local prev_lines=0
-              while [[ ! -f "${STALL_FLAG}.done" ]]; do
-                sleep "$STALL_CHECK_INTERVAL"
-                current_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
-                if [[ "$current_lines" -eq "$prev_lines" ]]; then
-                  elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
-                  echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
-                  if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
-                    echo "[stall-watcher] STALL DETECTED — killing test child processes"
-                    # Kill only the direct child (run_test.sh and its children),
-                    # NOT the outer process group (which would kill the retry loop itself)
-                    kill -TERM "$TEST_PID" 2>/dev/null || true
-                    pkill -TERM -P "$TEST_PID" 2>/dev/null || true
-                    kill -TERM "$TEE_PID" 2>/dev/null || true
-                    return
-                  fi
-                else
-                  elapsed_stall=0
-                fi
-                prev_lines=$current_lines
-              done
-            }
-
-            echo "Running ${{ matrix.suite.name }} tests..."
-            echo "  Host Platform : ${_ARCH}"
-            echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
-            echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
-
-            # On the final attempt, enable verbose DT logging for diagnostics
-            _DTLOG_PREFIX=""
-            if [[ $attempt -eq $MAX_ATTEMPTS ]]; then
-              echo "  DTLOG_LEVEL   : Info (final attempt --> DTLOG_LEVEL logging enabled)"
-              _DTLOG_PREFIX="DTLOG_LEVEL=Info"
-            fi
-
-            FIFO="$(mktemp -u /tmp/test_fifo_XXXXXX)"
-            mkfifo "$FIFO"
-
-            # Start tee reading first — it blocks until a writer opens the FIFO
-            tee "$LOG_FILE" < "$FIFO" &
-            TEE_PID=$!
-
-            # Now open the write end — guaranteed to have a reader already waiting
-            exec {FIFO_FD}>"$FIFO"
-
-            env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
-              >&"$FIFO_FD" 2>&1 &
-            TEST_PID=$!
-
-            # Close outer shell's write end — tee will now get EOF when test exits
-            exec {FIFO_FD}>&-
-
-            stall_watcher &
-            WATCHER_PID=$!
-
-            wait "$TEST_PID"
-            TEST_EXIT=$?
-
-            # Signal watcher first, before anything that might block
-            touch "${STALL_FLAG}.done"
-            kill "$WATCHER_PID" 2>/dev/null || true
-            wait "$WATCHER_PID" 2>/dev/null || true
-
-            # Reap tee — it exits on its own once run_test.sh closes the FIFO write end,
-            # but kill it first in case it's still running (e.g. after a stall-kill)
-            kill "$TEE_PID" 2>/dev/null || true
-            wait "$TEE_PID" 2>/dev/null || true
-            rm -f "$FIFO"
-
-            if [[ $TEST_EXIT -eq 0 ]]; then
-              echo "=== Attempt ${attempt} PASSED ==="
-              echo "${{ matrix.suite.name }} tests done"
-              rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
-              exit 0
-            fi
-
-            echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
-            if grep -qE "ResponseTimeout|Exceeded max iterations|Fatal Python error: Aborted|LX logout" "$LOG_FILE"; then
-              echo "    --> Hardware RAS timeout detected — will retry"
-            else
-              echo "    --> Non-hardware failure — will retry (up to ${MAX_ATTEMPTS} total)"
-            fi
-
-            rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
-            [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
-          done
-
-          echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ matrix.suite.name }} ==="
-          exit 1
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/${{ matrix.suite.config }}
+          extra_test_flags: ${{ inputs.extra_test_flags }}
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
@@ -433,31 +317,16 @@ jobs:
         uses: ./.github/actions/build-torch-spyre
 
       - name: Run ${{ matrix.suite.name }} tests
-        run: |-
-          source "$HOME/.bashrc"
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/${{ matrix.suite.config }}
+          extra_test_flags: ${{ inputs.extra_test_flags }}
+          pre_run: |
+            # Multi-Spyre tests require a fresh topology probe: clear the
+            # cached AIU setup guard and the stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all attached cards.
 
-          # Multi-Spyre tests require a fresh topology probe: clear the
-          # cached AIU setup guard and the stale topo.json so
-          # ibm-aiu-setup.sh re-discovers all attached cards.
-          unset _IBM_AIU_SETUP
-          rm -rf /tmp/etc/ibm/spyre/topo.json
-          source /etc/profile.d/ibm-aiu-setup.sh
-
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-
-          CONFIG="${{ matrix.suite.config }}"
-
-          _ARCH="$(uname -m)"
-          _SLOW_FLAG=""
-          if [[ "$_ARCH" != "x86_64" ]]; then
-            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
-            _SLOW_FLAG="--skip-slow"
-          fi
-
-          echo "Running ${{ matrix.suite.name }} tests..."
-          echo "  Host Platform : ${_ARCH}"
-          echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
-          echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
-          bash tests/run_test.sh "tests/configs/${CONFIG}" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG}
-          echo "${{ matrix.suite.name }} tests done"
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
