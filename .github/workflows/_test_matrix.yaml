@@ -110,6 +110,8 @@ jobs:
             config: torch_spyre_tests/test_execution_trace_config.yaml
           - name: Test Spyre Lazy Silent
             config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
+          - name: Test Spyre Lazy Init
+            config: torch_spyre_tests/test_spyre_lazy_init_config.yaml
           - name: Test Stream
             config: torch_spyre_tests/test_stream_config.yaml
           - name: Test Spyre Profiler
