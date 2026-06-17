@@ -254,7 +254,6 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    from . import _C  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
@@ -268,8 +267,9 @@ def _autoload():
     # Apply runtime-independent setup at autoload (import) time so it is in place
     # before the first device op. None of this starts the device runtime: the
     # C++ startRuntime() is std::call_once and self-triggers on the first real
-    # device op (e.g. an H2D copy via the stream pool). Importing _C here does
-    # not start the runtime either.
+    # device op (e.g. an H2D copy via the stream pool). _C is not imported here
+    # at all; the monkey-patch defers its _C imports into the patched method
+    # bodies, so the .so is only loaded when a Spyre tensor is first used.
     #
     # The tensor monkey-patch adds to(device_layout=), device_tensor_layout(),
     # the spyre-aware repr, torch.empty(device_layout=), and the dynamo/FxGraph

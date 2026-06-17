@@ -15,16 +15,12 @@
 
 from torch_spyre.constants import DEVICE_NAME
 
-from typing import Optional
-from torch_spyre._C import (
-    get_spyre_tensor_layout,
-    empty_with_layout,
-    spyre_empty_with_layout,
-    copy_tensor,
-)
+from typing import Optional, TYPE_CHECKING
 
 from torch._dynamo.guards import GuardBuilder
-from torch_spyre._C import SpyreTensorLayout
+
+if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
 
 
 def _patch_tensor_for_spyre():
@@ -64,10 +60,12 @@ def _patch_tensor_for_spyre():
         # Non-spyre tensors use normal behavior
         return orig_repr(self)
 
-    def device_tensor_layout(self: torch.Tensor) -> Optional[SpyreTensorLayout]:
+    def device_tensor_layout(self: torch.Tensor) -> Optional["SpyreTensorLayout"]:
         if self.device is not None and self.device.type == DEVICE_NAME:
             if isinstance(self, torch._subclasses.FakeTensor):
                 return None  # catch FakeTensor BEFORE calling device_tensor_layout()
+            from torch_spyre._C import get_spyre_tensor_layout
+
             return get_spyre_tensor_layout(self)
         else:
             return None
@@ -133,11 +131,15 @@ def _patch_tensor_for_spyre():
             if dtype is None:
                 dtype = self.dtype
 
+            from torch_spyre._C import spyre_empty_with_layout
+
             dst = spyre_empty_with_layout(
                 self.size(), self.stride(), dtype, device_layout
             )
 
             if self.device.type == "cpu":
+                from torch_spyre._C import copy_tensor
+
                 copy_tensor(self, dst, non_blocking=False)
                 return dst
             else:  # device to device copy
@@ -181,6 +183,8 @@ def _patch_tensor_for_spyre():
             # layout_opt is omitted; c10::Layout has no pybind11 type caster,
             # so py_empty_with_layout drops that parameter and always uses
             # the default (Strided).
+            from torch_spyre._C import empty_with_layout
+
             return empty_with_layout(
                 *args, device_layout, dtype, device, pin_memory, memory_format
             )
