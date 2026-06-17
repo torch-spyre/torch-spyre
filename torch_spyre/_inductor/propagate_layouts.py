@@ -59,6 +59,9 @@ from .ir import FixedTiledLayout, SpyreConstantFallback
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    find_matmul_generated_var,
+    find_reduction_var,
+    identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
     is_stick_expr_offset_free,
@@ -408,7 +411,7 @@ def _exx2_layout(
     out_stl = SpyreTensorLayout(
         c_size, c_stride, output.dtype, out_dim_order, ElementArrangement.EXX2
     )
-    reduction_var = _find_reduction_var(x.dep, output_dep, "exx2")
+    reduction_var = find_reduction_var(x.dep, output_dep)
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
     op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
     return [out_stl]
@@ -429,38 +432,12 @@ def _layernormnorm_layout(
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
-    reduction_var = _find_reduction_var(x.dep, output_dep, "layernormnorm")
+    reduction_var = find_reduction_var(x.dep, output_dep)
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
     op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
     return [out_stl]
-
-
-def _index_symbols(dep: MemoryDep) -> set[sympy.Symbol]:
-    return dep.index.free_symbols
-
-
-def _find_reduction_var(x_dep, out_dep, op_name: str = "reduction") -> sympy.Symbol:
-    """Reduction loop variable: appears in x's index but not in output's index."""
-    reduction_vars = _index_symbols(x_dep) - _index_symbols(out_dep)
-    if len(reduction_vars) != 1:
-        raise Unsupported(
-            f"{op_name}: expected 1 reduction variable, got {reduction_vars}"
-        )
-    return next(iter(reduction_vars))
-
-
-def _find_matmul_generated_var(y_dep, x_dep, out_dep) -> sympy.Symbol:
-    """N loop variable: appears in y's and output's index but not in x's index."""
-    generated_vars = (_index_symbols(y_dep) & _index_symbols(out_dep)) - _index_symbols(
-        x_dep
-    )
-    if len(generated_vars) != 1:
-        raise Unsupported(
-            f"matmul: expected 1 generated variable, got {generated_vars}"
-        )
-    return next(iter(generated_vars))
 
 
 def _dev_coord_for_var(dev_coords, arg_host_coords, var):
@@ -530,15 +507,21 @@ def _matmul_layouts(
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep)
 
-    x = args[0]
-    y = args[1]
+    x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
+    if x_dep is None or y_dep is None:
+        raise Unsupported(f"{data.reduction_type}: could not identify Input1/Input2")
+    # Map identified deps back to PropArgs.
+    if x_dep is args[0].dep:
+        x, y = args[0], args[1]
+    else:
+        x, y = args[1], args[0]
 
     # Hardware stick constraints (DF16):
     #   Input1 (x): stick on reduction_var (loop var absent from output)
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
-    reduction_var = _find_reduction_var(x.dep, output_dep, data.reduction_type)
-    generated_var = _find_matmul_generated_var(y.dep, x.dep, output_dep)
+    reduction_var = find_reduction_var(x.dep, output_dep)
+    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
 
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
@@ -696,7 +679,7 @@ def _topk_layouts(
     out_coords = host_coordinates(output, output_dep)
 
     # Reduction var: in x's index but absent from output's.
-    reduction_var = _find_reduction_var(x.dep, output_dep, "topk")
+    reduction_var = find_reduction_var(x.dep, output_dep)
 
     # Coords that survive the reduction into the output.
     surviving_coords = [
