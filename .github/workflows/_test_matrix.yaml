@@ -5,7 +5,7 @@ name: Test matrix (reusable)
 # Called by tests.yml and tests-nightly.yml.
 #
 # All differences between the two callers are expressed as inputs:
-#   - runner_label      : linux_for_pr_tests (PR) vs linux (nightly)
+#   - runner_label      : linux
 #   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
 #   - checkout_pytorch  : false (PR) vs true (nightly)
 #   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
@@ -16,7 +16,7 @@ on:
     inputs:
       # Runner pool to use for both test jobs
       runner_label:
-        description: Runner label appended to the fixed labels (linux_for_pr_tests or linux)
+        description: Runner label appended to the fixed labels (linux)
         required: true
         type: string
 
