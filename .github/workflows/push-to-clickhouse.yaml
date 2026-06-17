@@ -8,6 +8,7 @@ on:
       - model-module-tests
       - upstream-pytorch-tests
       - model-ops-tests
+      - tests # covers torch spyre tests
       # to add more workflows
     types: [completed]
   workflow_dispatch:
