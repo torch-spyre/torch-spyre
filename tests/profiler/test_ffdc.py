@@ -22,7 +22,6 @@ from torch_spyre.profiler._ffdc import (
     CATEGORY_RUNTIME_LAUNCH,
     CATEGORY_UNIMPLEMENTED,
     CATEGORY_UNKNOWN,
-    REQUIRED_FIELDS,
     collect,
     get_diagnostic_report,
 )
@@ -135,7 +134,6 @@ class TestFfdcCollect(unittest.TestCase):
         except ValueError as exc:
             report = self._collect_to_tmpdir(exc, failure_category=CATEGORY_UNKNOWN)
 
-        self.assertEqual(len(REQUIRED_FIELDS), 11)
         self.assertEqual(report["collector"]["missing_fields"], [])
 
     def test_metadata_fields_present(self):

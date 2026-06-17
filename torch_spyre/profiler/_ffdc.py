@@ -27,9 +27,11 @@ Usage:
     report = collect(exc, failure_category="compile")
 """
 
+import itertools
 import json
 import os
 import sys
+import tempfile
 import time
 import traceback
 import platform
@@ -59,9 +61,22 @@ REQUIRED_FIELDS = [
     "artifacts.searched",
 ]
 
-_DEFAULT_OUTPUT_DIR: Path = (
-    Path(__file__).resolve().parent.parent.parent / "ffdc_reports"
-)
+
+def _default_output_dir() -> Path:
+    """Return a user-writable directory for FFDC reports.
+
+    Prefers the Torch Inductor cache dir (respects TORCHINDUCTOR_CACHE_DIR,
+    falls back to ~/.cache/torch/inductor) so reports land alongside other
+    Inductor artifacts. Falls back to tempfile.gettempdir() in environments
+    where the Inductor cache is unavailable (e.g. import-only, no torch).
+    """
+    try:
+        from torch._inductor.runtime.runtime_utils import cache_dir as _cache_dir
+
+        return Path(_cache_dir()) / "torch-spyre" / "ffdc_reports"
+    except Exception:
+        return Path(tempfile.gettempdir()) / "torch-spyre-ffdc"
+
 
 _ENV_KEYS = [
     "TORCH_COMPILE_DEBUG",
@@ -140,8 +155,9 @@ def _collect_artifacts() -> dict:
             continue
         for pattern in filename_patterns:
             try:
-                matches = list(run_dir.rglob(pattern))
-                found.extend(str(m) for m in matches[:5])
+                found.extend(
+                    str(m) for m in itertools.islice(run_dir.rglob(pattern), 5)
+                )
             except Exception:
                 pass
 
@@ -156,8 +172,10 @@ def _collect_artifacts() -> dict:
                 newest_kernel = max(kernel_dirs, key=lambda d: d.stat().st_mtime)
                 for pattern in ["sdsc_*.json", "*.mlir", "*.log"]:
                     try:
-                        matches = list(newest_kernel.rglob(pattern))
-                        found.extend(str(m) for m in matches[:5])
+                        found.extend(
+                            str(m)
+                            for m in itertools.islice(newest_kernel.rglob(pattern), 5)
+                        )
                     except Exception:
                         pass
     except Exception:
@@ -198,8 +216,7 @@ def collect(
 
     Args:
         exc: The exception that triggered FFDC (or None for manual call).
-        failure_category: One of compile, runtime_launch, numerical,
-                          oom, timeout, unknown.
+        failure_category: One of compile, runtime_launch, unimplemented, unknown.
         kernel_name: Kernel name from SpyreSDSCKernelRunner if available.
         code_dir: Code directory from SpyreSDSCKernelRunner if available.
         output_dir: Directory to write report JSON. Defaults to <repo_root>/ffdc_reports.
@@ -312,7 +329,7 @@ def collect(
 
     # --- write report ---
     try:
-        out_dir = Path(output_dir) if output_dir else _DEFAULT_OUTPUT_DIR
+        out_dir = Path(output_dir) if output_dir else _default_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
         report_path = out_dir / f"ffdc_{failure_category}_{ts}_{os.getpid()}.json"
@@ -339,7 +356,7 @@ def get_diagnostic_report(
     Returns:
         Parsed JSON dict of the most recent report, or None.
     """
-    search_dir = Path(output_dir) if output_dir else _DEFAULT_OUTPUT_DIR
+    search_dir = Path(output_dir) if output_dir else _default_output_dir()
     if not search_dir.exists():
         return None
     reports = sorted(

@@ -31,19 +31,21 @@ class SpyreUnimplementedRunner:
         self.op = op
 
     def run(self, *args, **kw_args):
-        exc = RuntimeError(
-            f"Invoked {self.kernel_name} which contains"
-            f" unimplemented operation {self.op}"
-        )
         try:
-            _ffdc_collect(
-                exc,
-                failure_category=CATEGORY_UNIMPLEMENTED,
-                kernel_name=self.kernel_name,
+            raise RuntimeError(
+                f"Invoked {self.kernel_name} which contains"
+                f" unimplemented operation {self.op}"
             )
-        except Exception:
-            pass
-        raise exc
+        except RuntimeError as exc:
+            try:
+                _ffdc_collect(
+                    exc,
+                    failure_category=CATEGORY_UNIMPLEMENTED,
+                    kernel_name=self.kernel_name,
+                )
+            except Exception:
+                pass
+            raise
 
 
 class SpyreSDSCKernelRunner:

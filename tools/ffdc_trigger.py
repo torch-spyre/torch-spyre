@@ -60,6 +60,8 @@ try:
     runner.run()
 except RuntimeError as e:
     print(f"  Exception re-raised (expected): {e}")
+else:
+    raise AssertionError("Expected RuntimeError from runner.run() but none was raised")
 
 report_path = _newest(str(FFDC_OUT / "ffdc_runtime_launch_*.json"))
 if report_path:
@@ -84,6 +86,8 @@ try:
     urunner.run()
 except RuntimeError as e:
     print(f"  Exception re-raised (expected): {e}")
+else:
+    raise AssertionError("Expected RuntimeError from urunner.run() but none was raised")
 
 report_path_u = _newest(str(FFDC_OUT / "ffdc_unimplemented_*.json"))
 if report_path_u:
