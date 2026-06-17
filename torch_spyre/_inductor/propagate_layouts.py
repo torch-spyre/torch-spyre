@@ -63,7 +63,7 @@ from .pass_utils import (
     device_coordinates,
     is_stick_expr_offset_free,
     indirect_index_dep_names,
-    indirect_load_subs_from_op,
+    indirect_access_subs_from_op,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -751,13 +751,13 @@ def compute_layouts(
     # Log substituted device coordinates for indirect index args. Useful for
     # debugging gather/scatter layout propagation, and also the canonical
     # example of how to call device_coordinates() with indirect_load_subs
-    # pre-scheduler (keeping indirect_load_subs_from_op exercised and visible).
+    # pre-scheduler (keeping indirect_access_subs_from_op exercised and visible).
     if logger.isEnabledFor(logging.DEBUG):
         indirect_index_names = indirect_index_dep_names(op)
         if indirect_index_names:
-            indirect_subs = indirect_load_subs_from_op(op)
+            indirect_subs = indirect_access_subs_from_op(op)
             for arg in args:
-                if arg.dep.name not in indirect_index_names:
+                if arg.dep.name in indirect_index_names:
                     continue
                 for j, stl in enumerate(arg.layouts):
                     try:
@@ -767,7 +767,7 @@ def compute_layouts(
                     except Exception:
                         d_coords = "<error>"
                     logger.debug(
-                        f"  indirect index {arg.dep.name} STL[{j}] substituted d_coords={d_coords}"
+                        f"  indirect value {arg.dep.name} STL[{j}] d_coords (with IndirectAccess subs)={d_coords}"
                     )
 
     if len(args) > 1 and isinstance(data, Pointwise):
