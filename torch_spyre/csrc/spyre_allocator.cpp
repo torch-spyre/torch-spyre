@@ -235,8 +235,8 @@ void SpyreAllocator::memoryPressureCallback(std::mutex& allocator_mutex) {
     Py_ssize_t collected = PyGC_Collect();
     
     if (collected >= 0) {
-      DEBUGINFO("SpyreAllocator: PyGC_Collect() completed, collected "
-                << collected << " objects");
+      DEBUGINFO("SpyreAllocator: PyGC_Collect() completed, collected ",
+                collected, " objects");
     } else {
       // PyGC_Collect() returned -1, indicating an error
       // Log the error but don't throw - we still need to restore lock state
@@ -250,7 +250,7 @@ void SpyreAllocator::memoryPressureCallback(std::mutex& allocator_mutex) {
   } catch (const std::exception& e) {
     // Catch any exceptions during GC to ensure we always re-acquire the mutex
     // Log the error but don't propagate - FlexAllocator will handle OOM
-    DEBUGINFO("SpyreAllocator: exception during GC: " << e.what());
+    DEBUGINFO("SpyreAllocator: exception during GC: ", e.what());
   } catch (...) {
     DEBUGINFO("SpyreAllocator: unknown exception during GC");
   }
