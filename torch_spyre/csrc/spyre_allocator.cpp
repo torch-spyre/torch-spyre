@@ -16,6 +16,7 @@
 #include "spyre_allocator.h"
 
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include "logging.h"
@@ -26,12 +27,8 @@
 namespace spyre {
 
 SpyreAllocator::SpyreAllocator() {
-  // Register memory pressure callback with FlexAllocator
-  auto flex_alloc = getFlexAllocator();
-  if (flex_alloc) {
-    flex_alloc->registerMemoryPressureCallback(&SpyreAllocator::memoryPressureCallback);
-    DEBUGINFO("SpyreAllocator: registered memory pressure callback with FlexAllocator");
-  }
+  // Callback registration is deferred until first allocation
+  // to avoid accessing RuntimeContext during static initialization
 }
 
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
@@ -41,7 +38,18 @@ c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
 std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
   // FlexAllocator is owned by RuntimeContext (one per device per process).
   // RuntimeContext::getAllocator() returns shared_ptr<FlexAllocator>;
-  return flex::getFlexRuntimeContext()->getAllocator();
+  auto flex_alloc = flex::getFlexRuntimeContext()->getAllocator();
+  
+  // Register memory pressure callback on first access (lazy initialization)
+  static std::once_flag callback_registered;
+  std::call_once(callback_registered, [&flex_alloc]() {
+    if (flex_alloc) {
+      flex_alloc->registerMemoryPressureCallback(&SpyreAllocator::memoryPressureCallback);
+      DEBUGINFO("SpyreAllocator: registered memory pressure callback with FlexAllocator");
+    }
+  });
+  
+  return flex_alloc;
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
