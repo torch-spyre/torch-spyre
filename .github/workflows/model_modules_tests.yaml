@@ -35,8 +35,8 @@ jobs:
     runs-on:
       - x86_64
       - spyre_pf_x1
-      - linux_for_pr_tests
-      - image_torch_spyre_for_pr_2648
+      - linux
+      - image_torch_spyre
     timeout-minutes: 60
     env:
       # The CI env var is very important.

@@ -111,7 +111,7 @@ jobs:
     if: needs.changes.outputs.code_changed == 'true'
     uses: ./.github/workflows/_test_matrix.yaml
     with:
-      runner_label: linux_for_pr_tests
+      runner_label: linux
       extra_test_flags: -v
       checkout_pytorch: false
       torch_root: ''
