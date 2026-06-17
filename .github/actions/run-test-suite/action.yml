@@ -1,0 +1,173 @@
+name: Run test suite (with retry + stall watcher)
+description: >
+  Runs a single run_test.sh config with up to MAX_ATTEMPTS retries,
+  a stall watchdog, and DTLOG_LEVEL=Info on the final attempt.
+
+inputs:
+  suite_name:
+    description: Human-readable label (used in echo/log output)
+    required: true
+  config:
+    description: Path passed to run_test.sh (e.g. tests/configs/...)
+    required: true
+  extra_test_flags:
+    description: Extra flags forwarded to run_test.sh (e.g. "-v")
+    required: false
+    default: ''
+  work_dir:
+    description: Directory to cd into before running (must have .venv)
+    required: false
+    default: /home/senuser/torch-spyre
+  max_attempts:
+    description: Total number of attempts before giving up
+    required: false
+    default: '3'
+  stall_timeout_secs:
+    description: Seconds of no stdout before the test is killed as hung
+    required: false
+    default: '300'
+  stall_check_interval:
+    description: How often (seconds) the stall watcher polls
+    required: false
+    default: '30'
+  junit_xml_path:
+    description: Full path for the --junit-xml report (leave empty to skip)
+    required: false
+    default: ''
+  report_name:
+    description: Filename of the XML report (for GITHUB_ENV export to upload step)
+    required: false
+    default: ''
+  pre_run:
+    description: Optional bash snippet run at the start of every attempt (e.g. topology reset)
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Run ${{ inputs.suite_name }}
+      shell: bash
+      env:
+        MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
+        STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
+      run: |-
+        set +e
+        set +o pipefail
+
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        cd "${{ inputs.work_dir }}"
+        source .venv/bin/activate
+
+        CONFIG="${{ inputs.config }}"
+
+        _ARCH="$(uname -m)"
+        _SLOW_FLAG=""
+        if [[ "$_ARCH" != "x86_64" ]]; then
+          echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
+          _SLOW_FLAG="--skip-slow"
+        fi
+
+        attempt=0
+        while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
+          attempt=$(( attempt + 1 ))
+          echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ inputs.suite_name }} ==="
+
+          LOG_FILE="$(mktemp /tmp/test_output_XXXXXX.log)"
+          STALL_FLAG="$(mktemp /tmp/stall_flag_XXXXXX.tmp)"
+
+          stall_watcher() {
+            local elapsed_stall=0
+            local prev_lines=0
+            while [[ ! -f "${STALL_FLAG}.done" ]]; do
+              sleep "$STALL_CHECK_INTERVAL"
+              current_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+              if [[ "$current_lines" -eq "$prev_lines" ]]; then
+                elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
+                echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
+                if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
+                  echo "[stall-watcher] STALL DETECTED — killing test child processes"
+                  kill -TERM "$TEST_PID" 2>/dev/null || true
+                  pkill -TERM -P "$TEST_PID" 2>/dev/null || true
+                  kill -TERM "$TEE_PID" 2>/dev/null || true
+                  return
+                fi
+              else
+                elapsed_stall=0
+              fi
+              prev_lines=$current_lines
+            done
+          }
+
+          # Run any per-attempt setup (e.g. topology reset for multi-Spyre)
+          if [[ -n '${{ inputs.pre_run }}' ]]; then
+            eval '${{ inputs.pre_run }}'
+          fi
+
+          echo "Running ${{ inputs.suite_name }} tests..."
+          echo "  Host Platform : ${_ARCH}"
+          echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
+          echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
+
+          # On the final attempt, enable verbose DT logging for diagnostics
+          _DTLOG_PREFIX=""
+          if [[ $attempt -eq $MAX_ATTEMPTS ]]; then
+            echo "  DTLOG_LEVEL   : Info (final attempt — verbose logging enabled)"
+            _DTLOG_PREFIX="DTLOG_LEVEL=Info"
+          fi
+
+          _JUNIT_FLAG=""
+          if [[ -n "${{ inputs.junit_xml_path }}" ]]; then
+            _JUNIT_FLAG="--junit-xml=${{ inputs.junit_xml_path }}"
+          fi
+
+          FIFO="$(mktemp -u /tmp/test_fifo_XXXXXX)"
+          mkfifo "$FIFO"
+
+          tee "$LOG_FILE" < "$FIFO" &
+          TEE_PID=$!
+
+          exec {FIFO_FD}>"$FIFO"
+
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+            >&"$FIFO_FD" 2>&1 &
+          TEST_PID=$!
+
+          exec {FIFO_FD}>&-
+
+          stall_watcher &
+          WATCHER_PID=$!
+
+          wait "$TEST_PID"
+          TEST_EXIT=$?
+
+          touch "${STALL_FLAG}.done"
+          kill "$WATCHER_PID" 2>/dev/null || true
+          wait "$WATCHER_PID" 2>/dev/null || true
+
+          kill "$TEE_PID" 2>/dev/null || true
+          wait "$TEE_PID" 2>/dev/null || true
+          rm -f "$FIFO"
+
+          if [[ $TEST_EXIT -eq 0 ]]; then
+            echo "=== Attempt ${attempt} PASSED ==="
+            echo "${{ inputs.suite_name }} tests done"
+            rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+            exit 0
+          fi
+
+          echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
+          if grep -qE "ResponseTimeout|Exceeded max iterations|Fatal Python error: Aborted|LX logout" "$LOG_FILE"; then
+            echo "    --> Hardware RAS timeout detected — will retry"
+          else
+            echo "    --> Non-hardware failure — will retry (up to ${MAX_ATTEMPTS} total)"
+          fi
+
+          rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+          [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
+        done
+
+        echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ inputs.suite_name }} ==="
+        exit 1
