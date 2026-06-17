@@ -241,6 +241,13 @@ jobs:
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
         uses: ./.github/actions/build-torch-spyre
 
+      - name: Derive report paths
+        run: |
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
       - name: Run ${{ matrix.suite.name }} tests
         id: run_tests
         uses: ./.github/actions/run-test-suite
@@ -248,6 +255,17 @@ jobs:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
@@ -318,12 +336,21 @@ jobs:
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
         uses: ./.github/actions/build-torch-spyre
 
+      - name: Derive report paths
+        run: |
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
       - name: Run ${{ matrix.suite.name }} tests
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
           pre_run: |
             # Multi-Spyre tests require a fresh topology probe: clear the
             # cached AIU setup guard and the stale topo.json so
@@ -332,3 +359,12 @@ jobs:
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
             source /etc/profile.d/ibm-aiu-setup.sh
+
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10
