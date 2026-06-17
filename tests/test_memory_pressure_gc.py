@@ -99,11 +99,12 @@ class TestMemoryPressureGC:
         """
         gc.disable()
         
+        # Allocate tensors and KEEP references
+        tensors = []
         try:
-            # Allocate tensors and KEEP references
-            tensors = []
             tensor_size = 1024 * 1024 * 1024  # 1GB each
-            num_tensors = 7  # Fill most memory
+            # Increase to 10 tensors to ensure we exhaust memory on devices with >8GB
+            num_tensors = 10
             
             for i in range(num_tensors):
                 t = torch.randn(tensor_size // 4, device='spyre')
@@ -192,7 +193,7 @@ class TestMemoryPressureGC:
             class TensorHolder:
                 def __init__(self, tensor):
                     self.tensor = tensor
-                    self.ref = None  # Will create cycle
+                    self.ref: 'TensorHolder | None' = None  # Will create cycle
             
             holders = []
             tensor_size = 1024 * 1024 * 1024  # 1GB
@@ -293,26 +294,34 @@ class TestMemoryPressureGC:
         gc.disable()
         
         try:
-            # Create tensors and only keep weak references
+            # Create tensors and keep strong references temporarily
+            tensors = []
             weak_refs = []
             tensor_size = 1024 * 1024 * 1024
             
             for i in range(4):
                 t = torch.randn(tensor_size // 4, device='spyre')
+                tensors.append(t)
                 weak_refs.append(weakref.ref(t))
-                # t goes out of scope, only weak ref remains
             
-            # Verify weak refs are still alive (GC hasn't run)
+            # Verify weak refs are alive while strong refs exist
             alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 4, "Weak refs should still be alive before GC"
+            assert alive_count == 4, "Weak refs should be alive while strong refs exist"
+            
+            # Drop strong references - now only weak refs remain
+            # Objects won't be collected yet because GC is disabled
+            tensors.clear()
+            
+            # Verify weak refs are still alive (objects not collected yet with GC disabled)
+            alive_count = sum(1 for wr in weak_refs if wr() is not None)
+            assert alive_count == 4, "Weak refs should still be alive before GC runs"
             
             # Trigger memory pressure - should collect weakly-referenced tensors
             new_tensor = torch.randn(tensor_size // 4, device='spyre')
             
-            # After GC, weak refs should be dead
-            gc.collect()  # Ensure any remaining cleanup
+            # After memory pressure triggered GC, weak refs should be dead
             alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 0, "Weak refs should be dead after GC"
+            assert alive_count == 0, "Weak refs should be dead after memory pressure GC"
             
         finally:
             gc.enable()
