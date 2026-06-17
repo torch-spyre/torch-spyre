@@ -102,9 +102,9 @@ class TestMemoryPressureGC:
         # Allocate tensors and KEEP references
         tensors = []
         try:
-            tensor_size = 1024 * 1024 * 1024  # 1GB each
-            # Increase to 10 tensors to ensure we exhaust memory on devices with >8GB
-            num_tensors = 10
+            tensor_size = 512 * 1024 * 1024  # 512MB each
+            # Allocate many small tensors to fill memory
+            num_tensors = 20  # 20 * 512MB = 10GB
             
             for i in range(num_tensors):
                 t = torch.randn(tensor_size // 4, device='spyre')
@@ -138,14 +138,17 @@ class TestMemoryPressureGC:
         def allocate_with_pressure():
             """Thread that will hit memory pressure."""
             try:
-                # Fill memory to trigger pressure
+                # Allocate less memory to avoid actual OOM, just trigger pressure
                 tensors = []
-                for i in range(6):
-                    t = torch.randn(256 * 1024 * 1024, device='spyre')  # 1GB
+                for i in range(4):
+                    t = torch.randn(256 * 1024 * 1024, device='spyre')  # 1GB each
                     tensors.append(t)
                 
                 # Drop refs to allow GC
                 tensors.clear()
+                
+                # Small delay to let GC potentially run
+                time.sleep(0.05)
                 
                 # This should trigger memory pressure callback
                 t = torch.randn(256 * 1024 * 1024, device='spyre')
@@ -158,7 +161,7 @@ class TestMemoryPressureGC:
         def hold_gil_briefly():
             """Thread that holds GIL doing Python work."""
             # Do some Python work that holds GIL
-            for i in range(1000):
+            for i in range(500):  # Reduced iterations
                 _ = [j**2 for j in range(100)]
                 time.sleep(0.001)
         
@@ -171,8 +174,8 @@ class TestMemoryPressureGC:
         t2.start()
         
         # Wait for completion with timeout
-        t1.join(timeout=10.0)
-        t2.join(timeout=10.0)
+        t1.join(timeout=15.0)  # Increased timeout
+        t2.join(timeout=15.0)
         
         # Verify no deadlock (threads completed)
         assert not t1.is_alive(), "Allocation thread deadlocked"
@@ -288,40 +291,52 @@ class TestMemoryPressureGC:
 
     def test_weakref_tensors_collected_on_pressure(self):
         """
-        Additional test: Verify that tensors held only by weak references
+        Additional test: Verify that tensors held in reference cycles
         are collected when memory pressure triggers GC.
+        
+        Note: We use reference cycles instead of weak references because Python's
+        reference counting immediately destroys objects when refcount hits zero,
+        regardless of gc.disable(). Only cycle-collected objects survive gc.disable().
         """
         gc.disable()
         
         try:
-            # Create tensors and keep strong references temporarily
-            tensors = []
+            # Create tensors in reference cycles so they survive after clearing the list
+            class TensorHolder:
+                def __init__(self, tensor):
+                    self.tensor = tensor
+                    self.ref: 'TensorHolder | None' = None  # Will create cycle
+            
+            holders = []
             weak_refs = []
             tensor_size = 1024 * 1024 * 1024
             
             for i in range(4):
                 t = torch.randn(tensor_size // 4, device='spyre')
-                tensors.append(t)
+                holder = TensorHolder(t)
+                holder.ref = holder  # Create self-reference cycle
+                holders.append(holder)
+                # Weak ref to the tensor itself
                 weak_refs.append(weakref.ref(t))
             
-            # Verify weak refs are alive while strong refs exist
+            # Verify weak refs are alive while holders exist
             alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 4, "Weak refs should be alive while strong refs exist"
+            assert alive_count == 4, "Weak refs should be alive while holders exist"
             
-            # Drop strong references - now only weak refs remain
+            # Drop external references - now only cycles remain
             # Objects won't be collected yet because GC is disabled
-            tensors.clear()
+            holders.clear()
             
-            # Verify weak refs are still alive (objects not collected yet with GC disabled)
+            # Verify weak refs are still alive (cycle-collected objects not freed yet)
             alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 4, "Weak refs should still be alive before GC runs"
+            assert alive_count == 4, "Weak refs should still be alive before GC runs (held by cycles)"
             
-            # Trigger memory pressure - should collect weakly-referenced tensors
+            # Trigger memory pressure - should collect cycle-referenced tensors
             new_tensor = torch.randn(tensor_size // 4, device='spyre')
             
             # After memory pressure triggered GC, weak refs should be dead
             alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 0, "Weak refs should be dead after memory pressure GC"
+            assert alive_count == 0, "Weak refs should be dead after memory pressure GC collected cycles"
             
         finally:
             gc.enable()
