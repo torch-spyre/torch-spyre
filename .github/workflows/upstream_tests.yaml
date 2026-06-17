@@ -88,29 +88,20 @@ jobs:
 
       - uses: ./.github/actions/build-torch-spyre
 
-      - name: Run ${{ matrix.suite.name }} upstream test suite
+      - name: Derive report paths
         run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-
-          # Derive the XML report name from the config filename
-          # Example:
-          #   test_view_ops_config.yaml    ->  test_view_ops_config.xml
-          #   test_profiler_config.yaml ->  test_profiler_config.xml
-          CONFIG="${{ matrix.suite.config }}"
-          REPORT_NAME="${CONFIG%.yaml}.xml"
-          REPORT_PATH="${GITHUB_WORKSPACE}/${REPORT_NAME}"
-
-          # Expose report path/name to subsequent steps via GITHUB_ENV
-          echo "REPORT_PATH=${REPORT_PATH}" >> "$GITHUB_ENV"
+          REPORT_NAME="${{ matrix.suite.config }}"; REPORT_NAME="${REPORT_NAME%.yaml}.xml"
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
-          echo "Running ${{ matrix.suite.name }} upstream tests..."
-          bash tests/run_test.sh "tests/configs/upstream_tests/${CONFIG}" --capture=sys -v --junit-xml="${REPORT_PATH}"
-          echo "${{ matrix.suite.name }} upstream tests done"
-
+      - name: Run ${{ matrix.suite.name }} tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/upstream_tests/${{ matrix.suite.config }}
+          extra_test_flags: -v
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and
