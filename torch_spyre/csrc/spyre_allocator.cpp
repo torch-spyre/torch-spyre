@@ -25,7 +25,15 @@
 
 namespace spyre {
 
-SpyreAllocator::SpyreAllocator() = default;
+SpyreAllocator::SpyreAllocator() {
+  // Register memory pressure callback with FlexAllocator
+  auto flex_alloc = getFlexAllocator();
+  if (flex_alloc) {
+    flex_alloc->registerMemoryPressureCallback(&SpyreAllocator::memoryPressureCallback);
+    DEBUGINFO("SpyreAllocator: registered memory pressure callback with FlexAllocator");
+  }
+}
+
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
 c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
@@ -194,6 +202,63 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
 
 uint32_t SpyreAllocator::segmentForRegion(uint64_t region_id) const {
   return getFlexAllocator()->getIdToRegionMap().at(region_id)->segment_id();
+}
+
+void SpyreAllocator::memoryPressureCallback(std::mutex& allocator_mutex) {
+  // This callback is invoked by FlexAllocator while holding allocator_mutex
+  // We must:
+  // 1. Release the allocator mutex
+  // 2. Acquire the Python GIL
+  // 3. Call PyGC_Collect()
+  // 4. Release the GIL
+  // 5. Re-acquire the allocator mutex
+  //
+  // Lock ordering: allocator_mutex -> (release) -> GIL -> (release) -> allocator_mutex
+  // This prevents deadlock with Python threads that hold GIL before calling allocate()
+
+  DEBUGINFO("SpyreAllocator: memory pressure callback invoked, releasing allocator mutex");
+  
+  // Step 1: Release allocator mutex
+  allocator_mutex.unlock();
+
+  try {
+    // Step 2: Acquire Python GIL
+    // PyGILState_Ensure() is safe to call from any thread, even if the thread
+    // was not created by Python. It returns the previous GIL state.
+    DEBUGINFO("SpyreAllocator: acquiring Python GIL for garbage collection");
+    PyGILState_STATE gstate = PyGILState_Ensure();
+
+    // Step 3: Trigger Python garbage collection
+    // PyGC_Collect() runs a full collection cycle and returns the number of
+    // unreachable objects found (or -1 on error)
+    DEBUGINFO("SpyreAllocator: calling PyGC_Collect()");
+    Py_ssize_t collected = PyGC_Collect();
+    
+    if (collected >= 0) {
+      DEBUGINFO("SpyreAllocator: PyGC_Collect() completed, collected "
+                << collected << " objects");
+    } else {
+      // PyGC_Collect() returned -1, indicating an error
+      // Log the error but don't throw - we still need to restore lock state
+      DEBUGINFO("SpyreAllocator: PyGC_Collect() returned error");
+    }
+
+    // Step 4: Release Python GIL
+    DEBUGINFO("SpyreAllocator: releasing Python GIL");
+    PyGILState_Release(gstate);
+
+  } catch (const std::exception& e) {
+    // Catch any exceptions during GC to ensure we always re-acquire the mutex
+    // Log the error but don't propagate - FlexAllocator will handle OOM
+    DEBUGINFO("SpyreAllocator: exception during GC: " << e.what());
+  } catch (...) {
+    DEBUGINFO("SpyreAllocator: unknown exception during GC");
+  }
+
+  // Step 5: Re-acquire allocator mutex before returning to FlexAllocator
+  DEBUGINFO("SpyreAllocator: re-acquiring allocator mutex");
+  allocator_mutex.lock();
+  DEBUGINFO("SpyreAllocator: memory pressure callback complete");
 }
 
 // Register our custom allocator
