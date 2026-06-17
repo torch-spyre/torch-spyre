@@ -118,6 +118,17 @@ class TestInsertPaddingIR(unittest.TestCase):
         compiled(*args)
         return self.captured_operations
 
+    def compile_and_run(
+        self,
+        fn: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+    ) -> tuple[list[Operation], torch.Tensor]:
+        """Compile ``fn`` once, capture IR operations, and return (ops, result)."""
+        self.captured_operations = []
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(*args)
+        return self.captured_operations, result
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -225,13 +236,15 @@ class TestInsertPaddingIR(unittest.TestCase):
         # 67 is not a multiple of stick_size (64), so padding should occur.
         assert 67 % stick_size != 0
 
-        x = torch.randn(55, 67, dtype=dtype, device="spyre")
-        w = torch.randn(67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(55, 67, dtype=dtype)
+        w_cpu = torch.randn(67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return x @ w
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1, "Expected exactly one matmul op")
         mm = matmuls[0]
@@ -251,19 +264,23 @@ class TestInsertPaddingIR(unittest.TestCase):
         ops_before = self._ops_before(ops, mm)
         self._assert_constant_pad_nd_ops(ops_before)
 
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
     def test_mm_aligned_k_no_padding(self) -> None:
         """2D mm with K=128 (aligned) — no padding ops inserted."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 128 % stick_size == 0
 
-        x = torch.randn(55, 128, dtype=dtype, device="spyre")
-        w = torch.randn(128, 64, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(55, 128, dtype=dtype)
+        w_cpu = torch.randn(128, 64, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return x @ w
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1, "Expected exactly one matmul op")
         mm = matmuls[0]
@@ -278,19 +295,23 @@ class TestInsertPaddingIR(unittest.TestCase):
         ops_before = self._ops_before(ops, mm)
         self.assertEqual(len(ops_before), 0, "Expected no padding ops for aligned K")
 
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
     def test_bmm_3d_unaligned_k_pads(self) -> None:
         """3D bmm (B,M,K)×(B,K,N) with K=67 — only y is padded before bmm."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        x = torch.randn(2, 55, 67, dtype=dtype, device="spyre")
-        w = torch.randn(2, 67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(2, 55, 67, dtype=dtype)
+        w_cpu = torch.randn(2, 67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return torch.bmm(x, w)
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1, "Expected exactly one batched matmul op")
         mm = matmuls[0]
@@ -303,19 +324,23 @@ class TestInsertPaddingIR(unittest.TestCase):
         ops_before = self._ops_before(ops, mm)
         self._assert_constant_pad_nd_ops(ops_before)
 
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
     def test_bmm_3d_2d_unaligned_k_pads(self) -> None:
         """3D×2D bmm: (B,M,K)×(K,N) with K=67 — only y is padded."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        x = torch.randn(2, 55, 67, dtype=dtype, device="spyre")
-        w = torch.randn(67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(2, 55, 67, dtype=dtype)
+        w_cpu = torch.randn(67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return x @ w
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1)
         mm = matmuls[0]
@@ -327,6 +352,8 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         ops_before = self._ops_before(ops, mm)
         self._assert_constant_pad_nd_ops(ops_before)
+
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
     def test_matmul_4d_unaligned_k_pads(self) -> None:
         """4D matmul (B,H,M,K)×(B,H,K,N) with K=67 — only y is padded."""
@@ -334,13 +361,15 @@ class TestInsertPaddingIR(unittest.TestCase):
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        x = torch.randn(2, 3, 55, 67, dtype=dtype, device="spyre")
-        w = torch.randn(2, 3, 67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(2, 3, 55, 67, dtype=dtype)
+        w_cpu = torch.randn(2, 3, 67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return x @ w
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1)
         mm = matmuls[0]
@@ -353,19 +382,23 @@ class TestInsertPaddingIR(unittest.TestCase):
         ops_before = self._ops_before(ops, mm)
         self._assert_constant_pad_nd_ops(ops_before)
 
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
     def test_einsum_mk_kn_mn_pads(self) -> None:
         """einsum('mk,kn->mn') with K=67 — y is padded; reduction_ranges stays at K."""
         dtype = torch.float16
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        x = torch.randn(55, 67, dtype=dtype, device="spyre")
-        w = torch.randn(67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(55, 67, dtype=dtype)
+        w_cpu = torch.randn(67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return torch.einsum("mk,kn->mn", x, w)
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1)
         mm = matmuls[0]
@@ -374,6 +407,8 @@ class TestInsertPaddingIR(unittest.TestCase):
         reduction = mm.data
         assert isinstance(reduction, Reduction)
         self.assertEqual(int(reduction.reduction_ranges[0]), 67)
+
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
     def test_padding_constants_deduped(self) -> None:
         """Two matmuls with the same shapes yield exactly one spyre.constant after dedup.
@@ -387,14 +422,17 @@ class TestInsertPaddingIR(unittest.TestCase):
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        x = torch.randn(2, 55, 67, dtype=dtype, device="spyre")
-        w1 = torch.randn(2, 67, 128, dtype=dtype, device="spyre")
-        w2 = torch.randn(2, 67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(2, 55, 67, dtype=dtype)
+        w1_cpu = torch.randn(2, 67, 128, dtype=dtype)
+        w2_cpu = torch.randn(2, 67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w1 = w1_cpu.to(device="spyre")
+        w2 = w2_cpu.to(device="spyre")
 
         def fn(x, w1, w2):
             return torch.bmm(x, w1) + torch.bmm(x, w2)
 
-        ops = self.compile_and_capture(fn, (x, w1, w2))
+        ops, result = self.compile_and_run(fn, (x, w1, w2))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 2, "Expected 2 matmul ops")
 
@@ -413,6 +451,10 @@ class TestInsertPaddingIR(unittest.TestCase):
             "Expected the surviving spyre.constant to be the first operation",
         )
 
+        torch.testing.assert_close(
+            fn(x_cpu, w1_cpu, w2_cpu), result.cpu(), atol=0.1, rtol=0.1
+        )
+
     def test_origin_node_set_on_rebuilt_matmul(self) -> None:
         """Rebuilt matmul ComputedBuffer retains origin_node from the original.
 
@@ -423,13 +465,15 @@ class TestInsertPaddingIR(unittest.TestCase):
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        x = torch.randn(55, 67, dtype=dtype, device="spyre")
-        w = torch.randn(67, 128, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(55, 67, dtype=dtype)
+        w_cpu = torch.randn(67, 128, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return x @ w
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1)
         mm = matmuls[0]
@@ -438,6 +482,8 @@ class TestInsertPaddingIR(unittest.TestCase):
             mm.origin_node,
             "origin_node should not be None after _rebuild_matmul",
         )
+
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
     def test_padded_buffer_sizes_y_only(self) -> None:
         """Only y is padded; x is untouched.  y_padded has host size [B, K_padded, N].
@@ -456,13 +502,15 @@ class TestInsertPaddingIR(unittest.TestCase):
         B, M, K, N = 2, 55, 67, 128
         k_padded = ((K + stick_size - 1) // stick_size) * stick_size
 
-        x = torch.randn(B, M, K, dtype=dtype, device="spyre")
-        w = torch.randn(B, K, N, dtype=dtype, device="spyre")
+        x_cpu = torch.randn(B, M, K, dtype=dtype)
+        w_cpu = torch.randn(B, K, N, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
 
         def fn(x, w):
             return torch.bmm(x, w)
 
-        ops = self.compile_and_capture(fn, (x, w))
+        ops, result = self.compile_and_run(fn, (x, w))
         matmuls = self._matmul_ops(ops)
         self.assertEqual(len(matmuls), 1)
         mm = matmuls[0]
@@ -505,6 +553,8 @@ class TestInsertPaddingIR(unittest.TestCase):
             f"got {dev_size[-4]}; full device_size={dev_size}",
         )
 
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
     def test_padded_buffer_preserves_stick_dimension(self) -> None:
         """y's padded buffer preserves the original within-stick stride.
 
@@ -523,38 +573,29 @@ class TestInsertPaddingIR(unittest.TestCase):
         stick_size = get_elem_in_stick(dtype)
         assert 67 % stick_size != 0
 
-        cases: list[
-            tuple[str, Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]
-        ] = [
-            (
-                "mm [55,67]x[67,128]",
-                lambda x, w: x @ w,
-                (
-                    torch.randn(55, 67, dtype=dtype, device="spyre"),
-                    torch.randn(67, 128, dtype=dtype, device="spyre"),
-                ),
-            ),
-            (
-                "bmm [2,55,67]x[2,67,128]",
-                lambda x, w: torch.bmm(x, w),
-                (
-                    torch.randn(2, 55, 67, dtype=dtype, device="spyre"),
-                    torch.randn(2, 67, 128, dtype=dtype, device="spyre"),
-                ),
-            ),
+        def make_args(*shapes):
+            cpu = tuple(torch.randn(*s, dtype=dtype) for s in shapes)
+            dev = tuple(t.to(device="spyre") for t in cpu)
+            return cpu, dev
+
+        cpu0, dev0 = make_args((55, 67), (67, 128))
+        cpu1, dev1 = make_args((2, 55, 67), (2, 67, 128))
+        cpu2, dev2 = make_args((55, 67), (67, 128))
+
+        cases: list[tuple[str, Callable[..., torch.Tensor], tuple, tuple]] = [
+            ("mm [55,67]x[67,128]", lambda x, w: x @ w, dev0, cpu0),
+            ("bmm [2,55,67]x[2,67,128]", lambda x, w: torch.bmm(x, w), dev1, cpu1),
             (
                 "einsum mk,kn->mn [55,67]x[67,128]",
                 lambda x, w: torch.einsum("mk,kn->mn", x, w),
-                (
-                    torch.randn(55, 67, dtype=dtype, device="spyre"),
-                    torch.randn(67, 128, dtype=dtype, device="spyre"),
-                ),
+                dev2,
+                cpu2,
             ),
         ]
 
-        for name, fn, args in cases:
+        for name, fn, args, cpu_args in cases:
             with self.subTest(case=name):
-                ops = self.compile_and_capture(fn, args)
+                ops, result = self.compile_and_run(fn, args)
                 matmuls = self._matmul_ops(ops)
                 self.assertEqual(len(matmuls), 1, f"{name}: expected 1 matmul")
                 mm = matmuls[0]
@@ -582,6 +623,71 @@ class TestInsertPaddingIR(unittest.TestCase):
                         f"expected 1 (within-stick dim is contiguous); "
                         f"size={[int(s) for s in op.get_size()]}",
                     )
+
+                torch.testing.assert_close(
+                    fn(*cpu_args), result.cpu(), atol=0.1, rtol=0.1
+                )
+
+    def test_mm_square_unaligned_k_pads_y_only(self) -> None:
+        """Square mm (M==K==N) with unaligned K — only y is padded, not x.
+
+        Verifies that x/y identification works correctly when both inputs
+        have the same shape (M==K==N).
+        """
+        dtype = torch.float16
+        stick_size = get_elem_in_stick(dtype)
+        K = 67
+        assert K % stick_size != 0
+
+        x_cpu = torch.randn(K, K, dtype=dtype)
+        w_cpu = torch.randn(K, K, dtype=dtype)
+        x = x_cpu.to(device="spyre")
+        w = w_cpu.to(device="spyre")
+
+        def fn(x, w):
+            return x @ w
+
+        ops, result = self.compile_and_run(fn, (x, w))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1)
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), K)
+        ops_before = self._ops_before(ops, mm)
+        self._assert_constant_pad_nd_ops(ops_before)
+        torch.testing.assert_close(fn(x_cpu, w_cpu), result.cpu(), atol=0.1, rtol=0.1)
+
+    def test_4d_matmul_xt_restickify_pads_y(self) -> None:
+        """4D matmul where x is transposed (forcing restickify) and K is unaligned.
+
+        x is stored as [B, H, K, M] and transposed to [B, H, M, K] for the
+        matmul.  Restickify reorders x's device dims; insert_bmm_padding must
+        preserve the original inner_fn's x loader unchanged so work_division
+        sees valid device coordinates.  Regression test for that fix.
+        """
+        dtype = torch.float16
+        B, H, M, K, N = 12, 32, 256, 4, 128
+
+        x_cpu = torch.randn(B, H, K, M, dtype=dtype) * 0.01
+        y_cpu = torch.randn(B, H, K, N, dtype=dtype) * 0.01
+        x = x_cpu.to(device="spyre")
+        y = y_cpu.to(device="spyre")
+
+        def fn(x, y):
+            return torch.matmul(x.transpose(-1, -2), y)
+
+        ops, result = self.compile_and_run(fn, (x, y))
+        matmuls = self._matmul_ops(ops)
+        self.assertEqual(len(matmuls), 1, "Expected exactly one matmul op")
+        mm = matmuls[0]
+        reduction = mm.data
+        assert isinstance(reduction, Reduction)
+        self.assertEqual(int(reduction.reduction_ranges[0]), K)
+        # ops_before contains a restickify op for x in addition to the 4-op
+        # padding sequence for y, so _assert_constant_pad_nd_ops (which expects
+        # exactly 4 ops) cannot be used here.  Correctness is verified by assert_close.
+        torch.testing.assert_close(fn(x_cpu, y_cpu), result.cpu(), atol=0.1, rtol=0.1)
 
 
 if __name__ == "__main__":
