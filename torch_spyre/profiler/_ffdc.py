@@ -144,6 +144,25 @@ def _collect_artifacts() -> dict:
                 found.extend(str(m) for m in matches[:5])
             except Exception:
                 pass
+
+    # Also search the Spyre inductor cache for dxp_standalone bundle artifacts
+    try:
+        from torch._inductor.runtime.runtime_utils import cache_dir as _cache_dir
+
+        spyre_cache = Path(_cache_dir()) / "inductor-spyre"
+        if spyre_cache.exists():
+            kernel_dirs = [d for d in spyre_cache.iterdir() if d.is_dir()]
+            if kernel_dirs:
+                newest_kernel = max(kernel_dirs, key=lambda d: d.stat().st_mtime)
+                for pattern in ["sdsc_*.json", "*.mlir", "*.log"]:
+                    try:
+                        matches = list(newest_kernel.rglob(pattern))
+                        found.extend(str(m) for m in matches[:5])
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     unique = list(dict.fromkeys(found))
     return {
         "searched": True,
