@@ -36,6 +36,10 @@ runs:
         echo "PATH $PATH"
         echo "HOME $HOME"
         echo "TORCH_ROOT ${TORCH_ROOT:-<unset>}"
+        echo "---------------------------------"
+        ls -la "$HOME/installed_rpms.txt"
+        cat "$HOME/installed_rpms.txt"
+        echo "---------------------------------"
         python3 --version
         python3 -c 'import sys; print(sys.path)'
         if [[ "${VERBOSE}" == "true" ]]; then
