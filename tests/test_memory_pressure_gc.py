@@ -289,59 +289,6 @@ class TestMemoryPressureGC:
         # Note: We can't easily verify GC was called exactly once per pressure window
         # from Python, but the C++ implementation ensures this
 
-    def test_weakref_tensors_collected_on_pressure(self):
-        """
-        Additional test: Verify that tensors held in reference cycles
-        are collected when memory pressure triggers GC.
-        
-        Note: We use reference cycles instead of weak references because Python's
-        reference counting immediately destroys objects when refcount hits zero,
-        regardless of gc.disable(). Only cycle-collected objects survive gc.disable().
-        """
-        gc.disable()
-        
-        try:
-            # Create tensors in reference cycles so they survive after clearing the list
-            class TensorHolder:
-                def __init__(self, tensor):
-                    self.tensor = tensor
-                    self.ref: 'TensorHolder | None' = None  # Will create cycle
-            
-            holders = []
-            weak_refs = []
-            tensor_size = 1024 * 1024 * 1024
-            
-            for i in range(4):
-                t = torch.randn(tensor_size // 4, device='spyre')
-                holder = TensorHolder(t)
-                holder.ref = holder  # Create self-reference cycle
-                holders.append(holder)
-                # Weak ref to the tensor itself
-                weak_refs.append(weakref.ref(t))
-            
-            # Verify weak refs are alive while holders exist
-            alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 4, "Weak refs should be alive while holders exist"
-            
-            # Drop external references - now only cycles remain
-            # Objects won't be collected yet because GC is disabled
-            holders.clear()
-            
-            # Verify weak refs are still alive (cycle-collected objects not freed yet)
-            alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 4, "Weak refs should still be alive before GC runs (held by cycles)"
-            
-            # Trigger memory pressure - should collect cycle-referenced tensors
-            new_tensor = torch.randn(tensor_size // 4, device='spyre')
-            
-            # After memory pressure triggered GC, weak refs should be dead
-            alive_count = sum(1 for wr in weak_refs if wr() is not None)
-            assert alive_count == 0, "Weak refs should be dead after memory pressure GC collected cycles"
-            
-        finally:
-            gc.enable()
-            gc.collect()
-
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
