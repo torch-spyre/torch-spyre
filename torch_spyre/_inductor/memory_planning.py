@@ -24,11 +24,11 @@ from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .scheduler import CountedLoopSchedulerNode
-from .logging_utils import get_inductor_logger, _get_env_bool
+from .logging_utils import get_inductor_logger
+from . import config
 
 logger = get_inductor_logger("MEMORY_PLANNING")
 _STICK_BYTES = 128
-_MEMORY_PLAN_ENABLED = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 
 
 class Allocator:
@@ -148,7 +148,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     Graph inputs/outputs and LX-allocated buffers are excluded.
     """
 
-    if not _MEMORY_PLAN_ENABLED:
+    if not config.hbm_planning:
         V.graph.pool_size = 0
         return nodes
 
