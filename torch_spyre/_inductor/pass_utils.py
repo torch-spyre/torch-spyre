@@ -624,13 +624,11 @@ def restickify_device_size(
 ) -> list:
     """Computes the new device size after a restickify is performed
     moving the stick from old_sd to new_sd."""
-    assert new_sd_host_size % stick_size == 0, (
-        f"Cannot move stick to dimension with size {new_sd_host_size}: "
-        f"without padding since not a multiple of stick_size={stick_size}"
-    )
     new_device_size = list(old_device_size)
     new_device_size[-1] = stick_size
-    new_device_size[old_sd_outer_dim] = new_sd_host_size // stick_size
+    new_device_size[old_sd_outer_dim] = (
+        new_sd_host_size + stick_size - 1
+    ) // stick_size
     new_device_size[new_sd_outer_dim] = old_sd_host_size
     return new_device_size
 
@@ -684,8 +682,6 @@ def compute_restickify_target_layout(
     if not candidates:
         return None
     new_sd_outer_dim = candidates[0]
-    if host_size[new_sd] % stick_size != 0:
-        return None
     device_size = restickify_device_size(
         list(stl.device_size),
         old_sd_outer_dim,

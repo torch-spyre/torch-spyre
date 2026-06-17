@@ -115,11 +115,19 @@ def generate_bundle(
     _collect_loop_bounds(specs_list, loop_bounds)
 
     # Affine map deduplication: stride_key -> map index (0-based).
-    # A stride_key is a tuple of (stride,) values — one per loop variable at
-    # the nesting depth where the op lives.  For a single-level loop with one
-    # tiled sym the key is (stride_bytes,).
+    # A stride_key is a tuple of (stride,) values — one per tiled loop variable
+    # that advances this tensor.  For a single-level loop with one tiled sym the
+    # key is (stride_bytes,).
+    #
+    # affine_map_loop_var_indices: parallel to compiled, per op a list of
+    # per-tensor loop-var index lists.  Each inner list records which positions
+    # in the enclosing loop_vars list correspond to the strides in stride_key.
+    # _emit_specs uses this to pass only the relevant loop vars to affine.apply.
     affine_map_index: dict[tuple, int] = {}
-    _collect_affine_maps(specs_list, iter(compiled), [], affine_map_index)
+    affine_map_loop_var_indices: list[list[list[int]]] = []
+    _collect_affine_maps(
+        specs_list, iter(compiled), [], affine_map_index, affine_map_loop_var_indices
+    )
 
     compiled_iter = iter(compiled)
     addr_counter = [0]
@@ -269,13 +277,18 @@ def generate_bundle(
                 f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
         # Recursive body emission.
+        # affine_map_lv_iter spans the entire spec tree (one entry per OpSpec,
+        # in the same depth-first order as compiled_iter) and is consumed by
+        # _emit_specs across all recursive calls — not reset per loop level.
         loop_bound_idx = [0]
+        affine_map_lv_iter = iter(affine_map_loop_var_indices)
         _emit_specs(
             specs_list,
             compiled_iter,
             loop_bounds,
             loop_bound_idx,
             affine_map_index,
+            affine_map_lv_iter,
             addr_counter,
             [],
             f,
@@ -363,8 +376,16 @@ def _collect_affine_maps(
     compiled_iter,
     loop_var_depth: list,
     affine_map_index: dict,
+    loop_var_indices_out: list,
 ) -> None:
-    """Walk the spec tree and register unique affine stride keys."""
+    """Walk the spec tree and register unique affine stride keys.
+
+    Populates ``affine_map_index`` (stride_key -> map_idx) and appends one
+    entry per OpSpec to ``loop_var_indices_out``.  Each entry is a list of
+    per-tensor index lists: ``loop_var_indices_out[op_idx][tensor_idx]`` is
+    the list of loop-var positions (into the enclosing ``loop_vars`` list at
+    emit time) that correspond to the strides in the tensor's stride_key.
+    """
     for entry in specs:
         if isinstance(entry, LoopSpec):
             _collect_affine_maps(
@@ -372,17 +393,29 @@ def _collect_affine_maps(
                 compiled_iter,
                 loop_var_depth + [len(loop_var_depth)],
                 affine_map_index,
+                loop_var_indices_out,
             )
         elif isinstance(entry, OpSpec):
             _, _, affine_strides, _ = next(compiled_iter)
+            per_tensor_lv_indices: list[list[int]] = []
             for tensor_strides in affine_strides:
                 if not tensor_strides:
+                    per_tensor_lv_indices.append([])
                     continue
                 # Build stride key from the tiled symbols present in this tensor,
                 # in the order they appear in affine_strides dict.
                 stride_key = tuple(tensor_strides.values())
                 if stride_key not in affine_map_index:
                     affine_map_index[stride_key] = len(affine_map_index)
+                # Record which loop-var positions (in the enclosing loop_vars
+                # list) correspond to each stride entry.  tiled_symbols is
+                # ordered outermost-first (see spyre_kernel.py), so a K-only
+                # tiled op at nesting depth 2 has stride_key length 1 and we
+                # want the innermost loop var — hence we take the *last*
+                # len(stride_key) entries of loop_var_depth.
+                lv_idxs = list(loop_var_depth[-len(stride_key) :])
+                per_tensor_lv_indices.append(lv_idxs)
+            loop_var_indices_out.append(per_tensor_lv_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +438,7 @@ def _emit_specs(
     loop_bounds: list,
     loop_bound_idx: list,
     affine_map_index: dict,
+    affine_map_lv_iter,
     addr_counter: list,
     loop_vars: list,
     f,
@@ -451,6 +485,7 @@ def _emit_specs(
                 loop_bounds,
                 loop_bound_idx,
                 affine_map_index,
+                affine_map_lv_iter,
                 addr_counter,
                 loop_vars + [loop_var],
                 f,
@@ -464,6 +499,10 @@ def _emit_specs(
 
         elif isinstance(entry, OpSpec):
             sdsc_json, local_sym_values, affine_strides, _ = next(compiled_iter)
+            # Per-tensor loop-var index lists: which positions in the enclosing
+            # loop_vars list correspond to the strides for each tensor.
+            per_tensor_lv_indices: list[list[int]] = next(affine_map_lv_iter)
+
             # Determine the JSON filename from the sdsc_json key.
             sdsc_name = next(iter(sdsc_json))
             sdsc_idx = sdsc_name.split("_")[0]
@@ -489,7 +528,12 @@ def _emit_specs(
                     addr_name = f"%addr_{addr_counter[0]}"
                     addr_counter[0] += 1
                     base_addr_name = _resolve_sym(base_sym_id)
-                    loop_var_str = ", ".join(loop_vars)
+                    # Select only the loop vars that correspond to the strides
+                    # for this tensor (may be a subset of all enclosing loop vars
+                    # when the op is not tiled on every enclosing loop level).
+                    lv_indices = per_tensor_lv_indices[tensor_idx]
+                    apply_loop_vars = [loop_vars[i] for i in lv_indices]
+                    loop_var_str = ", ".join(apply_loop_vars)
                     f.write(
                         f"{tab}{addr_name} = affine.apply #map_{map_idx}"
                         f"({loop_var_str})[{base_addr_name}]\n"
