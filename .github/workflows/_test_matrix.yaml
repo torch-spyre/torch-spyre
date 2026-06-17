@@ -5,7 +5,7 @@ name: Test matrix (reusable)
 # Called by tests.yml and tests-nightly.yml.
 #
 # All differences between the two callers are expressed as inputs:
-#   - runner_label      : linux_for_pr_tests (PR) vs linux (nightly)
+#   - runner_label      : linux
 #   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
 #   - checkout_pytorch  : false (PR) vs true (nightly)
 #   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
@@ -16,7 +16,7 @@ on:
     inputs:
       # Runner pool to use for both test jobs
       runner_label:
-        description: Runner label appended to the fixed labels (linux_for_pr_tests or linux)
+        description: Runner label appended to the fixed labels (linux)
         required: true
         type: string
 
@@ -301,6 +301,12 @@ jobs:
             echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
             echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
 
+            # On the final attempt, enable verbose DT logging for diagnostics
+            _DTLOG_PREFIX=""
+            if [[ $attempt -eq $MAX_ATTEMPTS ]]; then
+              echo "  DTLOG_LEVEL   : Info (final attempt --> DTLOG_LEVEL logging enabled)"
+              _DTLOG_PREFIX="DTLOG_LEVEL=Info"
+            fi
 
             FIFO="$(mktemp -u /tmp/test_fifo_XXXXXX)"
             mkfifo "$FIFO"
@@ -312,7 +318,7 @@ jobs:
             # Now open the write end — guaranteed to have a reader already waiting
             exec {FIFO_FD}>"$FIFO"
 
-            bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
+            env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} \
               >&"$FIFO_FD" 2>&1 &
             TEST_PID=$!
 
