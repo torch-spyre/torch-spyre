@@ -327,10 +327,9 @@ def _autoload():
 
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging
-    # LOGLEVELS CHANGED FOR DEBUGGING CI CRASHES.  DO NOT MERGE!
-    os.environ.setdefault("TORCH_SENDNN_LOG", "DEBUG")
-    os.environ.setdefault("DT_DEEPRT_VERBOSE", "1")
-    os.environ.setdefault("DTLOG_LEVEL", "debug")
+    os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
+    os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
+    os.environ.setdefault("DTLOG_LEVEL", "error")
 
     # Enable spyre code with fake addresses by default
     os.environ.setdefault("DUMP_SPYRE_CODE", "1")

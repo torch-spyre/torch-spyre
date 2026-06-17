@@ -1421,7 +1421,7 @@ _run_pytest_isolated() {
         else
             echo "[torch_oot_device_tests_run] Running serial test"
             # Regular pytest for non-distributed tests
-            FLEX_STREAMER_FUNCTION=SEQUENTIAL DTLOG_LEVEL=debug python3 -m pytest -s "$_base" "${_args[@]}"
+            python3 -m pytest "$_base" "${_args[@]}"
             echo $? > "$_exit_tmp"
         fi
     ) || true
