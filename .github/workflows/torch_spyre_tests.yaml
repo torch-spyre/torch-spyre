@@ -1,4 +1,4 @@
-name: torch-spyre-tests
+name: tests
 
 on:
   push:

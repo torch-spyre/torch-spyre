@@ -196,6 +196,8 @@ jobs:
             config: torch_spyre_tests/tensors/test_resize_config.yaml
           - name: Tensor Memory Format
             config: torch_spyre_tests/tensors/test_memory_format_config.yaml
+          - name: Tensor Model Loading Layout
+            config: torch_spyre_tests/tensors/test_model_utils_config.yaml
 
     steps:
       - name: Checkout composite actions
