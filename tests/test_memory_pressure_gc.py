@@ -51,7 +51,6 @@ class TestMemoryPressureGC:
         
         # Cleanup after test
         gc.collect()
-        torch_spyre.empty_cache()
 
     def test_gc_releases_dead_tensors_allocation_succeeds(self):
         """
