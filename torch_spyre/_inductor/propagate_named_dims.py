@@ -133,7 +133,8 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     for i, coord in enumerate(coords):
         if coord.free_symbols:
             sym = _lone_sym(coord)
-            result.setdefault(sym, []).append(buf_named_dims[i])
+            if sym in dep.ranges:
+                result.setdefault(sym, []).append(buf_named_dims[i])
     for sym, names in result.items():
         actual_range = int(dep.ranges[sym])
         product = 1
@@ -244,7 +245,11 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep) -> None:
+def _log_dep_debug(
+    label: str, dep: MemoryDep
+) -> (
+    None
+):  # TODO: thread indirect_load_subs to show IndirectAccess in device_coordinates
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None

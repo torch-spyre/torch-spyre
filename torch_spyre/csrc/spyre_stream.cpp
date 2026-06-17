@@ -206,11 +206,13 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
   // Create and launch operation
   if (host2device) {
-    flex::RuntimeOperationH2D op(cpu_ptr, device_address, dci_ptr);
-    flex_stream->launchOperation(op);
+    flex::DmaParams params(cpu_ptr, device_address->total_size(), host2device,
+                           device_address, std::move(dci_ptr));
+    flex_stream->launchOperationH2D(&params);
   } else {
-    flex::RuntimeOperationD2H op(device_address, cpu_ptr, dci_ptr);
-    flex_stream->launchOperation(op);
+    flex::DmaParams params(cpu_ptr, device_address->total_size(), host2device,
+                           device_address, std::move(dci_ptr));
+    flex_stream->launchOperationD2H(&params);
   }
 }
 
@@ -227,12 +229,12 @@ void SpyreStream::executeProgramAsync(
 
   // Program
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
-  flex::RuntimeOperationCompute compute_op(
-      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
+  flex::ComputeParams params(&ctx->composite_addr, std::move(tensor_allocs),
+                             arts.bundle_mlir_path);
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
-  flex_stream->launchOperation(compute_op);
+  flex_stream->launchOperationCompute(&params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
@@ -246,19 +248,12 @@ void SpyreStream::launch(const JobPlan& plan,
   // Create launch context with tensor arguments
   LaunchContext ctx{args};
 
-  // Construct RuntimeOperations from each JobPlanStep
-  std::vector<std::unique_ptr<flex::RuntimeOperation>> operations;
-  operations.reserve(plan.steps.size());
-
-  for (const auto& step : plan.steps) {
-    operations.push_back(step->construct(ctx));
-  }
-
-  // Get the flex runtime stream handle
+  // Each JobPlanStep builds its flex operation params and launches them on the
+  // stream in order. flex owns the RuntimeOperation lifecycle.
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
-
-  // Submit all operations to the stream
-  flex_stream->launchOperation(operations);
+  for (const auto& step : plan.steps) {
+    step->construct(ctx, flex_stream);
+  }
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
