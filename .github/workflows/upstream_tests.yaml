@@ -36,7 +36,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_torch_spyre
+      - image_torch_spyre_shadow
     timeout-minutes: 60
     env:
       # The CI env var is very important.
