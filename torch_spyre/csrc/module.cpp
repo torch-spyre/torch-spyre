@@ -401,7 +401,7 @@ PYBIND11_MODULE(_C, m) {
       .def(
           "job_allocation_size",
           [](const spyre::JobPlan& plan) {
-            return plan.job_allocation.total_size();
+            return plan.job_allocation.at(0).total_size();
           },
           "Get the size of the job allocation")
       .def(
@@ -427,7 +427,7 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
-               std::to_string(plan.job_allocation.total_size()) +
+               std::to_string(plan.job_allocation.at(0).total_size()) +
                " expected_inputs=" +
                std::to_string(plan.expected_input_shapes.size()) +
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +

@@ -449,8 +449,10 @@ struct JobPlan {
   std::vector<std::unique_ptr<JobPlanStep>> steps;
 
   /**
-   * @brief Owning CompositeAddress of the program binary, and conditionally
-   * program correction data and spillover tensor data
+   * @brief vector of CompositeAddress with the first being the owning
+   * CompositeAddress of the program binary, and conditionally program
+   * correction data and spillover tensor data, and the rest being the
+   * non-owning CompositeAddress of each program.
    *
    * The JobPlan owns this address and is responsible for its lifetime. When the
    * JobPlan is destroyed, the memory is freed.
@@ -459,7 +461,7 @@ struct JobPlan {
    * DMA JobPlans (e.g., tensor .to(device)) that don't involve compute
    * operations.
    */
-  flex::CompositeAddress job_allocation;
+  std::vector<flex::CompositeAddress> job_allocation;
 
   /**
    * @brief Compiled tile dimensions from SpyreCode
@@ -480,6 +482,13 @@ struct JobPlan {
    */
   // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
   std::vector<HostBuffer> pinned_buffers;
+
+  /**
+   * @brief Compiled programs
+   *
+   * One entry per program.
+   */
+  std::vector<std::string> inits;
 };
 
 /**

@@ -155,10 +155,14 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   os << "Total steps: " << plan.steps.size() << "\n";
 
   // Job allocation
-  if (!plan.job_allocation.chunks().empty()) {
-    os << "Job allocation: " << plan.job_allocation << "\n";
-  } else {
-    os << "Job allocation: <none>\n";
+  size_t addr_idx = 0;
+  for (const auto& addr : plan.job_allocation) {
+    if (addr_idx == 0) {
+      os << "Job allocation: " << addr << "\n";
+    } else {
+      os << "Program " << addr_idx - 1 << ": " << addr << "\n";
+    }
+    ++addr_idx;
   }
 
   // Expected input shapes

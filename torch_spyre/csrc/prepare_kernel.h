@@ -138,11 +138,13 @@ class JobPlanBuilder {
   const SpyreStream stream_;
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
-  std::optional<flex::CompositeAddress> job_allocation_;
+  std::vector<flex::CompositeAddress> job_allocation_;
   /// Whether to bind inputs and outputs addresses for compute
   bool bind_io_addresses_;
 
   std::unordered_map<std::string, HostBuffer> pinned_buffer_map_;
+
+  std::vector<std::string> inits_;
 
   /// Execute the job preparation plan (allocate + init transfers)
   void executeJobPreparationPlan();
