@@ -404,18 +404,36 @@ def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
         seed, write_index, read_index, iter_space
     )
 
-    # Only single output-dim splits are flipped. Multi-dim splits (e.g.
-    # k_fast (1, n, k)) aren't yet handled.
     sliced_output_syms = [
         s for s in seed_per_sym if seed_per_sym[s] > 1 and write_index.coeff(s) != 0
     ]
+
+    options: list[tuple[dict, dict]] = [seed]
+    seen: set[tuple] = {_canonical_key(seed)}
+
+    # Matmul whose seed splits multiple output dims (e.g. M/4, N/8): concentrate
+    # the whole output factor onto one dim and add that as an option, so with
+    # the flip loop below we score the original seed plus both all-on-one-dim
+    # variants (e.g. M/32 and N/32). Skip if K is split — we don't redistribute
+    # reduction splits.
+    if is_matmul and len(sliced_output_syms) > 1 and not reduction_splits:
+        total = math.prod(seed_per_sym[s] for s in sliced_output_syms)
+        seed_sym = sliced_output_syms[0]
+        for s in sliced_output_syms:
+            seed_per_sym[s] = 1
+        seed_per_sym[seed_sym] = total
+        sliced_output_syms = [seed_sym]
+        concentrated = splits_by_index_coeff(seed_per_sym, write_index, read_index)
+        options.append(concentrated)
+        seen.add(_canonical_key(concentrated))
+
+    # Only single output-dim splits are flipped. Multi-dim splits (e.g.
+    # k_fast (1, n, k)) aren't yet handled.
     if len(sliced_output_syms) != 1:
         return [seed]
     seed_sym = sliced_output_syms[0]
     seed_factor = int(seed_per_sym[seed_sym])
 
-    options: list[tuple[dict, dict]] = [seed]
-    seen: set[tuple] = {_canonical_key(seed)}
     for sym, extent in iter_space.items():
         extent_int = concretize_expr(extent)
         if (
@@ -479,13 +497,11 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             if len(options_per_op[i]) > 1
         }
         logger.info(
-            "co-opt search: %d paths in %.1fms (enum %.1fms, eval %.1fms; "
-            "score %.1fms: graph_view %.1fms + mem_usage %.1fms); winner=%s",
+            "co-opt search: %d paths in %.1fms (key components in "
+            "_generate_buffers(): graph_view %.1fms + mem_usage %.1fms); "
+            "winner=%s",
             n_paths,
             (t_enum + t_search) * 1e3,
-            t_enum * 1e3,
-            t_search * 1e3,
-            timings["score"] * 1e3,
             timings["graph_view"] * 1e3,
             timings["mem_usage"] * 1e3,
             winner,
@@ -517,21 +533,19 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
     ) -> tuple[list[int], dict[str, float]]:
         """DFS over the option cross-product, scoring each leaf via
         _score_layout. Returns (best option index per op, timing
-        breakdown in seconds). The timing dict has keys: `score` (total
-        in _score_layout) and the two split-dependent shared-object builds
-        inside _generate_buffers — `graph_view` (filtered op view) and
-        `mem_usage` (mem_usage_by_buf). Liveness is split-invariant and
-        computed once here, not per leaf, so it has no per-leaf timer. No
-        early-stop pruning — bounded by ≤ K^N leaves where N counts ops
-        with >1 option (most return [seed]). Per-leaf cost is one full
-        _generate_buffers + plan_layout pass; the `cache` param on
-        _per_core_view_on_buf amortizes sympy work if it ever becomes hot.
+        breakdown in seconds). The timing dict has keys `graph_view` and
+        `mem_usage` — the two split-dependent shared-object builds inside
+        _generate_buffers, which dominate per-leaf cost. Liveness is
+        split-invariant and computed once here, not per leaf. No early-stop
+        pruning — bounded by ≤ K^N leaves where N counts ops with >1 option
+        (most return [seed]). Per-leaf cost is one full _generate_buffers +
+        plan_layout pass; the `cache` param on _per_core_view_on_buf
+        amortizes sympy work if it ever becomes hot.
         """
         chosen: list[int] = [0] * len(ops)
         best_total: float = math.inf
         best_chosen: list[int] = list(chosen)
         timings: dict[str, float] = {
-            "score": 0.0,
             "graph_view": 0.0,
             "mem_usage": 0.0,
         }
@@ -555,11 +569,9 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         def recurse(op_idx: int) -> None:
             nonlocal best_total, best_chosen
             if op_idx == len(ops):
-                t0 = time.perf_counter()
                 hbm = self._score_layout(
                     graph, buf_total_bytes, cache, timings, lifetimes
                 )
-                timings["score"] += time.perf_counter() - t0
                 if hbm < best_total:
                     best_total = hbm
                     best_chosen = list(chosen)  # list() makes a copy

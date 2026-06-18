@@ -38,6 +38,8 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "neg",
         "mm",
         "bmm",
+        "div",
+        "realdiv",
     }
 )
 
@@ -48,6 +50,8 @@ OP_GOOD_FOR_LX_INPLACE = frozenset(
         "add",
         "rsqrt",
         "neg",
+        "div",
+        "realdiv",
     }
 )
 
