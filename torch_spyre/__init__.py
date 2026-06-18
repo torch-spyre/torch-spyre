@@ -57,8 +57,13 @@ class _SpyreImpl:
         with _runtime_init_lock:
             if self._initialized:
                 return
-            # Load the C++ Module
-            # put any light, once-per-process setup here
+            # Start the device runtime. This is the ONLY thing _lazy_init does:
+            # all runtime-independent setup (tensor monkey-patch, inductor backend
+            # registration, dispatch-key kernels) is applied at import time in the
+            # top-level _autoload() so it is available before the first device op.
+            # The C++ startRuntime() is std::call_once, so eager device ops trigger
+            # it independently of this Python path; this remains for callers that
+            # want explicit runtime init.
             self._C = importlib.import_module("torch_spyre._C")
             # Apply pending device index before runtime init
             pending = self._pending_device_idx
@@ -67,27 +72,6 @@ class _SpyreImpl:
             # this will create the allocator
             self._C.start_runtime()
             self._initialized = True
-
-            ## Run patch on import
-            from ._monkey_patch import _patch_tensor_for_spyre
-
-            _patch_tensor_for_spyre()
-
-            from torch_spyre._inductor import _autoload as ts_autoload
-
-            ts_autoload()
-
-            # Permanently register PrivateUse1 kernels for DispatchKeys
-            # so that eager-mode dispatch reaches the Spyre implementations
-            # without requiring global monkey-patching.
-            # Customops must be imported here because decompositions.py references
-            # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
-            import torch_spyre._inductor.customops  # noqa: F401
-            from torch_spyre._inductor.decompositions import (
-                _register_spyre_dispatchkey_kernels_permanently,
-            )
-
-            _register_spyre_dispatchkey_kernels_permanently()
 
     def _is_in_bad_fork(self) -> bool:
         return self._in_bad_fork
@@ -270,7 +254,6 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    from . import _C  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
@@ -280,6 +263,38 @@ def _autoload():
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()
+
+    # Apply runtime-independent setup at autoload (import) time so it is in place
+    # before the first device op. None of this starts the device runtime: the
+    # C++ startRuntime() is std::call_once and self-triggers on the first real
+    # device op (e.g. an H2D copy via the stream pool). _C is not imported here
+    # at all; the monkey-patch defers its _C imports into the patched method
+    # bodies, so the .so is only loaded when a Spyre tensor is first used.
+    #
+    # The tensor monkey-patch adds to(device_layout=), device_tensor_layout(),
+    # the spyre-aware repr, torch.empty(device_layout=), and the dynamo/FxGraph
+    # cache guards. It must be available before any .to("spyre") /
+    # .to(device_layout=...) call -- including when that call is the very first
+    # mention of the device (e.g. moving model weights onto Spyre).
+    from ._monkey_patch import _patch_tensor_for_spyre
+
+    _patch_tensor_for_spyre()
+
+    # Inductor backend registration (scheduler / codegen / op-overrides).
+    from torch_spyre._inductor import _autoload as ts_inductor_autoload
+
+    ts_inductor_autoload()
+
+    # Permanently register PrivateUse1 kernels for DispatchKeys so that eager-mode
+    # dispatch reaches the Spyre implementations without global monkey-patching.
+    # Customops must be imported here because decompositions.py references
+    # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
+    import torch_spyre._inductor.customops  # noqa: F401
+    from torch_spyre._inductor.decompositions import (
+        _register_spyre_dispatchkey_kernels_permanently,
+    )
+
+    _register_spyre_dispatchkey_kernels_permanently()
 
     # Register the Spyre CCL distributed backend.
     # The creator function is a lazy proxy — _C is not imported until
