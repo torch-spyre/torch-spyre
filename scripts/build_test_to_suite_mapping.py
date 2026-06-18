@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json
-import regex as re
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List

@@ -44,7 +44,7 @@ def parse_yaml_matrix_file(matrix_file_path: Path) -> list:
                 configs.append(item["config"])
     except Exception:
         content = matrix_file_path.read_text(encoding="utf-8")
-        import regex as re
+        import re
 
         configs = sorted(
             list(set(re.findall(r"config:\s*(torch_spyre_tests/[^\s\n]+)", content)))
