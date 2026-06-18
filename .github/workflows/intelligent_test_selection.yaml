@@ -173,57 +173,58 @@ jobs:
           SUITE_NAME="${{ matrix.suite.name }}_config"
 
           bash tests/run_test.sh "$CONFIG" -v 
-            #\
-            # --cov=torch_spyre \
-            # --cov-report=json:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/coverage.json \
-            # --cov-report=html:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/htmlcov
 
-      - name: Upload coverage artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-${{ matrix.suite.name }}
-          path: /home/senuser/codebase/torch-spyre/coverage/${{ matrix.suite.name }}_config/
-          retention-days: 1
+  #\
+  # --cov=torch_spyre \
+  # --cov-report=json:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/coverage.json \
+  # --cov-report=html:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/htmlcov
 
-  update_mappings:
-    name: Build Local Impact Mappings
-    needs: [select_suites, run_suites]
-    if: always() && needs.run_suites.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  #     - name: Upload coverage artifacts
+  #       if: always()
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: coverage-${{ matrix.suite.name }}
+  #         path: /home/senuser/codebase/torch-spyre/coverage/${{ matrix.suite.name }}_config/
+  #         retention-days: 1
 
-      - name: Download coverage logs
-        uses: actions/download-artifact@v4
-        with:
-          path: coverage/
-          pattern: coverage-*
+  # update_mappings:
+  #   name: Build Local Impact Mappings
+  #   needs: [select_suites, run_suites]
+  #   if: always() && needs.run_suites.result == 'success'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
 
-      - name: Standardize Coverage Structure
-        run: |
-          cd coverage
-          for dir in coverage-*; do
-            suite_name="${dir#coverage-}"
-            if [[ -d "$dir" ]]; then
-              mkdir -p "../coverage/${suite_name}_config"
-              mv "$dir"/* "../coverage/${suite_name}_config/" 2>/dev/null || true
-              rmdir "$dir" 2>/dev/null || true
-            fi
-          done
-          cd ..
+  #     - name: Download coverage logs
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: coverage/
+  #         pattern: coverage-*
 
-      - name: Persist Generated Map Logs To Repo
-        run: |-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add coverage/ \
-                  mappings/selected_suites_by_rules.json 2>/dev/null || true
+  #     - name: Standardize Coverage Structure
+  #       run: |
+  #         cd coverage
+  #         for dir in coverage-*; do
+  #           suite_name="${dir#coverage-}"
+  #           if [[ -d "$dir" ]]; then
+  #             mkdir -p "../coverage/${suite_name}_config"
+  #             mv "$dir"/* "../coverage/${suite_name}_config/" 2>/dev/null || true
+  #             rmdir "$dir" 2>/dev/null || true
+  #           fi
+  #         done
+  #         cd ..
 
-          if git diff --staged --quiet; then
-            echo "No changes detected inside local mappings folder."
-          else
-            git commit -m "chore: update code impact target maps [skip ci]"
-            git push
-          fi
+  #     - name: Persist Generated Map Logs To Repo
+  #       run: |-
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git add coverage/ \
+  #                 mappings/selected_suites_by_rules.json 2>/dev/null || true
+
+  #         if git diff --staged --quiet; then
+  #           echo "No changes detected inside local mappings folder."
+  #         else
+  #           git commit -m "chore: update code impact target maps [skip ci]"
+  #           git push
+  #         fi
