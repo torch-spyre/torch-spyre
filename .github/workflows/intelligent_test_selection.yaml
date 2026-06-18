@@ -172,10 +172,11 @@ jobs:
           CONFIG="tests/configs/${{ matrix.suite.config }}"
           SUITE_NAME="${{ matrix.suite.name }}_config"
 
-          bash tests/run_test.sh "$CONFIG" -v \
-            --cov=torch_spyre \
-            --cov-report=json:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/coverage.json \
-            --cov-report=html:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/htmlcov
+          bash tests/run_test.sh "$CONFIG" -v 
+            #\
+            # --cov=torch_spyre \
+            # --cov-report=json:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/coverage.json \
+            # --cov-report=html:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/htmlcov
 
       - name: Upload coverage artifacts
         if: always()
