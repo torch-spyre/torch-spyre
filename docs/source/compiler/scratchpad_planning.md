@@ -13,8 +13,10 @@ First-fit and best-fit are available as opt-ins.
 
 Co-optimization with work distribution is opt-in.
 `config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
-defaults to off. The proof-of-concept handles only single-output-dim
-flips today.
+defaults to off. It searches pointwise-op splits only: it honors each
+matmul's (and reduction's) work-division split and additionally seeds
+the pointwise search with the matmuls' splits so the pointwise chain can
+adopt a matmul's tiling and pin shared buffers to LX.
 :::
 
 **Quick navigation:**
@@ -349,17 +351,42 @@ combination by counting HBM bytes the solver could not pin, and commits
 the winning assignment back before the standard allocator flow.
 :::
 
-The current POC (`v1`) only considers dim-flipping. When an op's seed
-split has a single output-dim split factor, it generates variants that
-move that factor onto each compatible alternative output dim.
-Reduction-axis splits and multi-dim splits are skipped for now. The
-search is bounded by `DEFAULT_VARIANT_CAP = 6` per op and uses DFS over
-the cross-product with no early-stop pruning, so the search stays
-compatible with future non-greedy solvers that can reach interior states.
+**Pointwise ops only.** Variant generation (`_enum_split_options`) runs
+for pointwise ops; matmuls and reductions return their seed unchanged.
+For a pointwise op whose seed splits a single output dim, it generates
+variants that move that factor onto each compatible alternative output
+dim. The search is bounded by `DEFAULT_VARIANT_CAP = 6` flip-variants per
+op and uses DFS over the cross-product with no early-stop pruning, so it
+stays compatible with future non-greedy solvers that can reach interior
+states.
+
+**Matmul splits are honored, not searched.** Overriding a matmul's
+work-division split to chase LX pinning can hurt: concentrating a
+balanced `M/4×N/8` split onto one dim (`M/32`) pins the matmul output and
+the surrounding chain to LX but is a poor matmul shape — on
+`mlp-linear-kn.t` (SENCORES=32) it regressed kernel time ~2.5× as
+process-engine utilization fell from 66% to 33%. The rule is: **for
+compute-bound ops, prioritize compute utilization over LX pinning.** So
+matmuls keep their split.
+
+**Pointwise ops are seeded with the matmuls' splits.** To still pin the
+pointwise chain *around* the fixed matmuls, the allocator first collects
+the distinct matmul output-splits and offers each as an extra candidate
+to every pointwise op (in addition to its own flip-variants, and not
+counted against the cap). When a pointwise op adopts the matmul's tiling,
+its per-core view matches the matmul's, so the shared buffer pins to LX
+*and* the op runs at the matmul's high-utilization shape. On
+`mlp-linear-kn.t` (SENCORES=32) this lifted process-engine utilization
+from ~66% to ~79% and cut the fused kernel time by ~17% (about 2× faster
+than the sendnn reference). Bases that don't fit a given op self-eliminate
+during scoring.
 
 The leaf-scoring function is intentionally cheap and solver-agnostic. It
 runs the full `_generate_buffers + plan_layout` pass on the candidate
 splits and counts the HBM bytes of every buffer the solver could not pin.
+Repeated `_per_core_view_on_buf` work is memoized across leaves, and the
+split-invariant liveness / filtered-op-view / mem-usage computations are
+hoisted out of the per-leaf path.
 
 ## Current limitations
 
@@ -374,15 +401,18 @@ best-fit mitigate this by sorting all buffers up front before placing.
 `find_free_block` can locate holes between allocations but cannot
 compact the address space. Allocate/deallocate cycles fragment LX.
 
-### Co-optimization is a POC
+### Co-optimization is still limited
 
 `StrategyBCoOptimizingAllocator` implements the joint
-work-division + LX planning idea, but the current variant generator only
-flips a single output-dim split. Productionisation needs richer variant
-generation (multi-dim splits, fewer-cores, reduction-axis), a
-performance model that balances compute throughput against memory
-traffic so we do not trade away compute parallelism for trivial LX wins,
-and coverage when the `coarse_tiling` pass also drives split decisions.
+work-division + LX planning idea. It searches pointwise-op splits
+(single output-dim flips plus the matmuls' splits as extra candidates)
+and deliberately leaves matmul/reduction splits to work division to
+protect compute utilization. Remaining gaps: richer pointwise variant
+generation (multi-dim splits, fewer-cores, reduction-axis); a proper
+performance model rather than the current heuristic of "honor
+compute-bound ops, search the rest" — so the trade between compute
+throughput and memory traffic is scored rather than hard-coded; and
+coverage when the `coarse_tiling` pass also drives split decisions.
 
 ### No cross-core ring utilization
 
@@ -433,12 +463,15 @@ Two non-greedy solver families are being prototyped on top of the same
 
 ### Richer co-optimization
 
-The current dim-flipping variant generator is a starting point. Planned
-extensions:
+Pointwise dim-flipping plus matmul-split seeding is the current state.
+Planned extensions:
 
-- multi-dim splits, fewer-cores variants, reduction-axis splits;
-- a performance model that balances compute throughput against memory
-  traffic so we do not trade away parallelism for trivial LX wins;
+- richer pointwise variants: multi-dim splits, fewer-cores variants,
+  reduction-axis splits;
+- replace the current "honor compute-bound ops, search the rest"
+  heuristic with a performance model that scores compute throughput
+  against memory traffic, so matmul (and other compute-bound) splits can
+  be searched too when the trade actually pays off;
 - joint operation with the `coarse_tiling` pass when that pass also
   drives split decisions.
 
