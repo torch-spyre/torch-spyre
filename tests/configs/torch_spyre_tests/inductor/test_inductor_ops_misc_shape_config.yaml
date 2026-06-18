@@ -55,6 +55,7 @@ test_suite_config:
             # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
+            - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
             - TestOps::test_restickify_fp32_unsupported_xfail
             - TestOps::test_restickify_int64_unsupported_xfail
