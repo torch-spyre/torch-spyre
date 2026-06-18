@@ -14,7 +14,6 @@
 
 """Tests for PrepareKernel Python bindings and JobPlan verification."""
 
-
 import os
 import tempfile
 import json

@@ -1,0 +1,228 @@
+name: Smart Tests V2
+
+on:
+  workflow_dispatch: null
+  push:
+    branches:
+      - main
+      - test/workflow-behavior
+    paths:
+      - torch_spyre/**/*.py
+      - tests/**/*.py
+      - tests/configs/**/*.yaml
+      - mappings/**/*.json
+      - .github/workflows/intelligent_test_selection.yaml
+      - scripts/**/*.py
+  pull_request:
+    branches: [main]
+    paths:
+      - torch_spyre/**/*.py
+      - tests/**/*.py
+      - tests/configs/**/*.yaml
+      - mappings/**/*.json
+      - .github/workflows/intelligent_test_selection.yaml
+      - scripts/**/*.py
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+  checks: write
+  pull-requests: read
+
+jobs:
+  select_suites:
+    name: Smart Suite Selection
+    runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.final_selection.outputs.suites }}
+      has_suites: ${{ steps.final_selection.outputs.has_suites }}
+      is_first_run: ${{ steps.check_coverage.outputs.is_first_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Ensures complete history is visible for calculating exact branch diffs
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Check if coverage directory exists
+        id: check_coverage
+        run: |
+          if [[ ! -d "./coverage" ]] || [[ -z "$(ls -A ./coverage 2>/dev/null)" ]]; then
+            echo "is_first_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_first_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # INITIALIZATION BLOCK (Runs only when NO ./coverage exists)
+      - name: Action A (First Run Initialization via Matrix Parsing)
+        if: steps.check_coverage.outputs.is_first_run == 'true'
+        run: python3 scripts/get_all_torch_spyre_suites.py
+
+      # MAPPING COMPILATION BLOCK =======
+      - name: Rebuild Source-To-Suite Mapping File (Step B & C)
+        run: python3 scripts/build_source_to_suite_mapping.py
+
+      - name: Rebuild Test-To-Suite Config Mapping File
+        run: python3 scripts/build_test_to_suite_mapping.py
+      #===========
+
+      - name: Gather Precise File Mutation Deltas
+        if: steps.check_coverage.outputs.is_first_run == 'false'
+        id: git_diff
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # Finds the exact historical commit where this branch split from main (the fork point)
+            FORK_POINT=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+            echo "Identified historical fork point commit target: $FORK_POINT"
+            
+            ALL_CHANGED=$(git diff --name-only "$FORK_POINT" HEAD | tr '\n' ' ')
+            ONLY_ADDED=$(git diff --name-only --diff-filter=A "$FORK_POINT" HEAD | tr '\n' ' ')
+          else
+            TARGET="${{ github.event.before }}"
+            if [[ -z "$TARGET" || "$TARGET" == "0000000000000000000000000000000000000000" ]]; then
+              TARGET="HEAD~1"
+            fi
+            echo "Comparing current HEAD against push baseline: $TARGET"
+            
+            ALL_CHANGED=$(git diff --name-only "$TARGET" HEAD | tr '\n' ' ')
+            ONLY_ADDED=$(git diff --name-only --diff-filter=A "$TARGET" HEAD | tr '\n' ' ')
+          fi
+
+          echo "changed_files=$ALL_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "added_files=$ONLY_ADDED" >> "$GITHUB_OUTPUT"
+
+      - name: Process Heuristic Mapping Logic
+        if: steps.check_coverage.outputs.is_first_run == 'false'
+        env:
+          CHANGED_FILES: ${{ steps.git_diff.outputs.changed_files }}
+          ADDED_FILES: ${{ steps.git_diff.outputs.added_files }}
+        run: python3 scripts/apply_change_rules.py
+
+      - name: Combine and Print Selection Output For Commits
+        id: combine
+        run: python3 scripts/combine_heuristics.py
+
+      - name: Final suite selection
+        id: final_selection
+        run: |
+          COUNT=$(cat mappings/selected_suites_by_rules.json | jq '.count')
+          MATRIX_OBJS="[]"
+          if [ "$COUNT" -gt 0 ]; then
+             MATRIX_OBJS=$(python3 -c "
+          import json, pathlib
+          with open('mappings/selected_suites_by_rules.json') as f:
+              data = json.load(f)
+          res = []
+          for cfg in data['suites']:
+              p = pathlib.Path(cfg)
+              name = p.stem[:-7] if p.stem.endswith('_config') else p.stem
+              res.append({'name': name, 'config': cfg})
+          print(json.dumps(res))
+             ")
+          fi
+          echo "suites<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$MATRIX_OBJS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          if [ "$COUNT" -gt 0 ]; then
+             echo "has_suites=true" >> "$GITHUB_OUTPUT"
+          else
+             echo "has_suites=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  run_suites:
+    name: ${{ matrix.suite.name }}
+    needs: select_suites
+    if: needs.select_suites.outputs.has_suites == 'true'
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 60
+    env:
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJson(needs.select_suites.outputs.suites) }}
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Run Test Suite Configuration with Coverage Logging
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_TORCH_SPYRE_DIR"
+          source .venv/bin/activate
+
+          CONFIG="tests/configs/${{ matrix.suite.config }}"
+          SUITE_NAME="${{ matrix.suite.name }}_config"
+
+          bash tests/run_test.sh "$CONFIG" -v \
+            --cov=torch_spyre \
+            --cov-report=json:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/coverage.json \
+            --cov-report=html:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/htmlcov
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.suite.name }}
+          path: /home/senuser/codebase/torch-spyre/coverage/${{ matrix.suite.name }}_config/
+          retention-days: 1
+
+  update_mappings:
+    name: Build Local Impact Mappings
+    needs: [select_suites, run_suites]
+    if: always() && needs.run_suites.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download coverage logs
+        uses: actions/download-artifact@v4
+        with:
+          path: coverage/
+          pattern: coverage-*
+
+      - name: Standardize Coverage Structure
+        run: |
+          cd coverage
+          for dir in coverage-*; do
+            suite_name="${dir#coverage-}"
+            if [[ -d "$dir" ]]; then
+              mkdir -p "../coverage/${suite_name}_config"
+              mv "$dir"/* "../coverage/${suite_name}_config/" 2>/dev/null || true
+              rmdir "$dir" 2>/dev/null || true
+            fi
+          done
+          cd ..
+
+      - name: Persist Generated Map Logs To Repo
+        run: |-
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add coverage/ \
+                  mappings/selected_suites_by_rules.json 2>/dev/null || true
+
+          if git diff --staged --quiet; then
+            echo "No changes detected inside local mappings folder."
+          else
+            git commit -m "chore: update code impact target maps [skip ci]"
+            git push
+          fi
