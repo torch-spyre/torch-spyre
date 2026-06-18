@@ -377,21 +377,29 @@ class DefaultAllocator(ScratchpadAllocator):
 DEFAULT_VARIANT_CAP = 6
 
 
-def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
-    """Generate split options based on the seed (current committed
-    split) by flipping the split factor onto a different output dim.
-    Returns ≤ DEFAULT_VARIANT_CAP options with the seed at index 0. If
-    the seed is unsplit or reduction-axis-only, returns the seed alone.
+def _enum_split_options(
+    op: Operation, extra_bases: tuple[tuple[dict, dict], ...] = ()
+) -> list[tuple[dict, dict]]:
+    """Split options for a pointwise op: the seed (index 0) plus variants
+    that flip the split onto another output dim (≤ DEFAULT_VARIANT_CAP).
+
+    `extra_bases` (the matmuls' output-splits) are offered on top so the op
+    can adopt a matmul's tiling and pin its shared buffer to LX. Matmuls and
+    reductions bail early (seed only — we honor their split). Invalid bases
+    self-eliminate during scoring.
     """
     seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    output_splits, reduction_splits = seed
+    is_output_splits_empty = seed[0] == {}
     is_computed_buf = isinstance(op, ComputedBuffer)
     is_reduction = is_computed_buf and isinstance(op.data, Reduction)
     is_matmul = is_reduction and _is_matmul_op(op)
 
-    # Only flip output-dim splits for pointwise ops and matmul (M/N only;
-    # K stays in reduction_splits). All other reductions are skipped.
-    if not output_splits or not is_computed_buf or (is_reduction and not is_matmul):
+    # Only pointwise ops are flipped; reductions/matmuls keep work-division's
+    # split. For compute-bound ops, prioritize PT utilization over LX pinning:
+    # overriding a matmul's split to chase pinning regressed kernel time ~2.5x
+    # (mlp-linear-kn.t, SENCORES=32; PT-util 66%→33%). Exclude future
+    # compute-bound ops here too.
+    if is_output_splits_empty or not is_computed_buf or is_reduction or is_matmul:
         return [seed]
 
     # Recover seed's per-symbol form to mutate the slicing.
@@ -408,24 +416,10 @@ def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
         s for s in seed_per_sym if seed_per_sym[s] > 1 and write_index.coeff(s) != 0
     ]
 
-    options: list[tuple[dict, dict]] = [seed]
-    seen: set[tuple] = {_canonical_key(seed)}
-
-    # Matmul whose seed splits multiple output dims (e.g. M/4, N/8): concentrate
-    # the whole output factor onto one dim and add that as an option, so with
-    # the flip loop below we score the original seed plus both all-on-one-dim
-    # variants (e.g. M/32 and N/32). Skip if K is split — we don't redistribute
-    # reduction splits.
-    if is_matmul and len(sliced_output_syms) > 1 and not reduction_splits:
-        total = math.prod(seed_per_sym[s] for s in sliced_output_syms)
-        seed_sym = sliced_output_syms[0]
-        for s in sliced_output_syms:
-            seed_per_sym[s] = 1
-        seed_per_sym[seed_sym] = total
-        sliced_output_syms = [seed_sym]
-        concentrated = splits_by_index_coeff(seed_per_sym, write_index, read_index)
-        options.append(concentrated)
-        seen.add(_canonical_key(concentrated))
+    # Dedup-and-collect in one dict: canonical key -> split tuple (the split
+    # tuple itself is two dicts, so it can't be a key directly). Insertion
+    # order is preserved, so the seed stays first.
+    options: dict[tuple, tuple[dict, dict]] = {_canonical_key(seed): seed}
 
     # Only single output-dim splits are flipped. Multi-dim splits (e.g.
     # k_fast (1, n, k)) aren't yet handled.
@@ -447,14 +441,15 @@ def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
         variant_per_sym[seed_sym] = 1
         variant_per_sym[sym] = seed_factor
         variant = splits_by_index_coeff(variant_per_sym, write_index, read_index)
-        key = _canonical_key(variant)
-        if key in seen:
-            continue
-        options.append(variant)
-        seen.add(key)
+        options.setdefault(_canonical_key(variant), variant)
         if len(options) >= DEFAULT_VARIANT_CAP:
             break
-    return options
+
+    # Let this pointwise op adopt a matmul's tiling to pin its shared buffer to
+    # LX. High-value, so added regardless of DEFAULT_VARIANT_CAP (flips only).
+    for base in extra_bases:
+        options.setdefault(_canonical_key(base), base)
+    return list(options.values())
 
 
 def _canonical_key(splits: tuple[dict, dict]) -> tuple:
@@ -476,9 +471,19 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
 
         # Enumerate options, run search, commit winners back to op_it_space_splits.
         ops = graph.operations
-        t0 = time.perf_counter()
-        options_per_op = [_enum_split_options(op) for op in ops]
-        t_enum = time.perf_counter() - t0
+
+        # Distinct matmul output-splits (drop K) to seed the pointwise search,
+        # keyed by canonical key (the split tuple itself isn't hashable).
+        matmul_bases: dict[tuple, tuple[dict, dict]] = {}
+        for op in ops:
+            out: dict = getattr(op, "op_it_space_splits", ({}, {}))[0]
+            if _is_matmul_op(op) and out != {}:
+                base: tuple[dict, dict] = (dict(out), {})
+                matmul_bases.setdefault(_canonical_key(base), base)
+
+        options_per_op = [
+            _enum_split_options(op, tuple(matmul_bases.values())) for op in ops
+        ]
         t1 = time.perf_counter()
         best_chosen, timings = self._search(graph, ops, options_per_op)
         t_search = time.perf_counter() - t1
@@ -501,7 +506,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             "_generate_buffers(): graph_view %.1fms + mem_usage %.1fms); "
             "winner=%s",
             n_paths,
-            (t_enum + t_search) * 1e3,
+            t_search * 1e3,
             timings["graph_view"] * 1e3,
             timings["mem_usage"] * 1e3,
             winner,
