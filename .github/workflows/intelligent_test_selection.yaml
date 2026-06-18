@@ -222,12 +222,25 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download coverage logs
         uses: actions/download-artifact@v4
         with:
           path: coverage/
           pattern: coverage-*
+
+      # FIX: Force the runner to switch to the active branch instead of a detached commit SHA
+      - name: Checkout Target Branch
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "Targeting PR branch: ${{ github.head_ref }}"
+            git checkout ${{ github.head_ref }}
+          else
+            echo "Targeting branch: ${{ github.ref_name }}"
+            git checkout ${{ github.ref_name }}
+          fi
 
       - name: Standardize Coverage Structure
         run: |
