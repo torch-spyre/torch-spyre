@@ -17,6 +17,8 @@ colorama==0.4.6 ; (os_name != 'nt' and sys_platform == 'win32') or (os_name == '
     #   build
     #   pytest
     #   tqdm
+coverage==7.14.1
+    # via pytest-cov
 distlib==0.4.0
     # via virtualenv
 execnet==2.1.2
@@ -92,8 +94,11 @@ pyproject-hooks==1.2.0
     # via build
 pytest==9.0.2
     # via
+    #   pytest-cov
     #   pytest-xdist
     #   torch-spyre
+pytest-cov==6.0.0
+    # via torch-spyre
 pytest-xdist==3.8.0
     # via torch-spyre
 pyyaml==6.0.3
@@ -120,6 +125,8 @@ sympy==1.14.0
     # via torch
 tokenizers==0.22.2
     # via transformers
+tomli==2.4.1 ; python_full_version <= '3.11'
+    # via coverage
 torch==2.11.0 ; sys_platform == 'darwin'
     # via torch-spyre
 torch==2.11.0+cpu ; sys_platform != 'darwin'
