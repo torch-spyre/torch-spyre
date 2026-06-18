@@ -1205,14 +1205,20 @@ def _per_core_view_on_buf(
          by device-dim so it's independent of op-local symbol names.
 
     Pass an optional `cache` dict to memoize results across calls,
-    keyed by (op.op_it_space_splits, dep, buf_name).
+    keyed by (op name, op.op_it_space_splits, dep). op name is required:
+    the result also depends on op-derived write_index / read_index /
+    iter_space, so two ops sharing the same (splits, dep) — e.g. a matmul
+    producer and a pointwise consumer of the same buffer — must not alias
+    the same cache entry. buf_name is omitted because the sole caller
+    (get_ncores_for_buffers) always passes buf_name == dep.name, so the
+    frozen MemoryDep `dep` already carries it.
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
         # dicts aren't hashable; freeze each into a frozenset of items so
         # the key is hashable and order-independent.
         out, red = coeff_splits
-        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        key = (op.get_name(), frozenset(out.items()), frozenset(red.items()), dep)
         hit = cache.get(key)
         if hit is not None:
             return hit

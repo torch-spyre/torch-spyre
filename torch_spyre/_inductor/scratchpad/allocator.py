@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import math
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -59,8 +59,10 @@ from torch_spyre._inductor.scratchpad.utils import (
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 
 from torch_spyre._inductor import config
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.pass_utils import _is_matmul_op
 
-logger = logging.getLogger(__name__)
+logger = get_inductor_logger("scratchpad.allocator")
 
 
 class ScratchpadAllocator(ABC):
@@ -116,8 +118,10 @@ class ScratchpadAllocator(ABC):
             return True
         return False
 
-    def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
-        core_div_mismatch = get_ncores_for_buffers(graph)
+    def _filter_ops(
+        self, graph: GraphLowering, cache: Optional[dict] = None
+    ) -> list[Operation]:
+        core_div_mismatch = get_ncores_for_buffers(graph, cache)
         drop_list = set()
 
         # filter out by permitted operations
@@ -126,9 +130,9 @@ class ScratchpadAllocator(ABC):
                 drop_list.add(op.name)
 
         # filter out core division mismatches
-        drop_list.update(
-            [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
-        )
+        for key, mismatch in core_div_mismatch.items():
+            if mismatch == -1:
+                drop_list.add(key)
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
@@ -145,9 +149,10 @@ class ScratchpadAllocator(ABC):
         self,
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
+        mem_usage: dict,
+        lifetimes: dict[str, list[int]],
+        cache: Optional[dict] = None,
     ) -> list[LifetimeBoundBuffer]:
-        lifetimes = calculate_liveness(graph)
-        mem_usage = mem_usage_by_buf(GraphView(graph, self._filter_ops))
         in_place = {} if in_place is None else in_place
         buffers = []
         graph_output_names = set(graph.get_output_names())
@@ -171,7 +176,7 @@ class ScratchpadAllocator(ABC):
             )
 
         if cloning_allowed:
-            ncores = get_ncores_for_buffers(graph)
+            ncores = get_ncores_for_buffers(graph, cache)
             for input_name in graph.graph_input_names:
                 uses = lifetimes[input_name]
                 if len(uses) <= 1:
@@ -200,14 +205,17 @@ class ScratchpadAllocator(ABC):
 
         return buffers
 
-    def _determine_in_place(self, graph: GraphLowering) -> dict[str, list[str]]:
+    def _determine_in_place(
+        self,
+        graph: GraphLowering,
+        graph_view: "GraphView",
+        mem_usage: dict,
+        lifetimes: dict[str, list[int]],
+    ) -> dict[str, list[str]]:
         allow_inplace: dict[str, list[str]] = {}
-        graph_view = GraphView(graph, self._filter_ops)
-        mem_usage = mem_usage_by_buf(graph_view)
         in_place_allowed = {
             op.name: self._op_good_for_lx_inplace(op) for op in graph_view.operations
         }
-        lifetimes = calculate_liveness(graph)
         for buf_name, info in mem_usage.items():
             allow_inplace[buf_name] = []
             if not in_place_allowed[buf_name]:
@@ -232,9 +240,36 @@ class ScratchpadAllocator(ABC):
                     allow_inplace[buf_name].append(input_buf)
         return allow_inplace
 
-    def _generate_buffers(self, graph: GraphLowering) -> list[Operation]:
-        in_place = self._determine_in_place(graph)
-        buffers = self._build_bound_buffers(graph, in_place)
+    def _generate_buffers(
+        self,
+        graph: GraphLowering,
+        cache: Optional[dict] = None,
+        timings: Optional[dict[str, float]] = None,
+        lifetimes: Optional[dict[str, list[int]]] = None,
+    ) -> list[Operation]:
+        # Build graph_view + mem_usage once and share; both helpers below treat
+        # them read-only. `lifetimes` is split-invariant, so the co-opt search
+        # passes it in (computed here only for the single-shot path).
+        #
+        # TODO: graph_view + mem_usage still rebuilt per leaf; only their
+        #   split-dependent part is the (cached) core-div check, so the rest
+        #   could be hoisted out of the per-leaf path too.
+        t0 = time.perf_counter()
+        graph_view = GraphView(graph, lambda g: self._filter_ops(g, cache))
+        t1 = time.perf_counter()
+        mem_usage = mem_usage_by_buf(graph_view, cache)
+        t2 = time.perf_counter()
+        if timings is not None:
+            timings["graph_view"] += t1 - t0
+            timings["mem_usage"] += t2 - t1
+
+        if lifetimes is None:
+            lifetimes = calculate_liveness(graph)
+
+        in_place = self._determine_in_place(graph, graph_view, mem_usage, lifetimes)
+        buffers = self._build_bound_buffers(
+            graph, in_place, mem_usage, lifetimes, cache
+        )
         return buffers
 
     def _push_allocation(
@@ -350,11 +385,13 @@ def _enum_split_options(op: Operation) -> list[tuple[dict, dict]]:
     """
     seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     output_splits, reduction_splits = seed
-    if not output_splits or not isinstance(op, ComputedBuffer):
-        return [seed]
+    is_computed_buf = isinstance(op, ComputedBuffer)
+    is_reduction = is_computed_buf and isinstance(op.data, Reduction)
+    is_matmul = is_reduction and _is_matmul_op(op)
 
-    # Reduction ops: don't flip for now.
-    if isinstance(op.data, Reduction):
+    # Only flip output-dim splits for pointwise ops and matmul (M/N only;
+    # K stays in reduction_splits). All other reductions are skipped.
+    if not output_splits or not is_computed_buf or (is_reduction and not is_matmul):
         return [seed]
 
     # Recover seed's per-symbol form to mutate the slicing.
@@ -421,13 +458,38 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
 
         # Enumerate options, run search, commit winners back to op_it_space_splits.
         ops = graph.operations
+        t0 = time.perf_counter()
         options_per_op = [_enum_split_options(op) for op in ops]
-        best_chosen = self._search(graph, ops, options_per_op)
+        t_enum = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        best_chosen, timings = self._search(graph, ops, options_per_op)
+        t_search = time.perf_counter() - t1
 
         for op, opt_idx, options in zip(ops, best_chosen, options_per_op):
             chosen = options[opt_idx]
             if chosen != getattr(op, "op_it_space_splits", ({}, {})):
                 op.op_it_space_splits = chosen
+
+        n_paths = math.prod(len(o) for o in options_per_op)
+        winner = {
+            f"{ops[i].get_name()}({self._get_op_name(ops[i])})": options_per_op[i][
+                best_chosen[i]
+            ]
+            for i in range(len(ops))
+            if len(options_per_op[i]) > 1
+        }
+        logger.info(
+            "co-opt search: %d paths in %.1fms (enum %.1fms, eval %.1fms; "
+            "score %.1fms: graph_view %.1fms + mem_usage %.1fms); winner=%s",
+            n_paths,
+            (t_enum + t_search) * 1e3,
+            t_enum * 1e3,
+            t_search * 1e3,
+            timings["score"] * 1e3,
+            timings["graph_view"] * 1e3,
+            timings["mem_usage"] * 1e3,
+            winner,
+        )
 
         # try insert clone again, as what was incompatible could be compatible now
         # TODO simplify the previous pre-opt (at the beginning of this func), we will
@@ -452,28 +514,52 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         graph: GraphLowering,
         ops: list[Operation],
         options_per_op: list[list[tuple[dict, dict]]],
-    ) -> list[int]:
+    ) -> tuple[list[int], dict[str, float]]:
         """DFS over the option cross-product, scoring each leaf via
-        _score_layout. Returns the option index per op for the leaf
-        with minimum HBM bytes. No early-stop pruning — bounded by
-        ≤ K^N leaves where N counts ops with >1 option (most return
-        [seed]). Per-leaf cost is one full _generate_buffers +
-        plan_layout pass; the `cache` param on _per_core_view_on_buf
-        amortizes sympy work if it ever becomes hot.
+        _score_layout. Returns (best option index per op, timing
+        breakdown in seconds). The timing dict has keys: `score` (total
+        in _score_layout) and the two split-dependent shared-object builds
+        inside _generate_buffers — `graph_view` (filtered op view) and
+        `mem_usage` (mem_usage_by_buf). Liveness is split-invariant and
+        computed once here, not per leaf, so it has no per-leaf timer. No
+        early-stop pruning — bounded by ≤ K^N leaves where N counts ops
+        with >1 option (most return [seed]). Per-leaf cost is one full
+        _generate_buffers + plan_layout pass; the `cache` param on
+        _per_core_view_on_buf amortizes sympy work if it ever becomes hot.
         """
         chosen: list[int] = [0] * len(ops)
         best_total: float = math.inf
         best_chosen: list[int] = list(chosen)
+        timings: dict[str, float] = {
+            "score": 0.0,
+            "graph_view": 0.0,
+            "mem_usage": 0.0,
+        }
 
         buf_total_bytes: dict[str, int] = {
             name: math.prod(buf.layout.device_layout.device_size[:-1]) * 128
             for name, buf in graph.name_to_buffer.items()
         }
 
+        # Liveness depends only on graph structure (not op.op_it_space_splits),
+        # so compute it once for the whole search instead of per leaf.
+        lifetimes = calculate_liveness(graph)
+
+        # Memoize _per_core_view_on_buf across leaves. Keyed on
+        # (op name, split values, dep) — see _per_core_view_on_buf for why
+        # op name is required. A single dict is correct across the whole
+        # search; scoped to this graph only since dep is not unique across
+        # graphs.
+        cache: dict = {}
+
         def recurse(op_idx: int) -> None:
             nonlocal best_total, best_chosen
             if op_idx == len(ops):
-                hbm = self._score_layout(graph, buf_total_bytes)
+                t0 = time.perf_counter()
+                hbm = self._score_layout(
+                    graph, buf_total_bytes, cache, timings, lifetimes
+                )
+                timings["score"] += time.perf_counter() - t0
                 if hbm < best_total:
                     best_total = hbm
                     best_chosen = list(chosen)  # list() makes a copy
@@ -494,7 +580,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             op.op_it_space_splits = prev_split
 
         recurse(0)
-        return best_chosen
+        return best_chosen, timings
 
     # ------------------------------------------------------------------
     # Leaf scoring
@@ -504,12 +590,19 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         self,
         graph: GraphLowering,
         buf_total_bytes: dict[str, int],
+        cache: Optional[dict] = None,
+        timings: Optional[dict[str, float]] = None,
+        lifetimes: Optional[dict[str, list[int]]] = None,
     ) -> int:
         """HBM bytes under the current split assignment: total device
         bytes of every buffer the solver couldn't pin. Non-committing
         (addresses land on throwaway buffers) and solver-agnostic.
+
+        If `timings` is provided, _generate_buffers accumulates its
+        `graph_view` / `mem_usage` sub-step seconds into it. `lifetimes`
+        (split-invariant) is forwarded to avoid recomputing it per leaf.
         """
-        buffers = self._generate_buffers(graph)
+        buffers = self._generate_buffers(graph, cache, timings, lifetimes)
         allocation = self.layout_planning.plan_layout(buffers)
         pinned_names = {b.name for b in allocation if b.address is not None}
 
