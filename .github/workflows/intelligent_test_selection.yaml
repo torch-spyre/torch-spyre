@@ -154,6 +154,8 @@ jobs:
     env:
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      # ADDED: Explicitly define this so the diagnostic tools and selected tests don't throw faults
+      TORCH_ROOT: ''
     strategy:
       fail-fast: false
       matrix:
@@ -171,8 +173,8 @@ jobs:
       - name: Checkout pre-built torch-spyre
         uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          # Leave 'ref' completely out; the action will auto-detect the PR/Push SHA flawlessly
+          repository: ${{ github.event.pull_request.head.repo.clone_url || '' }}
 
       - name: Clean Stale Build Cache and Artifacts
         run: |
