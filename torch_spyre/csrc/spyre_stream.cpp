@@ -297,7 +297,7 @@ flex::RuntimeStream* getDefaultStreamRuntimeHandle(c10::Device device) {
   initializeStreamPool(device.index());
 
   auto& pool = getStreamPool();
-  std::unique_lock<std::shared_mutex> lock(pool.mutex);
+  std::shared_lock<std::shared_mutex> lock(pool.mutex);
   auto it = pool.stream_handle_map.find(0);
   TORCH_CHECK(it != pool.stream_handle_map.end(),
               "Default stream handle not initialized for device ",
