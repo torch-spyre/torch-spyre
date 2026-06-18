@@ -1078,11 +1078,27 @@ def with_int64_fallback(fn, *args, convert_output=True):
         convert_output: If True, convert output back to int64.
                        Set to False for operations like div that should return float.
     """
-    if not any(x.get_dtype() == torch.int64 for x in args):
+    # Skip constants (int/float literals) that don't have get_dtype()
+    has_int64 = False
+    for x in args:
+        if isinstance(x, (int, float)):
+            continue
+        if hasattr(x, "get_dtype") and x.get_dtype() == torch.int64:
+            has_int64 = True
+            break
+
+    if not has_int64:
         return fn(*args)
 
-    args = [to_dtype(x, torch.float32) for x in args]
-    output = fn(*args)
+    # Convert args, skipping constants
+    converted_args = []
+    for x in args:
+        if isinstance(x, (int, float)):
+            converted_args.append(x)
+        else:
+            converted_args.append(to_dtype(x, torch.float32))
+
+    output = fn(*converted_args)
 
     if convert_output:
         return to_dtype(output, torch.int64)
