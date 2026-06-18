@@ -193,7 +193,7 @@ def get_indirect_layout_label(
     """Get layout label for a tensor in an indirect access operation.
 
     Index tensors → KERNEL_IDX
-    Others → normal layout label.
+    Value/Output tensors → OUTPUT
     """
     if tensor_idx in index_tensor_indices:
         label = "KERNEL_IDX"
@@ -206,6 +206,13 @@ def get_indirect_layout_label(
         logger.debug(f"Tensor {tensor_idx}: KERNEL_IDX layout (index tensor)")
         return label
 
-    return get_layout_label_func(
-        layouts, dim_order, effective_stick, stick_size, layout_labels
-    )
+    # For Value/Output tensors
+    label = "OUTPUT"
+    if label not in layouts:
+        layouts[label] = {
+            "dim_order": dim_order,
+            "stick_dim_order": effective_stick,
+            "stick_size": stick_size,
+        }
+    logger.debug(f"Tensor {tensor_idx}: OUTPUT layout (indirect access)")
+    return label
