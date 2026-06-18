@@ -25,6 +25,7 @@ from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .pass_utils import replace_computed_buffer_body
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
+from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("split_multi_ops")
 
@@ -34,8 +35,9 @@ _STRUCTURAL_OPS = frozenset({"load", "store", "get_index"})
 # Operations that involve dtype conversion or constant creation
 _DTYPE_OPS = frozenset({"to_dtype", "convert_element_type", "constant"})
 
-# Operations that accept constant values as scalars rather than buffers
-# The special case for these ops (clamp, layernormscale, softplus) are Spyre specific.
+# These operations are a special case for SDSC codegen: their scalar parameters must be
+# passed as compile-time constants via an `op_info['constants']` dictionary rather than
+# as standard input buffers.
 _OPS_WITH_CONSTANT_ARGS = frozenset({"clamp", "layernormscale", "softplus"})
 
 # Mapping of operation names to their FX graph targets when there is no 1-1 mapping.
@@ -190,7 +192,7 @@ def _infer_output_dtype(input_dtypes, kwargs, fallback):
 def _resolve_fx_target(op_name):
     if op_name in _OP_TARGET_TABLE:
         return _OP_TARGET_TABLE[op_name]
-    for ns in (torch.ops.aten, torch.ops.prims, getattr(torch.ops, "spyre", None)):
+    for ns in (torch.ops.aten, torch.ops.prims, getattr(torch.ops, DEVICE_NAME, None)):
         if ns is None:
             continue
         target = getattr(ns, op_name, None)
@@ -222,7 +224,7 @@ def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
     if op_name == "constant":
         fill = kwargs["fill_value"]
         dtype = kwargs.get("dtype", out_dtype)
-        dev = device if device is not None else torch.device("spyre")
+        dev = device if device is not None else torch.device(DEVICE_NAME)
         return (fill, dtype, dev), {}, dtype
 
     pos_keys = sorted(k for k in kwargs if k.startswith("_p"))
@@ -289,6 +291,11 @@ def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant
                     inputs.append(V.ops.load(vid_to_bufname[v], sympy.Integer(0)))
             else:
                 buf_stride = vid_to_stride[v]
+                if len(index) != len(buf_stride):
+                    raise ValueError(
+                        f"Mismatch between index & stride dimensions: "
+                        f"{len(index)} vs {len(buf_stride)}"
+                    )
                 idx = sum(i * s for i, s in zip(index, buf_stride))
                 inputs.append(V.ops.load(vid_to_bufname[v], idx))
         return getattr(V.ops, op_name)(*inputs, *extra, **clean_kw)

@@ -5581,9 +5581,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 cpu_compile=False,
                 run_eager=False,
             )
-            assert "All inputs to an op must have same element arrangement" in str(
-                exc_info.value
-            )
+
+        assert "All inputs to an op must have same element arrangement" in str(
+            exc_info.value
+        )
 
     def test_add_constant_cpu(self, op, x):
         def fn(op, x):
