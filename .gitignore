@@ -397,7 +397,7 @@ test/*.json
 
 .*env*
 stubs
-ffdc_reports/
+# FFDC reports land in the Inductor cache dir (~/.cache/torch/inductor), not the repo root.
 
 # provenance audit outputs
 provenance_capture_raw.json

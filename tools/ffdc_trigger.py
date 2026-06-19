@@ -27,7 +27,7 @@ Run from repo root with:
 import glob
 import json
 import os
-from pathlib import Path
+from typing import Any
 
 import torch  # noqa: F401 — ensures torch_spyre._C loads via real extension
 import torch_spyre  # noqa: F401
@@ -36,10 +36,9 @@ from torch_spyre.execution.kernel_runner import (
     SpyreSDSCKernelRunner,
     SpyreUnimplementedRunner,
 )
+from torch_spyre.profiler._ffdc import _default_output_dir
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-FFDC_OUT = REPO_ROOT / "ffdc_reports"
+FFDC_OUT = _default_output_dir()
 
 
 def _newest(pattern):
@@ -47,69 +46,84 @@ def _newest(pattern):
     return max(matches, key=os.path.getmtime) if matches else None
 
 
-print("\n=== FFDC Real Trigger ===\n")
-reports = []
+def main():
+    print("\n=== FFDC Real Trigger ===\n")
+    reports = []
 
-# ── Scenario A: runtime_launch failure ──────────────────────────────────────
-print("Scenario A: SpyreSDSCKernelRunner.run() → launch_kernel() raises")
-runner = SpyreSDSCKernelRunner(
-    name="test_kernel_add",
-    code_dir="/tmp/fake_spyre_code_dir",
-)
-try:
-    runner.run()
-except RuntimeError as e:
-    print(f"  Exception re-raised (expected): {e}")
-else:
-    raise AssertionError("Expected RuntimeError from runner.run() but none was raised")
-
-report_path = _newest(str(FFDC_OUT / "ffdc_runtime_launch_*.json"))
-if report_path:
-    with open(report_path) as f:
-        report = json.load(f)
-    reports.append(("runtime_launch", report))
-    print(f"  Report written: {report_path}")
-    c = report["collector"]
-    print(
-        f"  completeness={c['completeness_pct']}%  latency={c['capture_latency_ms']}ms  missing={c['missing_fields']}"
+    # ── Scenario A: runtime_launch failure ──────────────────────────────────────
+    print("Scenario A: SpyreSDSCKernelRunner.run() → launch_kernel() raises")
+    runner = SpyreSDSCKernelRunner(
+        name="test_kernel_add",
+        code_dir="/tmp/fake_spyre_code_dir",
     )
-else:
-    print("  [WARN] No report found — check FFDC output_dir")
+    try:
+        runner.run()
+    except RuntimeError as e:
+        print(f"  Exception re-raised (expected): {e}")
+    else:
+        raise AssertionError(
+            "Expected RuntimeError from runner.run() but none was raised"
+        )
 
-# ── Scenario B: unimplemented op failure ────────────────────────────────────
-print("\nScenario B: SpyreUnimplementedRunner.run() → unimplemented op → FFDC fires")
-urunner = SpyreUnimplementedRunner(
-    name="test_kernel_fft",
-    op="aten::fft_fft",
-)
-try:
-    urunner.run()
-except RuntimeError as e:
-    print(f"  Exception re-raised (expected): {e}")
-else:
-    raise AssertionError("Expected RuntimeError from urunner.run() but none was raised")
+    report_path = _newest(str(FFDC_OUT / "ffdc_runtime_launch_*.json"))
+    if report_path:
+        with open(report_path) as f:
+            report = json.load(f)
+        reports.append(("runtime_launch", report))
+        print(f"  Report written: {report_path}")
+        c = report["collector"]
+        print(
+            f"  completeness={c['completeness_pct']}%  latency={c['capture_latency_ms']}ms  missing={c['missing_fields']}"
+        )
+    else:
+        print("  [WARN] No report found — check FFDC output_dir")
 
-report_path_u = _newest(str(FFDC_OUT / "ffdc_unimplemented_*.json"))
-if report_path_u:
-    with open(report_path_u) as f:
-        report_u = json.load(f)
-    reports.append(("unimplemented", report_u))
-    print(f"  Report written: {report_path_u}")
-    c = report_u["collector"]
+    # ── Scenario B: unimplemented op failure ────────────────────────────────────
     print(
-        f"  completeness={c['completeness_pct']}%  latency={c['capture_latency_ms']}ms  missing={c['missing_fields']}"
+        "\nScenario B: SpyreUnimplementedRunner.run() → unimplemented op → FFDC fires"
     )
+    urunner = SpyreUnimplementedRunner(
+        name="test_kernel_fft",
+        op="aten::fft_fft",
+    )
+    try:
+        urunner.run()
+    except RuntimeError as e:
+        print(f"  Exception re-raised (expected): {e}")
+    else:
+        raise AssertionError(
+            "Expected RuntimeError from urunner.run() but none was raised"
+        )
 
-# ── Summary ─────────────────────────────────────────────────────────────────
-print("\n=== Captured Report Fields ===")
-for cat, r in reports:
-    print(f"\n[{cat}]")
-    print(f"  failure.exception_type : {r['failure']['exception_type']}")
-    print(f"  failure.message        : {r['failure']['message'][:80]}")
-    print(f"  failure.traceback_lines: {len(r['failure']['traceback'].splitlines())}")
-    print(f"  metadata.torch_version : {r['metadata'].get('torch_version', 'N/A')}")
-    print(
-        f"  metadata.torch_spyre_version : {r['metadata'].get('torch_spyre_version', 'N/A')}"
-    )
-    print(f"  artifacts.found_count  : {r['artifacts']['found_count']}")
-    print(f"  hardware_state         : {r['hardware_state']}")
+    report_path_u: Any | None = _newest(str(FFDC_OUT / "ffdc_unimplemented_*.json"))
+    if report_path_u:
+        with open(report_path_u) as f:
+            report_u = json.load(f)
+        reports.append(("unimplemented", report_u))
+        print(f"  Report written: {report_path_u}")
+        c = report_u["collector"]
+        print(
+            f"  completeness={c['completeness_pct']}%  latency={c['capture_latency_ms']}ms  missing={c['missing_fields']}"
+        )
+    else:
+        print("  [WARN] No report found — check FFDC output_dir")
+
+    # ── Summary ─────────────────────────────────────────────────────────────────
+    print("\n=== Captured Report Fields ===")
+    for cat, r in reports:
+        print(f"\n[{cat}]")
+        print(f"  failure.exception_type : {r['failure']['exception_type']}")
+        print(f"  failure.message        : {r['failure']['message'][:80]}")
+        print(
+            f"  failure.traceback_lines: {len(r['failure']['traceback'].splitlines())}"
+        )
+        print(f"  metadata.torch_version : {r['metadata'].get('torch_version', 'N/A')}")
+        print(
+            f"  metadata.torch_spyre_version : {r['metadata'].get('torch_spyre_version', 'N/A')}"
+        )
+        print(f"  artifacts.found_count  : {r['artifacts']['found_count']}")
+        print(f"  hardware_state         : {r['hardware_state']}")
+
+
+if __name__ == "__main__":
+    main()

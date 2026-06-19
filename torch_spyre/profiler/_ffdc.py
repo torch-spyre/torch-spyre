@@ -61,6 +61,28 @@ REQUIRED_FIELDS = [
     "artifacts.searched",
 ]
 
+# Maximum number of FFDC report files to keep in the output directory.
+# Oldest reports (by modification time) are deleted first.
+_MAX_REPORTS = 50
+
+
+def _prune_old_reports(out_dir: Path, keep: int) -> None:
+    """Delete the oldest ffdc_*.json files, retaining the newest ``keep`` files.
+
+    Sorts by modification time so retention is age-based across all failure
+    categories. Sorting by filename would group by category first (the filename
+    is ffdc_{category}_{ts}_{pid}.json), causing recent reports of a
+    later-sorting category to be evicted before older ones of an earlier-sorting
+    category.
+    """
+    reports = sorted(
+        out_dir.glob("ffdc_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in reports[keep:]:
+        old.unlink(missing_ok=True)
+
 
 def _default_output_dir() -> Path:
     """Return a user-writable directory for FFDC reports.
@@ -219,7 +241,9 @@ def collect(
         failure_category: One of compile, runtime_launch, unimplemented, unknown.
         kernel_name: Kernel name from SpyreSDSCKernelRunner if available.
         code_dir: Code directory from SpyreSDSCKernelRunner if available.
-        output_dir: Directory to write report JSON. Defaults to <repo_root>/ffdc_reports.
+        output_dir: Directory to write report JSON. Defaults to the Inductor cache dir
+            (``~/.cache/torch/inductor/torch-spyre/ffdc_reports``, respecting
+            ``TORCHINDUCTOR_CACHE_DIR``), with a fallback to the system temp dir.
 
     Returns:
         dict with the full FFDC report.
@@ -336,6 +360,7 @@ def collect(
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
         report["_report_path"] = str(report_path)
+        _prune_old_reports(out_dir, keep=_MAX_REPORTS)
     except Exception as e:
         report["_report_path"] = None
         report["collector"]["collector_errors"].append(f"write: {e}")
@@ -351,7 +376,9 @@ def get_diagnostic_report(
     Return the most recent FFDC report as a dict, or None if none exist.
 
     Args:
-        output_dir: Directory to search. Defaults to ``<repo_root>/ffdc_reports``.
+        output_dir: Directory to search. Defaults to the Inductor cache dir
+            (``~/.cache/torch/inductor/torch-spyre/ffdc_reports``, respecting
+            ``TORCHINDUCTOR_CACHE_DIR``), with a fallback to the system temp dir.
 
     Returns:
         Parsed JSON dict of the most recent report, or None.
