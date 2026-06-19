@@ -22,11 +22,12 @@ on:
 
       # IMAGE selector label for runs-on. Normal runs use the standing
       # image_torch_spyre set; the per-PR ephemeral flow passes that PR's set
-      # label (image_pr_<component>_<sha12>) so jobs land on the per-PR image
+      # label (image_torch_spyre_pr_<component>_<sha12>, e.g.
+      # image_torch_spyre_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
       # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
       # unchanged.
       image_label:
-        description: Image scaleSetLabel to select (image_torch_spyre | image_pr_<KEY>)
+        description: Image scaleSetLabel to select (image_torch_spyre | image_torch_spyre_pr_<KEY>)
         required: false
         type: string
         default: image_torch_spyre

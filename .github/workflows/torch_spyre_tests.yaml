@@ -43,7 +43,8 @@ on:
         default: true
       runner_label:
         description: |
-          Per-PR ephemeral runner-set IMAGE label to select (image_pr_<component>_<sha12>).
+          Per-PR ephemeral runner-set IMAGE label to select
+          (image_torch_spyre_pr_<component>_<sha12>, e.g. image_torch_spyre_pr_flex_8ddcf3e155e9).
           Empty = use the standing image_torch_spyre set (the RPM is then installed at
           runtime via rpm_names; the ephemeral flow leaves this set and rpm_names empty).
         required: false
