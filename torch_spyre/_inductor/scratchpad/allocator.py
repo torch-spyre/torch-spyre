@@ -70,6 +70,12 @@ class ScratchpadAllocator(ABC):
     Abstract class for all implementations of ScratchpadAllocator
     """
 
+    def __init__(self) -> None:
+        # Populated during plan_allocation: maps buffer/op name → reason string.
+        # Stamped by _filter_ops, _build_bound_buffers, and plan_allocation
+        # (for the solver decision). Reset at the start of each plan_allocation.
+        self.reject_reasons: dict[str, str] = {}
+
     @abstractmethod
     def plan_allocation(self, graph: GraphLowering):
         """
@@ -128,11 +134,13 @@ class ScratchpadAllocator(ABC):
         for op in graph.operations:
             if not self._op_output_good_for_lx_reuse(op):
                 drop_list.add(op.name)
+                self.reject_reasons[op.name] = "op not allowed"
 
         # filter out core division mismatches
         for key, mismatch in core_div_mismatch.items():
             if mismatch == -1:
                 drop_list.add(key)
+                self.reject_reasons[key] = "core div mismatch"
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
@@ -160,10 +168,13 @@ class ScratchpadAllocator(ABC):
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
             if len(uses) <= 1:
+                self.reject_reasons[output_name] = "single use"
                 continue  # output is not read (only the write, or never touched)
             if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
+                self.reject_reasons[output_name] = "extern kernel user"
                 continue
             if output_name in graph_output_names and not cloning_allowed:
+                self.reject_reasons[output_name] = "graph output (no clone)"
                 continue  # we can only allocate graph outputs if we're allowed to clone
             buffers.append(
                 LifetimeBoundBuffer(
@@ -272,6 +283,17 @@ class ScratchpadAllocator(ABC):
         )
         return buffers
 
+    def _log_lx_pinning(self, graph: GraphLowering) -> None:
+        """Log the final LX pinning decision for every op in the graph."""
+        for op in graph.operations:
+            reason = self.reject_reasons.get(op.name, "lx")
+            logger.debug(
+                "lx_pinning: %s (%s) → %s",
+                op.name,
+                self._get_op_name(op),
+                reason,
+            )
+
     def _push_allocation(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
     ):
@@ -354,6 +376,7 @@ class DefaultAllocator(ScratchpadAllocator):
         if post_optimization_passes is None:
             post_optimization_passes = []
 
+        super().__init__()
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
         self.layout_planning = layout_planning
@@ -365,11 +388,16 @@ class DefaultAllocator(ScratchpadAllocator):
             graph: Lowered graph whose buffers will be assigned LX scratchpad
                 addresses where viable.
         """
+        self.reject_reasons = {}
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
         allocation = self.layout_planning.plan_layout(buffers)
+        for b in allocation:
+            if b.address is None:
+                self.reject_reasons[b.name] = "no room on scratchpad"
         self._push_allocation(graph, allocation)
+        self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
@@ -466,6 +494,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
     """
 
     def plan_allocation(self, graph: GraphLowering):
+        self.reject_reasons = {}
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
 
@@ -522,7 +551,11 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         # DefaultAllocator.plan_allocation past the pre-passes.
         buffers = self._generate_buffers(graph)
         allocation = self.layout_planning.plan_layout(buffers)
+        for b in allocation:
+            if b.address is None:
+                self.reject_reasons[b.name] = "no room on scratchpad"
         self._push_allocation(graph, allocation)
+        self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
