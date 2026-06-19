@@ -165,6 +165,8 @@ class JobPlanBuilder {
       const nlohmann::json& cmd);
   /// Translate a DataTransfer command to a JobPlanStepH2D or JobPlanStepD2H
   std::unique_ptr<JobPlanStep> translateDataTransfer(const nlohmann::json& cmd);
+  /// Translate ExpectedInputShapes from spyrecode JSON to a vector of shapes
+  std::vector<std::vector<int64_t>> translateExpectedInputShapes() const;
 };
 
 /**

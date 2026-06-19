@@ -52,7 +52,9 @@ class SpyreStream {
   void executeProgramAsync(const KernelArtifacts& arts,
                            const std::vector<at::Tensor>& args) const;
 
-  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
+  void launch(const JobPlan& plan, 
+	      const std::vector<at::Tensor>& args,
+	      bool allow_tiled_launch = true) const;
 
   // Conversions
   c10::Stream unwrap() const;

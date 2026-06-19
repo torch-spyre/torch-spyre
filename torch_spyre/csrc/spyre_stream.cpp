@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -70,6 +71,57 @@ StreamPool& getStreamPool() {
 thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
     current_streams;
 
+enum class ShapeCompareResult {
+  kExact,       // every dimension matches -> single-iteration path
+  kExceedsTile, // all dims >= expected, at least one strictly larger
+  kMismatch,    // rank differs or any dim is smaller than expected
+};
+
+ShapeCompareResult classifyShapes(const std::vector<at::Tensor>& tensors,
+                                  const std::vector<std::vector<int64_t>>& expected_shapes) {
+  bool any_exceeds = false;
+
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    const auto& actual = tensors[i].sizes();
+    const auto& expected = expected_shapes[i];
+
+    if (static_cast<size_t>(actual.size()) != expected.size()) {
+      return ShapeCompareResult::kMismatch;
+    }
+    for (size_t d = 0; d < expected.size(); ++d) {
+      if (actual[d] < expected[d]) return ShapeCompareResult::kMismatch;
+      if (actual[d] > expected[d]) any_exceeds = true;
+    }
+  }
+  return any_exceeds ? ShapeCompareResult::kExceedsTile
+                     : ShapeCompareResult::kExact;
+}
+
+std::string formatShapes(const std::vector<std::vector<int64_t>>& shapes) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < shapes.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << "[";
+    for (size_t j = 0; j < shapes[i].size(); ++j) {
+      if (j > 0) oss << ", ";
+      oss << shapes[i][j];
+    }
+    oss << "]";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+std::string formatShapes(const std::vector<at::Tensor>& tensors) {
+  std::vector<std::vector<int64_t>> shapes;
+  shapes.reserve(tensors.size());
+  for (const auto& tensor : tensors) {
+    shapes.push_back(tensor.sizes().vec());
+  }
+  return formatShapes(shapes);
+}
+    
 }  // anonymous namespace
 
 // Stream pool configuration
@@ -238,11 +290,51 @@ void SpyreStream::executeProgramAsync(
 }
 
 void SpyreStream::launch(const JobPlan& plan,
-                         const std::vector<at::Tensor>& args) const {
+                         const std::vector<at::Tensor>& args
+			 bool allow_tiled_launch) const {
   // Validate all tensors are on Spyre device
   for (size_t i = 0; i < args.size(); ++i) {
     TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
                 " must be on Spyre device, got ", args[i].device());
+  }
+
+  // Shape comparison (skip if no expected shapes - pure DMA plan)
+  if (!plan.expected_input_shapes.empty()) {
+    const size_t n_inputs = plan.expected_input_shapes.size();
+    TORCH_CHECK(args.size() >= n_inputs,
+                "SpyreStream::launch: expected >= ", n_inputs,
+                " args, received ", args.size());
+
+    const std::vector<at::Tensor> input_args(args.begin(),
+                                             args.begin() + n_inputs);
+
+    switch (classifyShapes(input_args, plan.expected_input_shapes)) {
+      case ShapeCompareResult::kExact:
+        // proceed to single-iteration launch below
+        break;
+
+      case ShapeCompareResult::kExceedsTile:
+        if (allow_tiled_launch) {
+          // TODO: tiled launch
+          TORCH_WARN_ONCE("Tiled launch requested but not yet implemented");
+          break;
+        } else {
+          TORCH_CHECK(false,
+                      "SpyreStream::launch: input shapes exceed tile size. "
+                      "Expected: ",
+                      formatShapes(plan.expected_input_shapes),
+                      ", got: ", formatShapes(input_args));
+        }
+        break;
+
+      case ShapeCompareResult::kMismatch:
+        TORCH_CHECK(false,
+                    "SpyreStream::launch: input shapes incompatible with "
+                    "compiled kernel. Expected: ",
+                    formatShapes(plan.expected_input_shapes),
+                    ", got: ", formatShapes(input_args));
+        break;
+    }
   }
 
   // Create launch context with tensor arguments
