@@ -154,6 +154,70 @@ def _rebuild_matmul(
     return replace_computed_buffer_body(op, reduction, operations)
 
 
+def pad_fp8_weight_input(graph) -> None:
+    """Pad qfp8wt's FP16 input along its K dim to a multiple of the FP8
+    stick size (128) BEFORE quantization, instead of padding the FP8 output
+    after quantization.
+
+    constant_pad_nd's mutate_to-based lowering does not support FP8 identity
+    copies on Spyre hardware (see insert_bmm_padding's K-padding, which hits
+    'Scheduler failed to find a suitable op mapping for sdsc: 0_identity').
+    Padding the FP16 input instead reuses the same constant_pad_nd lowering
+    in a dtype where it is already proven to work, avoiding the unsupported
+    FP8 path entirely. qfp8wt then quantizes the already-padded buffer.
+
+    Runs in CustomPrePasses (early post-grad, per post_grad.post_grad_passes).
+    quantize_weight_fp8_with_scale has ALREADY been decomposed into
+    reciprocal/mul/clamp/qfp8wt by the time this pass sees the graph (it does
+    not survive as a single opaque node here, unlike at true pre-grad time),
+    so this targets qfp8wt's input directly instead.
+    """
+    stick_size = 128  # FP8 (SEN143_FP8) elems_per_stick
+
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.spyre.qfp8wt.default
+        ):
+            continue
+
+        weight_node = node.args[0]
+        if "val" not in weight_node.meta:
+            continue
+
+        weight_shape = list(weight_node.meta["val"].shape)
+        k_dim = len(weight_shape) - 2  # row dim feeding the K-dimension of mat_b
+        if k_dim < 0:
+            continue
+        k_size = weight_shape[k_dim]
+        pad = (stick_size - (k_size % stick_size)) % stick_size
+        if pad == 0:
+            continue
+
+        ndim = len(weight_shape)
+        pad_tuple = []
+        for i in range(ndim - 1, -1, -1):
+            if i == k_dim:
+                pad_tuple.extend([0, pad])
+            else:
+                pad_tuple.extend([0, 0])
+
+        with graph.inserting_before(node):
+            pad_node = graph.call_function(
+                torch.ops.aten.constant_pad_nd.default,
+                args=(weight_node, pad_tuple, 0.0),
+            )
+            padded_shape = list(weight_shape)
+            padded_shape[k_dim] = k_size + pad
+            pad_node.meta["val"] = torch.empty(
+                padded_shape,
+                dtype=weight_node.meta["val"].dtype,
+                device=weight_node.meta["val"].device,
+            )
+
+        node.args = (pad_node,) + node.args[1:]
+
+
 def insert_bmm_padding(graph: GraphLowering) -> None:
     """
     Pad y's K (row) dimension for each BATCH_MATMUL_OP to a stick boundary.
@@ -271,15 +335,30 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         else:
             y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
+        if y_size[y_k_dim] == k_padded:
+            # y is already at the padded target size (e.g. padded upstream by
+            # pad_fp8_weight_input, which pads the FP16 input to qfp8wt before
+            # quantization). Padding again here would be a no-op that trips
+            # lower_pad_sequence's "dim actually changed" assertion, so skip.
+            continue
         y_padded_size[y_k_dim] = k_padded
         y_fx_node = _find_arg_fx_node(y_name)
 
         y_orig_stl = y_buf.get_layout().device_layout
+        # FP8 tensors cannot be used as padding fill constants (no hardware
+        # identity op support for SEN143_FP8/SEN152_FP8). Use FP16 instead;
+        # the padded buffer's logical dtype stays FP8, only the fill/copy
+        # machinery inside lower_pad_sequence runs in FP16.
+        pad_dtype = (
+            torch.float16
+            if dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else dtype
+        )
         y_padded_buf, y_new_ops = lower_pad_sequence(
             y_fx_node,
             padded_size=y_padded_size,
             device=device,
-            dtype=dtype,
+            dtype=pad_dtype,
             dim=y_k_dim,
             insert_before=matmul_fx_node,
             orig_stl=y_orig_stl,

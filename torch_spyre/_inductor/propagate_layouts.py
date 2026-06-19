@@ -324,7 +324,7 @@ def _single_arg_op_layout(
             out_device_size[-1] = out_eps
             for i, s in enumerate(stl.stride_map):
                 if s == in_eps:
-                    out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+                    out_device_size[i] = (stl.device_size[i] * in_eps + out_eps - 1) // out_eps
                     out_stride_map[i] = out_eps
                     break
             return [

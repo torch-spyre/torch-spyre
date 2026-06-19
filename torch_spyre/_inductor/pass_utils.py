@@ -1219,7 +1219,19 @@ def lower_pad_sequence(
     for i in range(len(padded_core) - 2, -1, -1):
         core_stride[i] = core_stride[i + 1] * padded_core[i + 1]
 
-    padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
+    # Use the original buffer's true torch dtype (from its FX node metadata),
+    # not the possibly FP16-overridden `dtype` parameter, for the padded
+    # buffer's own device layout. `dtype` here may be FP16 even for an FP8
+    # buffer (padding.py overrides it so the internal fill/copy ops avoid
+    # unsupported FP8 identity ops), but the padded buffer's *device layout*
+    # must still reflect its real dtype (FP8) so downstream consumers (e.g.
+    # the matmul reduction) see consistent device_dtype/stick-size metadata.
+    # Must stay a torch.dtype (not DataFormats) to match the
+    # (host_size, host_strides, dtype, dim_order) constructor overload.
+    real_dtype = arg_fx_node.meta["val"].dtype
+    padded_stl = SpyreTensorLayout(
+        padded_core, core_stride, real_dtype, dim_order_core
+    )
     host_layout = padded_buf.layout
     padded_buf.layout = FixedTiledLayout(
         host_layout.device,
