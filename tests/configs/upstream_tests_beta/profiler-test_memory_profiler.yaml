@@ -18,37 +18,37 @@ test_suite_config:
           mode: xfail  # xfail: UNKNOWN
 
         - names:
-            - TestDataFlow::test_data_flow_graph_non_op_allocations 
-            - TestDataFlow::test_data_flow_graph_simple 
-            - TestDataFlow::test_data_flow_graph_simple_backward 
-            - TestDataFlow::test_data_flow_graph_simple_inplace 
-            - TestDataFlow::test_data_flow_graph_stacked 
-            - TestDataFlow::test_data_flow_graph_with_annotations 
-            - TestDataFlow::test_match_schemas 
-            - TestDataFlow::test_match_schemas_backward 
-            - TestDataFlow::test_match_schemas_tensorlist 
-            - TestIdentifyGradients::test_extract_gradients_from_module 
-            - TestIdentifyGradients::test_extract_gradients_from_module_and_optimizer 
-            - TestIdentifyGradients::test_extract_gradients_from_optimizer 
-            - TestIdentifyGradients::test_extract_gradients_from_optimizer_set_to_none 
-            - TestIdentifyGradients::test_extract_gradients_low_level 
-            - TestMemoryProfilerE2E::test_categories_e2e_sequential_fwd 
-            - TestMemoryProfilerE2E::test_categories_e2e_sequential_fwd_bwd 
-            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd 
-            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd_bwd 
-            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd_bwd_step 
-            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd 
-            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd_bwd 
-            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd_bwd_step 
-            - TestMemoryProfilerE2E::test_inputs_fwd 
-            - TestMemoryProfilerE2E::test_inputs_fwd_bwd 
-            - TestMemoryProfilerE2E::test_inputs_fwd_lazy 
-            - TestMemoryProfilerE2E::test_lazily_initialized 
-            - TestMemoryProfilerE2E::test_manual_optimizer_step 
-            - TestMemoryProfilerE2E::test_memory_timeline 
-            - TestMemoryProfilerE2E::test_parameters_and_gradients 
-            - TestMemoryProfilerE2E::test_parameters_and_gradients_set_to_none 
-            - TestMemoryProfiler::test_config_check 
+            - TestDataFlow::test_data_flow_graph_non_op_allocations
+            - TestDataFlow::test_data_flow_graph_simple
+            - TestDataFlow::test_data_flow_graph_simple_backward
+            - TestDataFlow::test_data_flow_graph_simple_inplace
+            - TestDataFlow::test_data_flow_graph_stacked
+            - TestDataFlow::test_data_flow_graph_with_annotations
+            - TestDataFlow::test_match_schemas
+            - TestDataFlow::test_match_schemas_backward
+            - TestDataFlow::test_match_schemas_tensorlist
+            - TestIdentifyGradients::test_extract_gradients_from_module
+            - TestIdentifyGradients::test_extract_gradients_from_module_and_optimizer
+            - TestIdentifyGradients::test_extract_gradients_from_optimizer
+            - TestIdentifyGradients::test_extract_gradients_from_optimizer_set_to_none
+            - TestIdentifyGradients::test_extract_gradients_low_level
+            - TestMemoryProfilerE2E::test_categories_e2e_sequential_fwd
+            - TestMemoryProfilerE2E::test_categories_e2e_sequential_fwd_bwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd_bwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd_bwd_step
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd_bwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd_bwd_step
+            - TestMemoryProfilerE2E::test_inputs_fwd
+            - TestMemoryProfilerE2E::test_inputs_fwd_bwd
+            - TestMemoryProfilerE2E::test_inputs_fwd_lazy
+            - TestMemoryProfilerE2E::test_lazily_initialized
+            - TestMemoryProfilerE2E::test_manual_optimizer_step
+            - TestMemoryProfilerE2E::test_memory_timeline
+            - TestMemoryProfilerE2E::test_parameters_and_gradients
+            - TestMemoryProfilerE2E::test_parameters_and_gradients_set_to_none
+            - TestMemoryProfiler::test_config_check
           mode: skip
 
   global:

@@ -8,11 +8,11 @@ test_suite_config:
         # They are classified as mandatory_success due to the critical nature of execution tracing in performance analysis.
         # The relevant Spyre capabilities include support for various ops and dtypes, but some ops like 'convolution' and 'gelu' are not fully supported.
         - names:
-            - TestExecutionTrace::test_execution_trace_alone    
+            - TestExecutionTrace::test_execution_trace_alone
             - TestExecutionTrace::test_execution_trace_env_disabled
             - TestExecutionTrace::test_execution_trace_repeat_in_loop
-            - TestExecutionTrace::test_execution_trace_start_stop 
-            - TestExecutionTrace::test_execution_trace_with_kineto 
+            - TestExecutionTrace::test_execution_trace_start_stop
+            - TestExecutionTrace::test_execution_trace_with_kineto
           mode: mandatory_success
         # These tests exercise execution tracing capabilities, including environment settings and loop behavior.
         # They are classified as xfail due to the missing 'dxp_standalone' executable, indicating a setup issue.
@@ -32,7 +32,7 @@ test_suite_config:
             - TestExecutionTrace::test_execution_trace_record_integral_tensor_range
             - TestExecutionTrace::test_execution_trace_with_pt2
             - TestExecutionTrace::test_triton_fx_graph_with_et
-            - TestExecutionTrace::test_execution_trace_nested_tensor 
+            - TestExecutionTrace::test_execution_trace_nested_tensor
           mode: skip  # does not engage the torch-spyre layer
 
   global:

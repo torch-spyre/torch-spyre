@@ -11,27 +11,27 @@ test_suite_config:
             - TestTorchTidyProfiler::test_allocation_id_uniqueness
           mode: mandatory_success
         - names:
-            - TestTorchTidyProfiler::test_allocation_ids 
-            - TestTorchTidyProfiler::test_allocation_ids_with_other_ops 
-            - TestTorchTidyProfiler::test_allocations 
-            - TestTorchTidyProfiler::test_extra_fields 
-            - TestTorchTidyProfiler::test_impl_reuse 
-            - TestTorchTidyProfiler::test_mkldnn_tensors 
-            - TestTorchTidyProfiler::test_module_and_optimizer_ids 
-            - TestTorchTidyProfiler::test_nnmodule_params 
-            - TestTorchTidyProfiler::test_optimizer 
-            - TestTorchTidyProfiler::test_optimizer_parameters_adam 
-            - TestTorchTidyProfiler::test_optimizer_parameters_sgd 
-            - TestTorchTidyProfiler::test_pointers_and_ids 
-            - TestTorchTidyProfiler::test_refcounts 
-            - TestTorchTidyProfiler::test_scalar_ins 
-            - TestTorchTidyProfiler::test_sparse_tensors 
-            - TestTorchTidyProfiler::test_tensor_lists 
-            - TestTorchTidyProfiler::test_tensor_properties 
-            - TestTorchTidyProfiler::test_tensorimpl_invalidation_full 
-            - TestTorchTidyProfiler::test_tensorimpl_invalidation_keep_alive 
-            - TestTorchTidyProfiler::test_tensorimpl_invalidation_scalar_args 
-            - TestTorchTidyProfiler::test_tensorimpl_invalidation_set 
+            - TestTorchTidyProfiler::test_allocation_ids
+            - TestTorchTidyProfiler::test_allocation_ids_with_other_ops
+            - TestTorchTidyProfiler::test_allocations
+            - TestTorchTidyProfiler::test_extra_fields
+            - TestTorchTidyProfiler::test_impl_reuse
+            - TestTorchTidyProfiler::test_mkldnn_tensors
+            - TestTorchTidyProfiler::test_module_and_optimizer_ids
+            - TestTorchTidyProfiler::test_nnmodule_params
+            - TestTorchTidyProfiler::test_optimizer
+            - TestTorchTidyProfiler::test_optimizer_parameters_adam
+            - TestTorchTidyProfiler::test_optimizer_parameters_sgd
+            - TestTorchTidyProfiler::test_pointers_and_ids
+            - TestTorchTidyProfiler::test_refcounts
+            - TestTorchTidyProfiler::test_scalar_ins
+            - TestTorchTidyProfiler::test_sparse_tensors
+            - TestTorchTidyProfiler::test_tensor_lists
+            - TestTorchTidyProfiler::test_tensor_properties
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_full
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_keep_alive
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_scalar_args
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_set
           mode: skip
 
   global:

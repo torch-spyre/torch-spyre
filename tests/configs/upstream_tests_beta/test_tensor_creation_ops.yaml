@@ -33,7 +33,7 @@ test_suite_config:
         # They are classified as `mandatory_success` because the Spyre backend must support `dsplit` for all relevant dtypes.
         # The relevant Spyre capability is the exclusion of `int64` dtype due to backend limitations.
         - names:
-            - TestTensorCreation::test_dsplit 
+            - TestTensorCreation::test_dsplit
           mode: mandatory_success
           edits:
             dtypes:
@@ -53,7 +53,7 @@ test_suite_config:
         # They are classified as `mandatory_success` due to the expectation that `hsplit` should work across supported dtypes.
         # The relevant Spyre capability is its support for tensor operations, but it currently lacks support for `int64` dtypes.
         - names:
-            - TestTensorCreation::test_hsplit 
+            - TestTensorCreation::test_hsplit
           mode: mandatory_success
           edits:
             dtypes:

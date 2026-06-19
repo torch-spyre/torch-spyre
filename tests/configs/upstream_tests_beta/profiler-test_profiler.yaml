@@ -14,38 +14,38 @@ test_suite_config:
         # They are classified as 'skip' on the Spyre backend due to unsupported operations and missing features in the Spyre op database.
         # Relevant Spyre limitations include missing support for certain ops like 'convolution' and 'copy_', and the absence of CUDA-specific profiling capabilities.
         - names:
-            - TestExperimentalUtils::test_profiler_for_loop_indexing_pattern 
-            - TestExperimentalUtils::test_profiler_grad_not_set_to_none_pattern 
-            - TestExperimentalUtils::test_profiler_name_pattern 
-            - TestExperimentalUtils::test_profiler_optimizer_single_tensor_pattern 
-            - TestExperimentalUtils::test_profiler_pattern_match_helper 
-            - TestExperimentalUtils::test_profiler_pattern_matcher_json_report 
-            - TestExperimentalUtils::test_profiler_synchronized_dataloader_pattern 
-            - TestExperimentalUtils::test_utils_compute_queue_depth_when_no_cuda_events 
-            - TestExperimentalUtils::test_utils_compute_self_time 
-            - TestProfiler::test_basic_chrome_trace 
-            - TestProfiler::test_concrete_inputs_profiling 
-            - TestProfiler::test_concrete_inputs_profiling_toggling 
-            - TestProfiler::test_forked_process 
-            - TestProfiler::test_guarded_record_function_fast 
-            - TestProfiler::test_is_profiler_enabled 
-            - TestProfiler::test_kineto_profiler_api 
-            - TestProfiler::test_kineto_profiler_multiple_steppers 
-            - TestProfiler::test_lazy_build_tree 
-            - TestProfiler::test_memory_profiler 
-            - TestProfiler::test_nested_tensor_with_shapes 
-            - TestProfiler::test_profiler_correlation_id 
-            - TestProfiler::test_profiler_metadata 
-            - TestProfiler::test_profiler_op_event_kwargs 
-            - TestProfiler::test_profiler_op_event_kwargs_list_of_strings 
-            - TestProfiler::test_profiler_time_scale 
-            - TestProfiler::test_profiler_type 
-            - TestProfiler::test_public_api_post_processing_timeout_large 
-            - TestProfiler::test_public_api_post_processing_timeout_none 
-            - TestProfiler::test_public_api_post_processing_timeout_zero 
-            - TestProfiler::test_record_function_fast 
-            - TestProfiler::test_schedule_function_count 
-            - TestProfiler::test_user_annotation 
+            - TestExperimentalUtils::test_profiler_for_loop_indexing_pattern
+            - TestExperimentalUtils::test_profiler_grad_not_set_to_none_pattern
+            - TestExperimentalUtils::test_profiler_name_pattern
+            - TestExperimentalUtils::test_profiler_optimizer_single_tensor_pattern
+            - TestExperimentalUtils::test_profiler_pattern_match_helper
+            - TestExperimentalUtils::test_profiler_pattern_matcher_json_report
+            - TestExperimentalUtils::test_profiler_synchronized_dataloader_pattern
+            - TestExperimentalUtils::test_utils_compute_queue_depth_when_no_cuda_events
+            - TestExperimentalUtils::test_utils_compute_self_time
+            - TestProfiler::test_basic_chrome_trace
+            - TestProfiler::test_concrete_inputs_profiling
+            - TestProfiler::test_concrete_inputs_profiling_toggling
+            - TestProfiler::test_forked_process
+            - TestProfiler::test_guarded_record_function_fast
+            - TestProfiler::test_is_profiler_enabled
+            - TestProfiler::test_kineto_profiler_api
+            - TestProfiler::test_kineto_profiler_multiple_steppers
+            - TestProfiler::test_lazy_build_tree
+            - TestProfiler::test_memory_profiler
+            - TestProfiler::test_nested_tensor_with_shapes
+            - TestProfiler::test_profiler_correlation_id
+            - TestProfiler::test_profiler_metadata
+            - TestProfiler::test_profiler_op_event_kwargs
+            - TestProfiler::test_profiler_op_event_kwargs_list_of_strings
+            - TestProfiler::test_profiler_time_scale
+            - TestProfiler::test_profiler_type
+            - TestProfiler::test_public_api_post_processing_timeout_large
+            - TestProfiler::test_public_api_post_processing_timeout_none
+            - TestProfiler::test_public_api_post_processing_timeout_zero
+            - TestProfiler::test_record_function_fast
+            - TestProfiler::test_schedule_function_count
+            - TestProfiler::test_user_annotation
             - TestExperimentalUtils::test_bfs
             - TestExperimentalUtils::test_dfs
             - TestExperimentalUtils::test_expose_kineto_event_metadata

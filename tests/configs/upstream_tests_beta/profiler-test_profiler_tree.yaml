@@ -14,11 +14,11 @@ test_suite_config:
         # They are classified as 'skip' because they do not engage the torch-spyre layer, which is required for backend-specific profiling.
         # The relevant Spyre capability is the lack of direct integration with CUDA-specific profiler features.
         - names:
-            - TestProfilerTree::test_profiler_experimental_tree_with_memory 
-            - TestProfilerTree::test_profiler_experimental_tree_with_record_function 
-            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_modules 
-            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_torch_dispatch 
-            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_torch_function 
+            - TestProfilerTree::test_profiler_experimental_tree_with_memory
+            - TestProfilerTree::test_profiler_experimental_tree_with_record_function
+            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_modules
+            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_torch_dispatch
+            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_torch_function
             - TestProfilerTree::test_profiler_experimental_tree_cuda
             - TestProfilerTree::test_profiler_experimental_tree_cuda_detailed
             - TestProfilerTree::test_profiler_experimental_tree_cuda_with_stream

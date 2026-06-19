@@ -20,10 +20,10 @@ test_suite_config:
             - TestConfigFuzzer::test_fuzzer_running_test
             - TestConfigFuzzer::test_sampling_method_random
             - TestConfigFuzzer::test_sampling_method_toggle
-            - TestConfigFuzzer::test_config_fuzzer_bisector_exception 
-            - TestConfigFuzzer::test_config_fuzzer_inductor_bisect 
-            - TestConfigFuzzer::test_config_fuzzer_inductor_cpu 
-            - TestConfigFuzzer::test_config_fuzzer_n_tuple 
+            - TestConfigFuzzer::test_config_fuzzer_bisector_exception
+            - TestConfigFuzzer::test_config_fuzzer_inductor_bisect
+            - TestConfigFuzzer::test_config_fuzzer_inductor_cpu
+            - TestConfigFuzzer::test_config_fuzzer_n_tuple
           mode: skip  # does not engage the torch-spyre layer
 
   global:

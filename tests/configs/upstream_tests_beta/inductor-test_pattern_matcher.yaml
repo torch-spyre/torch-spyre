@@ -17,14 +17,14 @@ test_suite_config:
         # They are classified as "skip" on the Spyre backend due to the lack of CUDA support, which is required for these tests to run successfully.
         # The relevant Spyre capability is its support for CPU-based operations, which does not include CUDA-specific functionalities.
         - names:
-            - TestPatternMatcher::test_input_output_same 
-            - TestPatternMatcher::test_mixed_mm_cpu 
-            - TestPatternMatcher::test_multioutput_register_replacement 
-            - TestPatternMatcher::test_pointless_cumsum 
-            - TestPatternMatcher::test_remove_noop_pass_with_remove_passes 
-            - TestPatternMatcher::test_remove_pointless_clones 
-            - TestPatternMatcher::test_scaled_softmax 
-            - TestPatternMatcher::test_symint_pattern_matching 
+            - TestPatternMatcher::test_input_output_same
+            - TestPatternMatcher::test_mixed_mm_cpu
+            - TestPatternMatcher::test_multioutput_register_replacement
+            - TestPatternMatcher::test_pointless_cumsum
+            - TestPatternMatcher::test_remove_noop_pass_with_remove_passes
+            - TestPatternMatcher::test_remove_pointless_clones
+            - TestPatternMatcher::test_scaled_softmax
+            - TestPatternMatcher::test_symint_pattern_matching
             - TestPatternMatcherLogging::test_failed_match_constant_args_format_string
             - TestPatternMatcherLogging::test_gumbel_max_trick
             - TestPatternMatcherLogging::test_pattern_match_debug_output

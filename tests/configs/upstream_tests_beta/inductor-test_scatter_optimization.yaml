@@ -14,12 +14,12 @@ test_suite_config:
             - TestScatterOpt::test_cross_entropy_loss
           mode: xfail
         - names:
-            - TestScatterOpt::test_can_not_optimize_due_to_dense 
-            - TestScatterOpt::test_can_not_optimize_due_to_non_const 
-            - TestScatterOpt::test_cross_entropy_loss 
-            - TestScatterOpt::test_neg_scatter_dim 
-            - TestScatterOpt::test_non_last_dim 
-            - TestScatterOpt::test_nonzero_const_tensor 
+            - TestScatterOpt::test_can_not_optimize_due_to_dense
+            - TestScatterOpt::test_can_not_optimize_due_to_non_const
+            - TestScatterOpt::test_cross_entropy_loss
+            - TestScatterOpt::test_neg_scatter_dim
+            - TestScatterOpt::test_non_last_dim
+            - TestScatterOpt::test_nonzero_const_tensor
             - TestScatterOpt::test_shorter_index_tensor
           mode: skip
   global:
