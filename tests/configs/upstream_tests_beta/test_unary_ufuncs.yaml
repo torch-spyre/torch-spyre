@@ -11,77 +11,6 @@ test_suite_config:
             - TestUnaryUfuncs::test_isposinf_isneginf_non_boolean_output
             - TestUnaryUfuncs::test_polygamma_neg
           mode: mandatory_success
-        # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) on various dtypes, excluding unsupported combinations.
-        # They are classified as mandatory_success due to Spyre's support for these ops and dtypes, except for specific exclusions.
-        # Relevant Spyre limitations include unsupported dtypes (bfloat16, float16, int64) for certain ops and lack of support for bool dtype in large value tests.
-        # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) on various dtypes.
-        # They are classified as mandatory_success due to unsupported dtypes (bfloat16, float16, int64) and ops.
-        # Spyre's limitations include lack of support for certain dtypes and ops, leading to InductorErrors.
-        # - names: # exclude not working
-        #     - TestUnaryUfuncs::test_reference_numerics_large
-        #     - TestUnaryUfuncs::test_reference_numerics_small
-        #     - TestUnaryUfuncs::test_reference_numerics_normal
-        #   mode: mandatory_success
-        #   edits:
-        #     ops:
-        #       exclude:
-        #         - name: _scaled_dot_product_fused_attention_overrideable
-        #         - name: _scaled_mm
-        #         - name: add
-        #         - name: addmm
-        #         - name: bitwise_and
-        #         - name: bitwise_not
-        #         - name: bmm
-        #         - name: cat
-        #         - name: clamp
-        #         - name: clamp_max
-        #         - name: clamp_min
-        #         - name: clone
-        #         - name: constant_pad_nd
-        #         - name: convolution
-        #         - name: copy_
-        #         - name: full
-        #         - name: gelu
-        #         - name: layer_norm
-        #         - name: linear
-        #         - name: logical_not
-        #         - name: max
-        #         - name: maximum
-        #         - name: mean
-        #         - name: min
-        #         - name: minimum
-        #         - name: mm
-        #         - name: mul
-        #         - name: new_ones
-        #         - name: ones
-        #         - name: rms_norm
-        #         - name: softplus
-        #         - name: sub
-        #         - name: topk
-        #         - name: where
-        #         - name: realdiv
-        #         - name: relufwd
-        #         - name: reciprocal
-        #         - name: sum
-        #         - name: layernormscale
-        #         - name: abs
-        #         - name: neg
-        #         - name: exp
-        #         - name: sigmoid
-        #         - name: exx2
-        #         - name: layernormnorm
-        #         - name: identity
-        #         - name: sqrt
-        #         - name: rsqrt
-        #         - name: topkvalue
-        #         - name: topkindex
-        #         - name: floor
-        #         - name: to_dtype
-        #     dtypes:
-        #       exclude:
-        #         - name: bool
-        #         - name: float32
-        #         - name: int64
         - names:
             - TestUnaryUfuncs::test_abs_zero
           mode: mandatory_success
@@ -92,6 +21,12 @@ test_suite_config:
                 - name: bool
                 - name: float16
                 - name: int64
+        # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) on various dtypes, excluding unsupported combinations.
+        # They are classified as mandatory_success due to Spyre's support for these ops and dtypes, except for specific exclusions.
+        # Relevant Spyre limitations include unsupported dtypes (bfloat16, float16, int64) for certain ops and lack of support for bool dtype in large value tests.
+        # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) on various dtypes.
+        # They are classified as mandatory_success due to unsupported dtypes (bfloat16, float16, int64) and ops.
+        # Spyre's limitations include lack of support for certain dtypes and ops, leading to InductorErrors.
         # These tests exercise various unary operations (abs, exp, igamma, igammac, nan_to_num, threshold) across different dtypes (int64, float32, bfloat16).
         # They are classified as xfail due to unsupported operations and missing files (e.g., 'dxp_standalone') on the Spyre backend.
         # Relevant Spyre limitations include unsupported data formats (e.g., IEEE_INT32) and missing standalone compilation tools.
@@ -101,7 +36,6 @@ test_suite_config:
             - TestUnaryUfuncs::test_reference_numerics_normal
             - TestUnaryUfuncs::test_abs_big_number
             - TestUnaryUfuncs::test_abs_signed_zero
-            # - TestUnaryUfuncs::test_abs_zero
             - TestUnaryUfuncs::test_exp
             - TestUnaryUfuncs::test_igamma_edge_cases
             - TestUnaryUfuncs::test_igammac_edge_cases
@@ -123,14 +57,11 @@ test_suite_config:
         # They are classified as xfail due to unsupported tensor ranks and dtype-specific operations on the Spyre backend.
         # Relevant Spyre limitations include unsupported tensor ranks and lack of support for certain dtype-specific operations.
         - names:
-            # - TestUnaryUfuncs::test_reference_numerics_large
-            # - TestUnaryUfuncs::test_reference_numerics_small
             - TestUnaryUfuncs::test_contig_size1_large_dim
             - TestUnaryUfuncs::test_contig_vs_every_other
             - TestUnaryUfuncs::test_mvlgamma_inplace_integer_error
             - TestUnaryUfuncs::test_mvlgamma_integer_promotion
             - TestUnaryUfuncs::test_reference_numerics_extremal
-            # - TestUnaryUfuncs::test_reference_numerics_normal
           mode: xfail  # xfail: UNKNOWN
         # These tests exercise unary operations like acos, log, and sqrt across dtypes bfloat16, float16, and float32.
         # They are classified as xfail due to missing 'dxp_standalone' file, causing FileNotFoundError.
