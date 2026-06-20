@@ -20,6 +20,18 @@ on:
         required: true
         type: string
 
+      # IMAGE selector label for runs-on. Normal runs use the standing
+      # image_torch_spyre set; the per-PR ephemeral flow passes that PR's set
+      # label (image_torch_spyre_pr_<component>_<sha12>, e.g.
+      # image_torch_spyre_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
+      # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
+      # unchanged.
+      image_label:
+        description: Image scaleSetLabel to select (image_torch_spyre | image_torch_spyre_pr_<KEY>)
+        required: false
+        type: string
+        default: image_torch_spyre
+
       # Flags appended to every `bash tests/run_test.sh <config>` call
       extra_test_flags:
         description: Extra flags passed to run_test.sh (e.g. "-v" or "--cpu-compile -vvv -s")
@@ -81,7 +93,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
@@ -221,6 +233,10 @@ jobs:
         with:
           verbose: 'true'
 
+      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
+      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
+      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
+      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
       - name: Download RPMs
         if: ${{ inputs.rpm_names != '' }}
         uses: ./.github/actions/download-rpms
@@ -278,7 +294,7 @@ jobs:
       - x86_64
       - spyre_pf_x2
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       CI: ''
@@ -316,6 +332,10 @@ jobs:
         with:
           verbose: 'true'
 
+      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
+      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
+      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
+      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
       - name: Download RPMs
         if: ${{ inputs.rpm_names != '' }}
         uses: ./.github/actions/download-rpms
