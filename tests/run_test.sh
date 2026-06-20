@@ -992,7 +992,7 @@ for _p in reversed(_os.environ.get('PYTHONPATH', '').split(_os.pathsep)):
 import importlib.util as _ilu
 
 _pre_import_classes = {}
-_restricted_names = set([${quoted_restricted_list}])
+_restricted_names: set[str] = set([${quoted_restricted_list}])
 
 def _do_pre_import():
     """Capture original class objects before the star-import deletes them."""
