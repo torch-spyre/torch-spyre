@@ -134,6 +134,8 @@ jobs:
             config: torch_spyre_tests/test_allocator_e2e_config.yaml
           - name: Test Launch Jobplan
             config: torch_spyre_tests/test_launch_jobplan_config.yaml
+          - name: Test logging patterns
+            config: torch_spyre_tests/test_logging_patterns_config.yaml
           # ---- Inductor tests ----
           - name: Inductor Building Blocks
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
