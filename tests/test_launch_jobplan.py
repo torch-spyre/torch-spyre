@@ -15,91 +15,80 @@
 """Tests for launching simple compiled ops through JobPlan execution."""
 
 import os
-import subprocess
-import sys
+from typing import Tuple
 
 import pytest
-
-
-def run_compiled_op_in_subprocess(op_name: str, env_vars: dict) -> bool:
-    """
-    Run a compiled op test in an isolated subprocess with specific env vars.
-
-    This ensures each test runs with a fresh torch.compile cache and config,
-    avoiding the need for torch._dynamo.reset_code_caches().
-    """
-    code = f"""
+from torch.testing._internal.common_utils import TestCase
 import torch
+import torch._dynamo
 
-# Get the op function
-op_fn = getattr(torch, "{op_name}")
+from torch_spyre._inductor import config as _spyre_config
 
-# Generate inputs based on op
-if "{op_name}" == "abs":
-    inputs = (torch.randn(64, dtype=torch.float16),)
-elif "{op_name}" == "mul":
-    inputs = (
-        torch.randn(64, dtype=torch.float16),
-        torch.randn(64, dtype=torch.float16),
-    )
-else:
-    raise ValueError(f"Unknown op: {{op_name}}")
 
-# Run on CPU
-cpu_result = op_fn(*inputs)
+def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
+    """
+    Compile an op with DUMP_SPYRE_CODE=1 and run it on Spyre, comparing to CPU.
 
-# Compile and run on Spyre
-compiled_fn = torch.compile(op_fn, backend="inductor")
-spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
-spyre_result = compiled_fn(*spyre_inputs).cpu()
+    Uses a fresh dynamo compile cache each call to ensure the kernel runner is
+    re-instantiated with the current DUMP_SPYRE_CODE env var value.  Runs
+    in-process (no subprocess) so the Spyre VFIO device opened by the test
+    session is reused rather than triggering a second exclusive open from a
+    child process.
+    """
+    torch._dynamo.reset()
 
-torch.testing.assert_close(
-    spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
-)
-print("PASS")
-"""
-    env = os.environ.copy()
-    env.update(env_vars)
+    op_fn = getattr(torch, op_name)
 
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Subprocess failed with code {result.returncode}\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    torch.manual_seed(42)
+    inputs: Tuple[torch.Tensor, ...]
+    if op_name == "abs":
+        inputs = (torch.randn(64, dtype=torch.float16),)
+    elif op_name == "mul":
+        inputs = (
+            torch.randn(64, dtype=torch.float16),
+            torch.randn(64, dtype=torch.float16),
         )
+    else:
+        raise ValueError(f"Unknown op: {op_name}")
 
-    return "PASS" in result.stdout
+    cpu_result = op_fn(*inputs)
+
+    old_val = os.environ.get("DUMP_SPYRE_CODE")
+    try:
+        os.environ["DUMP_SPYRE_CODE"] = "1"
+        with _spyre_config.patch(bundle_symbolic_args=symbolic_args):  # type: ignore[attr-defined]
+            compiled_fn = torch.compile(op_fn, backend="inductor")
+            spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
+            spyre_result = compiled_fn(*spyre_inputs).cpu()
+    finally:
+        if old_val is None:
+            os.environ.pop("DUMP_SPYRE_CODE", None)
+        else:
+            os.environ["DUMP_SPYRE_CODE"] = old_val
+
+    torch.testing.assert_close(
+        spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
+    )
 
 
-class TestLaunchJobPlan:
+class TestLaunchJobPlan(TestCase):
     """Test suite for JobPlan-backed compiled op execution."""
 
     def test_abs_matches_cpu_no_symbols(self):
         """Run compiled abs op without symbolic args and compare to CPU."""
-        assert run_compiled_op_in_subprocess("abs", {"DUMP_SPYRE_CODE": "1"})
+        _run_compiled_op("abs", symbolic_args=False)
 
     def test_abs_matches_cpu_with_symbols(self):
         """Run compiled abs op with symbolic args and compare to CPU."""
-        assert run_compiled_op_in_subprocess(
-            "abs", {"DUMP_SPYRE_CODE": "1", "BUNDLE_SYMBOLIC_ARGS": "1"}
-        )
+        _run_compiled_op("abs", symbolic_args=True)
 
     def test_mul_matches_cpu_no_symbols(self):
         """Run compiled mul op without symbolic args and compare to CPU."""
-        assert run_compiled_op_in_subprocess("mul", {"DUMP_SPYRE_CODE": "1"})
+        _run_compiled_op("mul", symbolic_args=False)
 
     def test_mul_matches_cpu_with_symbols(self):
         """Run compiled mul op with symbolic args and compare to CPU."""
-        assert run_compiled_op_in_subprocess(
-            "mul", {"DUMP_SPYRE_CODE": "1", "BUNDLE_SYMBOLIC_ARGS": "1"}
-        )
+        _run_compiled_op("mul", symbolic_args=True)
 
 
 if __name__ == "__main__":
