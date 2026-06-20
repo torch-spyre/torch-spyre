@@ -1,0 +1,34 @@
+# Misc shape shard A: tensor factory, copy/clone, and slice/split.
+#
+# Shard C holds cat/pad (split out to reduce per-job CI time).  Shard B
+# covers shape ops, squeeze/unsqueeze, t/transpose, dtype conversion, and
+# restickify.
+#
+# When a new test is added to test_inductor_ops.py that belongs in the misc
+# shape group, assign it to whichever shard keeps the jobs balanced.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # tensor creation / factory
+            - TestOps::test_arange.*
+            - TestOps::test_full.*
+            - TestOps::test_new_ones.*
+            - TestOps::test_numel.*
+            - TestOps::test_ones.*
+            - TestOps::test_zeros.*
+            # empty_like family (covers test_empty_like, test_empty_like_dtype_override,
+            # test_empty_like_memory_format)
+            - TestOps::test_empty_like.*
+            # copy / clone
+            - TestOps::test_clone.*
+            - TestOps::test_copy_roundtrip.*
+            # slice / split
+            - TestOps::test_slice.*
+            - TestOps::test_split.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

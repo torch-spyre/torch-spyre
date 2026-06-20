@@ -163,10 +163,18 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
           - name: Inductor Ops Pointwise
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc Shape
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
-          - name: Inductor Ops Misc Compute
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
+          - name: Inductor Ops Misc Shape A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
+          - name: Inductor Ops Misc Shape B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
+          - name: Inductor Ops Misc Shape C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
+          - name: Inductor Ops Misc Compute A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
+          - name: Inductor Ops Misc Compute B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
+          - name: Inductor Ops Misc Compute C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar

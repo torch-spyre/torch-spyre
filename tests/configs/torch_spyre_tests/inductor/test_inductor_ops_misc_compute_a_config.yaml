@@ -1,0 +1,29 @@
+# Misc compute shard A: activations and broadcast/scalar arithmetic.
+#
+# Shard C holds attention/sdpa/rope/qkv (split out to reduce job time).
+# Shard B covers normalization, embedding, isin, inplace, bitwise, misc,
+# random, and error-path tests.
+#
+# When a new test is added to test_inductor_ops.py that belongs in the misc
+# compute group, assign it to whichever shard keeps the jobs balanced.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # activations
+            - TestOps::test_activation_cls.*
+            - TestOps::test_activation_fn.*
+            # broadcast / scalar arithmetic
+            # test_add_broadcast.* covers test_add_broadcast and test_add_broadcast_cpu
+            - TestOps::test_add_broadcast.*
+            - TestOps::test_add_alpha.*
+            - TestOps::test_add_scalar.*
+            - TestOps::test_max_sub_broadcast.*
+            - TestOps::test_sub_alpha.*
+            - TestOps::test_sub_broadcast.*
+            - TestOps::test_sub_scalar.*
+            - TestOps::test_scalar_cpu.*
+          mode: mandatory_success
