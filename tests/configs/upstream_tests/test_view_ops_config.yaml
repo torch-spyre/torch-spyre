@@ -10,6 +10,11 @@ test_suite_config:
             - TestOldViewOps::test_atleast_gradient
             - TestOldViewOps::test_contiguous
             - TestOldViewOps::test_resize_as_preserves_strides
+            - TestViewOps::test_view_dtype_upsize_errors
+            - TestViewOps::test_view_tensor_split
+            - TestOldViewOps::test_broadcast_to
+            - TestOldViewOps::test_tensor_split_indices
+            - TestOldViewOps::test_tensor_split_sections
           mode: mandatory_success
 
         ############################################################
@@ -27,11 +32,6 @@ test_suite_config:
             - TestViewOps::test_view_tensor_vsplit
             - TestViewOps::test_reshape
             - TestOldViewOps::test_transpose_invalid
-            - TestViewOps::test_view_dtype_upsize_errors
-            - TestViewOps::test_view_tensor_split
-            - TestOldViewOps::test_broadcast_to
-            - TestOldViewOps::test_tensor_split_indices
-            - TestOldViewOps::test_tensor_split_sections
           mode: xfail
           # segmentation faults with @onlyNativeDeviceTypes
         - names:
