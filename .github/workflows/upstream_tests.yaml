@@ -8,12 +8,14 @@ on:
       - tests/docs/**
       - docs/**
       - README.md
+      - .github/workflows/config_integrity_checker.yaml
   pull_request:
     branches: [main]
     paths-ignore:
       - tests/docs/**
       - docs/**
       - README.md
+      - .github/workflows/config_integrity_checker.yaml
   merge_group:
     types: [checks_requested]
 
