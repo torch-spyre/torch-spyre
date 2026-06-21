@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -43,7 +44,7 @@ namespace {
 
 // Global stream pool (shared across all threads)
 struct StreamPool {
-  std::mutex mutex;
+  mutable std::shared_mutex mutex;
 
   // Per-device stream pools
   std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
@@ -114,7 +115,7 @@ bool SpyreStream::query() const {
   DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
             static_cast<int>(device().index()));
 
-  flex::RuntimeStream* handle = getRuntimeHandle();
+  flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->query();
 }
 
@@ -124,7 +125,7 @@ void SpyreStream::synchronize() const {
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             static_cast<int>(device().index()));
 
-  flex::RuntimeStream* handle = getRuntimeHandle();
+  flex::RuntimeStream* handle = resolveRuntimeHandle();
   handle->synchronize();
 }
 
@@ -175,17 +176,9 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   }
 }
 
-flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
-  if (flex_handle_ != nullptr) {
-    return flex_handle_;
-  }
-  flex_handle_ = resolveRuntimeHandle();
-  return flex_handle_;
-}
-
 flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::shared_lock<std::shared_mutex> lock(pool.mutex);
 
   auto it = pool.stream_handle_map.find(id());
   TORCH_CHECK(it != pool.stream_handle_map.end(),
@@ -202,7 +195,7 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
   // Get the flex runtime stream handle
-  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+  flex::RuntimeStream* flex_stream = resolveRuntimeHandle();
 
   // Create and launch operation
   if (host2device) {
@@ -233,7 +226,7 @@ void SpyreStream::executeProgramAsync(
                              arts.bundle_mlir_path);
 
   // Get the flex runtime stream handle
-  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+  flex::RuntimeStream* flex_stream = resolveRuntimeHandle();
   flex_stream->launchOperationCompute(&params);
 }
 
@@ -250,7 +243,7 @@ void SpyreStream::launch(const JobPlan& plan,
 
   // Each JobPlanStep builds its flex operation params and launches them on the
   // stream in order. flex owns the RuntimeOperation lifecycle.
-  flex::RuntimeStream* flex_stream = getRuntimeHandle();
+  flex::RuntimeStream* flex_stream = resolveRuntimeHandle();
   for (const auto& step : plan.steps) {
     step->construct(ctx, flex_stream);
   }
@@ -258,12 +251,14 @@ void SpyreStream::launch(const JobPlan& plan,
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
 
-  // Register the default stream (ID 0) using the concrete flex handle.
-  // This ensures getRuntimeHandle() resolves stream 0 to the real RuntimeStream
-  // instance owned by RuntimeContext.
+  // Initialize mapping from StreamId → RuntimeStream*.
+  // RuntimeStream instances are owned by GlobalRuntime.
+  // StreamPool only stores non-owning pointers for lookup.
   auto runtime = GlobalRuntime::get();
+
+  // Register default stream (ID 0).
   pool.stream_handle_map[0] = runtime->getDefaultStream();
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
@@ -273,7 +268,6 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   }
   pool.next_low_priority_idx[device_index] = 0;
 
-  // Initialize high priority streams
   pool.high_priority_streams[device_index].reserve(
       kHighPriorityStreamsPerDevice);
   for (int i = 1; i <= kHighPriorityStreamsPerDevice; ++i) {
@@ -303,7 +297,7 @@ flex::RuntimeStream* getDefaultStreamRuntimeHandle(c10::Device device) {
   initializeStreamPool(device.index());
 
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::shared_lock<std::shared_mutex> lock(pool.mutex);
   auto it = pool.stream_handle_map.find(0);
   TORCH_CHECK(it != pool.stream_handle_map.end(),
               "Default stream handle not initialized for device ",
@@ -343,7 +337,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   initializeStreamPool(device.index());
 
   auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.mutex);
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
 
   c10::StreamId stream_id;
   if (priority == 0) {
@@ -384,7 +378,7 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
     std::vector<flex::RuntimeStream*> handles_to_sync;
     {
       auto& pool = getStreamPool();
-      std::lock_guard<std::mutex> lock(pool.mutex);
+      std::shared_lock<std::shared_mutex> lock(pool.mutex);
 
       // Default stream (ID 0) is always present when the pool is initialized
       auto default_it = pool.stream_handle_map.find(0);
