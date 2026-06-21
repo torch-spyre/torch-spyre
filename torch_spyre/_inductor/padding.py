@@ -37,9 +37,10 @@ introduce numerical error from x.
 Deduplication of identical constants across multiple pad calls happens later
 at the IR level via dedup_and_promote_constants.
 
-x and y are identified via device_coordinates: x is the input sticked on the
-reduction coord, y is the other.  This avoids positional assumptions and handles
-square matrices (M==K==N) correctly.
+x and y are identified via identify_matmul_inputs() using the BatchMatmul
+generated_dim definition: y is the input whose index contains a symbol
+present in the output but absent from x (N).  This handles M==K==N and
+M=1 (decode phase) correctly.
 """
 
 import torch
@@ -58,12 +59,12 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
-    device_coordinates,
+    find_reduction_var,
+    identify_matmul_inputs,
     host_coordinates,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
-from .views import matching_dim
 from torch_spyre._C import get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -87,9 +88,7 @@ def _patch_env(graph_lowering) -> None:
     graph_lowering.env.update(env)
 
 
-def _find_arg_fx_node(
-    arg_name: str, expected_size: list[int] | None = None
-) -> torch.fx.Node:
+def _find_arg_fx_node(arg_name: str) -> torch.fx.Node:
     """Return the FX node whose lowered TensorBox has the given buffer name.
 
     Buffer names are unique, but a single buffer can be reached through
@@ -99,19 +98,13 @@ def _find_arg_fx_node(
     [M, K].  Both FX nodes lower to a TensorBox whose get_name() returns
     the same buffer name, but with different get_size() results.
 
-    ``expected_size`` selects the FX node whose TensorBox size matches the
-    dimensionality that the matmul inner_fn actually uses.  This ensures the
-    padded clone gets the right shape and _rebuild_matmul's loaders index it
-    with the correct number of dimensions.
-
-    Raises RuntimeError if no candidate matches the expected size, or if no
-    candidate exists at all.  When ``expected_size`` is None, returns the first
-    candidate (the base buffer, with no view applied).
+    Returns the first candidate (the base buffer, with no view applied).
+    Raises RuntimeError if no candidate exists.
     """
     graph_lowering = V.graph
     _patch_env(graph_lowering)
     candidates = [
-        (fx_node, tb)
+        fx_node
         for fx_node, tb in graph_lowering.env.items()
         if isinstance(fx_node, torch.fx.Node)
         and isinstance(tb, TensorBox)
@@ -119,62 +112,41 @@ def _find_arg_fx_node(
     ]
     if not candidates:
         raise RuntimeError(f"no FX node found for buffer {arg_name!r}")
-    if expected_size is not None:
-        for fx_node, tb in candidates:
-            if [int(s) for s in tb.get_size()] == expected_size:
-                return fx_node
-        raise RuntimeError(
-            f"no FX node for buffer {arg_name!r} with size {expected_size}; "
-            f"found sizes {[[int(s) for s in tb.get_size()] for _, tb in candidates]}"
-        )
-    return candidates[0][0]
+    return candidates[0]
 
 
 def _rebuild_matmul(
     op: ComputedBuffer,
-    x_ir: object,
     y_padded_buf: Buffer,
     operations: list[Operation],
 ) -> ComputedBuffer:
     """Rebuild the matmul ComputedBuffer so y's loader reads from the padded buffer.
 
-    Patches the Reduction's inner_fn to load x from its original IR node and y
-    from the padded buffer.  reduction_ranges is left unchanged (stays at K);
-    the K→K_padded extension happens at SDSC codegen time via
+    Preserves the original inner_fn's x loading unchanged; only replaces y's
+    loader with one that reads from the padded buffer.  reduction_ranges stays
+    at K; the K→K_padded extension happens at SDSC codegen time via
     _extend_matmul_k_to_padded in superdsc.py.
-
-    x_ir must support make_loader() and its get_size() must have ndim matching
-    len(output_ranges) (all output dims except N plus K) so indices
-    [batch..., M, r_K] are valid.
-    y_padded_buf must have the same ndim as the original y buffer.
     """
     reduction = op.data
     assert isinstance(reduction, Reduction)
 
-    x_loader = x_ir.make_loader()
+    orig_inner_fn = reduction.inner_fn
     y_padded_loader = y_padded_buf.make_loader()
-    # y's batch dims: y_ndim - 2 batch dims come first in y_index.
     y_ndim = len(y_padded_buf.get_size())
-    y_batch_ndim = y_ndim - 2  # number of batch dims in y (0 for non-batched y)
+    y_batch_ndim = y_ndim - 2
 
     def new_inner_fn(
         index,
         reduction_index,
-        _x_loader=x_loader,
+        _orig_inner_fn=orig_inner_fn,
         _y_loader=y_padded_loader,
         _y_batch_ndim=y_batch_ndim,
     ):
-        # x: all output dims except the last (N), plus the reduction dim.
-        # y: first y_batch_ndim batch dims, then reduction dim, then N (index[-1]).
-        # Matches the lowering pattern for all mm/bmm variants:
-        #   mm (2D×2D):   x_loader([i_M, r_K]),       y_loader([r_K, i_N])
-        #   bmm (3D×3D):  x_loader([i_B, i_M, r_K]),  y_loader([i_B, r_K, i_N])
-        #   bmm (4D×4D):  x_loader([i_B,i_H,i_M,r_K]),y_loader([i_B,i_H,r_K,i_N])
-        #   bmm (3D×2D):  x_loader([i_B, i_M, r_K]),  y_loader([r_K, i_N])
-        #   einsum→bmm:   x_loader([i_B, i_M, r_K]),  y_loader([r_K, i_N])  (y 2D)
-        x_index = list(index[:-1]) + list(reduction_index)
+        # x_val comes from the original inner_fn; discard its y and replace below.
+        x_val, _ = _orig_inner_fn(index, reduction_index)
         y_index = list(index[:_y_batch_ndim]) + list(reduction_index) + [index[-1]]
-        return (_x_loader(x_index), _y_loader(y_index))
+        y_val = _y_loader(y_index)
+        return (x_val, y_val)
 
     object.__setattr__(reduction, "inner_fn", new_inner_fn)
     # reduction_ranges stays at K; no extension here.
@@ -193,9 +165,10 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
     size by lower_pad_sequence; reduction_ranges stays at K so the IR iteration
     space is unchanged.  The K→K_padded widening happens at SDSC codegen time.
 
-    x and y are identified via device_coordinates: x is the input sticked on
-    the reduction coord, y is the other.  This avoids positional assumptions
-    and handles square matrices (M==K==N) correctly.
+    x and y are identified via identify_matmul_inputs() using the BatchMatmul
+    generated_dim definition: y is the input whose index contains a symbol
+    present in the output but absent from x (N).  This handles M==K==N and
+    M=1 (decode phase) correctly.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -218,8 +191,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # Skip aligned-K matmuls early before any x/y identification.
         # Aligned-K matmuls need no padding regardless of input layout, and
         # skipping here avoids a spurious warning for e.g. decode-phase SDPA
-        # attention where out_coords has a constant-folded M dimension that
-        # makes reduction_coord detection fail for both inputs.
+        # attention where constant-folded dimensions cause identify_matmul_inputs
+        # to fail.
         k_val = concretize_expr(reduction.reduction_ranges[0])
         first_buf = next(
             (graph.get_buffer(d.name) for d in reads if graph.get_buffer(d.name)),
@@ -232,52 +205,32 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         if compute_padding(k_val, dtype) == 0:
             continue
 
-        # Identify x and y via device_coordinates.
-        # x is the input sticked on the reduction coord (hardware masks within-stick
-        # padding for x).  y is the other input; its K host dim is derived from the
-        # same reduction coord.  This avoids positional assumptions and handles
-        # square matrices (M==K==N) correctly.
-        # See propagate_layouts._topk_layouts for the same reduction-coord derivation.
         write_dep = next(iter(rw.writes))
-        out_coords = host_coordinates(op.get_layout(), write_dep)
-
-        x_dep = None
-        y_dep = None
-        y_host_k_dim: int | None = None
-        for dep in reads:
-            buf = graph.get_buffer(dep.name)
-            if buf is None:
-                continue
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                continue
-            h_coords = host_coordinates(layout, dep)
-            d_coords = device_coordinates(layout.device_layout, dep)
-            stick_expr = d_coords[-1]
-            reduction_coord = next(
-                (
-                    c
-                    for c in h_coords
-                    if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
-                ),
-                None,
-            )
-            if reduction_coord is None:
-                continue
-            stick_dim = matching_dim(h_coords, stick_expr)
-            reduction_dim_host = matching_dim(h_coords, reduction_coord)
-            if stick_dim == reduction_dim_host:
-                x_dep = dep
-            else:
-                y_dep = dep
-                y_host_k_dim = reduction_dim_host
-
+        x_dep, y_dep = identify_matmul_inputs(reads, write_dep)
         if x_dep is None or y_dep is None:
             logger.warning(
                 "insert_bmm_padding: could not identify x/y for %s, skipping",
                 op.get_name(),
             )
             continue
+
+        reduction_var = find_reduction_var(x_dep, write_dep)
+
+        # y's K host dim: the dim whose host coordinate contains reduction_var.
+        y_buf_tmp = graph.get_buffer(y_dep.name)
+        y_host_k_dim: int | None = None
+        if y_buf_tmp is not None and isinstance(
+            y_buf_tmp.get_layout(), FixedTiledLayout
+        ):
+            y_h_coords = host_coordinates(y_buf_tmp.get_layout(), y_dep)
+            y_host_k_dim = next(
+                (
+                    i
+                    for i, c in enumerate(y_h_coords)
+                    if reduction_var in c.free_symbols
+                ),
+                None,
+            )
 
         x_name = x_dep.name
         y_name = y_dep.name
@@ -286,21 +239,8 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         if x_buf is None or y_buf is None:
             continue
 
-        # x's effective size for the inner_fn is derived from the output ranges:
-        # all output dims except N, plus K.  This correctly handles cases where
-        # the inner_fn accesses x through a view with more dims than x_buf
-        # (e.g. when mm_to_bmm_pass wraps a 2D mm into a 3D bmm).
-        output_ranges = [concretize_expr(s) for s in reduction.ranges]
-        x_size = output_ranges[:-1] + [k_val]  # [batch..., M, K]
         device = x_buf.get_device()
         pad = compute_padding(k_val, dtype)
-
-        # Find the FX node/TensorBox that presents x at x_size dimensionality.
-        # mm_to_bmm_pass may wrap a 2D x buffer with a 3D view; we need the
-        # loader to accept x_size-dimensional indices (len(output_ranges) dims).
-        x_view_fx = _find_arg_fx_node(x_name, expected_size=x_size)
-        _patch_env(graph)
-        x_view_buf = graph.env[x_view_fx]
 
         k_padded = k_val + pad
 
@@ -354,11 +294,6 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             operations.insert(op_idx + i, new_op)
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
-        # x keeps its original loader (via x_view_buf which presents x at the
-        # x_size dimensionality the inner_fn expects); reduction_ranges stays at K.
-        _rebuild_matmul(
-            op,
-            x_view_buf,
-            y_padded_buf,
-            operations,
-        )
+        # x is left entirely untouched: the original inner_fn's x loader is
+        # preserved as-is.  Only y's loader is replaced with the padded buffer.
+        _rebuild_matmul(op, y_padded_buf, operations)

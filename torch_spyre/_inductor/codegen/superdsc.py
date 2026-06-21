@@ -31,9 +31,17 @@ from torch_spyre._inductor.constants import (
     TOPK_OPS,
 )
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.indirect_access import (
+    compute_indirect_max_dim_sizes,
+    get_index_tensor_for_value,
+    get_indirect_dim_symbols,
+    get_indirect_layout_label,
+    get_value_tensor_idx_for_index,
+    is_index_tensor,
+    is_indirect_value_tensor,
+)
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import OpSpec
-from torch_spyre._inductor.op_spec import TensorArg
+from torch_spyre._inductor.op_spec import IndirectAccess, OpSpec, TensorArg
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import SymbolKind, generate_sdsc
@@ -54,6 +62,8 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     arg_index: int = -1
+    is_index_tensor: bool = False
+    related_value_tensor_idx: int = -1
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -73,6 +83,8 @@ class SDSCArgs:
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
             f"  backGap={self.backGap}\n"
+            f"  is_index_tensor={self.is_index_tensor}\n"
+            f"  related_value_tensor_idx={self.related_value_tensor_idx}\n"
             f")"
         )
 
@@ -92,6 +104,7 @@ class SDSCSpec:
     args: list[SDSCArgs]
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
+    indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -216,7 +229,7 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
 
 
 def _get_device_dim_order(
-    arg: TensorArg, symbol_mapping: dict
+    arg: TensorArg, symbol_mapping: dict, op_spec: OpSpec | None = None
 ) -> tuple[list[Symbol], Symbol | None]:
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution."""
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
@@ -225,7 +238,20 @@ def _get_device_dim_order(
 
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
-        expr = arg.device_coordinates[i].subs(symbol_mapping)
+        coord = arg.device_coordinates[i]
+        # Handle coordinates containing IndirectAccess — extract symbols from index tensor.
+        if hasattr(coord, "has") and coord.has(IndirectAccess):
+            if op_spec is not None and is_indirect_value_tensor(arg):
+                index_arg = get_index_tensor_for_value(op_spec, arg)
+                if index_arg is not None:
+                    indirect_dims = get_indirect_dim_symbols(
+                        arg, index_arg, symbol_mapping
+                    )
+                    for sym in indirect_dims:
+                        if sym not in dim_order:
+                            dim_order.append(sym)
+            continue
+        expr = coord.subs(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
         for sym in expr.free_symbols:
@@ -318,6 +344,35 @@ def _get_data_format(op, device_dtype):
     return data_format.get((op, device_dtype), device_dtype)
 
 
+def _collect_index_tensor_layouts(
+    op_spec: OpSpec,
+    symbol_mapping: dict,
+    index_tensor_indices: set[int],
+    logger: object,
+) -> tuple[dict, dict]:
+    """First pass: compute (dim_order, stick_dim) for each index tensor.
+
+    Returns:
+        index_tensor_layouts: dict mapping tensor_idx -> (dim_order, stick_dim)
+        index_active_dims: dict mapping tensor_idx -> set of active (non-stick) dims
+    """
+    index_tensor_layouts: dict[int, tuple[list, object]] = {}
+    index_active_dims: dict[int, set] = {}
+
+    for i in index_tensor_indices:
+        arg = op_spec.args[i]
+        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+        index_tensor_layouts[i] = (dim_order, stick_dim)
+        active_dims = {d for d in dim_order if d is not stick_dim}
+        index_active_dims[i] = active_dims
+        logger.debug(
+            f"Index tensor {i}: dim_order={dim_order}, stick_dim={stick_dim}, "
+            f"active_dims={sorted(map(str, active_dims))}"
+        )
+
+    return index_tensor_layouts, index_active_dims
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -330,39 +385,74 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
+    # Detect indirect access from device_coordinates: index tensors are those
+    # whose name is referenced by an IndirectAccess in another tensor's coordinates,
+    # and value tensors are those that contain IndirectAccess in their coordinates.
+    index_tensor_indices = {
+        i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
+    }
+    has_indirect_access = bool(index_tensor_indices)
+
+    # For indirect access: pre-compute index tensor layouts (first pass)
+    index_tensor_layouts: dict[int, tuple[list, Any]] = {}
+    index_active_dims: dict[int, set] = {}
+    if has_indirect_access:
+        index_tensor_layouts, index_active_dims = _collect_index_tensor_layouts(
+            op_spec, symbol_mapping, index_tensor_indices, logger
+        )
+
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
-    for arg in op_spec.args:
-        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+
+    for i, arg in enumerate(op_spec.args):
+        # Step 1: Determine dimension order and stick dimension.
+        # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
+        if has_indirect_access and i in index_tensor_layouts:
+            dim_order, stick_dim = index_tensor_layouts[i]
+        else:
+            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec)
+
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
-        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
-            reduced_dims = [
-                d for d in op_dim_order if d not in dim_order and d is not mb_sym
-            ]
-            dim_order = dim_order + reduced_dims
 
+        # Step 2: Handle reduced dimensions — skip for index tensors.
+        if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
+            if not (has_indirect_access and i in index_tensor_indices):
+                reduced_dims = [
+                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
+                ]
+                dim_order = dim_order + reduced_dims
+
+        # Step 3: Handle missing stick dimension — skip for index tensors.
         if op_stick_dim is None:
-            # No stick dim found in op - add one
-            stick_dim = next(d for d in dims if d not in op_dim_order)
-            dim_order = dim_order + [stick_dim]
+            if not (has_indirect_access and i in index_tensor_indices):
+                stick_dim = next(d for d in dims if d not in op_dim_order)
+                dim_order = dim_order + [stick_dim]
+
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
+
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
-            if dim in reduced_dims and op_spec.op != "layernormscale":
+
+            if has_indirect_access and (
+                i in index_tensor_indices or is_indirect_value_tensor(arg)
+            ):
+                scales[dim] = 1
+            elif dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
+
             strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
@@ -374,17 +464,30 @@ def _create_sdsc_tensors(
                 dev_dim_size *= stick_size
                 it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
-            if dev_dim_size > it_dim_size:
-                dim_coord = arg.device_coordinates[-stride_idx - 2]
+            if has_indirect_access:
+                max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
+                    i,
+                    dim,
+                    stick_dim,
+                    stride_idx,
+                    dev_dim_size,
+                    op_spec,
+                    symbol_mapping,
+                    index_tensor_indices,
+                    index_active_dims,
+                    logger,
+                )
+            else:
+                max_dim_sizes[dim] = -1
+
+            dim_coord = arg.device_coordinates[-stride_idx - 2]
+            if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
-            max_dim_sizes[dim] = -1
-
         if mb_sym is not None:
-            # Virtual dim with no physical device dimension; stride = full 1-D allocation size.
             dim_order = [mb_sym] + dim_order
             scales[mb_sym] = 1
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
@@ -392,16 +495,49 @@ def _create_sdsc_tensors(
             max_dim_sizes[mb_sym] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
-        label = _get_layout_label(
-            layouts,
-            dim_order,
-            effective_stick,
-            arg.device_dtype.elems_per_stick(),
-            MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+        layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
+
+        if has_indirect_access:
+            label = get_indirect_layout_label(
+                i,
+                index_tensor_indices,
+                layouts,
+                dim_order,
+                effective_stick,
+                arg.device_dtype.elems_per_stick(),
+                layout_labels,
+                _get_layout_label,
+                logger,
+            )
+        else:
+            label = _get_layout_label(
+                layouts,
+                dim_order,
+                effective_stick,
+                arg.device_dtype.elems_per_stick(),
+                layout_labels,
+            )
+
+        # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
+        # the backend doesn't yet accept IEEE_INT32 in SDSC (deeptools #4307).
+        arg_data_format = (
+            DataFormats.SENUINT32
+            if (has_indirect_access and i in index_tensor_indices)
+            else _get_data_format(op_spec.op, arg.device_dtype)
         )
-        # Change dataFormat_ value if needed.
-        # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
-        arg_data_format = _get_data_format(op_spec.op, arg.device_dtype)
+
+        start_addr = (
+            arg.allocation.get("pool")
+            if "pool" in arg.allocation
+            else arg.allocation.get("lx")
+            if "lx" in arg.allocation
+            else arg.allocation.get("hbm")
+        )
+
+        is_idx_tensor = has_indirect_access and i in index_tensor_indices
+        related_val_idx = (
+            get_value_tensor_idx_for_index(op_spec, i) if is_idx_tensor else -1
+        )
 
         sdsc_args.append(
             SDSCArgs(
@@ -413,13 +549,11 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address=arg.allocation.get("pool")
-                if "pool" in arg.allocation
-                else arg.allocation.get("lx")
-                if "lx" in arg.allocation
-                else arg.allocation.get("hbm"),
+                start_address=start_addr,
                 backGap=backGap,
                 arg_index=arg.arg_index,
+                is_index_tensor=is_idx_tensor,
+                related_value_tensor_idx=related_val_idx,
             )
         )
 
@@ -688,13 +822,18 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             sdsc_iteration_space, dim_splits, num_cores
         )
 
+    # Collect index tensor indices for indirect access
+    indirect_access_indices = [
+        i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
+    ]
+
     return (
         SDSCSpec(
             opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
             execution_unit="pt" if is_matmul else "sfp",
             data_format=args[
-                0
-            ].data_format,  # TODO: op_spec needs operation data format
+                1 if indirect_access_indices else 0
+            ].data_format,  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
             num_inputs=num_inputs,
             iteration_space=sdsc_iteration_space,
             num_cores=num_cores,
@@ -705,6 +844,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             args=args,
             constants=constants,
             coordinate_masking=coordinate_masking,
+            indirect_access_indices=indirect_access_indices,
         ),
         symbol_mapping,
     )

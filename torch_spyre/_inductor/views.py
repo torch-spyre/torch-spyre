@@ -598,7 +598,7 @@ def align_tensors(
         ]:
             # for each term except last one (stick dim)
             if var is None:
-                # offset holds either 0 (broadcast/scalar dim) or an IndexLoad
+                # offset holds either 0 (broadcast/scalar dim) or an IndirectAccess
                 # (indirect load access) that must pass through unchanged.
                 size.append(dim_size)
                 coordinates.append(offset)
