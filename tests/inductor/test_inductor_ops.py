@@ -39,6 +39,7 @@ POINTWISE_UNARY_OPS_DICT = {
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sign": torch.sign,
+    "silu": torch.ops.aten.silu,
     "sin": torch.sin,
     "tanh": torch.tanh,
 }

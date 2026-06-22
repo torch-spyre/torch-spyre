@@ -451,6 +451,11 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
+@register_spyre_decomposition([torch.ops.aten.silu.default])
+def silu(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.spyre.silu(input)
+
+
 @register_spyre_decomposition([torch.ops.aten.topk])
 def spyre_topk(
     input: torch.Tensor,
