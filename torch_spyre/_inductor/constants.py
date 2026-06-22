@@ -172,6 +172,9 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 
+AVGPOOL2D_OP = "avgpoolfwd"
+AVGPOOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
+AVGPOOL_LAYOUT_LABELS = ["OUTPUT", "INPUT"]
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
