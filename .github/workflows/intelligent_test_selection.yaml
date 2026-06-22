@@ -44,6 +44,7 @@ jobs:
     outputs:
       suites: ${{ steps.final_selection.outputs.suites }}
       has_suites: ${{ steps.final_selection.outputs.has_suites }}
+      is_first_run: ${{ steps.check_coverage.outputs.is_first_run }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -171,6 +172,14 @@ jobs:
              echo "has_suites=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Safely stash whatever coverage folders currently exist (or empty dir) away to pass down
+      - name: Share Baseline Map State
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-seed-coverage
+          path: coverage/
+          retention-days: 1
+
   run_suites:
     name: ${{ matrix.suite.name }}
     needs: select_suites
@@ -226,22 +235,55 @@ jobs:
           cd "$CLONED_TORCH_SPYRE_DIR"
           source .venv/bin/activate
 
-          # Automatically handle names like "Test Stream" -> "test_stream_config" folder pathing
           SUITE_DIR=$(python3 -c "
           import pathlib
           p = pathlib.Path('${{ matrix.suite.config }}')
           print(p.stem[:-7] if p.stem.endswith('_config') else p.stem)
           ")_config
 
+          # Removed the trailing backslash below to fix the syntax drop issue safely
           bash tests/run_test.sh "${{ matrix.suite.config }}" -v \
             --cov=torch_spyre \
-            --cov-report=json:/home/senuser/torch-spyre/coverage/$SUITE_DIR/coverage.json \
-  
-      # Upload directly into the master tracking artifact bundle
-      - name: Update Master Coverage Bundle
+            --cov-report=json:/home/senuser/torch-spyre/coverage/$SUITE_DIR/coverage.json
+
+      # Isolated multi-matrix uploads to avoid parallel racing overwrites
+      - name: Upload segment coverage artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: complete-coverage-map
+          name: batch-coverage-${{ matrix.suite.name }}_config
           path: /home/senuser/torch-spyre/coverage/
+          retention-days: 1
+
+  consolidate_mappings:
+    name: Save Master Mapping States
+    needs: [select_suites, run_suites]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create working map layout
+        run: mkdir -p compiled_output/
+
+      # 1. Download our base baseline seed
+      - name: Fetch Baseline Seed
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-seed-coverage
+          path: compiled_output/
+
+      # 2. Layer any newly run metrics seamlessly on top
+      - name: Fetch Matrix Iterations
+        if: needs.select_suites.outputs.has_suites == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: compiled_output/
+          pattern: batch-coverage-*
+          merge-multiple: true
+
+      # 3. Ship out the completely clean unified map package
+      - name: Upload Consolidated Complete Coverage Map
+        uses: actions/upload-artifact@v4
+        with:
+          name: complete-coverage-map
+          path: compiled_output/
           retention-days: 3
