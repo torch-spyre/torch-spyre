@@ -24,6 +24,7 @@ import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
 from .constants import (
+    AVGPOOL2D_OP,
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
     BATCH_MATMUL_FP8_OP,
@@ -686,6 +687,70 @@ def lower_topkindex(x, k, dim):
         inner_fn=inner_fn,
         ranges=ranges,
         reduction_ranges=reduction_ranges,
+    )
+    result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
+def lower_avg_pool2d(
+    x,
+    kernel_size,
+    stride=None,
+    padding=0,
+    ceil_mode=False,
+    count_include_pad=True,
+    divisor_override=None,
+):
+    if ceil_mode:
+        raise Unsupported("avg_pool2d ceil_mode not supported")
+    if not count_include_pad:
+        raise Unsupported("avg_pool2d count_include_pad=False not supported")
+    if divisor_override is not None:
+        raise Unsupported("avg_pool2d divisor_override not supported")
+
+    kH, kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+    stride = stride if stride is not None else kernel_size
+    sH, sW = (stride, stride) if isinstance(stride, int) else stride
+    padding = padding if padding else 0
+    pH, pW = (padding, padding) if isinstance(padding, int) else padding
+
+    x = V.graph.get_buffer(x.realize())
+    x_loader = x.make_loader()
+    N, C, H_in, W_in = x.get_size()
+
+    H_out = (H_in + 2 * pH - kH) // sH + 1
+    W_out = (W_in + 2 * pW - kW) // sW + 1
+
+    op_info = {
+        "constants": {
+            "kernel_h": kH,
+            "kernel_w": kW,
+            "stride_h": sH,
+            "stride_w": sW,
+            "pad_h": pH,
+            "pad_w": pW,
+            "scaling_factor": 1.0 / (kH * kW),
+        }
+    }
+
+    def inner_fn(index, reduction_index):
+        n, ho, wo, c = index
+        kh, kw = reduction_index
+        hi = ho * sH - pH + kh
+        wi = wo * sW - pW + kw
+        return x_loader([n, c, hi, wi])
+
+    result = SpyreReduction.create(
+        reduction_type=AVGPOOL2D_OP,
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, H_out, W_out, C],
+        reduction_ranges=[kH, kW],
+        op_info=op_info,
     )
     result.realize()
     return result
