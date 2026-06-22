@@ -55,6 +55,8 @@ import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    Layout,
+    Loops,
     MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
@@ -65,6 +67,7 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
 from .propagate_hints import get_op_hints
@@ -220,6 +223,42 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     return groups
 
 
+def _cache_key(cached_method: object) -> str:
+    """Return the cache attribute name used by a cache_on_self / cache_on_self_and_args method.
+
+    cache_on_self uses key ``f"__{fn.__name__}_cache"``; cache_on_self_and_args uses
+    ``f"__{class_name}_{fn.__name__}_cache"``.  Both patterns are captured as the
+    ``key`` free variable in the method's ``.clear_cache`` closure — extract it once
+    at module load so misspellings or upstream renames fail loudly on import.
+    """
+    clear_fn = getattr(cached_method, "clear_cache")  # AttributeError if absent
+    for i, name in enumerate(clear_fn.__code__.co_freevars):
+        if name == "key":
+            return clear_fn.__closure__[i].cell_contents
+    raise AttributeError(
+        f"Cannot find 'key' in clear_cache closure of {cached_method!r}"
+    )
+
+
+# Resolve cache keys once at import time — any rename in upstream IR will raise
+# AttributeError here rather than silently no-oping at runtime.
+_LOOPS_FREE_SYMS_KEY = _cache_key(Loops.get_free_symbol_uses)
+_LOOPS_INNER_FN_STR_KEY = _cache_key(Loops.inner_fn_str)
+_LOOPS_INNER_FN_OPCOUNT_KEY = _cache_key(Loops.inner_fn_opcount)
+_REDUCTION_FREE_SYMS_KEY = _cache_key(Reduction.get_free_symbol_uses)
+_LAYOUT_FREE_SYMS_KEY = _cache_key(Layout.get_free_symbol_uses)
+_COMPUTED_BUF_FREE_SYMS_KEY = _cache_key(ComputedBuffer.get_free_symbol_uses)
+_COMPUTED_BUF_SIZES_KEY = _cache_key(ComputedBuffer.get_default_sizes_body)
+
+
+def _clear_cache(obj: object, key: str) -> None:
+    # cache_on_self/cache_on_self_and_args store results via object.__setattr__ to
+    # bypass frozen-dataclass guards (Loops, Reduction, Layout); clearing must also
+    # use object.__delattr__ — plain delattr() raises FrozenInstanceError.
+    if hasattr(obj, key):
+        object.__delattr__(obj, key)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -337,16 +376,17 @@ def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> b
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
     """Raise RuntimeError for Reduction tiling configurations not yet implemented.
 
-    Supported (Stage 1): a single level that tiles only a non-stick reduction
-    dim — loop_tiled_dims all empty, exactly one loop_tiled_reduction_dims
-    sub-list non-empty with a single index, and that index must not be the
-    within-stick dimension of the primary input.
+    Supported:
+      - A single level that tiles only a non-stick reduction dim.
+      - A single level that tiles the K (reduction) dim of a BATCH_MATMUL_OP.
+        K is the stick dim for operand x, but each tile's output is a full
+        [M, N] matrix so no partial-stick sparsity occurs.
+      - Multiple nesting levels where outer level(s) tile output dims and the
+        innermost level tiles a reduction dim (e.g. outer M + inner K for mm).
 
-    Deferred to Stage 2 (raises):
-      - Reduction tiling on the stick dimension.
+    Deferred (raises RuntimeError):
+      - Reduction tiling on the stick dimension (except BATCH_MATMUL_OP above).
       - Mixed output+reduction tiling at the same nesting level.
-      - Multiple nesting levels where both output-dim and reduction-dim levels
-        appear (e.g. outer tiles output dim, inner tiles reduction dim).
       - Multiple reduction range indices tiled at one level.
     """
     data = op.data
@@ -362,16 +402,6 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
     n = max(len(tiled_dims), len(tiled_rdims))
     tiled_dims_padded = tiled_dims + [[]] * (n - len(tiled_dims))
     tiled_rdims_padded = tiled_rdims + [[]] * (n - len(tiled_rdims))
-
-    has_out_levels = any(d for d in tiled_dims_padded)
-    has_red_levels = any(d for d in tiled_rdims_padded)
-    if has_out_levels and has_red_levels:
-        raise RuntimeError(
-            f"coarse_tile: op {op.get_name()!r} has output-dim tiling levels "
-            f"{tiled_dims} and reduction-dim tiling levels {tiled_rdims} "
-            "across different nesting levels (mixed nested output+reduction "
-            "tiling is not yet implemented — Stage 2)."
-        )
 
     for i, (out_dims, red_dims) in enumerate(
         zip(tiled_dims_padded, tiled_rdims_padded)
@@ -390,7 +420,10 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
                 "dim per level is not yet implemented — Stage 2)."
             )
         for red_dim_idx in red_dims:
-            if _reduction_tiling_is_on_stick_dim(op, red_dim_idx):
+            if (
+                data.reduction_type != BATCH_MATMUL_OP
+                and _reduction_tiling_is_on_stick_dim(op, red_dim_idx)
+            ):
                 raise RuntimeError(
                     f"coarse_tile: op {op.get_name()!r} level {i} tiles "
                     f"reduction dim {red_dim_idx} which is the stick dimension "
@@ -653,13 +686,14 @@ def _allocate_full_buffer(
     else:
         device_layout = generic_layout(full_buf)
 
-    full_buf.layout = FixedTiledLayout(
+    layout = FixedTiledLayout(
         device,
         dtype,
         list(full_ranges),
         strides,
         device_layout,
     )
+    full_buf.layout = layout
 
     # Splice into operations at the correct position.
     operations.remove(full_buf)
@@ -737,7 +771,7 @@ def _insert_combine_op(
     def combine_inner_fn(index):
         partial = partial_loader(index)
         accum = accum_loader(index)
-        if reduction_type == "sum":
+        if reduction_type in ("sum", BATCH_MATMUL_OP):
             return vops.add(accum, partial)
         if reduction_type == "xor_sum":
             return vops.bitwise_xor(accum, partial)
@@ -777,6 +811,82 @@ def _insert_combine_op(
     operations.insert(tiled_idx + 1, combine_buf)
 
 
+def _insert_reduction_copy_op(
+    tiled_op: ComputedBuffer,
+    accum_tile: ComputedBuffer,
+    accum_full: ComputedBuffer,
+    outer_loop_info: "CoarseTileInfo",
+    operations: list[Operation],
+) -> None:
+    """Insert a copy op that writes accum_tile → accum_full at the outer loop level.
+
+    Reads accum_tile (per_tile_fixed=True, never advances) and writes into
+    accum_full via MutationLayoutSHOULDREMOVE.  Carries outer_loop_info so
+    the unroller advances accum_full per outer output-dim tile.
+    """
+    copy_data = Pointwise(
+        device=tiled_op.get_device(),
+        dtype=tiled_op.get_dtype(),
+        inner_fn=accum_tile.make_loader(),
+        ranges=list(tiled_op.data.ranges),
+    )
+    copy_name = V.graph.qualify_name(f"coarse_tile_reduce_copy_{tiled_op.get_name()}")
+    copy_buf = ComputedBuffer(
+        name=copy_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_full))),
+        data=copy_data,
+    )
+    copy_buf.origins = tiled_op.origins
+    copy_buf.operation_name = copy_name
+    copy_buf.loop_info = outer_loop_info  # type: ignore[attr-defined]
+    V.graph.name_to_buffer[copy_name] = copy_buf
+
+    combine_name = V.graph.qualify_name(f"coarse_tile_combine_{tiled_op.get_name()}")
+    combine_buf = V.graph.name_to_buffer.get(combine_name)
+    if combine_buf is not None and combine_buf in operations:
+        insert_idx = operations.index(combine_buf) + 1
+    else:
+        insert_idx = operations.index(tiled_op) + 1
+    operations.insert(insert_idx, copy_buf)
+
+
+def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
+    """Return the loop_info to stamp on the fill op for a nested tiled reduction.
+
+    For a flat (pure reduction) tiling the fill has no loop_info — it runs
+    once before all loops.  Returns None.
+
+    For a nested tiling where outer level(s) tile output dims and the inner
+    level tiles a reduction dim, the fill must run inside the outer loop (once
+    per outer tile) so the accumulator is per-outer-tile sized.  Returns a
+    CoarseTileInfo covering only the outer output-dim levels.
+    """
+    loop_info = op.loop_info
+    tiled_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
+
+    outer_counts: list[sympy.Expr] = []
+    outer_tiled_dims: list[list[int]] = []
+    outer_tiled_rdims: list[list[int]] = []
+    for dims, rdims, count in zip(
+        loop_info.loop_tiled_dims, tiled_rdims, loop_info.loop_count
+    ):
+        if dims:  # non-empty output-dim list → this is an output-dim level
+            outer_counts.append(count)
+            outer_tiled_dims.append(dims)
+            outer_tiled_rdims.append([])
+
+    if not outer_counts:
+        return None  # flat: fill runs before all loops
+
+    outer_gid = loop_info.loop_group_id[: len(outer_counts)]
+    return CoarseTileInfo(
+        loop_group_id=outer_gid,
+        loop_count=outer_counts,
+        loop_tiled_dims=outer_tiled_dims,
+        loop_tiled_reduction_dims=outer_tiled_rdims,
+    )
+
+
 def _propagate_tiled_reduction_op(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -784,24 +894,38 @@ def _propagate_tiled_reduction_op(
     """Handle buffer propagation for a Reduction op tiled over a reduction dim.
 
     Strategy: fill-initialize + per-tile combine.
-      1. Allocate a HBM accumulation buffer the size of the full output shape.
-      2. Insert a fill op (outside the loop) that writes the reduction's identity
-         value into the accumulation buffer.
-      3. Insert a combine op (inside the loop) that merges each tile's partial
-         result into the accumulation buffer using the reduction's combining fn.
-      4. Mark the tiled reduction op's output as per_tile_fixed (loop-internal
-         scratch, not advanced between iterations).
-      5. Patch outside consumers and graph outputs to read the accumulation buffer.
+      1. Allocate a HBM accumulation buffer sized to the full
+         (pre-outer-division) output shape (_compute_full_ranges), so that
+         address advancement across outer tiles writes each tile into the
+         correct slice.  For flat (reduction-only) tiling this equals
+         op.data.ranges.
+      2. Insert a fill op that writes the reduction's identity value into the
+         accumulation buffer.  For flat reduction tiling the fill has no
+         loop_info and runs before all loops.  For nested tiling (outer
+         output-dim loop + inner reduction loop) the fill carries the outer
+         loop's loop_info so it runs inside the outer loop — once per outer
+         tile — keeping the accumulator sized to the per-tile output shape.
+      3. Insert a combine op (inside the inner loop, same loop_info as the
+         tiled reduction op) that merges each tile's partial result into the
+         accumulation buffer using the reduction's combining fn.
+      4. Mark the tiled reduction op's output as per_tile_fixed (inner-loop
+         scratch, not advanced between inner iterations).
+      5. Patch outside consumers and graph outputs to read the accumulation
+         buffer.
     """
     loop_info = op.loop_info
     loop_group_id = loop_info.loop_group_id
     reduction_type = op.data.reduction_type
     identity = _reduction_identity_value(reduction_type, op.get_dtype())
 
-    # Accumulation buffer has the full output shape.  For reduction-dim-only
-    # tiling, data.ranges is already the full output shape (only
-    # reduction_ranges was divided, not ranges).
-    full_output_ranges = list(op.data.ranges)
+    # Per-outer-tile output shape (ranges after any outer tiling divided them).
+    per_tile_ranges = list(op.data.ranges)
+
+    # Accumulation buffer uses the full (pre-outer-division) output shape so
+    # that address advancement across outer output-dim tiles writes each tile's
+    # result into the correct slice.  For reduction-dim-only tiling there is no
+    # outer division, so full == per-tile.
+    full_output_ranges = _compute_full_ranges(op)
 
     # Insert HBM buffer before the first op in the loop group.
     outer_key = loop_group_id[0]
@@ -812,11 +936,37 @@ def _propagate_tiled_reduction_op(
         and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
         == outer_key
     )
-    accum_buf = _allocate_full_buffer(
-        op, full_output_ranges, operations, group_start_idx
-    )
 
-    # Insert fill op immediately after the HBM allocation (outside the loop).
+    fill_loop_info = _compute_fill_loop_info(op)
+    is_nested = fill_loop_info is not None
+
+    if is_nested:
+        # Nested case: allocate separate tile-sized and full-sized buffers.
+        # accum_tile (per_tile_fixed=True) stays inside the inner K-loop;
+        # accum_full accumulates across outer B-tiles via a copy op.
+        accum_full = _allocate_full_buffer(
+            op, full_output_ranges, operations, group_start_idx
+        )
+        group_start_idx_after_full = operations.index(accum_full) + 1
+        accum_tile = _allocate_full_buffer(
+            op, per_tile_ranges, operations, group_start_idx_after_full
+        )
+        from .ir import FixedTiledLayout
+
+        if isinstance(accum_tile.layout, FixedTiledLayout):
+            accum_tile.layout.per_tile_fixed = True
+        fill_target = accum_tile
+        combine_target = accum_tile
+    else:
+        # Flat case: single full-sized buffer (unchanged behaviour).
+        accum_full = _allocate_full_buffer(
+            op, full_output_ranges, operations, group_start_idx
+        )
+        fill_target = accum_full
+        combine_target = accum_full
+
+    # Insert fill op immediately after the fill target buffer allocation
+    # (outside the loop for flat, inside the outer loop for nested).
     # Use a SpyreConstantFallback scalar as the fill source so that Spyre's
     # kernel codegen can express this as an IDENTITY_OP broadcast.  We must
     # assign a FixedTiledLayout manually here because finalize_layouts has
@@ -842,27 +992,37 @@ def _propagate_tiled_reduction_op(
         device=device,
         dtype=dtype,
         inner_fn=lambda index, _loader=scalar_loader: _loader([]),
-        ranges=full_output_ranges,
+        ranges=per_tile_ranges,
     )
     fill_name = V.graph.qualify_name(f"coarse_tile_fill_{op.get_name()}")
     fill_buf = ComputedBuffer(
         name=fill_name,
-        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_buf))),
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(fill_target))),
         data=fill_data,
     )
     fill_buf.origins = op.origins
     fill_buf.operation_name = fill_name
-    # No loop_info: fill runs once, before the loop.
+    if fill_loop_info is not None:
+        fill_buf.loop_info = fill_loop_info  # type: ignore[attr-defined]
+    # else: no loop_info — fill runs once before all loops (flat reduction case).
     V.graph.name_to_buffer[fill_name] = fill_buf
-    accum_idx = operations.index(accum_buf)
+    fill_target_idx = operations.index(fill_target)
     # scalar_op was appended to graph.operations by register_operation(); move it
-    # to just after accum_buf, then insert fill_buf after scalar_op.
+    # to just after fill_target, then insert fill_buf after scalar_op.
     operations.remove(scalar_op)
-    operations.insert(accum_idx + 1, scalar_op)
-    operations.insert(accum_idx + 2, fill_buf)
+    operations.insert(fill_target_idx + 1, scalar_op)
+    operations.insert(fill_target_idx + 2, fill_buf)
 
     # Insert combine op after the tiled reduction op (inside the loop).
-    _insert_combine_op(op, accum_buf, operations)
+    _insert_combine_op(op, combine_target, operations)
+
+    # For nested case, insert a copy op at the outer loop level that writes
+    # accum_tile → accum_full, advancing accum_full across outer output tiles.
+    if is_nested:
+        assert fill_loop_info is not None  # guaranteed by is_nested == True
+        _insert_reduction_copy_op(
+            op, accum_tile, accum_full, fill_loop_info, operations
+        )
 
     # Mark tiled op's output as per-tile scratch (no address advance).
     if not isinstance(op.layout, FixedTiledLayout):
@@ -873,22 +1033,24 @@ def _propagate_tiled_reduction_op(
         )
     op.layout.per_tile_fixed = True
 
-    # Patch consumers.
+    # Patch consumers to read accum_full (the fully-assembled output).
     buf_name = op.get_name()
     outside_consumers, is_graph_output = _find_outside_consumers(
         buf_name, loop_group_id, operations
     )
-    accum_name = accum_buf.get_name()
+    accum_name = accum_full.get_name()
     _patch_consumers(outside_consumers, buf_name, accum_name, operations)
     if is_graph_output:
-        _patch_graph_outputs(buf_name, accum_buf)
+        _patch_graph_outputs(buf_name, accum_full)
 
     logger.debug(
-        "coarse_tile: tiled reduction %s → accum %s (fill=%s, identity=%s)",
+        "coarse_tile: tiled reduction %s → accum_full %s (fill=%s, identity=%s, "
+        "nested=%s)",
         buf_name,
         accum_name,
         fill_name,
         identity,
+        is_nested,
     )
 
 
@@ -1105,6 +1267,17 @@ def _divide_ranges(
     # Loops is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "ranges", ranges)
 
+    # Invalidate Loops-level caches that read ranges.
+    _clear_cache(data, _LOOPS_FREE_SYMS_KEY)
+    _clear_cache(data, _LOOPS_INNER_FN_STR_KEY)
+    _clear_cache(data, _LOOPS_INNER_FN_OPCOUNT_KEY)
+    if isinstance(data, Reduction):
+        _clear_cache(data, _REDUCTION_FREE_SYMS_KEY)
+
+    # Invalidate ComputedBuffer-level caches derived from data.ranges.
+    _clear_cache(op, _COMPUTED_BUF_SIZES_KEY)
+    _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
+
     # Sync layout.size, layout.stride, and layout.device_layout with the new ranges.
     from torch._inductor.ir import FixedLayout, FlexibleLayout
 
@@ -1121,6 +1294,10 @@ def _divide_ranges(
 
     # Recompute contiguous strides for the smaller buffer.
     layout.stride = list(FlexibleLayout.contiguous_strides(new_size))
+
+    # Invalidate Layout- and ComputedBuffer-level caches that read size/stride.
+    _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
+    _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
     # Rebuild SpyreTensorLayout for the new host size, preserving the
     # within-stick dimension.  stride_map[-1] is the element stride of the
@@ -1215,7 +1392,7 @@ def _reduction_identity_value(
 
     Used to initialize the accumulation buffer before a tiled reduction loop.
     """
-    if reduction_type in ("sum", "xor_sum", "any"):
+    if reduction_type in ("sum", "xor_sum", "any", BATCH_MATMUL_OP):
         return 0
     if reduction_type == "prod":
         return 1

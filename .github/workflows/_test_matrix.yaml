@@ -5,7 +5,7 @@ name: Test matrix (reusable)
 # Called by tests.yml and tests-nightly.yml.
 #
 # All differences between the two callers are expressed as inputs:
-#   - runner_label      : linux_for_pr_tests (PR) vs linux (nightly)
+#   - runner_label      : linux
 #   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
 #   - checkout_pytorch  : false (PR) vs true (nightly)
 #   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
@@ -16,9 +16,21 @@ on:
     inputs:
       # Runner pool to use for both test jobs
       runner_label:
-        description: Runner label appended to the fixed labels (linux_for_pr_tests or linux)
+        description: Runner label appended to the fixed labels (linux)
         required: true
         type: string
+
+      # IMAGE selector label for runs-on. Normal runs use the standing
+      # image_torch_spyre set; the per-PR ephemeral flow passes that PR's set
+      # label (image_torch_spyre_pr_<component>_<sha12>, e.g.
+      # image_torch_spyre_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
+      # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
+      # unchanged.
+      image_label:
+        description: Image scaleSetLabel to select (image_torch_spyre | image_torch_spyre_pr_<KEY>)
+        required: false
+        type: string
+        default: image_torch_spyre
 
       # Flags appended to every `bash tests/run_test.sh <config>` call
       extra_test_flags:
@@ -43,6 +55,11 @@ on:
       # workflow_dispatch pass-throughs
       ref:
         description: Branch, tag, or SHA to check out
+        required: false
+        type: string
+        default: ''
+      repository:
+        description: Full clone URL of the fork to check out (e.g. "https://github.example.com/myuser/torch-spyre.git"); leave empty for the base repo
         required: false
         type: string
         default: ''
@@ -74,9 +91,9 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf_x1
+      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
@@ -105,6 +122,8 @@ jobs:
             config: torch_spyre_tests/test_execution_trace_config.yaml
           - name: Test Spyre Lazy Silent
             config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
+          - name: Test Spyre Lazy Init
+            config: torch_spyre_tests/test_spyre_lazy_init_config.yaml
           - name: Test Stream
             config: torch_spyre_tests/test_stream_config.yaml
           - name: Test Spyre Profiler
@@ -115,6 +134,8 @@ jobs:
             config: torch_spyre_tests/test_allocator_e2e_config.yaml
           - name: Test Launch Jobplan
             config: torch_spyre_tests/test_launch_jobplan_config.yaml
+          - name: Test logging patterns
+            config: torch_spyre_tests/test_logging_patterns_config.yaml
           # ---- Inductor tests ----
           - name: Inductor Building Blocks
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
@@ -144,12 +165,23 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
           - name: Inductor Ops Pointwise
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc Shape
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
-          - name: Inductor Ops Misc Compute
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
+          - name: Inductor Ops Misc Shape A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
+            runner: spyre_pf_x4
+          - name: Inductor Ops Misc Shape B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
+          - name: Inductor Ops Misc Shape C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
+          - name: Inductor Ops Misc Compute A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
+          - name: Inductor Ops Misc Compute B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
+          - name: Inductor Ops Misc Compute C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Scalar
             config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
           - name: Inductor Logging
@@ -191,6 +223,8 @@ jobs:
             config: torch_spyre_tests/tensors/test_resize_config.yaml
           - name: Tensor Memory Format
             config: torch_spyre_tests/tensors/test_memory_format_config.yaml
+          - name: Tensor Model Loading Layout
+            config: torch_spyre_tests/tensors/test_model_utils_config.yaml
 
     steps:
       - name: Checkout composite actions
@@ -202,6 +236,7 @@ jobs:
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
           ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
@@ -211,12 +246,20 @@ jobs:
         with:
           verbose: 'true'
 
+      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
+      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
+      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
+      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
       - name: Download RPMs
         if: ${{ inputs.rpm_names != '' }}
         uses: ./.github/actions/download-rpms
         with:
           rpm_location: ${{ inputs.rpm_location }}
           rpm_names: ${{ inputs.rpm_names }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Install RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -229,28 +272,37 @@ jobs:
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
         uses: ./.github/actions/build-torch-spyre
 
-      - name: Run ${{ matrix.suite.name }} tests
+      - name: Derive report paths
         run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
-          CONFIG="tests/configs/${{ matrix.suite.config }}"
+      - name: Run ${{ matrix.suite.name }} tests
+        id: run_tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/${{ matrix.suite.config }}
+          extra_test_flags: ${{ inputs.extra_test_flags }}
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
 
-          _ARCH="$(uname -m)"
-          _SLOW_FLAG=""
-          if [[ "$_ARCH" != "x86_64" ]]; then
-            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
-            _SLOW_FLAG="--skip-slow"
-          fi
-
-          echo "Running ${{ matrix.suite.name }} tests..."
-          echo "  Host Platform : ${_ARCH}"
-          echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
-          echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
-          bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG}
-          echo "${{ matrix.suite.name }} tests done"
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
@@ -261,7 +313,7 @@ jobs:
       - x86_64
       - spyre_pf_x2
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       CI: ''
@@ -289,6 +341,7 @@ jobs:
       - uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
           ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
@@ -298,12 +351,20 @@ jobs:
         with:
           verbose: 'true'
 
+      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
+      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
+      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
+      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
       - name: Download RPMs
         if: ${{ inputs.rpm_names != '' }}
         uses: ./.github/actions/download-rpms
         with:
           rpm_location: ${{ inputs.rpm_location }}
           rpm_names: ${{ inputs.rpm_names }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Install RPMs
         if: ${{ inputs.rpm_names != '' }}
@@ -316,32 +377,35 @@ jobs:
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
         uses: ./.github/actions/build-torch-spyre
 
-      - name: Run ${{ matrix.suite.name }} tests
-        run: |-
-          source "$HOME/.bashrc"
-
-          # Multi-Spyre tests require a fresh topology probe: clear the
-          # cached AIU setup guard and the stale topo.json so
-          # ibm-aiu-setup.sh re-discovers all attached cards.
-          unset _IBM_AIU_SETUP
-          rm -rf /tmp/etc/ibm/spyre/topo.json
-          source /etc/profile.d/ibm-aiu-setup.sh
-
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-
+      - name: Derive report paths
+        run: |
           CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
-          _ARCH="$(uname -m)"
-          _SLOW_FLAG=""
-          if [[ "$_ARCH" != "x86_64" ]]; then
-            echo "Non-x86_64 platform (${_ARCH}): passing --skip-slow"
-            _SLOW_FLAG="--skip-slow"
-          fi
+      - name: Run ${{ matrix.suite.name }} tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/${{ matrix.suite.config }}
+          extra_test_flags: ${{ inputs.extra_test_flags }}
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Multi-Spyre tests require a fresh topology probe: clear the
+            # cached AIU setup guard and the stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all attached cards.
 
-          echo "Running ${{ matrix.suite.name }} tests..."
-          echo "  Host Platform : ${_ARCH}"
-          echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
-          echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
-          bash tests/run_test.sh "tests/configs/${CONFIG}" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG}
-          echo "${{ matrix.suite.name }} tests done"
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10

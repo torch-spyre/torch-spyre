@@ -18,6 +18,22 @@ inputs:
     description: Path to the download the RPMs to
     required: false
     default: rpms
+  artifactory_user:
+    description: Artifactory username
+    required: false
+    default: ''
+  artifactory_api_key:
+    description: Artifactory API key
+    required: false
+    default: ''
+  artifactory_base_url:
+    description: Artifactory base URL
+    required: false
+    default: ''
+  artifactory_rpm_path:
+    description: Artifactory RPM path
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -31,10 +47,10 @@ runs:
     - name: Download RPMs
       shell: bash
       env:
-        ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
-        ARTIFACTORY_API_KEY: ${{ secrets.ARTIFACTORY_API_KEY }}
-        ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
-        ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+        ARTIFACTORY_USER: ${{ inputs.artifactory_user }}
+        ARTIFACTORY_API_KEY: ${{ inputs.artifactory_api_key }}
+        ARTIFACTORY_BASE_URL: ${{ inputs.artifactory_base_url }}
+        ARTIFACTORY_RPM_PATH: ${{ inputs.artifactory_rpm_path }}
         ARTIFACTORY_LOCATION: ${{ inputs.rpm_location }}
         DOWNLOAD_SCRIPT: .github/scripts/download_rpms.sh
         RPM_NAMES: ${{ inputs.rpm_names }}
