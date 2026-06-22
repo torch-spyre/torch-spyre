@@ -201,7 +201,7 @@ test_suite_config:
         # They are xfailed because Spyre lacks support for many reduction ops and the histc function entirely.
         # The failures highlight missing Spyre kernels for reductions and the dxp_standalone compiler tool.
         - names:
-            - TestReductions::test_nansum_out_dtype # Segmentation fault
+            - TestReductions::test_nansum_out_dtype # Segmentation fault xfail -> skip
             - TestReductions::test_dim_reduction_fns_fn_name_amax
             - TestReductions::test_dim_reduction_fns_fn_name_amin
             - TestReductions::test_dim_reduction_fns_fn_name_max
