@@ -17,25 +17,16 @@ test_suite_config:
             - TestLinalg::test_lstsq_removed_error
             - TestLinalg::test_matrix_exp_backward_input_validation
             - TestLinalg::test_matrix_rank_removed_error
-            - TestLinalg::test_ormqr_errors_and_warnings # VERIFIER_GOT_IT_WRONG
-            - TestLinalg::test_qr_error_cases # VERIFIER_GOT_IT_WRONG
-            - TestLinalg::test_solve_removed_error # VERIFIER_GOT_IT_WRONG
-            - TestLinalg::test_symeig_removed_error # VERIFIER_GOT_IT_WRONG
+            - TestLinalg::test_ormqr_errors_and_warnings 
+            - TestLinalg::test_qr_error_cases
+            - TestLinalg::test_solve_removed_error
+            - TestLinalg::test_symeig_removed_error
           mode: mandatory_success
-        # These tests exercise the `baddbmm` operation with different input dtypes, including float32, float16, and int64.
-        # They are classified as `mandatory_success` because the Spyre backend must support all specified dtypes for `baddbmm`.
-        # The failure with float32 indicates a limitation in Spyre's support for batch matrix multiplication with this dtype.
-        - names:
-            - TestLinalg::test_baddbmm_input_dtypes_compatibility
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: float32
         # These tests exercise a wide range of linear algebra operations, including matrix multiplications, norms, and decompositions, across various data types and tensor shapes.
         # They are classified as xfail on the Spyre backend due to unsupported operations, data types, and tensor manipulations, as well as missing capabilities for handling certain error conditions and edge cases.
         # The most relevant Spyre limitations include unsupported batch matrix multiplications, specific data type promotions, and constraints on tensor layout transformations.
         - names:
+            - TestLinalg::test_baddbmm_input_dtypes_compatibility
             - TestLinalg::test_outer_ger_addr_legacy_tests
             - TestLinalg::test_1_sized_with_0_strided
             - TestLinalg::test__int4_mm
