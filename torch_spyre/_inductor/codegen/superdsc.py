@@ -883,6 +883,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
+    if is_pool:
+        num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
+
     if _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
         core_id_to_work_slice = _k_fast_core_to_slice_mapping(
             sdsc_iteration_space, dim_splits, num_cores

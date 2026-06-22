@@ -739,6 +739,14 @@ def generate_sdsc(
             }
 
     is_avgpool = sdsc_spec.opfunc == AVGPOOL2D_OP
+
+    def _tensor_layout_dims(layout_key: str) -> list:
+        """Return the layout dim_order for a tensor, filtering ki/kj for pool ops."""
+        dims = sdsc_spec.layouts[layout_key]["dim_order"]
+        if is_avgpool:
+            return [d for d in dims if str(d) not in ("ki", "kj")]
+        return dims
+
     if is_avgpool:
         _kH = int(sdsc_spec.pool_params.get("kernel_h", 1))
         _kW = int(sdsc_spec.pool_params.get("kernel_w", 1))
@@ -968,7 +976,7 @@ def generate_sdsc(
                             "primaryDsInfo_": {
                                 label: {
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in layout_info["dim_order"]
+                                        str(dim) for dim in _tensor_layout_dims(label)
                                     ],
                                     "stickDimOrder_": [
                                         str(layout_info["stick_dim_order"])
@@ -998,13 +1006,12 @@ def generate_sdsc(
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in tensor.dim_order
+                                        str(dim)
+                                        for dim in _tensor_layout_dims(tensor.layout)
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in _tensor_layout_dims(tensor.layout)
                                     ],
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
@@ -1101,9 +1108,7 @@ def generate_sdsc(
                                                     else "nopad"
                                                 ),
                                             )
-                                            for dim in sdsc_spec.layouts[
-                                                tensor.layout
-                                            ]["dim_order"]
+                                            for dim in _tensor_layout_dims(tensor.layout)
                                         },
                                         "coreIdToWkSlice_": {},
                                     },
@@ -1126,17 +1131,15 @@ def generate_sdsc(
                                     ),
                                     "scale_": [
                                         tensor.scales[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in _tensor_layout_dims(tensor.layout)
                                     ],
                                     **(
                                         {
                                             "density_": [
                                                 1
-                                                for _ in sdsc_spec.layouts[
+                                                for _ in _tensor_layout_dims(
                                                     tensor.layout
-                                                ]["dim_order"]
+                                                )
                                             ]
                                         }
                                         if is_avgpool
