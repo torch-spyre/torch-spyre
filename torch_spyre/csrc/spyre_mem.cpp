@@ -592,7 +592,7 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  * proper handle to the Spyre allocation
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
-                           bool non_blocking) {
+                           bool non_blocking, bool raw_copy) {
   SpyreStream stream;
   at::Tensor alloc_view;
   at::Tensor cpu_alloc;
@@ -637,7 +637,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     }
   }
 
-  stream.copyAsync(*copy_from, *copy_to);
+  stream.copyAsync(*copy_from, *copy_to, raw_copy);
   if (!non_blocking) {
     stream.synchronize();
   }

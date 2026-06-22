@@ -338,7 +338,18 @@ PYBIND11_MODULE(_C, m) {
   // Memory copy function
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
-        py::arg("dst"), py::arg("non_blocking") = false);
+        py::arg("dst"), py::arg("non_blocking") = false,
+        py::arg("raw_copy") = false);
+
+  // Raw (byte-for-byte) memory copy — bypasses layout/dtype conversion
+  m.def(
+      "copy_tensor_raw",
+      [](const at::Tensor& self, const at::Tensor& dst, bool non_blocking) {
+        return spyre::spyre_copy_from(self, dst, non_blocking,
+                                      /*raw_copy=*/true);
+      },
+      py::arg("self"), py::arg("dst"), py::arg("non_blocking") = false,
+      "Copy tensor between host and device without layout or dtype conversion");
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),

@@ -30,7 +30,7 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
                                std::optional<bool> pin_memory_opt);
 
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
-                           bool non_blocking);
+                           bool non_blocking, bool raw_copy = false);
 
 class SpyreTensorLayout;
 at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,

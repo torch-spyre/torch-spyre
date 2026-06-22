@@ -661,6 +661,17 @@ class TestSpyre(TestCase):
             ),
         )
 
+    def test_copy_tensor_raw_round_trip(self):
+        """Raw H2D then raw D2H returns the exact same bytes."""
+        import torch_spyre._C as _C
+
+        cpu_src = torch.rand(4, 8, 64, dtype=torch.float16)
+        dev = torch.empty(4, 8, 64, dtype=torch.float16, device="spyre")
+        _C.copy_tensor_raw(cpu_src, dev, non_blocking=False)
+        cpu_dst = torch.zeros(4, 8, 64, dtype=torch.float16)
+        _C.copy_tensor_raw(dev, cpu_dst, non_blocking=False)
+        self.assertTrue(torch.equal(cpu_src, cpu_dst))
+
     def test_scalar_tensor(self):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")

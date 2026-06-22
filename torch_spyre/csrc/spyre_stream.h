@@ -46,7 +46,8 @@ class SpyreStream {
   bool query() const;        // Check if work completed
   void synchronize() const;  // Block until work done
 
-  void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+  void copyAsync(const at::Tensor& src, const at::Tensor& dst,
+                 bool raw_copy = false) const;
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
   void executeProgramAsync(const KernelArtifacts& arts,

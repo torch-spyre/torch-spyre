@@ -140,8 +140,8 @@ void SpyreStream::copyProgramAsync(
   copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
 }
 
-void SpyreStream::copyAsync(const at::Tensor& src,
-                            const at::Tensor& dst) const {
+void SpyreStream::copyAsync(const at::Tensor& src, const at::Tensor& dst,
+                            bool raw_copy) const {
   DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
   DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
 
@@ -156,19 +156,23 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // Host-to-device or device-to-host copy
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
 
-    // Get SpyreTensorLayout using the public API
-    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
-
     // Extract device allocation from Spyre tensor storage
     auto* spyre_impl =
         static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
     auto& storage = spyre_impl->storage();
     auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+    if (raw_copy) {
+      copyAsyncImpl(cpu_ptr, &ctx->composite_addr, nullptr, host2device);
+    } else {
+      // Get SpyreTensorLayout using the public API
+      SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+      DataConversionInfo dci =
+          generate_dci(cpu_tensor, dev_tensor, stl,
+                       cpu_tensor->storage_offset(), host2device);
+      copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+    }
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
