@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .torch    { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.5; }
+      .kernel   { fill: #fff7e0; stroke: #b88a00; stroke-width: 1.5; }
+      .runtime  { fill: #d6efd6; stroke: #2d7a2d; stroke-width: 1.5; }
+      .label    { fill: #222; }
+      .name     { font-weight: 600; }
+      .sub      { fill: #555; font-size: 11px; font-style: italic; }
+      .arrow    { stroke: #444; stroke-width: 1.5; fill: none; }
+      .title    { fill: #222; font-size: 16px; font-weight: 700; }
+      .legend   { fill: #444; font-size: 11px; }
+      .producer { fill: #555; font-size: 11px; font-style: italic; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="410" y="34" text-anchor="middle" class="title">IR levels in the torch-spyre pipeline</text>
+  <text x="410" y="54" text-anchor="middle" class="sub">Each box is a distinct IR. Labels above the arrows name the pass that produces the next IR.</text>
+
+  <!-- Producer labels above arrows -->
+  <text class="producer" x="158" y="135" text-anchor="middle">Dynamo</text>
+  <text class="producer" x="316" y="135" text-anchor="middle">AOTAutograd</text>
+  <text class="producer" x="474" y="135" text-anchor="middle">Inductor</text>
+  <text class="producer" x="632" y="135" text-anchor="middle">codegen</text>
+  <text class="producer" x="775" y="135" text-anchor="middle">prepare</text>
+  <text class="producer" x="775" y="148" text-anchor="middle">Kernel</text>
+
+  <!-- Box 1: Torch IR -->
+  <rect class="torch" x="20" y="160" width="140" height="80" rx="8"/>
+  <text class="label name" x="90" y="190" text-anchor="middle">Torch IR</text>
+  <text class="label" x="90" y="210" text-anchor="middle">FX graph</text>
+  <text class="sub" x="90" y="228" text-anchor="middle">PyTorch dynamic ops</text>
+
+  <!-- Box 2: ATen IR -->
+  <rect class="torch" x="178" y="160" width="140" height="80" rx="8"/>
+  <text class="label name" x="248" y="190" text-anchor="middle">ATen IR</text>
+  <text class="label" x="248" y="210" text-anchor="middle">post-AOT</text>
+  <text class="sub" x="248" y="228" text-anchor="middle">decomposed primitives</text>
+
+  <!-- Box 3: LoopLevel IR -->
+  <rect class="torch" x="336" y="160" width="140" height="80" rx="8"/>
+  <text class="label name" x="406" y="190" text-anchor="middle">LoopLevel IR</text>
+  <text class="label" x="406" y="210" text-anchor="middle">scheduler</text>
+  <text class="sub" x="406" y="228" text-anchor="middle">Inductor IR + Spyre passes</text>
+
+  <!-- Box 4: SuperDSC / KTIR -->
+  <rect class="kernel" x="494" y="160" width="140" height="80" rx="8"/>
+  <text class="label name" x="564" y="190" text-anchor="middle">SuperDSC</text>
+  <text class="label name" x="564" y="208" text-anchor="middle">/ KTIR</text>
+  <text class="sub" x="564" y="226" text-anchor="middle">kernel descriptor</text>
+
+  <!-- Box 5: SpyreCode JobPlan -->
+  <rect class="runtime" x="652" y="160" width="148" height="80" rx="8"/>
+  <text class="label name" x="726" y="190" text-anchor="middle">SpyreCode</text>
+  <text class="label name" x="726" y="208" text-anchor="middle">JobPlan</text>
+  <text class="sub" x="726" y="226" text-anchor="middle">runtime contract</text>
+
+  <!-- Arrows between boxes -->
+  <path class="arrow" d="M 160 200 L 178 200" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 318 200 L 336 200" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 476 200 L 494 200" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 634 200 L 652 200" marker-end="url(#arr)"/>
+
+  <!-- Trailing arrow into device -->
+  <path class="arrow" d="M 800 200 L 815 200" marker-end="url(#arr)"/>
+
+  <!-- Legend -->
+  <rect class="torch" x="60" y="280" width="14" height="14"/>
+  <text class="legend" x="80" y="292">PyTorch / Inductor IR</text>
+  <rect class="kernel" x="240" y="280" width="14" height="14"/>
+  <text class="legend" x="260" y="292">Spyre kernel IR</text>
+  <rect class="runtime" x="430" y="280" width="14" height="14"/>
+  <text class="legend" x="450" y="292">runtime container</text>
+
+  <!-- Bottom note -->
+  <text class="sub" x="410" y="312" text-anchor="middle">Production today: SuperDSC. KTIR is the planned successor; both lower into the same JobPlan at the runtime boundary.</text>
+</svg>

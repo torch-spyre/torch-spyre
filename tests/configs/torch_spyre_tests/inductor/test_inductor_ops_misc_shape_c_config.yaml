@@ -1,0 +1,21 @@
+# Misc shape shard C: concat and pad tests.
+#
+# Split out from shard A to reduce per-job CI time.  Shard A covers tensor
+# factory, copy/clone, and slice/split.  Shard B covers shape ops,
+# squeeze/unsqueeze, t/transpose, dtype conversion, and restickify.
+#
+# When a new test is added to test_inductor_ops.py that belongs in the misc
+# shape group, assign it to whichever shard keeps the jobs balanced.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # concat / pad
+            - TestOps::test_cat.*
+            - TestOps::test_pad.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

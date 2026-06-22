@@ -70,8 +70,8 @@ class DtypeOpTable:
         return cls._TYPECAST_OPS_TABLE
 
     @classmethod
-    def get_dtype_pairs(cls) -> set[tuple[torch.dtype, torch.dtype]]:
-        return cls._TYPECAST_OP_DTYPES
+    def get_dtype_pairs(cls) -> list[tuple[torch.dtype, torch.dtype]]:
+        return list(cls._TYPECAST_OPS_TABLE.keys())
 
     @classmethod
     def is_dtype_op(cls, op: str) -> bool:

@@ -708,10 +708,72 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
+const at::Tensor& spyre_resize_(
+    const at::Tensor& self, c10::SymIntArrayRef size,
+    std::optional<c10::MemoryFormat> memory_format_opt) {
+  auto size_int = c10::asIntArrayRefUnchecked(size);
+  // Case 1: No-op.
+  if (self.sizes() == size_int && self.is_contiguous()) {
+    return self;
+  }
+  TORCH_CHECK(memory_format_opt != c10::MemoryFormat::Preserve,
+              "aten::resize_ does not support MemoryFormat::Preserve");
+  TORCH_CHECK(!memory_format_opt.has_value() ||
+                  *memory_format_opt == c10::MemoryFormat::Contiguous,
+              "aten::resize_ on Spyre only supports contiguous memory format");
+  const auto dtype = c10::typeMetaToScalarType(self.dtype());
+  TORCH_CHECK(spyre::is_supported_dtype(dtype),
+              "Spyre backend does not support dtype ", dtype);
+
+  auto* self_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  // Use STL device bytes (stick-padded) to determine if existing allocation
+  // suffices.
+  auto new_layout = SpyreTensorLayout(size_int.vec(), dtype);
+  const size_t new_device_bytes = get_device_size_in_bytes(new_layout);
+  const size_t new_cpu_bytes =
+      at::detail::computeStorageNbytesContiguous(size_int, self.itemsize());
+  const size_t new_size_bytes = std::max(new_device_bytes, new_cpu_bytes);
+  // Case 2: Same-numel or shrink — reinterpret storage in-place, no data moved.
+  // Only valid when new last dim ≤ old last dim; otherwise D2H reads into stick
+  // padding.
+  const int64_t new_numel = c10::multiply_integers(size_int);
+  const bool last_dim_ok = size_int.empty() || self.sizes().empty() ||
+                           size_int.back() <= self.sizes().back();
+  if (new_size_bytes <= self.storage().nbytes() && new_numel <= self.numel() &&
+      last_dim_ok) {
+    self_impl->set_sizes_contiguous(size_int);
+    self_impl->spyre_layout = new_layout;
+    self_impl->dma_sizes = size_int.vec();
+    self_impl->dma_strides = self_impl->strides().vec();
+    DEBUGINFO("resize_ to shape=", size_int,
+              " layout=", self_impl->spyre_layout.toString());
+    return self;
+  }
+  // Case 3: Reallocate — D2H → CPU resize_ → H2D. Handles expand and any
+  // reshape where the new last dim > old last dim (stick-layout incompatible).
+  // TODO(kunuruabhishek): avoid round-trip once restickify supports
+  // cross-layout D2D copies.
+  at::Tensor cpu_buf = self.cpu();
+  cpu_buf.resize_(size_int);
+  auto new_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), new_size_bytes,
+      &SpyreAllocator::instance(), /*resizeable=*/true);
+  self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
+  self_impl->set_sizes_contiguous(size_int);
+  self_impl->spyre_layout = new_layout;
+  self_impl->dma_sizes = size_int.vec();
+  self_impl->dma_strides = self_impl->strides().vec();
+  at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
+  DEBUGINFO("resize_ expand to shape=", size_int,
+            " layout=", self_impl->spyre_layout.toString());
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
+  m.impl("resize_", TORCH_FN(spyre_resize_));
 }
 
 }  // namespace spyre

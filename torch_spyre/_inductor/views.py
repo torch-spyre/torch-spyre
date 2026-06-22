@@ -22,6 +22,8 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
 
+from .errors import Unsupported
+
 
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
@@ -131,6 +133,7 @@ def compute_coordinates(
     stride: Sequence[sympy.Expr],
     var_ranges: dict[sympy.Symbol, sympy.Expr],
     index: sympy.Expr,
+    indirect_load_subs: "dict | None" = None,
 ) -> list[sympy.Expr]:
     """
     Compute an array of coordinate expressions from an index expression.
@@ -217,9 +220,31 @@ def compute_coordinates(
         # injected by dynamic shapes that appear in the index expression
         # but are not iteration variables).
         if var not in var_ranges:
-            continue
-
-        range_val = var_ranges[var]
+            # Indirect index symbols (e.g. tmp0 from an indirect load) appear
+            # in the index expression but are not loop variables.  Infer their
+            # range from the layout: find the dim whose stride equals the
+            # symbol's coefficient in the index.
+            term = index.xreplace({v: 0 for v in vars - {var}})
+            try:
+                coeff = int(term.xreplace({var: 1}))
+            except (TypeError, ValueError):
+                continue
+            inferred = next(
+                (
+                    sz
+                    for st, sz in zip(stride, size)
+                    if int(st) == coeff and int(sz) > 1
+                ),
+                None,
+            )
+            if inferred is None:
+                raise Unsupported(
+                    f"indirect symbol {var} (coeff={coeff}) in index {index} "
+                    f"has no matching stride in layout {list(zip(stride, size))}"
+                )
+            range_val = inferred
+        else:
+            range_val = var_ranges[var]
 
         # Skip vars with trivial range.  For symbolic ranges we cannot
         # statically determine triviality, so we assume they are non-trivial.
@@ -243,6 +268,8 @@ def compute_coordinates(
         limit = term.xreplace({var: range_val})
         add_term(var=var, step=step, limit=limit)
 
+    if indirect_load_subs:
+        coordinates = [c.xreplace(indirect_load_subs) for c in coordinates]
     return coordinates
 
 
@@ -254,7 +281,18 @@ def _is_range_subset(expr: sympy.Expr, coord: sympy.Expr, v: sympy.Symbol) -> bo
     Handles two cases:
     - coord == v: coord is unbounded, so any expr in v is a subset.
     - coord == Mod(v, b) and expr == Mod(v, a) with a <= b: [0,a-1] ⊆ [0,b-1].
+
+    Both coord and expr can have optional constant offsets, but they must match.
     """
+    if expr.free_symbols == {v} and coord.free_symbols == {v}:
+        # Strip constant offsets if both have them
+        expr_offset = expr.subs(v, 0)
+        coord_offset = coord.subs(v, 0)
+        if expr_offset != coord_offset:
+            return False
+        expr = expr - expr_offset
+        coord = coord - coord_offset
+
     if coord == v:
         return True
     if (
@@ -342,6 +380,11 @@ def normalize_coordinates(
             else:
                 assert offset == 0
                 terms.append(Term(None, None, None, None, dim_size))
+            continue
+        # If all free symbols are indirect (not loop vars), pass the raw
+        # coordinate through as an opaque offset on a var=None term.
+        if not vars.issubset(var_ranges.keys()):
+            terms.append(Term(None, None, None, None, dim_size, offset=coordinate))
             continue
         dim_terms = []  # terms for current dimension
         for var in vars:
@@ -555,10 +598,10 @@ def align_tensors(
         ]:
             # for each term except last one (stick dim)
             if var is None:
-                assert offset == sympy.S.Zero
-                # dimension is not iterated over, keep as is
+                # offset holds either 0 (broadcast/scalar dim) or an IndirectAccess
+                # (indirect load access) that must pass through unchanged.
                 size.append(dim_size)
-                coordinates.append(sympy.S.Zero)
+                coordinates.append(offset)
                 continue
             # decompose dimension according to splits and tiling of stick dim
             low = (

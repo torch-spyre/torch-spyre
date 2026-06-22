@@ -20,7 +20,7 @@ and consumed by the scheduler, kernel codegen, and buffer-propagation pass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -45,11 +45,17 @@ class CoarseTileInfo:
         contains the ``data.ranges`` positional indices that are tiled at
         that level.  An empty sub-list means the op is loop-invariant at
         that level.
+    loop_tiled_reduction_dims:
+        List of lists, one sub-list per nesting level.  Each sub-list
+        contains the ``data.reduction_ranges`` positional indices that are
+        tiled at that level.  An empty sub-list means no reduction dim is
+        tiled at that level.  Parallel to ``loop_tiled_dims``.
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
+    loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +64,7 @@ class CoarseTileInfo:
 
 _SPYRE_METADATA_ATTRS = (
     "dim_hints",
+    "work_div_loop_info",
     "loop_info",
 )
 
@@ -66,7 +73,8 @@ def copy_op_metadata(src: "ComputedBuffer", dst: "ComputedBuffer") -> None:
     """Copy all Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    dim_hints and coarse-tiling attrs are not silently dropped.
+    dim_hints, work-division hint metadata, and coarse-tiling attrs are not
+    silently dropped.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):

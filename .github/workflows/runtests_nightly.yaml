@@ -4,72 +4,76 @@ on:
   schedule:
     - cron: 0 2 * * *
 
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to check out and test
+        required: false
+        type: string
+        default: ''
+      rpm_location:
+        description: The Artifactory location where to download the RPM from
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        description: A space separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ''
+      build_torch_spyre:
+        description: Whether to re-build torch-spyre after installing the RPM
+        required: false
+        type: boolean
+        default: true
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
-
-defaults:
-  run:
-    shell: bash
 
 permissions:
   contents: read
   checks: write
 
 jobs:
-  test:
-    name: Run Spyre unit tests - complete version
-    runs-on:
-      - x86_64
-      - spyre_pf_x1
-      - linux
-      - image_torch_spyre
-    timeout-minutes: 60
-    env:
-      # The CI env var is very important.
-      # GitHub actions automatically sets CI=true
-      # which causes the pytest inductor tests to fail with AssertionError
-      # due to a mix of fallbacks and decompositions.
-      # Here we set it to an empty string (or we could also unset it).
-      CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      # The new torch-spyre image already contains a pre-cloned pytorch
-      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
-      TORCH_ROOT: /home/senuser/pytorch
+  # ---------------------------------------------------------------------------
+  # Delegate entirely to the shared test matrix.
+  # Nightly always runs everything — no doc-skip logic needed.
+  # ---------------------------------------------------------------------------
+  run-tests:
+    uses: ./.github/workflows/_test_matrix.yaml
+    with:
+      runner_label: linux
+      extra_test_flags: --cpu-compile -vvv -s
+      checkout_pytorch: true
+      torch_root: /home/senuser/pytorch
+      ref: ${{ inputs.ref || '' }}
+      rpm_location: ${{ inputs.rpm_location || '' }}
+      rpm_names: ${{ inputs.rpm_names || '' }}
+      build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
 
+  # ---------------------------------------------------------------------------
+  # Job 2: run-spyre-unit-tests (fan-in gate)
+  #
+  # Fans in the reusable workflow result. Reports a single green/red status.
+  #   run-tests result = success -> all suites passed -> green
+  #   run-tests result = failure -> one or more suites bad -> red
+  # ---------------------------------------------------------------------------
+  run-spyre-unit-tests:
+    name: Run Spyre unit tests
+    runs-on: ubuntu-latest
+    needs: [run-tests]
+    if: always()
     steps:
-      # Sparse checkout into the GHA workspace so the local composite
-      # actions under .github/actions/ are available. The pre-cloned
-      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
-      # against.
-      - name: Checkout composite actions
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          sparse-checkout: .github/actions
-          sparse-checkout-cone-mode: false
+      - name: Evaluate test results
+        run: |-
+          RESULT="${{ needs.run-tests.result }}"
+          echo "run-tests result: ${RESULT}"
 
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
-
-      - uses: ./.github/actions/checkout-prebuilt-pytorch
-
-      - uses: ./.github/actions/gather-runner-info
-
-      - uses: ./.github/actions/build-torch-spyre
-
-      - name: Run unit tests
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-          echo 'Run unit tests start'
-          pytest tests/ --cpu-compile -vvv -s || EXIT_CODE=$?
-          EXIT_CODE=${EXIT_CODE:-0}
-          echo "pytest EXIT_CODE: ${EXIT_CODE}"
-          if [[ "$EXIT_CODE" == '0' ]] ; then
-            echo 'pytest success'
-          else
-            echo 'pytest failed'
+          if [[ "${RESULT}" == "success" ]]; then
+            echo "All test suites passed."
+            exit 0
           fi
-          echo 'Run unit tests end'
-          exit "$EXIT_CODE"
+
+          echo "One or more test suites failed or were cancelled."
+          exit 1

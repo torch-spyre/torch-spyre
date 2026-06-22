@@ -1,0 +1,63 @@
+name: Download RPMs from Artifactory
+description: |
+  Downloads the given RPM names from the given Artifactory location
+
+inputs:
+  rpm_names:
+    description: A space separated list of RPM names to download and install
+    required: true
+    type: string
+  rpm_location:
+    description: |
+      Full Artifactory URL to download RPMs from (e.g.
+      https://artifactory.example.com/path/to/rpms). When set, overrides the
+      ARTIFACTORY_BASE_URL + ARTIFACTORY_RPM_PATH secrets.
+    required: false
+    default: ''
+  output_dir:
+    description: Path to the download the RPMs to
+    required: false
+    default: rpms
+  artifactory_user:
+    description: Artifactory username
+    required: false
+    default: ''
+  artifactory_api_key:
+    description: Artifactory API key
+    required: false
+    default: ''
+  artifactory_base_url:
+    description: Artifactory base URL
+    required: false
+    default: ''
+  artifactory_rpm_path:
+    description: Artifactory RPM path
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        path: torch-spyre-repo
+        fetch-depth: 1
+
+    - name: Download RPMs
+      shell: bash
+      env:
+        ARTIFACTORY_USER: ${{ inputs.artifactory_user }}
+        ARTIFACTORY_API_KEY: ${{ inputs.artifactory_api_key }}
+        ARTIFACTORY_BASE_URL: ${{ inputs.artifactory_base_url }}
+        ARTIFACTORY_RPM_PATH: ${{ inputs.artifactory_rpm_path }}
+        ARTIFACTORY_LOCATION: ${{ inputs.rpm_location }}
+        DOWNLOAD_SCRIPT: .github/scripts/download_rpms.sh
+        RPM_NAMES: ${{ inputs.rpm_names }}
+        RPMS_DOWNLOAD_DIR: ${{ inputs.output_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        cd torch-spyre-repo/
+        ls -la "$DOWNLOAD_SCRIPT"
+        "$DOWNLOAD_SCRIPT"

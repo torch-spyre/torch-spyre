@@ -26,12 +26,12 @@
 
 namespace spyre {
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepH2D::construct(
-    LaunchContext&) const {
-  auto op = std::make_unique<flex::RuntimeOperationH2D>(host_address_,
-                                                        &device_address_);
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+void JobPlanStepH2D::construct(LaunchContext&,
+                               flex::RuntimeStream* flex_stream) const {
+  flex::DmaParams params(host_address_, device_address_.total_size(),
+                         /*to_device=*/true, &device_address_);
+  params.pipeline_barrier = pipeline_barrier_;
+  flex_stream->launchOperationH2D(&params);
 }
 
 void JobPlanStepH2D::write(std::ostream& os) const {
@@ -42,12 +42,12 @@ void JobPlanStepH2D::write(std::ostream& os) const {
      << "\n";
 }
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepD2H::construct(
-    LaunchContext&) const {
-  auto op = std::make_unique<flex::RuntimeOperationD2H>(&device_address_,
-                                                        host_address_);
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+void JobPlanStepD2H::construct(LaunchContext&,
+                               flex::RuntimeStream* flex_stream) const {
+  flex::DmaParams params(host_address_, device_address_.total_size(),
+                         /*to_device=*/false, &device_address_);
+  params.pipeline_barrier = pipeline_barrier_;
+  flex_stream->launchOperationD2H(&params);
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
@@ -58,26 +58,22 @@ void JobPlanStepD2H::write(std::ostream& os) const {
      << "\n";
 }
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
-    LaunchContext& ctx) const {
+void JobPlanStepCompute::construct(LaunchContext& ctx,
+                                   flex::RuntimeStream* flex_stream) const {
+  std::vector<const flex::CompositeAddress*> tensor_allocs;
   if (bind_io_addresses_) {
-    std::vector<const flex::CompositeAddress*> inp;
     for (auto& tensor : ctx.inputs_outputs) {
       flex::CompositeAddress* address =
           &(static_cast<SharedOwnerCtx*>(
                 tensor.storage().data_ptr().get_context())
                 ->composite_addr);
-      inp.push_back(address);
+      tensor_allocs.push_back(address);
     }
-
-    auto op = std::make_unique<flex::RuntimeOperationCompute>(
-        &binary_address_, inp, "", bootstrap_addr_);
-    op->setPipelineBarrier(pipeline_barrier_);
-    return op;
   }
-  auto op = std::make_unique<flex::RuntimeOperationCompute>(&binary_address_);
-  op->setPipelineBarrier(pipeline_barrier_);
-  return op;
+  flex::ComputeParams params(&binary_address_, std::move(tensor_allocs), "",
+                             bootstrap_addr_);
+  params.pipeline_barrier = pipeline_barrier_;
+  flex_stream->launchOperationCompute(&params);
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
@@ -89,56 +85,59 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
-// convert CompositeAddress to address that host compute function expects
-int64_t convert_address(flex::CompositeAddress& composite_address) {
+// TODO(jni): move to flex
+// convert CompositeAddress to dmva
+static int64_t composite_address_to_dmva(
+    const flex::CompositeAddress& composite_address) {
   size_t num_chunks = composite_address.chunks().size();
   TORCH_CHECK(num_chunks == 1, "Interleaved not supported yet");
 
-  // TODO(jni): update once resolved on flex support
-  // const auto& addr = composite_address.chunks().at(0).addr;
-  // int64_t address = addr.segment_id * flex::SEGMENT_SIZE + addr.offset;
-
-  TORCH_CHECK(false,
-              "convert_address not yet implemented - waiting for flex support");
-  return 0;
+  const auto& addr = composite_address.chunks()[0].addr;
+  auto& allocator = SpyreAllocator::instance();
+  auto seg_id = allocator.segmentForRegion(addr.region_id);
+  auto address = flex::SegmentByteOffset_todmva(seg_id, addr.offset);
+  return address;
 }
 
-std::unique_ptr<flex::RuntimeOperation> JobPlanStepHostCompute::construct(
-    LaunchContext& ctx) const {
-  // Helper lambda to create RuntimeOperationHostCallback with given callback
-  auto make_host_callback_op = [this](auto&& callback) {
-    return std::make_unique<flex::RuntimeOperationHostCallback>(
-        pipeline_barrier_, std::forward<decltype(callback)>(callback), nullptr);
+void JobPlanStepHostCompute::construct(LaunchContext& ctx,
+                                       flex::RuntimeStream* flex_stream) const {
+  // Helper lambda to build HostCallbackParams and launch on the stream
+  auto launch_host_callback = [this, flex_stream](auto&& callback) {
+    flex::HostCallbackParams params(std::forward<decltype(callback)>(callback),
+                                    nullptr, pipeline_barrier_);
+    flex_stream->launchOperationHostCallback(&params);
   };
 
   // Case 1: input_buffer_ is provided
   if (input_buffer_ != nullptr) {
-    return make_host_callback_op([this](void*) {
+    launch_host_callback([this](void*) {
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
                                              input_buffer_);
     });
+    return;
   }
 
   // Case 2: fake symbols (ishape_ is {0})
   // Further discussion is required on "ishape". For now, it's vector<int64_t>,
   // and it's {0}, it's for fake symbols
   if (ishape_.size() == 1 && ishape_[0] == 0) {
-    return make_host_callback_op([this](void*) {
+    launch_host_callback([this](void*) {
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
     });
+    return;
   }
 
   // Case 3: extract addresses from context tensors
   std::vector<int64_t> addresses(ctx.inputs_outputs.size());
   int addr_idx = 0;
   for (auto& tensor : ctx.inputs_outputs) {
-    int64_t addr = convert_address(
+    int64_t addr = composite_address_to_dmva(
         (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
              ->composite_addr));
     addresses[addr_idx++] = addr;
   }
 
-  return make_host_callback_op([this, addresses](void*) {
+  launch_host_callback([this, addresses](void*) {
     deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
   });
 }
@@ -156,10 +155,14 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   os << "Total steps: " << plan.steps.size() << "\n";
 
   // Job allocation
-  if (!plan.job_allocation.chunks().empty()) {
-    os << "Job allocation: " << plan.job_allocation << "\n";
-  } else {
-    os << "Job allocation: <none>\n";
+  size_t addr_idx = 0;
+  for (const auto& addr : plan.job_allocation) {
+    if (addr_idx == 0) {
+      os << "Job allocation: " << addr << "\n";
+    } else {
+      os << "Program " << addr_idx - 1 << ": " << addr << "\n";
+    }
+    ++addr_idx;
   }
 
   // Expected input shapes
