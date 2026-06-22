@@ -36,7 +36,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         super().setUp()
         torch._dynamo.reset()
         _pnd.reset()
-        self.logger = logging.getLogger("torch_spyre._inductor.work_division")
+        self.logger = logging.getLogger("spyre.inductor.work_division")
         self._original_level = self.logger.level
         self.logger.setLevel(logging.DEBUG)
         self.log_handler = logging.handlers.MemoryHandler(capacity=1000)

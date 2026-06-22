@@ -1,0 +1,42 @@
+# Misc shape shard B: shape ops, squeeze/unsqueeze, t/transpose, dtype
+# conversion, and restickify.
+#
+# Pair with test_inductor_ops_misc_shape_a_config.yaml which covers tensor
+# factory, copy/clone, and concat/split/slice/pad.  Together they replace the
+# former test_inductor_ops_misc_shape_config.yaml.
+#
+# When a new test is added to test_inductor_ops.py that belongs in the misc
+# shape group, assign it to whichever shard keeps the two jobs balanced.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # shape ops
+            - TestOps::test_flatten.*
+            - TestOps::test_permute.*
+            - TestOps::test_unbind.*
+            - TestOps::test_size_one.*
+            - TestOps::test_unfold.*
+            # squeeze covers test_squeeze and test_squeeze_reduction
+            - TestOps::test_squeeze.*
+            # unsqueeze covers test_unsqueeze and test_unsqueeze_broadcast
+            - TestOps::test_unsqueeze.*
+            # t / transpose — each prefix covers the contiguous variant too
+            - TestOps::test_t_1d.*
+            - TestOps::test_t_2d.*
+            - TestOps::test_transpose_2d.*
+            - TestOps::test_transpose_3d.*
+            - TestOps::test_transpose_4d.*
+            # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
+            - TestOps::test_to_dtype.*
+            - TestOps::test_round_trip_to_dtype.*
+            - TestOps::test_add_constant.*
+            - TestOps::test_repeat.*
+            - TestOps::test_restickify_fp32_unsupported_xfail
+            - TestOps::test_restickify_int64_unsupported_xfail
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

@@ -20,6 +20,18 @@ on:
         required: true
         type: string
 
+      # IMAGE selector label for runs-on. Normal runs use the standing
+      # image_torch_spyre set; the per-PR ephemeral flow passes that PR's set
+      # label (image_torch_spyre_pr_<component>_<sha12>, e.g.
+      # image_torch_spyre_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
+      # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
+      # unchanged.
+      image_label:
+        description: Image scaleSetLabel to select (image_torch_spyre | image_torch_spyre_pr_<KEY>)
+        required: false
+        type: string
+        default: image_torch_spyre
+
       # Flags appended to every `bash tests/run_test.sh <config>` call
       extra_test_flags:
         description: Extra flags passed to run_test.sh (e.g. "-v" or "--cpu-compile -vvv -s")
@@ -81,7 +93,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
@@ -122,6 +134,8 @@ jobs:
             config: torch_spyre_tests/test_allocator_e2e_config.yaml
           - name: Test Launch Jobplan
             config: torch_spyre_tests/test_launch_jobplan_config.yaml
+          - name: Test logging patterns
+            config: torch_spyre_tests/test_logging_patterns_config.yaml
           # ---- Inductor tests ----
           - name: Inductor Building Blocks
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
@@ -151,10 +165,18 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
           - name: Inductor Ops Pointwise
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc Shape
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
-          - name: Inductor Ops Misc Compute
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
+          - name: Inductor Ops Misc Shape A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
+          - name: Inductor Ops Misc Shape B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
+          - name: Inductor Ops Misc Shape C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
+          - name: Inductor Ops Misc Compute A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
+          - name: Inductor Ops Misc Compute B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
+          - name: Inductor Ops Misc Compute C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar
@@ -221,6 +243,10 @@ jobs:
         with:
           verbose: 'true'
 
+      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
+      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
+      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
+      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
       - name: Download RPMs
         if: ${{ inputs.rpm_names != '' }}
         uses: ./.github/actions/download-rpms
@@ -278,7 +304,7 @@ jobs:
       - x86_64
       - spyre_pf_x2
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       CI: ''
@@ -316,6 +342,10 @@ jobs:
         with:
           verbose: 'true'
 
+      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
+      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
+      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
+      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
       - name: Download RPMs
         if: ${{ inputs.rpm_names != '' }}
         uses: ./.github/actions/download-rpms
