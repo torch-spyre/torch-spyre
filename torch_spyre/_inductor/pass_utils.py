@@ -724,8 +724,13 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
-        # The iteration space of a Reduction is that of its input
-        return next(iter(n.read_writes.reads)).ranges.copy()
+        # Output dims from the write dep; reduction dims appended from read deps.
+        result = next(iter(n.read_writes.writes)).ranges.copy()
+        for dep in n.read_writes.reads:
+            for sym, size in dep.ranges.items():
+                if sym not in result:
+                    result[sym] = size
+        return result
     else:
         raise Unsupported("Unexpected node type")
 
@@ -737,7 +742,13 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
-        return next(iter(rw.reads)).ranges.copy()
+        # Output dims from write dep; reduction dims appended from read deps.
+        result = next(iter(rw.writes)).ranges.copy()
+        for dep in rw.reads:
+            for sym, size in dep.ranges.items():
+                if sym not in result:
+                    result[sym] = size
+        return result
     else:
         raise Unsupported("Unexpected node type")
 
