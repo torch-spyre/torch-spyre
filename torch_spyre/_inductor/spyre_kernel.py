@@ -363,6 +363,10 @@ class SpyreOpFuncs:
         return PointwiseOp("realdiv", [a, b])
 
     @staticmethod
+    def silu(a):
+        return PointwiseOp("silu", [a])
+
+    @staticmethod
     def where(x, y, z):
         return PointwiseOp("where3", [x, y, z])
 
