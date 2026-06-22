@@ -135,7 +135,7 @@ runs:
 
           exec {FIFO_FD}>"$FIFO"
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" --parallel ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 

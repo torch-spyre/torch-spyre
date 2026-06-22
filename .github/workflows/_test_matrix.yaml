@@ -91,7 +91,7 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf_x1
+      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
       - ${{ inputs.runner_label }}
       - ${{ inputs.image_label }}
     timeout-minutes: 60
@@ -167,16 +167,19 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
           - name: Inductor Ops Misc Shape A
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Ops Misc Shape B
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
           - name: Inductor Ops Misc Shape C
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
           - name: Inductor Ops Misc Compute A
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Ops Misc Compute B
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
           - name: Inductor Ops Misc Compute C
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
           - name: Inductor Scalar
@@ -285,6 +288,12 @@ jobs:
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
 
       - name: Upload JUnit XML report
         if: always()
