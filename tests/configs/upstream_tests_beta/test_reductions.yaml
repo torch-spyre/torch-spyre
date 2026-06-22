@@ -180,7 +180,6 @@ test_suite_config:
             - TestReductions::test_identity_prod
             - TestReductions::test_identity_sum
             - TestReductions::test_nansum
-            - TestReductions::test_nansum_out_dtype
           mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise reduction ops like mean, sum, min, max, and mode across various dtypes and tensor ranks.
         # They are xfail due to Spyre's 64-dimension limit, lack of double dtype support, and missing type conversion during copy.
@@ -202,6 +201,7 @@ test_suite_config:
         # They are xfailed because Spyre lacks support for many reduction ops and the histc function entirely.
         # The failures highlight missing Spyre kernels for reductions and the dxp_standalone compiler tool.
         - names:
+            - TestReductions::test_nansum_out_dtype # Segmentation fault
             - TestReductions::test_dim_reduction_fns_fn_name_amax
             - TestReductions::test_dim_reduction_fns_fn_name_amin
             - TestReductions::test_dim_reduction_fns_fn_name_max

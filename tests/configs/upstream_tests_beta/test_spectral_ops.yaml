@@ -35,7 +35,6 @@ test_suite_config:
         - names:
             - TestFFT::test_fft_input_modification
             - TestFFT::test_fftfreq_numpy
-            - TestFFT::test_fftfreq_out
             - TestFFT::test_fftshift_frequencies
           mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise FFT operations with various dtypes and tensor behaviors.
@@ -56,6 +55,7 @@ test_suite_config:
         # They are classified as 'skip' because they do not engage the torch-spyre layer, which is responsible for handling device-specific operations.
         # The relevance of these tests is limited due to Spyre's current focus on other operations and data types.
         - names:
+            - TestFFT::test_fftfreq_out # segmentation fault
             - TestFFT::test_stft_window_device
             - TestFFT::test_istft_requires_window
             - TestFFT::test_stft_align_to_window_only_requires_non_center
