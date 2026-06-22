@@ -54,11 +54,11 @@ jobs:
           - name: Linear algebra
             config: test_linalg.yaml
           - name: NeuralNet test embedding
-            config: test_nn_test_embedding.yaml
+            config: nn-test_embedding.yaml
           - name: NeuralNet lazy modules
-            config: test_nn_test_lazy_modules.yaml
+            config: nn-test_lazy_modules.yaml
           - name: NeuralNet pooling
-            config: test_nn_test_pooling.yaml
+            config: nn-test_pooling.yaml
           - name: NeuralNet convolution
             config: nn-test_convolution.yaml
           - name: NeuralNet embedding
