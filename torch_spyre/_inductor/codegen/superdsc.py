@@ -21,6 +21,9 @@ from sympy import Integer, Symbol, Expr, Mod, floor
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
+    AVGPOOL2D_OP,
+    AVGPOOL_DIM_LABELS,
+    AVGPOOL_LAYOUT_LABELS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
@@ -109,6 +112,7 @@ class SDSCSpec:
         default_factory=dict
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
+    pool_params: dict = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -321,6 +325,19 @@ def _is_matmul(op: str) -> bool:
 
 def _is_topk(op: str) -> bool:
     return op in TOPK_OPS
+
+
+def _is_pool(op: str) -> bool:
+    return op == AVGPOOL2D_OP
+
+
+def _pool_dim_labels(ndim: int, constants: dict) -> list[str]:
+    kH = int(constants.get("kernel_h", 1))
+    kW = int(constants.get("kernel_w", 1))
+    red_labels = (["ki"] if kH > 1 else []) + (["kj"] if kW > 1 else [])
+    n_out = ndim - len(red_labels)
+    out_labels = AVGPOOL_DIM_LABELS[:4][-n_out:] if n_out > 0 else []
+    return out_labels + red_labels
 
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
@@ -565,6 +582,8 @@ def _create_sdsc_tensors(
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
+    if _is_pool(op):
+        return op
     if (
         is_reduction
         and not _is_matmul(op)
@@ -695,6 +714,7 @@ def _extend_matmul_k_to_padded(
 
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
+    is_pool = _is_pool(op_spec.op)
     ndim = len(op_spec.iteration_space)
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -704,7 +724,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     }
     has_indirect_access = bool(index_tensor_indices)
 
-    dim_labels = _get_op_dim_labels(ndim, is_matmul)
+    if is_pool and op_spec.op_info:
+        pool_constants = op_spec.op_info.get("constants", {})
+        dim_labels = _pool_dim_labels(ndim, pool_constants)
+    else:
+        dim_labels = _get_op_dim_labels(ndim, is_matmul)
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
     }
@@ -843,7 +867,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             work_slices[dim] = 1
         num_cores = math.prod(dim_splits.values())
 
-    constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
+    pool_params_out: dict = {}
+    if is_pool and op_spec.op_info:
+        pool_params_out = dict(op_spec.op_info.get("constants", {}))
+        scaling_factor = pool_params_out.get("scaling_factor", 1.0)
+        constants = {"nmap": scaling_factor}
+    else:
+        constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
     if coordinate_masking:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
@@ -886,6 +916,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
+            pool_params=pool_params_out,
         ),
         symbol_mapping,
     )
