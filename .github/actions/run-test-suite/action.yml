@@ -89,9 +89,13 @@ runs:
                 echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
                 if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
                   echo "[stall-watcher] STALL DETECTED — killing test child processes"
-                  kill -TERM "$TEST_PID" 2>/dev/null || true
-                  pkill -TERM -P "$TEST_PID" 2>/dev/null || true
-                  kill -TERM "$TEE_PID" 2>/dev/null || true
+                  # Kill the parent and ALL child processes in order
+                  # 1. Freeze the parent process so it cannot spawn anything
+                  kill -STOP "$TEST_PID" || true
+                  # 2. Kill all existing child processes
+                  pkill -P "$TEST_PID" || true
+                  # 3. Kill the frozen parent process
+                  kill -KILL "$TEST_PID" || true
                   return
                 fi
               else
@@ -131,7 +135,7 @@ runs:
 
           exec {FIFO_FD}>"$FIFO"
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" --parallel ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 
