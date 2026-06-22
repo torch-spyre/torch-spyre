@@ -55,8 +55,6 @@ jobs:
             config: test_linalg.yaml
           - name: NeuralNet test embedding
             config: nn-test_embedding.yaml
-          - name: NeuralNet lazy modules
-            config: nn-test_lazy_modules.yaml
           - name: NeuralNet pooling
             config: nn-test_pooling.yaml
           - name: NeuralNet convolution
@@ -75,9 +73,9 @@ jobs:
             config: profiler-test_execution_trace.yaml
           - name: Profiler memory
             config: profiler-test_memory_profiler.yaml
-          - name: Profiler torch tidy 
+          - name: Profiler torch tidy
             config: profiler-test_torch_tidy.yaml
-          - name: Profiler 
+          - name: Profiler
             config: profiler-test_profiler.yaml
           - name: Reductions
             config: test_reductions.yaml

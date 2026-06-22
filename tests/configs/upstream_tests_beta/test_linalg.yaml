@@ -17,7 +17,7 @@ test_suite_config:
             - TestLinalg::test_lstsq_removed_error
             - TestLinalg::test_matrix_exp_backward_input_validation
             - TestLinalg::test_matrix_rank_removed_error
-            - TestLinalg::test_ormqr_errors_and_warnings 
+            - TestLinalg::test_ormqr_errors_and_warnings
             - TestLinalg::test_qr_error_cases
             - TestLinalg::test_solve_removed_error
             - TestLinalg::test_symeig_removed_error
