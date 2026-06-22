@@ -32,9 +32,10 @@ defaults:
     shell: bash
 
 permissions:
-  contents: write
+  contents: read
   checks: write
   pull-requests: read
+  actions: read 
 
 jobs:
   select_suites:
@@ -43,28 +44,63 @@ jobs:
     outputs:
       suites: ${{ steps.final_selection.outputs.suites }}
       has_suites: ${{ steps.final_selection.outputs.has_suites }}
-      is_first_run: ${{ steps.check_coverage.outputs.is_first_run }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Ensures complete history is visible for calculating exact branch diffs
+          fetch-depth: 0 
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Check if coverage directory exists
+      - name: Check if coverage artifacts exist in history
         id: check_coverage
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ ! -d "./coverage" ]] || [[ -z "$(ls -A ./coverage 2>/dev/null)" ]]; then
-            echo "is_first_run=true" >> "$GITHUB_OUTPUT"
+          FORCE_FIRST_RUN=false
+          
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TARGET_REPO="torch-spyre/torch-spyre"
+            TARGET_SHA=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            if [[ -z "$TARGET_SHA" ]]; then
+              FORCE_FIRST_RUN=true
+            fi
           else
-            echo "is_first_run=false" >> "$GITHUB_OUTPUT"
+            TARGET_REPO="${{ github.repository }}"
+            TARGET_SHA="${{ github.event.before }}"
+            if [[ -z "$TARGET_SHA" || "$TARGET_SHA" == "0000000000000000000000000000000000000000" ]]; then
+              TARGET_SHA=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+              if [[ -z "$TARGET_SHA" ]]; then
+                FORCE_FIRST_RUN=true
+              fi
+            fi
           fi
 
-      # INITIALIZATION BLOCK (Runs only when NO ./coverage exists)
+          RUN_ID=""
+          if [[ "$FORCE_FIRST_RUN" == "false" && -n "$TARGET_SHA" ]]; then
+            RUN_ID=$(gh run list \
+              --repo "$TARGET_REPO" \
+              --workflow "intelligent_test_selection.yaml" \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha==\"$TARGET_SHA\") | .databaseId" \
+              | head -n1)
+          fi
+
+          mkdir -p coverage
+          if [[ -n "$RUN_ID" ]]; then
+            if gh run download "$RUN_ID" --repo "$TARGET_REPO" -n complete-coverage-map -D coverage; then
+              echo "is_first_run=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_first_run=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "is_first_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # INITIALIZATION BLOCK (Runs only when NO baseline artifacts exist)
       - name: Action A (First Run Initialization via Matrix Parsing)
         if: steps.check_coverage.outputs.is_first_run == 'true'
         run: python3 scripts/get_all_torch_spyre_suites.py
@@ -82,10 +118,7 @@ jobs:
         id: git_diff
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            # Finds the exact historical commit where this branch split from main (the fork point)
             FORK_POINT=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
-            echo "Identified historical fork point commit target: $FORK_POINT"
-            
             ALL_CHANGED=$(git diff --name-only "$FORK_POINT" HEAD | tr '\n' ' ')
             ONLY_ADDED=$(git diff --name-only --diff-filter=A "$FORK_POINT" HEAD | tr '\n' ' ')
           else
@@ -93,12 +126,9 @@ jobs:
             if [[ -z "$TARGET" || "$TARGET" == "0000000000000000000000000000000000000000" ]]; then
               TARGET="HEAD~1"
             fi
-            echo "Comparing current HEAD against push baseline: $TARGET"
-            
             ALL_CHANGED=$(git diff --name-only "$TARGET" HEAD | tr '\n' ' ')
             ONLY_ADDED=$(git diff --name-only --diff-filter=A "$TARGET" HEAD | tr '\n' ' ')
           fi
-
           echo "changed_files=$ALL_CHANGED" >> "$GITHUB_OUTPUT"
           echo "added_files=$ONLY_ADDED" >> "$GITHUB_OUTPUT"
 
@@ -154,7 +184,6 @@ jobs:
     env:
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      # ADDED: Explicitly define this so the diagnostic tools and selected tests don't throw faults
       TORCH_ROOT: ''
     strategy:
       fail-fast: false
@@ -173,7 +202,6 @@ jobs:
       - name: Checkout pre-built torch-spyre
         uses: ./.github/actions/checkout-prebuilt-torch-spyre
         with:
-          # Leave 'ref' completely out; the action will auto-detect the PR/Push SHA flawlessly
           repository: ${{ github.event.pull_request.head.repo.clone_url || '' }}
 
       - name: Clean Stale Build Cache and Artifacts
@@ -198,73 +226,22 @@ jobs:
           cd "$CLONED_TORCH_SPYRE_DIR"
           source .venv/bin/activate
 
-          CONFIG="tests/configs/${{ matrix.suite.config }}"
-          SUITE_NAME="${{ matrix.suite.name }}_config"
+          # Automatically handle names like "Test Stream" -> "test_stream_config" folder pathing
+          SUITE_DIR=$(python3 -c "
+          import pathlib
+          p = pathlib.Path('${{ matrix.suite.config }}')
+          print(p.stem[:-7] if p.stem.endswith('_config') else p.stem)
+          ")_config
 
-          bash tests/run_test.sh "$CONFIG" -v \
+          bash tests/run_test.sh "${{ matrix.suite.config }}" -v \
             --cov=torch_spyre \
-            --cov-report=json:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/coverage.json \
-            --cov-report=html:/home/senuser/codebase/torch-spyre/coverage/$SUITE_NAME/htmlcov
-
-      - name: Upload coverage artifacts
+            --cov-report=json:/home/senuser/torch-spyre/coverage/$SUITE_DIR/coverage.json \
+  
+      # Upload directly into the master tracking artifact bundle
+      - name: Update Master Coverage Bundle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-${{ matrix.suite.name }}
-          path: /home/senuser/codebase/torch-spyre/coverage/${{ matrix.suite.name }}_config/
-          retention-days: 1
-
-  update_mappings:
-    name: Build Local Impact Mappings
-    needs: [select_suites, run_suites]
-    if: always() && needs.run_suites.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download coverage logs
-        uses: actions/download-artifact@v4
-        with:
-          path: coverage/
-          pattern: coverage-*
-
-      # FIX: Force the runner to switch to the active branch instead of a detached commit SHA
-      - name: Checkout Target Branch
-        run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "Targeting PR branch: ${{ github.head_ref }}"
-            git checkout ${{ github.head_ref }}
-          else
-            echo "Targeting branch: ${{ github.ref_name }}"
-            git checkout ${{ github.ref_name }}
-          fi
-
-      - name: Standardize Coverage Structure
-        run: |
-          cd coverage
-          for dir in coverage-*; do
-            suite_name="${dir#coverage-}"
-            if [[ -d "$dir" ]]; then
-              mkdir -p "../coverage/${suite_name}_config"
-              mv "$dir"/* "../coverage/${suite_name}_config/" 2>/dev/null || true
-              rmdir "$dir" 2>/dev/null || true
-            fi
-          done
-          cd ..
-
-      - name: Persist Generated Map Logs To Repo
-        run: |-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add coverage/ \
-                  mappings/selected_suites_by_rules.json 2>/dev/null || true
-
-          if git diff --staged --quiet; then
-            echo "No changes detected inside local mappings folder."
-          else
-            git commit -m "chore: update code impact target maps [skip ci]"
-            git push
-          fi
+          name: complete-coverage-map
+          path: /home/senuser/torch-spyre/coverage/
+          retention-days: 3
