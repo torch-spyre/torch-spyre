@@ -319,8 +319,8 @@ class SuperDSCScheduling(BaseScheduling):
                 var_ranges = iteration_space(node)
                 vars = list(var_ranges.keys())
                 index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
+                    vars[: len(node._sizes[0])],
+                    vars[len(node._sizes[0]) :],
                 ]
                 node.codegen(index_vars)
 
@@ -373,8 +373,8 @@ class SuperDSCScheduling(BaseScheduling):
                         var_ranges = iteration_space(snode)
                         vs = list(var_ranges.keys())
                         index_vars = [
-                            vs[: len(snode._body.iter_vars)],
-                            vs[len(snode._body.iter_vars) :],
+                            vs[: len(snode._sizes[0])],
+                            vs[len(snode._sizes[0]) :],
                         ]
                         snode.codegen(index_vars)
 
@@ -429,8 +429,8 @@ class SuperDSCScheduling(BaseScheduling):
                     var_ranges = iteration_space(snode)
                     vs = list(var_ranges.keys())
                     index_vars = [
-                        vs[: len(snode._body.iter_vars)],
-                        vs[len(snode._body.iter_vars) :],
+                        vs[: len(snode._sizes[0])],
+                        vs[len(snode._sizes[0]) :],
                     ]
                     snode.codegen(index_vars)
 
