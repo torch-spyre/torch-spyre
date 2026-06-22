@@ -21,6 +21,34 @@ from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
+@torch.library.custom_op("spyre::compact", mutates_args=(), device_types="spyre")
+def compact(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    # meant for sparse-stick tensors
+    # -> created from reduction along stick dimension
+    # also only works in compile mode
+
+    if x.dim() == 1:
+        d = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        # hack to induce restickify
+        # directly transposing and cloning does NOT work
+        return d + x.t()
+    elif x.dim() == 2:
+        d = torch.zeros((x.shape[0], x.shape[1]), device=x.device, dtype=x.dtype)
+
+        # double tranpose to get into right shape
+        return d + x.transpose(-1, -2).transpose(-1, -2)
+
+    else:
+        raise RuntimeError(
+            f"compact: unsupported input dimensionality {x.dim()}"
+        )
+
+@compact.register_fake
+def _(x: torch.Tensor):
+    return x.new_empty(x.size())
+
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(

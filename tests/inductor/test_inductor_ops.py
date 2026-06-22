@@ -5427,6 +5427,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
+    def test_compact(self):
+
+        # the compact op needs to be compiled
+        def fn(arg):
+            return torch.ops.spyre.compact(arg)
+
+        a = torch.ones((4, 64), dtype=torch.float16, device="spyre")
+        # reduce on the stick dimension to obtain a sparse tensor
+        b = a.sum(1)
+
+        # we have 4 rows, each a sparse stick with a single useful element
+        assert b.device_tensor_layout().device_size == [1, 4, 64]
+
+        cfn = torch.compile(fn)
+        c = cfn(b)
+
+        # after compaction we have a single stick
+        assert c.device_tensor_layout().device_size == [1, 64]
+
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
             B, S, E = q.shape
