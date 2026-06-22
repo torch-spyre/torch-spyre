@@ -174,7 +174,6 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
           - name: Inductor Ops Misc Compute A
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
-            runner: spyre_pf_x4
           - name: Inductor Ops Misc Compute B
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
           - name: Inductor Ops Misc Compute C
@@ -182,6 +181,7 @@ jobs:
             runner: spyre_pf_x4
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Scalar
             config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
           - name: Inductor Logging
