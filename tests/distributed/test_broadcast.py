@@ -44,11 +44,6 @@ except ValueError:
         allow_module_level=True,
     )
 
-# ------------
-# Temporary hack
-torch.spyre._impl._lazy_init()
-# ------------
-
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 

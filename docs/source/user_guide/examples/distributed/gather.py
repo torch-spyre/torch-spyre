@@ -23,6 +23,8 @@ def run_test(comm_rank, comm_size):
     """Run a gather test where each rank contributes a unique tensor."""
     global DEVICE
 
+    dst_rank = 0
+
     # Each rank creates a tensor filled with its rank+1 value
     input_tensor = torch.zeros(128, dtype=torch.float16)
     input_tensor.fill_(float(comm_rank + 1))
@@ -36,16 +38,16 @@ def run_test(comm_rank, comm_size):
 
     # Prepare output tensors (only needed at root, but we prepare for all for simplicity)
     output_list = None
-    if comm_rank == 0:
+    if comm_rank == dst_rank:
         # Root rank prepares a list to receive tensors from all ranks
         output_list = [torch.zeros_like(input_device) for _ in range(comm_size)]
 
     # Gather with the collective library
     print(f"[{comm_rank} of {comm_size}] Gather Tensor: Spyre")
-    dist.gather(input_device, gather_list=output_list, dst=0)
+    dist.gather(input_device, gather_list=output_list, dst=dst_rank)
 
     # Check the result at root
-    if comm_rank == 0:
+    if comm_rank == dst_rank:
         print(f"[{comm_rank} of {comm_size}] Gathered tensors at root:")
         all_correct = True
         for rank_idx in range(comm_size):
