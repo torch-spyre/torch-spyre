@@ -38,7 +38,7 @@ jobs:
       - x86_64
       - spyre_pf_x0
       - linux
-      - image_torch_spyre
+      - image_spyre_backend
     timeout-minutes: 15
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
@@ -91,9 +91,20 @@ jobs:
           sparse-checkout: |
             .github/scripts/ingest_xml.py
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: setup venv
+        run: |
+          pwd
+          ls -la
+          uv venv
+          source .venv/bin/activate
+          echo "VIRTUAL_ENV $VIRTUAL_ENV"
+
       - name: Install Python dependencies
         run: |
-          source /home/senuser/torch-spyre/.venv/bin/activate
+          source .venv/bin/activate
           uv pip install requests clickhouse-driver clickhouse-connect lxml
 
       - name: Install gh CLI
@@ -165,7 +176,7 @@ jobs:
       # ---------------------------------------------------------------------------
       - name: Ingest XML files into ClickHouse
         run: |
-          source /home/senuser/torch-spyre/.venv/bin/activate
+          source .venv/bin/activate
           python3 .github/scripts/ingest_xml.py \
             --xml-dir xml_artifacts \
             --workflow "${TRIGGERING_WORKFLOW}" \

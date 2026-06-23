@@ -8,7 +8,6 @@ name: Test matrix (reusable)
 #   - runner_label      : linux
 #   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
 #   - checkout_pytorch  : false (PR) vs true (nightly)
-#   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
 #   - ref / rpm_*       : forwarded from workflow_dispatch inputs
 # ---------------------------------------------------------------------------
 on:
@@ -21,16 +20,16 @@ on:
         type: string
 
       # IMAGE selector label for runs-on. Normal runs use the standing
-      # image_torch_spyre set; the per-PR ephemeral flow passes that PR's set
-      # label (image_torch_spyre_pr_<component>_<sha12>, e.g.
-      # image_torch_spyre_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
+      # image_spyre_backend set; the per-PR ephemeral flow passes that PR's set
+      # label (image_spyre_backend_pr_<component>_<sha12>, e.g.
+      # image_spyre_backend_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
       # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
       # unchanged.
       image_label:
-        description: Image scaleSetLabel to select (image_torch_spyre | image_torch_spyre_pr_<KEY>)
+        description: Image scaleSetLabel to select (image_spyre_backend | image_spyre_backend_pr_<KEY>)
         required: false
         type: string
-        default: image_torch_spyre
+        default: image_spyre_backend
 
       # Flags appended to every `bash tests/run_test.sh <config>` call
       extra_test_flags:
@@ -38,19 +37,12 @@ on:
         required: true
         type: string
 
-      # Whether to run checkout-prebuilt-pytorch (nightly only)
+      # Whether to run checkout-pytorch (nightly only)
       checkout_pytorch:
         description: Whether to check out the pre-built PyTorch tree
         required: false
         type: boolean
         default: false
-
-      # TORCH_ROOT value; empty string means the env var is not set
-      torch_root:
-        description: Path to the pre-cloned PyTorch repo (leave empty to omit)
-        required: false
-        type: string
-        default: ''
 
       # workflow_dispatch pass-throughs
       ref:
@@ -99,9 +91,6 @@ jobs:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
       # Explicitly clear it.
       CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      # TORCH_ROOT is only set when the caller passes a non-empty value.
-      TORCH_ROOT: ${{ inputs.torch_root }}
 
     strategy:
       fail-fast: false
@@ -235,40 +224,19 @@ jobs:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.ref }}
-          repository: ${{ inputs.repository }}
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
-        uses: ./.github/actions/checkout-prebuilt-pytorch
+        uses: ./.github/actions/checkout-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
-
-      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
-      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
-      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
-      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
-      - name: Download RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/download-rpms
-        with:
-          rpm_location: ${{ inputs.rpm_location }}
-          rpm_names: ${{ inputs.rpm_names }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Install RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        run: |
-          ls -la
-          ls -la rpms/
-          sudo dnf install -y rpms/*.rpm
 
       - name: Build torch-spyre
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
@@ -319,8 +287,6 @@ jobs:
     timeout-minutes: 60
     env:
       CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      TORCH_ROOT: ${{ inputs.torch_root }}
 
     strategy:
       fail-fast: false
@@ -340,40 +306,19 @@ jobs:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.ref }}
-          repository: ${{ inputs.repository }}
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
-        uses: ./.github/actions/checkout-prebuilt-pytorch
+        uses: ./.github/actions/checkout-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
-
-      # LEGACY runtime-RPM path. The per-PR ephemeral flow bakes the RPM into the
-      # image and sends an EMPTY rpm_names, so both RPM steps below auto-skip (no
-      # runtime `sudo dnf` — sudo is unreliable on the cluster SCC). Kept gated for
-      # the legacy path; remove once the USE_EPHEMERAL_RUNNERS=false path is retired.
-      - name: Download RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/download-rpms
-        with:
-          rpm_location: ${{ inputs.rpm_location }}
-          rpm_names: ${{ inputs.rpm_names }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Install RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        run: |
-          ls -la
-          ls -la rpms/
-          sudo dnf install -y rpms/*.rpm
 
       - name: Build torch-spyre
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
