@@ -20,7 +20,7 @@ several:
 |---|---|---|
 | Python API | `torch_spyre/profiler/` | `profile_spyre()` wrapper, `torch.spyre.memory_*` |
 | C++ registration | `torch_spyre/csrc/profiler/` | PrivateUse1 observer, kineto wiring |
-| Build | `CMakeLists.txt`, `torch_spyre/csrc/profiler/CMakeLists.txt` | Guarded by `USE_SPYRE_PROFILER` |
+| Build | `setup.py` (setuptools `CppExtension`) | Guarded by `USE_SPYRE_PROFILER` (mirrors `USE_SPYRE_CCL`) |
 | Tests | `tests/profiler/` | Skip-marked when `USE_SPYRE_PROFILER` is off |
 | External | [`kineto-spyre`][kineto-spyre], [`aiu-trace-analyzer`][ata] | Versioned separately |
 | Docs | `docs/source/user_guide/profiling/` | User-visible additions |
@@ -34,7 +34,7 @@ tells the reviewer what each branch is about without opening the PR:
 
 | Prefix | Use for |
 |---|---|
-| `profiler/build-…` | Build system, CMake, linking, `USE_SPYRE_PROFILER` |
+| `profiler/build-…` | Build system (`setup.py`), linking, `USE_SPYRE_PROFILER` |
 | `profiler/reg-…` | C++ registration, PrivateUse1 plugin loading |
 | `profiler/api-…` | Python APIs in `torch_spyre/profiler/` |
 | `profiler/trace-…` | Trace enrichment, post-processing, Perfetto grouping |
@@ -44,7 +44,7 @@ tells the reviewer what each branch is about without opening the PR:
 | `profiler/feat-…` | Multi-PR feature work |
 | `profiler/fix-…` | Bug fixes |
 
-Keep `<short-description>` to **3–5 hyphenated words**. `cmake-libaiupti`
+Keep `<short-description>` to **3–5 hyphenated words**. `link-libaiupti`
 is about right. `sol` is too terse to read at a glance, and
 `tex-scratchpad-vram-sol-average` should be split into smaller PRs.
 
@@ -89,8 +89,9 @@ for.
 
 ## Building with the profiler enabled
 
-The profiler is gated by a CMake flag so torch-spyre still imports
-cleanly without it. Local development usually wants it on:
+The profiler is gated by the `USE_SPYRE_PROFILER` build flag (read by `setup.py`,
+default off) so torch-spyre still imports cleanly without it. Local development
+usually wants it on:
 
 ```bash
 USE_SPYRE_PROFILER=1 pip install -e . --no-build-isolation
