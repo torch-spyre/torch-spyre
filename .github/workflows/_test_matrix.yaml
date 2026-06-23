@@ -8,7 +8,6 @@ name: Test matrix (reusable)
 #   - runner_label      : linux
 #   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
 #   - checkout_pytorch  : false (PR) vs true (nightly)
-#   - torch_root        : "" (PR) vs "/home/senuser/pytorch" (nightly)
 #   - ref / rpm_*       : forwarded from workflow_dispatch inputs
 # ---------------------------------------------------------------------------
 on:
@@ -20,25 +19,30 @@ on:
         required: true
         type: string
 
+      # IMAGE selector label for runs-on. Normal runs use the standing
+      # image_spyre_backend set; the per-PR ephemeral flow passes that PR's set
+      # label (image_spyre_backend_pr_<component>_<sha12>, e.g.
+      # image_spyre_backend_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
+      # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
+      # unchanged.
+      image_label:
+        description: Image scaleSetLabel to select (image_spyre_backend | image_spyre_backend_pr_<KEY>)
+        required: false
+        type: string
+        default: image_spyre_backend
+
       # Flags appended to every `bash tests/run_test.sh <config>` call
       extra_test_flags:
         description: Extra flags passed to run_test.sh (e.g. "-v" or "--cpu-compile -vvv -s")
         required: true
         type: string
 
-      # Whether to run checkout-prebuilt-pytorch (nightly only)
+      # Whether to run checkout-pytorch (nightly only)
       checkout_pytorch:
         description: Whether to check out the pre-built PyTorch tree
         required: false
         type: boolean
         default: false
-
-      # TORCH_ROOT value; empty string means the env var is not set
-      torch_root:
-        description: Path to the pre-cloned PyTorch repo (leave empty to omit)
-        required: false
-        type: string
-        default: ''
 
       # workflow_dispatch pass-throughs
       ref:
@@ -79,17 +83,14 @@ jobs:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
-      - spyre_pf_x1
+      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
       # Explicitly clear it.
       CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      # TORCH_ROOT is only set when the caller passes a non-empty value.
-      TORCH_ROOT: ${{ inputs.torch_root }}
 
     strategy:
       fail-fast: false
@@ -110,6 +111,8 @@ jobs:
             config: torch_spyre_tests/test_execution_trace_config.yaml
           - name: Test Spyre Lazy Silent
             config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
+          - name: Test Spyre Lazy Init
+            config: torch_spyre_tests/test_spyre_lazy_init_config.yaml
           - name: Test Stream
             config: torch_spyre_tests/test_stream_config.yaml
           - name: Test Spyre Profiler
@@ -120,6 +123,8 @@ jobs:
             config: torch_spyre_tests/test_allocator_e2e_config.yaml
           - name: Test Launch Jobplan
             config: torch_spyre_tests/test_launch_jobplan_config.yaml
+          - name: Test logging patterns
+            config: torch_spyre_tests/test_logging_patterns_config.yaml
           # ---- Inductor tests ----
           - name: Inductor Building Blocks
             config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
@@ -149,12 +154,25 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
           - name: Inductor Ops Pointwise
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc Shape
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml
-          - name: Inductor Ops Misc Compute
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml
+          - name: Inductor Ops Misc Shape A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
+            runner: spyre_pf_x4
+          - name: Inductor Ops Misc Shape B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
+          - name: Inductor Ops Misc Shape C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
+          - name: Inductor Ops Misc Compute A
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
+          - name: Inductor Ops Misc Compute B
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
+          - name: Inductor Ops Misc Compute C
+            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
+            runner: spyre_pf_x4
+          - name: Inductor Ops FP8
+            config: torch_spyre_tests/inductor/test_inductor_ops_fp8_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Scalar
             config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
           - name: Inductor Logging
@@ -206,36 +224,19 @@ jobs:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.ref }}
-          repository: ${{ inputs.repository }}
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
-        uses: ./.github/actions/checkout-prebuilt-pytorch
+        uses: ./.github/actions/checkout-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
-
-      - name: Download RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/download-rpms
-        with:
-          rpm_location: ${{ inputs.rpm_location }}
-          rpm_names: ${{ inputs.rpm_names }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Install RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        run: |
-          ls -la
-          ls -la rpms/
-          sudo dnf install -y rpms/*.rpm
 
       - name: Build torch-spyre
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
@@ -257,6 +258,12 @@ jobs:
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
 
       - name: Upload JUnit XML report
         if: always()
@@ -276,12 +283,10 @@ jobs:
       - x86_64
       - spyre_pf_x2
       - ${{ inputs.runner_label }}
-      - image_torch_spyre
+      - ${{ inputs.image_label }}
     timeout-minutes: 60
     env:
       CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      TORCH_ROOT: ${{ inputs.torch_root }}
 
     strategy:
       fail-fast: false
@@ -301,36 +306,19 @@ jobs:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.ref }}
-          repository: ${{ inputs.repository }}
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
 
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
-        uses: ./.github/actions/checkout-prebuilt-pytorch
+        uses: ./.github/actions/checkout-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
-
-      - name: Download RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        uses: ./.github/actions/download-rpms
-        with:
-          rpm_location: ${{ inputs.rpm_location }}
-          rpm_names: ${{ inputs.rpm_names }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Install RPMs
-        if: ${{ inputs.rpm_names != '' }}
-        run: |
-          ls -la
-          ls -la rpms/
-          sudo dnf install -y rpms/*.rpm
 
       - name: Build torch-spyre
         if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}

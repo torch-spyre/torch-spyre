@@ -36,7 +36,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_torch_spyre
+      - image_spyre_backend
     timeout-minutes: 60
     env:
       # The CI env var is very important.
@@ -45,10 +45,6 @@ jobs:
       # due to a mix of fallbacks and decompositions.
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      # The new torch-spyre image already contains a pre-cloned pytorch
-      # repo at /home/senuser/pytorch which TORCH_ROOT must point at.
-      TORCH_ROOT: /home/senuser/pytorch
     # ---------------------------------------------------------------------------
     # To add a new module test suite, append an entry here:
     #   - name: <human-readable label shown in the GHA UI>
@@ -63,21 +59,27 @@ jobs:
         suite:
           - name: Granite 3.3 8B Instruct
             config: granite_3_3_8b_instruct_spyre.yaml
+          - name: Granite 4.1 8B
+            config: granite_4_1_8b_spyre.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Ministral 3 14B 2512
+            config: Ministral-3-14B-Instruct-2512.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
-      # actions under .github/actions/ are available. The pre-cloned
-      # repo at $CLONED_TORCH_SPYRE_DIR is what the tests actually run
-      # against.
+      # actions under .github/actions/ are available.
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: ./.github/actions/checkout-prebuilt-torch-spyre
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
 
-      - uses: ./.github/actions/checkout-prebuilt-pytorch
+      - uses: ./.github/actions/checkout-pytorch
 
       - uses: ./.github/actions/gather-runner-info
         with:
@@ -97,7 +99,6 @@ jobs:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/module_tests/${{ matrix.suite.config }}
           extra_test_flags: -v
-          work_dir: ${{ env.CLONED_TORCH_SPYRE_DIR }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
       # ---------------------------------------------------------------------------

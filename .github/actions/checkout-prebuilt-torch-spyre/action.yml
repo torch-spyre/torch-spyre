@@ -1,7 +1,15 @@
+# =======================================================================
+# TODO: remove this action entirely
+# LEGACY: we are using spyre-backend image and normal checkout action now
+# =======================================================================
+
 name: Checkout torch-spyre in pre-cloned image
 description: |
+  TODO: remove this action entirely
+  LEGACY: we are using spyre-backend image and normal checkout action now
+
   Checks out the workflow's target SHA inside the pre-cloned torch-spyre
-  directory baked into the image_torch_spyre runner image. Prefers the PR
+  directory baked into the image_spyre_backend runner image. Prefers the PR
   head SHA when triggered by pull_request, otherwise falls back to the SHA
   of the push, tag, schedule, or merge_group event that triggered the
   workflow.
@@ -10,6 +18,8 @@ inputs:
   cloned-dir:
     description: Path to the pre-cloned torch-spyre directory in the image.
     required: false
+    # TODO: remove this action entirely
+    # LEGACY: we are using spyre-backend image and normal checkout action now
     default: /home/senuser/torch-spyre
   ref:
     description: |
