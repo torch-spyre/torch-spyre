@@ -1063,6 +1063,13 @@ def generate_sdsc(
                                                     else {"-1": str(gap)}
                                                 )
                                                 for dim, gap in tensor.backGap.items()
+                                                if str(dim)
+                                                in {
+                                                    str(d)
+                                                    for d in _tensor_layout_dims(
+                                                        tensor.layout
+                                                    )
+                                                }
                                             }
                                         }
                                         if tensor.backGap
