@@ -201,6 +201,25 @@ else
         exit 1
     fi
 
+    # -----------------------------------------------------------------------
+    # Pre-merge: record which raw path tokens each YAML contributes.
+    # Used later to assign a per-YAML label to every entry in TEST_FILES so
+    # we can print per-suite result summaries at the end of the run.
+    #
+    # _YAML_FILE_SETS[k] is a newline-free space-joined string of the raw
+    # path tokens from YAML_CONFIGS[k] (before variable expansion/glob).
+    # Matching against TEST_FILES (which ARE expanded) is done in step 7b.
+    # -----------------------------------------------------------------------
+    _YAML_FILE_SETS=()
+    for _yc in "${YAML_CONFIGS[@]}"; do
+        _raw_tokens=$(grep -E '^\s*(- )?path:\s' "$_yc" 2>/dev/null \
+            | sed 's/.*path:[[:space:]]*//' \
+            | sed 's/[[:space:]]*#.*//' \
+            | sed '/^[[:space:]]*$/d' \
+            | tr '\n' '|')
+        _YAML_FILE_SETS+=("${_raw_tokens:-}")
+    done
+
     YAML_CONFIG=$(python3 "$_UTILITIES_PY" "${YAML_CONFIGS[@]}") || {
         echo "ERROR: Failed to merge YAML configs." >&2
         exit 1
@@ -482,6 +501,51 @@ for f in "${TEST_FILES[@]}"; do
     echo "  $f"
 done
 echo ""
+
+# ---------------------------------------------------------------------------
+# 7b. Per-YAML file-index mapping (multi-config only)
+#
+# Build _FILE_YAML_LABEL[i] = human-readable label for TEST_FILES[i].
+# For single-config runs every entry gets the config basename.
+# For multi-config runs each entry is labelled with the basename of the first
+# YAML whose raw path token list contains a substring that matches the
+# resolved absolute path of that file.  Deduplication inside merge means a
+# file shared by two YAMLs is credited to whichever YAML appeared first.
+# ---------------------------------------------------------------------------
+_FILE_YAML_LABEL=()
+if [[ ${#YAML_CONFIGS[@]} -le 1 ]]; then
+    # Single config — label every file the same.
+    _single_label="$(basename "${YAML_CONFIGS[0]:-$YAML_CONFIG}")"
+    for _fi in "${!TEST_FILES[@]}"; do
+        _FILE_YAML_LABEL+=("$_single_label")
+    done
+else
+    for _fi in "${!TEST_FILES[@]}"; do
+        _abs_f="${TEST_FILES[$_fi]}"
+        _label=""
+        for _yi in "${!YAML_CONFIGS[@]}"; do
+            _token_str="${_YAML_FILE_SETS[$_yi]:-}"
+            # Each token is separated by '|'. Check if the expanded file
+            # path matches any token after variable substitution.
+            IFS='|' read -ra _tokens <<< "$_token_str"
+            for _tok in "${_tokens[@]}"; do
+                [[ -z "$_tok" ]] && continue
+                # Expand the same two root variables used in step 6.
+                _etok="${_tok//\$\{TORCH_ROOT\}/$TORCH_ROOT}"
+                _etok="${_etok//\$\{TORCH_DEVICE_ROOT\}/$TORCH_DEVICE_ROOT}"
+                # Strip glob wildcards for prefix/substring matching.
+                _etok_base="${_etok%%\**}"
+                _etok_base="${_etok_base%%\?*}"
+                if [[ -n "$_etok_base" && "$_abs_f" == *"$_etok_base"* ]]; then
+                    _label="$(basename "${YAML_CONFIGS[$_yi]}")"
+                    break 2
+                fi
+            done
+        done
+        # Fallback: label unknown files with the merged config basename.
+        _FILE_YAML_LABEL+=("${_label:-$(basename "$YAML_CONFIG")}")
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 8. AST analyzer
@@ -1344,6 +1408,65 @@ done
 _XML_SHARDS=()
 
 # ---------------------------------------------------------------------------
+# Per-suite result tracking (multi-config only).
+#
+# _SUITE_LABELS[]   - unique YAML labels in first-seen order
+# _SUITE_COUNTS[]   - parallel to _SUITE_LABELS; each entry is a
+#                     space-separated string: "passed failed error skipped xfailed xpassed"
+#                     Counts are accumulated across all files belonging to that suite.
+#
+# _add_suite_counts <label> <passed> <failed> <error> <skipped> <xfailed> <xpassed>
+#   Looks up <label> in _SUITE_LABELS; appends if new, then adds the counts.
+# ---------------------------------------------------------------------------
+_SUITE_LABELS=()
+_SUITE_COUNTS=()
+
+_add_suite_counts() {
+    local _lbl="$1" _p="$2" _f="$3" _e="$4" _s="$5" _xf="$6" _xp="$7"
+    local _idx=-1
+    for _ci in "${!_SUITE_LABELS[@]}"; do
+        [[ "${_SUITE_LABELS[$_ci]}" == "$_lbl" ]] && { _idx=$_ci; break; }
+    done
+    if [[ $_idx -eq -1 ]]; then
+        _SUITE_LABELS+=("$_lbl")
+        _SUITE_COUNTS+=("$_p $_f $_e $_s $_xf $_xp")
+    else
+        local _cur="${_SUITE_COUNTS[$_idx]}"
+        read -r _cp _cf _ce _cs _cxf _cxp <<< "$_cur"
+        _SUITE_COUNTS[$_idx]="$(( _cp+_p )) $(( _cf+_f )) $(( _ce+_e )) $(( _cs+_s )) $(( _cxf+_xf )) $(( _cxp+_xp ))"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# _parse_pytest_summary_line <output_file>
+#
+# Reads the captured pytest output file, finds the terminal summary line
+# (e.g. "5 passed, 2 failed, 1 skipped, 1 xfailed in 3.14s"), and prints
+# space-separated: passed failed error skipped xfailed xpassed
+# Prints "0 0 0 0 0 0" when no summary line is found.
+# ---------------------------------------------------------------------------
+_parse_pytest_summary_line() {
+    local _f="$1"
+    [[ -f "$_f" ]] || { echo "0 0 0 0 0 0"; return; }
+    # The summary line is the last line matching one of the known result words.
+    local _line
+    _line=$(grep -E '(passed|failed|error|skipped|xfailed|xpassed)' "$_f" \
+            | grep -v '^\s*#' | tail -1) || true
+    if [[ -z "$_line" ]]; then
+        echo "0 0 0 0 0 0"; return
+    fi
+    # Extract each counter with a portable sed; default to 0 when absent.
+    local _p _f2 _e _s _xf _xp
+    _p=$(echo  "$_line" | grep -oE '[0-9]+ passed'  | grep -oE '[0-9]+' || echo 0)
+    _f2=$(echo "$_line" | grep -oE '[0-9]+ failed'  | grep -oE '[0-9]+' || echo 0)
+    _e=$(echo  "$_line" | grep -oE '[0-9]+ error'   | grep -oE '[0-9]+' || echo 0)
+    _s=$(echo  "$_line" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)
+    _xf=$(echo "$_line" | grep -oE '[0-9]+ xfailed' | grep -oE '[0-9]+' || echo 0)
+    _xp=$(echo "$_line" | grep -oE '[0-9]+ xpassed' | grep -oE '[0-9]+' || echo 0)
+    echo "${_p:-0} ${_f2:-0} ${_e:-0} ${_s:-0} ${_xf:-0} ${_xp:-0}"
+}
+
+# ---------------------------------------------------------------------------
 # XML shard merger: combines N JUnit XML files (each produced by a separate
 # pytest run) into one, summing suite-level counters and concatenating all
 # <testcase> elements (which already carry their injected <properties> tags).
@@ -1398,23 +1521,34 @@ print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {
 '
 
 # ---------------------------------------------------------------------------
-# _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> [pytest_args...]
+# _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> <output_tmp> \
+#                      [pytest_args...]
 #
 # Runs a single pytest invocation inside a subshell that is fully isolated
 # from the parent process's errexit/pipefail settings.  The real pytest exit
-# code is written to <exit_tmp> so the caller can read it even when the
-# subshell itself exits non-zero.  The subshell's stdout/stderr are NOT
-# redirected so output streams to the terminal as usual.
+# code is written to <exit_tmp>.
+#
+# <output_tmp>: path to capture combined stdout+stderr via tee while still
+#   streaming to the terminal.  Pass "" to skip capture.
 #
 # Returns 0 always; caller reads <exit_tmp> for the real exit code.
 # ---------------------------------------------------------------------------
 _run_pytest_isolated() {
-    local _dir="$1" _base="$2" _exit_tmp="$3"
-    shift 3
+    local _dir="$1" _base="$2" _exit_tmp="$3" _out_tmp="$4"
+    shift 4
     local _args=("$@")
     (
         set +euo pipefail
         cd "$_dir"
+
+        # Helper: run a command, tee its output when _out_tmp is set.
+        _run_cmd() {
+            if [[ -n "$_out_tmp" ]]; then
+                "$@" 2>&1 | tee "$_out_tmp"; echo "${PIPESTATUS[0]}" > "$_exit_tmp"
+            else
+                "$@"; echo $? > "$_exit_tmp"
+            fi
+        }
 
         if [[ "$_dir" == *"/distributed"* ]] || [[ "$_dir" == *"/distributed" ]]; then
             # Check that AIU_WORLD_SIZE is set
@@ -1434,16 +1568,14 @@ _run_pytest_isolated() {
             mkdir -p "${_LOGDIR}"
 
             # Run with split_output.sh wrapper
-            torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
-            echo $? > "$_exit_tmp"
+            _run_cmd torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
             # Regular pytest for non-distributed tests
-            python3 -m pytest "$_base" "${_args[@]}"
-            echo $? > "$_exit_tmp"
+            _run_cmd python3 -m pytest "$_base" "${_args[@]}"
         fi
     ) || true
 }
@@ -1470,15 +1602,17 @@ _run_pytest_isolated() {
 #   $3  original_file -- original source path (logging only)
 #   $4  exit_tmp      -- temp file path for exit code (reused from caller)
 #   $5  shard_xml     -- destination XML path (empty if no --junit-xml)
+#   $6  suite_label   -- YAML label for per-suite accumulation (may be "")
 #   rest              -- extra pytest args (already stripped of --junit-xml)
 #
 # Side-effects:
 #   - Updates global OVERALL_EXIT.
 #   - Injects XML tags into shard_xml when present.
+#   - Accumulates per-suite counts into _SUITE_LABELS/_SUITE_COUNTS.
 # ---------------------------------------------------------------------------
 _run_xdist_fallback() {
-    local _dir="$1" _base="$2" _orig="$3" _exit_tmp="$4" _shard_xml="$5"
-    shift 5
+    local _dir="$1" _base="$2" _orig="$3" _exit_tmp="$4" _shard_xml="$5" _suite_lbl="$6"
+    shift 6
     local _extra=("$@")
 
     export SPYRE_TEST_FILE="${_dir}/${_base}"
@@ -1504,7 +1638,8 @@ _run_xdist_fallback() {
     local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
     [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
 
-    _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "${_xdist_args[@]}"
+    local _xdist_out_tmp="/tmp/_spyre_xdist_out_${$}_$$.tmp"
+    _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
 
     local _xexit=139
     if [[ -f "$_exit_tmp" ]]; then
@@ -1513,6 +1648,13 @@ _run_xdist_fallback() {
     else
         echo "[torch_oot_device_tests_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
     fi
+
+    # Accumulate per-suite counts from xdist output (multi-config only).
+    if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" && -f "$_xdist_out_tmp" ]]; then
+        read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_xdist_out_tmp")"
+        _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}"
+    fi
+    rm -f "$_xdist_out_tmp"
 
     # Propagate test failures from the xdist fallback run.
     if [[ $_xexit -eq 1 ]]; then
@@ -1727,18 +1869,23 @@ _run_parallel_across_cards() {
     local -a _card_pids=()
     local -a _card_exit_files=()
     local -a _card_shard_list_files=()
+    local -a _card_counts_files=()
 
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _card_exit_tmp="/tmp/_spyre_card_exit_${$}_${_k}.tmp"
         local _card_shard_list="/tmp/_spyre_card_shards_${$}_${_k}.tmp"
+        local _card_counts_file="/tmp/_spyre_card_counts_${$}_${_k}.tmp"
         _card_exit_files+=("$_card_exit_tmp")
         _card_shard_list_files+=("$_card_shard_list")
+        _card_counts_files+=("$_card_counts_file")
         : > "$_card_shard_list"
+        : > "$_card_counts_file"
 
         local _subshell_card="$_k"
         local _subshell_id_file="${_card_id_files[$_k]}"
         local _subshell_exit_tmp="$_card_exit_tmp"
         local _subshell_shard_list="$_card_shard_list"
+        local _subshell_counts_file="$_card_counts_file"
 
         (
             set +euo pipefail
@@ -1820,13 +1967,14 @@ _run_parallel_across_cards() {
                 # the collection step above.  Pass them directly as pytest
                 # collection targets (run from run_dir).
                 local -a _id_args=("${_node_ids[@]}")
+                local _par_out_tmp="/tmp/_spyre_par_out_${$}_card${_subshell_card}_${_fidx}.tmp"
                 # Run pytest with this card's node IDs as the collection targets
                 # instead of the bare filename so only this card's slice runs.
                 (
                     set +euo pipefail
                     cd "$run_dir"
-                    python3 -m pytest "${_id_args[@]}" "${_file_args[@]}"
-                    echo $? > "$_exit_tmp"
+                    python3 -m pytest "${_id_args[@]}" "${_file_args[@]}" 2>&1 | tee "$_par_out_tmp"
+                    echo "${PIPESTATUS[0]}" > "$_exit_tmp"
                 ) || true
 
                 local _exit=0
@@ -1837,6 +1985,14 @@ _run_parallel_across_cards() {
                     _exit=139
                     echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally for $original_file" >&2
                 fi
+
+                # Accumulate per-suite counts (multi-config only, clean runs).
+                if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
+                    _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                    read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_par_out_tmp")"
+                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0}" >> "$_subshell_counts_file"
+                fi
+                rm -f "$_par_out_tmp"
 
                 # XML tag injection for clean runs.
                 if [[ -n "$_shard_xml" && -f "$_shard_xml" && $_exit -lt 128 ]]; then
@@ -1860,11 +2016,12 @@ _run_parallel_across_cards() {
                         echo "[torch_oot_device_tests_run] WARNING: pytest exited with signal (code $_exit) on card ${_subshell_card}" >&2
                         if python3 -c "import xdist" 2>/dev/null; then
                             local -a _xdist_args=("-n1" "${_file_args[@]+"${_file_args[@]}"}")
+                            local _xdist_par_out="/tmp/_spyre_par_xdist_out_${$}_card${_subshell_card}_${_fidx}.tmp"
                             (
                                 set +euo pipefail
                                 cd "$run_dir"
-                                python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}"
-                                echo $? > "$_exit_tmp"
+                                python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}" 2>&1 | tee "$_xdist_par_out"
+                                echo "${PIPESTATUS[0]}" > "$_exit_tmp"
                             ) || true
                             if [[ -f "$_exit_tmp" ]]; then
                                 local _xexit; _xexit=$(< "$_exit_tmp"); rm -f "$_exit_tmp"
@@ -1872,7 +2029,14 @@ _run_parallel_across_cards() {
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
                                 fi
+                                # Accumulate counts from xdist retry output.
+                                if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
+                                    _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                                    read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_xdist_par_out")"
+                                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0}" >> "$_subshell_counts_file"
+                                fi
                             fi
+                            rm -f "$_xdist_par_out"
                         else
                             echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — skipping xdist fallback for card ${_subshell_card}." >&2
                             [[ $_card_overall -eq 0 ]] && _card_overall=1
@@ -1918,6 +2082,17 @@ _run_parallel_across_cards() {
                 [[ -n "$_s" ]] && _XML_SHARDS+=("$_s")
             done < "$_shard_list"
             rm -f "$_shard_list"
+        fi
+
+        # Read per-suite counts written by the card subshell.
+        local _counts_file="${_card_counts_files[$_k]}"
+        if [[ -f "$_counts_file" ]]; then
+            while IFS= read -r _cline; do
+                [[ -z "$_cline" ]] && continue
+                read -r _clbl _cp _cf _ce _cs _cxf _cxp <<< "$_cline"
+                _add_suite_counts "$_clbl" "${_cp:-0}" "${_cf:-0}" "${_ce:-0}" "${_cs:-0}" "${_cxf:-0}" "${_cxp:-0}"
+            done < "$_counts_file"
+            rm -f "$_counts_file"
         fi
 
         rm -f "${_card_id_files[$_k]}"
@@ -2041,9 +2216,10 @@ for i in "${!RUN_FILES[@]}"; do
     export OOT_TEST_FILE="$run_file"
 
     _EXIT_TMP="/tmp/_spyre_pytest_exit_${$}_${i}.tmp"
+    _OUT_TMP="/tmp/_spyre_pytest_out_${$}_${i}.tmp"
     _exit=0
 
-    _run_pytest_isolated "$run_dir" "$run_basename" "$_EXIT_TMP" "${_FILE_PYTEST_ARGS[@]}"
+    _run_pytest_isolated "$run_dir" "$run_basename" "$_EXIT_TMP" "$_OUT_TMP" "${_FILE_PYTEST_ARGS[@]}"
 
     if [[ -f "$_EXIT_TMP" ]]; then
         _exit=$(< "$_EXIT_TMP")
@@ -2053,6 +2229,14 @@ for i in "${!RUN_FILES[@]}"; do
         _exit=139
         echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
     fi
+
+    # Accumulate per-suite counts from pytest terminal output (multi-config only).
+    if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_OUT_TMP" && $_exit -lt 128 ]]; then
+        _suite_label="${_FILE_YAML_LABEL[$i]:-unknown}"
+        read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_OUT_TMP")"
+        _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}"
+    fi
+    rm -f "$_OUT_TMP"
 
     # Post-process XML to inject YAML tags as <properties>.
     # Only do this for a clean or test-failure run (not for signal exits that
@@ -2120,6 +2304,7 @@ for i in "${!RUN_FILES[@]}"; do
             _run_xdist_fallback \
                 "$run_dir" "$run_basename" "$original_file" \
                 "$_EXIT_TMP" "$_SHARD_XML" \
+                "${_FILE_YAML_LABEL[$i]:-unknown}" \
                 "${_FALLBACK_ARGS[@]+"${_FALLBACK_ARGS[@]}"}"
 
             # OVERALL_EXIT updated inside _run_xdist_fallback.
@@ -2151,6 +2336,53 @@ if [[ -n "$_FINAL_XML_PATH" && ${#_XML_SHARDS[@]} -gt 0 ]]; then
     else
         echo "[torch_oot_device_tests_run] WARNING: No XML shards found to merge." >&2
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# Per-suite (per-YAML) result summary — printed when >= 2 YAMLs were given.
+# Counts come from pytest's own terminal output, parsed by
+# _parse_pytest_summary_line and accumulated in _SUITE_LABELS/_SUITE_COUNTS.
+# ---------------------------------------------------------------------------
+if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
+    echo ""
+    echo "========================================================================"
+    echo "[torch_oot_device_tests_run] Per-suite result summary:"
+    echo "========================================================================"
+    if [[ ${#_SUITE_LABELS[@]} -eq 0 ]]; then
+        # No counts (no runs completed or all signal-crashed before tee).
+        # Fall back to listing known labels.
+        _seen_labels=()
+        for _fi in "${!TEST_FILES[@]}"; do
+            _lbl="${_FILE_YAML_LABEL[$_fi]:-unknown}"
+            _already=0
+            for _sl in "${_seen_labels[@]+"${_seen_labels[@]}"}"; do
+                [[ "$_sl" == "$_lbl" ]] && { _already=1; break; }
+            done
+            [[ $_already -eq 0 ]] && _seen_labels+=("$_lbl")
+        done
+        for _lbl in "${_seen_labels[@]}"; do
+            printf "  %-52s  (no results)\n" "$_lbl"
+        done
+    else
+        for _ci in "${!_SUITE_LABELS[@]}"; do
+            _lbl="${_SUITE_LABELS[$_ci]}"
+            read -r _cp _cf _ce _cs _cxf _cxp <<< "${_SUITE_COUNTS[$_ci]}"
+            _parts=()
+            [[ "${_cp:-0}"  -gt 0 ]] && _parts+=("${_cp} passed")
+            [[ "${_cf:-0}"  -gt 0 ]] && _parts+=("${_cf} failed")
+            [[ "${_ce:-0}"  -gt 0 ]] && _parts+=("${_ce} error")
+            [[ "${_cs:-0}"  -gt 0 ]] && _parts+=("${_cs} skipped")
+            [[ "${_cxf:-0}" -gt 0 ]] && _parts+=("${_cxf} xfailed")
+            [[ "${_cxp:-0}" -gt 0 ]] && _parts+=("${_cxp} xpassed")
+            if [[ ${#_parts[@]} -eq 0 ]]; then
+                _summary="0 tests"
+            else
+                _summary="$(IFS=', '; echo "${_parts[*]}")"
+            fi
+            printf "  %-52s  %s\n" "$_lbl" "$_summary"
+        done
+    fi
+    echo "========================================================================"
 fi
 
 echo ""
