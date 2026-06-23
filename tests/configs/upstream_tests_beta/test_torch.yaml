@@ -223,7 +223,6 @@ test_suite_config:
             - TestTorchDeviceType::test_cdist_cuda_backward
             - TestTorchDeviceType::test_cdist_euclidean_large
             - TestTorchDeviceType::test_cdist_grad_p_lt_1_no_nan
-            - TestTorchDeviceType::test_cdist_large
             - TestTorchDeviceType::test_cdist_non_contiguous
             - TestTorchDeviceType::test_cdist_non_contiguous_batch
             - TestTorchDeviceType::test_cdist_same_inputs
@@ -515,6 +514,7 @@ test_suite_config:
             - TestTorchDeviceType::test_gradient_all
             - TestTorchDeviceType::test_gradient_extreme_cases # Deeptools incompatibility
             - TestTorchDeviceType::test_gradient_spacing_list_length_error # Deeptools incompatibility
+            - TestTorchDeviceType::test_cdist_large # Deeptools incompatibility
           mode: skip  # does not engage the torch-spyre layer
 
   global:
