@@ -242,7 +242,7 @@ jobs:
           ")_config
 
           # Removed the trailing backslash below to fix the syntax drop issue safely
-          bash tests/run_test.sh "${{ matrix.suite.config }}" -v \
+          bash tests/run_test.sh "tests/configs/${{ matrix.suite.config }}" -v \
             --cov=torch_spyre \
             --cov-report=json:/home/senuser/torch-spyre/coverage/$SUITE_DIR/coverage.json
 
