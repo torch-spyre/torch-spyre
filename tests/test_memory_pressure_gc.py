@@ -47,10 +47,22 @@ class TestMemoryPressureGC:
         gc.enable()
         gc.collect()
         
+        # Synchronize device before test to ensure clean state
+        try:
+            torch_spyre.synchronize()
+        except Exception:
+            pass  # Ignore errors if device is already in error state
+        
         yield
         
         # Cleanup after test
         gc.collect()
+        
+        # Synchronize device after test to clear any pending operations
+        try:
+            torch_spyre.synchronize()
+        except Exception:
+            pass  # Ignore errors from OOM tests that put device in error state
 
     def test_gc_releases_dead_tensors_allocation_succeeds(self):
         """
@@ -102,16 +114,17 @@ class TestMemoryPressureGC:
         # Allocate tensors and KEEP references
         tensors = []
         try:
-            tensor_size = 512 * 1024 * 1024  # 512MB each
-            # Allocate many small tensors to fill memory
-            num_tensors = 20  # 20 * 512MB = 10GB
+            tensor_size = 2 * 1024 * 1024 * 1024  # 2GB each
+            # Device has ~103GB capacity (103079215104 bytes)
+            # Allocate ~96GB to leave room for the final allocation attempt to trigger OOM
+            num_tensors = 48  # 48 * 2GB = 96GB
             
             for i in range(num_tensors):
                 t = torch.randn(tensor_size // 4, device='spyre')
                 tensors.append(t)
             
             # Try to allocate more - should trigger GC, find nothing to free, raise OOM
-            with pytest.raises(RuntimeError, match="out of memory|OOM"):
+            with pytest.raises(RuntimeError, match="out of memory|OOM|OutOfMemory"):
                 # This should fail after GC finds nothing to collect
                 torch.randn(tensor_size // 4, device='spyre')
             
