@@ -311,6 +311,10 @@ class SpyreOpFuncs:
         return PointwiseOp("reciprocal", [x])
 
     @staticmethod
+    def qfp8ch(x):
+        return PointwiseOp("qfp8ch", [x])
+
+    @staticmethod
     def relu(x):
         return PointwiseOp("relufwd", [x])
 
@@ -524,15 +528,22 @@ class SpyreKernel(Kernel[CSEVariable]):
         args: Sequence[TensorArg],
         op_info: dict[str, Any],
     ) -> OpSpec:
+        from torch_spyre._inductor.constants import SPYRE_FP8_OPS
+
         for arg in args:
             if _is_indirect_index_arg(arg, args):
                 continue
+            # Check if operation supports the argument's dtype
             if not (
                 op == IDENTITY_OP
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
-                or arg.device_dtype == DataFormats.SEN143_FP8
+                or (
+                    op in SPYRE_FP8_OPS
+                    and arg.device_dtype
+                    in [DataFormats.SEN143_FP8, DataFormats.SEN152_FP8]
+                )
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 

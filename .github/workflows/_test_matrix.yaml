@@ -179,6 +179,8 @@ jobs:
           - name: Inductor Ops Misc Compute C
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
             runner: spyre_pf_x4
+          - name: Inductor Ops FP8
+            config: torch_spyre_tests/inductor/test_inductor_ops_fp8_config.yaml
           - name: Inductor Ops LX Planning
             config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
             runner: spyre_pf_x4
