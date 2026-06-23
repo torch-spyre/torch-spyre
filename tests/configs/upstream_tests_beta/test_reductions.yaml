@@ -254,7 +254,7 @@ test_suite_config:
         # They are classified as skip because the torch-spyre layer does not support many of these reduction ops, particularly logsumexp and complex reductions.
         # Spyre's limited op support for reductions and missing bfloat16/float16 handling for large tensors are the relevant limitations.
         - names:
-            - TestReductions::test_nansum_out_dtype # Segmentation fault xfail -> skip
+            - TestReductions::test_nansum_out_dtype # Segmentation fault in xfail. Moved it to skip to prevent crashes.
             - TestReductions::test_accreal_type
             - TestReductions::test_all_issue117215
             - TestReductions::test_argminmax_axis_with_dim_one
