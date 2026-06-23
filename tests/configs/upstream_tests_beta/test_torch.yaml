@@ -131,7 +131,6 @@ test_suite_config:
         # Relevant Spyre limitations include missing support for certain dtypes and ops, such as random_ and dxp_standalone.
         - names:
             - TestDevicePrecision::test_clamp
-            - TestTorchDeviceType::test_copy_
             - TestTorchDeviceType::test_diff
             - TestTorchDeviceType::test_diff_noncontig
             - TestTorchDeviceType::test_put_accumulate
@@ -512,6 +511,7 @@ test_suite_config:
             - TestTorchDeviceType::test_copy_transpose_math_view
             - TestTorchDeviceType::test_cumsum
             - TestTorchDeviceType::test_gradient_all
+            - TestTorchDeviceType::test_copy_ # Deeptools incompatibility
             - TestTorchDeviceType::test_gradient_extreme_cases # Deeptools incompatibility
             - TestTorchDeviceType::test_gradient_spacing_list_length_error # Deeptools incompatibility
             - TestTorchDeviceType::test_cdist_large # Deeptools incompatibility
