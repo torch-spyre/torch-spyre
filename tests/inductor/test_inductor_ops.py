@@ -1837,8 +1837,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_empty_like_dtype_override_cpu",
         ): {
             "param_sets": {
-                "fp16_to_fp32": (cached_randn((4, 8), dtype=torch.float16),),
-                "fp32_to_fp16": (cached_randn((4, 8), dtype=torch.float32),),
+                "fp16_to_fp32": (cached_randn((64, 128), dtype=torch.float16),),
+                "fp32_to_fp16": (cached_randn((64, 128), dtype=torch.float32),),
             },
         },
         (
