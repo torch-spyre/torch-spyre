@@ -65,8 +65,8 @@ jobs:
           
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             TARGET_REPO="torch-spyre/torch-spyre"
-            TARGET_SHA=$(git rev-parse HEAD^ 2>/dev/null || echo "")
-            if [[ -z "$TARGET_SHA" ]]; then
+            TARGET_SHA="${{ github.event.before }}"
+            if [[ -z "$TARGET_SHA" || "$TARGET_SHA" == "0000000000000000000000000000000000000000" ]]; then
               FORCE_FIRST_RUN=true
             fi
           else
@@ -90,10 +90,20 @@ jobs:
               | head -n1)
           fi
 
+          echo "DEBUG INFO:"
+          echo "  Event Name:  ${{ github.event_name }}"
+          echo "  TARGET_REPO: $TARGET_REPO"
+          echo "  TARGET_SHA:  $TARGET_SHA"
+          echo "  RUN_ID:      ${RUN_ID:-None (Empty)}"
+
           mkdir -p coverage
           if [[ -n "$RUN_ID" ]]; then
             if gh run download "$RUN_ID" --repo "$TARGET_REPO" -n complete-coverage-map -D coverage; then
               echo "is_first_run=false" >> "$GITHUB_OUTPUT"
+              
+              echo "DOWNLOAD SUCCESSFUL: Listing coverage/ folder"
+              ls -al coverage
+
             else
               echo "is_first_run=true" >> "$GITHUB_OUTPUT"
             fi
