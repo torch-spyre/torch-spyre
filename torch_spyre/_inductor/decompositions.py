@@ -267,10 +267,8 @@ def register_spyre_decompositions_via_dispatchkey(
             def __init__(self, op, spyre_fn):
                 self.op = op
                 self.spyre_fn = spyre_fn
-                # Pre-compile once so that repeated eager-mode calls reuse the
-                # same compiled entry point rather than constructing a new
-                # torch.compile wrapper on every invocation.
-                self._compiled_fn = torch.compile(spyre_fn, dynamic=False)
+                self._compiled_fn = None
+                self._compile_lock = threading.Lock()
 
             def __call__(self, *args, **kwargs):
                 # We are about to execute the op on spyre, hence the inputs are expected to be on spyre
@@ -293,7 +291,15 @@ def register_spyre_decompositions_via_dispatchkey(
                 if torch.compiler.is_compiling():
                     return self.spyre_fn(*args, **kwargs)
                 else:
-                    # Eager mode: use the pre-compiled wrapper.
+                    # Eager mode: compile lazily on first call to avoid
+                    # concurrent torch.compile invocations at import time,
+                    # which can corrupt glibc's heap allocator.
+                    if self._compiled_fn is None:
+                        with self._compile_lock:
+                            if self._compiled_fn is None:
+                                self._compiled_fn = torch.compile(
+                                    self.spyre_fn, dynamic=False
+                                )
                     return self._compiled_fn(*args, **kwargs)
 
         def register(op):
@@ -589,23 +595,23 @@ def spyre__sdpa_overrideable(
 ## TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
 ## See: https://github.com/torch-spyre/torch-spyre/issues/1172
 ## This will be enabled after solving this.
-# @register_spyre_decomposition([torch.ops.aten.max.default])
-# def spyre_max_default_decomp(input):
-#    """
-#    Decompose torch.max(input) with conditional CPU fallback for int64.
-#
-#    For int64 tensors, use custom op spyre::max_default_int64_fallback which has
-#    a CPU fallback registered in fallbacks.py.
-#    For other dtypes (float16, float32, etc.), use amax.
-#    """
-#    if input.dtype == torch.int64:
-#        # Use custom op with CPU fallback to avoid recursive decomposition
-#        # Returns a scalar (0D) tensor
-#        return torch.ops.spyre.max_default_int64_fallback(input)
-#    else:
-#        # Use amax for supported dtypes (can run on Spyre)
-#        # Returns a scalar (0D) tensor
-#        return torch.ops.aten.amax(input)
+@register_spyre_decomposition([torch.ops.aten.max.default])
+def spyre_max_default_decomp(input):
+    """
+    Decompose torch.max(input) with conditional CPU fallback for int64.
+
+    For int64 tensors, use custom op spyre::max_default_int64_fallback which has
+    a CPU fallback registered in fallbacks.py.
+    For other dtypes (float16, float32, etc.), use amax.
+    """
+    if input.dtype == torch.int64:
+        # Use custom op with CPU fallback to avoid recursive decomposition
+        # Returns a scalar (0D) tensor
+        return torch.ops.spyre.max_default_int64_fallback(input)
+    else:
+        # Use amax for supported dtypes (can run on Spyre)
+        # Returns a scalar (0D) tensor
+        return torch.ops.aten.amax(input)
 
 
 @register_spyre_decomposition([torch.ops.aten.max.dim])
