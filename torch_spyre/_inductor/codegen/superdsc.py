@@ -331,13 +331,44 @@ def _is_pool(op: str) -> bool:
     return op == AVGPOOL2D_OP
 
 
-def _pool_dim_labels(ndim: int, constants: dict) -> list[str]:
+def _pool_dim_labels(iteration_space: dict, constants: dict) -> list[str]:
     kH = int(constants.get("kernel_h", 1))
     kW = int(constants.get("kernel_w", 1))
-    red_labels = (["ki"] if kH > 1 else []) + (["kj"] if kW > 1 else [])
-    n_out = ndim - len(red_labels)
-    out_labels = AVGPOOL_DIM_LABELS[:4][-n_out:] if n_out > 0 else []
-    return out_labels + red_labels
+    sizes = [int(size) for size, _ in iteration_space.values()]
+    n = len(sizes)
+    labels: list[str | None] = [None] * n
+    cursor = n - 1
+    if kW > 1 and cursor >= 0 and sizes[cursor] == kW:
+        labels[cursor] = "kj"
+        cursor -= 1
+    if kH > 1 and cursor >= 0 and sizes[cursor] == kH:
+        labels[cursor] = "ki"
+        cursor -= 1
+    remaining = [i for i in range(n) if labels[i] is None]
+    rem_sizes = [sizes[i] for i in remaining]
+    spatial_pair: tuple | None = None
+    for a in range(len(remaining)):
+        for b in range(a + 1, len(remaining)):
+            if rem_sizes[a] == rem_sizes[b]:
+                spatial_pair = (remaining[a], remaining[b])
+                break
+        if spatial_pair is not None:
+            break
+    if spatial_pair is not None:
+        labels[spatial_pair[0]] = "i"
+        labels[spatial_pair[1]] = "j"
+    leftovers = [i for i in range(n) if labels[i] is None]
+    if len(leftovers) == 1:
+        labels[leftovers[0]] = "out"
+    elif len(leftovers) == 2:
+        a, b = leftovers
+        if sizes[a] <= sizes[b]:
+            labels[a] = "mb"
+            labels[b] = "out"
+        else:
+            labels[a] = "out"
+            labels[b] = "mb"
+    return [lb for lb in labels if lb is not None]
 
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
@@ -726,7 +757,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_pool and op_spec.op_info:
         pool_constants = op_spec.op_info.get("constants", {})
-        dim_labels = _pool_dim_labels(ndim, pool_constants)
+        dim_labels = _pool_dim_labels(op_spec.iteration_space, pool_constants)
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul)
     symbol_mapping = {

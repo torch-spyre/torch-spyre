@@ -715,8 +715,6 @@ def lower_avg_pool2d(
     padding = padding if padding else 0
     pH, pW = (padding, padding) if isinstance(padding, int) else padding
 
-    x = V.graph.get_buffer(x.realize())
-    x_loader = x.make_loader()
     N, C, H_in, W_in = x.get_size()
 
     H_out = (H_in + 2 * pH - kH) // sH + 1
@@ -735,11 +733,11 @@ def lower_avg_pool2d(
     }
 
     def inner_fn(index, reduction_index):
-        n, ho, wo, c = index
+        n, c, ho, wo = index
         kh, kw = reduction_index
         hi = ho * sH - pH + kh
         wi = wo * sW - pW + kw
-        return x_loader([n, c, hi, wi])
+        return x.make_loader()([n, c, hi, wi])
 
     result = SpyreReduction.create(
         reduction_type=AVGPOOL2D_OP,
@@ -748,7 +746,7 @@ def lower_avg_pool2d(
         dst_dtype=x.get_dtype(),
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=[N, H_out, W_out, C],
+        ranges=[N, C, H_out, W_out],
         reduction_ranges=[kH, kW],
         op_info=op_info,
     )
