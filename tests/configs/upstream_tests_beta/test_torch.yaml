@@ -135,7 +135,6 @@ test_suite_config:
             - TestTorchDeviceType::test_copy_
             - TestTorchDeviceType::test_diff
             - TestTorchDeviceType::test_diff_noncontig
-            - TestTorchDeviceType::test_gradient_all
             - TestTorchDeviceType::test_put_accumulate
           mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise tensor comparison and upsampling operations, respectively.
@@ -514,6 +513,7 @@ test_suite_config:
             - TestTorch::test_wildcard_import
             - TestTorchDeviceType::test_copy_transpose_math_view
             - TestTorchDeviceType::test_cumsum
+            - TestTorchDeviceType::test_gradient_all
             - TestTorchDeviceType::test_gradient_extreme_cases # Deeptools incompatibility
           mode: skip  # does not engage the torch-spyre layer
 
