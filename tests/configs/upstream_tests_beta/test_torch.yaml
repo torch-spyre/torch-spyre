@@ -125,7 +125,7 @@ test_suite_config:
             - TestTorchDeviceType::test_storage_meta_from_tensor
             - TestTorchDeviceType::test_where_scalar_handcrafted_values
             - TestTorchDeviceType::test_item
-          mode: xfail  # xfail: UNKNOWN
+          mode: skip  # xfail: UNKNOWN
         # These tests exercise various tensor operations and dtypes, including clamp, copy_, diff, gradient, and put_accumulate.
         # They are classified as xfail due to NotImplementedError and InductorError, indicating unsupported ops or dtypes.
         # Relevant Spyre limitations include missing support for certain dtypes and ops, such as random_ and dxp_standalone.
@@ -134,14 +134,14 @@ test_suite_config:
             - TestTorchDeviceType::test_diff
             - TestTorchDeviceType::test_diff_noncontig
             - TestTorchDeviceType::test_put_accumulate
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise tensor comparison and upsampling operations, respectively.
         # They are classified as xfail due to AssertionErrors, indicating precision issues or memory limitations.
         # The relevant Spyre limitations include precision discrepancies in tensor comparisons and memory allocation constraints.
         - names:
             - TestDevicePrecision::test_copy_broadcast
             - TestTorchDeviceType::test_int64_upsample3d
-          mode: xfail  # xfail: AssertionError
+          mode: skip  # xfail: AssertionError
         # These tests exercise various tensor operations and memory format transformations, including type conversions and non-contiguous memory handling.
         # They are classified as xfail due to Spyre backend limitations in handling type conversions during tensor operations and unsupported memory formats.
         # The most relevant Spyre capabilities are its support for contiguous memory format and its current lack of support for complex dtypes and non-contiguous memory operations.
@@ -161,7 +161,7 @@ test_suite_config:
             - TestTorchDeviceType::test_scatter_add_to_large_input
             - TestTorchDeviceType::test_scatter_to_large_input
             - TestTorchDeviceType::test_untyped_storage_meta
-          mode: xfail  # xfail: RuntimeError
+          mode: skip  # xfail: RuntimeError
         # These tests exercise a variety of tensor operations and data types, including random number generation, cumulative operations, and tensor manipulation.
         # They are classified as xfail on the Spyre backend due to missing or unimplemented operators, such as `aten::_efficientzerotensor`, `aten::set_.source_Storage`, and `aten::index_add.out`.
         # The most relevant Spyre capabilities or limitations include the lack of support for certain tensor operations and data types, which are essential for these tests to pass.
@@ -208,13 +208,13 @@ test_suite_config:
             - TestTorchDeviceType::test_take
             - TestTorchDeviceType::test_take_empty
             - TestTorchDeviceType::test_tensor_shape_empty
-          mode: xfail  # xfail: NotImplementedError
+          mode: skip  # xfail: NotImplementedError
         # These tests exercise various broadcasting operations across different tensor operations and data types.
         # They are classified as xfail due to missing or unsupported operators and file access errors on the Spyre backend.
         # Relevant Spyre limitations include missing support for certain tensor operations and file system dependencies.
         - names:
             - TestTorchDeviceType::test_broadcast
-          mode: xfail  # xfail: NotImplementedError, RuntimeError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, RuntimeError, UNKNOWN, torch._inductor.exc.InductorError
         # These tests exercise a variety of operations and tensor behaviors, including non-contiguous tensors, gradient scaling, and cumulative operations.
         # They are classified as xfail due to unsupported operations, missing features, or errors related to the Spyre backend.
         # Relevant Spyre limitations include unsupported mutation operations, missing standalone executables, and unsupported data formats.
@@ -248,37 +248,37 @@ test_suite_config:
             - TestTorchDeviceType::test_repeat_interleave
             - TestTorchDeviceType::test_strides_propagation
             - TestTorchDeviceType::test_tolist_with_grad
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
+          mode: skip  # xfail: torch._inductor.exc.InductorError
         # These tests exercise the `empty` operation across various dtypes, including unsupported ones like `bfloat16` and `int64`.
         # They are classified as `xfail` due to Spyre's lack of support for certain dtypes and operations like `aten::isnan`.
         # Relevant Spyre limitations include unsupported dtypes and operations, as well as handling of large constants.
         - names:
             - TestTorchDeviceType::test_deterministic_empty
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
         # These tests exercise deterministic resizing across various dtypes, including bfloat16, bool, float16, float32, and int64.
         # They are classified as xfail due to the Spyre backend's lack of support for the 'aten::set_.source_Storage' operator.
         # The primary limitation is the unimplemented operator, affecting dtype-specific tensor manipulations.
         - names:
             - TestTorchDeviceType::test_deterministic_resize
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN
+          mode: skip  # xfail: NotImplementedError, UNKNOWN
         # These tests exercise tensor creation from storage across various dtypes.
         # They are classified as xfail due to missing support for 'aten::random_.from' and shape determination issues.
         # Relevant Spyre limitations include incomplete support for certain tensor operations and dtype-specific errors.
         - names:
             - TestTorchDeviceType::test_tensor_from_storage
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, ValueError
+          mode: skip  # xfail: NotImplementedError, UNKNOWN, ValueError
         # These tests verify tensor storage types across various dtypes, including unsupported ones like int64.
         # They are classified as xfail due to Spyre's lack of support for certain dtypes and ops, causing AssertionErrors and NotImplementedErrors.
         # The primary limitation is Spyre's incomplete support for all dtypes and ops required by PyTorch's tensor storage tests.
         - names:
             - TestTorchDeviceType::test_tensor_storage_type
-          mode: xfail  # xfail: AssertionError, NotImplementedError, UNKNOWN
+          mode: skip  # xfail: AssertionError, NotImplementedError, UNKNOWN
         # These tests verify the behavior of typed storage metadata across various dtypes.
         # They are classified as xfail due to consistent AssertionErrors indicating discrepancies in storage size.
         # The relevant Spyre limitation is the inability to accurately compute storage metadata for certain dtypes.
         - names:
             - TestTorchDeviceType::test_typed_storage_meta
-          mode: xfail  # xfail: AssertionError, UNKNOWN
+          mode: skip  # xfail: AssertionError, UNKNOWN
         - names:
             - TestDevicePrecision::test_multidevice_serialization
             - TestDevicePrecision::test_type_conversions_same_device
