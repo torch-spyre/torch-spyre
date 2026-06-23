@@ -125,7 +125,7 @@ test_suite_config:
             - TestTorchDeviceType::test_storage_meta_from_tensor
             - TestTorchDeviceType::test_where_scalar_handcrafted_values
             - TestTorchDeviceType::test_item
-          mode: skip  # xfail: UNKNOWN
+          mode: xfail  # xfail: UNKNOWN
         # These tests exercise various tensor operations and dtypes, including clamp, copy_, diff, gradient, and put_accumulate.
         # They are classified as xfail due to NotImplementedError and InductorError, indicating unsupported ops or dtypes.
         # Relevant Spyre limitations include missing support for certain dtypes and ops, such as random_ and dxp_standalone.
