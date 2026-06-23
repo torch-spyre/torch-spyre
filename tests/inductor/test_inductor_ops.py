@@ -4121,6 +4121,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
         },
+        (
+            "test_multiops_split",
+            "test_view_permute_mul",
+        ): {
+            "param_sets": {
+                "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5172,6 +5180,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(input):
             return torch.nn.functional.softplus(input, beta, threshold)
+
+        self.compare_with_cpu(fn, x)
+
+    def test_view_permute_mul(self, x):
+        """Create 3D tensor, view as 4D, permute, multiply by constant."""
+
+        def fn(x):
+            return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
 
