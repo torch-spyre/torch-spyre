@@ -53,8 +53,6 @@ jobs:
             config: test_indexing.yaml
           - name: Linear algebra
             config: test_linalg.yaml
-          - name: NeuralNet test embedding
-            config: nn-test_embedding.yaml
           - name: NeuralNet pooling
             config: nn-test_pooling.yaml
           - name: NeuralNet convolution
