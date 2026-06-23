@@ -1422,18 +1422,20 @@ _SUITE_LABELS=()
 _SUITE_COUNTS=()
 
 _add_suite_counts() {
-    local _lbl="$1" _p="$2" _f="$3" _e="$4" _s="$5" _xf="$6" _xp="$7"
+    local _lbl="$1" _p="$2" _f="$3" _e="$4" _s="$5" _xf="$6" _xp="$7" _t="${8:-0}"
     local _idx=-1
     for _ci in "${!_SUITE_LABELS[@]}"; do
         [[ "${_SUITE_LABELS[$_ci]}" == "$_lbl" ]] && { _idx=$_ci; break; }
     done
     if [[ $_idx -eq -1 ]]; then
         _SUITE_LABELS+=("$_lbl")
-        _SUITE_COUNTS+=("$_p $_f $_e $_s $_xf $_xp")
+        _SUITE_COUNTS+=("$_p $_f $_e $_s $_xf $_xp $_t")
     else
         local _cur="${_SUITE_COUNTS[$_idx]}"
-        read -r _cp _cf _ce _cs _cxf _cxp <<< "$_cur"
-        _SUITE_COUNTS[$_idx]="$(( _cp+_p )) $(( _cf+_f )) $(( _ce+_e )) $(( _cs+_s )) $(( _cxf+_xf )) $(( _cxp+_xp ))"
+        read -r _cp _cf _ce _cs _cxf _cxp _ct <<< "$_cur"
+        local _new_t
+        _new_t=$(python3 -c "print('%.2f' % (${_ct:-0} + ${_t:-0}))" 2>/dev/null || echo "0")
+        _SUITE_COUNTS[$_idx]="$(( _cp+_p )) $(( _cf+_f )) $(( _ce+_e )) $(( _cs+_s )) $(( _cxf+_xf )) $(( _cxp+_xp )) $_new_t"
     fi
 }
 
@@ -1447,23 +1449,25 @@ _add_suite_counts() {
 # ---------------------------------------------------------------------------
 _parse_pytest_summary_line() {
     local _f="$1"
-    [[ -f "$_f" ]] || { echo "0 0 0 0 0 0"; return; }
+    [[ -f "$_f" ]] || { echo "0 0 0 0 0 0 0"; return; }
     # The summary line is the last line matching one of the known result words.
     local _line
     _line=$(grep -E '(passed|failed|error|skipped|xfailed|xpassed)' "$_f" \
             | grep -v '^\s*#' | tail -1) || true
     if [[ -z "$_line" ]]; then
-        echo "0 0 0 0 0 0"; return
+        echo "0 0 0 0 0 0 0"; return
     fi
     # Extract each counter with a portable sed; default to 0 when absent.
-    local _p _f2 _e _s _xf _xp
+    local _p _f2 _e _s _xf _xp _t
     _p=$(echo  "$_line" | grep -oE '[0-9]+ passed'  | grep -oE '[0-9]+' || echo 0)
     _f2=$(echo "$_line" | grep -oE '[0-9]+ failed'  | grep -oE '[0-9]+' || echo 0)
     _e=$(echo  "$_line" | grep -oE '[0-9]+ error'   | grep -oE '[0-9]+' || echo 0)
     _s=$(echo  "$_line" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)
     _xf=$(echo "$_line" | grep -oE '[0-9]+ xfailed' | grep -oE '[0-9]+' || echo 0)
     _xp=$(echo "$_line" | grep -oE '[0-9]+ xpassed' | grep -oE '[0-9]+' || echo 0)
-    echo "${_p:-0} ${_f2:-0} ${_e:-0} ${_s:-0} ${_xf:-0} ${_xp:-0}"
+    # Extract the "in X.XXs" duration reported by pytest at the end of the summary line.
+    _t=$(echo  "$_line" | grep -oE 'in [0-9]+(\.[0-9]+)?s' | grep -oE '[0-9]+(\.[0-9]+)?' || echo 0)
+    echo "${_p:-0} ${_f2:-0} ${_e:-0} ${_s:-0} ${_xf:-0} ${_xp:-0} ${_t:-0}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1651,8 +1655,8 @@ _run_xdist_fallback() {
 
     # Accumulate per-suite counts from xdist output (multi-config only).
     if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" && -f "$_xdist_out_tmp" ]]; then
-        read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_xdist_out_tmp")"
-        _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}"
+        read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_out_tmp")"
+        _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
     fi
     rm -f "$_xdist_out_tmp"
 
@@ -1989,8 +1993,8 @@ _run_parallel_across_cards() {
                 # Accumulate per-suite counts (multi-config only, clean runs).
                 if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
                     _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
-                    read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_par_out_tmp")"
-                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0}" >> "$_subshell_counts_file"
+                    read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_par_out_tmp")"
+                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
                 fi
                 rm -f "$_par_out_tmp"
 
@@ -2032,8 +2036,8 @@ _run_parallel_across_cards() {
                                 # Accumulate counts from xdist retry output.
                                 if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
                                     _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
-                                    read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_xdist_par_out")"
-                                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0}" >> "$_subshell_counts_file"
+                                    read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_par_out")"
+                                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
                                 fi
                             fi
                             rm -f "$_xdist_par_out"
@@ -2089,8 +2093,8 @@ _run_parallel_across_cards() {
         if [[ -f "$_counts_file" ]]; then
             while IFS= read -r _cline; do
                 [[ -z "$_cline" ]] && continue
-                read -r _clbl _cp _cf _ce _cs _cxf _cxp <<< "$_cline"
-                _add_suite_counts "$_clbl" "${_cp:-0}" "${_cf:-0}" "${_ce:-0}" "${_cs:-0}" "${_cxf:-0}" "${_cxp:-0}"
+                read -r _clbl _cp _cf _ce _cs _cxf _cxp _ct <<< "$_cline"
+                _add_suite_counts "$_clbl" "${_cp:-0}" "${_cf:-0}" "${_ce:-0}" "${_cs:-0}" "${_cxf:-0}" "${_cxp:-0}" "${_ct:-0}"
             done < "$_counts_file"
             rm -f "$_counts_file"
         fi
@@ -2233,8 +2237,8 @@ for i in "${!RUN_FILES[@]}"; do
     # Accumulate per-suite counts from pytest terminal output (multi-config only).
     if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_OUT_TMP" && $_exit -lt 128 ]]; then
         _suite_label="${_FILE_YAML_LABEL[$i]:-unknown}"
-        read -r _sp _sf _se _ss _sxf _sxp <<< "$(_parse_pytest_summary_line "$_OUT_TMP")"
-        _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}"
+        read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_OUT_TMP")"
+        _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
     fi
     rm -f "$_OUT_TMP"
 
@@ -2366,7 +2370,7 @@ if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
     else
         for _ci in "${!_SUITE_LABELS[@]}"; do
             _lbl="${_SUITE_LABELS[$_ci]}"
-            read -r _cp _cf _ce _cs _cxf _cxp <<< "${_SUITE_COUNTS[$_ci]}"
+            read -r _cp _cf _ce _cs _cxf _cxp _ct <<< "${_SUITE_COUNTS[$_ci]}"
             _parts=()
             [[ "${_cp:-0}"  -gt 0 ]] && _parts+=("${_cp} passed")
             [[ "${_cf:-0}"  -gt 0 ]] && _parts+=("${_cf} failed")
@@ -2378,6 +2382,9 @@ if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
                 _summary="0 tests"
             else
                 _summary="$(IFS=', '; echo "${_parts[*]}")"
+            fi
+            if [[ -n "${_ct:-}" && "$_ct" != "0" ]]; then
+                _summary="${_summary} in ${_ct}s"
             fi
             printf "  %-52s  %s\n" "$_lbl" "$_summary"
         done
