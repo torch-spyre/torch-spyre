@@ -72,7 +72,6 @@ test_suite_config:
             - TestTorchDeviceType::test_grad_scaling_clipping_separate_unscale
             - TestTorchDeviceType::test_grad_scaling_unscale_sparse
             - TestTorchDeviceType::test_grad_scaling_update_scale
-            - TestTorchDeviceType::test_gradient_extreme_cases
             - TestTorchDeviceType::test_gradient_spacing_list_length_error
             - TestTorchDeviceType::test_invalid_shapes_grid_sampler
             - TestTorchDeviceType::test_lazy_clone_binary_op_no_materialize
@@ -515,6 +514,7 @@ test_suite_config:
             - TestTorch::test_wildcard_import
             - TestTorchDeviceType::test_copy_transpose_math_view
             - TestTorchDeviceType::test_cumsum
+            - TestTorchDeviceType::test_gradient_extreme_cases # Deeptools incompatibility
           mode: skip  # does not engage the torch-spyre layer
 
   global:
