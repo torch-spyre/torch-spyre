@@ -24,8 +24,31 @@ import torch._decomp as decomp
 from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
+from torch_spyre._C import DataFormats, get_device_dtype
 
 import threading
+
+
+# Determine the float dtype for bool at module load time (not during tracing)
+_BOOL_FLOAT_DTYPE = None
+
+
+def _get_float_dtype_for_bool() -> torch.dtype:
+    """
+    Get the appropriate float dtype to convert boolean tensors on Spyre.
+    Boolean tensors are stored as either FP16 or FP32 on the device.
+    This is determined once at module load time to avoid tracing issues.
+    """
+    global _BOOL_FLOAT_DTYPE
+    if _BOOL_FLOAT_DTYPE is None:
+        device_dtype = get_device_dtype(torch.bool)
+        # Map DataFormats to torch.dtype, defaulting to float16
+        if device_dtype == DataFormats.IEEE_FP32:
+            _BOOL_FLOAT_DTYPE = torch.float32
+        else:
+            _BOOL_FLOAT_DTYPE = torch.float16
+    return _BOOL_FLOAT_DTYPE
+
 
 # A module-level lock to make the CM thread-safe
 _decompositions_lock = threading.RLock()
@@ -606,25 +629,25 @@ def spyre__sdpa_overrideable(
 #        # Use amax for supported dtypes (can run on Spyre)
 #        # Returns a scalar (0D) tensor
 #        return torch.ops.aten.amax(input)
-
-
 @register_spyre_decomposition([torch.ops.aten.max.dim])
 def spyre_max_dim_decomp(input, dim, keepdim=False):
     """
-    Decompose torch.max(input, dim) with conditional CPU fallback for int64.
-
-    For int64 tensors, use custom op spyre::max_dim_int64_fallback which has
-    a CPU fallback registered in fallbacks.py.
-    For other dtypes (float16, float32, etc.), decompose into amax and argmax operations.
-
-    Returns a named tuple (values, indices) as expected by torch.max.
-
-    # TODO (imaihal): Decomposed into torch.topk with k=1 to obtain both values and indices,
-    #  or implement argmax in the backend compiler to get indices
+    Decompose torch.max(input, dim) with conditional handling for bool and int64.
+    For bool: convert to float16, perform max, convert back (bool stored as fp16 on Spyre).
+    For int64: use CPU fallback custom op (not supported on Spyre).
+    For other dtypes: use default PyTorch decomposition (amax + argmax).
     """
-    if input.dtype == torch.int64:
-        # Use custom op with CPU fallback to avoid recursive decomposition
-        return torch.ops.spyre.max_dim_int64_fallback(input, dim, keepdim)
+    if input.dtype == torch.bool:
+        # Reinterpret bool as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+        float_dtype = _get_float_dtype_for_bool()
+        input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+        values_float = torch.ops.aten.amax(input_float, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmax(input_float, dim=dim, keepdim=keepdim)
+        values = torch.ops.prims.convert_element_type(values_float, torch.bool)
+        return torch.return_types.max((values, indices))
+    elif input.dtype == torch.int64:
+        # Use CPU fallback custom op for int64
+        return torch.ops.spyre.max_dim_int64_fallback(input, dim=dim, keepdim=keepdim)
     else:
         # Use amax and argmax for supported dtypes (can run on Spyre)
         values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
@@ -635,18 +658,73 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
 @register_spyre_decomposition([torch.ops.aten.min.dim])
 def spyre_min_dim_decomp(input, dim, keepdim=False):
     """
-    Decompose torch.min(input, dim) with conditional CPU fallback for int64.
-
-    Mirrors spyre_max_dim_decomp: int64 inputs go through a CPU-fallback custom
-    op; other dtypes are decomposed into amin (Spyre-native) and argmin (CPU
-    fallback). Returns a named tuple (values, indices) as expected by torch.min.
+    Decompose torch.min(input, dim) with conditional handling for bool and int64.
+    For bool: convert to float16, perform min, convert back (bool stored as fp16 on Spyre).
+    For int64: use CPU fallback custom op (not supported on Spyre).
+    For other dtypes: use default PyTorch decomposition (amin + argmin).
     """
-    if input.dtype == torch.int64:
-        return torch.ops.spyre.min_dim_int64_fallback(input, dim, keepdim)
+    if input.dtype == torch.bool:
+        # Reinterpret bool as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+        float_dtype = _get_float_dtype_for_bool()
+        input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+        values_float = torch.ops.aten.amin(input_float, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmin(input_float, dim=dim, keepdim=keepdim)
+        values = torch.ops.prims.convert_element_type(values_float, torch.bool)
+        return torch.return_types.min((values, indices))
+    elif input.dtype == torch.int64:
+        # Use CPU fallback custom op for int64
+        return torch.ops.spyre.min_dim_int64_fallback(input, dim=dim, keepdim=keepdim)
     else:
+        # Use amin and argmin for supported dtypes (can run on Spyre)
         values = torch.ops.aten.amin(input, dim=dim, keepdim=keepdim)
         indices = torch.ops.aten.argmin(input, dim=dim, keepdim=keepdim)
         return torch.return_types.min((values, indices))
+
+
+@register_spyre_decomposition([torch.ops.aten.amax.default])
+def spyre_amax_decomp(
+    input: torch.Tensor, dim=None, keepdim: bool = False
+) -> torch.Tensor:
+    """
+    Decompose torch.amax for boolean tensors.
+    For bool tensors: convert to float16, perform amax, convert back (bool stored as fp16 on Spyre).
+    For other dtypes: return NotImplemented to use default behavior.
+    """
+    if input.dtype != torch.bool:
+        # For non-bool types, don't decompose - use default lowering
+        return NotImplemented
+
+    # For bool tensors: reinterpret as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+    float_dtype = _get_float_dtype_for_bool()
+    input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+    if dim is None:
+        result_float = torch.ops.aten.amax(input_float, keepdim=keepdim)
+    else:
+        result_float = torch.ops.aten.amax(input_float, dim=dim, keepdim=keepdim)
+    return torch.ops.prims.convert_element_type(result_float, torch.bool)
+
+
+@register_spyre_decomposition([torch.ops.aten.amin.default])
+def spyre_amin_decomp(
+    input: torch.Tensor, dim=None, keepdim: bool = False
+) -> torch.Tensor:
+    """
+    Decompose torch.amin for boolean tensors.
+    For bool tensors: convert to float16, perform amin, convert back (bool stored as fp16 on Spyre).
+    For other dtypes: return NotImplemented to use default behavior.
+    """
+    if input.dtype != torch.bool:
+        # For non-bool types, don't decompose - use default lowering
+        return NotImplemented
+
+    # For bool tensors: reinterpret as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+    float_dtype = _get_float_dtype_for_bool()
+    input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+    if dim is None:
+        result_float = torch.ops.aten.amin(input_float, keepdim=keepdim)
+    else:
+        result_float = torch.ops.aten.amin(input_float, dim=dim, keepdim=keepdim)
+    return torch.ops.prims.convert_element_type(result_float, torch.bool)
 
 
 @register_spyre_decomposition([torch.ops.aten.ceil.default])
