@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 600" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .open    { fill: #d6efd6; stroke: #2d7a2d; stroke-width: 1.5; }
+      .pytorch { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.5; }
+      .closed  { fill: #f0f0f0; stroke: #888; stroke-width: 1.5; }
+      .device  { fill: #fdf3e0; stroke: #b06600; stroke-width: 1.5; }
+      .label   { fill: #222; }
+      .caption { fill: #555; font-size: 11px; font-style: italic; }
+      .arrow   { stroke: #444; stroke-width: 1.5; fill: none; }
+      .title   { fill: #222; font-size: 16px; font-weight: 700; }
+      .name    { font-weight: 600; }
+      .legend  { fill: #444; font-size: 11px; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="310" y="30" text-anchor="middle" class="title">spyreccl backend in the distributed stack</text>
+  <text x="310" y="50" text-anchor="middle" class="caption">Each process attaches to one Spyre device. PyTorch dispatches collectives through SpyreCCLBackend.</text>
+
+  <!-- Layer 1: User code -->
+  <rect class="pytorch" x="60" y="80" width="500" height="60" rx="8"/>
+  <text class="label name" x="310" y="105" text-anchor="middle">User code</text>
+  <text class="caption" x="310" y="125" text-anchor="middle" font-family="ui-monospace, monospace">dist.broadcast(x, src=0)</text>
+
+  <!-- Layer 2: torch.distributed -->
+  <rect class="pytorch" x="60" y="170" width="500" height="60" rx="8"/>
+  <text class="label name" x="310" y="195" text-anchor="middle">torch.distributed</text>
+  <text class="caption" x="310" y="215" text-anchor="middle">routes through the registered backend named "spyreccl"</text>
+
+  <!-- Layer 3: SpyreCCLBackend (open) -->
+  <rect class="open" x="60" y="260" width="500" height="60" rx="8"/>
+  <text class="label name" x="310" y="285" text-anchor="middle">SpyreCCLBackend  (in-tree)</text>
+  <text class="caption" x="310" y="305" text-anchor="middle">csrc/distributed/spyre_ccl.cpp · adapter to the transport library</text>
+
+  <!-- Layer 4: spyre_comms (closed) -->
+  <rect class="closed" x="60" y="350" width="500" height="60" rx="8"/>
+  <text class="label name" x="310" y="375" text-anchor="middle">spyre_comms  (closed-source IBM library)</text>
+  <text class="caption" x="310" y="395" text-anchor="middle">wire-level transport, P2P protocols, hardware quirks</text>
+
+  <!-- Layer 5: Device -->
+  <rect class="device" x="60" y="440" width="500" height="60" rx="8"/>
+  <text class="label name" x="310" y="465" text-anchor="middle">Spyre devices</text>
+  <text class="caption" x="310" y="485" text-anchor="middle">attached one-per-rank, sharing the rank's flex runtime + default stream</text>
+
+  <!-- Arrows between layers -->
+  <path class="arrow" d="M 310 140 L 310 170" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 310 230 L 310 260" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 310 320 L 310 350" marker-end="url(#arr)"/>
+  <path class="arrow" d="M 310 410 L 310 440" marker-end="url(#arr)"/>
+
+  <!-- Legend (offset below the stack with breathing room) -->
+  <rect class="open" x="80" y="560" width="14" height="14"/>
+  <text class="legend" x="100" y="572">in-tree (Apache-2.0)</text>
+  <rect class="closed" x="240" y="560" width="14" height="14"/>
+  <text class="legend" x="260" y="572">closed-source IBM</text>
+  <rect class="device" x="400" y="560" width="14" height="14"/>
+  <text class="legend" x="420" y="572">device hardware</text>
+</svg>

@@ -17,6 +17,7 @@
 #include "prepare_kernel.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -200,9 +201,9 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
                                       std::nullopt, flex::MemoryType::Program);
   c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
 
-  job_allocation_ =
+  job_allocation_.emplace_back(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
-                    ->composite_addr);
+                    ->composite_addr));
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -223,7 +224,7 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string binary_file = init_props["init_bin_file"].get<std::string>();
   std::filesystem::path binary_path = spyrecode_dir_ / binary_file;
 
-  std::string binary_data = read_file_to_string(binary_path);
+  inits_.emplace_back(read_file_to_string(binary_path));
 
   TORCH_CHECK(init_props.contains("dev_ptr"),
               "InitTransfer command missing 'dev_ptr' property");
@@ -237,12 +238,12 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string init_size_str = init_props["size"].get<std::string>();
   size_t init_size = std::stoull(init_size_str);
 
-  auto device_addr =
-      compute_offset_address(job_allocation_.value(), dev_ptr, init_size);
+  job_allocation_.emplace_back(
+      compute_offset_address(job_allocation_.at(0), dev_ptr, init_size));
 
   stream_.copyProgramAsync(
-      const_cast<void*>(static_cast<const void*>(binary_data.data())),
-      &device_addr);
+      const_cast<void*>(static_cast<const void*>(inits_.back().data())),
+      &job_allocation_.back());
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -251,6 +252,9 @@ void JobPlanBuilder::executeJobPreparationPlan() {
               "JobPreparationPlan must be an array with at least 2 commands (1 "
               "Allocate and 1+ InitTransfer)");
 
+  job_allocation_.reserve(job_prep_plan.size());
+  inits_.reserve(job_prep_plan.size() - 1);
+
   // Execute Allocate command (first item)
   executeAllocate(job_prep_plan[0]);
 
@@ -258,7 +262,6 @@ void JobPlanBuilder::executeJobPreparationPlan() {
   for (size_t i = 1; i < job_prep_plan.size(); ++i) {
     executeInitTransfer(job_prep_plan[i]);
   }
-  stream_.synchronize();
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
@@ -270,7 +273,12 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
 
   auto job_bin_addr =
-      compute_offset_address(job_allocation_.value(), job_bin_ptr);
+      compute_offset_address(job_allocation_.at(0), job_bin_ptr);
+
+  // Verify the resulting binary address is populated
+  TORCH_CHECK(job_bin_addr.total_size() > 0,
+              "ComputeOnDevice binary address must be populated (size > 0)");
+
   // Create RuntimeOperationCompute with the allocated program address
   return std::make_unique<JobPlanStepCompute>(std::move(job_bin_addr),
                                               bind_io_addresses_, job_bin_ptr);
@@ -374,7 +382,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 
       // Compute CompositeAddress with offset
       flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.value(), device_ptr, transfer_size);
+          job_allocation_.at(0), device_ptr, transfer_size);
 
       return std::make_unique<JobPlanStepH2D>(host_addr, std::move(comp_addr));
     }
@@ -408,7 +416,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 
       // Compute CompositeAddress with offset from device_addr
       flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.value(), device_ptr, transfer_size);
+          job_allocation_.at(0), device_ptr, transfer_size);
 
       return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr);
     }
@@ -457,7 +465,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // TODO(jni): further discussions is required on the condition to specialize
   // addresses
-  bind_io_addresses_ = true;
+  const char* env = std::getenv("BUNDLE_SYMBOLIC_ARGS");
+  bind_io_addresses_ = (env == nullptr || std::string(env) != "1");
 
   // Parse each command in the JobExecPlan and create JobPlanSteps
   std::vector<std::unique_ptr<JobPlanStep>> steps;
@@ -481,12 +490,12 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // Create and return the JobPlan
   // Use brace initialization to construct JobPlan with moved members
-  return std::make_unique<JobPlan>(JobPlan{
-      std::move(steps),                    // steps
-      std::move(job_allocation_.value()),  // job_allocation
-      {},                                  // expected_input_shapes
-      std::move(pinned_buffers)            // pinned_buffers
-  });
+  return std::make_unique<JobPlan>(
+      JobPlan{std::move(steps),            // steps
+              std::move(job_allocation_),  // job_allocation
+              {},                          // expected_input_shapes
+              std::move(pinned_buffers),   // pinned_buffers
+              std::move(inits_)});
 }
 
 JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
@@ -501,10 +510,53 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape count matches number of input tensors
 
   // P2-14: JobPlan step ordering validation
-  // TODO(johngontaryk): Implement once step ordering rules are defined
-  // - Verify HostCompute steps precede their corresponding H2D steps
-  // - Verify H2D steps precede Compute steps that depend on them
-  // - Verify no circular dependencies in step ordering
+  // Enforces the following rule when first step is HostCallback:
+  // - HostCallback→H2D→Compute sequence must be maintained
+  if (!job_plan.steps.empty()) {
+    bool first_is_host_callback = dynamic_cast<const JobPlanStepHostCompute*>(
+                                      job_plan.steps[0].get()) != nullptr;
+
+    if (first_is_host_callback) {
+      enum class ExpectedStep {
+        H2D,      // Expecting H2D after HostCallback
+        Compute,  // Expecting Compute after H2D
+      };
+
+      // Step 0 is already verified as HostCallback; validate from step 1 onward
+      ExpectedStep expected = ExpectedStep::H2D;
+      bool sequence_complete = false;
+
+      for (size_t i = 1; i < job_plan.steps.size(); ++i) {
+        const auto& step = job_plan.steps[i];
+
+        // Check step type using dynamic_cast
+        bool is_h2d =
+            dynamic_cast<const JobPlanStepH2D*>(step.get()) != nullptr;
+        bool is_compute =
+            dynamic_cast<const JobPlanStepCompute*>(step.get()) != nullptr;
+
+        // Validate based on expected state
+        switch (expected) {
+          case ExpectedStep::H2D:
+            TORCH_CHECK(is_h2d, "Step ordering violation at step ", i,
+                        ": HostCallback must be followed by H2D transfer");
+            // H2D must be followed by Compute
+            expected = ExpectedStep::Compute;
+            break;
+
+          case ExpectedStep::Compute:
+            TORCH_CHECK(is_compute, "Step ordering violation at step ", i,
+                        ": H2D transfer must be followed by Compute");
+            sequence_complete = true;
+            break;
+        }
+      }
+
+      TORCH_CHECK(sequence_complete,
+                  "Incomplete step sequence: HostCallback must be followed "
+                  "by H2D transfer and Compute");
+    }
+  }
 
   // P2-15: Host compute metadata validation
   // TODO(johngontaryk): Implement once host compute metadata structure is

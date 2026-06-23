@@ -133,7 +133,8 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     for i, coord in enumerate(coords):
         if coord.free_symbols:
             sym = _lone_sym(coord)
-            result.setdefault(sym, []).append(buf_named_dims[i])
+            if sym in dep.ranges:
+                result.setdefault(sym, []).append(buf_named_dims[i])
     for sym, names in result.items():
         actual_range = int(dep.ranges[sym])
         product = 1
@@ -244,7 +245,11 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep) -> None:
+def _log_dep_debug(
+    label: str, dep: MemoryDep
+) -> (
+    None
+):  # TODO: thread indirect_load_subs to show IndirectAccess in device_coordinates
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -429,6 +434,9 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
+        # Reconstructed buffers can copy optional metadata; recompute it here.
+        if hasattr(op, "work_div_loop_info"):
+            del op.work_div_loop_info  # type: ignore[attr-defined]
         dp = getattr(op, "_dim_prop_info", None)
         op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
         if not op_hints:
@@ -438,6 +446,11 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             continue
 
         assert dp is not None  # guaranteed by op_hints check above
+        if any(hint_dict.get("work_div") for hint_dict in op_hints.values()):
+            op.work_div_loop_info = {  # type: ignore[attr-defined]
+                sym: list(names) for sym, names in dp.loop_var_dims.items()
+            }
+
         reduction_dims = set(dp.reduction_named_dims or [])
 
         coord_for_name: dict[str, sympy.Symbol] = {}
@@ -447,6 +460,14 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             sym = _lone_sym(coord)
             for name, _ in named_dims_for_sym(op, sym):
                 coord_for_name[name] = sym
+        # Also map reduction dim names to their loop variable.  Reduction dims
+        # don't appear in output coordinates, so they would never be found by
+        # the output-coord loop above.  dp.loop_var_dims covers all loop vars
+        # (including the reduction dim), so we invert it for reduction names.
+        for sym, names in dp.loop_var_dims.items():
+            for name in names:
+                if name in reduction_dims:
+                    coord_for_name[name] = sym
 
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):

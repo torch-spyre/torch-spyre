@@ -18,9 +18,23 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Sequence
 
-from sympy import Symbol, Expr
+from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats
 import torch
+
+
+class IndirectAccess(Function):
+    """Sympy function: IndirectAccess(tensor_name) — runtime index read from that tensor at the current iteration point.
+
+    Used in TensorArg.device_coordinates to encode indirect access: as a coordinate of an
+    input arg (gather) or an output arg (scatter).
+    IndexedBase was not used because sympify('arg1_1[i]') fails: the parser reconstructs
+    arg1_1 as a Symbol, and Symbol.__getitem__ raises TypeError.
+    """
+
+    @classmethod
+    def eval(cls, name):  # noqa: ARG003
+        return None  # keep unevaluated
 
 
 @dataclasses.dataclass
@@ -46,6 +60,7 @@ class TensorArg:
     allocation: Any
     stride_map: list[int] | None = None
     per_tile_fixed: bool = False
+    name: str | None = None
 
 
 @dataclasses.dataclass

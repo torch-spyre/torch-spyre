@@ -1,0 +1,21 @@
+# Misc compute shard C: attention, sdpa, rope, and qkv tests.
+#
+# Split out from shard A to reduce per-job CI time.  Shard A covers
+# activations and broadcast/scalar arithmetic.  Shard B covers normalization,
+# embedding, isin, inplace, bitwise, misc, random, and error-path tests.
+#
+# When a new test is added to test_inductor_ops.py that belongs in the misc
+# compute group, assign it to whichever shard keeps the jobs balanced.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # attention / sdpa / rope / qkv
+            - TestOps::test_attention.*
+            - TestOps::test_sdpa.*
+            - TestOps::test_rope_fms.*
+            - TestOps::test_qkv_attn_paths_fms.*
+          mode: mandatory_success
