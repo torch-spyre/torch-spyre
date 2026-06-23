@@ -21,7 +21,7 @@ import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME
+from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
 
@@ -763,6 +763,25 @@ def conv2d_via_bmm_decomp(
     return output
 
 
+# Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
+@decomp.register_decomposition(
+    [torch.ops.spyre.dequantize_fp8_with_scale], spyre_decompositions
+)
+def dequantize_fp8_with_scale_decomp(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """
+    Decompose dequantize_fp8_with_scale into:
+    1. FP8→FP16 conversion using .to() (triggers fp8todl16 via dtype_ops)
+    2. Multiply by scale
+
+    This decomposition is executed during compilation and removes the custom op
+    from the graph before lowering.
+    """
+    x_fp16 = input.to(torch.float16)
+    return x_fp16 * scale
+
+
 @register_spyre_decomposition([torch.ops.aten.where.ScalarOther])
 def where_scalar_other_decomp(condition, self, other):
     other_t = torch.full_like(self, other)
@@ -795,6 +814,16 @@ def where_scalar_decomp(condition, self, other):
     )
 
     return torch.ops.aten.where.self(condition, self_t, other_t)
+
+
+@register_spyre_decomposition([torch.ops.spyre.quantize_fp8_with_scale])
+def spyre_quantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    inv_scale = torch.reciprocal(scale)
+    x_scaled = input * inv_scale
+    x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
+    return torch.ops.spyre.qfp8ch(x_clamped)
 
 
 ###############################################################################################

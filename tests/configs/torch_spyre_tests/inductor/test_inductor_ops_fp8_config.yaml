@@ -1,0 +1,10 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_fp8_operations.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestFP8Operations::test_(quantize_dequantize_fp8_small_range|quantize_dequantize_fp8_medium_range|quantize_dequantize_fp8_boundary_cases|quantize_dequantize_fp8_production_shapes|qfp8ch_basic_conversion|fp8todl16_basic_conversion).*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-fp8
