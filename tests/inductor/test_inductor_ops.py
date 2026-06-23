@@ -550,18 +550,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "fp32_enabled": (
                     True,
-                    cached_randn((4, 4), dtype=torch.float32),
-                    cached_randn((4, 4), differentiation=1, dtype=torch.float32),
+                    cached_randn((64, 64), dtype=torch.float32),
+                    cached_randn((64, 64), differentiation=1, dtype=torch.float32),
                 ),
                 "f16_enabled": (
                     True,
-                    cached_randn((4, 4), dtype=torch.float16),
-                    cached_randn((4, 4), differentiation=1, dtype=torch.float16),
+                    cached_randn((64, 64), dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=1, dtype=torch.float16),
                 ),
                 "f16_disabled": (
                     False,
-                    cached_randn((4, 4), differentiation=2, dtype=torch.float16),
-                    cached_randn((4, 4), differentiation=3, dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=2, dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=3, dtype=torch.float16),
                 ),
             },
             "expect_fail": ["fp32_enabled"],
