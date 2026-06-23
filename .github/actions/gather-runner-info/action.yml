@@ -10,11 +10,13 @@ inputs:
       When 'true', also dumps sorted env, AIU env vars, and a directory
       listing of the pre-cloned repo. Defaults to 'false' for a terse log.
     required: false
+    type: string
     default: 'false'
-  cloned-dir:
-    description: Path to the pre-cloned torch-spyre directory in the image.
+  torch_spyre_dir:
+    description: Path to the pre-cloned torch-spyre directory
     required: false
-    default: /home/senuser/torch-spyre
+    type: string
+    default: torch-spyre
 
 runs:
   using: composite
@@ -23,7 +25,7 @@ runs:
       shell: bash
       env:
         VERBOSE: ${{ inputs.verbose }}
-        CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -37,17 +39,19 @@ runs:
         echo "HOME $HOME"
         echo "TORCH_ROOT ${TORCH_ROOT:-<unset>}"
         echo "---------------------------------"
+        ls -la "$HOME"
         ls -la "$HOME/installed_rpms.txt"
         cat "$HOME/installed_rpms.txt"
         echo "---------------------------------"
         python3 --version
         python3 -c 'import sys; print(sys.path)'
-        if [[ "${VERBOSE}" == "true" ]]; then
+        if [[ "$VERBOSE" == 'true' ]]; then
           echo "--- env ---"
           env | sort
           echo "--- AIU env ---"
           env | sort | grep AIU || true
           echo "--- repo listing ---"
-          ls -lart "$CLONED_TORCH_SPYRE_DIR"
+          echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+          ls -lart "$TORCH_SPYRE_DIR" || true
         fi
         echo "================================="

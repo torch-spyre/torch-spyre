@@ -1,0 +1,72 @@
+name: Checkout pytorch repo
+description: |
+  Re-points the pre-cloned pytorch source tree at the release branch that
+  matches the torch version pinned in torch-spyre's pyproject.toml.
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the pre-cloned torch-spyre directory
+    required: false
+    type: string
+    default: torch-spyre
+  pytorch_dir:
+    description: Path to clone the pytorch directory to
+    required: false
+    type: string
+    default: pytorch
+
+runs:
+  using: composite
+  steps:
+    - name: Re-checkout pytorch at release branch matching pyproject.toml
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+        PYTORCH_DIR: ${{ inputs.pytorch_dir }}
+        PYTORCH_REPO_URL: https://github.com/pytorch/pytorch.git
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        [[ "$PYTORCH_DIR" != /* ]] && PYTORCH_DIR="${PWD}/${PYTORCH_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+        echo "PYTORCH_DIR $PYTORCH_DIR"
+
+        # Any pre-cloned repos may be owned by a different user than the
+        # runner process; mark all directories as safe (covers the repo
+        # and any submodules).
+
+        git config --global --add safe.directory '*'
+
+        # Derive the target pytorch release branch from torch-spyre's
+        # pyproject.toml — single source of truth. The same script is used
+        # by the runner-image build pipeline (spyre-runtimes Dockerfile) to
+        # pick TORCH_MINOR for the pre-cloned pytorch tree, so this action
+        # always agrees with the image on what `release/X.Y` means. The
+        # script uses stdlib only (re + tomllib), so no venv activation
+        # needed here.
+
+        cd "$TORCH_SPYRE_DIR" || exit 1
+        ls -la pyproject.toml || exit 1
+        VERSION=$(python3 tools/get_torch_minor.py pyproject.toml)
+        TARGET_BRANCH="release/${VERSION}"
+        echo "TARGET_BRANCH $TARGET_BRANCH"
+        echo "PYTORCH_REPO_URL $PYTORCH_REPO_URL"
+
+        mkdir -p "$PYTORCH_DIR" || exit 1
+        cd "$PYTORCH_DIR" || exit 1
+        git init -b main
+
+        git remote add origin "$PYTORCH_REPO_URL"
+        git fetch --depth=1 origin "$TARGET_BRANCH"
+        git checkout --detach FETCH_HEAD
+
+        git submodule sync --recursive
+        git submodule update --init --recursive --depth 1 --jobs 8
+
+        git log -1 --oneline || true
+
+        export TORCH_ROOT="$PYTORCH_DIR"
+        echo "TORCH_ROOT $TORCH_ROOT"
+        echo "TORCH_ROOT=${TORCH_ROOT}" >> "$GITHUB_ENV"

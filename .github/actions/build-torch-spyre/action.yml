@@ -11,28 +11,34 @@ description: |
   via --reinstall-package.
 
 inputs:
-  cloned-dir:
-    description: Path to the pre-cloned torch-spyre directory in the image.
+  torch_spyre_dir:
+    description: Path to the pre-cloned torch-spyre directory
     required: false
-    default: /home/senuser/torch-spyre
+    type: string
+    default: torch-spyre
 
 runs:
   using: composite
   steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
     - name: Build torch-spyre
       shell: bash
       env:
-        CLONED_TORCH_SPYRE_DIR: ${{ inputs.cloned-dir }}
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
-        cd "$CLONED_TORCH_SPYRE_DIR"
-        source .venv/bin/activate
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+
+        cd "$TORCH_SPYRE_DIR"
         uv sync \
           --verbose \
-          --all-extras \
-          --active \
-          --inexact \
-          --reinstall-package torch-spyre
+          --frozen \
+          --all-extras
+        source .venv/bin/activate
         uv pip show torch
         uv pip freeze
