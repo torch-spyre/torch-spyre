@@ -98,7 +98,7 @@ jobs:
 
           mkdir -p coverage
           if [[ -n "$RUN_ID" ]]; then
-            if gh run download "$RUN_ID" --repo "$TARGET_REPO" -n complete-coverage-map -D coverage; then
+            if gh run download "$RUN_ID" --repo "$TARGET_REPO"  -D coverage; then
               echo "is_first_run=false" >> "$GITHUB_OUTPUT"
               
               echo "DOWNLOAD SUCCESSFUL: Listing coverage/ folder"
