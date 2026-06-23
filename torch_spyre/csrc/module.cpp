@@ -16,6 +16,7 @@
 
 #include "module.h"
 
+#include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <c10/core/ScalarType.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
@@ -162,9 +163,37 @@ int device_count() {
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
+  // Register PrivateUse1 hooks — tells PyTorch the device exists.
+  // Loading _C.so does NOT trigger device initialization;
+  // start_runtime() must be called explicitly (via _lazy_init()).
+  {
+    struct SpyreHooksArgs : public at::PrivateUse1HooksArgs {};
+    struct SpyreHooksInterface : public at::PrivateUse1HooksInterface {
+      SpyreHooksInterface() = default;
+      explicit SpyreHooksInterface(SpyreHooksArgs) {}
+      ~SpyreHooksInterface() override = default;
+      bool hasPrimaryContext(c10::DeviceIndex) const override {
+        return true;
+      }
+      bool isAvailable() const override {
+        return true;
+      }
+      const at::Generator& getDefaultGenerator(
+          c10::DeviceIndex device) const override {
+        return spyre::detail::getDefaultSpyreGenerator(device);
+      }
+      at::Generator getNewGenerator(c10::DeviceIndex device) const override {
+        return spyre::detail::createSpyreGenerator(device);
+      }
+    };
+    static auto* hooks = new SpyreHooksInterface();
+    at::RegisterPrivateUse1HooksInterface(hooks);
+  }
+
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
+  m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
@@ -372,7 +401,7 @@ PYBIND11_MODULE(_C, m) {
       .def(
           "job_allocation_size",
           [](const spyre::JobPlan& plan) {
-            return plan.job_allocation.total_size();
+            return plan.job_allocation.at(0).total_size();
           },
           "Get the size of the job allocation")
       .def(
@@ -398,7 +427,7 @@ PYBIND11_MODULE(_C, m) {
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
-               std::to_string(plan.job_allocation.total_size()) +
+               std::to_string(plan.job_allocation.at(0).total_size()) +
                " expected_inputs=" +
                std::to_string(plan.expected_input_shapes.size()) +
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +

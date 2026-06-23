@@ -15,6 +15,7 @@
 import numpy as np
 import pytest
 import torch
+import torch._dynamo as dynamo
 
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu
 
@@ -363,6 +364,55 @@ class TestDatatypeScalarOperations:
         x = cached_randn((10, 10), dtype=torch.float32) * 1e-10
         # For large numbers, atol must be large, but rtol is the real gate
         _compare_modes(execution_mode, large_scalar_mul, x, atol=1e25, rtol=1e-3)
+
+    @torch._dynamo.config.patch(assume_static_by_default=False)
+    def test_dtype_conversion_with_symbolic_dimensions(self, execution_mode):
+        """
+        Test dtype conversion with symbolic dimensions (dynamic shapes).
+
+        Regression test for propagate_layouts.py line 167 bug where:
+        - Bug: unaligned = stick_dim_size % in_elems_per_stick
+               if unaligned > 0:  # TypeError: cannot determine truth value of Relational
+        - Fix: unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
+
+        Without the fix, this test fails with:
+        TypeError: cannot determine truth value of Relational: Mod(s53, 64) > 0
+
+        Note: This test verifies the symbolic dimension fix works (no TypeError during
+        compilation). Full numerical correctness testing is blocked by Issue #2185
+        ("anywhere valid" coordinate bug in dtype conversions causing data corruption).
+        """
+        # Reset compilation cache to ensure clean state
+        dynamo.reset()
+
+        def convert_fp16_to_fp32(x):
+            """Dtype conversion with dynamic shapes forces symbolic dimensions"""
+            return x.to(torch.float32)
+
+        # Use large dimensions to ensure symbolic dimension handling is triggered
+        batch_size = 1
+        seq_len = 128
+        hidden_dim = 4096
+
+        # Create input tensor
+        x = cached_randn(
+            (batch_size, seq_len, hidden_dim),
+            dtype=torch.float16,
+            differentiation="symbolic_dim_fp16_to_fp32",
+        )
+
+        # Test that compilation succeeds without TypeError
+        # (the bug we're fixing would cause: TypeError: cannot determine truth value of Relational)
+        result = _run_spyre(execution_mode, convert_fp16_to_fp32, x)
+
+        # Verify basic properties (shape, dtype, device)
+        assert result.shape == x.shape, f"Shape mismatch: {result.shape} != {x.shape}"
+        assert result.dtype == torch.float32, (
+            f"Dtype mismatch: {result.dtype} != torch.float32"
+        )
+        assert result.device.type == "spyre", (
+            f"Device mismatch: {result.device.type} != spyre"
+        )
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")

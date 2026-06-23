@@ -180,8 +180,12 @@ The table below shows the currently registered suites and their configs as a ref
 | Inductor Ops Reductions Keepdim Index Norm Eager | `torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_index_norm_eager_config.yaml` |
 | Inductor Ops Reductions Scalar | `torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml` |
 | Inductor Ops Pointwise | `torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml` |
-| Inductor Ops Misc Shape | `torch_spyre_tests/inductor/test_inductor_ops_misc_shape_config.yaml` |
-| Inductor Ops Misc Compute | `torch_spyre_tests/inductor/test_inductor_ops_misc_compute_config.yaml` |
+| Inductor Ops Misc Shape A | `torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml` |
+| Inductor Ops Misc Shape B | `torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml` |
+| Inductor Ops Misc Shape C | `torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml` |
+| Inductor Ops Misc Compute A | `torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml` |
+| Inductor Ops Misc Compute B | `torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml` |
+| Inductor Ops Misc Compute C | `torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml` |
 | Inductor Ops LX Planning | `torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml` |
 | Inductor Scalar | `torch_spyre_tests/inductor/test_inductor_scalar_config.yaml` |
 | Inductor Logging | `torch_spyre_tests/inductor/test_logging_config.yaml` |
