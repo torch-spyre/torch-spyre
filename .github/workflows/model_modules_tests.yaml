@@ -63,6 +63,10 @@ jobs:
         suite:
           - name: Granite 3.3 8B Instruct
             config: granite_3_3_8b_instruct_spyre.yaml
+          - name: Granite 4.1 8B
+            config: granite_4_1_8b_spyre.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite

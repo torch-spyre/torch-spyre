@@ -1,0 +1,129 @@
+name: push-hw-diagnostics-to-clickhouse
+
+on:
+  workflow_run:
+    workflows:
+      - tests
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      gha_run_id:
+        description: GHA run ID to parse and ingest
+        required: true
+        default: ''
+
+concurrency:
+  group: hw-diag-${{ github.event.workflow_run.id || inputs.gha_run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  ingest:
+    name: Parse logs -> ClickHouse
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 15
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion != 'cancelled'
+
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+
+      TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
+      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name       || 'tests' }}
+      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha   || github.sha }}
+
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/scripts/parse_hw_failures.py
+            .github/scripts/ingest_hw_diagnostics.py
+
+      - name: Install Python dependencies
+        run: |
+          source /home/senuser/torch-spyre/.venv/bin/activate
+          uv pip install clickhouse-connect
+
+      - name: Install gh CLI
+        run: |
+          wget -q https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz
+          tar -xzf gh_2.92.0_linux_amd64.tar.gz
+          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
+          gh_2.92.0_linux_amd64/bin/gh --version
+
+      - name: Download Job Logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p raw_logs
+
+          gh api \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
+            --paginate \
+            --jq '.jobs[] | {id: .id, name: .name}' \
+          > /tmp/jobs.jsonl
+
+          python3 - << 'PYEOF'
+          import json, os, re, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
+
+          for idx, j in enumerate(jobs):
+              safe   = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
+              out    = f"raw_logs/{idx}_{safe}.txt"
+              result = subprocess.run(
+                  ["gh", "api", f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
+                  capture_output=True, env={**os.environ},
+              )
+              if result.returncode == 0 and result.stdout:
+                  open(out, "wb").write(result.stdout)
+                  print(f"  OK  {out}")
+              else:
+                  print(f"  SKIP  {j['name']} (no log)")
+          PYEOF
+
+      - name: Parse Logs
+        run: |
+          source /home/senuser/torch-spyre/.venv/bin/activate
+
+          SAFE_WF=$(echo "${TRIGGERING_WORKFLOW}" | tr ' ' '_')
+          JSON_FILE="hw_diagnostics_${SAFE_WF}_${TRIGGERING_RUN_ID}.json"
+          echo "JSON_FILE=${JSON_FILE}" >> "$GITHUB_ENV"
+
+          python3 .github/scripts/parse_hw_failures.py \
+            --log-dir raw_logs \
+            --run-id  "${TRIGGERING_RUN_ID}" \
+            --out     "${JSON_FILE}"
+
+      - name: Ingest Logs Report into ClickHouse
+        run: |
+          source /home/senuser/torch-spyre/.venv/bin/activate
+          python3 .github/scripts/ingest_hw_diagnostics.py \
+            --json-file "${JSON_FILE}" \
+            --workflow  "${TRIGGERING_WORKFLOW}" \
+            --branch    "${TRIGGERING_BRANCH}" \
+            --sha       "${TRIGGERING_SHA}" \
+            --run-id    "${TRIGGERING_RUN_ID}"
+
+      - name: Upload JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.JSON_FILE }}
+          path: ${{ env.JSON_FILE }}
+          retention-days: 10
