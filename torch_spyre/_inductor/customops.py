@@ -21,6 +21,8 @@ from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
+aten = torch.ops.aten
+
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
@@ -170,6 +172,18 @@ def gelu(
 
 @gelu.register_fake
 def _(input: torch.Tensor, approximate: str = "none"):
+    return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::silu", mutates_args=(), device_types="spyre")
+def silu(
+    input: torch.Tensor,
+) -> torch.Tensor:
+    return aten.div.Tensor(input, 1 + aten.exp.default(-input))
+
+
+@silu.register_fake
+def _(input: torch.Tensor):
     return input.new_empty(input.size())
 
 
