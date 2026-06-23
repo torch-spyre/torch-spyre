@@ -37,6 +37,8 @@ test_suite_config:
             - TestOps::test_repeat.*
             - TestOps::test_restickify_fp32_unsupported_xfail
             - TestOps::test_restickify_int64_unsupported_xfail
+            # multiops split test
+            - TestOps::test_multiops_split.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

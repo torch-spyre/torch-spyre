@@ -250,7 +250,15 @@ def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
     return tuple(args), clean_kw, out_dtype
 
 
-def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant):
+def _build_inner_fn(
+    op_name,
+    value_vids,
+    kwargs,
+    vid_to_bufname,
+    vid_to_constant,
+    vid_to_load_index=None,
+    n_dims=None,
+):
     """Build an inner_fn that loads from intermediate buffers.
 
     Special cases:
@@ -276,10 +284,16 @@ def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant
     vid_to_stride = {}
     for v in value_vids:
         if v not in vid_to_constant:
+            if vid_to_load_index and n_dims and v in vid_to_load_index:
+                continue
             buf_name = vid_to_bufname[v]
             vid_to_stride[v] = V.graph.get_buffer(buf_name).layout.stride
 
     def inner_fn(index):
+        subs = {}
+        if vid_to_load_index and n_dims:
+            subs = {sympy.Symbol(f"_i{k}"): index[k] for k in range(n_dims)}
+
         inputs = []
         for v in value_vids:
             if v in vid_to_constant:
@@ -289,6 +303,14 @@ def _build_inner_fn(op_name, value_vids, kwargs, vid_to_bufname, vid_to_constant
                     inputs.append(fill)
                 else:
                     inputs.append(V.ops.load(vid_to_bufname[v], sympy.Integer(0)))
+            elif subs and vid_to_load_index and v in vid_to_load_index:
+                # Use the original traced load index expression
+                # instead of stride since index tuple could be different
+                # from allocated buffer dimension.
+                # ref - https://github.com/torch-spyre/torch-spyre/issues/2797
+                traced_idx = vid_to_load_index[v]
+                idx = traced_idx.subs(subs)
+                inputs.append(V.ops.load(vid_to_bufname[v], idx))
             else:
                 buf_stride = vid_to_stride[v]
                 if len(index) != len(buf_stride):
@@ -368,6 +390,11 @@ def _init_vid_to_bufname(trace):
         Dictionary mapping value IDs to buffer names
     """
     return {vid: kwargs["_name"] for op, vid, _, kwargs in trace if op == "load"}
+
+
+def _init_vid_to_load_index(trace):
+    """Extract per-VID symbolic load indices from load operations in a trace."""
+    return {vid: kwargs["_index"] for op, vid, _, kwargs in trace if op == "load"}
 
 
 def _init_vid_to_constant(trace):
@@ -492,7 +519,12 @@ def _make_intermediate_bufs(
 
 
 def _update_original_buf(
-    op, final_entry, vid_to_bufname, vid_to_constant, operations
+    op,
+    final_entry,
+    vid_to_bufname,
+    vid_to_constant,
+    operations,
+    vid_to_load_index=None,
 ) -> None:
     """Update the original buffer to use intermediate buffers.
 
@@ -513,7 +545,13 @@ def _update_original_buf(
     new_data = dataclasses.replace(
         op.data,
         inner_fn=_build_inner_fn(
-            op_name, vids, kwargs, vid_to_bufname, vid_to_constant
+            op_name,
+            vids,
+            kwargs,
+            vid_to_bufname,
+            vid_to_constant,
+            vid_to_load_index=vid_to_load_index,
+            n_dims=len(op.data.ranges),
         ),
     )
 
@@ -625,6 +663,7 @@ def split_multi_ops(graph: GraphLowering):
     3. Skips if tracing fails or operation is not in operations list
     4. Requires valid FX node origins for graph manipulation
     5. Builds environment mapping from name_to_users for FX node lookup
+    6. load index is computed from traced index rather using stride
 
     Algorithm:
     1. Build FX node environment from name_to_users
@@ -690,6 +729,9 @@ def split_multi_ops(graph: GraphLowering):
             continue
 
         intermediate_ops, final_op = compute_ops[:-1], compute_ops[-1]
+
+        vid_to_load_index = _init_vid_to_load_index(trace)
+
         _make_intermediate_bufs(
             intermediate_ops,
             dtype_map,
@@ -700,7 +742,15 @@ def split_multi_ops(graph: GraphLowering):
             gl,
             orig_node,
         )
-        _update_original_buf(op, final_op, bufname_map, const_map, operations)
+
+        _update_original_buf(
+            op,
+            final_op,
+            bufname_map,
+            const_map,
+            operations,
+            vid_to_load_index=vid_to_load_index,
+        )
         logger.info(
             "split_multi_op: '%s' -> %d intermediate buffers",
             op.get_name(),
