@@ -773,6 +773,10 @@ def main():
 
     logger.info(f"Loading model: {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+
+    # Fix missing pad_token for Mistral tokenizers
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModel.from_pretrained(args.model_path).eval()
     all_custom_modules = get_all_custom_modules(model)
     logger.info(f"Found {len(all_custom_modules)} custom module instances")
