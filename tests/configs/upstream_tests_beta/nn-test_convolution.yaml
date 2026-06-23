@@ -16,7 +16,6 @@ test_suite_config:
             - TestConvolutionNNDeviceType::test_Conv3d_depthwise_naive_groups
             - TestConvolutionNNDeviceType::test_ConvTranspose2d_large_output_padding
             - TestConvolutionNNDeviceType::test_ConvTranspose2d_size_1_kernel
-            - TestConvolutionNNDeviceType::test_ConvTranspose3d_size_1_kernel
             - TestConvolutionNNDeviceType::test_contig_wrong_stride_cudnn
             - TestConvolutionNNDeviceType::test_conv1d_same_padding
             - TestConvolutionNNDeviceType::test_conv1d_same_padding_backward
@@ -56,6 +55,7 @@ test_suite_config:
             - TestConvolutionNNDeviceType::test_group_conv_empty
           mode: xfail  # xfail: RuntimeError
         - names:
+            - TestConvolutionNNDeviceType::test_ConvTranspose3d_size_1_kernel
             - TestConvolutionNN::test_Conv1d_module_same_padding
             - TestConvolutionNN::test_Conv2d_1x1
             - TestConvolutionNN::test_Conv2d_OneDNN
