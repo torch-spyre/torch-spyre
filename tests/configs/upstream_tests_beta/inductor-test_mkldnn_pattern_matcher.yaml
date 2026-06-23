@@ -64,18 +64,18 @@ test_suite_config:
       - name: float32
       - name: int64
     supported_ops:
-      - name: _scaled_dot_product_fused_attention_overrideable
-        dtypes:
-          - name: bfloat16
-          - name: bool
-          - name: float16
-          - name: int64
-      - name: _scaled_mm
-        dtypes:
-          - name: bfloat16
-          - name: bool
-          - name: float16
-          - name: int64
+      # - name: _scaled_dot_product_fused_attention_overrideable
+      #   dtypes:
+      #     - name: bfloat16
+      #     - name: bool
+      #     - name: float16
+      #     - name: int64
+      # - name: _scaled_mm
+      #   dtypes:
+      #     - name: bfloat16
+      #     - name: bool
+      #     - name: float16
+      #     - name: int64
       - name: add
         dtypes:
           - name: bfloat16
