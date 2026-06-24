@@ -337,6 +337,7 @@ jobs:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
+          parallel: 'false'
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
