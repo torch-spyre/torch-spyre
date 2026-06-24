@@ -93,11 +93,20 @@ def _tile_device_size(
     must keep the full-tensor size so the hardware uses the correct row stride
     when it steps from one row of the tile to the next.
 
-    Concretely: only update ``device_size[d]`` for dimensions whose delta is
-    driven solely by row-like tiled symbols — symbols that do NOT appear in
-    ``device_coordinates[-1]`` (the within-stick coordinate).  The stick
-    column symbol appears in both the sticks-per-row coordinate and the
-    within-stick coordinate, so it is excluded from this update.
+    Two guards determine whether ``device_size[d]`` may be shrunk to the tile
+    extent:
+
+    1. Stick-symbol exclusion: symbols that appear in ``device_coordinates[-1]``
+       (the within-stick coordinate) are column/stick symbols.  Their
+       sticks-per-row dimension encodes the inter-stick-group stride and must
+       not be shrunk.
+
+    2. Outer-dimension guard: ``device_size[d]`` contributes to the physical
+       row stride of every outer dimension ``d' < d`` that has
+       ``device_size[d'] > 1``.  If any such outer dimension exists, shrinking
+       ``device_size[d]`` would corrupt the hardware's stride calculation.
+       Only shrink ``device_size[d]`` when all outer dimensions are degenerate
+       (size 1).
     """
     all_syms: set = set()
     for expr in arg.device_coordinates:
@@ -119,8 +128,14 @@ def _tile_device_size(
             at_range = int(coord_expr.subs(sub_range))
             at_zero = int(coord_expr.subs(sub_zero))
             delta = at_range - at_zero
-            if delta > 0:
-                result[d] = delta
+            if delta <= 0:
+                continue
+            # Only shrink device_size[d] when all outer dims are degenerate.
+            # A non-degenerate outer dim uses device_size[d] as part of its
+            # physical row stride; shrinking it would corrupt that stride.
+            if any(arg.device_size[d_] > 1 for d_ in range(d)):
+                continue
+            result[d] = delta
     return result
 
 
