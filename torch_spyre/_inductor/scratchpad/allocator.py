@@ -55,6 +55,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     get_ncores_for_buffers,
     get_buffer_users,
     GraphView,
+    get_op_pointwise_inputs,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 
@@ -103,18 +104,19 @@ class ScratchpadAllocator(ABC):
             )
         )
 
-    def _op_good_for_lx_inplace(self, op: Any) -> bool:
+    def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:
         target = getattr(getattr(op, "origin_node", None), "target", None)
         if target is None:
-            return False
+            return []
+        reads = [dep.name for dep in op.get_read_writes().reads]
         if self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE:
-            # If the op is in the whitelist, return true
-            return True
+            # If the op is in the whitelist, allow all inputs
+            return reads
         if torch.Tag.pointwise in target.tags:
             # If the op is tagged as pointwise by pytorch upstream
-            # return True. Works only for unary ops
-            return True
-        return False
+            # allow all inputs. Does not work for all ops
+            return reads
+        return get_op_pointwise_inputs(op.data)
 
     def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
         core_div_mismatch = get_ncores_for_buffers(graph)
@@ -205,7 +207,8 @@ class ScratchpadAllocator(ABC):
         graph_view = GraphView(graph, self._filter_ops)
         mem_usage = mem_usage_by_buf(graph_view)
         in_place_allowed = {
-            op.name: self._op_good_for_lx_inplace(op) for op in graph_view.operations
+            op.name: self._op_inputs_good_for_lx_inplace(op)
+            for op in graph_view.operations
         }
         lifetimes = calculate_liveness(graph)
         for buf_name, info in mem_usage.items():
@@ -224,7 +227,8 @@ class ScratchpadAllocator(ABC):
                 inp_i_eol = in_end == out_start  # same op reads input and writes output
                 no_core_div_mismatch = not info["core_div_mismatch"]
                 if (
-                    inp_i_size_match
+                    input_buf in in_place_allowed[buf_name]
+                    and inp_i_size_match
                     and inp_i_lay_match
                     and inp_i_eol
                     and no_core_div_mismatch
