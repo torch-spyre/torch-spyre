@@ -1282,7 +1282,6 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[512, 64, 1, 64],
             device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
             allocation={"hbm": 0},
-            stride_map=[4096, 64, -1, 1],
         )
         kernel_arg = TensorArg(
             is_input=True,
@@ -1291,7 +1290,6 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[200, 4096, 64],
             device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
             allocation={"hbm": 0x400000000},
-            stride_map=[64, 12800, 1],
         )
         output_arg = TensorArg(
             is_input=False,
@@ -1300,12 +1298,10 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[512, 200, 1, 64],
             device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
             allocation={"hbm": 0x800000000},
-            stride_map=[12800, 64, -1, 1],
         )
         for arg in (input_arg, output_arg):
             del arg.device_size[-2]
             del arg.device_coordinates[-2]
-            del arg.stride_map[-2]
         iteration_space = {
             c0: (Integer(512), 4),
             c1: (Integer(12800), 8),

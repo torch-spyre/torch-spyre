@@ -827,9 +827,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
         Regression test for a bug in _byte_stride_for_arg (unroll.py) where
-        align_tensors rewrites device_coordinates but leaves stride_map stale,
-        causing per-tile HBM base addresses to advance by the wrong amount when
-        the tiled dimension is not the outermost host dimension (e.g. H in BHLD).
+        per-tile HBM base addresses advanced by the wrong amount when the tiled
+        dimension was not the outermost host dimension (e.g. H in BHLD).
         """
         from torch_spyre._inductor import spyre_hint
 
