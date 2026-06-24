@@ -290,7 +290,7 @@ TO_DTYPE_OP_PARAMS_SETS = {
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.bool and dst != torch.bool
+    if src not in (torch.bool, torch.float8_e4m3fn) and dst != torch.bool
 }
 
 
@@ -550,18 +550,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "fp32_enabled": (
                     True,
-                    cached_randn((4, 4), dtype=torch.float32),
-                    cached_randn((4, 4), differentiation=1, dtype=torch.float32),
+                    cached_randn((64, 64), dtype=torch.float32),
+                    cached_randn((64, 64), differentiation=1, dtype=torch.float32),
                 ),
                 "f16_enabled": (
                     True,
-                    cached_randn((4, 4), dtype=torch.float16),
-                    cached_randn((4, 4), differentiation=1, dtype=torch.float16),
+                    cached_randn((64, 64), dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=1, dtype=torch.float16),
                 ),
                 "f16_disabled": (
                     False,
-                    cached_randn((4, 4), differentiation=2, dtype=torch.float16),
-                    cached_randn((4, 4), differentiation=3, dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=2, dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=3, dtype=torch.float16),
                 ),
             },
             "expect_fail": ["fp32_enabled"],
@@ -1837,8 +1837,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_empty_like_dtype_override_cpu",
         ): {
             "param_sets": {
-                "fp16_to_fp32": (cached_randn((4, 8), dtype=torch.float16),),
-                "fp32_to_fp16": (cached_randn((4, 8), dtype=torch.float32),),
+                "fp16_to_fp32": (cached_randn((64, 128), dtype=torch.float16),),
+                "fp32_to_fp16": (cached_randn((64, 128), dtype=torch.float32),),
             },
         },
         (
@@ -4121,6 +4121,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
         },
+        (
+            "test_multiops_split",
+            "test_view_permute_mul",
+        ): {
+            "param_sets": {
+                "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5172,6 +5180,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(input):
             return torch.nn.functional.softplus(input, beta, threshold)
+
+        self.compare_with_cpu(fn, x)
+
+    def test_view_permute_mul(self, x):
+        """Create 3D tensor, view as 4D, permute, multiply by constant."""
+
+        def fn(x):
+            return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
 
