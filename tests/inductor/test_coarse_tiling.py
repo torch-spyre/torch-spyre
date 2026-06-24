@@ -1282,7 +1282,6 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[512, 64, 1, 64],
             device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
             allocation={"hbm": 0},
-            stride_map=[4096, 64, -1, 1],
         )
         kernel_arg = TensorArg(
             is_input=True,
@@ -1291,7 +1290,6 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[200, 4096, 64],
             device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
             allocation={"hbm": 0x400000000},
-            stride_map=[64, 12800, 1],
         )
         output_arg = TensorArg(
             is_input=False,
@@ -1300,12 +1298,10 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[512, 200, 1, 64],
             device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
             allocation={"hbm": 0x800000000},
-            stride_map=[12800, 64, -1, 1],
         )
         for arg in (input_arg, output_arg):
             del arg.device_size[-2]
             del arg.device_coordinates[-2]
-            del arg.stride_map[-2]
         iteration_space = {
             c0: (Integer(512), 4),
             c1: (Integer(12800), 8),
@@ -1890,14 +1886,13 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
     # --- Group 2: nested outer-B + inner-K reduction ---
     #
     # Strides match TestNestedReductionUnroll in test_unroll_loop_specs.py:
-    #   k_input: device_size=[2,64,64], stride_map=[64,64,1], 128 K-elems/tile
-    #     byte_stride = (128//64) * 64 * 2 = 256
-    #   accum_buf: device_size=[1,2,64], stride_map=[64,64,1], 2 batches/tile
-    #     byte_stride = 2 * 64 * 2 = 256
-    # Both happen to be 256; the combine's accum_buf stride is irrelevant (not
-    # tiled on K), so only K_STRIDE=256 appears in the affine map.
+    #   k_input: device_size=[2,64,64]; device_stride[0]=prod([64,64])=4096
+    #     128 K-elems/tile → 2 sticks; byte_stride = (128//64)*4096*2 = 16384
+    #   accum_buf: device_size=[1,2,64]; device_stride[1]=prod([64])=64
+    #     2 batches/tile; byte_stride = 2*64*2 = 256
+    # Only K_STRIDE appears in the affine map (accum_buf not tiled on K).
 
-    _GRP2_K_STRIDE = 256  # (128//64) * 64 * 2
+    _GRP2_K_STRIDE = 16384  # (128//64) * prod([64,64]) * 2
 
     def _fake_nested_reduction(self, k_stride):
         c_k = self._c_k
@@ -1983,13 +1978,13 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
     # --- Group 3: tile-accum copy pattern ---
     #
     # Strides match TestNestedReductionTileAccum in test_unroll_loop_specs.py:
-    #   bmm K-input: same geometry as Group 2 → K_STRIDE = 256
-    #   accum_full (copy output): device_size=[1,128,32], stride_map=[2048,32,1]
-    #     device_coords=[c_b, c_m, c_n]; 1 tile advances c_b by 1
-    #     byte_stride = 1 * 2048 * 2 = 4096  (_OUTER_TILE_STRIDE_BYTES)
+    #   bmm K-input: same geometry as Group 2 → K_STRIDE = 16384
+    #   accum_full (copy output): device_size=[1,128,32]
+    #     device_stride[0]=prod([128,32])=4096; 1 tile advances c_b by 1
+    #     byte_stride = 1 * 4096 * 2 = 8192  (_OUTER_TILE_STRIDE_BYTES)
 
-    _GRP3_K_STRIDE = 256  # (128//64) * 64 * 2
-    _GRP3_B_STRIDE = 4096  # 1 * 2048 * 2
+    _GRP3_K_STRIDE = 16384  # (128//64) * prod([64,64]) * 2
+    _GRP3_B_STRIDE = 8192  # 1 * prod([128,32]) * 2
 
     def _fake_tile_accum(self, k_stride, b_stride):
         c_k, c_b = self._c_k, self._c_b
