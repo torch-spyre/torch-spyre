@@ -16,112 +16,50 @@
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
-from typing import Callable, Optional, Iterable, override
+from typing import Callable, ClassVar, Optional, Iterable
 from unittest import TestCase, expectedFailure
 from enum import Enum
 import os
-from functools import wraps
 
 import torch
-from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._inductor.scratchpad.allocator import (
-    scratchpad_planning,
-    DefaultAllocator,
     LifetimeBoundBuffer,
 )
-from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
-from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    BestFitLayoutSolver,
+    FirstFitLayoutSolver,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    MemoryPlanSolver,
+    GreedyLayoutSolver,
+    LifetimeBoundBuffer as Buffer,
+)
 from torch_spyre._inductor import config
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
 
-if os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1":
-    # Define usuallyExpectedFailure as a no-op. This should show failures indicating that the
-    # current allocation uses more HBM than the good allocation, not anything else.
-    def usuallyExpectedFailure(test_item: Callable) -> Callable:
-        @wraps(test_item)
-        def wrapper(*args, **kwargs):
-            return test_item(*args, **kwargs)
-
-        return wrapper
-else:
-    usuallyExpectedFailure = expectedFailure
-
-
-class BufferDeviceLayout:
-    """This class mimics the FixedTiledLayout.device_layout field."""
-
-    def __init__(self, size: int):
-        self.device_size = [(size + 127) // 128, 128]
-
-
-class BufferLayout:
-    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
-
-    def __init__(self, size: int):
-        self.device_layout = BufferDeviceLayout(size)
-        self.size = size
-        self.allocation = {}
-
-
-class Buffer:
-    def __init__(self, name: str, size: int):
-        self.name = name
-        self.size = size
-        self.layout = BufferLayout(size)
-        self.data = self  # This helps 'scratchpad'
+BYPASS_XFAIL = os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1"
 
 
 def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
-    return {name: Buffer(name=name, size=size) for (name, size) in names_sizes.items()}
-
-
-@dataclass
-class ReadWrites:
-    reads: OrderedSet[Buffer]
-    writes: OrderedSet[Buffer]
+    return {
+        name: Buffer(name=name, size=size, uses=[])
+        for (name, size) in names_sizes.items()
+    }
 
 
 @dataclass
 class Operation:
-    _opname: str
+    name: str
     inputs: list[str]
     output: str
-    _buffer_registry: dict[str, "Buffer"]
-
-    # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
-    # a field _opname that is the same as name, and a field op_it_space_splits that is used in core
-    # division. (If the value of op_it_space_splits is different for operations in a sequence, that
-    # blocks LX allocation, so we make sure it is always the same.)
-    op_it_space_splits = None
-    origin_node = None
-    target = None
-    name = None
-
-    def __post_init__(self):
-        self.op_it_space_splits = []
-        self.origin_node = self
-        self.target = self
-        self.name = self.output
+    _buffer_registry: dict[str, Buffer]
 
     @property
     def outputs(self):
         return [self.output]
-
-    def get_read_writes(self) -> ReadWrites:
-        # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
-        reads = OrderedSet(
-            self._buffer_registry[buffer_name] for buffer_name in self.inputs
-        )
-        writes = OrderedSet(
-            self._buffer_registry[buffer_name] for buffer_name in self.outputs
-        )
-        return ReadWrites(reads=reads, writes=writes)
-
-    def get_read_names(self):
-        return self.inputs
 
 
 def make_operations(
@@ -148,7 +86,7 @@ class Allocation:
     component: Component = Component.LX
     # If the component is LX, then the address must be an integer. If the component is HBM, we don't
     # care about the address; this is encoded by the address being None. (This is enforced in
-    # TestExamplePattern.verify_pattern.)
+    # PatternTests.verify_pattern.)
     address: Optional[int] = None
 
 
@@ -206,6 +144,31 @@ class Pattern:
     # is valid and that the current result is at least as good -- that is, the HBM usage of the
     # current result is no more than that of the good pattern.
     good_allocation: AllocationResult
+    inplace: bool = False
+
+    def __post_init__(self):
+        for i, op in enumerate(self.operations):
+            for buffer_name in op.inputs + op.outputs:
+                buffer = self.buffers[buffer_name]
+                if i not in buffer.uses:
+                    buffer.uses.append(i)
+
+        self.inputs, self.outputs = self.determine_inputs_outputs()
+
+        for input_name in self.inputs:
+            self.buffers[input_name].first_use_is_read = True
+
+        for i, op in enumerate(self.operations):
+            output_buffer = self.buffers[op.outputs[0]]
+            for buffer_name in op.inputs:
+                buffer = self.buffers[buffer_name]
+                if (
+                    buffer_name not in self.inputs + self.outputs
+                    and buffer.uses
+                    and buffer.uses[-1] == i
+                    and buffer.size == output_buffer.size
+                ):
+                    output_buffer.in_place_parents.append(buffer_name)
 
     def determine_inputs_outputs(self) -> tuple[list[str], list[str]]:
         # A buffer is an input if it is read before it is written. A buffer is an output if it is
@@ -225,124 +188,52 @@ class Pattern:
         return (list(inputs), outputs)
 
 
-class MockGraphLowering:
-    """This class impersonates V.graph."""
+class PatternTests:
+    """Mixin providing pattern definitions and test infrastructure.
 
-    def __init__(self, pattern: Pattern):
-        self.graph_input_names, self._output_names = pattern.determine_inputs_outputs()
-        self.buffers = pattern.buffers
-        self.operations = pattern.operations
+    Concrete subclasses are created with a ``role`` keyword:
+    - ``role="verify"``  — generates ``test_verify_{name}_pattern`` methods that validate the
+      good allocation defined in the pattern
+    - ``role="solver"``  — generates ``test_{name}_pattern`` methods that run the solver and
+      check it meets the good allocation; names in ``expected_failures`` are wrapped with
+      ``@expectedFailure``
+    """
 
-    def get_output_names(self):
-        return self._output_names
+    PATTERNS: ClassVar[list[str]] = [
+        "simple_fragmentation",
+        "staircase",
+        "downward_staircase",
+        "simple_eviction",
+        "eviction_reallocation",
+        "gqattention",
+        "moe_mlp",
+    ]
 
-    def get_buffer(self, buf: str) -> Buffer:
-        return self.buffers[buf]
+    def __init_subclass__(cls, role: str = "", **kwargs: object) -> None:
+        # This creates tests like test_verify_moe_mlp_pattern
+        # and test_moe_mlp_pattern
+        super().__init_subclass__(**kwargs)  # type: ignore[misc]
+        if role == "verify":
+            for name in PatternTests.PATTERNS:
 
+                def _test_verify(self, _n: str = name) -> None:
+                    self.verify_pattern(getattr(self, f"make_{_n}_pattern")())
 
-class InstrumentedAllocator(DefaultAllocator):
-    def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
-        self.buffers = pattern.buffers
-        self.operations = pattern.operations
-        layout_planning = GreedyLayoutSolver(AVAILABLE_LX_SIZE)
-        super().__init__(
-            layout_planning,
-            pre_optimization_passes=[
-                MockCloneInputNodesPass(layout_planning.limit, self)
-            ],
-        )
-        self.allocations: dict[str, int] = {}
-        self.graph_lowering = lowering
-        self.inputs, self.outputs = pattern.determine_inputs_outputs()
+                setattr(cls, f"test_verify_{name}_pattern", _test_verify)
+        elif role == "solver":
+            xfails: frozenset[str] = getattr(cls, "expected_failures", frozenset())
+            for name in PatternTests.PATTERNS:
 
-    def _op_output_good_for_lx_reuse(self, op: Operation) -> bool:
-        return True
+                def _test_solve(self, _n: str = name) -> None:
+                    self.run_pattern(
+                        self.solver_type, getattr(self, f"make_{_n}_pattern")()
+                    )
 
-    def _op_good_for_lx_inplace(self, op: Operation) -> bool:
-        return True
+                if name in xfails and not BYPASS_XFAIL:
+                    _test_solve = expectedFailure(_test_solve)
+                setattr(cls, f"test_{name}_pattern", _test_solve)
 
-    def _push_allocation(
-        self, graph: MockGraphLowering, buffers: list[LifetimeBoundBuffer]
-    ):
-        # push the allocation into the code generation
-        for b in buffers:
-            tensor_name = b.name
-            addr = b.address
-            if b.address is None:
-                continue
-            if tensor_name in self.allocations:
-                # TODO: At this point we don't know where we are in terms of time / operations, so we
-                # can't record at what point in time the allocation happens. This is okay as long as we
-                # every buffer name can be uniquely allocated with a single address. In order to change
-                # this, we need to store allocations differently, and then modify the logic for
-                # measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to account for
-                # this. Also update TestExamplePattern.verify_actual_run to account for this.
-                assert self.allocations[tensor_name] == addr, (
-                    f"Buffer {tensor_name} was already allocated at address "
-                    f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
-                    f" That is probably a good improvement, but it means this test needs to be "
-                    f"adjusted."
-                )
-            self.allocations[tensor_name] = addr
-
-    def new_name(self, prefix: str, current_names: set[str]) -> str:
-        candidate = prefix
-        i = 0
-        while candidate in current_names:
-            candidate = f"{prefix}_{i}"
-            i += 1
-        return candidate
-
-
-class MockCloneInputNodesPass(CloneInputNodesPass):
-    def __init__(self, limit: int, allocator: "InstrumentedAllocator"):
-        super().__init__(limit)
-        self._allocator = allocator
-
-    @override
-    def _insert_op_after(
-        self,
-        graph: MockGraphLowering,
-        buf: Buffer,
-        lowering_func: Callable,
-        buf_users: dict,
-        operations: list,
-    ) -> None:
-        buf_index = [i for i, op in enumerate(operations) if buf.name in op.inputs]
-        if not buf_index:
-            raise ValueError(
-                f"Was asked to insert after {buf.name}, but couldn't find it"
-            )
-
-        buffers = self._allocator.buffers
-        buffer_name = self._allocator.new_name("copy_buf", set(buffers))
-        buffers[buffer_name] = Buffer(buffer_name, buf.size)
-
-        op_name = self._allocator.new_name(
-            "copy_op", {op.name for op in self._allocator.operations}
-        )
-        new_op = Operation(
-            op_name,
-            inputs=[buf.name],
-            outputs=[buffer_name],
-            _buffer_registry=buffers,
-        )
-
-        # The expected order in the list of operations is actually *before* the first operation
-        # that uses buf.
-        self._allocator.operations.insert(buf_index[0], new_op)
-
-        for op in self._allocator.operations[buf_index[0] + 1 :]:
-            op.inputs = [
-                buffer_name if buf.name == input else input for input in op.inputs
-            ]
-            op.outputs = [
-                buffer_name if buf.name == output else output for output in op.outputs
-            ]
-
-
-class TestExamplePattern(TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         super().setUp()
         torch.manual_seed(0xAFFE)
 
@@ -368,9 +259,10 @@ class TestExamplePattern(TestCase):
                         see_first(op, alloc[buffer_name], buffer_name)
                     seen_buffers.add(buffer_name)
 
-    def verify_pattern(self, pattern: Pattern, *, inplace: bool = False):
+    def verify_pattern(self, pattern: Pattern):
         allocation = pattern.good_allocation
         operations = pattern.operations
+        inplace = pattern.inplace
         self.assertEqual(
             len(allocation),
             len(operations),
@@ -460,7 +352,9 @@ class TestExamplePattern(TestCase):
                     f"operation {op.name}",
                 )
 
-    def verify_actual_run(self, pattern: Pattern, alloc: InstrumentedAllocator):
+    def verify_actual_run(
+        self, pattern: Pattern, planned_buffers: dict[str, LifetimeBoundBuffer]
+    ):
         # Verify that the actual run's allocation is valid. We assume that any allocation is "live"
         # during the entire liveness of the corresponding buffer.
         liveness_start = {}
@@ -477,35 +371,48 @@ class TestExamplePattern(TestCase):
         allocate_at = defaultdict(list)
         deallocate_at = defaultdict(list)
         for buffer_name in liveness_start:
-            if buffer_name in alloc.allocations:
-                allocate_at[liveness_start[buffer_name]].append(buffer_name)
-                deallocate_at[liveness_end[buffer_name] + 1].append(buffer_name)
+            if buffer_name not in planned_buffers:
+                # This buffer is a graph input or output.
+                continue
+            addr = planned_buffers[buffer_name].address
+            if addr is None:
+                # This buffer resides in HBM.
+                continue
+            allocate_at[liveness_start[buffer_name]].append(buffer_name)
+            deallocate_at[liveness_end[buffer_name] + 1].append(buffer_name)
 
         live_buffers = set()
         for i, op in enumerate(pattern.operations):
             live_buffers.update(allocate_at[i])
             for buffer_name in op.inputs + op.outputs:
-                if buffer_name not in alloc.allocations:
+                # Verify that buffer_name does not overlap with any allocated buffers at this point.
+                if buffer_name not in planned_buffers:
+                    # This buffer is a graph input or output.
+                    continue
+                addr = planned_buffers[buffer_name].address
+                if addr is None:
                     # This buffer resides in HBM.
                     continue
-
-                # Verify that buffer_name does not overlap with any allocated buffers at this point.
-                addr = alloc.allocations[buffer_name]
-                size = op._buffer_registry[buffer_name].size
+                size = planned_buffers[buffer_name].size
                 self.assertLessEqual(
                     addr + size,
                     AVAILABLE_LX_SIZE,
                     f"Buffer {buffer_name} exceeds scratch pad size during operation {op.name}",
                 )
                 for other_buffer_name in live_buffers:
-                    if (
-                        other_buffer_name == buffer_name
-                        or other_buffer_name not in alloc.allocations
-                    ):
+                    other_addr = planned_buffers[other_buffer_name].address
+                    if other_buffer_name == buffer_name or other_addr is None:
                         continue
-                    other_addr = alloc.allocations[other_buffer_name]
-                    other_size = op._buffer_registry[other_buffer_name].size
-                    if addr <= other_addr:
+                    other_size = planned_buffers[other_buffer_name].size
+                    if addr == other_addr:
+                        self.assertTrue(
+                            other_buffer_name
+                            in planned_buffers[buffer_name].in_place_parents
+                            or buffer_name
+                            in planned_buffers[other_buffer_name].in_place_parents,
+                            f"Buffers {buffer_name} and {other_buffer_name} overlap during operation {op.name}",
+                        )
+                    elif addr <= other_addr:
                         self.assertLessEqual(
                             addr + size,
                             other_addr,
@@ -522,52 +429,53 @@ class TestExamplePattern(TestCase):
             live_buffers.difference_update(deallocate_at[i + 1])
 
     def hbm_usage_for_good_allocation(
-        self, allocation: AllocationResult, operations: list[Operation]
+        self, pattern: Pattern, planned_buffers: dict[str, LifetimeBoundBuffer]
     ) -> int:
         hbm_usage = 0
+        allocation = pattern.good_allocation
 
-        for op, alloc in zip(operations, allocation, strict=True):
+        for op, alloc in zip(pattern.operations, allocation, strict=True):
             for buffer_name in op.inputs + op.outputs:
                 if alloc[buffer_name].component == Component.HBM:
-                    hbm_usage += op._buffer_registry[buffer_name].size
+                    hbm_usage += pattern.buffers[buffer_name].size
 
         return hbm_usage
 
     def hbm_usage_for_actual_run(
-        self, operations: list[Operation], alloc: InstrumentedAllocator
+        self, pattern: Pattern, planned_buffers: dict[str, LifetimeBoundBuffer]
     ) -> int:
         hbm_usage = 0
 
         # Count all usage for buffers not allocated in the scratchpad.
-        for op in operations:
+        for op in pattern.operations:
             for buffer_name in op.inputs + op.outputs:
-                if buffer_name not in alloc.allocations:
-                    # This buffer is not allocated in the scratch pad before this operation, so it
+                if (
+                    buffer_name not in planned_buffers
+                    or planned_buffers[buffer_name].address is None
+                ):
+                    # This buffer is not allocated in the scratch pad, so it
                     # must be loaded from HBM.
-                    hbm_usage += op._buffer_registry[buffer_name].size
+                    hbm_usage += pattern.buffers[buffer_name].size
 
         return hbm_usage
 
-    def run_pattern(self, pattern: Pattern):
-        # The scratchpad_planning operation may modify the pattern (adding operations), and then
-        # examining the "good" allocation will run into trouble.
-        pattern_copy = copy.deepcopy(pattern)
-        lowering = MockGraphLowering(pattern_copy)
-        alloc = InstrumentedAllocator(pattern_copy, lowering)
+    def run_pattern(self, solver_type: type[MemoryPlanSolver], pattern: Pattern):
+        solver = solver_type(AVAILABLE_LX_SIZE)
 
-        scratchpad_planning(lowering, alloc)
-
+        buffers_to_plan = [
+            copy.deepcopy(buf)
+            for buf in pattern.buffers.values()
+            if buf.name not in pattern.inputs + pattern.outputs
+        ]
+        planned_buffers = solver.plan_layout(buffers_to_plan)
+        planned_buffers = {buf.name: buf for buf in planned_buffers}
         # Verify that the currently implemented allocation is indeed valid
-        self.verify_actual_run(pattern_copy, alloc)
+        self.verify_actual_run(pattern, planned_buffers)
 
         # Verify that the currently implemented allocation is at least as good as the "good
         # allocation" in terms of HBM usage.
-        current_hbm_usage = self.hbm_usage_for_actual_run(
-            pattern_copy.operations, alloc
-        )
-        good_hbm_usage = self.hbm_usage_for_good_allocation(
-            pattern.good_allocation, pattern.operations
-        )
+        current_hbm_usage = self.hbm_usage_for_actual_run(pattern, planned_buffers)
+        good_hbm_usage = self.hbm_usage_for_good_allocation(pattern, planned_buffers)
         self.assertLessEqual(
             current_hbm_usage,
             good_hbm_usage,
@@ -614,13 +522,6 @@ class TestExamplePattern(TestCase):
         )
         return Pattern(buffers, ops, good_allocation=good_allocation)
 
-    def test_verify_simple_fragmentation_pattern(self):
-        self.verify_pattern(self.make_simple_fragmentation_pattern())
-
-    @usuallyExpectedFailure
-    def test_simple_fragmentation_pattern(self):
-        self.run_pattern(self.make_simple_fragmentation_pattern())
-
     def make_staircase_pattern(self) -> Pattern:
         """Allocate N*2 buffers of sizes k, k, 2*k, 2*k, 3*k, 3*k, ..., N*k, N*k. After an
         even-numbered buffer is allocated, free the previous odd-numbered buffer. This creates a
@@ -631,7 +532,7 @@ class TestExamplePattern(TestCase):
 
         The greedy allocator will always allocate the next buffer just after all other buffers,
         because no gap is big enough for the current size. So it uses
-        2 * (k + 2*k + ... + N*k) = k * N * (N + 1) or roughly 2/3 times more."""
+        2 * (k + 2*k + ... + N*k) = k * N * (N + 1) or roughly 2 times more."""
         N = 7
         k = (2 * AVAILABLE_LX_SIZE) // (N * (N + 3))
         k = (k // 128) * 128  # round down to a multiple of the stick size
@@ -668,13 +569,6 @@ class TestExamplePattern(TestCase):
 
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
-
-    def test_verify_staircase_pattern(self):
-        self.verify_pattern(self.make_staircase_pattern())
-
-    @usuallyExpectedFailure
-    def test_staircase_pattern(self):
-        self.run_pattern(self.make_staircase_pattern())
 
     def make_downward_staircase_pattern(self) -> Pattern:
         """Allocate 1+N*2 buffers of sizes k, N*k, N*k, (N-1)*k, (N-1)*k, ..., 2*k, 2*k, k, k.
@@ -732,13 +626,6 @@ class TestExamplePattern(TestCase):
 
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
-
-    def test_verify_downward_staircase_pattern(self):
-        self.verify_pattern(self.make_downward_staircase_pattern())
-
-    @usuallyExpectedFailure
-    def test_downward_staircase_pattern(self):
-        self.run_pattern(self.make_downward_staircase_pattern())
 
     def make_simple_eviction_pattern(self) -> Pattern:
         """This pattern requires allocating a buffer, evicting it, and then reallocating it later.
@@ -810,15 +697,9 @@ class TestExamplePattern(TestCase):
             buffers,
             ops,
             good_allocation=make_general_allocation_result(good_allocation),
+            inplace=True,
         )
         return pattern
-
-    def test_verify_simple_eviction_pattern(self):
-        self.verify_pattern(self.make_simple_eviction_pattern(), inplace=True)
-
-    @usuallyExpectedFailure
-    def test_simple_eviction_pattern(self):
-        self.run_pattern(self.make_simple_eviction_pattern())
 
     def make_eviction_reallocation_pattern(self) -> Pattern:
         """This pattern requires allocating a buffer, evicting it, and then reallocating it later
@@ -894,15 +775,9 @@ class TestExamplePattern(TestCase):
             buffers,
             ops,
             good_allocation=make_general_allocation_result(good_allocations),
+            inplace=True,
         )
         return pattern
-
-    def test_verify_eviction_reallocation_pattern(self):
-        self.verify_pattern(self.make_eviction_reallocation_pattern(), inplace=True)
-
-    @usuallyExpectedFailure
-    def test_eviction_reallocation_pattern(self):
-        self.run_pattern(self.make_eviction_reallocation_pattern())
 
     def make_gqattention_pattern(self) -> Pattern:
         """We describe the GQA attention pattern. The "input" are three tensors, Q, K, and V. The
@@ -1006,13 +881,6 @@ class TestExamplePattern(TestCase):
 
         pattern = Pattern(buffers, ops, good_allocation=good_allocation)
         return pattern
-
-    def test_verify_gqattention_pattern(self):
-        self.verify_pattern(self.make_gqattention_pattern())
-
-    @usuallyExpectedFailure
-    def test_gqattention_pattern(self):
-        self.run_pattern(self.make_gqattention_pattern())
 
     def make_moe_mlp_pattern(self) -> Pattern:
         """This pattern is a (simplified) mixture of experts multi-layer perceptron.
@@ -1190,14 +1058,39 @@ class TestExamplePattern(TestCase):
             ops,
         )
 
-        pattern = Pattern(buffers, ops, good_allocation=good_allocation)
+        pattern = Pattern(buffers, ops, good_allocation=good_allocation, inplace=True)
         return pattern
 
-    def test_verify_moe_mlp_pattern(self):
-        self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
 
-    def test_moe_mlp_pattern(self):
-        self.run_pattern(self.make_moe_mlp_pattern())
+class TestVerifyPatterns(PatternTests, TestCase, role="verify"):
+    pass
+
+
+class TestGreedyPatterns(PatternTests, TestCase, role="solver"):
+    solver_type = GreedyLayoutSolver
+    expected_failures: ClassVar[frozenset[str]] = frozenset(
+        {
+            "simple_fragmentation",
+            "staircase",
+            "downward_staircase",
+            "simple_eviction",
+            "eviction_reallocation",
+        }
+    )
+
+
+class TestBestFitPatterns(PatternTests, TestCase, role="solver"):
+    solver_type = BestFitLayoutSolver
+    expected_failures: ClassVar[frozenset[str]] = frozenset(
+        {"eviction_reallocation", "simple_eviction"}
+    )
+
+
+class TestFirstFitPatterns(PatternTests, TestCase, role="solver"):
+    solver_type = FirstFitLayoutSolver
+    expected_failures: ClassVar[frozenset[str]] = frozenset(
+        {"eviction_reallocation", "simple_eviction"}
+    )
 
 
 if __name__ == "__main__":

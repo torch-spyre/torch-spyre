@@ -1,0 +1,1 @@
+# OOT config checker package

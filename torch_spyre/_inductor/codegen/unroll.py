@@ -14,11 +14,9 @@
 
 """Loop unrolling for coarse-tiling LoopSpec trees.
 
-When ``bundle_hbm_symbols=False`` the backend compiler does not support
-``scf.for`` loops in ``bundle.mlir``.  This module provides
-``unroll_loop_specs``, which fully unrolls a ``list[OpSpec | LoopSpec]`` tree
-into a flat list of ``OpSpec`` entries with concrete per-iteration addresses
-baked into each ``TensorArg.allocation``.
+This module provides ``unroll_loop_specs``, which fully unrolls a
+``list[OpSpec | LoopSpec]`` tree into a flat list of ``OpSpec`` entries
+with concrete per-iteration addresses baked into each ``TensorArg.allocation``.
 
 Whether a tensor's address advances per iteration is determined solely by
 ``TensorArg.per_tile_fixed`` (set by ``insert_tiling_propagation``'s use-def
@@ -72,7 +70,10 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
     for d, coord_expr in enumerate(arg.device_coordinates):
         at_range = int(coord_expr.subs(sub_range))
         at_zero = int(coord_expr.subs(sub_zero))
-        total_elem_stride += (at_range - at_zero) * arg.stride_map[d]
+        delta = at_range - at_zero
+        if delta == 0:
+            continue
+        total_elem_stride += delta * arg.stride_map[d]
     return total_elem_stride * num_bytes(arg.device_dtype)
 
 

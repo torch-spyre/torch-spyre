@@ -55,8 +55,8 @@ def _compile_and_run_plan_capture(fn, *args):
     captured = {}
     finalize_layouts = _passes.finalize_layouts
 
-    def capturing_finalize_layouts(operations):
-        finalize_layouts(operations)
+    def capturing_finalize_layouts(graph):
+        finalize_layouts(graph)
         captured["plan"] = dict(V.graph.restickify_plan)
 
     with patch.object(_passes, "finalize_layouts", capturing_finalize_layouts):
@@ -504,7 +504,7 @@ def test_opt_parens_one_conflict():
     """((a + b) + (c.t() + d)) + (e + f) — conflict only in inner group."""
     a, b, c, d, e, f = _make_tensors(6, S, S)
     _compare(
-        lambda a, b, c, d, e, f: (((a + b) + (c.t() + d)) + (e + f)),
+        lambda a, b, c, d, e, f: ((a + b) + (c.t() + d)) + (e + f),
         a,
         b,
         c,
@@ -519,7 +519,7 @@ def test_opt_adds_then_matmul_x():
     """(a + b.t() + c.t() + d.t()) @ e — upstream optimal + forced matmul x cost."""
     a, b, c, d, e = _make_tensors(5, S, S)
     _compare(
-        lambda a, b, c, d, e: ((a + b.t() + c.t() + d.t()) @ e),
+        lambda a, b, c, d, e: (a + b.t() + c.t() + d.t()) @ e,
         a,
         b,
         c,
@@ -532,14 +532,14 @@ def test_opt_adds_then_matmul_x():
 def test_opt_adds_then_matmul_y():
     """a @ (b + c.t()) — beam picks upstream stick to avoid extra matmul cost."""
     a, b, c = _make_tensors(3, S, S)
-    _compare(lambda a, b, c: (a @ (b + c.t())), a, b, c, optimal_cost=S * S)
+    _compare(lambda a, b, c: a @ (b + c.t()), a, b, c, optimal_cost=S * S)
 
 
 def test_opt_adds_then_matmul_y_long_chain():
     """a @ (b + c.t() + d.t() + e.t()) — majority transposed going into y."""
     a, b, c, d, e = _make_tensors(5, S, S)
     _compare(
-        lambda a, b, c, d, e: (a @ (b + c.t() + d.t() + e.t())),
+        lambda a, b, c, d, e: a @ (b + c.t() + d.t() + e.t()),
         a,
         b,
         c,
@@ -552,34 +552,32 @@ def test_opt_adds_then_matmul_y_long_chain():
 def test_opt_matmul_x_and_y_conflict():
     """a.t() @ (b + c.t()) — x wrong stick + y upstream conflict."""
     a, b, c = _make_tensors(3, S, S)
-    _compare(lambda a, b, c: (a.t() @ (b + c.t())), a, b, c, optimal_cost=2 * S * S)
+    _compare(lambda a, b, c: a.t() @ (b + c.t()), a, b, c, optimal_cost=2 * S * S)
 
 
 def test_opt_matmul_then_adds():
     """(a @ b) + c.t() — matmul output stick vs transposed input."""
     a, b, c = _make_tensors(3, S, S)
-    _compare(lambda a, b, c: ((a @ b) + c.t()), a, b, c, optimal_cost=S * S)
+    _compare(lambda a, b, c: (a @ b) + c.t(), a, b, c, optimal_cost=S * S)
 
 
 def test_opt_matmul_then_long_adds():
     """(a @ b) + c.t() + d.t() — keep matmul stick, restickify one input."""
     a, b, c, d = _make_tensors(4, S, S)
-    _compare(
-        lambda a, b, c, d: ((a @ b) + c.t() + d.t()), a, b, c, d, optimal_cost=S * S
-    )
+    _compare(lambda a, b, c, d: (a @ b) + c.t() + d.t(), a, b, c, d, optimal_cost=S * S)
 
 
 def test_opt_chained_matmuls():
     """(a @ b) @ c — no restickify needed."""
     a, b, c = _make_tensors(3, S, S)
-    _compare(lambda a, b, c: ((a @ b) @ c), a, b, c, optimal_cost=0)
+    _compare(lambda a, b, c: (a @ b) @ c, a, b, c, optimal_cost=0)
 
 
 def test_opt_two_independent_conflicts():
     """(a+b.t()) + (e.t()+f.t()+g) — two separate conflicts."""
     a, b, e, f, g = _make_tensors(5, S, S)
     _compare(
-        lambda a, b, e, f, g: ((a + b.t()) + (e.t() + f.t() + g)),
+        lambda a, b, e, f, g: (a + b.t()) + (e.t() + f.t() + g),
         a,
         b,
         e,
@@ -616,7 +614,7 @@ def test_opt_matmul_rect_x_wrong_stick():
     M, K, N = 64, 128, 192
     (a,) = _make_tensors(1, M, K)
     (b,) = _make_tensors(1, M, N)
-    _compare(lambda a, b: (a.t() @ b), a, b, optimal_cost=M * K)
+    _compare(lambda a, b: a.t() @ b, a, b, optimal_cost=M * K)
 
 
 def test_opt_sum_between_pointwise():
@@ -628,7 +626,7 @@ def test_opt_sum_between_pointwise():
     # of sparse/non-sparse sticks in a pointwise op.  Disabling correctness
     # check until that is resolved
     _compare(
-        lambda a, b, c: ((a + b.t()).sum(0) + c),
+        lambda a, b, c: (a + b.t()).sum(0) + c,
         a,
         b,
         c,
@@ -640,7 +638,7 @@ def test_opt_sum_between_pointwise():
 def test_opt_chain_transposed_intermediate():
     """(a.t() + b).t() + c — intermediate consumed transposed."""
     a, b, c = _make_tensors(3, S, S)
-    _compare(lambda a, b, c: ((a.t() + b).t() + c), a, b, c, optimal_cost=S * S)
+    _compare(lambda a, b, c: (a.t() + b).t() + c, a, b, c, optimal_cost=S * S)
 
 
 def test_opt_beam_trim(monkeypatch):
@@ -665,7 +663,7 @@ def test_opt_4d_one_conflict():
     """a.transpose(0,3) + b + c + d — one input with stick on dim 0."""
     a, b, c, d = _make_tensors(4, T, T, T, T)
     _compare(
-        lambda a, b, c, d: (a.transpose(0, 3) + b + c + d),
+        lambda a, b, c, d: a.transpose(0, 3) + b + c + d,
         a,
         b,
         c,
@@ -708,7 +706,7 @@ def test_opt_4d_chain_transposed_intermediate():
     """(a.transpose(2,3) + b).transpose(2,3) + c — 4D version of transposed intermediate."""
     a, b, c = _make_tensors(3, T, T, T, T)
     _compare(
-        lambda a, b, c: ((a.transpose(2, 3) + b).transpose(2, 3) + c),
+        lambda a, b, c: (a.transpose(2, 3) + b).transpose(2, 3) + c,
         a,
         b,
         c,
@@ -720,7 +718,7 @@ def test_opt_two_matmuls_wrong_inputs():
     """(a.t() @ b) + (c @ d.t()) — each matmul has one wrong-stick input."""
     a, b, c, d = _make_tensors(4, S, S)
     _compare(
-        lambda a, b, c, d: ((a.t() @ b) + (c @ d.t())),
+        lambda a, b, c, d: (a.t() @ b) + (c @ d.t()),
         a,
         b,
         c,
@@ -733,7 +731,7 @@ def test_opt_matmul_both_inputs_upstream_conflict():
     """(a + b.t()) @ (c + d.t()) — both inputs have upstream stick conflicts."""
     a, b, c, d = _make_tensors(4, S, S)
     _compare(
-        lambda a, b, c, d: ((a + b.t()) @ (c + d.t())),
+        lambda a, b, c, d: (a + b.t()) @ (c + d.t()),
         a,
         b,
         c,
@@ -761,6 +759,72 @@ def test_wrong_optimal_cost_fails():
         match=f"restickify cost: expected 0, got {correct_expected_cost}",
     ):
         _compare(func, a, b, c, d, e, optimal_cost=0)
+
+
+# ------- Constant tensor STL tests ---------
+
+
+def test_constant_plus_xt():
+    """ones_like(x) + x.t() — constant tensor should adopt x.t()'s stick, cost 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda x: torch.ones_like(x) + x.t(), x, optimal_cost=0)
+
+
+def test_constant_in_conflict_chain():
+    """ones_like(x) + x.t() + y — constant adopts winning STL, doesn't add to conflict cost."""
+    x, y = _make_tensors(2, S, S)
+    _compare(lambda x, y: torch.ones_like(x) + x.t() + y, x, y, optimal_cost=S * S)
+
+
+def test_constant_matmul_x():
+    """ones_like(y) @ y — constant should get col-major STL that matmul x needs, cost 0."""
+    y = _make_tensors(1, S, S)[0]
+    _compare(lambda y: torch.ones_like(y) @ y, y, optimal_cost=0)
+
+
+def test_two_constants_plus_xt():
+    """ones_like(x) + zeros_like(x) + x.t() — two flexible constants, cost still 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(
+        lambda x: torch.ones_like(x) + torch.zeros_like(x) + x.t(), x, optimal_cost=0
+    )
+
+
+def test_full_plus_xt():
+    """torch.full + x.t() — full tensor constant should adopt x.t()'s stick, cost 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(
+        lambda x: torch.full((S, S), 0.5, dtype=torch.float16, device=x.device) + x.t(),
+        x,
+        optimal_cost=0,
+    )
+
+
+def test_fill_plus_xt():
+    """empty_like + fill_ + x.t() — mutation-based constant should adopt x.t()'s stick, cost 0."""
+    x = torch.randn((S, S), dtype=torch.float16)
+
+    def fn(x):
+        e = torch.empty_like(x)
+        e.fill_(1.0)
+        return e + x.t()
+
+    _compare(fn, x, optimal_cost=0)
+
+
+def test_arange_plus_xt():
+    """arange.view + x.t() — correctness check only.
+
+    arange lowers to FallbackKernel which gets a fixed generic layout, so the
+    downstream add may still need a restickify.  No optimal_cost asserted.
+    """
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(
+        lambda x: (
+            torch.arange(S * S, dtype=torch.float16, device=x.device).view(S, S) + x.t()
+        ),
+        x,
+    )
 
 
 # ------- Unsupported stick configurations ---------

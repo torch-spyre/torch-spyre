@@ -41,12 +41,12 @@ points, all registered in
 
 | Extension Point | Stage | Purpose |
 |----------------|-------|---------|
-| `CustomPreGradPasses` | Pre-grad FX graph | Graph rewrites before autograd partitioning |
-| `CustomPrePasses` | Post-grad FX graph (early) | Spyre-specific rewrites early in `post_grad.post_grad_passes` |
-| `CustomPostPasses` | Post-grad FX graph (late) | Late post-grad rewrites: `insert_padding`, `replace_scalar_with_tensor`, `mm_to_bmm_pass`, `bmm_unflatten_pass` |
-| `CustomPreFusionPasses` | LoopLevelIR (pre-fusion) | Pre-fusion scheduler passes (currently `propagate_mutation_layouts`) |
-| `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes (currently `spyre_fuse_nodes`) |
-| `CustomPreSchedulingPasses` | LoopLevelIR (pre-scheduler) | Operation-list passes that run immediately before the Scheduler is constructed (wired in via a `GraphLowering._update_scheduler` monkey-patch in [`patches.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)). Dispatches `deadcode_elimination`, `propagate_spyre_tensor_layouts`, `insert_restickify`, `span_reduction`, `work_distribution`, and `scratchpad_planning` (gated on `config.lx_planning`). |
+| `CustomPreGradPasses` | Pre-grad FX graph | Reserved for graph rewrites before autograd partitioning. The pipeline is empty today. |
+| `CustomPrePasses` | Post-grad FX graph (early) | `collect_spyre_hints` snapshots `spyre_hint` annotations so they survive AOT re-tracing. |
+| `CustomPostPasses` | Post-grad FX graph (late) | Late post-grad rewrites: `recover_spyre_hints`, `convert_constant_with_graph_node`, `mm_to_bmm_pass`, `mark_direct_unit_bmm_pass`, `bmm_unflatten_pass`. |
+| `CustomPreFusionPasses` | LoopLevelIR (pre-fusion) | Pre-fusion scheduler passes: `propagate_mutation_layouts`, `build_loop_scheduler_nodes`. |
+| `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes: `memory_planning`, `spyre_fuse_nodes`. |
+| `CustomPreSchedulingPasses` | LoopLevelIR (pre-scheduler) | The pre-scheduling pipeline that runs immediately before the Scheduler is constructed (wired in via a `GraphLowering._update_scheduler` monkey-patch in [`patches.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)). The full step list is in [LoopLevelIR Passes](#looplevelir-passes) below. |
 
 ### FX Graph Passes
 
@@ -58,9 +58,28 @@ Some examples of passes that are appropriate to perform at this level are:
 
 ### LoopLevelIR Passes
 
-Passes on the LoopLevelIR run relatively late in compilation. `CustomPreSchedulingPasses` dispatches the LoopLevelIR pipeline in a fixed order: dead-code elimination ([deadcode_elimination.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/deadcode_elimination.py)), device-layout propagation through stickification ([propagate_layouts.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py)), restickify insertion ([insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py)), work division ([work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)), and, when `config.lx_planning` is enabled, scratchpad allocation ([scratchpad.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad.py)).
+Passes on the LoopLevelIR run late in compilation. `CustomPreSchedulingPasses` dispatches them in a fixed order. Each step takes the `GraphLowering` and mutates `graph.operations` in place. Steps marked "Gated" are skipped when their config flag is off.
+
+| # | Pass | Module | Notes |
+|---|---|---|---|
+| 1 | `deadcode_elimination` | [deadcode_elimination.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/deadcode_elimination.py) | Drops unreachable ops. |
+| 2 | `propagate_spyre_tensor_layouts` | [propagate_layouts.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py) | Stamps `FixedTiledLayout` on every `ComputedBuffer`. |
+| 3 | `optimize_restickify_locations` | [optimize_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/optimize_restickify.py) | Moves restickify ops to better placements before the layout is finalized. |
+| 4 | `finalize_layouts` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Settles tile-structure decisions before any new restickify is inserted. |
+| 5 | `insert_restickify` | [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | Adds explicit re-tile ops where adjacent ops disagree on layout. |
+| 6 | `insert_bmm_padding` | [padding.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | Pads `mm` and `bmm` operands to satisfy hardware alignment. |
+| 7 | `dedup_and_promote_constants` | [dedup_constants.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/dedup_constants.py) | Deduplicates identical constants and promotes shared ones. |
+| 8 | `chunk_large_tensors` | [chunk_large_tensors.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/chunk_large_tensors.py) | Gated by `config.chunk_large_tensors`. Splits tensors that exceed the per-core span. |
+| 9 | `propagate_named_dims` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_named_dims.py) | Propagates `name_tensor_dims` annotations from inputs through the op graph. |
+| 10 | `assign_dim_hints` | [propagate_named_dims.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_named_dims.py) | Lowers each `spyre_hint` scope to a per-op `DimHint` list. |
+| 11 | `coarse_tile` | [coarse_tile.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/coarse_tile.py) | Runs only when hint-derived loop groups are present. Wraps each group in nested counted loops. |
+| 12 | `span_reduction` | [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | Reduces per-core access spans to fit the hardware memory budget. |
+| 13 | `cost_model_matmul_division` + `work_distribution` | [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | The cost-model pass claims a subset of matmuls; `work_distribution` covers the rest. |
+| 14 | `scratchpad_planning` | [scratchpad/](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/) | Gated by `config.lx_planning`. Allocates the LX scratchpad. |
 
 Once stickification has run, every `ComputedBuffer` carries a `FixedTiledLayout`, so the later passes can take device layout into account when making decisions.
+
+For deeper treatment of individual passes see [Working Set Reduction](working_set_reduction.md), [Coarse-Tiling Loops](coarse_tiling_loops.md), [Work Division Planning](work_division_planning.md), and [Scratchpad Planning](scratchpad_planning.md).
 
 ### Views and Index Translation
 
@@ -232,14 +251,21 @@ The headline modules above are the ones a contributor reaches for first. The fro
 | Module | Purpose |
 |---|---|
 | [`passes.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py) | The six extension-point classes, plus `_format_operations`, which renders the LoopLevelIR before and after the pre-scheduling pipeline. |
-| [`temp_passes.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/temp_passes.py) | Transitional FX-graph rewrites registered in `CustomPostPasses`: `bmm_unflatten_pass`, `mm_to_bmm_pass`, and `replace_scalar_with_tensor`. The "temp" name reflects the plan to retire them as upstream Inductor evolves. |
+| [`temp_passes.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/temp_passes.py) | Transitional FX-graph rewrites registered in `CustomPostPasses`: `mm_to_bmm_pass`, `mark_direct_unit_bmm_pass`, `bmm_unflatten_pass`, and `convert_constant_with_graph_node`. The "temp" name reflects the plan to retire them as upstream Inductor evolves. |
 | [`propagate_layouts.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_layouts.py) | `propagate_spyre_tensor_layouts` and `propagate_mutation_layouts`. Assigns `FixedTiledLayout` to every `ComputedBuffer`. |
 | [`optimize_restickify.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/optimize_restickify.py) | Optimizes restickify operations inserted by layout propagation. |
 | [`insert_restickify.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | `insert_restickify`. Re-sticks tensors whose layout would otherwise be inconsistent. |
 | [`memory_planning.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/memory_planning.py) | Memory planning for Spyre device buffers. |
 | [`deadcode_elimination.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/deadcode_elimination.py) | `deadcode_elimination` for the pre-scheduling LoopLevelIR. |
-| [`work_division.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | `span_reduction`, `work_distribution`, `divide_pointwise_op`, `divide_reduction_op`, `apply_splits`. Two-pass work division: span reduction (mandatory) and work distribution (optional). |
-| [`scratchpad.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad.py) | `scratchpad_planning`. LX scratchpad allocation, gated on `LX_PLANNING`. |
+| [`work_division.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | `span_reduction`, `cost_model_matmul_division`, `work_distribution`, `divide_pointwise_op`, `divide_reduction_op`, `apply_splits`. Three-pass work division: span reduction (mandatory), cost-model matmul division (claims a subset of matmuls), and work distribution (covers the rest). |
+| [`scratchpad/`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/) | `scratchpad_planning` and the layout-solver framework (`GreedyLayoutSolver`, `FirstFitLayoutSolver`, `BestFitLayoutSolver`). LX scratchpad allocation. |
+| [`propagate_hints.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_hints.py) | `spyre_hint` context manager, the `DimHint` dataclass, and `collect_spyre_hints` / `recover_spyre_hints` for surviving AOT re-tracing. |
+| [`propagate_named_dims.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/propagate_named_dims.py) | `declare_tensor_dim`, `name_tensor_dims`, `propagate_named_dims`, and `assign_dim_hints`. Propagates named-dim metadata through the op graph and lowers `spyre_hint` scopes to per-op `DimHint` lists. |
+| [`coarse_tile.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/coarse_tile.py) | `coarse_tile`, `hints_to_coarse_tile_groups`, `insert_tiling_propagation`. Wraps each hint-derived group in nested counted loops and scales per-iteration ranges. |
+| [`chunk_large_tensors.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/chunk_large_tensors.py) | `chunk_large_tensors`, `ChunkingInfo`. Splits tensors that exceed the per-core span before work division sees them. |
+| [`dedup_constants.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/dedup_constants.py) | `dedup_and_promote_constants`. Deduplicates identical constants in the LoopLevelIR. |
+| [`loop_info.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/loop_info.py) | `CoarseTileInfo`, `copy_op_metadata`. Per-op metadata stamped by `coarse_tile()` and consumed by the scheduler, kernel codegen, and buffer-propagation pass. |
+| [`dtype_ops.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/dtype_ops.py) | `DtypeOpTable`. Lookup table mapping PyTorch dtype pairs to Spyre hardware dtype-conversion operators. |
 | [`pass_utils.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py) | Shared helpers for the pre-scheduling pipeline, including `splits_by_index_coeff` and `apply_splits_from_index_coeff`. These translate between iteration-variable splits and the index-coefficient-keyed splits stored on `ComputedBuffer.op_it_space_splits`. |
 | [`views.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/views.py) | `compute_coordinates`, `align_tensors`, `normalize_coordinates`, `Term`, `matching_dim`. Coordinate computation for memory-dep expressions and tensor alignment for fused kernels. Used by `spyre_kernel.py` and `work_division.py`. |
 | [`multi_dim_reduction_pass.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/multi_dim_reduction_pass.py) | `decompose_multi_dim_reductions`. Splits a multi-dim reduction into a sequence of single-dim reductions. |
@@ -248,7 +274,7 @@ The headline modules above are the ones a contributor reaches for first. The fro
 | [`padding.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/padding.py) | `insert_padding`. Pads `mm`, `bmm`, and tensor methods to satisfy hardware alignment. |
 | [`fusion.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/fusion.py) | `spyre_fuse_nodes`. Post-fusion scheduler pass. |
 | [`wrapper.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/wrapper.py) | `SpyrePythonWrapperCodegen`. The host-code generator that produces the Python wrapper around device kernels. |
-| [`codegen/`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/) | `superdsc.py` (`SDSCArgs`, `SDSCSpec`, `parse_op_spec`, `compile_op_spec`, `_get_core_to_slice_mapping`, `_get_padded_iteration_space`, `_get_op_dim_labels`), `compute_ops.py` (`generate_sdsc`), `bundle.py` (`generate_bundle`). Translates `OpSpec` into SuperDSC JSON for the back-end compiler. |
+| [`codegen/`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/) | `superdsc.py` (`SDSCArgs`, `SDSCSpec`, `parse_op_spec`, `compile_op_spec`, `_get_core_to_slice_mapping`, `_get_padded_iteration_space`, `_get_op_dim_labels`), `compute_ops.py` (`generate_sdsc`), `bundle.py` (`generate_bundle`), `unroll.py` (loop unrolling for coarse-tiling LoopSpec trees). Translates `OpSpec` into SuperDSC JSON for the back-end compiler. |
 | [`config.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/config.py) | Spyre-specific Inductor configuration: `SENCORES`, `LX_PLANNING`, `DXP_LX_FRAC_AVAIL`. |
 
 `torch.compile(..., dynamic=True)` is supported through the static-binary path. Shapes are specialized at compile time and the resulting binary is reused across calls with the same input geometry.

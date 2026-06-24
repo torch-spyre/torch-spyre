@@ -249,14 +249,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1, 1, 41]
                           stride: [41, 41, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L378 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
@@ -508,14 +508,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
                     **kwargs)'
@@ -564,14 +564,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1024, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
                     **kwargs)'
@@ -1101,3 +1101,4 @@ test_suite_config:
                   tags:
                     - constant
                     - torch.truediv.1_spyre
+cases: []

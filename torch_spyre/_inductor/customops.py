@@ -17,8 +17,11 @@ import torch
 import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.eager import compile_once
+from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
+
+aten = torch.ops.aten
 
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
@@ -169,6 +172,18 @@ def gelu(
 
 @gelu.register_fake
 def _(input: torch.Tensor, approximate: str = "none"):
+    return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::silu", mutates_args=(), device_types="spyre")
+def silu(
+    input: torch.Tensor,
+) -> torch.Tensor:
+    return aten.div.Tensor(input, 1 + aten.exp.default(-input))
+
+
+@silu.register_fake
+def _(input: torch.Tensor):
     return input.new_empty(input.size())
 
 
@@ -362,6 +377,91 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False):
     return (values, indices)
 
 
+@torch.library.custom_op("spyre::unfold", mutates_args=(), device_types="spyre")
+def spyre_unfold(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    dilation: Optional[Sequence[int]] = None,
+    padding: Optional[Sequence[int]] = None,
+    stride: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    """
+    Im2col unfold operation via torch.nn.functional.unfold.
+    Converts (N, C, H, W) input to (N, C*K_h*K_w, L) where L = H_out * W_out.
+    Uses CPU fallback for the unfold operation.
+    """
+
+    dilation = dilation or (1, 1)
+    padding = padding or (0, 0)
+    stride = stride or (1, 1)
+
+    warn_fallback("torch.ops.spyre.unfold")
+    # Move to CPU, perform unfold, move back to Spyre
+    input_cpu = input.to("cpu")
+    result_cpu = torch.nn.functional.unfold(
+        input_cpu,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        padding=padding,
+        stride=stride,
+    )
+    return result_cpu.to(input.device)
+
+
+@spyre_unfold.register_fake
+def _(
+    input: torch.Tensor,
+    kernel_size: Sequence[int],
+    dilation: Optional[Sequence[int]] = None,
+    padding: Optional[Sequence[int]] = None,
+    stride: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    dilation = dilation or (1, 1)
+    padding = padding or (0, 0)
+    stride = stride or (1, 1)
+
+    N, C, H_in, W_in = input.shape
+    K_h, K_w = kernel_size
+    dil_h, dil_w = dilation
+    pad_h, pad_w = padding
+    stride_h, stride_w = stride
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    return input.new_empty((N, C * K_h * K_w, H_out * W_out))
+
+
+@torch.library.custom_op(
+    "spyre::reshape_via_cpu", mutates_args=(), device_types="spyre"
+)
+def spyre_reshape_via_cpu(
+    input: torch.Tensor,
+    shape: Sequence[int],
+) -> torch.Tensor:
+    """
+    Reshape operation that executes on CPU to avoid stick-alignment issues.
+
+    When reshaping produces a shape with innermost dimension that doesn't align
+    with stick boundaries (64 elements for fp16), the Inductor coordinate
+    computation fails. This op moves to CPU, reshapes, then moves back to Spyre.
+
+    This is similar to unfold, which also uses CPU fallback for correct layouts.
+    """
+    warn_fallback("torch.ops.spyre.reshape_via_cpu")
+    input_cpu = input.to("cpu")
+    result_cpu = input_cpu.reshape(shape)
+    return result_cpu.to(input.device)
+
+
+@spyre_reshape_via_cpu.register_fake
+def _(
+    input: torch.Tensor,
+    shape: Sequence[int],
+) -> torch.Tensor:
+    return input.new_empty(shape)
+
+
 @torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
 def min_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
@@ -446,3 +546,108 @@ def _constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
 ) -> torch.types.Number:
     return fill_value
+
+
+@torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
+def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    warn_fallback(f"conversion from {input.dtype} to {dtype}")
+    return input.cpu().to(dtype=dtype).to(input.device)
+
+
+@to_dtype_cpu.register_fake
+def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return torch.empty_like(input, dtype=dtype)
+
+
+@torch.library.custom_op("spyre::qfp8ch", mutates_args=(), device_types="spyre")
+def qfp8ch(input: torch.Tensor) -> torch.Tensor:
+    """
+    Channel-wise FP8 format conversion (pointwise, optimized for matmul).
+
+    Converts input tensor to FP8 E4M3 format with channel-wise semantics.
+    This operation ONLY performs format conversion - scaling must be done separately.
+
+    Args:
+        input: Input tensor (FP16/BF16/FP32) to convert to FP8
+               Should already be scaled and clamped
+
+    Returns:
+        FP8 E4M3 tensor (same shape as input)
+
+    Maps to: deeptools Qfp8ch operation
+    """
+    pass
+
+
+@qfp8ch.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    Quantize FP16 tensor to FP8 using pre-computed scale.
+
+    Performs four steps:
+    1. Compute inverse scale: inv_scale = 1 / scale (reciprocal, POINTWISE on sfp unit)
+    2. Scale the input: x_scaled = x * inv_scale (POINTWISE)
+    3. Clamp to FP8 E4M3 range: x_clamped = clamp(x_scaled, -448, 448) (POINTWISE)
+    4. Convert to FP8 format: x_fp8 = qfp8ch(x_clamped) (POINTWISE format conversion)
+
+    Args:
+        input: Input tensor (FP16) to quantize, shape [batch, seq, hidden]
+        scale: Quantization scale (FP16), shape [batch, seq, 1]
+
+    Returns:
+        FP8 E4M3 tensor (same shape as input)
+
+    Example:
+        >>> x = torch.randn(2, 4, 8, dtype=torch.float16, device='spyre')
+        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+    Note:
+        - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
+    """
+    pass
+
+
+@quantize_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Dequantize FP8 tensor to FP16 using pre-computed scale.
+    Performs two steps:
+    1. Convert FP8 to FP16: x_fp16 = fp8todl16(x) (dtype conversion)
+    2. Scale the output: x_scaled = x_fp16 * scale (POINTWISE)
+    Args:
+        input: Input tensor (FP8) to dequantize, shape [batch, seq, hidden]
+        scale: Dequantization scale (FP16), shape [batch, seq, 1]
+    Returns:
+        FP16 tensor (same shape as input)
+    Example:
+        >>> @torch.compile(backend='inductor')
+        >>> def dequant(x_fp8, scale):
+        >>>     return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+    Note:
+        - MUST use torch.compile(backend='inductor') - does not work in eager mode
+        - Uses fp8todl16 operation for FP8→FP16 conversion
+        - Scale must be FP16, NOT FP32
+    """
+    pass
+
+
+@dequantize_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP16 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float16, device=input.device)

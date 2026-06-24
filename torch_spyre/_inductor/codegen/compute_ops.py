@@ -13,8 +13,59 @@
 # limitations under the License.
 
 
+import dataclasses
+
 from torch_spyre._C import encode_constant, DataFormats
 from sympy import Symbol
+
+
+@dataclasses.dataclass(frozen=True)
+class SymbolKind:
+    """Classifies a symbol registered in the bundle symbol table.
+
+    Three variants (constructed via class methods):
+      - ``kernel(arg_index)``:               base HBM address of a kernel tensor arg;
+                                             emitted as a ``!sdscbundle.input_arg`` param
+                                             named ``%arg_{arg_index}``.
+      - ``kernel_derived(idx, off, arg_i)``: per-core derived address = base + offset;
+                                             emitted as ``arith.addi %arg_{arg_i}, off``.
+                                             ``base_sym_idx`` is the 0-based index into the
+                                             global ``symbols`` list of the kernel base symbol.
+      - ``pool()``:                          pool-allocated tensor address;
+                                             emitted as ``arith.addi %pool, value``.
+    """
+
+    kind: str
+    base_sym_idx: int = -1
+    offset: int = 0
+    arg_index: int = -1
+
+    @classmethod
+    def kernel(cls, arg_index: int) -> "SymbolKind":
+        return cls(kind="kernel", arg_index=arg_index)
+
+    @classmethod
+    def kernel_derived(
+        cls, base_sym_idx: int, offset: int, arg_index: int
+    ) -> "SymbolKind":
+        return cls(
+            kind="kernel_derived",
+            base_sym_idx=base_sym_idx,
+            offset=offset,
+            arg_index=arg_index,
+        )
+
+    @classmethod
+    def pool(cls) -> "SymbolKind":
+        return cls(kind="pool")
+
+    @property
+    def is_derived(self) -> bool:
+        return self.kind == "kernel_derived"
+
+    @property
+    def is_pool(self) -> bool:
+        return self.kind == "pool"
 
 
 def core_idx_to_slice_offset(
@@ -219,6 +270,78 @@ def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
     )
 
 
+def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
+    """Find the index of the index tensor that references the given value tensor.
+
+    Returns -1 if no index tensor references this value tensor.
+    """
+    for j, t in enumerate(sdsc_spec.args):
+        if t.is_index_tensor and t.related_value_tensor_idx == value_tensor_idx:
+            return j
+    return -1
+
+
+def _get_indirect_access_info(
+    sdsc_spec, tensor, tensor_idx: int
+) -> tuple[str, str | None]:
+    """Get indirect access allocation type and related allocation name for a tensor.
+
+    Returns:
+        A tuple of (alloc_type, related_alloc_or_none) where:
+        - alloc_type: "index_tensor", "value_tensor", or "no_indirection"
+        - related_alloc_or_none: allocation name of related tensor, or None
+    """
+    # Index tensors and value tensors involved in indirect access must reside in HBM;
+    # the Spyre engine does not support indirect addressing through LX scratchpad.
+    if tensor.is_index_tensor:
+        alloc_type = "index_tensor"
+        related_alloc = (
+            f"allocate-Tensor{tensor.related_value_tensor_idx}_hbm"
+            if tensor.related_value_tensor_idx >= 0
+            else None
+        )
+        return alloc_type, related_alloc
+
+    # Check if this is a value tensor referenced by an index tensor
+    value_tensor_indices = [
+        t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor
+    ]
+    if tensor_idx in value_tensor_indices:
+        alloc_type = "value_tensor"
+        index_tensor_idx = _find_index_tensor_for_value(sdsc_spec, tensor_idx)
+        if index_tensor_idx < 0:
+            raise ValueError(
+                f"Tensor {tensor_idx} is listed as a value tensor but no index "
+                "tensor claims it — sdsc_spec is malformed"
+            )
+        related_alloc = f"allocate-Tensor{index_tensor_idx}_hbm"
+        return alloc_type, related_alloc
+
+    return "no_indirection", None
+
+
+def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Build the indirect access fields for a tensor allocation.
+
+    Returns a dictionary containing:
+    - indirectAllocType_: The allocation type ("index_tensor", "value_tensor",
+      or "no_indirection")
+    - relatedIndirectAccessAlloc_: The related allocation name (only if applicable)
+    - indexTensorType_: The index tensor type - only for index tensors; the
+      backend supports "address" and "index" but we only generate "index"
+    """
+    alloc_type, related_alloc = _get_indirect_access_info(sdsc_spec, tensor, tensor_idx)
+
+    fields = {"indirectAllocType_": alloc_type}
+    if related_alloc is not None:
+        fields["relatedIndirectAccessAlloc_"] = related_alloc
+
+    if tensor.is_index_tensor:
+        fields["indexTensorType_"] = "index"
+
+    return fields
+
+
 def generate_sdsc(
     idx,
     sdsc_spec,
@@ -229,19 +352,21 @@ def generate_sdsc(
 ):
     """Generate SDSC JSON for one OpSpec.
 
-    Returns a 3-tuple ``(sdsc_json, base_symbol_values, affine_strides)``:
+    Returns a 4-tuple ``(sdsc_json, base_symbol_values, affine_strides, symbol_kinds)``:
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
-    - ``base_symbol_values``: list of base HBM byte offsets registered in
-      ``symbols``; empty when ``use_symbols=False``
+    - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``;
+      empty when ``use_symbols=False``
     - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of dicts
       ``{tiled_sym: stride_bytes}`` for tiled HBM tensors; always empty when
       ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply``
       ops inside ``scf.for`` loops.
+    - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``;
+      empty when ``use_symbols=False``.  Classifies each symbol as a kernel base
+      address, per-core derived address, or pool-allocated address.
 
     When ``use_symbols=False``, HBM tensor addresses are baked directly as
-    concrete integers into the SDSC JSON.  No symbol IDs are registered and ``symbols``
-    is not modified.  This is the default until backend symbol-table support
-    is complete.
+    concrete integers into the SDSC JSON.  No symbol IDs are registered and
+    ``symbols`` is not modified.
 
     When ``use_symbols=True``, HBM addresses are registered as negative symbol
     IDs in the JSON and their values appended to ``symbols``, enabling
@@ -269,16 +394,37 @@ def generate_sdsc(
     # that happen to share a base address will emit two separate arith.constant
     # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
     # symbols list indices: symbols[abs(id)-1] is always the value for id.
-    #
-    # When use_symbols=False this dict stays empty (symbols is not modified).
     local_symbols: dict[int, int] = {}
+    # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
+    local_symbol_kind: list[SymbolKind] = []
+
+    def _per_core_kind(
+        c: int, arg_index: int, core0_addr: int, addr: int, base_sym_idx: int
+    ) -> SymbolKind:
+        """Return the SymbolKind for a per-core HBM address.
+
+        Core 0 of a kernel arg (arg_index >= 0) is the input_arg base; subsequent
+        cores are derived from it.  ``base_sym_idx`` is the 0-based index into the
+        global ``symbols`` list where the core-0 symbol was (or will be) registered.
+        Pool tensors (arg_index < 0) always use SymbolKind.pool().
+        """
+        if arg_index < 0:
+            return SymbolKind.pool()
+        if c == 0:
+            return SymbolKind.kernel(arg_index=arg_index)
+        return SymbolKind.kernel_derived(
+            base_sym_idx=base_sym_idx,
+            offset=addr - core0_addr,
+            arg_index=arg_index,
+        )
 
     if use_symbols:
 
-        def offset_as_symbol(s):
+        def offset_as_symbol(s, kind: SymbolKind):
             if s not in local_symbols:
                 local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
                 symbols.append(s)
+                local_symbol_kind.append(kind)
             return local_symbols[s]
 
         # Compute per-tensor affine strides and register base addresses in symbols.
@@ -289,14 +435,25 @@ def generate_sdsc(
             if "lx" in tensor.allocation:
                 affine_strides.append({})
                 continue
+            core0_addr = tensor.start_address + core_idx_to_slice_offset(
+                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+            ) * num_bytes(tensor.data_format)
+            # base_sym_idx: index in global symbols[] where core-0 will be registered.
+            # Used by kernel_derived symbols to reference their base without searching.
+            base_sym_idx = symbol_id_offset + len(local_symbols)
             tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
             if not tensor_tiled:
-                # Non-tiled HBM: register full per-core addresses.
+                # Non-tiled HBM: register per-core addresses.
                 for c in range(sdsc_spec.num_cores):
-                    full_addr = tensor.start_address + core_idx_to_slice_offset(
+                    addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(full_addr)
+                    offset_as_symbol(
+                        addr,
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
+                    )
                 affine_strides.append({})
             else:
                 # Tiled HBM: symbol value = per-core iter-0 base address.
@@ -307,13 +464,20 @@ def generate_sdsc(
                         tensor, s, sdsc_spec.iteration_space
                     )
                 for c in range(sdsc_spec.num_cores):
-                    base_addr = tensor.start_address + core_idx_to_slice_offset(
+                    addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(base_addr)
+                    offset_as_symbol(
+                        addr,
+                        _per_core_kind(
+                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                        ),
+                    )
                 affine_strides.append(strides_for_tensor)
 
         def _start_addr_data(tensor):
+            # All per-core addresses were already registered by the per-tensor loop
+            # above. Look them up directly rather than re-computing SymbolKind.
             if "lx" in tensor.allocation:
                 return {
                     f"[{c}, 0, 0]": str(tensor.start_address)
@@ -324,15 +488,20 @@ def generate_sdsc(
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
-                result[f"[{c}, 0, 0]"] = str(offset_as_symbol(addr))
+                result[f"[{c}, 0, 0]"] = str(local_symbols[addr])
             return result
 
     else:
-        # use_symbols=False: bake concrete HBM addresses directly into the JSON,
-        # mirroring the LX tensor path.  symbols and local_symbols are not modified.
+        # use_symbols=False: bake concrete HBM addresses directly into the JSON.
+        # symbols and local_symbols are not modified.
         affine_strides = [{} for _ in sdsc_spec.args]
 
         def _start_addr_data(tensor):
+            if "lx" in tensor.allocation:
+                return {
+                    f"[{c}, 0, 0]": str(tensor.start_address)
+                    for c in range(sdsc_spec.num_cores)
+                }
             return {
                 f"[{c}, 0, 0]": str(
                     tensor.start_address
@@ -440,6 +609,9 @@ def generate_sdsc(
                                             "dim_order"
                                         ]
                                     ],
+                                    **_build_indirect_access_fields(
+                                        sdsc_spec, tensor, i
+                                    ),
                                     "startAddressCoreCorelet_": {
                                         "dim_prop_func": [
                                             {"Map": {}},
@@ -459,9 +631,18 @@ def generate_sdsc(
                                     **(
                                         {
                                             "backGapCore_": {
-                                                str(dim): {
-                                                    "-1": str(gap)  # HBM is -1
-                                                }
+                                                str(dim): (
+                                                    # LX: per-core keys 0..num_cores-1
+                                                    {
+                                                        str(c): str(gap)
+                                                        for c in range(
+                                                            sdsc_spec.num_cores
+                                                        )
+                                                    }
+                                                    if "lx" in tensor.allocation
+                                                    # HBM: -1 sentinel covers all cores
+                                                    else {"-1": str(gap)}
+                                                )
                                                 for dim, gap in tensor.backGap.items()
                                             }
                                         }
@@ -510,7 +691,12 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
-                                    "memOrg_": {
+                                    # Index tensors must reside in HBM; the Spyre
+                                    # engine does not support indirect addressing
+                                    # through LX scratchpad.
+                                    "memOrg_": {"hbm": {"isPresent": 1}}
+                                    if tensor.is_index_tensor
+                                    else {
                                         "hbm": {"isPresent": 1},
                                         "lx": {"isPresent": 1},
                                     }
@@ -536,10 +722,21 @@ def generate_sdsc(
                                     "inputLabeledDs": [
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
+                                        if i not in sdsc_spec.indirect_access_indices
                                     ],
                                     "outputLabeledDs": [
                                         f"Tensor{out_idx}-idx{out_idx}"
                                     ],
+                                    **(
+                                        {
+                                            "indirectAccessIndexLabeledDs": [
+                                                f"Tensor{i}-idx{i}"
+                                                for i in sdsc_spec.indirect_access_indices
+                                            ]
+                                        }
+                                        if sdsc_spec.indirect_access_indices
+                                        else {}
+                                    ),
                                 }
                             ],
                         }
@@ -549,4 +746,5 @@ def generate_sdsc(
         },
         list(local_symbols.keys()),
         affine_strides,
+        local_symbol_kind,
     )

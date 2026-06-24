@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from typing import Any
 import os
 import subprocess
+import torch
 
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -58,7 +59,8 @@ class SpyreAsyncCompile:
         generate_bundle(kernel_name, output_dir, specs)
 
         # Invoke backend compiler of SDSC Bundle
-        subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
+        with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
+            subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
 
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 

@@ -26,9 +26,9 @@ from . import config
 from .logging_utils import get_inductor_logger
 
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     InputBuffer,
-    MutationLayoutSHOULDREMOVE,
     StorageBox,
     TensorBox,
 )
@@ -55,8 +55,10 @@ class EdgeCostMap:
         in_layouts: list,
         target_layouts: list,
         target_dep: "MemoryDep",
+        op,
     ):
         self.dep = dep
+        self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
@@ -81,7 +83,7 @@ class EdgeCostMap:
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep
+            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
         if not needed:
             cost = 0.0
@@ -148,10 +150,10 @@ class AllSameNode(RestickNodeCost):
     """Cost node for ops that require all inputs and the output to be stick compatible (eg pointwise ops)."""
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_dep):
+    def from_args(cls, args, out_layouts, out_dep, op):
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args
+            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
         ]
         return cls(edge_costs)
 
@@ -180,10 +182,10 @@ class FixedInOutNode(RestickNodeCost):
         )
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls):
+    def from_args(cls, args, out_stl, req_stls, op):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep)
+            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
             for arg, req in zip(args, req_stls)
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
@@ -498,12 +500,12 @@ def beam_global_min_cost(operations: list) -> None:
     best = frontier.best()
     for name, stl in zip(frontier.buf_names, best.assignments):
         op = V.graph.get_buffer(name)
-        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            op.committed_stl = stl
+        op.committed_stl = stl
 
 
-def optimize_restickify_locations(operations: list) -> None:
+def optimize_restickify_locations(graph: GraphLowering) -> None:
     """Select restickify locations for all ops, minimizing total restickify cost."""
+    operations = graph.operations
     if config.global_stick_optimizer:
         logger.info("optimizer: beam (global)")
         beam_global_min_cost(operations)

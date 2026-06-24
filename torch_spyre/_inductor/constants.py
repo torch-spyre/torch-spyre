@@ -15,12 +15,31 @@
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 
 # Type casting operators from deeptools
 DL16TOFP32_OP = "dl16tofp32"
 FP32TODL16_OP = "fp32todl16"
+FP8TODL16_OP = "fp8todl16"
 
 DEVICE_NAME = "spyre"
+
+# Marker on a ComputedBuffer that should be considered for copy-back removal.
+# ``aten.copy_`` lowering sets this on the explicit copy-back mutation op; layout
+# propagation later proves feasibility and either removes the copy or leaves it
+# intact.
+COPY_BACK_CANDIDATE_ATTR = "_spyre_copy_back_candidate"
+
+# Marker on a ComputedBuffer whose layout was retargeted so that the producer
+# writes a graph input directly. Downstream passes use this to distinguish a
+# compute mutation op from a pure-copy mutation op.
+ELIDED_COPY_BACK_ATTR = "_spyre_writes_copy_back_target"
+
+# FX ``custom`` metadata key for BMMs created from a shared 2D weight whose
+# logical batch dim is statically 1.  The downstream OpSpec key carries the same
+# fact after lowering, where FX metadata is no longer directly available.
+SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY = "_spyre_shared_weight_unit_bmm"
+SHARED_WEIGHT_UNIT_BMM_INFO_KEY = "shared_weight_unit_bmm"
 
 
 SEGMENT_OFFSETS = [
@@ -44,6 +63,10 @@ SPYRE_FP32_OPS = [
     "realdiv",
     "relufwd",
     "reciprocal",
+    "mean",
+    "sum",
+    "max",
+    "min",
     "layernormscale",
     "abs",
     "neg",
@@ -52,6 +75,8 @@ SPYRE_FP32_OPS = [
     "exx2",
     "layernormnorm",
     "identity",
+    "sqrt",
+    "rsqrt",
     "topkvalue",
     "topkindex",
     "floor",
@@ -59,6 +84,15 @@ SPYRE_FP32_OPS = [
     "maximum",
     "minimum",
 ]
+
+# Operations that directly handle FP8 dtypes (SEN143_FP8)
+# FP8 E4M3 numeric limits
+FP8_E4M3_MAX = 448.0
+
+SPYRE_FP8_OPS = {
+    "qfp8ch",  # Channel-wise FP8 quantization (output: FP8)
+    "fp8todl16",  # FP8 to FP16 conversion (input: FP8)
+}
 
 TOPK_OPS = {"topkvalue", "topkindex"}
 

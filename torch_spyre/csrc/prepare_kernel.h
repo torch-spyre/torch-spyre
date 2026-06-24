@@ -21,15 +21,14 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "flex/flex.hpp"
+#include "job_plan.h"
 #include "spyre_stream.h"
 
 namespace spyre {
-
-// Forward declarations
-class JobPlan;
-class JobPlanStep;
 
 /**
  * @brief Builder class for constructing JobPlan from SpyreCode
@@ -61,6 +60,76 @@ class JobPlanBuilder {
   std::unique_ptr<JobPlan> build();
 
  private:
+  /**
+   * @brief Severity level for validation messages
+   */
+  enum class Severity {
+    ERROR,    // Critical issue that prevents execution
+    WARNING,  // Non-critical issue that may affect behavior
+    INFO      // Informational message
+  };
+
+  /**
+   * @brief A single validation message with severity
+   */
+  struct ValidationMessage {
+    Severity severity;
+    std::string message;
+  };
+
+  /**
+   * @brief Result of JobPlan validation
+   *
+   * Contains the list of validation messages found during JobPlan validation.
+   * An empty message list indicates successful validation.
+   */
+  struct ValidationResult {
+    /**
+     * @brief List of validation messages
+     *
+     * Each message describes a validation finding with its severity level.
+     * Empty vector indicates the JobPlan passed all validation checks.
+     */
+    std::vector<ValidationMessage> messages;
+
+    /**
+     * @brief Check if validation was successful
+     *
+     * @return true if no error-level messages were found, false otherwise
+     */
+    bool isValid() const {
+      for (const auto& msg : messages) {
+        if (msg.severity == Severity::ERROR) {
+          return false;
+        }
+      }
+      return true;
+    }
+  };
+
+  /**
+   * @brief Validate the JobPlan structure and configuration
+   *
+   * Runs all validation checks (P2-13 through P2-16) and collects all messages.
+   * This method is called during build() after JobPlan construction to
+   * ensure the plan is well-formed before returning it.
+   *
+   * Validation checks include:
+   * - P2-13: expected_input_shapes validation (blocked - not yet implemented)
+   * - P2-14: JobPlan step ordering validation (blocked - not yet implemented)
+   * - P2-15: host compute metadata validation (blocked - not yet implemented)
+   * - P2-16: Additional structural validation (blocked - not yet implemented)
+   *
+   * @param job_plan The JobPlan to validate
+   * @return ValidationResult containing list of validation messages with
+   * severity. Empty message list indicates successful validation.
+   *
+   * @note This is currently a skeleton implementation that auto-validates
+   *       (returns empty message list). Full validation logic will be added
+   *       once the blocked dependencies are resolved.
+   */
+  ValidationResult validate(const JobPlan& job_plan) const;
+
   /// Path to the SpyreCode directory containing kernel artifacts
   const std::filesystem::path spyrecode_dir_;
   /// Parsed SpyreCode JSON containing preparation and execution plans
@@ -69,9 +138,13 @@ class JobPlanBuilder {
   const SpyreStream stream_;
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
-  std::optional<flex::CompositeAddress> job_allocation_;
+  std::vector<flex::CompositeAddress> job_allocation_;
   /// Whether to bind inputs and outputs addresses for compute
   bool bind_io_addresses_;
+
+  std::unordered_map<std::string, HostBuffer> pinned_buffer_map_;
+
+  std::vector<std::string> inits_;
 
   /// Execute the job preparation plan (allocate + init transfers)
   void executeJobPreparationPlan();

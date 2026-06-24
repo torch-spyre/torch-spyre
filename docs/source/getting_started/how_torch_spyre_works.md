@@ -669,11 +669,20 @@ Spyre hardware. There is no emulated mode yet.*
 
 The extension points exist. These are PrivateUse1, the scheduler pass hooks, the TorchInductor
 backend registration, and a custom `TensorImpl`. We built everything out-of-tree, but we still
-monkey-patch a few internal APIs where the extension points are incomplete. The three patches
-cover dtype computation maps, fusion patterns, and compile_fx wrapping. The device registration
-layer is well documented. `torch.accelerator` and OpenReg give a clear starting point. The
-deeper hooks, which are the scheduler passes and codegen, are less well documented. For those,
-we spent a lot of time reading the source code of other backends to figure out the patterns.
+monkey-patch a small number of internal APIs where the extension points are incomplete. The
+patches fall into two groups: import-time patches in
+[`_monkey_patch.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_monkey_patch.py)
+that extend Dynamo guards and the FxGraph cache key to track `SpyreTensorLayout` plus a few
+`torch.Tensor` and `torch.empty` overrides for tiled-layout awareness, and compilation-scoped
+patches in
+[`_inductor/patches.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)
+that adjust the computation-dtype map, fusion patterns, the scheduler-passes injection, and a
+realization heuristic. Each patch corresponds to a missing upstream extension point.
+
+The device registration layer is well documented. `torch.accelerator` and OpenReg give a clear
+starting point. The deeper hooks, which are the scheduler passes and codegen, are less well
+documented. For those, we spent a lot of time reading the source code of other backends to
+figure out the patterns.
 
 Staying out-of-tree was worth the discipline it imposed. Every time we were tempted to edit a
 core file directly, the constraint pushed us toward finding the proper hook instead. That is not
@@ -691,25 +700,36 @@ layout propagation, view semantics, and error messaging across dozens of operati
 
 ## What is next
 
-**KTIR.** We are transitioning from SuperDSC to an MLIR-based IR that is designed as a
-community specification rather than a Spyre-specific format. The
-[KTIR RFC](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) is
-available in our public repository.
+**KTIR.** The Kernel Tile IR specification is published as
+[RFC 0682](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) and
+two open-source companion projects are up: a CPU interpreter at
+[torch-spyre/ktir-cpu](https://github.com/torch-spyre/ktir-cpu) and an MLIR parser at
+[torch-spyre/ktir-mlir-frontend](https://github.com/torch-spyre/ktir-mlir-frontend). The
+remaining work is the backend lowering path that lets KTIR replace SuperDSC in the production
+flow.
 
-**Scratchpad optimization.** We are designing and building a `ScratchPadAllocator` that plans
-what data lives in the 2 MB LX scratchpad and what stays in DDR. This is the Spyre equivalent of
-what a GPU cache does implicitly. Without it, compute units stall while they wait for data.
+**Scratchpad optimization.** The scratchpad planner is in-tree under
+`torch_spyre/_inductor/scratchpad/`. The default greedy solver has shipped along with first-fit
+and best-fit variants, an in-place reuse pass, a clone-input pre-pass, and a multi-core layout
+mode. A graph-aware co-optimisation pass that aligns work-division splits with LX placement is
+in proof-of-concept form. See [Scratchpad planning](../compiler/scratchpad_planning.md).
+
+**Distributed inference.** The `spyreccl` torch.distributed backend is implemented under
+`csrc/distributed/`. Synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`,
+`reduce`, and `allreduce` work today. The remaining work is async support and the missing
+collectives (`scatter`, `reduce_scatter`, `alltoall`). See
+[Runtime — Multi-card and distributed execution](../runtime/index.md).
+
+**Profiling.** `torch.profiler` integration via `ProfilerActivity.PrivateUse1` is implemented
+in the in-progress `SpyreActivityProfiler` Kineto bridge. The memory APIs
+(`torch.spyre.memory.memory_allocated` and friends) are available today, and
+`aiu-trace-analyzer` post-processes traces with PT-utilisation metrics. The
+[profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md)
+covers the full plan; current state is summarised on the
+[Profiling page](../user_guide/profiling/index.md).
 
 **Broader model and serving coverage.** Llama 3.1 8B, vision models, and speech models are
 next. We are also integrating with vLLM as a platform plugin alongside CUDA and ROCm.
-
-**Distributed inference.** We are extending `torch.compile` to generate collective operations
-for multi-card Spyre configurations, using the standard PyTorch distributed communication APIs.
-
-**Profiling.** We are building `torch.profiler` integration through `ProfilerActivity.PrivateUse1`
-so that transfer latency, scratchpad pressure, and pipeline utilization are visible to users.
-Early scaffolding is in place. See our
-[profiling RFC](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md).
 
 **Upstream contributions.** We plan to contribute a generalized `FixedTiledLayout` for Inductor,
 OpenReg primitives for standardized out-of-tree backend testing, and documented CI patterns for
@@ -750,6 +770,7 @@ used. The tables are organized by the challenge that each hook addresses.
 | `SpyreTensorImpl` | `at::TensorImpl` | Carries tiled layout metadata alongside the PyTorch tensor | Adds `SpyreTensorLayout` with device-side tiled size, a stride map from host dims to device dims, and device dtype. `BYTES_IN_STICK=128` (64 fp16 elements) |
 | `SpyreHooksInterface` | `PrivateUse1HooksInterface` | Reports device availability and primary context status | Queried by PyTorch runtime during device enumeration |
 | `SpyreStream` | `torch.cuda.Stream` semantics | Asynchronous execution and CPU↔Spyre overlap | Implements `torch.spyre.Stream`, `current_stream()`, `synchronize()`; enables pipelining batch N+1's input transfer behind batch N's compute |
+| `SpyreCCLBackend` | `c10d::Backend` (registered as `"spyreccl"`) | Multi-card collective communication via `torch.distributed` | `init_process_group(backend="spyreccl")`. Implements synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, `allreduce`. Reuses the rank's flex runtime instance and default stream. |
 
 Initialization is lazy and thread-safe. Importing `torch_spyre` registers the device name and
 module. `flex::initializeRuntime()` starts only on the first device use.
@@ -785,11 +806,14 @@ would require invasive core changes. Deferring to codegen is too late.
 | Decompositions | Registered in `enable_spyre_context()` | Layer 4 ops not natively available | `logical_not` → `eq(input, ne(input, input))` (bool), `addmm` → `matmul+scale+add`, `linear` → `matmul+add` (with weight transpose), `rms_norm` → `spyre::rms_norm`, `layer_norm` → `spyre::layer_norm`, `gelu` → `spyre::gelu`, `softplus` → `spyre::softplus`, `topk` → `spyre::topkvalue`/`spyre::topkindex`, `max.dim` → split value/index decomp, `scaled_dot_product_attention` → explicit Q·K^T·V, `cat`, `constant_pad_nd`, `ones` → `spyre::ones_scalar+expand+clone`, `new_ones`, `full` → `spyre::full`, `bitwise_not`, `bitwise_and` |
 | CPU fallback (auto-transfer) | PyTorch fallback dispatch | Infrequent ops that are off the critical path | `embedding`, `arange`, `sin`, `cos`, `tril`, `triu`, `isin`, `normal_`, `argmax`, `bitwise_or`, `bitwise_xor`, int64 variants of `max`. Data auto-transfers to the CPU, executes, and returns to Spyre. Transparent to the model. |
 
-### Profiling (in progress)
+### Profiling
 
 | Component | PyTorch Hook | Purpose | Key Detail |
 |---|---|---|---|
-| kineto-spyre extension | `ProfilerActivity.PrivateUse1` | Spyre-specific metrics in `torch.profiler` | Target metrics are transfer latency, scratchpad pressure, pipeline utilization, and inter-core communication overhead. Early scaffolding is in place. See the [profiling RFC](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
+| `torch.spyre.memory.*` | `torch.accelerator.memory` re-export | Per-device memory queries | `memory_allocated`, `max_memory_allocated`, `reset_peak_memory_stats`, `memory_stats` — all available today. |
+| `aiu-smi` | Standalone CLI / sampler | Power, thermal, PT-utilisation, DDR / PCIe / RDMA bandwidth | Available in PF and VF mode (Z/LinuxONE rollout in progress for VF). Public release tracked in [#1335](https://github.com/torch-spyre/torch-spyre/issues/1335). |
+| `aiu-trace-analyzer` | Trace post-processor | Adds derived metrics (PT-Util %) to Chrome / Perfetto traces | Available with some known gaps. |
+| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | In progress in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856). The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
 
 ---
 

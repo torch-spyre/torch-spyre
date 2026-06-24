@@ -14,28 +14,56 @@
 
 
 import math
+from typing import Any
+
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
+from torch._inductor.ir import Operation, IRNode, Pointwise
+from torch._inductor.virtualized import V
+from torch._inductor.ops_handler import WrapperHandler
+
+import sympy
+
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import _per_core_view_on_buf
 
 # Op outputs eligible for LX-pinning. `amax` is the lowered form of
 # `max`; both names are listed to match whichever the IR shows.
-OP_OUTPUT_GOOD_FOR_LX_REUSE = [
-    "max",
-    "amax",
-    "sum",
-    # "clone",
-    "exp",
-    "sub",
-    # "mul",
-]
+OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
+    {
+        "max",
+        "amax",
+        "sum",
+        # "clone",
+        "exp",
+        "sub",
+        "mul",
+        "mean",
+        "add",
+        "rsqrt",
+    }
+)
 
-OP_GOOD_FOR_LX_INPLACE = [
-    "exp",
-    "sub",
-]
+OP_GOOD_FOR_LX_INPLACE = frozenset(
+    {
+        "exp",
+        "sub",
+        "add",
+        "rsqrt",
+    }
+)
+
+
+def clone_at_graph_boundaries() -> bool:
+    """True when clone ops are eligible for LX, enabling clone insertion at graph
+    input/output boundaries so those buffers can also be LX-pinned.
+
+    Gated by the dedicated ``lx_boundary_clones`` flag (or, legacy, by listing
+    "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE). It intentionally does NOT consult
+    ``allow_all_ops_in_lx_planning``: that flag widens intermediate-output
+    eligibility and is set broadly (e.g. the LX-planning op suite), so coupling
+    it here would silently turn on the not-yet-correct boundary clone path."""
+    return config.lx_boundary_clones or "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
 
 
 class GraphView:
@@ -52,17 +80,25 @@ class GraphView:
         return getattr(self.graph, name)
 
 
-def calculate_liveness(graph: GraphLowering) -> dict:
-    liveness: dict[str, dict[str, bool | int]] = {}
+def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
+    """Return a dict mapping each buffer name to the sorted list of operation indices
+    at which that buffer is accessed (read or written).  Graph inputs are seeded with
+    an empty list; unused inputs remain empty.
+
+    Note: previously, unused graph inputs did not appear in the returned dict at all.
+    Now they appear with an empty list.  Callers that skip buffers with ``len(uses) <= 1``
+    (e.g. ``_build_bound_buffers``) will still skip unused inputs correctly, since
+    ``len([]) == 0 <= 1``."""
+    liveness: dict[str, list[int]] = {}
+    for input_name in graph.graph_input_names:
+        liveness[input_name] = []
     for i, op in enumerate(graph.operations):
         rw = op.get_read_writes()
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
             if buf_name not in liveness:
-                liveness[buf_name] = {}
-            if "liveness_start" not in liveness[buf_name]:
-                liveness[buf_name]["liveness_start"] = i
-            liveness[buf_name]["liveness_end"] = i + 1
+                liveness[buf_name] = []
+            liveness[buf_name].append(i)
     return liveness
 
 
@@ -173,3 +209,40 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             num_cores = 1
         result[buf_name] = num_cores
     return result
+
+
+class _GetLoadStoreIndices(WrapperHandler):
+    def __init__(self, inner):
+        super().__init__(inner)
+        self._load_map = {}
+        self._store_map = {}
+
+    def load(self, name: str, index: sympy.Expr):
+        self._load_map[name] = index
+        return super().load(name, index)
+
+    def store(self, name: str, index: sympy.Expr, value: Any, mode: Any = None):
+        self._store_map[name] = index
+        return super().store(name, index, value, mode)
+
+
+def get_load_and_store_indices(
+    pointwise: Pointwise,
+) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr]]:
+    handler = _GetLoadStoreIndices(V.MockHandler())
+    index = [sympy.Symbol(f"index{i}") for i in range(len(pointwise.ranges))]
+    with V.set_ops_handler(handler):
+        pointwise.inner_fn(index)
+    return handler._load_map, handler._store_map
+
+
+def get_op_pointwise_inputs(node: IRNode) -> list[str]:
+    if not isinstance(node, Pointwise):
+        return []
+    loads, stores = get_load_and_store_indices(node)
+
+    return [
+        inp
+        for inp, load_index in loads.items()
+        if all(store_index == load_index for store_index in stores.values())
+    ]

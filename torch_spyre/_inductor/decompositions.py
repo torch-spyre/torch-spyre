@@ -21,11 +21,34 @@ import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME
+from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
+from torch_spyre._C import DataFormats, get_device_dtype
 
 import threading
+
+
+# Determine the float dtype for bool at module load time (not during tracing)
+_BOOL_FLOAT_DTYPE = None
+
+
+def _get_float_dtype_for_bool() -> torch.dtype:
+    """
+    Get the appropriate float dtype to convert boolean tensors on Spyre.
+    Boolean tensors are stored as either FP16 or FP32 on the device.
+    This is determined once at module load time to avoid tracing issues.
+    """
+    global _BOOL_FLOAT_DTYPE
+    if _BOOL_FLOAT_DTYPE is None:
+        device_dtype = get_device_dtype(torch.bool)
+        # Map DataFormats to torch.dtype, defaulting to float16
+        if device_dtype == DataFormats.IEEE_FP32:
+            _BOOL_FLOAT_DTYPE = torch.float32
+        else:
+            _BOOL_FLOAT_DTYPE = torch.float16
+    return _BOOL_FLOAT_DTYPE
+
 
 # A module-level lock to make the CM thread-safe
 _decompositions_lock = threading.RLock()
@@ -451,6 +474,11 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
+@register_spyre_decomposition([torch.ops.aten.silu.default])
+def silu(input: torch.Tensor) -> torch.Tensor:
+    return torch.ops.spyre.silu(input)
+
+
 @register_spyre_decomposition([torch.ops.aten.topk])
 def spyre_topk(
     input: torch.Tensor,
@@ -601,25 +629,25 @@ def spyre__sdpa_overrideable(
 #        # Use amax for supported dtypes (can run on Spyre)
 #        # Returns a scalar (0D) tensor
 #        return torch.ops.aten.amax(input)
-
-
 @register_spyre_decomposition([torch.ops.aten.max.dim])
 def spyre_max_dim_decomp(input, dim, keepdim=False):
     """
-    Decompose torch.max(input, dim) with conditional CPU fallback for int64.
-
-    For int64 tensors, use custom op spyre::max_dim_int64_fallback which has
-    a CPU fallback registered in fallbacks.py.
-    For other dtypes (float16, float32, etc.), decompose into amax and argmax operations.
-
-    Returns a named tuple (values, indices) as expected by torch.max.
-
-    # TODO (imaihal): Decomposed into torch.topk with k=1 to obtain both values and indices,
-    #  or implement argmax in the backend compiler to get indices
+    Decompose torch.max(input, dim) with conditional handling for bool and int64.
+    For bool: convert to float16, perform max, convert back (bool stored as fp16 on Spyre).
+    For int64: use CPU fallback custom op (not supported on Spyre).
+    For other dtypes: use default PyTorch decomposition (amax + argmax).
     """
-    if input.dtype == torch.int64:
-        # Use custom op with CPU fallback to avoid recursive decomposition
-        return torch.ops.spyre.max_dim_int64_fallback(input, dim, keepdim)
+    if input.dtype == torch.bool:
+        # Reinterpret bool as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+        float_dtype = _get_float_dtype_for_bool()
+        input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+        values_float = torch.ops.aten.amax(input_float, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmax(input_float, dim=dim, keepdim=keepdim)
+        values = torch.ops.prims.convert_element_type(values_float, torch.bool)
+        return torch.return_types.max((values, indices))
+    elif input.dtype == torch.int64:
+        # Use CPU fallback custom op for int64
+        return torch.ops.spyre.max_dim_int64_fallback(input, dim=dim, keepdim=keepdim)
     else:
         # Use amax and argmax for supported dtypes (can run on Spyre)
         values = torch.ops.aten.amax(input, dim=dim, keepdim=keepdim)
@@ -630,18 +658,73 @@ def spyre_max_dim_decomp(input, dim, keepdim=False):
 @register_spyre_decomposition([torch.ops.aten.min.dim])
 def spyre_min_dim_decomp(input, dim, keepdim=False):
     """
-    Decompose torch.min(input, dim) with conditional CPU fallback for int64.
-
-    Mirrors spyre_max_dim_decomp: int64 inputs go through a CPU-fallback custom
-    op; other dtypes are decomposed into amin (Spyre-native) and argmin (CPU
-    fallback). Returns a named tuple (values, indices) as expected by torch.min.
+    Decompose torch.min(input, dim) with conditional handling for bool and int64.
+    For bool: convert to float16, perform min, convert back (bool stored as fp16 on Spyre).
+    For int64: use CPU fallback custom op (not supported on Spyre).
+    For other dtypes: use default PyTorch decomposition (amin + argmin).
     """
-    if input.dtype == torch.int64:
-        return torch.ops.spyre.min_dim_int64_fallback(input, dim, keepdim)
+    if input.dtype == torch.bool:
+        # Reinterpret bool as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+        float_dtype = _get_float_dtype_for_bool()
+        input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+        values_float = torch.ops.aten.amin(input_float, dim=dim, keepdim=keepdim)
+        indices = torch.ops.aten.argmin(input_float, dim=dim, keepdim=keepdim)
+        values = torch.ops.prims.convert_element_type(values_float, torch.bool)
+        return torch.return_types.min((values, indices))
+    elif input.dtype == torch.int64:
+        # Use CPU fallback custom op for int64
+        return torch.ops.spyre.min_dim_int64_fallback(input, dim=dim, keepdim=keepdim)
     else:
+        # Use amin and argmin for supported dtypes (can run on Spyre)
         values = torch.ops.aten.amin(input, dim=dim, keepdim=keepdim)
         indices = torch.ops.aten.argmin(input, dim=dim, keepdim=keepdim)
         return torch.return_types.min((values, indices))
+
+
+@register_spyre_decomposition([torch.ops.aten.amax.default])
+def spyre_amax_decomp(
+    input: torch.Tensor, dim=None, keepdim: bool = False
+) -> torch.Tensor:
+    """
+    Decompose torch.amax for boolean tensors.
+    For bool tensors: convert to float16, perform amax, convert back (bool stored as fp16 on Spyre).
+    For other dtypes: return NotImplemented to use default behavior.
+    """
+    if input.dtype != torch.bool:
+        # For non-bool types, don't decompose - use default lowering
+        return NotImplemented
+
+    # For bool tensors: reinterpret as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+    float_dtype = _get_float_dtype_for_bool()
+    input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+    if dim is None:
+        result_float = torch.ops.aten.amax(input_float, keepdim=keepdim)
+    else:
+        result_float = torch.ops.aten.amax(input_float, dim=dim, keepdim=keepdim)
+    return torch.ops.prims.convert_element_type(result_float, torch.bool)
+
+
+@register_spyre_decomposition([torch.ops.aten.amin.default])
+def spyre_amin_decomp(
+    input: torch.Tensor, dim=None, keepdim: bool = False
+) -> torch.Tensor:
+    """
+    Decompose torch.amin for boolean tensors.
+    For bool tensors: convert to float16, perform amin, convert back (bool stored as fp16 on Spyre).
+    For other dtypes: return NotImplemented to use default behavior.
+    """
+    if input.dtype != torch.bool:
+        # For non-bool types, don't decompose - use default lowering
+        return NotImplemented
+
+    # For bool tensors: reinterpret as float (fp16 or fp32) using prims.convert_element_type (zero-copy identity op)
+    float_dtype = _get_float_dtype_for_bool()
+    input_float = torch.ops.prims.convert_element_type(input, float_dtype)
+    if dim is None:
+        result_float = torch.ops.aten.amin(input_float, keepdim=keepdim)
+    else:
+        result_float = torch.ops.aten.amin(input_float, dim=dim, keepdim=keepdim)
+    return torch.ops.prims.convert_element_type(result_float, torch.bool)
 
 
 @register_spyre_decomposition([torch.ops.aten.ceil.default])
@@ -672,24 +755,153 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
-@register_spyre_decomposition([torch.ops.aten.sub.Tensor])
-def sub_with_alpha(
-    self: torch.Tensor, other: torch.Tensor, *, alpha: float = 1
+@register_spyre_decomposition([torch.ops.aten.convolution.default])
+def conv2d_via_bmm_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    groups: int,
 ) -> torch.Tensor:
     """
-    Decompose torch.sub(a, b, alpha=alpha) into separate mul and sub operations.
-
-    The Spyre backend does not have a single operation for a - alpha * b.
-    When alpha != 1, we decompose into: a - (alpha * b)
-    This ensures the operations are not fused by Inductor's optimization passes.
+    Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
+    torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
+    intermediate reshape/view/unsqueeze operations.
     """
-    if alpha == 1:
-        # Simple subtraction without alpha - use default behavior
-        return NotImplemented
+    if transposed:
+        raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
+
+    if any(op != 0 for op in output_padding):
+        raise Unsupported("conv2d_via_bmm: output_padding not supported")
+
+    if input.dim() != 4:
+        raise Unsupported(f"conv2d_via_bmm: expected 4D input, got {input.dim()}D")
+
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    stride_h, stride_w = stride[0], stride[1]
+    pad_h, pad_w = padding[0], padding[1]
+    dil_h, dil_w = dilation[0], dilation[1]
+
+    if C_in != groups * C_in_per_group:
+        raise Unsupported(
+            f"conv2d_via_bmm: expect C_in == groups * C_in_per_group, got C_in: {C_in}, groups: {groups} C_in_per_group: {C_in_per_group}"
+        )
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    patches = torch.ops.spyre.unfold(
+        input,
+        kernel_size=(K_h, K_w),
+        dilation=(dil_h, dil_w),
+        padding=(pad_h, pad_w),
+        stride=(stride_h, stride_w),
+    )
+
+    if groups == 1:
+        # weight_2d = weight.reshape(C_out, C_in_per_group * K_h * K_w)
+        weight_2d = torch.ops.spyre.reshape_via_cpu(
+            weight, (C_out, C_in_per_group * K_h * K_w)
+        )
+        weight_2d_exp = weight_2d.unsqueeze(0).expand(N, -1, -1)
+        weight_2d_exp_cln = weight_2d_exp.clone()
+        # output = torch.matmul(weight_2d, patches)
+        output = torch.matmul(weight_2d_exp_cln, patches)
     else:
-        # Decompose: sub(a, b, alpha) = sub(a, mul(b, alpha))
-        scaled_other = torch.mul(other, alpha)
-        return torch.sub(self, scaled_other)
+        C_out_per_group = C_out // groups
+        # patches = patches.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        patches = torch.ops.spyre.reshape_via_cpu(
+            patches, (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        )
+        # weight_grouped = weight.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
+        weight_grouped = torch.ops.spyre.reshape_via_cpu(
+            weight, (groups, C_out_per_group, C_in_per_group * K_h * K_w)
+        )
+
+        output = torch.matmul(
+            weight_grouped.unsqueeze(0),
+            patches,
+        )
+        output = output.reshape(N, C_out, H_out * W_out)
+
+    output = output.reshape(N, C_out, H_out, W_out)
+
+    if bias is not None:
+        # To ensure stick compatibility: reshape bias via reshape_via_cpu to (1, C_out, 1, 1).
+        # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
+        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
+        output = output + bias_shaped
+
+    return output
+
+
+# Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
+@decomp.register_decomposition(
+    [torch.ops.spyre.dequantize_fp8_with_scale], spyre_decompositions
+)
+def dequantize_fp8_with_scale_decomp(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """
+    Decompose dequantize_fp8_with_scale into:
+    1. FP8→FP16 conversion using .to() (triggers fp8todl16 via dtype_ops)
+    2. Multiply by scale
+
+    This decomposition is executed during compilation and removes the custom op
+    from the graph before lowering.
+    """
+    x_fp16 = input.to(torch.float16)
+    return x_fp16 * scale
+
+
+@register_spyre_decomposition([torch.ops.aten.where.ScalarOther])
+def where_scalar_other_decomp(condition, self, other):
+    other_t = torch.full_like(self, other)
+    return torch.ops.aten.where.self(condition, self, other_t)
+
+
+@register_spyre_decomposition([torch.ops.aten.where.ScalarSelf])
+def where_scalar_self_decomp(condition, self, other):
+    self_t = torch.full_like(other, self)
+    return torch.ops.aten.where.self(condition, self_t, other)
+
+
+@register_spyre_decomposition([torch.ops.aten.where.Scalar])
+def where_scalar_decomp(condition, self, other):
+    # Must use dtype float16 for spyre backend where3
+    dtype = torch.float16
+
+    # Use full.default instead of full_like to explicitly control dtype
+    self_t = torch.ops.aten.full.default(
+        list(condition.shape),
+        self,
+        dtype=dtype,
+        device=condition.device,
+    )
+    other_t = torch.ops.aten.full.default(
+        list(condition.shape),
+        other,
+        dtype=dtype,
+        device=condition.device,
+    )
+
+    return torch.ops.aten.where.self(condition, self_t, other_t)
+
+
+@register_spyre_decomposition([torch.ops.spyre.quantize_fp8_with_scale])
+def spyre_quantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    inv_scale = torch.reciprocal(scale)
+    x_scaled = input * inv_scale
+    x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
+    return torch.ops.spyre.qfp8ch(x_clamped)
 
 
 ###############################################################################################

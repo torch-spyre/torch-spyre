@@ -1,0 +1,64 @@
+# Misc compute shard B: normalization, embedding, isin, inplace, bitwise,
+# misc arithmetic, random, error-path, and restickify tests.
+#
+# Pair with test_inductor_ops_misc_compute_a_config.yaml which covers
+# activations, broadcast/scalar arithmetic, attention, sdpa, rope, and qkv.
+# Together they replace the former
+# test_inductor_ops_misc_compute_config.yaml.
+#
+# When a new test is added to test_inductor_ops.py that belongs in the misc
+# compute group, assign it to whichever shard keeps the two jobs balanced.
+
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # normalization
+            - TestOps::test_layernorm.*
+            - TestOps::test_rmsnorm.*
+            - TestOps::test_softmax.*
+            - TestOps::test_softplus.*
+            # embedding
+            - TestOps::test_embedding.*
+            # isin family — test_isin.* covers all test_isin_* variants
+            - TestOps::test_isin.*
+            # inplace / copy — test_inplace_copy.* covers noncontiguous variant too
+            - TestOps::test_inplace_copy.*
+            - TestOps::test_inplace_op.*
+            # bitwise (fallback path)
+            - TestOps::test_bitwise_and.*
+            - TestOps::test_bitwise_not.*
+            # misc arithmetic / ops
+            - TestOps::test_dropout_functional.*
+            - TestOps::test_fallback.*
+            - TestOps::test_fill_scalar.*
+            - TestOps::test_implicit_loading.*
+            - TestOps::test_is_nonzero.*
+            - TestOps::test_item.*
+            # exact matches — no .* to avoid leaking into other shards
+            - TestOps::test_log
+            # test_mean has 3 params: 3d_dim0, 3d_dim1, 3d_dim0_keepdim.
+            # The 3d_dim0_keepdim variant is in the keepdim shard (matched by
+            # the old .*keepdim.* pattern on instantiated names). The other two
+            # are listed explicitly here to avoid double-collecting 3d_dim0_keepdim.
+            - TestOps::test_mean_3d_dim0
+            - TestOps::test_mean_3d_dim1
+            - TestOps::test_mean_default.*
+            - TestOps::test_normal_randn_cpu.*
+            - TestOps::test_overwrite.*
+            - TestOps::test_tril.*
+            - TestOps::test_triu.*
+            - TestOps::test_uniform_cpu.*
+            - TestOps::test_uniform_custom_range_cpu.*
+            - TestOps::test_random_from_cpu.*
+            - TestOps::test_where.*
+            # invalid-dim error-path tests
+            - TestOps::test_core_reduction_invalid_dims_api.*
+            - TestOps::test_core_reduction_invalid_dims_spyre.*
+            - TestOps::test_single_dim_reduction_invalid_dims_api.*
+            - TestOps::test_single_dim_reduction_invalid_dims_spyre.*
+            # restickify add on padded dim tests
+            - TestOps::test_restickify_add_transpose.*
+          mode: mandatory_success

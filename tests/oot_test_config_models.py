@@ -6,9 +6,6 @@ Pydantic models for the OOT PyTorch test framework YAML config.
 Used by oot_test_parsing.py to validate and parse the YAML config.
 """
 
-import ast
-import regex as re
-import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
@@ -17,162 +14,21 @@ import torch
 from pydantic import BaseModel, field_validator, model_validator  # type: ignore
 
 from oot_test_constants import (
+    _VALID_DTYPE_STRINGS,
+    _VALID_INIT_STRATEGIES,
+    _VALID_TEST_MODES,
+    _VALID_UNLISTED_MODES,
     DTYPE_STR_MAP,
     MODE_MANDATORY_SUCCESS,
-    MODE_SKIP,
     MODE_XFAIL,
-    MODE_XFAIL_STRICT,
     REL_PATH_TOKENS,
 )
 from oot_test_matching import parse_dtype
-
-
-# ---------------------------------------------------------------------------
-# Valid dtype strings (used in validators)
-# ---------------------------------------------------------------------------
-
-_VALID_DTYPE_STRINGS = {
-    "float16",
-    "float32",
-    "float64",
-    "bfloat16",
-    "int8",
-    "int16",
-    "int32",
-    "int64",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "complex32",
-    "complex64",
-    "complex128",
-    "bool",
-    "half",
-}
-# -------------------------------------------
-# Valid tensor generation strategies
-# -------------------------------------------
-_VALID_INIT_STRATEGIES = {
-    "rand",
-    "randn",
-    "zeros",
-    "ones",
-    "randint",
-    "arange",
-    "eye",
-    "full",
-    "file",
-}
-
-_VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
-
-_VALID_UNLISTED_MODES = {"skip", "xfail", "xfail_strict", "mandatory_success"}
-
-# ---------------------------------------------------------------------------
-# Python literal evaluator — shared by InputArgPy and InputsEdits
-# ---------------------------------------------------------------------------
-
-_PY_ALLOWED_NODES = {
-    ast.Expression,
-    ast.Constant,
-    ast.Tuple,
-    ast.List,
-    ast.Name,
-    ast.Call,
-    ast.Load,
-    ast.UnaryOp,
-    ast.USub,
-    ast.UAdd,
-}
-_PY_ALLOWED_NAMES: Dict[str, Any] = {
-    "None": None,
-    "Ellipsis": Ellipsis,
-    "slice": slice,
-    "inf": float("inf"),
-    "nan": float("nan"),
-}
-
-_TOKEN_RE = re.compile(r"\$\{([^}]+)\}")
-
-
-def _eval_py_literal(expr: str) -> Any:
-    """Safely evaluate a restricted Python literal (slice, tuple, Ellipsis, etc.)."""
-    node = ast.parse(expr, mode="eval")
-    for n in ast.walk(node):
-        if type(n) not in _PY_ALLOWED_NODES:
-            raise ValueError(
-                f"Node type {type(n).__name__!r} not allowed in py: {expr!r}"
-            )
-        if isinstance(n, ast.Call):
-            if not (isinstance(n.func, ast.Name) and n.func.id == "slice"):
-                raise ValueError(f"Only slice(...) calls are allowed in py: {expr!r}")
-        if isinstance(n, ast.Name) and n.id not in _PY_ALLOWED_NAMES:
-            raise ValueError(f"Name {n.id!r} not allowed in py: {expr!r}")
-    return eval(compile(node, "<py>", "eval"), {"__builtins__": {}}, _PY_ALLOWED_NAMES)
-
-
-# ---------------------------------------------------------------------------
-# Dtype resolution using DTYPE_STR_MAP
-# ---------------------------------------------------------------------------
-
-
-def _resolve_dtype_str(spec: str) -> torch.dtype:
-    """Resolve a dtype string using DTYPE_STR_MAP. Accepts 'float16' or 'torch.float16'."""
-    bare = spec.removeprefix("torch.")
-    if bare in DTYPE_STR_MAP:
-        return DTYPE_STR_MAP[bare]
-    try:
-        return parse_dtype(bare)
-    except ValueError:
-        pass
-    raise ValueError(
-        f"Unsupported dtype: {spec!r}. "
-        f"Supported aliases: {sorted(DTYPE_STR_MAP)} and torch.<dtype>"
-    )
-
-
-def _resolve_tensor_path(raw_path: str) -> str:
-    """Expand ``${TOKEN}`` placeholders in a tensor init_args.path and return
-    an absolute path.
-
-    Resolution order:
-    1. Replace every ``${TOKEN}`` using the env-var declared in REL_PATH_TOKENS.
-    2. If the result is already absolute, return it.
-    3. Otherwise resolve relative to the process working directory.
-
-    Raises:
-        ValueError:      Unknown token or its env-var is unset.
-        FileNotFoundError: Resolved path does not exist on disk.
-    """
-    token_map: dict[str, str] = {
-        tok.strip("${}") if tok.startswith("${") else tok: env_var
-        for tok, env_var in REL_PATH_TOKENS
-    }
-
-    def _replace(m: re.Match) -> str:
-        name = m.group(1)
-        if name not in token_map:
-            raise ValueError(
-                f"Unknown path token '${{{name}}}' in init_args.path={raw_path!r}. "
-                f"Known tokens: {sorted(token_map)}"
-            )
-        value = os.environ.get(token_map[name])
-        if value is None:
-            raise ValueError(
-                f"Environment variable '{token_map[name]}' (for token '${{{name}}}') "
-                f"is not set. Export it before running tests."
-            )
-        return value
-
-    expanded = _TOKEN_RE.sub(_replace, raw_path)
-    resolved = str(Path(expanded).resolve())
-
-    if not Path(resolved).exists():
-        raise FileNotFoundError(
-            f"Tensor file not found: {resolved!r}  (from init_args.path={raw_path!r})"
-        )
-    return resolved
+from oot_test_utilities import (
+    _eval_py_literal,
+    _resolve_dtype_str,
+    _resolve_tensor_path,
+)
 
 
 # ---------------------------
@@ -253,6 +109,8 @@ class InputTensorSpec(BaseModel):
             len(self.shape) != 2 or self.shape[0] != self.shape[1]
         ):
             raise ValueError(f"eye requires a square 2-D shape, got {self.shape}")
+        if self.init == "xavier" and len(self.shape) < 2:
+            raise ValueError(f"xavier requires 2-D or larger shape, got {self.shape}")
         if self.stride is not None and len(self.stride) != len(self.shape):
             raise ValueError(
                 f"stride length {len(self.stride)} must match shape length {len(self.shape)}"
@@ -286,6 +144,8 @@ class InputTensorSpec(BaseModel):
             return torch.arange(shape[0], dtype=dtype)
         elif init == "eye":
             return torch.eye(shape[0], dtype=dtype)
+        elif init == "xavier":
+            return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
         elif init == "full":
             return torch.full(shape, ia.fill_value, dtype=dtype)
         elif init == "zeros":
@@ -408,7 +268,7 @@ class InputTensorSpec(BaseModel):
 
             t = torch.from_numpy(np.load(path))
         elif path.endswith(".safetensors"):
-            from safetensors.torch import load_file
+            from safetensors.torch import load_file  # type: ignore
 
             tensors = load_file(path)
             if ia.key is None:
@@ -561,6 +421,21 @@ class InputsEdits(BaseModel):
                     and "cuda" in val
                 ):
                     val = test_device
+                # Handle tuples/lists from YAML (e.g., view/reshape shapes)
+                # If value is a string that looks like a tuple/list, convert it
+                elif isinstance(val, str) and (
+                    val.startswith("(") or val.startswith("[")
+                ):
+                    import ast
+
+                    try:
+                        val = ast.literal_eval(val)
+                    except (ValueError, SyntaxError):
+                        # If conversion fails, keep as string
+                        pass
+                # Tuples and lists are already valid Python values
+                elif isinstance(val, (tuple, list)):
+                    pass
                 cpu_args.append(val)
 
             elif isinstance(arg, InputArgPy):
@@ -754,6 +629,7 @@ class DtypeNamedItem(BaseModel):
     name: str
     description: Optional[str] = None
     precision: Optional[Precision] = None
+    force_xfail: bool = False
 
 
 class OpsEdits(BaseModel):
@@ -823,10 +699,33 @@ class DtypesEdits(BaseModel):
         }
 
 
+class FunctionItem(BaseModel):
+    """A single function entry for function modification."""
+
+    name: str  # Method name (e.g., "assertEqual")
+    description: Optional[str] = None  # Optional description
+
+
+class FunctionsEdits(BaseModel):
+    """Per-test function modification configuration.
+
+    Container for all function-level modifications. cpu_move is a list of
+    function names that will have their tensor arguments moved to CPU.
+    Extensible for future functionality.
+    """
+
+    cpu_move: List[FunctionItem] = []
+
+    def resolved_cpu_move_functions(self) -> List[str]:
+        """Return list of function names to patch with CPU move."""
+        return [item.name for item in self.cpu_move]
+
+
 class TestEdits(BaseModel):
     ops: OpsEdits = OpsEdits()
     dtypes: DtypesEdits = DtypesEdits()
     modules: ModulesEdits = ModulesEdits()
+    functions: FunctionsEdits = FunctionsEdits()
 
 
 class TestEntry(BaseModel):
@@ -1077,6 +976,12 @@ class GlobalConfig(BaseModel):
             parse_dtype(item.name): item.precision
             for item in self.supported_dtypes
             if item.precision is not None
+        }
+
+    def resolved_supported_dtypes_force_xfail(self) -> Set[torch.dtype]:
+        """Return the set of dtypes that have force_xfail: true."""
+        return {
+            parse_dtype(item.name) for item in self.supported_dtypes if item.force_xfail
         }
 
     def resolved_supported_ops(self) -> Optional[Set[str]]:

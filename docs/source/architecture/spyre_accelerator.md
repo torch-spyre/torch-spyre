@@ -26,6 +26,8 @@ Some of the key features of the Spyre device are listed below:
 * Each card supports up to 128 GB of LPDDR5 memory, with ensembles of up to eight cards delivering 1 TB memory and massive AI performance.
 * It delivers exceptional AI compute, exceeding 300 TOPS per card, while consuming just 75W.
 * PCIe gen5 x16 host interface (PCIe form factor card).
+* Each core has a 2 MB LX scratchpad (SRAM), shared between the two corelets within the core.
+* Each core has a 256 MB limit on the contiguous device-memory span it can address. This is a hardware constraint on the addressable range, distinct from the 2 MB LX scratchpad capacity.
 
 ### Core microarchitecture
 
@@ -57,7 +59,7 @@ The Spyre device is designed for enterprise AI workloads including:
 
 ## Integration with PyTorch
 
-The Spyre device is integrated with PyTorch as a custom backend device, enabling standard PyTorch models to leverage Spyre's AI acceleration capabilities. See the [Getting Started](../getting_started/installation.md) guide for setup and usage instructions. The [examples](../user_guide/examples.md) section provides annotated code examples.
+The Spyre device is integrated with PyTorch as a custom backend device, enabling standard PyTorch models to leverage Spyre's AI acceleration capabilities. See the [Getting Started](../getting_started/installation.md) guide for setup and usage instructions. The [examples](../user_guide/examples/index.md) section provides annotated code examples.
 
 IBM and the PyTorch community are collaborating to broaden Spyre's integration into the open-source AI stack, including vLLM and torchtitan. See [Expanding AI model training and inference for the open-source community](https://research.ibm.com/blog/pytorch-expanding-ai-model-training-and-inference-for-the-open-source-community) for details.
 

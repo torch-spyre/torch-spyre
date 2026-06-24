@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 460" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .cell      { fill: #ffffff; stroke: #bbb; stroke-width: 0.7; }
+      .highlight { fill: #d6efd6; stroke: #2d7a2d; stroke-width: 1.5; }
+      .axis      { fill: #222; font-weight: 600; }
+      .label     { fill: #222; }
+      .caption   { fill: #555; font-size: 12px; font-style: italic; }
+      .arrow     { stroke: #444; stroke-width: 1.4; fill: none; }
+      .title     { fill: #222; font-size: 16px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="390" y="34" text-anchor="middle" class="title">Iteration space of a 2D pointwise op</text>
+
+  <!-- Sub-caption under title -->
+  <text x="390" y="58" text-anchor="middle" class="caption">output[c0, c1] = f(input[c0, c1]). The op fires once for each (c0, c1) pair.</text>
+
+  <!-- Top axis: c1 with arrow + range. Grid origin at (220, 130); cell 36×36; 8 cols, 5 rows. -->
+  <text class="axis" x="400" y="98" text-anchor="middle">c1: 0 → N − 1</text>
+  <path class="arrow" d="M 220 110 L 530 110" marker-end="url(#arr)"/>
+
+  <!-- Left axis: c0 arrow + rotated range label -->
+  <path class="arrow" d="M 200 130 L 200 320" marker-end="url(#arr)"/>
+  <text class="axis" x="180" y="225" text-anchor="middle" transform="rotate(-90, 180, 225)">c0: 0 → M − 1</text>
+
+  <!-- Grid: 5 rows × 8 cols, cell 36×36, top-left at (220, 130) -->
+  <!-- Row 0 -->
+  <g>
+    <rect class="cell" x="220" y="130" width="36" height="36"/>
+    <rect class="cell" x="256" y="130" width="36" height="36"/>
+    <rect class="cell" x="292" y="130" width="36" height="36"/>
+    <rect class="cell" x="328" y="130" width="36" height="36"/>
+    <rect class="cell" x="364" y="130" width="36" height="36"/>
+    <rect class="cell" x="400" y="130" width="36" height="36"/>
+    <rect class="cell" x="436" y="130" width="36" height="36"/>
+    <rect class="cell" x="472" y="130" width="36" height="36"/>
+  </g>
+  <!-- Row 1 -->
+  <g>
+    <rect class="cell" x="220" y="166" width="36" height="36"/>
+    <rect class="cell" x="256" y="166" width="36" height="36"/>
+    <rect class="cell" x="292" y="166" width="36" height="36"/>
+    <rect class="cell" x="328" y="166" width="36" height="36"/>
+    <rect class="cell" x="364" y="166" width="36" height="36"/>
+    <rect class="cell" x="400" y="166" width="36" height="36"/>
+    <rect class="cell" x="436" y="166" width="36" height="36"/>
+    <rect class="cell" x="472" y="166" width="36" height="36"/>
+  </g>
+  <!-- Row 2: highlighted cell at c0=2, c1=4 -->
+  <g>
+    <rect class="cell" x="220" y="202" width="36" height="36"/>
+    <rect class="cell" x="256" y="202" width="36" height="36"/>
+    <rect class="cell" x="292" y="202" width="36" height="36"/>
+    <rect class="cell" x="328" y="202" width="36" height="36"/>
+    <rect class="highlight" x="364" y="202" width="36" height="36"/>
+    <text class="label" x="382" y="224" text-anchor="middle" font-size="11" font-weight="600">(2,4)</text>
+    <rect class="cell" x="400" y="202" width="36" height="36"/>
+    <rect class="cell" x="436" y="202" width="36" height="36"/>
+    <rect class="cell" x="472" y="202" width="36" height="36"/>
+  </g>
+  <!-- Row 3 -->
+  <g>
+    <rect class="cell" x="220" y="238" width="36" height="36"/>
+    <rect class="cell" x="256" y="238" width="36" height="36"/>
+    <rect class="cell" x="292" y="238" width="36" height="36"/>
+    <rect class="cell" x="328" y="238" width="36" height="36"/>
+    <rect class="cell" x="364" y="238" width="36" height="36"/>
+    <rect class="cell" x="400" y="238" width="36" height="36"/>
+    <rect class="cell" x="436" y="238" width="36" height="36"/>
+    <rect class="cell" x="472" y="238" width="36" height="36"/>
+  </g>
+  <!-- Row 4 -->
+  <g>
+    <rect class="cell" x="220" y="274" width="36" height="36"/>
+    <rect class="cell" x="256" y="274" width="36" height="36"/>
+    <rect class="cell" x="292" y="274" width="36" height="36"/>
+    <rect class="cell" x="328" y="274" width="36" height="36"/>
+    <rect class="cell" x="364" y="274" width="36" height="36"/>
+    <rect class="cell" x="400" y="274" width="36" height="36"/>
+    <rect class="cell" x="436" y="274" width="36" height="36"/>
+    <rect class="cell" x="472" y="274" width="36" height="36"/>
+  </g>
+
+  <!-- Annotation arrow + text on the right -->
+  <path class="arrow" d="M 600 220 L 402 220" marker-end="url(#arr)"/>
+  <text class="label" x="610" y="208">One iteration of the op:</text>
+  <text class="label" x="610" y="226" font-weight="600">c0 = 2,  c1 = 4</text>
+  <text class="caption" x="610" y="246">The total number of iterations is M × N.</text>
+
+  <!-- Bottom captions -->
+  <text x="390" y="360" text-anchor="middle" class="caption">c0 ranges over the M output rows. c1 ranges over the N output columns.</text>
+  <text x="390" y="382" text-anchor="middle" class="caption">The iteration space is { c0 : M,  c1 : N }.</text>
+  <text x="390" y="404" text-anchor="middle" class="caption">Each cell of the M × N output grid corresponds to one (c0, c1) iteration.</text>
+</svg>

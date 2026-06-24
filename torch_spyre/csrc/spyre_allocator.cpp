@@ -32,11 +32,8 @@ c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
 
 std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
   // FlexAllocator is owned by RuntimeContext (one per device per process).
-  // RuntimeContext::getAllocator() returns shared_ptr<const FlexAllocator>;
-  // we const_cast to shared_ptr<FlexAllocator> because allocate()/deallocate()
-  // are non-const (internally mutex-protected and thread-safe).
-  auto const_alloc = flex::getFlexRuntimeContext()->getAllocator();
-  return std::const_pointer_cast<flex::FlexAllocator>(const_alloc);
+  // RuntimeContext::getAllocator() returns shared_ptr<FlexAllocator>;
+  return flex::getFlexRuntimeContext()->getAllocator();
 }
 
 SpyreAllocator& SpyreAllocator::instance() {
@@ -144,6 +141,7 @@ c10::DataPtr SpyreAllocator::allocate(
   flex::CompositeAddress composite_addr =
       flex_alloc->allocate(nbytes, directive);
 
+  DEBUGINFO("allocated ", composite_addr);
   // FlexAllocator rounds up to DEVICE_ALIGNMENT (128 bytes), so the actual
   // allocation may be larger than the requested nbytes. Use total_size() for
   // accurate memory profiling.
@@ -192,6 +190,10 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   // do nothing -- look into when this is called
   // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
   // reinterpret_cast<spyre_ptr_t>(src));
+}
+
+uint32_t SpyreAllocator::segmentForRegion(uint64_t region_id) const {
+  return getFlexAllocator()->getIdToRegionMap().at(region_id)->segment_id();
 }
 
 // Register our custom allocator

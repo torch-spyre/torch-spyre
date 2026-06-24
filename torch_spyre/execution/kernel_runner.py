@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import torch
 from torch_spyre._C import launch_kernel, prepare_kernel, launch_jobplan
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -41,7 +42,9 @@ class SpyreSDSCKernelRunner:
 
     def run(self, *args, **kw_args):
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
-        if self.jobplan:
-            launch_jobplan(self.jobplan, args)
-        else:
-            launch_kernel(self.code_dir, args)
+
+        with torch.profiler.record_function(f"launch_kernel:{self.kernel_name}"):
+            if self.jobplan:
+                launch_jobplan(self.jobplan, args)
+            else:
+                launch_kernel(self.code_dir, args)
