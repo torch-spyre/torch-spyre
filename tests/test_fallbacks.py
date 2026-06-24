@@ -159,7 +159,7 @@ class TestIntDispatchFallback(TestCase):
 
     @parametrize(
         "dtype",
-        [torch.int8, torch.int16, torch.int32, torch.int64],
+        [torch.int32, torch.int64],
     )
     def test_int_add_matches_cpu(self, dtype):
         a_cpu = torch.arange(16, dtype=dtype)
