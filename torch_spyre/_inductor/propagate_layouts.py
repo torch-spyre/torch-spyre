@@ -1013,9 +1013,8 @@ def propagate_spyre_tensor_layouts(
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
-    # performed to compute the set of possible output SpyreTensorLayouts
-    it = iter(operations)
-    for op in it:
+    # performed to compute the set of possible output SpyreTensorLayouts.
+    for op in operations:
         if op.is_no_op():
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
@@ -1063,9 +1062,15 @@ def propagate_spyre_tensor_layouts(
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
-            op = next(it, None)
-            if not isinstance(op, MultiOutput):
-                raise RuntimeError("FallbackKernel must be followed by MultiOutput")
+            # FallbackKernel.create in PyTorch produces three cases:
+            #   Case 1 (single tensor)  -> MultiOutputLayout + 1 MultiOutput
+            #   Case 2 (tuple of N)     -> MultiOutputLayout + N MultiOutputs
+            #   Case 3 (void/in-place)  -> NoneLayout       + 0 MultiOutputs
+            # The FallbackKernel itself never carries a real tensor layout
+            # (MultiOutputLayout / NoneLayout both raise from get_layout()).
+            # The trailing MultiOutputs are handled in their own branch below.
+            pass
+        elif isinstance(op, MultiOutput):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreConstantFallback):

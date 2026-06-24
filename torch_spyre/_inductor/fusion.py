@@ -45,7 +45,12 @@ def _is_non_intermediate(name: str) -> bool:
     buf = V.graph.get_buffer(name)
     if buf is None or isinstance(buf, FallbackKernel):
         return False
-    layout = buf.get_layout()
+    # FallbackKernel may register companion buffers with NoneLayout /
+    # MultiOutputLayout (MutationOutput sentinels for void/in-place ops, the
+    # MultiOutputLayout buffer for tuple ops). These have no real tensor
+    # layout, can't be FixedTiledLayout, and shouldn't count toward the
+    # bundle's non-intermediate tensor budget.
+    layout = buf.maybe_get_layout()
     return isinstance(layout, FixedTiledLayout) and not layout.allocation
 
 
