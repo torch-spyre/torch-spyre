@@ -876,9 +876,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         sticks/row, shrinking device_size[1] from 1024 to 512 corrupts the
         inter-stick-group stride, producing wrong values in the second tile.
 
-        atol=0.001 is strict: fp16 add/mul on random inputs in [0, 1) has
-        rounding error well below 0.001 when the result is correct; a wrong
-        address produces values that differ by at least 0.1 on average.
+        atol=0.01: fp16 (a+b)*c on inputs in [0,1) accumulates ~0.002 rounding
+        error; atol=0.01 clears that comfortably while remaining well below the
+        ~0.1 average error produced by a wrong-address read.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -900,7 +900,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 return z
 
         compare_with_cpu(
-            fn, a, b, c, run_compile=True, run_eager=False, atol=0.001, rtol=0.001
+            fn, a, b, c, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
 
