@@ -265,6 +265,8 @@ jobs:
 
       - name: Build torch-spyre
         uses: ./.github/actions/build-torch-spyre
+        with:
+          torch_spyre_dir: "."
 
       - name: Run Test Suite Configuration with Coverage Logging
         run: |
