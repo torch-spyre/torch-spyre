@@ -139,7 +139,35 @@ jobs:
             fi
             ALL_CHANGED=$(git diff --name-only "$TARGET" HEAD | tr '\n' ' ')
             ONLY_ADDED=$(git diff --name-only --diff-filter=A "$TARGET" HEAD | tr '\n' ' ')
+            FORK_POINT="$TARGET"
           fi
+
+
+          REPO="${{ github.server_url }}/${{ github.repository }}"
+          HEAD_SHA=$(git rev-parse HEAD)
+          FORK_SHA=$(git rev-parse "$FORK_POINT")
+
+          echo "============================================"
+          echo "EVENT:        ${{ github.event_name }}"
+          echo "BASE_REF:     ${{ github.base_ref }}"
+          echo "HEAD_REF:     ${{ github.head_ref }}"
+          echo "--------------------------------------------"
+          echo "FORK POINT SHA: $FORK_SHA"
+          echo "FORK POINT URL: $REPO/commit/$FORK_SHA"
+          echo "--------------------------------------------"
+          echo "HEAD SHA:       $HEAD_SHA"
+          echo "HEAD URL:       $REPO/commit/$HEAD_SHA"
+          echo "--------------------------------------------"
+          echo "COMPARE URL:    $REPO/compare/$FORK_SHA...$HEAD_SHA"
+          echo "--------------------------------------------"
+          echo "ALL CHANGED FILES:"
+          git diff --name-only "$FORK_SHA" HEAD | sed 's/^/  /'
+          echo "--------------------------------------------"
+          echo "ONLY ADDED FILES:"
+          git diff --name-only --diff-filter=A "$FORK_SHA" HEAD | sed 's/^/  /'
+          echo "============================================"
+
+
           echo "changed_files=$ALL_CHANGED" >> "$GITHUB_OUTPUT"
           echo "added_files=$ONLY_ADDED" >> "$GITHUB_OUTPUT"
 
