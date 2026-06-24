@@ -423,8 +423,11 @@ class InputsEdits(BaseModel):
                     val = test_device
                 # Handle tuples/lists from YAML (e.g., view/reshape shapes)
                 # If value is a string that looks like a tuple/list, convert it
-                elif isinstance(val, str) and (val.startswith('(') or val.startswith('[')):
+                elif isinstance(val, str) and (
+                    val.startswith("(") or val.startswith("[")
+                ):
                     import ast
+
                     try:
                         val = ast.literal_eval(val)
                     except (ValueError, SyntaxError):
