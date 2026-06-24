@@ -330,8 +330,8 @@ class TestNestedReductionUnroll(unittest.TestCase):
     #   byte_stride = 2 * 64 * 2 = 256
 
     # K-input advance per K-tile (128 K-elems = 2 sticks along c_k):
-    #   device_coords[0] = c_k//64; device_stride[0] = 64
-    #   byte_stride = (128//64) * 64 * 2 = 256
+    #   device_coords[0] = c_k//64; device_stride[0] = 64*64 = 4096
+    #   byte_stride = (128//64) * 4096 * 2 = 16384
 
     def _make_accum_arg(self, base: int = _ACCUM_BASE, per_tile_fixed: bool = False):
         return TensorArg(
