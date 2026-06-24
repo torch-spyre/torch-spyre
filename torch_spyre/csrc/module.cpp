@@ -100,7 +100,7 @@ void _startRuntime() {
               logical_device_id, ", number of visible devices=", num_devices);
 
   std::shared_ptr<Runtime> runtime;
-  auto s = flex::initializeRuntime(&runtime, logical_device_id);
+  auto s = flex::initializeRuntimeContext(&runtime, logical_device_id);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);

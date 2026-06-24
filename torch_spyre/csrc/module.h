@@ -28,7 +28,9 @@ using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
-using Runtime = flex::RuntimeEntry;
+// Migrated off the deprecated flex::RuntimeEntry facade to RuntimeContext directly.
+// GlobalRuntime below holds the RuntimeContext singleton (one per device per process).
+using Runtime = flex::RuntimeContext;
 
 class GlobalRuntime {
  public:

@@ -259,7 +259,7 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto runtime = GlobalRuntime::get();
 
   // Register default stream (ID 0).
-  pool.stream_handle_map[0] = runtime->getDefaultStream();
+  pool.stream_handle_map[0] = runtime->defaultStream();
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
@@ -360,8 +360,11 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   // Create corresponding flex stream handle (if not exists)
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
-    flex::RuntimeStream* flex_handle =
-        runtime->createStream(runtime->toPriority(priority));
+    // RuntimeContext::createStream takes (mode, priority); preserve the
+    // STRICT_ORDERING mode that the RuntimeEntry facade implied, and use the
+    // free flex::toPriority() helper.
+    flex::RuntimeStream* flex_handle = runtime->createStream(
+        flex::RuntimeStreamMode::STRICT_ORDERING, flex::toPriority(priority));
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
