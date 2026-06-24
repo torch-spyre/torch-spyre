@@ -19,17 +19,16 @@ TensorArgs.  No Spyre device or backend compiler is needed.
 
 Stick layout reference for a 2D fp16 tensor shaped [R, C] (C a multiple of 64):
   device_size        = [C//64, R, 64]      # [sticks_per_row, rows, elems_per_stick]
-  stride_map         = [64, C, 1]          # elems per stick-col advance, row advance, within-stick
   device_coordinates = [c_col//64, c_row, c_col%64]
 
 All fixtures use a [512, 256] fp16 tensor:
-  device_size = [4, 512, 64],  stride_map = [64, 256, 1]
+  device_size = [4, 512, 64]
 
 Tiling by c_row (T_ROW rows per iteration):
-  byte_stride = T_ROW * stride_map[1] * 2 = T_ROW * 256 * 2
+  byte_stride = T_ROW * device_stride[1] * 2 = T_ROW * 64 * 2
 
 Tiling by c_col (T_COL elements per iteration, T_COL a multiple of 64):
-  byte_stride = (T_COL // 64) * stride_map[0] * 2 = (T_COL // 64) * 64 * 2
+  byte_stride = (T_COL // 64) * device_stride[0] * 2 = (T_COL // 64) * (512 * 64) * 2
 """
 
 import unittest
@@ -53,12 +52,11 @@ _C_COL = Symbol("c_col")
 _HBM_BASE = 0x400000000  # SEGMENT_OFFSETS[1]
 _LX_ADDR = 0
 
-# [512, 256] fp16 → device_size=[4, 512, 64], stride_map=[64, 256, 1]
+# [512, 256] fp16 → device_size=[4, 512, 64]
 _DEVICE_SIZE = [4, 512, 64]
-_STRIDE_MAP = [64, 256, 1]
-# Row tile: advance 512 rows; byte stride = 512 * 256 * 2
+# Row tile: advance 512 rows; device_stride[1]=64; byte stride = 512 * 64 * 2
 _T_ROW = 512
-_STRIDE_BYTES = _T_ROW * 256 * 2  # 262144
+_STRIDE_BYTES = _T_ROW * 64 * 2  # 65536
 
 
 def _device_coords():
@@ -74,7 +72,6 @@ def _make_hbm_tensor_arg(base: int = _HBM_BASE) -> TensorArg:
         device_size=list(_DEVICE_SIZE),
         device_coordinates=_device_coords(),
         allocation={"hbm": base},
-        stride_map=list(_STRIDE_MAP),
     )
 
 
@@ -87,7 +84,6 @@ def _make_lx_tensor_arg() -> TensorArg:
         device_size=list(_DEVICE_SIZE),
         device_coordinates=_device_coords(),
         allocation={"lx": _LX_ADDR},
-        stride_map=list(_STRIDE_MAP),
         per_tile_fixed=True,
     )
 
@@ -109,7 +105,6 @@ def _make_op_spec(
             device_size=list(_DEVICE_SIZE),
             device_coordinates=_device_coords(),
             allocation={"hbm": _HBM_BASE + 0x100000000},
-            stride_map=list(_STRIDE_MAP),
         )
     )
     return OpSpec(
@@ -143,7 +138,7 @@ class TestUnrollLoopSpecs(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # 2. LoopSpec(count=2) produces 2 copies; second HBM addr advanced.
-    #    Tiling c_row with T_ROW=512: byte_stride = 512 * 256 * 2 = 262144
+    #    Tiling c_row with T_ROW=512: byte_stride = 512 * 64 * 2 = 65536
     # ------------------------------------------------------------------
 
     def test_flat_loop_k2_advances_hbm(self):
@@ -225,8 +220,8 @@ class TestUnrollLoopSpecs(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # 8. _byte_stride_for_arg: tiling c_row (row dimension).
-    #    coord[1] = c_row; stride_map[1] = 256; tile_range = 512
-    #    byte_stride = 512 * 256 * 2 = 262144
+    #    coord[1] = c_row; device_stride[1] = 64; tile_range = 512
+    #    byte_stride = 512 * 64 * 2 = 65536
     # ------------------------------------------------------------------
 
     def test_byte_stride_for_arg(self):
@@ -238,28 +233,29 @@ class TestUnrollLoopSpecs(unittest.TestCase):
     # 9. _byte_stride_for_arg: tiling c_col (column dimension).
     #    coord[0] = c_col//64 (sticks_per_row), coord[2] = c_col%64 (within-stick).
     #    Advancing by T_COL=128 elements (2 sticks):
-    #      delta[0] = 128//64 = 2; delta[2] = 128%64 = 0
-    #      byte_stride = 2 * stride_map[0] * 2 = 2 * 64 * 2 = 256
+    #      delta[0] = 128//64 = 2; device_stride[0] = prod([512, 64]) = 32768
+    #      byte_stride = 2 * 32768 * 2 = 131072
     # ------------------------------------------------------------------
 
     def test_hbm_byte_stride_col_dim(self):
         arg = _make_hbm_tensor_arg()
         t_col = 128  # 2 sticks
-        expected = (t_col // 64) * _STRIDE_MAP[0] * 2  # 2 * 64 * 2 = 256
+        # device_stride[0] = prod(device_size[1:]) = 512 * 64 = 32768
+        expected = (t_col // 64) * (512 * 64) * 2  # 2 * 32768 * 2 = 131072
         self.assertEqual(_byte_stride_for_arg(arg, _C_COL, t_col), expected)
 
     # ------------------------------------------------------------------
     # 10. Two HBM args with different tensor shapes advance independently.
-    #     arg0: [512, 256] fp16, stride_map=[64, 256, 1] → row stride = 256*2
-    #     arg1: [512, 128] fp16, stride_map=[64, 128, 1] → row stride = 128*2
+    #     arg0: [512, 256] fp16, device_size=[4, 512, 64] → device_stride[1] = 64
+    #     arg1: [512, 128] fp16, device_size=[2, 512, 64] → device_stride[1] = 64
     #     Tiling c_row with T_ROW=512:
-    #       arg0 byte_stride = 512 * 256 * 2 = 262144
-    #       arg1 byte_stride = 512 * 128 * 2 = 131072
+    #       arg0 byte_stride = 512 * 64 * 2 = 65536
+    #       arg1 byte_stride = 512 * 64 * 2 = 65536
     # ------------------------------------------------------------------
 
     def test_per_arg_independent_strides(self):
         arg0 = _make_hbm_tensor_arg(_HBM_BASE)
-        # [512, 128] fp16: device_size=[2, 512, 64], stride_map=[64, 128, 1]
+        # [512, 128] fp16: device_size=[2, 512, 64]
         arg1 = TensorArg(
             is_input=False,
             arg_index=-1,
@@ -267,7 +263,6 @@ class TestUnrollLoopSpecs(unittest.TestCase):
             device_size=[2, 512, 64],
             device_coordinates=[_C_COL // 64, _C_ROW, sympy.Mod(_C_COL, 64)],
             allocation={"hbm": _HBM_BASE + 0x100000000},
-            stride_map=[64, 128, 1],
         )
         op = OpSpec(
             op="add",
@@ -283,12 +278,12 @@ class TestUnrollLoopSpecs(unittest.TestCase):
         loop = LoopSpec(count=Integer(2), body=[op])
         result = unroll_loop_specs([loop])
         self.assertEqual(len(result), 2)
-        # arg0: [512, 256], byte_stride = 512 * 256 * 2 = 262144
-        self.assertEqual(result[1].args[0].allocation["hbm"], _HBM_BASE + 512 * 256 * 2)
-        # arg1: [512, 128], byte_stride = 512 * 128 * 2 = 131072
+        # arg0: [512, 256], device_stride[1]=64; byte_stride = 512 * 64 * 2 = 65536
+        self.assertEqual(result[1].args[0].allocation["hbm"], _HBM_BASE + 512 * 64 * 2)
+        # arg1: [512, 128], device_stride[1]=64; byte_stride = 512 * 64 * 2 = 65536
         self.assertEqual(
             result[1].args[1].allocation["hbm"],
-            _HBM_BASE + 0x100000000 + 512 * 128 * 2,
+            _HBM_BASE + 0x100000000 + 512 * 64 * 2,
         )
 
 
@@ -302,10 +297,10 @@ class TestNestedReductionUnroll(unittest.TestCase):
 
     Tensor geometry used throughout:
       accum_buf  [B=2, M=64, N=32] fp16 per outer tile → HBM at ACCUM_BASE
-        device_size=[1, 2, 64], stride_map=[64, 64, 1]
+        device_size=[1, 2, 64], device_stride=[128, 64, 1]
         device_coords=[c_col//64, c_b, c_col%64]   (c_b tiles batch within tile)
       k_input    [M=64, K=128] fp16 per K-tile   → HBM at K_BASE (advances per K)
-        device_size=[2, 64, 64], stride_map=[64, 64, 1]
+        device_size=[2, 64, 64], device_stride=[4096, 64, 1]
         device_coords=[c_col//64, c_row, c_col%64]
       pool_scratch per_tile_fixed=True (bmm intermediate output, stays fixed)
     """
@@ -323,20 +318,20 @@ class TestNestedReductionUnroll(unittest.TestCase):
 
     # Per-tile tensor geometry:
     #   accum_buf: [B=2, N=32] per row — but using simplified 2D layout:
-    #     device_size=[1, 2, 64], stride_map=[64, 64, 1]
+    #     device_size=[1, 2, 64], device_stride=[128, 64, 1]
     #     device_coords=[c_n//64, c_b, c_n%64]
-    #   k_input (K-dim): device_size=[2, 64, 64], stride_map=[64, 64, 1]
+    #   k_input (K-dim): device_size=[2, 64, 64], device_stride=[4096, 64, 1]
     #     device_coords=[c_k//64, c_m, c_k%64]
     #     per K-tile stride: 1 tile = 128 K-elems = 2 sticks
-    #       byte_stride = 2 * 64 * 2 = 256  (one stick = 64 fp16 = 128 bytes)
+    #       byte_stride = (128//64) * 4096 * 2 = 16384  (one stick = 64 fp16 = 128 bytes)
 
     # For accum_buf: advancing 2 batches in c_b direction:
-    #   device_coords[1] = c_b; stride_map[1] = 64
+    #   device_coords[1] = c_b; device_stride[1] = 64
     #   byte_stride = 2 * 64 * 2 = 256
 
     # K-input advance per K-tile (128 K-elems = 2 sticks along c_k):
-    #   device_coords[0] = c_k//64; stride_map[0] = 64
-    #   byte_stride = (128//64) * 64 * 2 = 256
+    #   device_coords[0] = c_k//64; device_stride[0] = 64*64 = 4096
+    #   byte_stride = (128//64) * 4096 * 2 = 16384
 
     def _make_accum_arg(self, base: int = _ACCUM_BASE, per_tile_fixed: bool = False):
         return TensorArg(
@@ -350,7 +345,6 @@ class TestNestedReductionUnroll(unittest.TestCase):
                 sympy.Mod(self._C_N, 64),
             ],
             allocation={"hbm": base},
-            stride_map=[64, 64, 1],
             per_tile_fixed=per_tile_fixed,
         )
 
@@ -366,7 +360,6 @@ class TestNestedReductionUnroll(unittest.TestCase):
                 sympy.Mod(self._C_K, 64),
             ],
             allocation={"hbm": base},
-            stride_map=[64, 64, 1],
         )
 
     def _make_pool_scratch(self):
@@ -381,7 +374,6 @@ class TestNestedReductionUnroll(unittest.TestCase):
                 sympy.Mod(self._C_N, 64),
             ],
             allocation={"pool": self._POOL_BASE},
-            stride_map=[64, 64, 1],
             per_tile_fixed=True,
         )
 
@@ -481,13 +473,15 @@ class TestNestedReductionUnroll(unittest.TestCase):
     # ------------------------------------------------------------------
     # 13. Inner K-loop: bmm's K-input advances per K-tile.
     #
-    #     k_input device_coords[0] = c_k//64; stride_map[0]=64; dtype=fp16.
+    #     k_input device_size=[2, 64, 64]; device_stride[0] = 64*64 = 4096; dtype=fp16.
     #     Per K-tile (128 K-elems = 2 sticks):
-    #       byte_stride = (128//64) * 64 * 2 = 256
+    #       byte_stride = (128//64) * (64*64) * 2 = 2 * 4096 * 2 = 16384
     # ------------------------------------------------------------------
 
     def test_bmm_k_input_advances_per_k_iteration(self):
-        K_TILE_BYTES = (128 // 64) * 64 * 2  # 256
+        # k_input device_size=[2, 64, 64]; device_stride[0] = 64*64 = 4096
+        # T_K=128 → delta[0]=2; byte_stride = 2 * 4096 * 2 = 16384
+        K_TILE_BYTES = (128 // 64) * (64 * 64) * 2  # 16384
         bmm = self._make_bmm_op()
         combine = self._make_combine_op()
         inner = LoopSpec(
@@ -527,7 +521,7 @@ class TestNestedReductionUnroll(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_nested_outer_b_inner_k_full_layout(self):
-        # B-tile byte advance: 2 batches in c_b, stride_map[1]=64, dtype=fp16
+        # B-tile byte advance: 2 batches in c_b, device_stride[1]=64, dtype=fp16
         B_TILE_BYTES = 2 * 64 * 2  # 256
 
         fill_accum = self._make_accum_arg()
@@ -617,14 +611,12 @@ class TestNestedReductionTileAccum(unittest.TestCase):
 
     # accum_tile: [64, 32] fp16 per tile; simple device layout
     _TILE_DEVICE_SIZE = [1, 64, 32]  # 1 stick-group, 64 rows, 32 cols
-    _TILE_STRIDE_MAP = [2048, 32, 1]
 
     # accum_full: [128, 32] fp16 = 2 tiles × [64, 32]; c_b in device coords
-    # stride_map[0] = 64*32 = 2048 elements per B-tile
-    # byte stride per outer tile = 1 * 2048 * 2 = 4096
+    # device_size=[1, 128, 32]; device_stride[0] = 128*32 = 4096
+    # byte stride per outer tile = 1 * 4096 * 2 = 8192
     _FULL_DEVICE_SIZE = [1, 128, 32]
-    _FULL_STRIDE_MAP = [2048, 32, 1]
-    _OUTER_TILE_STRIDE_BYTES = 1 * 2048 * 2  # 4096
+    _OUTER_TILE_STRIDE_BYTES = 1 * 4096 * 2  # 8192
 
     def _make_accum_tile_arg(self) -> TensorArg:
         return TensorArg(
@@ -634,7 +626,6 @@ class TestNestedReductionTileAccum(unittest.TestCase):
             device_size=list(self._TILE_DEVICE_SIZE),
             device_coordinates=[Integer(0), self._C_M, self._C_N],
             allocation={"hbm": self._ACCUM_TILE_BASE},
-            stride_map=list(self._TILE_STRIDE_MAP),
             per_tile_fixed=True,
         )
 
@@ -647,7 +638,6 @@ class TestNestedReductionTileAccum(unittest.TestCase):
             device_size=list(self._FULL_DEVICE_SIZE),
             device_coordinates=[self._C_B, self._C_M, self._C_N],
             allocation={"hbm": self._ACCUM_FULL_BASE},
-            stride_map=list(self._FULL_STRIDE_MAP),
             per_tile_fixed=False,
         )
 
@@ -696,7 +686,6 @@ class TestNestedReductionTileAccum(unittest.TestCase):
                 sympy.Mod(self._C_K, 64),
             ],
             allocation={"hbm": 0x800000000},
-            stride_map=[64, 512, 1],
             per_tile_fixed=False,
         )
         bmm_output = TensorArg(
@@ -706,7 +695,6 @@ class TestNestedReductionTileAccum(unittest.TestCase):
             device_size=list(self._TILE_DEVICE_SIZE),
             device_coordinates=[Integer(0), self._C_M, self._C_N],
             allocation={"hbm": 0x2000000000},
-            stride_map=list(self._TILE_STRIDE_MAP),
             per_tile_fixed=True,
         )
         bmm_partial = OpSpec(
@@ -771,6 +759,142 @@ class TestNestedReductionTileAccum(unittest.TestCase):
         fill_1 = result[10]
         self.assertEqual(fill_0.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
         self.assertEqual(fill_1.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
+
+
+class TestDeviceStrideFormula(unittest.TestCase):
+    """Unit tests that verify _byte_stride_for_arg uses device_stride, not stride_map.
+
+    These tests are parametrised over tensor shapes where stride_map and
+    device_stride diverge, so they would fail with the old (wrong) formula.
+
+    Fixture: [R, C] fp16 col-stick layout.
+      device_size = [C//64, R, 64]
+      device_coordinates = [c_col//64, c_row, Mod(c_col, 64)]
+      device_stride[0] = R * 64   (advancing one stick group steps over R rows)
+      device_stride[1] = 64       (advancing one row steps over 64 elems)
+      device_stride[2] = 1
+    """
+
+    _C_COL = Symbol("c_col")
+    _C_ROW = Symbol("c_row")
+
+    def _make_arg(self, R: int, C: int, base: int = 0) -> TensorArg:
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[C // 64, R, 64],
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": base},
+        )
+
+    # ------------------------------------------------------------------
+    # Row-tiling: advancing T_ROW rows.
+    # Correct: T_ROW * device_stride[1] * 2 = T_ROW * 64 * 2
+    # Wrong (old formula): T_ROW * stride_map[1] * 2 = T_ROW * C * 2
+    # These diverge whenever C != 64 (i.e. sticks_per_row > 1).
+    # ------------------------------------------------------------------
+
+    def test_row_tile_stride_narrow_tensor(self):
+        """Row-tiling [512, 64] fp16: 1 stick per row, both formulas agree."""
+        R, C, T_ROW = 512, 64, 128
+        arg = self._make_arg(R, C)
+        expected = T_ROW * 64 * 2  # device_stride[1]=64; = 16384
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_ROW, T_ROW), expected)
+
+    def test_row_tile_stride_wide_tensor(self):
+        """Row-tiling [512, 256] fp16: 4 sticks/row; old formula gave 4x too large."""
+        R, C, T_ROW = 512, 256, 128
+        arg = self._make_arg(R, C)
+        # device_stride[1] = 64 regardless of C
+        expected = T_ROW * 64 * 2  # 128 * 64 * 2 = 16384
+        # old (wrong): T_ROW * C * 2 = 128 * 256 * 2 = 65536
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_ROW, T_ROW), expected)
+
+    def test_row_tile_stride_very_wide_tensor(self):
+        """Row-tiling [1024, 4096] fp16: 64 sticks/row; old formula was 64x too large."""
+        R, C, T_ROW = 1024, 4096, 256
+        arg = self._make_arg(R, C)
+        expected = T_ROW * 64 * 2  # 256 * 64 * 2 = 32768
+        # old (wrong): 256 * 4096 * 2 = 2097152
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_ROW, T_ROW), expected)
+
+    # ------------------------------------------------------------------
+    # Col-tiling: advancing T_COL elements (T_COL must be a multiple of 64).
+    # delta[0] = T_COL // 64 (stick groups), delta[1]=0, delta[2]=0
+    # Correct: (T_COL//64) * device_stride[0] * 2 = (T_COL//64) * R * 64 * 2
+    # Wrong (old formula): (T_COL//64) * stride_map[0] * 2 = (T_COL//64) * 64 * 2
+    # ------------------------------------------------------------------
+
+    def test_col_tile_stride_one_stick(self):
+        """Col-tiling [512, 256] by T_COL=64 (1 stick): correct advance."""
+        R, C, T_COL = 512, 256, 64
+        arg = self._make_arg(R, C)
+        # delta[0] = 1; device_stride[0] = R * 64 = 32768
+        expected = 1 * (R * 64) * 2  # 65536
+        # old (wrong): 1 * 64 * 2 = 128
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_COL, T_COL), expected)
+
+    def test_col_tile_stride_two_sticks(self):
+        """Col-tiling [512, 256] by T_COL=128 (2 sticks): correct advance."""
+        R, C, T_COL = 512, 256, 128
+        arg = self._make_arg(R, C)
+        # delta[0] = 2; device_stride[0] = 32768
+        expected = 2 * (R * 64) * 2  # 131072
+        # old (wrong): 2 * 64 * 2 = 256
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_COL, T_COL), expected)
+
+    # ------------------------------------------------------------------
+    # End-to-end unroll: row-tiled LoopSpec with multi-stick tensor.
+    # Verifies that the correct address advances appear in the unrolled copies.
+    # ------------------------------------------------------------------
+
+    def test_unroll_row_tile_multi_stick_addresses(self):
+        """Unrolling a row-tile loop over [1024, 256] fp16 gives correct HBM advances.
+
+        [1024, 256] fp16: device_size=[4, 1024, 64], T_ROW=256, count=4.
+        device_stride[1] = 64; byte_stride = 256 * 64 * 2 = 32768.
+        Tile addresses: base, base+32768, base+65536, base+98304.
+        """
+        R, C, T_ROW = 1024, 256, 256
+        c_row = Symbol("c_row")
+        c_col = Symbol("c_col")
+        base = 0x400000000
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[C // 64, R, 64],
+            device_coordinates=[c_col // 64, c_row, sympy.Mod(c_col, 64)],
+            allocation={"hbm": base},
+        )
+        op = OpSpec(
+            op="abs",
+            is_reduction=False,
+            iteration_space={
+                c_row: (Integer(T_ROW), 1),
+                c_col: (Integer(C), 1),
+            },
+            args=[arg],
+            op_info={},
+            tiled_symbols=[c_row],
+        )
+        loop = LoopSpec(count=Integer(4), body=[op])
+        result = unroll_loop_specs([loop])
+        self.assertEqual(len(result), 4)
+        tile_stride = T_ROW * 64 * 2  # 32768
+        for i, copy_op in enumerate(result):
+            expected_addr = base + i * tile_stride
+            self.assertEqual(
+                copy_op.args[0].allocation["hbm"],
+                expected_addr,
+                f"tile {i}: expected {hex(expected_addr)}, "
+                f"got {hex(copy_op.args[0].allocation['hbm'])}",
+            )
 
 
 if __name__ == "__main__":
