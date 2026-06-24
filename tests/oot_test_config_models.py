@@ -421,6 +421,21 @@ class InputsEdits(BaseModel):
                     and "cuda" in val
                 ):
                     val = test_device
+                # Handle tuples/lists from YAML (e.g., view/reshape shapes)
+                # If value is a string that looks like a tuple/list, convert it
+                elif isinstance(val, str) and (
+                    val.startswith("(") or val.startswith("[")
+                ):
+                    import ast
+
+                    try:
+                        val = ast.literal_eval(val)
+                    except (ValueError, SyntaxError):
+                        # If conversion fails, keep as string
+                        pass
+                # Tuples and lists are already valid Python values
+                elif isinstance(val, (tuple, list)):
+                    pass
                 cpu_args.append(val)
 
             elif isinstance(arg, InputArgPy):

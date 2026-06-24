@@ -270,6 +270,78 @@ def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
     )
 
 
+def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
+    """Find the index of the index tensor that references the given value tensor.
+
+    Returns -1 if no index tensor references this value tensor.
+    """
+    for j, t in enumerate(sdsc_spec.args):
+        if t.is_index_tensor and t.related_value_tensor_idx == value_tensor_idx:
+            return j
+    return -1
+
+
+def _get_indirect_access_info(
+    sdsc_spec, tensor, tensor_idx: int
+) -> tuple[str, str | None]:
+    """Get indirect access allocation type and related allocation name for a tensor.
+
+    Returns:
+        A tuple of (alloc_type, related_alloc_or_none) where:
+        - alloc_type: "index_tensor", "value_tensor", or "no_indirection"
+        - related_alloc_or_none: allocation name of related tensor, or None
+    """
+    # Index tensors and value tensors involved in indirect access must reside in HBM;
+    # the Spyre engine does not support indirect addressing through LX scratchpad.
+    if tensor.is_index_tensor:
+        alloc_type = "index_tensor"
+        related_alloc = (
+            f"allocate-Tensor{tensor.related_value_tensor_idx}_hbm"
+            if tensor.related_value_tensor_idx >= 0
+            else None
+        )
+        return alloc_type, related_alloc
+
+    # Check if this is a value tensor referenced by an index tensor
+    value_tensor_indices = [
+        t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor
+    ]
+    if tensor_idx in value_tensor_indices:
+        alloc_type = "value_tensor"
+        index_tensor_idx = _find_index_tensor_for_value(sdsc_spec, tensor_idx)
+        if index_tensor_idx < 0:
+            raise ValueError(
+                f"Tensor {tensor_idx} is listed as a value tensor but no index "
+                "tensor claims it — sdsc_spec is malformed"
+            )
+        related_alloc = f"allocate-Tensor{index_tensor_idx}_hbm"
+        return alloc_type, related_alloc
+
+    return "no_indirection", None
+
+
+def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Build the indirect access fields for a tensor allocation.
+
+    Returns a dictionary containing:
+    - indirectAllocType_: The allocation type ("index_tensor", "value_tensor",
+      or "no_indirection")
+    - relatedIndirectAccessAlloc_: The related allocation name (only if applicable)
+    - indexTensorType_: The index tensor type - only for index tensors; the
+      backend supports "address" and "index" but we only generate "index"
+    """
+    alloc_type, related_alloc = _get_indirect_access_info(sdsc_spec, tensor, tensor_idx)
+
+    fields = {"indirectAllocType_": alloc_type}
+    if related_alloc is not None:
+        fields["relatedIndirectAccessAlloc_"] = related_alloc
+
+    if tensor.is_index_tensor:
+        fields["indexTensorType_"] = "index"
+
+    return fields
+
+
 def generate_sdsc(
     idx,
     sdsc_spec,
@@ -537,6 +609,9 @@ def generate_sdsc(
                                             "dim_order"
                                         ]
                                     ],
+                                    **_build_indirect_access_fields(
+                                        sdsc_spec, tensor, i
+                                    ),
                                     "startAddressCoreCorelet_": {
                                         "dim_prop_func": [
                                             {"Map": {}},
@@ -616,7 +691,12 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
-                                    "memOrg_": {
+                                    # Index tensors must reside in HBM; the Spyre
+                                    # engine does not support indirect addressing
+                                    # through LX scratchpad.
+                                    "memOrg_": {"hbm": {"isPresent": 1}}
+                                    if tensor.is_index_tensor
+                                    else {
                                         "hbm": {"isPresent": 1},
                                         "lx": {"isPresent": 1},
                                     }
@@ -642,10 +722,21 @@ def generate_sdsc(
                                     "inputLabeledDs": [
                                         f"Tensor{i}-idx{i}"
                                         for i in range(sdsc_spec.num_inputs)
+                                        if i not in sdsc_spec.indirect_access_indices
                                     ],
                                     "outputLabeledDs": [
                                         f"Tensor{out_idx}-idx{out_idx}"
                                     ],
+                                    **(
+                                        {
+                                            "indirectAccessIndexLabeledDs": [
+                                                f"Tensor{i}-idx{i}"
+                                                for i in sdsc_spec.indirect_access_indices
+                                            ]
+                                        }
+                                        if sdsc_spec.indirect_access_indices
+                                        else {}
+                                    ),
                                 }
                             ],
                         }

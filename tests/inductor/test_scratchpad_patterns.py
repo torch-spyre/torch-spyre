@@ -45,7 +45,7 @@ BYPASS_XFAIL = os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1"
 
 def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
     return {
-        name: Buffer(name=name, size=size, start_time=-1, end_time=-1)
+        name: Buffer(name=name, size=size, uses=[])
         for (name, size) in names_sizes.items()
     }
 
@@ -150,11 +150,13 @@ class Pattern:
         for i, op in enumerate(self.operations):
             for buffer_name in op.inputs + op.outputs:
                 buffer = self.buffers[buffer_name]
-                if buffer.start_time == -1:
-                    buffer.start_time = i
-                buffer.end_time = i + 1
+                if i not in buffer.uses:
+                    buffer.uses.append(i)
 
         self.inputs, self.outputs = self.determine_inputs_outputs()
+
+        for input_name in self.inputs:
+            self.buffers[input_name].first_use_is_read = True
 
         for i, op in enumerate(self.operations):
             output_buffer = self.buffers[op.outputs[0]]
@@ -162,7 +164,8 @@ class Pattern:
                 buffer = self.buffers[buffer_name]
                 if (
                     buffer_name not in self.inputs + self.outputs
-                    and buffer.end_time == i + 1
+                    and buffer.uses
+                    and buffer.uses[-1] == i
                     and buffer.size == output_buffer.size
                 ):
                     output_buffer.in_place_parents.append(buffer_name)
