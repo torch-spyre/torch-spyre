@@ -67,7 +67,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           source .venv/bin/activate
-          uv pip install clickhouse-connect
+          uv pip install clickhouse-connect regex
 
       - name: Install gh CLI
         run: |
