@@ -33,10 +33,14 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
-from .pass_utils import host_coordinates, device_coordinates, op_out_coords
+from .pass_utils import (
+    host_coordinates,
+    device_coordinates,
+    op_out_coords,
+    find_reduction_var,
+)
 from .ir import SpyreConstantFallback
 from .propagate_hints import DimHint, get_op_hints
-from .views import matching_dim, compute_coordinates
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
@@ -75,6 +79,20 @@ def _get_buffer(dep):
     return V.graph.get_buffer(dep.name)
 
 
+def _get_layout(dep) -> "FixedLayout | None":
+    buf = _get_buffer(dep)
+    if buf is not None and hasattr(buf, "get_layout"):
+        return buf.get_layout()
+    tb = V.graph.graph_inputs.get(dep.name)
+    if (
+        isinstance(tb, TensorBox)
+        and isinstance(tb.data, StorageBox)
+        and isinstance(tb.data.data, InputBuffer)
+    ):
+        return tb.data.data.layout
+    return None
+
+
 def _get_dim_prop_info(dep):
     buf = _get_buffer(dep)
     if buf is not None:
@@ -85,8 +103,9 @@ def _get_dim_prop_info(dep):
     return getattr(tb, "_dim_prop_info", None) if tb is not None else None
 
 
-def _lone_sym(coord: sympy.Expr) -> sympy.Symbol:
-    return next(iter(coord.free_symbols))
+def _lone_sym(coord: sympy.Expr) -> sympy.Symbol | None:
+    syms = coord.free_symbols
+    return next(iter(syms)) if len(syms) == 1 else None
 
 
 def _untracked_name(context: str, sym, size: int) -> str:
@@ -98,68 +117,86 @@ def _untracked_name(context: str, sym, size: int) -> str:
     return name
 
 
-def _compute_named_layout(named_dims):
-    """Compute size and stride from declared named dim sizes."""
-    size = []
-    stride = [1]
-    for s in reversed(named_dims):
-        if s not in _named_dims:
+def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
+    """Return the prefix of remaining whose declared sizes multiply to layout_size."""
+    product = 1
+    for i, name in enumerate(remaining):
+        if name not in _named_dims:
             raise KeyError(
-                f"Named dim '{s}' used in name_tensor_dims but not declared -- "
-                f"call declare_tensor_dim('{s}', size) before compiling"
+                f"Named dim '{name}' used in name_tensor_dims but not declared -- "
+                f"call declare_tensor_dim('{name}', size) before compiling"
             )
-        stride.append(stride[-1] * _named_dims[s])
-        size.append(_named_dims[s])
-    return list(reversed(size)), list(reversed(stride[:-1]))
+        product *= _named_dims[name]
+        if product == layout_size:
+            return remaining[: i + 1]
+    logger.warning(
+        f"_consume_names: no prefix of {remaining} multiplies to {layout_size}"
+    )
+    return []
 
 
 def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
-    """Map loop vars to named dim names for a single input dep, using named-space coords."""
+    """Map loop vars to named dim names for a single input dep."""
     dpi = _get_dim_prop_info(dep)
     buf_named_dims = dpi.named_dims if dpi is not None else None
     if not buf_named_dims:
-        # Scalar broadcast: constant index, contributes nothing to loop_var_dims
         if not dep.index.free_symbols:
             return {}
-        # Unannotated tensor: synthesize _untracked_ names from dep ranges
         context = f"{op.get_name()}/{dep.name}" if op is not None else dep.name
         return {
             sym: [_untracked_name(context, sym, int(size))]
             for sym, size in dep.ranges.items()
         }
-    named_size, named_stride = _compute_named_layout(buf_named_dims)
-    coords = compute_coordinates(named_size, named_stride, dep.ranges, dep.index)
+    layout = _get_layout(dep)
+    if layout is None:
+        return {}
+    coords = host_coordinates(layout, dep)
+    remaining = list(buf_named_dims)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
-        if coord.free_symbols:
-            sym = _lone_sym(coord)
-            if sym in dep.ranges:
-                result.setdefault(sym, []).append(buf_named_dims[i])
-    for sym, names in result.items():
-        actual_range = int(dep.ranges[sym])
-        product = 1
-        for n in names:
-            product *= _named_dims.get(n, actual_range)
-        if actual_range != product:
-            logger.warning(
-                f"{dep.name}: loop var {sym} has range {actual_range} "
-                f"but maps to {names} with product {product} -- partial/sliced dim, "
-                f"continuing using range {actual_range}"
+        if not remaining:
+            break
+        dim_size = int(layout.size[i])
+        if dim_size == 1:
+            # Skip: size-1 dims are not annotated.  Broadcast dims (e.g. a [1,N]
+            # buffer annotated ["M","N"]) silently become _untracked_ — we cannot
+            # raise here without breaking legitimate unannotated size-1 dims.
+            # See test_broadcast_expand_*
+            continue
+        names = _consume_names(remaining, dim_size)
+        if not names:
+            break
+        remaining = remaining[len(names) :]
+        # Loop vars for this layout dim: symbols in the coord that are also
+        # loop variables of this dep (dep.ranges.keys()), sorted by coefficient
+        # descending so the outermost (largest-stride) var comes first.
+        loop_vars = sorted(
+            coord.free_symbols & dep.ranges.keys(),
+            key=lambda s: int(abs(coord.coeff(s))),
+            reverse=True,
+        )
+        if len(loop_vars) == 1:
+            # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
+            result.setdefault(loop_vars[0], []).extend(names)
+        elif len(loop_vars) > len(names):
+            # More loop vars than named dims: a single named dim was split by reshape.
+            raise Unsupported(
+                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars but only "
+                f"{len(names)} name(s) {names} -- reshape split a named dim, "
+                f"re-annotate after the reshape"
             )
-    return result
-
-
-def coords_to_named_dims(coords: list, loop_var_dims: dict) -> list:
-    """Map coordinate expressions to named dim names via their loop variable."""
-    result = []
-    for c in coords:
-        if c.free_symbols:
-            sym = _lone_sym(c)
-            assert sym in loop_var_dims, (
-                f"coords_to_named_dims: no mapping for loop var {sym} -- "
-                f"this is a bug in _compute_named_dims synthesis"
+        elif len(loop_vars) < len(names):
+            # Fewer loop vars than names: a size-1 declared dim was fused into
+            # this layout dim and zip would silently drop the trailing name(s).
+            raise Unsupported(
+                f"{dep.name}: layout dim {i} has {len(loop_vars)} loop var(s) "
+                f"but {len(names)} name(s) {names} -- a declared size-1 name "
+                f"may be fused here; omit size-1 names from the annotation"
             )
-            result.extend(loop_var_dims[sym])
+        else:
+            # Multi-loop-var coord: match each loop var to one name by coefficient order
+            for loop_var, name in zip(loop_vars, names):
+                result.setdefault(loop_var, []).append(name)
     return result
 
 
@@ -174,9 +211,10 @@ def named_dims_for_coord(
     op: ComputedBuffer, coord: sympy.Expr
 ) -> list[tuple[str, int]] | None:
     """Return [(name, size), ...] for the named dims covered by a host coord expression."""
-    if not coord.free_symbols:
+    sym = _lone_sym(coord)
+    if sym is None:
         return None
-    return named_dims_for_sym(op, _lone_sym(coord))
+    return named_dims_for_sym(op, sym)
 
 
 def get_input_named_dims(inputs: list, op=None) -> dict:
@@ -195,15 +233,6 @@ def get_input_named_dims(inputs: list, op=None) -> dict:
     return loop_var_dims
 
 
-def get_reduction_dim(dep: MemoryDep, out_coords: list) -> sympy.Symbol:
-    """Return the reduction loop variable: the input coord absent from the output."""
-    in_coords = host_coordinates(_get_buffer(dep).get_layout(), dep)
-    reduction_coord = next(
-        c for c in in_coords if c.free_symbols and matching_dim(out_coords, c) is None
-    )
-    return _lone_sym(reduction_coord)
-
-
 @dataclasses.dataclass
 class _DimPropInfo:
     named_dims: list = dataclasses.field(default_factory=list)
@@ -217,27 +246,27 @@ def _set_no_named_dims(op):
 
 def _compute_named_dims(op, inputs):
     loop_var_dims = get_input_named_dims(inputs, op)
-    out_coords = op_out_coords(op)
-    # Synthesize names for loop vars not covered by any input.
-    # This handles full/zeros_like/constant ops whose iteration space defines
-    # named dims but whose constant value contributes nothing to loop_var_dims.
     output_dep = next(iter(op.get_read_writes().writes))
+    for sym in output_dep.ranges:
+        if sym not in loop_var_dims:
+            size = int(output_dep.ranges[sym])
+            loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+    out_coords = op_out_coords(op)
+
+    named_dims = []
     for coord in out_coords:
-        if coord.free_symbols:
-            sym = _lone_sym(coord)
-            if sym not in loop_var_dims:
-                size = int(output_dep.ranges[sym])
-                loop_var_dims[sym] = [_untracked_name(op.get_name(), sym, size)]
+        sym = _lone_sym(coord)
+        if sym is not None:
+            named_dims.extend(loop_var_dims.get(sym, []))
     reduction_named_dims = None
     if isinstance(op.data, Reduction):
-        reduction_sym = get_reduction_dim(inputs[0], out_coords)
+        reduction_sym = find_reduction_var(inputs[0], output_dep)
         if reduction_sym not in loop_var_dims:
             size = int(inputs[0].ranges[reduction_sym])
             loop_var_dims[reduction_sym] = [
                 _untracked_name(op.get_name(), reduction_sym, size)
             ]
         reduction_named_dims = loop_var_dims[reduction_sym]
-    named_dims = coords_to_named_dims(out_coords, loop_var_dims)
     op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
         named_dims=named_dims,
         loop_var_dims=loop_var_dims,
@@ -245,11 +274,7 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(
-    label: str, dep: MemoryDep
-) -> (
-    None
-):  # TODO: thread indirect_load_subs to show IndirectAccess in device_coordinates
+def _log_dep_debug(label: str, dep: MemoryDep) -> None:
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -364,9 +389,9 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             if hint:
                 coords = op_out_coords(op)
                 loop_var_dims = {
-                    _lone_sym(coord): [dim_name]
+                    sym: [dim_name]
                     for coord, dim_name in zip(coords, named_dims)
-                    if len(coord.free_symbols) == 1
+                    if (sym := _lone_sym(coord)) is not None
                 }
                 op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
                     named_dims=named_dims,
@@ -455,9 +480,9 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
 
         coord_for_name: dict[str, sympy.Symbol] = {}
         for coord in op_out_coords(op):
-            if not coord.free_symbols:
-                continue
             sym = _lone_sym(coord)
+            if sym is None:
+                continue
             for name, _ in named_dims_for_sym(op, sym):
                 coord_for_name[name] = sym
         # Also map reduction dim names to their loop variable.  Reduction dims
