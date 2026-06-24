@@ -4,7 +4,6 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestOps::test_max_default.*
             - TestOps::test_min_keepdim.*
             - TestOps::test_max_keepdim.*
             - TestOps::test_aminmax_keepdim.*
