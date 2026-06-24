@@ -4934,6 +4934,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
+    def test_relu_inplace(self):
+        """Test in-place ReLU operation on Spyre device."""
+        x = torch.tensor([[-1.0, 2.0], [3.0, -4.0]], device="spyre")
+        x.relu_()
+        expected = torch.tensor([[0.0, 2.0], [3.0, 0.0]])
+        torch.testing.assert_close(x.cpu(), expected)
+
     def test_t_1d_cpu(self, x):
         self.compare_with_cpu(lambda x: x.t(), x)
 
