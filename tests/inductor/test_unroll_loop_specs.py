@@ -138,7 +138,7 @@ class TestUnrollLoopSpecs(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # 2. LoopSpec(count=2) produces 2 copies; second HBM addr advanced.
-    #    Tiling c_row with T_ROW=512: byte_stride = 512 * 256 * 2 = 262144
+    #    Tiling c_row with T_ROW=512: byte_stride = 512 * 64 * 2 = 65536
     # ------------------------------------------------------------------
 
     def test_flat_loop_k2_advances_hbm(self):
@@ -297,10 +297,10 @@ class TestNestedReductionUnroll(unittest.TestCase):
 
     Tensor geometry used throughout:
       accum_buf  [B=2, M=64, N=32] fp16 per outer tile → HBM at ACCUM_BASE
-        device_size=[1, 2, 64], device_stride=[64, 64, 1]
+        device_size=[1, 2, 64], device_stride=[128, 64, 1]
         device_coords=[c_col//64, c_b, c_col%64]   (c_b tiles batch within tile)
       k_input    [M=64, K=128] fp16 per K-tile   → HBM at K_BASE (advances per K)
-        device_size=[2, 64, 64], device_stride=[64, 64, 1]
+        device_size=[2, 64, 64], device_stride=[4096, 64, 1]
         device_coords=[c_col//64, c_row, c_col%64]
       pool_scratch per_tile_fixed=True (bmm intermediate output, stays fixed)
     """
@@ -318,12 +318,12 @@ class TestNestedReductionUnroll(unittest.TestCase):
 
     # Per-tile tensor geometry:
     #   accum_buf: [B=2, N=32] per row — but using simplified 2D layout:
-    #     device_size=[1, 2, 64], device_stride=[64, 64, 1]
+    #     device_size=[1, 2, 64], device_stride=[128, 64, 1]
     #     device_coords=[c_n//64, c_b, c_n%64]
-    #   k_input (K-dim): device_size=[2, 64, 64], device_stride=[64, 64, 1]
+    #   k_input (K-dim): device_size=[2, 64, 64], device_stride=[4096, 64, 1]
     #     device_coords=[c_k//64, c_m, c_k%64]
     #     per K-tile stride: 1 tile = 128 K-elems = 2 sticks
-    #       byte_stride = 2 * 64 * 2 = 256  (one stick = 64 fp16 = 128 bytes)
+    #       byte_stride = (128//64) * 4096 * 2 = 16384  (one stick = 64 fp16 = 128 bytes)
 
     # For accum_buf: advancing 2 batches in c_b direction:
     #   device_coords[1] = c_b; device_stride[1] = 64
