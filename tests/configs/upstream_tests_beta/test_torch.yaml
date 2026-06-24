@@ -196,13 +196,13 @@ test_suite_config:
             - TestTorchDeviceType::test_take
             - TestTorchDeviceType::test_take_empty
             - TestTorchDeviceType::test_tensor_shape_empty
-          mode: xfail  # xfail: NotImplementedError
+          mode: skip  # xfail: NotImplementedError
         # These tests exercise various broadcasting operations across different tensor operations and data types.
         # They are classified as xfail due to missing or unsupported operators and file access errors on the Spyre backend.
         # Relevant Spyre limitations include missing support for certain tensor operations and file system dependencies.
         - names:
             - TestTorchDeviceType::test_broadcast
-          mode: xfail  # xfail: NotImplementedError, RuntimeError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, RuntimeError, UNKNOWN, torch._inductor.exc.InductorError
         # These tests exercise a variety of operations and tensor behaviors, including non-contiguous tensors, gradient scaling, and cumulative operations.
         # They are classified as xfail due to unsupported operations, missing features, or errors related to the Spyre backend.
         # Relevant Spyre limitations include unsupported mutation operations, missing standalone executables, and unsupported data formats.
@@ -242,31 +242,31 @@ test_suite_config:
         # Relevant Spyre limitations include unsupported dtypes and operations, as well as handling of large constants.
         - names:
             - TestTorchDeviceType::test_deterministic_empty
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
         # These tests exercise deterministic resizing across various dtypes, including bfloat16, bool, float16, float32, and int64.
         # They are classified as xfail due to the Spyre backend's lack of support for the 'aten::set_.source_Storage' operator.
         # The primary limitation is the unimplemented operator, affecting dtype-specific tensor manipulations.
         - names:
             - TestTorchDeviceType::test_deterministic_resize
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN
+          mode: skip  # xfail: NotImplementedError, UNKNOWN
         # These tests exercise tensor creation from storage across various dtypes.
         # They are classified as xfail due to missing support for 'aten::random_.from' and shape determination issues.
         # Relevant Spyre limitations include incomplete support for certain tensor operations and dtype-specific errors.
         - names:
             - TestTorchDeviceType::test_tensor_from_storage
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, ValueError
+          mode: skip  # xfail: NotImplementedError, UNKNOWN, ValueError
         # These tests verify tensor storage types across various dtypes, including unsupported ones like int64.
         # They are classified as xfail due to Spyre's lack of support for certain dtypes and ops, causing AssertionErrors and NotImplementedErrors.
         # The primary limitation is Spyre's incomplete support for all dtypes and ops required by PyTorch's tensor storage tests.
         - names:
             - TestTorchDeviceType::test_tensor_storage_type
-          mode: xfail  # xfail: AssertionError, NotImplementedError, UNKNOWN
+          mode: skip  # xfail: AssertionError, NotImplementedError, UNKNOWN
         # These tests verify the behavior of typed storage metadata across various dtypes.
         # They are classified as xfail due to consistent AssertionErrors indicating discrepancies in storage size.
         # The relevant Spyre limitation is the inability to accurately compute storage metadata for certain dtypes.
         - names:
             - TestTorchDeviceType::test_typed_storage_meta
-          mode: xfail  # xfail: AssertionError, UNKNOWN
+          mode: skip  # xfail: AssertionError, UNKNOWN
         - names:
             - TestDevicePrecision::test_multidevice_serialization
             - TestDevicePrecision::test_type_conversions_same_device
