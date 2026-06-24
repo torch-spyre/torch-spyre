@@ -761,5 +761,141 @@ class TestNestedReductionTileAccum(unittest.TestCase):
         self.assertEqual(fill_1.args[0].allocation["hbm"], self._ACCUM_TILE_BASE)
 
 
+class TestDeviceStrideFormula(unittest.TestCase):
+    """Unit tests that verify _byte_stride_for_arg uses device_stride, not stride_map.
+
+    These tests are parametrised over tensor shapes where stride_map and
+    device_stride diverge, so they would fail with the old (wrong) formula.
+
+    Fixture: [R, C] fp16 col-stick layout.
+      device_size = [C//64, R, 64]
+      device_coordinates = [c_col//64, c_row, Mod(c_col, 64)]
+      device_stride[0] = R * 64   (advancing one stick group steps over R rows)
+      device_stride[1] = 64       (advancing one row steps over 64 elems)
+      device_stride[2] = 1
+    """
+
+    _C_COL = Symbol("c_col")
+    _C_ROW = Symbol("c_row")
+
+    def _make_arg(self, R: int, C: int, base: int = 0) -> TensorArg:
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[C // 64, R, 64],
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": base},
+        )
+
+    # ------------------------------------------------------------------
+    # Row-tiling: advancing T_ROW rows.
+    # Correct: T_ROW * device_stride[1] * 2 = T_ROW * 64 * 2
+    # Wrong (old formula): T_ROW * stride_map[1] * 2 = T_ROW * C * 2
+    # These diverge whenever C != 64 (i.e. sticks_per_row > 1).
+    # ------------------------------------------------------------------
+
+    def test_row_tile_stride_narrow_tensor(self):
+        """Row-tiling [512, 64] fp16: 1 stick per row, both formulas agree."""
+        R, C, T_ROW = 512, 64, 128
+        arg = self._make_arg(R, C)
+        expected = T_ROW * 64 * 2  # device_stride[1]=64; = 16384
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_ROW, T_ROW), expected)
+
+    def test_row_tile_stride_wide_tensor(self):
+        """Row-tiling [512, 256] fp16: 4 sticks/row; old formula gave 4x too large."""
+        R, C, T_ROW = 512, 256, 128
+        arg = self._make_arg(R, C)
+        # device_stride[1] = 64 regardless of C
+        expected = T_ROW * 64 * 2  # 128 * 64 * 2 = 16384
+        # old (wrong): T_ROW * C * 2 = 128 * 256 * 2 = 65536
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_ROW, T_ROW), expected)
+
+    def test_row_tile_stride_very_wide_tensor(self):
+        """Row-tiling [1024, 4096] fp16: 64 sticks/row; old formula was 64x too large."""
+        R, C, T_ROW = 1024, 4096, 256
+        arg = self._make_arg(R, C)
+        expected = T_ROW * 64 * 2  # 256 * 64 * 2 = 32768
+        # old (wrong): 256 * 4096 * 2 = 2097152
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_ROW, T_ROW), expected)
+
+    # ------------------------------------------------------------------
+    # Col-tiling: advancing T_COL elements (T_COL must be a multiple of 64).
+    # delta[0] = T_COL // 64 (stick groups), delta[1]=0, delta[2]=0
+    # Correct: (T_COL//64) * device_stride[0] * 2 = (T_COL//64) * R * 64 * 2
+    # Wrong (old formula): (T_COL//64) * stride_map[0] * 2 = (T_COL//64) * 64 * 2
+    # ------------------------------------------------------------------
+
+    def test_col_tile_stride_one_stick(self):
+        """Col-tiling [512, 256] by T_COL=64 (1 stick): correct advance."""
+        R, C, T_COL = 512, 256, 64
+        arg = self._make_arg(R, C)
+        # delta[0] = 1; device_stride[0] = R * 64 = 32768
+        expected = 1 * (R * 64) * 2  # 65536
+        # old (wrong): 1 * 64 * 2 = 128
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_COL, T_COL), expected)
+
+    def test_col_tile_stride_two_sticks(self):
+        """Col-tiling [512, 256] by T_COL=128 (2 sticks): correct advance."""
+        R, C, T_COL = 512, 256, 128
+        arg = self._make_arg(R, C)
+        # delta[0] = 2; device_stride[0] = 32768
+        expected = 2 * (R * 64) * 2  # 131072
+        # old (wrong): 2 * 64 * 2 = 256
+        self.assertEqual(_byte_stride_for_arg(arg, self._C_COL, T_COL), expected)
+
+    # ------------------------------------------------------------------
+    # End-to-end unroll: row-tiled LoopSpec with multi-stick tensor.
+    # Verifies that the correct address advances appear in the unrolled copies.
+    # ------------------------------------------------------------------
+
+    def test_unroll_row_tile_multi_stick_addresses(self):
+        """Unrolling a row-tile loop over [1024, 256] fp16 gives correct HBM advances.
+
+        [1024, 256] fp16: device_size=[4, 1024, 64], T_ROW=256, count=4.
+        device_stride[1] = 64; byte_stride = 256 * 64 * 2 = 32768.
+        Tile addresses: base, base+32768, base+65536, base+98304.
+        """
+        R, C, T_ROW = 1024, 256, 256
+        c_row = Symbol("c_row")
+        c_col = Symbol("c_col")
+        base = 0x400000000
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[C // 64, R, 64],
+            device_coordinates=[c_col // 64, c_row, sympy.Mod(c_col, 64)],
+            allocation={"hbm": base},
+        )
+        op = OpSpec(
+            op="abs",
+            is_reduction=False,
+            iteration_space={
+                c_row: (Integer(T_ROW), 1),
+                c_col: (Integer(C), 1),
+            },
+            args=[arg],
+            op_info={},
+            tiled_symbols=[c_row],
+        )
+        loop = LoopSpec(count=Integer(4), body=[op])
+        result = unroll_loop_specs([loop])
+        self.assertEqual(len(result), 4)
+        tile_stride = T_ROW * 64 * 2  # 32768
+        for i, copy_op in enumerate(result):
+            expected_addr = base + i * tile_stride
+            self.assertEqual(
+                copy_op.args[0].allocation["hbm"],
+                expected_addr,
+                f"tile {i}: expected {hex(expected_addr)}, "
+                f"got {hex(copy_op.args[0].allocation['hbm'])}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
