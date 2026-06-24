@@ -220,8 +220,8 @@ class TestUnrollLoopSpecs(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # 8. _byte_stride_for_arg: tiling c_row (row dimension).
-    #    coord[1] = c_row; stride_map[1] = 256; tile_range = 512
-    #    byte_stride = 512 * 256 * 2 = 262144
+    #    coord[1] = c_row; device_stride[1] = 64; tile_range = 512
+    #    byte_stride = 512 * 64 * 2 = 65536
     # ------------------------------------------------------------------
 
     def test_byte_stride_for_arg(self):
@@ -297,10 +297,10 @@ class TestNestedReductionUnroll(unittest.TestCase):
 
     Tensor geometry used throughout:
       accum_buf  [B=2, M=64, N=32] fp16 per outer tile → HBM at ACCUM_BASE
-        device_size=[1, 2, 64], stride_map=[64, 64, 1]
+        device_size=[1, 2, 64], device_stride=[64, 64, 1]
         device_coords=[c_col//64, c_b, c_col%64]   (c_b tiles batch within tile)
       k_input    [M=64, K=128] fp16 per K-tile   → HBM at K_BASE (advances per K)
-        device_size=[2, 64, 64], stride_map=[64, 64, 1]
+        device_size=[2, 64, 64], device_stride=[64, 64, 1]
         device_coords=[c_col//64, c_row, c_col%64]
       pool_scratch per_tile_fixed=True (bmm intermediate output, stays fixed)
     """
@@ -318,19 +318,19 @@ class TestNestedReductionUnroll(unittest.TestCase):
 
     # Per-tile tensor geometry:
     #   accum_buf: [B=2, N=32] per row — but using simplified 2D layout:
-    #     device_size=[1, 2, 64], stride_map=[64, 64, 1]
+    #     device_size=[1, 2, 64], device_stride=[64, 64, 1]
     #     device_coords=[c_n//64, c_b, c_n%64]
-    #   k_input (K-dim): device_size=[2, 64, 64], stride_map=[64, 64, 1]
+    #   k_input (K-dim): device_size=[2, 64, 64], device_stride=[64, 64, 1]
     #     device_coords=[c_k//64, c_m, c_k%64]
     #     per K-tile stride: 1 tile = 128 K-elems = 2 sticks
     #       byte_stride = 2 * 64 * 2 = 256  (one stick = 64 fp16 = 128 bytes)
 
     # For accum_buf: advancing 2 batches in c_b direction:
-    #   device_coords[1] = c_b; stride_map[1] = 64
+    #   device_coords[1] = c_b; device_stride[1] = 64
     #   byte_stride = 2 * 64 * 2 = 256
 
     # K-input advance per K-tile (128 K-elems = 2 sticks along c_k):
-    #   device_coords[0] = c_k//64; stride_map[0] = 64
+    #   device_coords[0] = c_k//64; device_stride[0] = 64
     #   byte_stride = (128//64) * 64 * 2 = 256
 
     def _make_accum_arg(self, base: int = _ACCUM_BASE, per_tile_fixed: bool = False):
@@ -521,7 +521,7 @@ class TestNestedReductionUnroll(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_nested_outer_b_inner_k_full_layout(self):
-        # B-tile byte advance: 2 batches in c_b, stride_map[1]=64, dtype=fp16
+        # B-tile byte advance: 2 batches in c_b, device_stride[1]=64, dtype=fp16
         B_TILE_BYTES = 2 * 64 * 2  # 256
 
         fill_accum = self._make_accum_arg()
