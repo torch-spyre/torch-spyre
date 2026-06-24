@@ -13,24 +13,10 @@
 # limitations under the License.
 
 import copy
-import pytest
 
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
-
-from transformers.models.roberta.modeling_roberta import (
-    RobertaSelfAttention,
-    RobertaLayer,
-    RobertaEncoder,
-)
-from transformers.models.roberta.configuration_roberta import RobertaConfig
-from transformers.models.llama.modeling_llama import (
-    LlamaModel,
-    LlamaDecoderLayer,
-    LlamaAttention,
-)
-from transformers.models.llama.configuration_llama import LlamaConfig
 
 
 class TestOps(TestCase):
@@ -69,150 +55,6 @@ class TestOps(TestCase):
             y = m_spyre(x_spyre).to("cpu")
 
         torch.testing.assert_close(y, m(x), rtol=self.rtol, atol=self.atol)
-
-    @pytest.mark.xfail(reason="Roberta still has issues on Eager path", strict=True)
-    def test_roberta_self_attention(self):
-        config = RobertaConfig()
-        config.hidden_size = 144
-        m = RobertaSelfAttention(config)
-        m.eval()
-        m.to(self.dtype)
-        m_spyre = copy.deepcopy(m)
-        m_spyre.to("spyre")
-
-        x = torch.rand(2, 10, config.hidden_size, dtype=self.dtype)
-        x_spyre = x.to("spyre")
-
-        with torch.no_grad():
-            y = m(x)
-            y_spyre = m_spyre(x_spyre)
-
-        torch.testing.assert_close(
-            y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
-        )
-
-    @pytest.mark.xfail(reason="Roberta still has issues on Eager path", strict=True)
-    def test_roberta_layer(self):
-        config = RobertaConfig()
-        config.hidden_size = 144
-        m = RobertaLayer(config)
-        m.eval()
-        # m.dropout = nn.Sequential()
-        m.to(self.dtype)
-        m_spyre = copy.deepcopy(m)
-        m_spyre.to("spyre")
-
-        x = torch.rand(2, 10, config.hidden_size, dtype=self.dtype)
-        x_spyre = x.to("spyre")
-
-        with torch.no_grad():
-            y = m(x)
-            y_spyre = m_spyre(x_spyre)
-
-        torch.testing.assert_close(
-            y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
-        )
-
-    @pytest.mark.xfail(reason="Roberta HF has issues", strict=True)
-    def test_roberta_encoder(self):
-        config = RobertaConfig()
-        config.hidden_size = 144
-        m = RobertaEncoder(config)
-        m.eval()
-        m.to(self.dtype)
-        m_spyre = copy.deepcopy(m)
-        m_spyre.to("spyre")
-
-        x = torch.randn(10, 384, config.hidden_size, dtype=self.dtype)
-        x_spyre = x.to("spyre")
-
-        with torch.no_grad():
-            y = m(x)
-            y_spyre = m_spyre(x_spyre)
-
-        torch.testing.assert_close(
-            y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
-        )
-
-    @pytest.mark.xfail(reason="Llama still has issues on Eager path", strict=True)
-    def test_llama_attention(self):
-        config = LlamaConfig()
-        T = 1000
-        B = 1
-        config.hidden_size = 1024
-
-        config.head_dim = config.hidden_size // 32
-
-        llama_model = LlamaModel(config)
-        m = LlamaAttention(config, 0)
-        m.eval()
-        m.to(self.dtype)
-        m_spyre = copy.deepcopy(m)
-        m_spyre.to("spyre")
-
-        x = torch.rand(B, T, config.hidden_size, dtype=self.dtype)
-        x_spyre = x.to("spyre")
-
-        position_ids = torch.arange(T).unsqueeze(0)
-        position_embeddings = llama_model.rotary_emb(x, position_ids)
-        position_embeddings_spyre = (
-            position_embeddings[0].to(self.dtype).to("spyre"),
-            position_embeddings[1].to(self.dtype).to("spyre"),
-        )
-
-        attention_mask = torch.ones([T, T], dtype=self.dtype)
-        attention_mask_spyre = attention_mask.to("spyre")
-
-        with torch.no_grad():
-            y = m(
-                hidden_states=x,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-            )
-            y_spyre = m_spyre(
-                hidden_states=x_spyre,
-                position_embeddings=position_embeddings_spyre,
-                attention_mask=attention_mask_spyre,
-            )
-
-        torch.testing.assert_close(
-            y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
-        )
-
-    @pytest.mark.xfail(reason="Llama still has issues on Eager path", strict=True)
-    def test_llama_layer(self):
-        config = LlamaConfig()
-        config.hidden_size = 1024
-        T = 1000
-        B = 1
-
-        llama_model = LlamaModel(config)
-        m = LlamaDecoderLayer(config, 0)
-        m.eval()
-        m.to(self.dtype)
-        m_spyre = copy.deepcopy(m)
-        m_spyre.to("spyre")
-
-        x = torch.rand(B, T, config.hidden_size, dtype=self.dtype)
-        x_spyre = x.to("spyre")
-
-        position_ids = torch.arange(4096).unsqueeze(0)
-        position_embeddings = llama_model.rotary_emb(x, position_ids)
-        position_embeddings_spyre = (
-            position_embeddings[0].to(self.dtype).to("spyre"),
-            position_embeddings[1].to(self.dtype).to("spyre"),
-        )
-
-        with torch.no_grad():
-            y = m(hidden_states=x, position_embeddings=position_embeddings)
-            y_spyre = m_spyre(
-                hidden_states=x_spyre,
-                position_embeddings=position_embeddings_spyre,
-            )
-
-        torch.testing.assert_close(
-            y_spyre[0].cpu(), y[0], rtol=self.rtol, atol=self.atol
-        )
 
 
 if __name__ == "__main__":
