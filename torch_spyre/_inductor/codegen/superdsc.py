@@ -817,8 +817,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         op_dim_order = [mb_sym] + op_dim_order
 
     if op_stick_dim is None:
-        stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
-        sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
+        if is_pool:
+            # Pool op where C fits in one stick (e.g. C=1): the "out" (channel)
+            # dimension was dropped from the iteration space because its size is 1,
+            # but the SDSC still needs it.  Use the actual channel count from the
+            # output tensor's device layout: device_size[-3] = channel count C.
+            # (Using INPUT_DIM_LABELS[ndim] would collide with pool dim labels
+            # like "i", "j", "ki", "kj" that _pool_dim_labels assigns.)
+            stick_sym = Symbol("out")
+            sdsc_iteration_space[stick_sym] = int(op_spec.args[1].device_size[-3])
+        else:
+            stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
+            sdsc_iteration_space[stick_sym] = (
+                op_spec.args[0].device_dtype.elems_per_stick()
+            )
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
@@ -916,6 +928,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_pool:
         num_inputs = 1  # avgpool has exactly 1 input tensor and 1 output tensor
+        # The pool hardware accumulates the full kernel window on each core.
+        # Splitting ki/kj across cores produces partial sums, giving wrong results.
+        for _k_sym in (Symbol("ki"), Symbol("kj")):
+            if _k_sym in dim_splits:
+                dim_splits[_k_sym] = 1
+                work_slices[_k_sym] = 1
+        num_cores = math.prod(dim_splits.values())
 
     if _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
         core_id_to_work_slice = _k_fast_core_to_slice_mapping(
