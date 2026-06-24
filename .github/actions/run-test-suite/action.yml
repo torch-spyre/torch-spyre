@@ -43,6 +43,10 @@ inputs:
     description: Optional bash snippet run at the start of every attempt (e.g. topology reset)
     required: false
     default: ''
+  parallel:
+    description: Whether to pass --parallel to run_test.sh (disable for distributed torchrun tests)
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -141,7 +145,12 @@ runs:
 
           exec {FIFO_FD}>"$FIFO"
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" --parallel ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          _PARALLEL_FLAG=""
+          if [[ "${{ inputs.parallel }}" != "false" ]]; then
+            _PARALLEL_FLAG="--parallel"
+          fi
+
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 
