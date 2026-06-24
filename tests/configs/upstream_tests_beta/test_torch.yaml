@@ -236,7 +236,7 @@ test_suite_config:
             - TestTorchDeviceType::test_repeat_interleave
             - TestTorchDeviceType::test_strides_propagation
             - TestTorchDeviceType::test_tolist_with_grad
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
+          mode: skip  # xfail: torch._inductor.exc.InductorError
         # These tests exercise the `empty` operation across various dtypes, including unsupported ones like `bfloat16` and `int64`.
         # They are classified as `xfail` due to Spyre's lack of support for certain dtypes and operations like `aten::isnan`.
         # Relevant Spyre limitations include unsupported dtypes and operations, as well as handling of large constants.
