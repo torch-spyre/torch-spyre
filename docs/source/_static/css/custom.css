@@ -13,3 +13,91 @@ code.literal {
     padding: 0 3px;
     font-size: 90%;
 }
+
+/* =========================================================================
+   Knowledge Graph Explorer
+   ========================================================================= */
+
+/* Tab bar */
+#kg-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid #e0e0e0;
+    margin-bottom: 0.5em;
+}
+
+.kg-tab {
+    padding: 0.5em 1.2em;
+    border: none;
+    background: transparent;
+    font-size: 0.9em;
+    font-weight: 500;
+    color: #666;
+    cursor: pointer;
+    border-bottom: 3px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.kg-tab:hover {
+    color: #333;
+    background: #f8f8f8;
+}
+
+.kg-tab.active {
+    color: #2c3e50;
+    border-bottom-color: #3498db;
+    font-weight: 600;
+}
+
+/* Graph container */
+#cy {
+    width: 100%;
+    height: 600px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background: #fafbfc;
+    touch-action: none;
+}
+
+/* Info panel */
+#kg-info {
+    min-height: 50px;
+    padding: 0.75em 1em;
+    background: #f7f8f9;
+    border: 1px solid #e8e8e8;
+    border-radius: 6px;
+    margin-top: 0.75em;
+    font-size: 0.88em;
+    line-height: 1.5;
+}
+
+#kg-info code {
+    background: #eef;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+
+/* Legend */
+.kg-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+}
+
+.kg-legend-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+}
+
+/* Search input */
+#kg-search:focus {
+    outline: none;
+    border-color: #3498db;
+    box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.15);
+}

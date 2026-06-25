@@ -5,6 +5,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath("../.."))
+sys.path.insert(0, os.path.abspath("_ext"))
 
 # -- Project information -----------------------------------------------------
 project = "Torch-Spyre"
@@ -21,6 +22,7 @@ extensions = [
     "sphinx.ext.viewcode",  # add [source] links to API pages
     "sphinx.ext.todo",  # support .. todo:: directives
     "myst_parser",  # parse Markdown (.md) files
+    "knowledge_graph_ext",  # auto-generate operation explorer graph
 ]
 
 # MyST-Parser settings — allow RST-style cross-refs inside .md files
