@@ -123,7 +123,8 @@ jobs:
       runner_label: linux
       # Per-PR ephemeral image label when provided, else the standing set.
       image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
-      extra_test_flags: -v
+      extra_test_flags: -v -m "not xfail"
+      extra_test_flags_multi_spyre: -v
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
