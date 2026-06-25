@@ -31,11 +31,18 @@ on:
         type: string
         default: image_spyre_backend
 
-      # Flags appended to every `bash tests/run_test.sh <config>` call
+      # Flags appended to every `bash tests/run_test.sh <config>` call for the test job
       extra_test_flags:
-        description: Extra flags passed to run_test.sh (e.g. "-v" or "--cpu-compile -vvv -s")
+        description: Extra flags passed to run_test.sh for the test job (e.g. "-v" or "--cpu-compile -vvv -s")
         required: true
         type: string
+
+      # Flags appended to every `bash tests/run_test.sh <config>` call for the test_multi_spyre job
+      extra_test_flags_multi_spyre:
+        description: Extra flags passed to run_test.sh for the test_multi_spyre job (e.g. "-v")
+        required: false
+        type: string
+        default: ''
 
       # Whether to run checkout-pytorch (nightly only)
       checkout_pytorch:
@@ -341,7 +348,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
-          extra_test_flags: ${{ inputs.extra_test_flags }}
+          extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
           parallel: 'false'
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
