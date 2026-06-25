@@ -184,6 +184,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_padding_config.yaml
           - name: Inductor Overwrite
             config: torch_spyre_tests/inductor/test_overwrite.yaml
+          - name: Inductor Propagate Named Dims
+            config: torch_spyre_tests/inductor/test_propagate_named_dims_config.yaml
           - name: Inductor Restickify
             config: torch_spyre_tests/inductor/test_restickify_config.yaml
           - name: Inductor Scratchpad Patterns
