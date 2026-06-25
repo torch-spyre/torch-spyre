@@ -715,6 +715,9 @@ def lower_avg_pool2d(
     padding = padding if padding else 0
     pH, pW = (padding, padding) if isinstance(padding, int) else padding
 
+    if pH > 0 or pW > 0:
+        raise Unsupported("avg_pool2d with non-zero padding not yet supported")
+
     N, C, H_in, W_in = x.get_size()
 
     H_out = (H_in + 2 * pH - kH) // sH + 1
