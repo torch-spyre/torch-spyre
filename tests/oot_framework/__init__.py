@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Copyright 2026 Anubhav Jana (Anubhav.Jana97@ibm.com).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Thin wrapper — the OOT runner lives in tests/oot_framework/.
-# All arguments are forwarded unchanged.
-_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "${_dir}/oot_framework/run_test.sh" "$@"

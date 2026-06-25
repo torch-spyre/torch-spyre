@@ -27,7 +27,7 @@ import regex as re
 import pytest  # type: ignore
 import torch.utils._pytree as pytree
 
-from oot_test_utilities import (
+from .oot_test_utilities import (
     _OOT_PLATFORM_ARCH,
     _extract_base_module_name,
     _get_privateuse1_device_type,

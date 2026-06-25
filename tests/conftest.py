@@ -19,7 +19,7 @@ import pytest
 
 
 import shared_config
-from oot_test_utilities import _RUNTIME_TAGS
+from oot_framework.oot_test_utilities import _RUNTIME_TAGS
 
 
 # Attaches per-test tags to the pytest report object after each test call.

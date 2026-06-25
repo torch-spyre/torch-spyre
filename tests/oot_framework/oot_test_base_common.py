@@ -12,7 +12,7 @@ import warnings
 import pytest  # type: ignore
 import torch
 
-from oot_test_constants import (
+from oot_framework.oot_test_constants import (
     _DYNAMIC_TAG_PREFIXES,
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
@@ -22,18 +22,18 @@ from oot_test_constants import (
     MODE_XFAIL_STRICT,
     UNLISTED_MODE_XFAIL,
 )
-from oot_test_matching import (
+from oot_framework.oot_test_matching import (
     extract_dtype_from_name,
     parse_dtype,
 )
-from oot_test_parsing import (
+from oot_framework.oot_test_parsing import (
     FileEntry,
     apply_op_config_overrides,
     load_yaml_config,
     resolve_current_file,
 )
 
-from oot_upstream_patcher import (
+from oot_framework.oot_upstream_patcher import (
     _OOTDtypePatcher,
     _OOTModuleMarkerPatcher,
     _OOTOnlyOnPatcher,
@@ -47,18 +47,18 @@ from oot_upstream_patcher import (
     _OOTCpuMovePatcher,
     _OOTPlatformMarkerPatcher,
 )
-from oot_test_config_models import (
+from oot_framework.oot_test_config_models import (
     OOTTestConfig,
     Precision,
     SupportedOpConfig,
     SupportedModuleConfig,
     TestEntry,
 )
-from oot_test_common_methods_invocations import (
+from oot_framework.oot_test_common_methods_invocations import (
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
-from oot_test_utilities import (
+from oot_framework.oot_test_utilities import (
     _get_privateuse1_device_type,
     _log_warning,
     _log_error,

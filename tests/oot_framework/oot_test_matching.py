@@ -14,7 +14,7 @@ from typing import Dict, Optional, Set
 import regex as re
 import torch
 
-from oot_test_constants import DTYPE_STR_MAP, DTYPE_NAMES_ORDERED
+from .oot_test_constants import DTYPE_STR_MAP, DTYPE_NAMES_ORDERED
 
 
 # ----------------

@@ -32,16 +32,16 @@ from torch.testing._internal.common_utils import TestCase
 import shared_config
 from op_registry import OP_REGISTRY, OpAdapter
 
-from oot_test_constants import ENV_TEST_CONFIG
-from oot_test_config_models import (
+from oot_framework.oot_test_constants import ENV_TEST_CONFIG
+from oot_framework.oot_test_config_models import (
     InputArgTensor,
     InputArgTensorList,
     OOTTestConfig,
     OpsNamedItem,
     TestEntry,
 )
-from oot_test_parsing import load_yaml_config, resolve_current_file
-from oot_test_utilities import print_test_tags_oot
+from oot_framework.oot_test_parsing import load_yaml_config, resolve_current_file
+from oot_framework.oot_test_utilities import print_test_tags_oot
 
 # ---------------------------------------------------------------------------
 # ModelOpInfo

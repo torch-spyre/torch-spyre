@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oot-framework"
+version = "0.1.0"
+description = "OOT PyTorch test framework for out-of-tree device backends"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0",
+    "pydantic>=2.0",
+    "pyyaml",
+    "pytest",
+    "regex",
+    "expecttest",
+    "pytest-xdist",
+]
+
+[tool.setuptools]
+# The package oot_framework maps to this directory (tests/oot_framework/).
+# oot_framework.oot_test_constants resolves to
+# tests/oot_framework/oot_test_constants.py after pip install.
+package-dir = {"oot_framework" = "."}
+packages = ["oot_framework"]
+package-data = {"oot_framework" = ["*.sh"]}

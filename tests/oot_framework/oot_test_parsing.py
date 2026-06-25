@@ -18,8 +18,8 @@ from typing import Dict, Optional
 
 import yaml
 
-from oot_test_constants import REL_PATH_TOKENS
-from oot_test_config_models import FileEntry, OOTTestConfig, SupportedOpConfig
+from .oot_test_constants import REL_PATH_TOKENS
+from .oot_test_config_models import FileEntry, OOTTestConfig, SupportedOpConfig
 
 
 # ---------------------------------------------------------------------------
