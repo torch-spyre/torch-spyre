@@ -11,6 +11,7 @@ name: integration-tests
 #     --repo <org>/torch-spyre \
 #     -f triggering_repo=<repo link to deeptools/flex> \
 #     -f triggering_sha=${{ github.sha }} \
+#     -f pr_url_hash=$(echo -n "${{ github.event.pull_request.html_url }}" | sha256sum | cut -c1-16) \
 #     -f rpm_location=... \
 #     -f rpm_names=...
 # ---------------------------------------------------------------------------
@@ -25,6 +26,14 @@ on:
         default: ''
       triggering_sha:
         description: Commit SHA in the upstream repo that triggered this run
+        required: false
+        type: string
+        default: ''
+      pr_url_hash:
+        description: |
+          Hash of the full URL of the upstream PR that triggered this run.
+          Used to key the concurrency group so that re-runs for the same PR
+          cancel any in-flight run. Leave empty for non-PR triggers.
         required: false
         type: string
         default: ''
@@ -67,7 +76,8 @@ on:
         default: ''
 
 concurrency:
-  group: integration-tests-${{ inputs.triggering_repo }}-${{ inputs.triggering_sha || github.run_id }}
+  group: integration-tests-${{ (inputs.pr_url_hash != '' && inputs.pr_url_hash) || inputs.triggering_repo }}-${{ inputs.triggering_sha || github.run_id
+    }}
   cancel-in-progress: true
 
 permissions:
@@ -91,6 +101,7 @@ jobs:
             echo "|---|---|"
             echo "| Upstream repo   | ${{ inputs.triggering_repo || '(not specified)' }} |"
             echo "| Upstream commit | ${{ inputs.triggering_sha || '(not specified)' }} |"
+            echo "| PR URL hash     | ${{ inputs.pr_url_hash || '(not specified)' }} |"
             echo "| torch-spyre ref | ${{ inputs.ref || github.sha }} |"
             echo "| RPM names       | ${{ inputs.rpm_names || '(none)' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
