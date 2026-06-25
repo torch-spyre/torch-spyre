@@ -1095,6 +1095,27 @@ class TestSpyreFuseNodesLoopBudget(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], node)
 
+    def test_nested_loop_node_tensor_union_checked(self):
+        """Outer CountedLoopSchedulerNode's read_writes covers inner tensors.
+
+        _build_loop_group wraps inner loops first, then the outer loop.
+        FusedSchedulerNode.__init__ calls ReadWrites.merge_list on its
+        snodes, so the outer node's read_writes is already the full union
+        of all inner tensors.  This test confirms that the budget check
+        on the outer node sees all tensors from nested inner nodes.
+        """
+        sched = _make_scheduler()
+        # Simulate an outer CountedLoopSchedulerNode whose read_writes
+        # already aggregates tensors from two inner loop nodes (t1..t4).
+        # In production this aggregation is done by ReadWrites.merge_list
+        # during FusedSchedulerNode construction.
+        outer = _make_counted_loop_node(sched, ["t1", "t2", "t3", "t4"], "outer_loop")
+        # 4 unique non-intermediate tensors > max_tensors(2): must raise.
+        with self.assertRaises(RuntimeError) as ctx:
+            spyre_fuse_nodes([outer])
+        self.assertIn("outer_loop", str(ctx.exception))
+        self.assertIn("4", str(ctx.exception))
+
 
 # ===========================================================================
 # 4. generate_sdsc and compile_op_spec — symbol/affine-stride paths

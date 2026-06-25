@@ -56,7 +56,15 @@ def _is_non_intermediate(name: str) -> bool:
 
 
 def _count_non_intermediate_tensors(node: BaseSchedulerNode) -> int:
-    """Count unique non-intermediate tensors referenced by node."""
+    """Count unique non-intermediate tensors referenced by node.
+
+    For a CountedLoopSchedulerNode, node.read_writes is the recursively
+    merged union of all inner nodes' read_writes (built by
+    FusedSchedulerNode.__init__ → init_group_node →
+    ReadWrites.merge_list).  Nested CountedLoopSchedulerNodes therefore
+    contribute their full tensor sets automatically; no manual recursion
+    is needed here.
+    """
     names = {dep.name for dep in node.read_writes.reads_and_writes()}
     return sum(1 for name in names if _is_non_intermediate(name))
 
