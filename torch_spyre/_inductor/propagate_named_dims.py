@@ -29,7 +29,7 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, is_indirect
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
@@ -178,6 +178,17 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
         if len(loop_vars) == 1:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
             result.setdefault(loop_vars[0], []).extend(names)
+        elif len(loop_vars) == 0:
+            # This layout dim is index-selected by a gather/scatter index
+            # symbol (e.g. `tmp0`).  Raise for anything else — a constant
+            # or unexpected coord should not be silently skipped.
+            sym = _lone_sym(coord)
+            if sym is not None and is_indirect(sym.name):
+                continue
+            raise Unsupported(
+                f"{dep.name}: layout dim {i} (size {dim_size}) has no loop vars "
+                f"and no indirect index symbol in coord {coord!r} for names {names}"
+            )
         elif len(loop_vars) > len(names):
             # More loop vars than named dims: a single named dim was split by reshape.
             raise Unsupported(
