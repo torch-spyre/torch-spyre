@@ -46,7 +46,6 @@ jobs:
       runner_label: linux
       extra_test_flags: --cpu-compile -vvv -s
       checkout_pytorch: true
-      torch_root: /home/senuser/pytorch
       ref: ${{ inputs.ref || '' }}
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}

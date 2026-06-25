@@ -1180,3 +1180,29 @@ def lower_minimum(x, y):
 )
 def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8ch)
+def lower_qfp8ch(x):
+    """
+    Lower qfp8ch operation - channel-wise FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw

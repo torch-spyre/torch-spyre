@@ -710,7 +710,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # virtual mb=1 row when the op's tensor has only the stick dim.
     mb_sym: Symbol | None = None
     if (
-        DtypeOpTable.is_dtype_op(op_spec.op)
+        (DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch")
         and op_spec.op != IDENTITY_OP
         and op_stick_dim is not None
         and all(d is op_stick_dim for d in op_dim_order)

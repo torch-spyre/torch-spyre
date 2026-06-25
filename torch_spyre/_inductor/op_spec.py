@@ -58,7 +58,6 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    stride_map: list[int] | None = None
     per_tile_fixed: bool = False
     name: str | None = None
 
