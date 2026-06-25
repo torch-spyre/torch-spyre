@@ -40,6 +40,7 @@ from torch_spyre._C import DataFormats
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg
 from torch_spyre._inductor.codegen.unroll import (
     _byte_stride_for_arg,
+    _tile_device_size,
     unroll_loop_specs,
 )
 
@@ -894,6 +895,334 @@ class TestDeviceStrideFormula(unittest.TestCase):
                 expected_addr,
                 f"tile {i}: expected {hex(expected_addr)}, "
                 f"got {hex(copy_op.args[0].allocation['hbm'])}",
+            )
+
+
+class TestTileDeviceSize(unittest.TestCase):
+    """Unit tests for _tile_device_size covering all key tiling patterns.
+
+    The function computes the device_size that describes the tile geometry
+    after loop unrolling.  The key invariant: device_size[d] may only be
+    shrunk to tile extent when all outer dims d' < d are degenerate (size 1).
+    Shrinking a dimension that contributes to an outer dim's physical row
+    stride corrupts that stride.
+
+    Layout conventions used throughout:
+      col-stick [R, C] fp16:
+        device_size=[C//64, R, 64], device_coordinates=[c1//64, c0, Mod(c1,64)]
+        d=0: sticks_per_row (C//64), outer stride contributor
+        d=1: rows (R), inner stride
+        d=2: within-stick (64)
+      row-stick [R, C] fp16 (after restickify):
+        device_size=[R//64, C, 64], device_coordinates=[c0//64, c1, Mod(c0,64)]
+        d=0: sticks_per_col (R//64), outer stride contributor
+        d=1: cols (C), inner stride
+        d=2: within-stick (64)
+    """
+
+    _C0 = Symbol("c0")
+    _C1 = Symbol("c1")
+    _FP16 = DataFormats.SEN169_FP16
+
+    def _col_stick_arg(self, R: int, C: int) -> TensorArg:
+        """[R, C] fp16 col-stick: device_size=[C//64, R, 64]."""
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=self._FP16,
+            device_size=[C // 64, R, 64],
+            device_coordinates=[self._C1 // 64, self._C0, sympy.Mod(self._C1, 64)],
+            allocation={"hbm": 0},
+        )
+
+    def _row_stick_arg(self, R: int, C: int) -> TensorArg:
+        """[R, C] fp16 row-stick: device_size=[R//64, C, 64]."""
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=self._FP16,
+            device_size=[R // 64, C, 64],
+            device_coordinates=[self._C0 // 64, self._C1, sympy.Mod(self._C0, 64)],
+            allocation={"hbm": 0},
+        )
+
+    # ------------------------------------------------------------------
+    # Col-stick, tile the row dimension (c0).
+    #
+    # BUG case: old code shrank device_size[1] from R to T_ROW, but d=1
+    # has a non-degenerate outer dim at d=0 (C//64 > 1 when C > 64).
+    # The hardware uses device_size[1] as the inter-stick-group row stride;
+    # shrinking it breaks every stick group after the first.
+    # ------------------------------------------------------------------
+
+    def test_col_stick_row_tiling_multi_stick_preserves_d1(self):
+        """Col-stick multi-stick tensor: tiling c0 (rows) must NOT shrink device_size[1].
+
+        [1024, 4096] fp16: device_size=[64, 1024, 64].
+        Tiling c0 by T_ROW=512: tile has 512 rows.
+        device_size[0]=64 > 1 → outer dim is non-degenerate → d=1 must stay at 1024.
+        """
+        R, C, T_ROW = 1024, 4096, 512
+        arg = self._col_stick_arg(R, C)
+        it_space = {self._C0: (Integer(T_ROW), 1), self._C1: (Integer(C), 1)}
+        result = _tile_device_size(arg, [self._C0], it_space)
+        # d=0: c0 has no delta in floor(c1/64) → unchanged
+        self.assertEqual(result[0], C // 64, "sticks_per_row must not change")
+        # d=1: must stay at full R, not shrink to T_ROW
+        self.assertEqual(result[1], R, f"device_size[1] must stay {R}, got {result[1]}")
+        self.assertEqual(result[2], 64, "within-stick size must not change")
+
+    def test_col_stick_row_tiling_single_stick_shrinks_d1(self):
+        """Col-stick single-stick tensor: tiling c0 (rows) MAY shrink device_size[1].
+
+        [1024, 64] fp16: device_size=[1, 1024, 64].
+        device_size[0]=1 → outer dim is degenerate → d=1 may be shrunk to T_ROW.
+        """
+        R, C, T_ROW = 1024, 64, 256
+        arg = self._col_stick_arg(R, C)
+        it_space = {self._C0: (Integer(T_ROW), 1), self._C1: (Integer(C), 1)}
+        result = _tile_device_size(arg, [self._C0], it_space)
+        self.assertEqual(result[0], 1, "single stick group must not change")
+        self.assertEqual(result[1], T_ROW, f"device_size[1] must shrink to {T_ROW}")
+        self.assertEqual(result[2], 64)
+
+    # ------------------------------------------------------------------
+    # Col-stick, tile the column dimension (c1).
+    #
+    # c1 appears in both floor(c1/64) (d=0) and Mod(c1,64) (d=2, the
+    # within-stick coord).  Since c1 is in stick_syms it must be excluded
+    # entirely — device_size is unchanged.
+    # ------------------------------------------------------------------
+
+    def test_col_stick_col_tiling_excluded_as_stick_sym(self):
+        """Col-stick: tiling c1 (the stick symbol) leaves device_size unchanged.
+
+        c1 appears in Mod(c1,64), the within-stick coordinate, so it is a
+        stick symbol and must not affect device_size at all.
+        """
+        R, C, T_COL = 1024, 4096, 1024
+        arg = self._col_stick_arg(R, C)
+        it_space = {self._C0: (Integer(R), 1), self._C1: (Integer(T_COL), 1)}
+        result = _tile_device_size(arg, [self._C1], it_space)
+        self.assertEqual(result, [C // 64, R, 64])
+
+    # ------------------------------------------------------------------
+    # Row-stick, tile the column dimension (c1).
+    #
+    # After restickify, c1 is the non-stick (inner stride) dimension.
+    # device_size=[R//64, C, 64]; d=0 sticks_per_col = R//64.
+    # If R//64 > 1, tiling c1 must not shrink d=1.
+    # ------------------------------------------------------------------
+
+    def test_row_stick_col_tiling_multi_stick_preserves_d1(self):
+        """Row-stick multi-stick tensor: tiling c1 (cols) must NOT shrink device_size[1].
+
+        [1024, 4096] fp16 row-stick: device_size=[16, 4096, 64].
+        Tiling c1 by T_COL=2048: device_size[0]=16 > 1 → d=1 must stay at 4096.
+        """
+        R, C, T_COL = 1024, 4096, 2048
+        arg = self._row_stick_arg(R, C)
+        it_space = {self._C0: (Integer(R), 1), self._C1: (Integer(T_COL), 1)}
+        result = _tile_device_size(arg, [self._C1], it_space)
+        self.assertEqual(result[0], R // 64, "sticks_per_col must not change")
+        self.assertEqual(result[1], C, f"device_size[1] must stay {C}, got {result[1]}")
+        self.assertEqual(result[2], 64)
+
+    def test_row_stick_col_tiling_single_stick_shrinks_d1(self):
+        """Row-stick single-stick tensor: tiling c1 (cols) MAY shrink device_size[1].
+
+        [64, 4096] fp16 row-stick: device_size=[1, 4096, 64].
+        device_size[0]=1 → d=1 may shrink to T_COL.
+        """
+        R, C, T_COL = 64, 4096, 1024
+        arg = self._row_stick_arg(R, C)
+        it_space = {self._C0: (Integer(R), 1), self._C1: (Integer(T_COL), 1)}
+        result = _tile_device_size(arg, [self._C1], it_space)
+        self.assertEqual(result[0], 1)
+        self.assertEqual(result[1], T_COL, f"device_size[1] must shrink to {T_COL}")
+        self.assertEqual(result[2], 64)
+
+    # ------------------------------------------------------------------
+    # Row-stick, tile the row dimension (c0).
+    #
+    # c0 appears in Mod(c0,64), the within-stick coord → c0 in stick_syms.
+    # Must be excluded.
+    # ------------------------------------------------------------------
+
+    def test_row_stick_row_tiling_excluded_as_stick_sym(self):
+        """Row-stick: tiling c0 (the stick symbol) leaves device_size unchanged."""
+        R, C, T_ROW = 1024, 4096, 256
+        arg = self._row_stick_arg(R, C)
+        it_space = {self._C0: (Integer(T_ROW), 1), self._C1: (Integer(C), 1)}
+        result = _tile_device_size(arg, [self._C0], it_space)
+        self.assertEqual(result, [R // 64, C, 64])
+
+    # ------------------------------------------------------------------
+    # 4D layout: batch + col-stick.
+    # device_size=[B, C//64, R, 64]
+    # device_coordinates=[c_b, c1//64, c0, Mod(c1,64)]
+    # ------------------------------------------------------------------
+
+    def test_4d_batch_col_stick_tile_batch_shrinks_d0(self):
+        """4D layout: tiling c_b (batch, d=0) shrinks device_size[0] — no outer dims."""
+        c_b = Symbol("c_b")
+        c0, c1 = self._C0, self._C1
+        B, R, C, T_B = 8, 256, 128, 4
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=self._FP16,
+            device_size=[B, C // 64, R, 64],
+            device_coordinates=[c_b, c1 // 64, c0, sympy.Mod(c1, 64)],
+            allocation={"hbm": 0},
+        )
+        it_space = {
+            c_b: (Integer(T_B), 1),
+            c0: (Integer(R), 1),
+            c1: (Integer(C), 1),
+        }
+        result = _tile_device_size(arg, [c_b], it_space)
+        # d=0: c_b, no outer dims → may shrink to T_B
+        self.assertEqual(result[0], T_B, f"batch dim must shrink to {T_B}")
+        # d=1: c1//64, outer d=0 now has device_size[0]=B > 1 → must not shrink
+        self.assertEqual(result[1], C // 64, "sticks_per_row must not change")
+        self.assertEqual(result[2], R)
+        self.assertEqual(result[3], 64)
+
+    def test_4d_batch_col_stick_tile_col_excluded_as_stick_sym(self):
+        """4D layout: tiling c1 (stick sym) leaves device_size unchanged."""
+        c_b = Symbol("c_b")
+        c0, c1 = self._C0, self._C1
+        B, R, C, T_C = 8, 256, 128, 64
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=self._FP16,
+            device_size=[B, C // 64, R, 64],
+            device_coordinates=[c_b, c1 // 64, c0, sympy.Mod(c1, 64)],
+            allocation={"hbm": 0},
+        )
+        it_space = {
+            c_b: (Integer(B), 1),
+            c0: (Integer(R), 1),
+            c1: (Integer(T_C), 1),
+        }
+        result = _tile_device_size(arg, [c1], it_space)
+        self.assertEqual(result, [B, C // 64, R, 64])
+
+    # ------------------------------------------------------------------
+    # Multiple simultaneously tiled symbols.
+    #
+    # When two non-stick symbols tile independent dimensions, each is
+    # evaluated against the *original* device_size.  Only the outermost
+    # dimension (no non-degenerate outer dims) may shrink per symbol.
+    # ------------------------------------------------------------------
+
+    def test_multi_sym_only_outermost_shrinks(self):
+        """Tiling both c_b and c0 simultaneously: only c_b (d=0) may shrink.
+
+        4D col-stick: device_size=[B, C//64, R, 64].
+        c_b ticks d=0 (no outer non-degenerate dims → may shrink).
+        c0 ticks d=2 (outer d=0 B>1 → must not shrink).
+        """
+        c_b = Symbol("c_b")
+        c0, c1 = self._C0, self._C1
+        B, R, C, T_B, T_R = 8, 512, 256, 4, 128
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=self._FP16,
+            device_size=[B, C // 64, R, 64],
+            device_coordinates=[c_b, c1 // 64, c0, sympy.Mod(c1, 64)],
+            allocation={"hbm": 0},
+        )
+        it_space = {
+            c_b: (Integer(T_B), 1),
+            c0: (Integer(T_R), 1),
+            c1: (Integer(C), 1),
+        }
+        result = _tile_device_size(arg, [c_b, c0], it_space)
+        self.assertEqual(result[0], T_B, f"c_b (d=0) must shrink to {T_B}")
+        self.assertEqual(result[1], C // 64, "sticks_per_row must not change")
+        self.assertEqual(
+            result[2], R, f"c0 (d=2) must stay at {R}: outer d=0 non-degenerate"
+        )
+        self.assertEqual(result[3], 64)
+
+    def test_multi_sym_two_degenerate_outers_both_shrink(self):
+        """Both c_a (d=0) and c0 (d=2) may shrink when outer dims between them are all size 1.
+
+        device_size=[A, 1, R, 64]; d=1 is degenerate.
+        c_a ticks d=0 (no outer → may shrink).
+        c0 ticks d=2; outer check: device_size[0]=A > 1 → may NOT shrink d=2.
+        """
+        c_a = Symbol("c_a")
+        c0, c1 = self._C0, self._C1
+        A, R, C, T_A, T_R = 4, 512, 64, 2, 256
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=self._FP16,
+            device_size=[A, 1, R, 64],
+            device_coordinates=[c_a, Integer(0), c0, sympy.Mod(c1, 64)],
+            allocation={"hbm": 0},
+        )
+        it_space = {
+            c_a: (Integer(T_A), 1),
+            c0: (Integer(T_R), 1),
+            c1: (Integer(C), 1),
+        }
+        result = _tile_device_size(arg, [c_a, c0], it_space)
+        # c_a at d=0: no outer dims → may shrink
+        self.assertEqual(result[0], T_A)
+        self.assertEqual(result[1], 1)
+        # c0 at d=2: device_size[0]=A > 1 → blocked
+        self.assertEqual(result[2], R, f"d=2 must stay at {R}: d=0 has A={A} > 1")
+        self.assertEqual(result[3], 64)
+
+    # ------------------------------------------------------------------
+    # End-to-end unroll: verify device_size on unrolled copies.
+    # This is the regression test for the original bug: a col-stick tensor
+    # with >1 sticks/row tiled over rows must preserve device_size[1].
+    # ------------------------------------------------------------------
+
+    def test_unroll_preserves_device_size1_multi_stick(self):
+        """Unrolled col-stick row-tile copies must carry the full-tensor device_size[1].
+
+        [1024, 4096] fp16: device_size=[64, 1024, 64].  Tile c0 by 512, count=2.
+        All copies must have device_size = [64, 1024, 64], NOT [64, 512, 64].
+        """
+        R, C, T_ROW, COUNT = 1024, 4096, 512, 2
+        c0, c1 = Symbol("c0"), Symbol("c1")
+        base = 0x400000000
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[C // 64, R, 64],
+            device_coordinates=[c1 // 64, c0, sympy.Mod(c1, 64)],
+            allocation={"hbm": base},
+        )
+        op = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                c0: (Integer(T_ROW), 1),
+                c1: (Integer(C), 1),
+            },
+            args=[arg],
+            op_info={},
+            tiled_symbols=[c0],
+        )
+        loop = LoopSpec(count=Integer(COUNT), body=[op])
+        result = unroll_loop_specs([loop])
+        self.assertEqual(len(result), COUNT)
+        for i, copy_op in enumerate(result):
+            ds = copy_op.args[0].device_size
+            self.assertEqual(
+                ds,
+                [C // 64, R, 64],
+                f"tile {i}: device_size must be [{C // 64}, {R}, 64], got {ds}",
             )
 
 
