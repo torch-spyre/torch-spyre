@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import pytest
 import torch
 from torch.testing import assert_close
 from torch.testing._internal.common_utils import (
@@ -159,7 +160,26 @@ class TestIntDispatchFallback(TestCase):
 
     @parametrize(
         "dtype",
-        [torch.int32, torch.int64],
+        [
+            torch.int8,
+            subtest(
+                torch.int16,
+                decorators=[
+                    pytest.mark.skip(
+                        reason=(
+                            "int16 H2D copy aborts in the SDK's "
+                            "sen_data_convert.cpp with 'Unsupported data "
+                            "format types' — the type table advertises "
+                            "SENINT16 but the runtime has no converter for "
+                            "it, so the tensor never reaches dispatch and "
+                            "the CPU fallback can't fire."
+                        )
+                    )
+                ],
+            ),
+            torch.int32,
+            torch.int64,
+        ],
     )
     def test_int_add_matches_cpu(self, dtype):
         a_cpu = torch.arange(16, dtype=dtype)
