@@ -1412,6 +1412,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         if consumer_op is None:
             return {}
+        # A restickify moves the stick dimension, so its per-core read frame and
+        # write frame are transposes of each other. The per-core view comparison
+        # below runs in a single buffer's device-dim frame and cannot see that
+        # cross-frame transpose, so it would wrongly accept a match and pin a
+        # buffer the restickify actually reads/writes across core boundaries
+        # (wholesale-wrong). Treat restickify as a coherence barrier: a buffer a
+        # restickify reads can't be pinned for it (consumer-side), and a
+        # restickify's output can't be a resident producer (producer-side).
+        # Both fall back to HBM, where the restickify is globally correct.
+        if self._get_op_name(consumer_op) == "restickify":
+            return {}
         matches: dict[str, list[tuple[int, int]]] = {}
         consumer_reads = op_read_writes(consumer_op).reads
         for parent in parent_names:
@@ -1422,6 +1433,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             parent_divs = divisions[parent]
             parent_op = op_by_name[parent]
+            if self._get_op_name(parent_op) == "restickify":
+                continue
             write_dep = next(
                 (
                     w
