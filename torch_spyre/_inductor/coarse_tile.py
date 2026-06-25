@@ -117,6 +117,139 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     return []
 
 
+def _hint_key(op: Operation) -> frozenset | None:
+    """Return the frozenset of hint_ids on op, or None if op has no hints."""
+    if not isinstance(op, ComputedBuffer):
+        return None
+    hints = getattr(op, "dim_hints", [])
+    return frozenset(h.hint_id for h in hints) if hints else None
+
+
+def _can_move_before(
+    op: Operation,
+    ops: list[Operation],
+    start: int,
+    end: int,
+) -> bool:
+    """Return True if op (currently at ops[end]) can move to just before ops[start].
+
+    Legal iff neither direction of data-flow is violated:
+      (a) ops[start..end-1] do not read op's output buffer, and
+      (b) op does not read any buffer produced by ops[start..end-1].
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    op_name = op.get_name()
+    op_reads = op.get_read_names()
+    for other in ops[start:end]:
+        if not isinstance(other, ComputedBuffer):
+            continue
+        if op_name in other.get_read_names():
+            return False
+        if other.get_name() in op_reads:
+            return False
+    return True
+
+
+def _can_move_after(
+    op: Operation,
+    ops: list[Operation],
+    start: int,
+    end: int,
+) -> bool:
+    """Return True if op (currently at ops[start]) can move to just after ops[end-1].
+
+    Legal iff ops[start+1..end-1] do not read op's output buffer and op does
+    not read any buffer produced by ops[start+1..end-1].
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    op_name = op.get_name()
+    op_reads = op.get_read_names()
+    for other in ops[start + 1 : end]:
+        if not isinstance(other, ComputedBuffer):
+            continue
+        if op_name in other.get_read_names():
+            return False
+        if other.get_name() in op_reads:
+            return False
+    return True
+
+
+def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
+    """Move unhinted ComputedBuffer ops that interrupt hint-group runs.
+
+    ``hints_to_coarse_tile_groups`` breaks a run whenever it encounters a
+    ComputedBuffer with no hints (or a different hint key).  If such an op
+    could legally be repositioned — either just before the current run's
+    start or just after its end — move it so the run remains unbroken.
+
+    A move is legal when it introduces no new data-flow violation:
+    no op in the skipped range reads the moved op's output, and the
+    moved op reads no buffer produced within the skipped range.
+
+    When both directions are legal the op is moved before the run (closer
+    to its original position).
+    """
+    ops = graph.operations
+    i = 0
+    while i < len(ops):
+        op = ops[i]
+        key = _hint_key(op)
+        if key is None:
+            i += 1
+            continue
+
+        # Collect the maximal contiguous run of ComputedBuffer ops sharing key,
+        # attempting to reorder unhinted interlopers out of the way.
+        run_start = i
+        j = i + 1
+        while j < len(ops):
+            candidate = ops[j]
+            ckey = _hint_key(candidate)
+            if ckey == key:
+                j += 1
+                continue
+            # candidate does not belong to the run.
+            if not isinstance(candidate, ComputedBuffer) or ckey is not None:
+                # Non-ComputedBuffer or differently-hinted op — cannot reorder.
+                break
+            # candidate is an unhinted ComputedBuffer interloper.  Try to move
+            # it before the run start first (preferred: stays closer to its
+            # original position).
+            if _can_move_before(candidate, ops, run_start, j):
+                ops.insert(run_start, ops.pop(j))
+                run_start += 1
+                # j is unchanged: after the rotate, ops[j] is the next op.
+                continue
+            # Try moving after the end of the remaining run.  Find that end.
+            run_end = j + 1
+            while run_end < len(ops) and _hint_key(ops[run_end]) == key:
+                run_end += 1
+            # Only attempt move-after if there are hinted ops to skip over;
+            # if run_end == j + 1 the interloper is already at the run boundary
+            # and inserting at run_end would produce an infinite loop.
+            if run_end > j + 1 and _can_move_after(candidate, ops, j, run_end):
+                ops.insert(run_end, ops.pop(j))
+                # All ops between j and run_end-1 have key; skip past them and
+                # the moved interloper so the outer loop doesn't revisit it.
+                j = run_end
+                break
+            # The interloper cannot be moved in either direction — it has a
+            # data-flow dependency that anchors it between hinted ops that
+            # share the same loop group.  This is a graph structure violation
+            # because hinted ops with the same hint_id must form a contiguous
+            # block (validated later by _validate_contiguous).
+            run_ops = [ops[k].get_name() for k in range(run_start, j)]
+            raise RuntimeError(
+                f"Cannot reorder unhinted op '{candidate.get_name()}': "
+                f"data-flow deps prevent moving it before or after the "
+                f"hint-group run [{', '.join(run_ops)}] "
+                f"(hint_ids={sorted(key)})"
+            )
+        i = j
+
+
 def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
 
