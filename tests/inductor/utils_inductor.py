@@ -559,6 +559,7 @@ def _compile_and_run(
     needs_device=False,
     compile=True,
     source_check=None,
+    dynamic=None,
 ):
     """Compile and execute function on specified device/backend, returning result on CPU."""
     torch._dynamo.reset_code_caches()
@@ -570,7 +571,7 @@ def _compile_and_run(
     device_kwargs = {"device": device} if needs_device else {}
 
     if compile:
-        comp_func = torch.compile(fn, backend=backend)
+        comp_func = torch.compile(fn, backend=backend, dynamic=dynamic)
 
         if source_check is not None and device == "spyre":
             result, source_codes = run_and_get_code(
@@ -629,6 +630,7 @@ def compare_with_cpu(
     run_compile=True,
     source_check=None,
     clone_inputs=False,
+    dynamic=None,
 ):
     """Compare Spyre execution against CPU for one or both Spyre execution paths.
 
@@ -682,6 +684,7 @@ def compare_with_cpu(
                 needs_device=needs_device,
                 compile=compiled,
                 source_check=source_check,
+                dynamic=dynamic,
             )
         )
 

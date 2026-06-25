@@ -15,6 +15,7 @@
 import pytest
 import unittest
 import torch
+import torch.nn.functional as F
 
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -4425,6 +4426,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_avg_pool2d", "test_avg_pool2d_base"): {
+            "ops_dict": {
+                "k2s2": lambda x: F.avg_pool2d(x, kernel_size=2, stride=2),
+                "k4s4": lambda x: F.avg_pool2d(x, kernel_size=4, stride=4),
+            },
+            "param_sets": {
+                "1x3x8x8": (cached_randn((1, 3, 8, 8)),),
+                "1x3x24x24": (cached_randn((1, 3, 24, 24)),),
+                "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
+            },
+        },
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -6217,6 +6229,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert torch.equal(output_cpu, expected_output), (
             f"Bool conversion failed: got {output_cpu.sum().item()}/{64} True, expected {expected_output.sum().item()}/{64}"
         )
+
+    def test_avg_pool2d_base(self, op, x):
+        # CPU reference on NCHW input
+        cpu_ref = op(x)
+        # Spyre input: NCHW → NHWC (contiguous) → Spyre → permute back to NCHW-view
+        # This matches the pattern in examples/test_pool_spyre_3.py: the physical
+        # layout on Spyre is NHWC (Spyre-native), presented as NCHW to the op.
+        torch._dynamo.reset()
+        x_spyre = x.permute(0, 2, 3, 1).contiguous().to("spyre").permute(0, 3, 1, 2)
+        compiled = torch.compile(op, dynamic=False)
+        with torch.no_grad():
+            spyre_out = compiled(x_spyre).cpu()
+        torch.testing.assert_close(spyre_out, cpu_ref, atol=0.1, rtol=0.1)
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
