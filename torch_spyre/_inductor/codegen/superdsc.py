@@ -346,9 +346,12 @@ def _pool_dim_labels(iteration_space: dict, constants: dict) -> list[str]:
         cursor -= 1
     remaining = [i for i in range(n) if labels[i] is None]
     rem_sizes = [sizes[i] for i in remaining]
+    # Search right-to-left so the rightmost equal-sized pair wins.
+    # This ensures (H_out, W_out) is chosen over (N, H_out) when N==H_out
+    # (e.g. k4s4 on 2x3x8x8 gives H_out=2=N=2).
     spatial_pair: tuple | None = None
-    for a in range(len(remaining)):
-        for b in range(a + 1, len(remaining)):
+    for b in range(len(remaining) - 1, 0, -1):
+        for a in range(b - 1, -1, -1):
             if rem_sizes[a] == rem_sizes[b]:
                 spatial_pair = (remaining[a], remaining[b])
                 break
