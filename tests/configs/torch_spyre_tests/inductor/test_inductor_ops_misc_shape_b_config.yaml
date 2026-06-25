@@ -30,6 +30,7 @@ test_suite_config:
             - TestOps::test_transpose_2d.*
             - TestOps::test_transpose_3d.*
             - TestOps::test_transpose_4d.*
+            - TestOps::test_transpose_patterns.*
             # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*

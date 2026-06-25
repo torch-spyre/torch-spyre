@@ -14,9 +14,16 @@
 
 
 import math
+from typing import Any
+
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation
+from torch._inductor.ir import Operation, IRNode, Pointwise
+from torch._inductor.virtualized import V
+from torch._inductor.ops_handler import WrapperHandler
+
+import sympy
+
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import _per_core_view_on_buf
 
@@ -202,3 +209,40 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             num_cores = 1
         result[buf_name] = num_cores
     return result
+
+
+class _GetLoadStoreIndices(WrapperHandler):
+    def __init__(self, inner):
+        super().__init__(inner)
+        self._load_map = {}
+        self._store_map = {}
+
+    def load(self, name: str, index: sympy.Expr):
+        self._load_map[name] = index
+        return super().load(name, index)
+
+    def store(self, name: str, index: sympy.Expr, value: Any, mode: Any = None):
+        self._store_map[name] = index
+        return super().store(name, index, value, mode)
+
+
+def get_load_and_store_indices(
+    pointwise: Pointwise,
+) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr]]:
+    handler = _GetLoadStoreIndices(V.MockHandler())
+    index = [sympy.Symbol(f"index{i}") for i in range(len(pointwise.ranges))]
+    with V.set_ops_handler(handler):
+        pointwise.inner_fn(index)
+    return handler._load_map, handler._store_map
+
+
+def get_op_pointwise_inputs(node: IRNode) -> list[str]:
+    if not isinstance(node, Pointwise):
+        return []
+    loads, stores = get_load_and_store_indices(node)
+
+    return [
+        inp
+        for inp, load_index in loads.items()
+        if all(store_index == load_index for store_index in stores.values())
+    ]

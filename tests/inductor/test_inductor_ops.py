@@ -325,6 +325,159 @@ FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
 
+def _attention_fn(q, k, v, scale=True):
+    d_k = q.size(-1)
+    scores = q @ k.transpose(-2, -1)
+    if scale:
+        scores = scores / (d_k**0.5)
+    attn = scores.softmax(dim=-1)
+    return attn @ v
+
+
+_PATTERN_TOL = {
+    "attn_scaled_dot_product": (1e-2, 1e-1),
+    # Encoder path adds transpose(1,2) after attention; compiled fp16 vs CPU can exceed 1e-2 abs
+    # on ~0.4% of elements (softmax tails / small refs inflate rtol without loosening atol).
+    "transformer_encoder_attention": (1e-1, 5e-1),
+    "transformer_decoder_cross_attention": (1e-1, 1e-1),
+    "vit_attention_cls_token": (1e-2, 1e-1),
+    "pos_encoding_broadcast": (2e-3, 1e-2),
+    # Pure transpose / view+transpose / transpose+contiguous+view.
+    "vit_patch_transpose": (1e-3, 1e-2),
+    "attn_multi_head_split": (1e-3, 1e-2),
+    "attn_head_concat": (1e-3, 1e-2),
+}
+
+
+def _pattern_param_sets():
+    out = {}
+
+    def pair(key, variant, *tensor_args):
+        out[f"{key}_eager"] = (variant, "eager", *tensor_args)
+        out[f"{key}_compiled"] = (variant, "compiled", *tensor_args)
+
+    torch.manual_seed(0xAFFE)
+
+    qa = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
+    ka = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
+    va = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=3)
+    pair("pattern_scaled_dot_product", "attn_scaled_dot_product", qa, ka, va)
+
+    pair(
+        "pattern_multi_head_split",
+        "attn_multi_head_split",
+        cached_randn((2, 128, 512), dtype=torch.float16),
+    )
+    pair(
+        "pattern_head_concat",
+        "attn_head_concat",
+        cached_randn((2, 8, 128, 64), dtype=torch.float16),
+    )
+    pair(
+        "pattern_qkv_split",
+        "attn_qkv_projection",
+        cached_randn((2, 128, 3, 8, 64), dtype=torch.float16),
+    )
+
+    pair("pattern_encoder_attention", "transformer_encoder_attention", qa, ka, va)
+    qd = cached_randn((2, 8, 64, 64), dtype=torch.float16, differentiation=10)
+    kd = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=11)
+    vd = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=12)
+    pair(
+        "pattern_decoder_cross_attention",
+        "transformer_decoder_cross_attention",
+        qd,
+        kd,
+        vd,
+    )
+
+    xpos = cached_randn((2, 128, 512), dtype=torch.float16)
+    pos = cached_randn((128, 512), dtype=torch.float16)
+    pair("pattern_pos_encoding_broadcast", "pos_encoding_broadcast", xpos, pos)
+
+    pair(
+        "pattern_vit_patch_transpose",
+        "vit_patch_transpose",
+        cached_randn((2, 196, 768), dtype=torch.float16),
+    )
+    qv = cached_randn((2, 12, 197, 64), dtype=torch.float16, differentiation=13)
+    kv = cached_randn((2, 12, 197, 64), dtype=torch.float16, differentiation=14)
+    vv = cached_randn((2, 12, 197, 64), dtype=torch.float16, differentiation=15)
+    pair("pattern_vit_cls_attention", "vit_attention_cls_token", qv, kv, vv)
+    return out
+
+
+def _pattern_resolve(variant, args):
+    a = args
+    if variant == "attn_scaled_dot_product":
+        q, k, v = a
+        return (
+            lambda q2, k2, v2: _attention_fn(q2, k2, v2, scale=True),
+            (q, k, v),
+        )
+    if variant == "attn_multi_head_split":
+        (x,) = a
+
+        def _mhsplit(t):
+            b, s, d_model = t.shape
+            num_heads, d_k = 8, 64
+            t2 = t.view(b, s, num_heads, d_k)
+            return t2.transpose(1, 2)
+
+        return _mhsplit, (x,)
+    if variant == "attn_head_concat":
+        (x,) = a
+
+        def _concat(t):
+            t2 = t.transpose(1, 2)
+            b_, seq_len, heads, d_k = t2.shape
+            return t2.contiguous().view(b_, seq_len, heads * d_k)
+
+        return _concat, (x,)
+    if variant == "attn_qkv_projection":
+        (qkv,) = a
+
+        def _split(qkv_tensor):
+            p = qkv_tensor.permute(2, 0, 3, 1, 4)
+            return p[0], p[1], p[2]
+
+        return _split, (qkv,)
+    if variant == "transformer_encoder_attention":
+        q, k, v = a
+
+        def _enc(q2, k2, v2):
+            out = _attention_fn(q2, k2, v2, scale=False)
+            return out.transpose(1, 2)
+
+        return _enc, (q, k, v)
+    if variant == "transformer_decoder_cross_attention":
+        q, k, v = a
+        return (
+            lambda q2, k2, v2: _attention_fn(q2, k2, v2, scale=False),
+            (q, k, v),
+        )
+    if variant == "pos_encoding_broadcast":
+        x, p = a
+        # Transpose to (batch, hidden, seq), add pos encoding in that space, then
+        # transpose back — a real pattern where positional bias is applied channel-first.
+        return (
+            lambda t, u: (t.transpose(1, 2) + u.transpose(0, 1).unsqueeze(0)).transpose(
+                1, 2
+            ),
+            (x, p),
+        )
+    if variant == "vit_patch_transpose":
+        (x,) = a
+        return lambda t: t.transpose(1, 2), (x,)
+    if variant == "vit_attention_cls_token":
+        q, k, v = a
+        return (
+            lambda q2, k2, v2: _attention_fn(q2, k2, v2, scale=True),
+            (q, k, v),
+        )
+    raise ValueError(f"unknown transpose suite variant {variant}")
+
+
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
 
@@ -1033,13 +1186,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         ("test_t_2d", "test_t_2d_cpu"): {
-            "param_sets": make_param_dict(
-                [
-                    ((1088, 320),),
-                    ((320, 320),),
-                    ((49159, 4096),),
-                ]
-            ),
+            "param_sets": {
+                **make_param_dict(
+                    [
+                        ((1088, 320),),
+                        ((320, 320),),
+                        ((49159, 4096),),
+                        ((64, 128),),
+                        ((128, 256),),
+                        ((256, 512),),
+                        ((64, 64),),
+                        ((1, 64),),
+                        ((64, 1),),
+                        ((127, 131),),
+                        ((1, 1),),
+                    ]
+                ),
+                "16x32_f32": (cached_randn((16, 32), dtype=torch.float32),),
+                "16x16_f32": (cached_randn((16, 16), dtype=torch.float32),),
+            },
         },
         ("test_t_2d_contiguous", "test_t_2d_contiguous_cpu"): {
             "param_sets": make_param_dict(
@@ -1049,6 +1214,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((49280, 4096),),
                     ((4096, 49280),),
                     ((49159, 4096),),
+                    ((64, 128),),
+                    ((128, 256),),
+                    ((256, 512),),
+                    ((64, 64),),
+                    ((1, 64),),
+                    ((64, 1),),
+                    ((1, 1),),
                 ]
             ),
             "expect_fail": ["49159x4096"],
@@ -1236,7 +1408,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "dim_1_2": (
                     1,
-                    3,
+                    2,
                     cached_randn((3, 256, 64, 64), abs=True),
                 ),
                 "dim_0_1": (
@@ -1265,7 +1437,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "dim_1_2": (
                     1,
-                    3,
+                    2,
                     cached_randn((3, 256, 64, 64), abs=True),
                 ),
                 "dim_0_1": (
@@ -1465,9 +1637,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_1_0": ((2, 3), (1, 0)),
                 "4d_0_2_1_3": ((2, 3, 16, 64), (0, 2, 1, 3)),
                 "3d_0_2_1": ((2, 1024, 844), (0, 2, 1)),
+                "3d_021_common": (
+                    (64, 128, 256),
+                    (0, 2, 1),
+                ),
+                "3d_210": ((64, 128, 256), (2, 1, 0)),
+                "3d_102": ((64, 128, 256), (1, 0, 2)),
+                "3d_201": ((64, 128, 256), (2, 0, 1)),
+                "3d_120": ((64, 128, 256), (1, 2, 0)),
+                "4d_attn_0213": (
+                    (2, 8, 128, 64),
+                    (0, 2, 1, 3),
+                ),
+                "4d_attn_0132": (
+                    (2, 8, 128, 64),
+                    (0, 1, 3, 2),
+                ),
+                "4d_attn_0231": (
+                    (2, 8, 128, 64),
+                    (0, 2, 3, 1),
+                ),
+                "4d_attn_2013": (
+                    (2, 8, 128, 64),
+                    (2, 0, 1, 3),
+                ),
+                "3d_stick_large": (
+                    (64, 128, 192),
+                    (0, 2, 1),
+                ),
+                "3d_stick_small": (
+                    (16, 32, 48),
+                    (0, 2, 1),
+                ),
+                "sz1_perm_a": ((1, 64, 1), (0, 2, 1)),
+                "sz1_perm_b": ((1, 1, 64), (2, 1, 0)),
+                "prime_perm": ((17, 19, 23), (2, 0, 1)),
                 "4d_0_3_1_2": ((2, 2, 256, 48), (0, 3, 1, 2)),
                 "4d_0_m2_m1_1": ((2, 48, 2, 256), (0, -2, -1, 1)),
                 "5d_0_2_3_4_1": ((2, 48, 2, 256, 265), (0, 2, 3, 4, 1)),
+                "3d_prime_201": ((11, 13, 17), (2, 0, 1)),
+                "3d_prime_120": ((17, 19, 23), (1, 2, 0)),
+                "4d_odd_0213": ((2, 7, 11, 13), (0, 2, 1, 3)),
+                "4d_odd_3120": ((2, 7, 11, 13), (3, 1, 2, 0)),
+                "perm_mixed_signs": (
+                    (2, 5, 7, 11),
+                    (0, -1, -3, -2),
+                ),
             },
         },
         ("test_flatten", "test_flatten_cpu"): {
@@ -4129,6 +4344,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
             },
         },
+        ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
+            "param_sets": _pattern_param_sets(),
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -4934,6 +5152,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
+    def test_relu_inplace(self):
+        """Test in-place ReLU operation on Spyre device."""
+        x = torch.tensor([[-1.0, 2.0], [3.0, -4.0]], device="spyre")
+        x.relu_()
+        expected = torch.tensor([[0.0, 2.0], [3.0, 0.0]])
+        torch.testing.assert_close(x.cpu(), expected)
+
     def test_t_1d_cpu(self, x):
         self.compare_with_cpu(lambda x: x.t(), x)
 
@@ -4971,6 +5196,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return a + b.t()
 
         self.compare_with_cpu(fn, a, b, run_eager=False)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_transpose_patterns_cpu(self, variant, execution_mode, *args):
+        if variant == "attn_qkv_projection":
+            pytest.skip(
+                "Issue #1800: Memory corruption in indexed views of permuted tensors "
+                "(torch-spyre GitHub)"
+            )
+        if variant == "vit_attention_cls_token":
+            pytest.xfail(
+                "Issue #543 (eager): aten::_reshape_alias not implemented in eager mode; "
+                "Issue #1731 (compiled): Spyre SIGABRT in fused_bmm_transpose compilation "
+                "(torch-spyre GitHub)"
+            )
+        if (
+            variant
+            in (
+                "attn_scaled_dot_product",
+                "transformer_encoder_attention",
+                "transformer_decoder_cross_attention",
+            )
+            and execution_mode == "eager"
+        ):
+            pytest.xfail(
+                "Issue #543: aten::_reshape_alias not implemented in eager mode "
+                "(torch-spyre GitHub)"
+            )
+
+        fn, call_args = _pattern_resolve(variant, args)
+        atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
+        compare_with_cpu(
+            fn,
+            *call_args,
+            atol=atol,
+            rtol=rtol,
+            run_compile=(execution_mode == "compiled"),
+            run_eager=(execution_mode == "eager"),
+        )
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend

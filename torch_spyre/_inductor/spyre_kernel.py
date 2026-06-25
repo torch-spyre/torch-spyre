@@ -118,8 +118,6 @@ def _preserve_shared_weight_unit_bmm_dim(
             insert_at = len(arg.device_size) - 1
             arg.device_size.insert(insert_at, 1)
             arg.device_coordinates.insert(insert_at, sympy.S.Zero)
-            if arg.stride_map is not None:
-                arg.stride_map.insert(insert_at, -1)
         unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
@@ -136,8 +134,6 @@ def _preserve_shared_weight_unit_bmm_dim(
         order.append(len(arg.device_size) - 1)
         arg.device_size[:] = [arg.device_size[i] for i in order]
         arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
-        if arg.stride_map is not None and len(arg.stride_map) == len(order):
-            arg.stride_map[:] = [arg.stride_map[i] for i in order]
 
     logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
     return {unit_sym: (sympy.S.One, 1), **it_space}
@@ -510,7 +506,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
-            stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             name=opspec_name,
         )
@@ -968,8 +963,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 + "],"
                             )
                             buf.writeline(f"allocation={arg.allocation!r},")
-                            if arg.stride_map is not None:
-                                buf.writeline(f"stride_map={arg.stride_map!r},")
                             if arg.per_tile_fixed:
                                 buf.writeline("per_tile_fixed=True,")
                             if arg.name is not None:
@@ -992,35 +985,5 @@ def simplify_op_spec(op_spec):
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):
-        old_coords = arg.device_coordinates
-        old_stride_map = arg.stride_map
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
-        # Invariant: stride_map[d] must be the host-element stride for
-        # device dimension d.  align_tensors may reorder device_coordinates
-        # without touching stride_map, breaking this invariant.  Restore it
-        # by remapping each entry: for every new coordinate at position d,
-        # locate the old position that held the same iteration symbol and
-        # carry its stride value forward.
-        if old_stride_map is not None:
-            # Extend if align_tensors added coordinate dimensions, padding
-            # with 0 (those positions will never drive a non-zero delta).
-            new_stride_map = list(old_stride_map) + [0] * max(
-                0, len(arg.device_coordinates) - len(old_stride_map)
-            )
-            old_sym_to_idx = {}
-            for j, coord in enumerate(old_coords):
-                for sym in coord.free_symbols:
-                    old_sym_to_idx.setdefault(sym, j)
-            for d, coord in enumerate(arg.device_coordinates):
-                syms = coord.free_symbols
-                if not syms:
-                    continue
-                j = old_sym_to_idx.get(next(iter(syms)))
-                if j is not None and j < len(old_stride_map):
-                    new_stride_map[d] = old_stride_map[j]
-            # TODO: consider whether this stick-dim stride preservation should
-            # apply to other op types once another validated case needs it.
-            if SHARED_WEIGHT_UNIT_BMM_INFO_KEY in op_spec.op_info and old_stride_map:
-                new_stride_map[-1] = old_stride_map[-1]
-            arg.stride_map = new_stride_map

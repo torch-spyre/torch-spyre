@@ -95,6 +95,7 @@ register_torch_compile_kernel(
         aten.reciprocal,
         aten.neg,
         aten.relu,
+        aten.relu_,
         aten.rsqrt,
         aten.sigmoid,
         aten._softmax,

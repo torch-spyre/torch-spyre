@@ -16,11 +16,11 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import regex as re
 import torch
 
-from oot_test_constants import (
+from .oot_test_constants import (
     DTYPE_STR_MAP,
     REL_PATH_TOKENS,
 )
-from oot_test_matching import parse_dtype
+from .oot_test_matching import parse_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ def _select_entry_for_variant(
     precedence over config-B entries for identical dtype sets.
     """
     # Deferred imports to avoid circular dependency at module level.
-    from oot_test_matching import extract_dtype_from_name, parse_dtype
+    from .oot_test_matching import extract_dtype_from_name, parse_dtype
 
     if len(entries) == 1:
         return entries[0]

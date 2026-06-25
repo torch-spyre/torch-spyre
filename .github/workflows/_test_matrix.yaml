@@ -134,6 +134,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_copy_back_elision_config.yaml
           - name: Inductor Decomp
             config: torch_spyre_tests/inductor/test_decomp_config.yaml
+          - name: Inductor Fallback Kernel Shapes
+            config: torch_spyre_tests/inductor/test_fallback_kernel_shapes_config.yaml
           - name: Inductor FX Passes
             config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
           - name: Inductor Normalization Scalars
@@ -182,6 +184,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_padding_config.yaml
           - name: Inductor Overwrite
             config: torch_spyre_tests/inductor/test_overwrite.yaml
+          - name: Inductor Propagate Named Dims
+            config: torch_spyre_tests/inductor/test_propagate_named_dims_config.yaml
           - name: Inductor Restickify
             config: torch_spyre_tests/inductor/test_restickify_config.yaml
           - name: Inductor Scratchpad Patterns
@@ -202,6 +206,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           - name: Inductor Work Division Hint
             config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
+          - name: Inductor Tensor Transpose
+            config: torch_spyre_tests/inductor/test_inductor_transpose_edge_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
