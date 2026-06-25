@@ -1,15 +1,15 @@
 name: integration-tests
 
 # ---------------------------------------------------------------------------
-# Triggered by commits in upstream repos (deeptools, flex, etc.) via
+# Triggered by commits in upstream dependant repos (deeptools, flex, etc.) via
 # workflow_dispatch.  Runs the full test matrix against a specified
 # torch-spyre ref so regressions from upstream changes are caught early.
 #
-# Intended caller pattern (from an upstream repo's workflow):
+# Example caller pattern from an upstream repo's workflow:
 #
 #   gh workflow run integration-tests.yaml \
 #     --repo <org>/torch-spyre \
-#     -f triggering_repo=flex \
+#     -f triggering_repo=<repo link to deeptools/flex> \
 #     -f triggering_sha=${{ github.sha }} \
 #     -f rpm_location=... \
 #     -f rpm_names=...
@@ -17,7 +17,7 @@ name: integration-tests
 on:
   workflow_dispatch:
     inputs:
-      # ---- Upstream provenance (for display / traceability) ----------------
+      # ---- Upstream provenance ----------------
       triggering_repo:
         description: Name of the upstream repo that triggered this run (e.g. "deeptools", "flex")
         required: false
@@ -29,7 +29,7 @@ on:
         type: string
         default: ''
 
-      # ---- torch-spyre ref to test ----------------------------------------
+      # ---- torch-spyre ref to test ----------
       ref:
         description: Branch, tag, or SHA of torch-spyre to check out and test
         required: false
@@ -41,7 +41,7 @@ on:
         type: string
         default: ''
 
-      # ---- RPM / image overrides ------------------------------------------
+      # ---- RPM / image overrides ------------------
       rpm_location:
         description: Artifactory location for RPM download
         required: false
@@ -76,26 +76,28 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Print a summary of what triggered this run so it is visible in the UI.
+  # Print a summary of what triggered this run so it is tracked
   # ---------------------------------------------------------------------------
   provenance:
-    name: Log upstream trigger
+    name: Log upstream dependant tool regression trigger
     runs-on: ubuntu-latest
     steps:
       - name: Show trigger info
         run: |
-          echo "## Integration test triggered by upstream change" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Upstream repo   | ${{ inputs.triggering_repo || '(not specified)' }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Upstream commit | ${{ inputs.triggering_sha || '(not specified)' }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| torch-spyre ref | ${{ inputs.ref || github.sha }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| RPM names       | ${{ inputs.rpm_names || '(none)' }} |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Integration test triggered by upstream change"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Upstream repo   | ${{ inputs.triggering_repo || '(not specified)' }} |"
+            echo "| Upstream commit | ${{ inputs.triggering_sha || '(not specified)' }} |"
+            echo "| torch-spyre ref | ${{ inputs.ref || github.sha }} |"
+            echo "| RPM names       | ${{ inputs.rpm_names || '(none)' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Run the full test matrix — identical flags to the "run-tests" job in
-  # torch_spyre_tests.yaml so results are directly comparable.
+  # Run the full test matrix currently same as "run-tests" job in
+  # torch_spyre_tests.yaml
   # ---------------------------------------------------------------------------
   run-tests:
     needs: provenance
@@ -111,10 +113,10 @@ jobs:
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
 
-  # ---------------------------------------------------------------------------
-  # Gate job — mirrors run-spyre-unit-tests in torch_spyre_tests.yaml so
-  # callers can poll a single stable job name for pass/fail.
-  # ---------------------------------------------------------------------------
+  # ----------------------------------------------------------------------------------
+  # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml
+  # so callers can poll a single stable job name for pass/fail.
+  # ----------------------------------------------------------------------------------
   integration-test-result:
     name: Integration test result
     runs-on: ubuntu-latest
