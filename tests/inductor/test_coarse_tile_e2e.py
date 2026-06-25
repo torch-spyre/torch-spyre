@@ -401,10 +401,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         spyre_hint(num_tiles_per_dim={"B": 4}).  sencores=1 avoids
         core-division issues.  The reductions collapse dim 1 (D); the loop
         tiles dim 0 (B), so no tiled dim overlaps with the reduction dim.
+
+        D=256 gives 4 sticks/row, exercising multi-stick address arithmetic
+        under row-tiling.  Narrower shapes (D=64, 1 stick/row) would not
+        catch per-tile device_size bugs that corrupt the inter-stick stride.
         """
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 256, 64
+        B, D = 256, 256
         x = torch.randn(B, D, dtype=torch.float16)
 
         _declare_tensor_dim("B", B)
@@ -714,7 +718,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     def test_hint_softmax_row_tiling(self):
-        """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension."""
+        """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
+
+        NCOL=4096 gives 64 sticks/row.  Row-tiling this shape exercises the
+        multi-stick device_size[1] invariant: a per-tile device_size bug that
+        shrinks the row-stride dimension corrupts all stick groups after the
+        first in each non-first tile.  atol=0.02 is tight enough to catch
+        values from the wrong row (fp16 errors from random inputs exceed 0.5).
+        """
         from torch_spyre._inductor import spyre_hint
 
         NROW, NCOL = 16384, 4096
@@ -728,7 +739,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"NROW": 4}):
                 return torch.softmax(x, dim)
 
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.1, rtol=0.1)
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.02, rtol=0.1)
 
     # ------------------------------------------------------------------
     # Matmul with row-tiling: tile the M dimension of x @ y
@@ -827,9 +838,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
         Regression test for a bug in _byte_stride_for_arg (unroll.py) where
-        align_tensors rewrites device_coordinates but leaves stride_map stale,
-        causing per-tile HBM base addresses to advance by the wrong amount when
-        the tiled dimension is not the outermost host dimension (e.g. H in BHLD).
+        per-tile HBM base addresses advanced by the wrong amount when the tiled
+        dimension was not the outermost host dimension (e.g. H in BHLD).
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -857,6 +867,41 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
+
+    def test_hint_row_tiling_multi_stick_pointwise_correct(self):
+        """Row-tiling a multi-stick pointwise chain produces correct output.
+
+        y = a + b; z = y * c on [1024, 4096] fp16 with num_tiles_per_dim={"A": 2}.
+        This is the minimal reproducer for the _tile_device_size bug: with 64
+        sticks/row, shrinking device_size[1] from 1024 to 512 corrupts the
+        inter-stick-group stride, producing wrong values in the second tile.
+
+        atol=0.01: fp16 (a+b)*c on inputs in [0,1) accumulates ~0.002 rounding
+        error; atol=0.01 clears that comfortably while remaining well below the
+        ~0.1 average error produced by a wrong-address read.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 1024, 4096
+        a = torch.rand(A, B, dtype=torch.float16)
+        b = torch.rand(A, B, dtype=torch.float16)
+        c = torch.rand(A, B, dtype=torch.float16)
+
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+
+        def fn(a, b, c):
+            _name_tensor_dims(a, ["A", "B"])
+            _name_tensor_dims(b, ["A", "B"])
+            _name_tensor_dims(c, ["A", "B"])
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                y = a + b
+                z = y * c
+                return z
+
+        compare_with_cpu(
+            fn, a, b, c, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
 
 
 class TestNamedDimsHint(InductorTestCase):

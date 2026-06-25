@@ -2,3 +2,16 @@ test_suite_config:
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/test_launch_jobplan.py
       unlisted_test_mode: mandatory_success
+      tests:
+        - names:
+            - TestLaunchJobPlan::test_abs_matches_cpu_with_symbols
+            - TestLaunchJobPlan::test_mul_matches_cpu_with_symbols
+          mode: skip
+          tags:
+            - jobplan_symbolic_args
+        - names:
+            - TestLaunchJobPlan::test_abs_matches_cpu_no_symbols
+            - TestLaunchJobPlan::test_mul_matches_cpu_no_symbols
+          mode: mandatory_success
+          tags:
+            - jobplan_no_symbolic_args

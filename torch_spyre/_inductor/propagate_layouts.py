@@ -295,6 +295,30 @@ def _single_arg_op_layout(
             )
             return [stl]
 
+        case spyreop.qfp8ch.default:
+            # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
+            # Propagate the input device layout and rescale for the dtype change,
+            # preserving any padding present in the input STL.
+            elem_arr = ElementArrangement.QFP8CH
+            in_eps = get_elem_in_stick(in_layout.dtype)
+            out_eps = get_elem_in_stick(output.dtype)
+            out_device_size = list(stl.device_size)
+            out_stride_map = list(stl.stride_map)
+            out_device_size[-1] = out_eps
+            for i, s in enumerate(stl.stride_map):
+                if s == in_eps:
+                    out_device_size[i] = stl.device_size[i] * in_eps // out_eps
+                    out_stride_map[i] = out_eps
+                    break
+            return [
+                SpyreTensorLayout(
+                    out_device_size,
+                    out_stride_map,
+                    get_device_dtype(output.dtype),
+                    elem_arr,
+                )
+            ]
+
     in_coords = host_coordinates(in_layout, dep)
     out_coords = host_coordinates(output, output_dep)
     if (
@@ -989,9 +1013,8 @@ def propagate_spyre_tensor_layouts(
 
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
-    # performed to compute the set of possible output SpyreTensorLayouts
-    it = iter(operations)
-    for op in it:
+    # performed to compute the set of possible output SpyreTensorLayouts.
+    for op in operations:
         if op.is_no_op():
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
@@ -1039,9 +1062,15 @@ def propagate_spyre_tensor_layouts(
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
         elif isinstance(op, FallbackKernel):
-            op = next(it, None)
-            if not isinstance(op, MultiOutput):
-                raise RuntimeError("FallbackKernel must be followed by MultiOutput")
+            # FallbackKernel.create in PyTorch produces three cases:
+            #   Case 1 (single tensor)  -> MultiOutputLayout + 1 MultiOutput
+            #   Case 2 (tuple of N)     -> MultiOutputLayout + N MultiOutputs
+            #   Case 3 (void/in-place)  -> NoneLayout       + 0 MultiOutputs
+            # The FallbackKernel itself never carries a real tensor layout
+            # (MultiOutputLayout / NoneLayout both raise from get_layout()).
+            # The trailing MultiOutputs are handled in their own branch below.
+            pass
+        elif isinstance(op, MultiOutput):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreConstantFallback):

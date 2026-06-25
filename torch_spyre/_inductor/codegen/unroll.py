@@ -16,7 +16,10 @@
 
 This module provides ``unroll_loop_specs``, which fully unrolls a
 ``list[OpSpec | LoopSpec]`` tree into a flat list of ``OpSpec`` entries
-with concrete per-iteration addresses baked into each ``TensorArg.allocation``.
+with concrete per-iteration addresses baked into each ``TensorArg.allocation``
+derived from ``device_coordinates`` and ``device_size`` — so args with different tile
+sizes or layouts each get the correct independent advance regardless of
+allocation type (hbm, pool, or lx).
 
 Whether a tensor's address advances per iteration is determined solely by
 ``TensorArg.per_tile_fixed`` (set by ``insert_tiling_propagation``'s use-def
@@ -36,6 +39,7 @@ innermost-first, yielding K×M flat copies with correct combined addresses.
 from __future__ import annotations
 
 import copy
+import math
 
 import sympy
 from sympy import Symbol
@@ -50,17 +54,15 @@ logger = get_inductor_logger("codegen.unroll")
 def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> int:
     """Byte advance per loop iteration for a single TensorArg.
 
-    Computes the byte advance using:
+    Computes the byte advance using device row-major strides derived from
+    device_size:
+        device_stride[d] = prod(device_size[d+1:])
         delta[d] = coord_d(sym=tile_range, others=0) - coord_d(sym=0, others=0)
-        byte_stride = dot(delta, stride_map) * bytes_per_elem
+        byte_stride = dot(delta, device_stride) * bytes_per_elem
 
     This correctly handles non-linear device coordinates such as the stick
     layout's ``floor(c/64)`` and ``Mod(c, 64)`` expressions.
     """
-    assert arg.stride_map is not None, (
-        "_byte_stride_for_arg: TensorArg has no stride_map — "
-        "all TensorArgs reaching the unroller must be constructed with stride_map"
-    )
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
@@ -73,7 +75,8 @@ def _byte_stride_for_arg(arg: TensorArg, tiled_sym: Symbol, tile_range: int) -> 
         delta = at_range - at_zero
         if delta == 0:
             continue
-        total_elem_stride += delta * arg.stride_map[d]
+        device_stride_d = math.prod(arg.device_size[d + 1 :])
+        total_elem_stride += delta * device_stride_d
     return total_elem_stride * num_bytes(arg.device_dtype)
 
 
@@ -90,16 +93,21 @@ def _tile_device_size(
     must keep the full-tensor size so the hardware uses the correct row stride
     when it steps from one row of the tile to the next.
 
-    Concretely: only update ``device_size[d]`` for dimensions whose delta is
-    driven solely by row-like tiled symbols — symbols that do NOT appear in
-    ``device_coordinates[-1]`` (the within-stick coordinate).  The stick
-    column symbol appears in both the sticks-per-row coordinate and the
-    within-stick coordinate, so it is excluded from this update.
+    Two guards determine whether ``device_size[d]`` may be shrunk to the tile
+    extent:
+
+    1. Stick-symbol exclusion: symbols that appear in ``device_coordinates[-1]``
+       (the within-stick coordinate) are column/stick symbols.  Their
+       sticks-per-row dimension encodes the inter-stick-group stride and must
+       not be shrunk.
+
+    2. Outer-dimension guard: ``device_size[d]`` contributes to the physical
+       row stride of every outer dimension ``d' < d`` that has
+       ``device_size[d'] > 1``.  If any such outer dimension exists, shrinking
+       ``device_size[d]`` would corrupt the hardware's stride calculation.
+       Only shrink ``device_size[d]`` when all outer dimensions are degenerate
+       (size 1).
     """
-    assert arg.stride_map is not None, (
-        "_tile_device_size: TensorArg has no stride_map — "
-        "all TensorArgs reaching the unroller must be constructed with stride_map"
-    )
     all_syms: set = set()
     for expr in arg.device_coordinates:
         all_syms |= expr.free_symbols
@@ -120,8 +128,14 @@ def _tile_device_size(
             at_range = int(coord_expr.subs(sub_range))
             at_zero = int(coord_expr.subs(sub_zero))
             delta = at_range - at_zero
-            if delta > 0:
-                result[d] = delta
+            if delta <= 0:
+                continue
+            # Only shrink device_size[d] when all outer dims are degenerate.
+            # A non-degenerate outer dim uses device_size[d] as part of its
+            # physical row stride; shrinking it would corrupt that stride.
+            if any(arg.device_size[d_] > 1 for d_ in range(d)):
+                continue
+            result[d] = delta
     return result
 
 
@@ -262,7 +276,7 @@ def unroll_loop_specs(specs: list) -> list:
     Each ``LoopSpec(count=K, body=[...])`` is replaced by K copies of its
     body.  For each ``TensorArg`` with ``per_tile_fixed=False`` the base
     address is advanced by the per-arg, per-iteration byte offset derived from
-    ``device_coordinates`` and ``stride_map`` — so args with different tile
+    ``device_coordinates`` and ``device_size`` — so args with different tile
     sizes or layouts each get the correct independent advance regardless of
     allocation type (hbm, pool, or lx).
 
