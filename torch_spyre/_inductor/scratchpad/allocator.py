@@ -1384,6 +1384,28 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         return buffers
 
+    def _is_frame_changing_clone(self, op: Operation, buf_name: str) -> bool:
+        """True if ``op`` is a clone whose output ``buf_name`` has an iteration
+        dimension that none of its inputs carry -- i.e. it broadcasts a dim
+        (e.g. GQA broadcasting K/V over the query-group axis). Such a clone reads
+        its input in a different frame than it writes its output, so a per-core
+        slice of the output cannot be produced from a core-local slice of the
+        input; pinning the output mis-addresses (cf. the restickify barrier)."""
+        if self._get_op_name(op) != "clone":
+            return False
+        rw = op_read_writes(op)
+        write = next(
+            (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
+        )
+        if write is None:
+            return False
+        read_syms: set = set()
+        for r in rw.reads:
+            if hasattr(r, "index"):
+                read_syms |= set(r.index.free_symbols)
+        # A write-only free symbol means the clone expands (broadcasts) that dim.
+        return bool(set(write.index.free_symbols) - read_syms)
+
     def _cd_parent_matches(
         self,
         consumer_op: Optional[Operation],
@@ -1434,6 +1456,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             parent_divs = divisions[parent]
             parent_op = op_by_name[parent]
             if self._get_op_name(parent_op) == "restickify":
+                continue
+            if self._is_frame_changing_clone(parent_op, parent):
+                # A clone whose output has a dimension its input lacks
+                # broadcasts that dim (e.g. GQA broadcasting K/V over the
+                # query-group axis): the per-core write of the output reads the
+                # input in a different frame, so a per-core slice of the output
+                # cannot be produced core-locally. Like restickify, this is a
+                # cross-frame barrier the single-frame view comparison misses;
+                # keep the output in HBM (broadcast read is globally correct).
                 continue
             write_dep = next(
                 (
