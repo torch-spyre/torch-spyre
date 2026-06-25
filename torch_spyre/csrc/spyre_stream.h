@@ -54,6 +54,14 @@ class SpyreStream {
 
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
 
+  // Typed flex operation launches. These are the single chokepoint through
+  // which torch-spyre submits work to the underlying flex stream; the raw
+  // flex::RuntimeStream handle never escapes SpyreStream.
+  void launchH2D(flex::DmaParams* params) const;
+  void launchD2H(flex::DmaParams* params) const;
+  void launchCompute(flex::ComputeParams* params) const;
+  void launchHostCallback(flex::HostCallbackParams* params) const;
+
   // Conversions
   c10::Stream unwrap() const;
 

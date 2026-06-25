@@ -212,10 +212,15 @@ void launchKernel(const std::string& code_dir,
   stream.executeProgramAsync(arts, args);
 }
 
+void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
+                   const SpyreStream& stream) {
+  stream.launch(job_plan, args);
+}
+
 void launchJobPlan(const JobPlan& job_plan,
                    const std::vector<at::Tensor>& args) {
   auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
-  stream.launch(job_plan, args);
+  launchJobPlan(job_plan, args, stream);
 }
 
 void clearArtifactCache() {

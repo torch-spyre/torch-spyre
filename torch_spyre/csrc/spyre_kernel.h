@@ -63,6 +63,14 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
 void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args);
 
+// Launch a JobPlan on an explicit stream. The whole plan is submitted to this
+// single stream, preserving cross-step ordering.
+void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
+                   const SpyreStream& stream);
+
+// Launch a JobPlan on the calling thread's current stream. The current stream
+// is resolved exactly once here, at the public boundary, then threaded
+// explicitly into the launch path.
 void launchJobPlan(const JobPlan& job_plan,
                    const std::vector<at::Tensor>& args);
 
