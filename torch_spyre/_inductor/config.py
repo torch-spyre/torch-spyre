@@ -60,6 +60,8 @@ ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 )
 
+ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders
