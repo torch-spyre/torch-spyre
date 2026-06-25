@@ -134,6 +134,14 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
 
+    def _is_pool_buffer(self, buffer: BufferLike) -> bool:
+        layout = buffer.get_layout()
+        return isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation
+
+    def codegen_free_buffer(self, buffer: BufferLike) -> None:
+        if not self._is_pool_buffer(buffer):
+            super().codegen_free_buffer(buffer)
+
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()
         old_name = old.get_name()
