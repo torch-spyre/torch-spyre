@@ -38,6 +38,7 @@ from torch_spyre._inductor.pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     op_read_writes,
+    _is_matmul_op,
     _prepare_per_core_view,
     _per_core_view_from_prep,
 )
@@ -132,7 +133,11 @@ class ScratchpadAllocator(ABC):
         if self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE:
             # If the op is in the whitelist, allow all inputs
             return reads
-        if torch.Tag.pointwise in target.tags:
+        # `tags` is an OpOverload attribute; some origin targets (e.g. builtin
+        # functions behind int64 fallbacks) don't have it. Treat a tag-less
+        # target as not-pointwise rather than crashing. The joint-division path
+        # reaches this for ops the greedy path's _filter_ops drops first.
+        if torch.Tag.pointwise in getattr(target, "tags", ()):
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
             return reads
@@ -1434,9 +1439,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
             # Producer view per candidate on its own output ``parent``. ``None``
             # marks a candidate that cannot host a readable residency: a
-            # partial-reduction write, or an unrepresentable slicing of ``parent``.
+            # partial-reduction write, an unrepresentable slicing of ``parent``,
+            # or a matmul output split across more than one device dim. The SDSC
+            # for a matmul carries only the primary split, so a multi-dim-split
+            # matmul output (e.g. M-split x N-stick-split) cannot be coherently
+            # LX-pinned even when producer/consumer views match -- a consumer
+            # reads per-core LX holding only a fragment (wholesale-wrong). The
+            # broadcast-operand case is already handled by the equal-``cores_used``
+            # requirement on matched pairs below. (Mirrors #2745's
+            # ``get_ncores_for_buffers`` matmul guard for the greedy path.)
+            parent_is_matmul = _is_matmul_op(parent_op)
             prod_views: list[Optional[tuple]] = [
-                view if (repr_ok and not partial) else None
+                view
+                if (
+                    repr_ok
+                    and not partial
+                    and not (parent_is_matmul and len(view.work_slice_dims) > 1)
+                )
+                else None
                 for view, partial, repr_ok in self._views_for_divs(
                     parent_op, write_dep, parent, parent_divs, prep_cache
                 )
