@@ -16,6 +16,7 @@
 #include "spyre_ccl.hpp"
 
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <unordered_map>
@@ -38,8 +39,10 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
     : Backend(rank, size), group_context_(nullptr) {
   DEBUGINFO("# [Spyre CCL]: Constructor for ", getBackendName());
 
-  /* Start the communication library */
-  spyre_comms::initialize_library();
+  /* Start the communication library — guard against ContextAlreadyCreated
+   * when startRuntime() has already initialised the RuntimeContext. */
+  static std::once_flag init_flag;
+  std::call_once(init_flag, spyre_comms::initialize_library);
   group_context_ = spyre_comms::get_world_context();
   if (nullptr == group_context_) {
     std::string _err_msg =
