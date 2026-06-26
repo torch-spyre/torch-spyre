@@ -42,7 +42,7 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
   /* Start the communication library — guard against ContextAlreadyCreated
    * when startRuntime() has already initialised the RuntimeContext. */
   static std::once_flag init_flag;
-  std::call_once(init_flag, spyre_comms::initialize_library);
+  std::call_once(init_flag, []() { spyre_comms::initialize_library(); });
   group_context_ = spyre_comms::get_world_context();
   if (nullptr == group_context_) {
     std::string _err_msg =
