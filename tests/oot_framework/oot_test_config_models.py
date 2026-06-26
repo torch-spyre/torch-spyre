@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 import torch
 from pydantic import BaseModel, field_validator, model_validator  # type: ignore
 
-from oot_test_constants import (
+from .oot_test_constants import (
     _VALID_DTYPE_STRINGS,
     _VALID_INIT_STRATEGIES,
     _VALID_TEST_MODES,
@@ -23,8 +23,8 @@ from oot_test_constants import (
     MODE_XFAIL,
     REL_PATH_TOKENS,
 )
-from oot_test_matching import parse_dtype
-from oot_test_utilities import (
+from .oot_test_matching import parse_dtype
+from .oot_test_utilities import (
     _eval_py_literal,
     _resolve_dtype_str,
     _resolve_tensor_path,
@@ -421,6 +421,21 @@ class InputsEdits(BaseModel):
                     and "cuda" in val
                 ):
                     val = test_device
+                # Handle tuples/lists from YAML (e.g., view/reshape shapes)
+                # If value is a string that looks like a tuple/list, convert it
+                elif isinstance(val, str) and (
+                    val.startswith("(") or val.startswith("[")
+                ):
+                    import ast
+
+                    try:
+                        val = ast.literal_eval(val)
+                    except (ValueError, SyntaxError):
+                        # If conversion fails, keep as string
+                        pass
+                # Tuples and lists are already valid Python values
+                elif isinstance(val, (tuple, list)):
+                    pass
                 cpu_args.append(val)
 
             elif isinstance(arg, InputArgPy):

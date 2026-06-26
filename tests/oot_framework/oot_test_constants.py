@@ -76,8 +76,6 @@ _VALID_INIT_STRATEGIES = {
 
 _VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
 
-# _VALID_UNLISTED_MODES = {"skip", "xfail", "xfail_strict", "mandatory_success"}
-
 # --------------------
 # Dtype defaults
 # --------------------

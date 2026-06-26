@@ -16,6 +16,7 @@ test_suite_config:
             # activations
             - TestOps::test_activation_cls.*
             - TestOps::test_activation_fn.*
+            - TestOps::test_relu_inplace
             # broadcast / scalar arithmetic
             # test_add_broadcast.* covers test_add_broadcast and test_add_broadcast_cpu
             - TestOps::test_add_broadcast.*
