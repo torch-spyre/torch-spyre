@@ -270,7 +270,7 @@ def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
         chunk_large_tensors(graph)
 
 
-@_runs(hints_to_coarse_tile_groups, coarse_tile, reorder_unhinted_interlopers)
+@_runs(reorder_unhinted_interlopers, hints_to_coarse_tile_groups, coarse_tile)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
     if not config.ignore_wsr_hints:
         reorder_unhinted_interlopers(graph)

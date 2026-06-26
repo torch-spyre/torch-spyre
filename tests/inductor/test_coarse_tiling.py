@@ -3476,7 +3476,6 @@ def _make_rui_op(name, reads=(), hint_ids=()):
     """
     from torch._inductor.ir import ComputedBuffer
     from torch_spyre._inductor.propagate_hints import DimHint
-    from torch.utils._ordered_set import OrderedSet
 
     op = MagicMock(spec=ComputedBuffer)
     op.get_name.return_value = name
@@ -3514,7 +3513,6 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
 
     def _run(self, ops):
         from torch_spyre._inductor.coarse_tile import reorder_unhinted_interlopers
-        from types import SimpleNamespace
 
         graph = SimpleNamespace(operations=list(ops))
         reorder_unhinted_interlopers(graph)
