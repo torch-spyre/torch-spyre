@@ -1424,29 +1424,42 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
 
-    # Pass 1: match non-singleton, non-inner-stick device dims to host dims.
-    # Primary key: device_size[j] == old_host_size[p].
-    # When size is ambiguous (two host dims share the same size), use
-    # stride_map[j] == old_contiguous_stride[p] as a tiebreaker.
-    matched_host = {}  # j → p (non-stick matches)
-    unmatched_j = []  # device dims not matched → stick tile-count candidates
+    # Pass 1: match non-inner-stick device dims to host dims.
+    # Two match strategies by device_size:
+    #
+    # * Size-1 device dims (device_size==1): stride_map is -1 (either a sparse
+    #   placeholder or a non-stick dim that was tiled to extent 1).  Match by
+    #   size alone — if exactly one host dim has size 1, claim it.  If zero or
+    #   multiple, push to unmatched_j.
+    #
+    # * Size > 1 device dims: primary key is device_size[j] == old_host_size[p].
+    #   When size is ambiguous (multiple host dims share it), use
+    #   stride_map[j] == contiguous_stride[p] as a tiebreaker.  When exactly one
+    #   host dim has the right size, accept it provisionally; if that provisional
+    #   match turns out to be a tile-count collision (detected in Pass 1b below),
+    #   it will be moved to unmatched_j.
+    matched_host = {}  # j → p (non-stick matches, provisional for size>1)
+    unmatched_j = []  # device dims not matched → tile-count / placeholder
 
     for j in range(ndev - 1):  # j == ndev-1 is always inner stick
         dsz = orig_ds[j]
         if dsz == 1:
-            continue  # singleton / sparse placeholder
-        size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
-        if len(size_cands) == 1:
-            matched_host[j] = size_cands[0]
-        elif len(size_cands) > 1:
-            # Tiebreak by stride_map[j] == contiguous_stride(old_host_size)[p].
-            stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
-            if len(stride_cands) == 1:
-                matched_host[j] = stride_cands[0]
-            else:
-                unmatched_j.append(j)  # ambiguous even with stride
+            size1_cands = [p for p in range(ndim) if old_host_size[p] == 1]
+            if len(size1_cands) == 1:
+                matched_host[j] = size1_cands[0]
+            # else: sparse placeholder (no host dim of size 1) — skip silently.
         else:
-            unmatched_j.append(j)  # no size match → stick tile-count
+            size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
+            if len(size_cands) == 1:
+                matched_host[j] = size_cands[0]  # provisional
+            elif len(size_cands) > 1:
+                stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
+                if len(stride_cands) == 1:
+                    matched_host[j] = stride_cands[0]
+                else:
+                    unmatched_j.append(j)
+            else:
+                unmatched_j.append(j)  # no size match → tile-count
 
     # Identify pstar by elimination: the host dim not claimed by any non-stick
     # device dim match.  Prefer non-singleton host dims first (the stick normally
@@ -1457,6 +1470,34 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     # dimension has been eliminated (e.g. reduction output).  In that case
     # pstar is None and Passes 3 and 4 are skipped — tile-count and inner-stick
     # device dims retain their existing (frozen) values.
+    def _find_pstar(matched):
+        matched_p = set(matched.values())
+        unmatched_all = [p for p in range(ndim) if p not in matched_p]
+        if not unmatched_all:
+            return None, unmatched_all
+        pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
+        if not pstar_cands:
+            pstar_cands = unmatched_all
+        if len(pstar_cands) != 1:
+            return None, unmatched_all  # ambiguous
+        return pstar_cands[0], unmatched_all
+
+    pstar_provisional, _ = _find_pstar(matched_host)
+
+    # Pass 1b: fix provisional size-only matches that are actually tile-count dims.
+    # If a provisionally-matched device dim j has orig_sm[j] != old_hs[p]
+    # (stride mismatch — non-contiguous OR tile-count collision) and its size
+    # equals ceil(old_host_size[pstar_provisional] / eps), it is the tile-count
+    # dim, not a non-stick dim.  Move it to unmatched_j.
+    if pstar_provisional is not None:
+        expected_tc = -(-old_host_size[pstar_provisional] // eps)
+        for j in list(matched_host):
+            p = matched_host[j]
+            if orig_ds[j] > 1 and orig_sm[j] != old_hs[p] and orig_ds[j] == expected_tc:
+                del matched_host[j]
+                unmatched_j.append(j)
+
+    # Re-derive pstar after corrections.
     matched_p = set(matched_host.values())
     unmatched_all = [p for p in range(ndim) if p not in matched_p]
     pstar: int | None
@@ -1473,8 +1514,7 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
         pstar = None
     else:
         pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
-        if len(pstar_cands) == 0:
-            # All unmatched host dims are size-1 singletons; the stick must be one.
+        if not pstar_cands:
             pstar_cands = unmatched_all
         if len(pstar_cands) != 1:
             raise RuntimeError(
@@ -1492,8 +1532,8 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
             new_sm[j] = -1
-        elif orig_sm[j] == old_hs[p]:
-            # Dim p is contiguous: update stride to new contiguous value.
+        elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
+            # Dim p is contiguous, or was a singleton (-1): update stride.
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; leave new_sm[j] = orig_sm[j] (unchanged).
 
@@ -1530,8 +1570,8 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     j = ndev - 1
     if new_host_size[pstar] == 1:
         new_sm[j] = -1
-    elif orig_sm[j] == old_hs[pstar]:
-        # Contiguous stick: update inner-stick stride.
+    elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
+        # Contiguous stick, or was a singleton (-1): update inner-stick stride.
         new_sm[j] = new_hs[pstar]
     # else: non-contiguous stick; leave stride unchanged.
 

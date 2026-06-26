@@ -793,10 +793,10 @@ class TestDivideRanges(unittest.TestCase):
 
         # [2, 2, 2, 16] contiguous, stick on dim3 (last).  host_stride[0]=64
         # equals 64*host_stride[3], so the stick tile-count and a non-stick dim
-        # share a stride_map value; device_size must break the tie.
+        # share a stride_map value; stride check must break the tie.
         op, layout = self._make_ftl_op([2, 2, 2, 16], dim_order=[0, 1, 2, 3])
 
-        # Tile dim0/2: [2,2,2,16] -> [1,2,2,16].
+        # Tile dim0: [2,2,2,16] -> [1,2,2,16].
         _divide_ranges(op, Integer(2), tiled_dims=[0])
 
         expected_strides = [
@@ -806,6 +806,43 @@ class TestDivideRanges(unittest.TestCase):
             [1, 2, 2, 16], expected_strides, torch.float16, [0, 1, 2, 3]
         )
         self.assertEqual(layout.device_layout, expected)
+
+    def test_divide_ranges_tile_count_size_collision(self):
+        """Tile-count device_size equals a non-stick host dim size — the stride
+        check (not size alone) must classify it correctly.
+
+        [2, 128] with stick on dim1: tile-count device_size = ceil(128/64) = 2,
+        which equals old_host_size[0] = 2.  Without the stride check, Pass 1
+        misclassifies the tile-count dim as non-stick and never updates it."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        op, layout = self._make_ftl_op([2, 128], dim_order=[0, 1])
+
+        # Tile dim0: [2, 128] -> [1, 128].
+        _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        expected_strides = [int(s) for s in FlexibleLayout.contiguous_strides([1, 128])]
+        expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_resize_device_layout_grow_from_singleton(self):
+        """_allocate_full_buffer grow path: a device dim tiled to size 1
+        (stride_map != -1) must be grown back on the full-buffer allocation.
+
+        [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
+        update to device_size=4, not remain frozen at 1."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
+        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
+        stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
+        result = _resize_device_layout(stl, [1, 128], [4, 128])
+
+        expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
+        self.assertEqual(result, expected)
 
     def test_resize_device_layout_raises_on_unsupported(self):
         """_resize_device_layout raises RuntimeError when the stick host dim
