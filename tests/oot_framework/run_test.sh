@@ -65,6 +65,15 @@
 
 set -euo pipefail
 
+# Resolve the tests/ directory from this script's own location so that
+# oot_framework is importable as a module even before TORCH_DEVICE_ROOT is
+# resolved later. This is needed for the multi-config merge step below.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_TESTS_DIR="$(dirname "$_SCRIPT_DIR")"
+case ":${PYTHONPATH:-}:" in
+    *":$_SCRIPT_TESTS_DIR:"*) ;;
+    *) export PYTHONPATH="$_SCRIPT_TESTS_DIR:${PYTHONPATH:-}" ;;
+esac
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <config.yaml | config_dir/> [config2.yaml ...] [extra pytest args...]" >&2
