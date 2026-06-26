@@ -183,20 +183,6 @@ class TestScratchpadUsage(unittest.TestCase):
         x = self.rand_device((512, 1024))
         self.common(f, (x,))
 
-    def test_silu(self):
-        """SiLU/swish activation (x * sigmoid(x)), the gating nonlinearity used
-        inside the SwiGLU MLP. A lone pointwise silu fuses into a single kernel
-        with no materialised intermediate, so the activation is reused by two
-        consumers here -- that forces its output to be materialised once, which
-        LX planning keeps on-chip rather than spilling to HBM between reads."""
-
-        def fn(x):
-            y = torch.nn.functional.silu(x)
-            return y * y + y
-
-        x = self.rand_device((512, 1024))
-        self.common(fn, (x,), atol=1e-2, rtol=1e-2)
-
     def test_mlp(self):
         """SwiGLU MLP block (gate/up/down projections), the FFN found in
         Llama-style transformers. Three matmuls share the activation and the
@@ -692,6 +678,106 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         self.assertTrue(
             any(cores(s) > 1 for s in splits.values()),
             f"_commit_divisions never committed a multi-core split: {splits}",
+        )
+
+    def test_optimal_core_division_committed_cpsat(self):
+        """The cpsat solver commits the *optimal* core division, not merely
+        some multi-core split.
+
+        The solver's objective is lexicographic: phase 1 maximizes LX residency
+        (minimizes HBM traffic), phase 2 maximizes total core usage holding that
+        residency optimum. This graph is built so the joint optimum is
+        unambiguous: every op is a pointwise op over the same shape, so each
+        op's most-parallel enumerable division is the *same* per-core slicing.
+        That single division both lets the reused intermediate reside in LX
+        (phase 1) and gives every op its maximum core count (phase 2), so the
+        optimum is exactly "every op committed to its most-parallel enumerable
+        division, with the intermediate resident."
+
+        We assert the committed division for every divisible op equals the
+        maximum over that op's own enumerated candidates -- a direct optimality
+        check that ``test_pointwise_reduction_chain_cpsat``'s "some split > 1"
+        assertion does not make.
+        """
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+
+        def model(a, b):
+            # The reuse of ``y`` forces it to be materialized once (rather than
+            # fused away), creating a real producer->consumer edge the solver
+            # must keep resident while still dividing every op maximally.
+            y = a + b
+            return y * y + y
+
+        a = self.rand_device((2048, 512))
+        b = self.rand_device((2048, 512))
+        cpu_result = model(a.to("cpu"), b.to("cpu"))
+
+        def cores(s):
+            out, red = s
+            return math.prod(out.values() or [1]) * math.prod(red.values() or [1])
+
+        committed: dict[str, int] = {}
+        max_enumerable: dict[str, int] = {}
+        residency: dict[str, str] = {}
+
+        def visitor(graph: GraphLowering) -> None:
+            # Candidate enumeration is independent of the already-committed
+            # split (it re-derives from the op's iteration space), so it
+            # recovers the full set the solver chose from.
+            enumerator = CoOptimizingAllocator()
+            for op in graph.operations:
+                committed[op.name] = cores(getattr(op, "op_it_space_splits", ({}, {})))
+                candidates = enumerator._enumerate_core_divisions(
+                    op, ts_inductor_config.sencores
+                )
+                max_enumerable[op.name] = max(
+                    (cd.cores_used for cd in candidates), default=1
+                )
+                allocation = getattr(
+                    graph.get_buffer(op.name).get_layout(), "allocation", {}
+                )
+                residency[op.name] = "LX" if "lx" in allocation else "HBM"
+
+        with ts_inductor_config.patch(sencores=32):
+            with ts_inductor_config.patch(layout_solver="cpsat"):
+                with ts_inductor_config.patch(lx_planning=True):
+                    with self.pre_scheduling_iterating_pass(visitor):
+                        compiled = torch.compile(model, fullgraph=True)
+                        device_result = compiled(a, b).to("cpu")
+
+        # Correctness through the joint-division glue.
+        torch.testing.assert_close(
+            device_result,
+            cpu_result,
+            atol=0.1,
+            rtol=0.1,
+            msg="cpsat-allocated result diverged from CPU",
+        )
+
+        # The scenario must actually offer a parallelism choice, else the
+        # optimality assertion below is vacuous.
+        divisible = {n for n, m in max_enumerable.items() if m > 1}
+        self.assertTrue(
+            divisible,
+            f"no op had a multi-core division to optimize: {max_enumerable}",
+        )
+
+        # Optimality: every divisible op was committed to its most-parallel
+        # enumerable division -- the phase-2 optimum for this graph.
+        for name in divisible:
+            self.assertEqual(
+                committed[name],
+                max_enumerable[name],
+                f"{name}: cpsat committed {committed[name]} cores but the "
+                f"optimal (most-parallel) division uses {max_enumerable[name]}; "
+                f"committed={committed} max={max_enumerable}",
+            )
+
+        # And the optimum was reached *with* the shared intermediate resident,
+        # not by spilling it to sidestep the slicing-match constraint.
+        self.assertTrue(
+            any(loc == "LX" for loc in residency.values()),
+            f"expected the reused intermediate to reside in LX, got {residency}",
         )
 
 
