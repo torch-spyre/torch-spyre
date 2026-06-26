@@ -30,6 +30,7 @@ _test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_test_dir)
 
 import inductor.test_inductor_ops  # noqa: E402
+from torch_spyre._inductor import config as _lx_config  # noqa: E402
 
 tests_lx_planning_run_skips: bool = (
     os.environ.get("TEST_LX_PLANNING_RUN_SKIPS", "0") == "1"
@@ -147,7 +148,17 @@ INHERITED_TEST_ATTRIBUTES = [
     "_get_single_dim_reduction_invalid_dim_cases",
 ]
 
-POINTWISE_TEST_FAILURES = [
+# Skip-lists for the LX-planning two-op suite, split by scratchpad allocator.
+# The greedy and ILP allocators have different failing sets, so the effective
+# list is an allocator-independent common base plus an allocator-specific delta,
+# selected by config.layout_solver. Refreshed against a full RUN_SKIPS=1 run.
+# Families: flatten / mm_67x67 are a backend partial-stick limitation
+# (Mod(d,K), K<64 unmappable by ddl_conversion; PR #1866); unfold has multi-var
+# stick expressions (d0+d1, 4*d0+d1; issue #2346); unbind / transpose / conv2d
+# are layout/stick-expression op-support gaps.
+# When ILP becomes the only solver, delete the _GREEDY_ONLY_* lists and the
+# selector and fold _ILP_ONLY_* into the common lists.
+_COMMON_POINTWISE_FAILURES = [
     "test_conv2d_1x3x32_ksize3_no_pad",
     "test_conv2d_1x64_ksize3_depthwise",
     "test_conv2d_2x32_ksize1_stride2",
@@ -155,9 +166,6 @@ POINTWISE_TEST_FAILURES = [
     "test_conv2d_mistral_model",
     "test_einsum_einsum_67x255_255x128",
     "test_einsum_einsum_67x256_256x128",
-    # torch.flatten tests - Contiguous access pattern with span of 4 elements
-    # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
-    # support for partially-filled contiguous regions. See PR #1866.
     "test_flatten_2d_full",
     "test_flatten_3d_full",
     "test_flatten_3d_mixed_dims",
@@ -170,19 +178,23 @@ POINTWISE_TEST_FAILURES = [
     "test_flatten_4d_large_full",
     "test_flatten_4d_trailing",
     "test_full_value_1",
-    "test_matmul_matmul_55x2_2x99",
-    "test_matmul_tiled_y",
-    "test_mm_autocast_f16_disabled",
-    "test_mm_autocast_f16_enabled",
-    "test_mm_mm_55x2_2x99",
-    "test_slice_stick_reduce_dim2_amax_3d64_0",
-    "test_slice_stick_reduce_dim2_sum_3d64_0",
-    "test_restickify_add_transpose_10x20_add_transpose",
-    "test_restickify_add_transpose_7x13_add_transpose",
-    "test_restickify_add_transpose_64x129_add_transpose",
-    # unfold: lx_planning cannot handle multi-variable stick expressions produced
-    # by unfold's overlapping/strided access patterns (e.g. d0+d1, 4*d0+d1).
-    # Tracked by issue #2346.
+    "test_slice_stick_reduce_dim1_sum_3d128_01",
+    "test_slice_stick_reduce_dim1_sum_3d64_01",
+    "test_slice_stick_reduce_dim2_sum_3d128_01",
+    "test_transpose_2d_large_dim_0_1",
+    "test_transpose_2d_large_dim_0_1_nopad",
+    "test_transpose_2d_large_dim_0_2",
+    "test_transpose_2d_large_dim_0_2_nopad",
+    "test_unbind_1d_dim0",
+    "test_unbind_2d_dim0",
+    "test_unbind_2d_dim1",
+    "test_unbind_2d_dimneg1",
+    "test_unbind_3d_dim0",
+    "test_unbind_3d_dim1",
+    "test_unbind_3d_dim2",
+    "test_unbind_3d_dimneg1",
+    "test_unbind_4d_dim0",
+    "test_unbind_4d_dim3",
     "test_unfold_1d_large",
     "test_unfold_1d_no_overlap",
     "test_unfold_1d_step1",
@@ -201,9 +213,35 @@ POINTWISE_TEST_FAILURES = [
     "test_unfold_edge_nopad_2d",
     "test_unfold_edge_nopad_37",
     "test_unfold_edge_pow2_64",
+]
+
+_COMMON_REDUCTION_FAILURES = [
     "test_conv2d_1x3x32_ksize3_no_pad",
+    "test_conv2d_1x64_ksize3_depthwise",
+    "test_conv2d_2x32_ksize1_stride2",
+    "test_conv2d_2x3x32_ksize1",
+    "test_conv2d_mistral_model",
+    "test_flatten_2d_full",
+    "test_flatten_3d_full",
+    "test_flatten_3d_leading",
+    "test_flatten_3d_mixed_dims",
+    "test_flatten_3d_neg_dims",
+    "test_flatten_3d_neg_full",
+    "test_flatten_3d_noncontig_full",
+    "test_flatten_3d_noncontig_partial",
+    "test_flatten_3d_trailing",
+    "test_flatten_4d_full",
+    "test_flatten_4d_large_full",
+    "test_flatten_4d_leading",
+    "test_flatten_4d_trailing",
+    "test_full_value_1",
+    "test_pointwise_binary_op_div_67x71x256_67x71x256",
+    "test_t_2d_contiguous_4096x49280",
+    "test_transpose_2d_large_dim_0_1",
+    "test_transpose_2d_large_dim_0_1_nopad",
+    "test_transpose_2d_large_dim_0_2",
+    "test_transpose_2d_large_dim_0_2_nopad",
     "test_unbind_1d_dim0",
-    "test_where_self_out_where_fp16_2d",
     "test_unbind_2d_dim0",
     "test_unbind_2d_dim1",
     "test_unbind_2d_dimneg1",
@@ -213,7 +251,72 @@ POINTWISE_TEST_FAILURES = [
     "test_unbind_3d_dimneg1",
     "test_unbind_4d_dim0",
     "test_unbind_4d_dim3",
+    "test_unfold_1d_large",
+    "test_unfold_1d_no_overlap",
+    "test_unfold_1d_step1",
+    "test_unfold_1d_step2",
+    "test_unfold_2d_dim0",
+    "test_unfold_2d_dim1",
+    "test_unfold_2d_dim_neg",
+    "test_unfold_2d_square",
+    "test_unfold_3d_dim0",
+    "test_unfold_3d_dim1",
+    "test_unfold_3d_dim2",
+    "test_unfold_4d_batch",
+    "test_unfold_4d_cnn",
+    "test_unfold_4d_spatial",
+    "test_unfold_edge_large_step",
+    "test_unfold_edge_nopad_2d",
+    "test_unfold_edge_nopad_37",
+    "test_unfold_edge_pow2_64",
 ]
+
+# Coherence cases the ILP allocator fixes (core-division choice + frame
+# barriers) but the greedy allocator still fails:
+_GREEDY_ONLY_POINTWISE_FAILURES = [
+    "test_matmul_matmul_55x2_2x99",
+    "test_matmul_tiled_y",
+    "test_mm_mm_55x2_2x99",
+]
+
+_GREEDY_ONLY_REDUCTION_FAILURES = [
+    "test_add_alpha_add_alpha_0.5_6x7x12x256_6x7x12x256",
+    "test_add_alpha_add_alpha_2_6x7x12x256_6x7x12x256",
+    "test_add_alpha_add_alpha_neg_6x7x12x256_6x7x12x256",
+    "test_matmul_tiled_y",
+    "test_round_trip_to_dtype_add_float16_to_float32_4x8x128",
+    "test_round_trip_to_dtype_implicit_add_float16_to_float32_4x8x128",
+    "test_slice_add_3d1s0",
+    "test_slice_add_3d1s1",
+    "test_slice_add_3d1s2",
+    "test_slice_add_3d2s0",
+    "test_slice_add_3d2s1",
+    "test_slice_add_3d2s2",
+]
+
+# Fail only under the ILP allocator (e.g. mm_67x67: backend partial-stick on
+# a pinned matmul output):
+_ILP_ONLY_POINTWISE_FAILURES = [
+    "test_mm_mm_67x67_67x67",
+]
+
+_ILP_ONLY_REDUCTION_FAILURES = []
+
+# The joint core-division + LX-placement allocator (CoOptimizingAllocator) is
+# selected by layout_solver == "cpsat" (OR-Tools CP-SAT). The _ILP_ONLY_* /
+# _GREEDY_ONLY_* deltas distinguish that co-optimizing allocator from the
+# greedy/bestfit/firstfit placement-only path.
+_USE_COOPT_FAILURES = _lx_config.layout_solver == "cpsat"
+POINTWISE_TEST_FAILURES = _COMMON_POINTWISE_FAILURES + (
+    _ILP_ONLY_POINTWISE_FAILURES
+    if _USE_COOPT_FAILURES
+    else _GREEDY_ONLY_POINTWISE_FAILURES
+)
+REDUCTION_TEST_FAILURES = _COMMON_REDUCTION_FAILURES + (
+    _ILP_ONLY_REDUCTION_FAILURES
+    if _USE_COOPT_FAILURES
+    else _GREEDY_ONLY_REDUCTION_FAILURES
+)
 
 
 class _LxPlanningTwoOpTestBase(unittest.TestCase):
@@ -296,99 +399,6 @@ _copy_canonical_tests(
     POINTWISE_TEST_FAILURES if not tests_lx_planning_run_skips else None,
     INHERITED_TEST_ATTRIBUTES,
 )
-
-
-REDUCTION_TEST_FAILURES = [
-    "test_addmm_1152_10x1152_1152x1152",
-    "test_addmm_out_basic",
-    "test_alias_operands_cube_67x256",
-    "test_alias_operands_cube_67x71x256",
-    "test_alias_operands_double_67x71x256",
-    "test_alias_operands_triple_67x256",
-    "test_alias_operands_triple_67x71x256",
-    "test_conv2d_1x3x32_ksize3_no_pad",
-    "test_conv2d_1x64_ksize3_depthwise",
-    "test_conv2d_2x32_ksize1_stride2",
-    "test_conv2d_2x3x32_ksize1",
-    "test_conv2d_mistral_model",
-    "test_einsum_einsum_67x255_255x128",
-    # torch.flatten tests - Contiguous access pattern with span of 4 elements
-    # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
-    # support for partially-filled contiguous regions. See PR #1866.
-    "test_flatten_2d_full",
-    "test_flatten_3d_full",
-    "test_flatten_3d_leading",
-    "test_flatten_3d_mixed_dims",
-    "test_flatten_3d_neg_dims",
-    "test_flatten_3d_neg_full",
-    "test_flatten_3d_noncontig_full",
-    "test_flatten_3d_noncontig_partial",
-    "test_flatten_3d_trailing",
-    "test_flatten_4d_full",
-    "test_flatten_4d_large_full",
-    "test_flatten_4d_leading",
-    "test_flatten_4d_trailing",
-    "test_full_value_1",
-    "test_large_matmul_matmul_2d_M2048_K2048_N65536",
-    "test_matmul_tiled_y",
-    "test_mm_autocast_f16_disabled",
-    "test_mm_autocast_f16_enabled",
-    "test_pointwise_binary_op_div_67x256_67x256",
-    "test_pointwise_binary_op_div_67x71x256_67x71x256",
-    "test_pointwise_range_op_clamp_fp16",
-    "test_pointwise_unary_op_reciprocal_67x71x256",
-    "test_round_trip_to_dtype_add_float16_to_float32_4x8x128",
-    "test_scalar_cpu_combined_3d",
-    "test_slice_add_3d1s0",
-    "test_slice_add_3d1s1",
-    "test_slice_add_3d1s2",
-    "test_slice_add_3d2s0",
-    "test_slice_add_3d2s1",
-    "test_slice_add_3d2s2",
-    "test_slice_stick_reduce_dim2_sum_3d64_0",
-    "test_t_2d_49159x4096",
-    "test_t_2d_contiguous_4096x49280",
-    "test_t_2d_contiguous_49280x4096",
-    "test_transpose_2d_large_dim_0_1",
-    "test_transpose_2d_large_dim_0_1_nopad",
-    "test_transpose_2d_large_dim_0_2",
-    "test_transpose_2d_large_dim_0_2_nopad",
-    "test_restickify_add_transpose_10x20_add_transpose",
-    "test_restickify_add_transpose_7x13_add_transpose",
-    "test_restickify_add_transpose_64x129_add_transpose",
-    # unfold: same as POINTWISE — multi-variable stick expressions. Issue #2346.
-    "test_unfold_1d_large",
-    "test_unfold_1d_no_overlap",
-    "test_unfold_1d_step1",
-    "test_unfold_1d_step2",
-    "test_unfold_2d_dim0",
-    "test_unfold_2d_dim1",
-    "test_unfold_2d_dim_neg",
-    "test_unfold_2d_square",
-    "test_unfold_3d_dim0",
-    "test_unfold_3d_dim1",
-    "test_unfold_3d_dim2",
-    "test_unfold_4d_batch",
-    "test_unfold_4d_cnn",
-    "test_unfold_4d_spatial",
-    "test_unfold_edge_large_step",
-    "test_unfold_edge_nopad_2d",
-    "test_unfold_edge_nopad_37",
-    "test_unfold_edge_pow2_64",
-    "test_conv2d_1x3x32_ksize3_no_pad",
-    "test_unbind_1d_dim0",
-    "test_unbind_2d_dim0",
-    "test_unbind_2d_dim1",
-    "test_unbind_2d_dimneg1",
-    "test_unbind_3d_dim0",
-    "test_unbind_3d_dim1",
-    "test_unbind_3d_dim2",
-    "test_unbind_3d_dimneg1",
-    "test_unbind_4d_dim0",
-    "test_unbind_4d_dim3",
-    "test_einsum_einsum_67x256_256x128",
-    "test_t_2d_contiguous_1088x320",
-]
 
 
 class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
