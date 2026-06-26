@@ -28,6 +28,21 @@ common Torch-Spyre use cases.
 | `distributed/gather.py` | Gather collective on Spyre |
 | `distributed/reduce.py` | Reduce collective on Spyre |
 
+## Provenance Audit
+
+A multi-stage audit that traces a model through the compilation pipeline and
+records, at each stage, which source-to-kernel provenance fields are carried or
+dropped ([issue #2574](https://github.com/torch-spyre/torch-spyre/issues/2574)).
+
+```{toctree}
+:maxdepth: 1
+:caption: Provenance Audit
+
+provenance/README
+provenance/provenance_audit
+provenance/provenance_analysis
+```
+
 ## Running an Example
 
 ```bash
