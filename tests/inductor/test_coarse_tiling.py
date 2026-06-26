@@ -825,6 +825,25 @@ class TestDivideRanges(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _resize_device_layout(stl, [1, 1], [1, 1])
 
+    def test_resize_device_layout_reduction_output(self):
+        """Reduction output: stick host dim has been eliminated, so old_host_size
+        has no unmatched dim.  _resize_device_layout must handle this gracefully
+        by leaving the tile-count and inner-stick entries frozen."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
+        # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
+        # frozen at 1 (stick collapsed), inner stick frozen at -1.
+        stl = SpyreTensorLayout([128], [1], torch.float16, [0])
+        # Tile the non-stick dim: [128] -> [64].
+        result = _resize_device_layout(stl, [128], [64])
+
+        # Non-stick device dim (j=1, size 128) updates to size 64, stride 1.
+        # Tile-count (j=0, size 1) and inner stick (j=2, size 64) are frozen.
+        expected = SpyreTensorLayout([64], [1], torch.float16, [0])
+        self.assertEqual(result, expected)
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""

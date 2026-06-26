@@ -1452,22 +1452,40 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     # device dim match.  Prefer non-singleton host dims first (the stick normally
     # has size > 1); fall back to singleton host dims only when every unmatched
     # candidate is a singleton (e.g. a 1-element stick host dim).
+    #
+    # Special case: if all host dims were matched as non-stick dims, the stick
+    # dimension has been eliminated (e.g. reduction output).  In that case
+    # pstar is None and Passes 3 and 4 are skipped — tile-count and inner-stick
+    # device dims retain their existing (frozen) values.
     matched_p = set(matched_host.values())
     unmatched_all = [p for p in range(ndim) if p not in matched_p]
-    pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
-    if len(pstar_cands) == 0:
-        # All unmatched host dims are size-1 singletons; the stick must be one.
-        pstar_cands = unmatched_all
-    if len(pstar_cands) != 1:
-        raise RuntimeError(
-            f"_resize_device_layout: cannot uniquely identify the stick host dim "
-            f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
-            f"unmatched host dims={unmatched_all} "
-            f"(non-singleton candidates={pstar_cands}), "
-            f"non-stick device dims={matched_host}. "
-            f"This layout is not supported by the device-native reconstruction."
-        )
-    pstar = pstar_cands[0]
+    pstar: int | None
+    if not unmatched_all:
+        # Stick host dim eliminated (reduction output): no tile-count or
+        # inner-stick entries to update.
+        if unmatched_j:
+            raise RuntimeError(
+                f"_resize_device_layout: stick host dim is absent from "
+                f"old_host_size={old_host_size} but device dims {unmatched_j} "
+                f"could not be matched as non-stick dims in {orig_stl!r}. "
+                f"This layout is not supported by the device-native reconstruction."
+            )
+        pstar = None
+    else:
+        pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
+        if len(pstar_cands) == 0:
+            # All unmatched host dims are size-1 singletons; the stick must be one.
+            pstar_cands = unmatched_all
+        if len(pstar_cands) != 1:
+            raise RuntimeError(
+                f"_resize_device_layout: cannot uniquely identify the stick host dim "
+                f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
+                f"unmatched host dims={unmatched_all} "
+                f"(non-singleton candidates={pstar_cands}), "
+                f"non-stick device dims={matched_host}. "
+                f"This layout is not supported by the device-native reconstruction."
+            )
+        pstar = pstar_cands[0]
 
     # Pass 2: update device_size and (if contiguous) stride_map for non-stick dims.
     for j, p in matched_host.items():
@@ -1478,6 +1496,13 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
             # Dim p is contiguous: update stride to new contiguous value.
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; leave new_sm[j] = orig_sm[j] (unchanged).
+
+    # Passes 3 and 4 require pstar.  When the stick dim was eliminated (reduction
+    # output), pstar is None and the tile-count / inner-stick entries are frozen.
+    if pstar is None:
+        return SpyreTensorLayout(
+            new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
+        )
 
     # Pass 3: update tile-count device dims (unmatched non-singleton dims).
     for j in unmatched_j:
