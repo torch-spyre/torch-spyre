@@ -3468,11 +3468,12 @@ class TestReductionIdentityValues(unittest.TestCase):
 # ===========================================================================
 
 
-def _make_rui_op(name, reads=(), hint_ids=()):
+def _make_rui_op(name, reads=(), hint_ids=(), mutates=()):
     """Return a fake ComputedBuffer for reorder_unhinted_interlopers tests.
 
     ``reads`` is an iterable of buffer names this op reads.
     ``hint_ids`` is an iterable of hint-id integers; empty means unhinted.
+    ``mutates`` is an iterable of buffer names this op mutates in-place.
     """
     from torch._inductor.ir import ComputedBuffer
     from torch_spyre._inductor.propagate_hints import DimHint
@@ -3480,6 +3481,7 @@ def _make_rui_op(name, reads=(), hint_ids=()):
     op = MagicMock(spec=ComputedBuffer)
     op.get_name.return_value = name
     op.get_read_names.return_value = OrderedSet(reads)
+    op.get_mutation_names.return_value = list(mutates)
     if hint_ids:
         op.dim_hints = [
             DimHint(
@@ -3631,6 +3633,42 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         c = _make_rui_op("c", hint_ids=(0,))
         d = _make_rui_op("d", reads=("x",))  # unhinted, reads x — after run
         self.assertEqual(self._run([a, x, b, c, d]), ["a", "b", "c", "x", "d"])
+
+    def test_interloper_with_unhinted_gap_before_next_hinted(self):
+        # [H, U(reads H), V(unhinted), H2] — run_end must span past V to H2.
+        # Without this fix, run_end collapses to j+1=V and move-after is a
+        # silent no-op that leaves U in place with no error.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a",))  # blocked from moving before
+        v = _make_rui_op("v")  # another unhinted op (no deps)
+        a2 = _make_rui_op("a2", hint_ids=(0,))
+        # v has no deps and moves before the run; x (reads a) cannot move before
+        # but can move after a2 (run_end spans past v to a2).
+        self.assertEqual(self._run([a, x, v, a2]), ["v", "a", "a2", "x"])
+
+    def test_non_contiguous_run_multiple_interlopers(self):
+        # [H, U1(reads H), H2, U2, H3] — U1 cannot move before (reads a);
+        # move-after must span to H3 (the last same-key op), not just H2.
+        # Without the fix U1 moves to between H2 and U2, still splitting [H3].
+        # With the fix: u1 moves after c (run_end spans to c); u2 then moves
+        # before the run; result is one contiguous hinted block [a, b, c].
+        a = _make_rui_op("a", hint_ids=(0,))
+        u1 = _make_rui_op("u1", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        u2 = _make_rui_op("u2")
+        c = _make_rui_op("c", hint_ids=(0,))
+        self.assertEqual(self._run([a, u1, b, u2, c]), ["u2", "a", "b", "c", "u1"])
+
+    def test_mutating_interloper_blocked(self):
+        # x mutates buffer 'a' produced by a hinted op; x cannot legally move
+        # before the run (would run before 'a' is produced) and b reads x so
+        # x cannot move after — should raise RuntimeError.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", mutates=("a",))  # mutation dep on a
+        b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        with self.assertRaises(RuntimeError):
+            self._run([a, x, b, c])
 
 
 if __name__ == "__main__":
