@@ -132,7 +132,10 @@ class ScratchpadAllocator(ABC):
         # because it iterates the _filter_ops view; CoOptimizingAllocator iterates
         # every op, so guard here (get_op_pointwise_inputs returns [] for a
         # non-Pointwise node, including None).
-        return get_op_pointwise_inputs(getattr(op, "data", None))
+        if not getattr(op, "data", None):
+            return []
+        
+        return get_op_pointwise_inputs(op.data)
 
     def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
         core_div_mismatch = get_ncores_for_buffers(graph)
