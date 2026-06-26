@@ -44,11 +44,6 @@ except ValueError:
         allow_module_level=True,
     )
 
-# ------------
-# Temporary hack
-torch.spyre._impl._lazy_init()
-# ------------
-
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
@@ -69,6 +64,12 @@ class TestBroadcast(TestCase):
         # Add 'cpu:gloo' since we want to use the backend as well
         if not dist.is_initialized():
             dist.init_process_group(f"cpu:gloo,spyre:{C10D_BACKEND}")
+
+        # initialize_library() (called inside createSpyreCCLBackend) creates
+        # the RAS RuntimeContext. Ensure the flex runtime is started after
+        # CCL init so flex::initializeRuntime() sees the existing context.
+        if not torch.spyre.is_initialized():
+            torch.spyre._impl._lazy_init()
 
         cls.comm_size = dist.get_world_size()
         cls.comm_rank = dist.get_rank()
