@@ -159,8 +159,10 @@ class TestScratchpadUsage(unittest.TestCase):
         )
 
         atol = kwargs.get("atol", 1e-4)
+        rtol = kwargs.get("rtol", 1e-5)
         self.assertTrue(
-            torch.allclose(cpu_result, device_result, atol=atol), "Results do not match"
+            torch.allclose(cpu_result, device_result, atol=atol, rtol=rtol),
+            "Results do not match",
         )
 
     def common(
@@ -180,6 +182,54 @@ class TestScratchpadUsage(unittest.TestCase):
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
         self.common(f, (x,))
+
+    def test_mlp(self):
+        """SwiGLU MLP block (gate/up/down projections), the FFN found in
+        Llama-style transformers. Three matmuls share the activation and the
+        two projection outputs, so LX planning has reuse to exploit. Uses
+        zero-mean activations and kaiming-initialised weights (rather than the
+        uniform ``rand_device`` helper) so the fp16 matmul accumulations stay
+        in range; fp16 matmul still warrants a relaxed tolerance vs. the
+        pointwise default.
+        """
+        seq_len = 128
+        emb_dim = 256
+        hidden_dim = 4 * emb_dim
+
+        def kaiming(rows, cols):
+            w = torch.empty(rows, cols, dtype=torch.float16)
+            torch.nn.init.kaiming_uniform_(w)
+            return w.to("spyre")
+
+        x = torch.randn(seq_len, emb_dim, dtype=torch.float16).to("spyre")
+        gate = kaiming(emb_dim, hidden_dim)
+        up = kaiming(emb_dim, hidden_dim)
+        down = kaiming(hidden_dim, emb_dim)
+
+        def mlp(x, gate, up, down):
+            gate_out = x @ gate
+            up_out = x @ up
+            swiglu_out = up_out * torch.nn.functional.silu(gate_out)
+            return swiglu_out @ down
+
+        self.common(mlp, (x, gate, up, down), atol=0.1, rtol=0.1)
+
+    def test_scaled_dot_product_attention(self):
+        """4D scaled-dot-product attention via the SDPA decomposition
+        (matmul -> softmax -> matmul). The attention scores and probabilities
+        are large intermediates that LX planning can keep on-chip; fp16 matmul
+        plus softmax warrants a relaxed tolerance.
+        """
+        batch, heads, seq_len, head_dim = 1, 4, 256, 64
+
+        q = self.rand_device((batch, heads, seq_len, head_dim))
+        k = self.rand_device((batch, heads, seq_len, head_dim))
+        v = self.rand_device((batch, heads, seq_len, head_dim))
+
+        def sdpa(q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        self.common(sdpa, (q, k, v), atol=0.1, rtol=0.1)
 
 
 class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
