@@ -745,19 +745,36 @@ def _get_git_sha(repo_root):
 
 
 def _run_file_extractor(extractor, filepath, repo_root):
-    """Run a single-file extractor and normalize its source_file paths.
+    """Run a single-file extractor and normalize the path it was handed.
 
     Extractors read their input via the path they are handed and echo it
-    back as each node's ``source_file``. We pass the absolute path so the
-    read resolves regardless of the current working directory (the docs
-    build runs from docs/source on ReadTheDocs, not the repo root), then
-    rewrite ``source_file`` to be relative to ``repo_root`` for display.
+    back as each node's ``source_file``; ``extract_config`` also bakes that
+    path into the config module node id (and the endpoints of its
+    ``reads_env`` edges). We pass the absolute path so the read resolves
+    regardless of the current working directory (the docs build runs from
+    docs/source on ReadTheDocs, not the repo root), then rewrite the absolute
+    path back to one relative to ``repo_root`` wherever it appears so node
+    ids and ``source_file`` stay stable across build environments.
     """
-    nodes, edges = extractor(str(filepath))
+    abs_path = str(filepath)
+    rel_path = str(Path(filepath).relative_to(repo_root))
+
+    nodes, edges = extractor(abs_path)
+
+    id_remap = {}
     for node in nodes:
-        src = node.get("source_file")
-        if src:
-            node["source_file"] = str(Path(src).relative_to(repo_root))
+        if node.get("source_file"):
+            node["source_file"] = node["source_file"].replace(abs_path, rel_path)
+        if abs_path in node["id"]:
+            new_id = node["id"].replace(abs_path, rel_path)
+            id_remap[node["id"]] = new_id
+            node["id"] = new_id
+
+    for edge in edges:
+        for endpoint in ("source", "target"):
+            if edge.get(endpoint) in id_remap:
+                edge[endpoint] = id_remap[edge[endpoint]]
+
     return nodes, edges
 
 
@@ -861,7 +878,7 @@ def build_graph(torch_spyre_root):
     graph = {
         "metadata": {
             "source_commit": _get_git_sha(repo_root),
-            "torch_spyre_root": str(root),
+            "torch_spyre_root": str(root.relative_to(repo_root)),
         },
         "nodes": list(seen.values()),
         "edges": valid_edges,
