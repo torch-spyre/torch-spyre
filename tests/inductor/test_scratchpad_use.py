@@ -183,6 +183,20 @@ class TestScratchpadUsage(unittest.TestCase):
         x = self.rand_device((512, 1024))
         self.common(f, (x,))
 
+    def test_silu(self):
+        """SiLU/swish activation (x * sigmoid(x)), the gating nonlinearity used
+        inside the SwiGLU MLP. A lone pointwise silu fuses into a single kernel
+        with no materialised intermediate, so the activation is reused by two
+        consumers here -- that forces its output to be materialised once, which
+        LX planning keeps on-chip rather than spilling to HBM between reads."""
+
+        def fn(x):
+            y = torch.nn.functional.silu(x)
+            return y * y + y
+
+        x = self.rand_device((512, 1024))
+        self.common(fn, (x,), atol=1e-2, rtol=1e-2)
+
     def test_mlp(self):
         """SwiGLU MLP block (gate/up/down projections), the FFN found in
         Llama-style transformers. Three matmuls share the activation and the
