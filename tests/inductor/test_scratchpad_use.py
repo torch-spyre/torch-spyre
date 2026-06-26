@@ -39,6 +39,12 @@ except ImportError:
 
 Ts = TypeVarTuple("Ts")
 
+# One buffer's entry in a cpsat allocation fingerprint (keyed by buffer name):
+#   (location, size_bytes, (output_splits, reduction_splits))
+# where each split list is a sorted tuple of (iteration_space_stride, factor).
+_Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
+_AllocEntry = tuple[str, int, _Splits]
+
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
     """torch_spyre._inductor.patches.enable_spyre_context sets
@@ -784,20 +790,24 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[str, int, int]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _AllocEntry]]:
         """Compile ``model`` under the cpsat solver (sencores=32, lx_planning on)
         and return ``(cpu_result, device_result, fingerprint)``.
 
-        The fingerprint is a name-independent signature of the chosen
-        allocation: the sorted list of ``(location, size_bytes, cores)`` over
-        every op, where ``location`` is "LX"/"HBM" and ``cores`` is the product
-        of the committed output/reduction splits. Buffer names (buf0, buf1, ...)
-        are an unstable keying choice, but this profile is deterministic
-        run-to-run, so it can be prescribed exactly.
+        The fingerprint maps each op's buffer name to its
+        ``(location, size_bytes, split)``. ``location`` is "LX"/"HBM"; ``split``
+        is the committed core division as
+        ``((output_splits...), (reduction_splits...))``, each a sorted tuple of
+        ``(iteration_space_stride, factor)`` pairs. We keep the full per-axis
+        split rather than the core-count product so that, e.g., a 32-way split
+        of one axis (``((256, 32),)``) is distinguished from a 4x8 split across
+        two axes (``((64, 8), (16384, 4))``) even though both use 32 cores. The
+        buffer names and the values are both deterministic run-to-run, so the
+        per-buffer allocation can be prescribed exactly.
         """
         cpu_result = model(*(t.to("cpu") for t in args))
 
-        fingerprint: list[tuple[str, int, int]] = []
+        fingerprint: dict[str, _AllocEntry] = {}
 
         def visitor(graph: GraphLowering) -> None:
             fingerprint.clear()
@@ -806,15 +816,12 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
                 out, red = getattr(op, "op_it_space_splits", ({}, {}))
-                cores = math.prod(out.values() or [1]) * math.prod(red.values() or [1])
-                fingerprint.append(
-                    (
-                        "LX" if "lx" in allocation else "HBM",
-                        math.prod(device_layout.device_size[:-1]) * 128,
-                        cores,
-                    )
+                split = (tuple(sorted(out.items())), tuple(sorted(red.items())))
+                fingerprint[op.name] = (
+                    "LX" if "lx" in allocation else "HBM",
+                    math.prod(device_layout.device_size[:-1]) * 128,
+                    split,
                 )
-            fingerprint.sort()
 
         with ts_inductor_config.patch(sencores=32):
             with ts_inductor_config.patch(layout_solver="cpsat"):
@@ -829,7 +836,7 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
-        expected: list[tuple[str, int, int]],
+        expected: dict[str, _AllocEntry],
         atol: float = 0.1,
         rtol: float = 0.1,
     ) -> None:
@@ -838,10 +845,10 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         )
         self.assertEqual(
             fingerprint,
-            sorted(expected),
+            expected,
             "cpsat allocation does not match the prescribed ideal "
-            f"(location, size, cores):\n  expected {sorted(expected)}\n  got      "
-            f"{fingerprint}",
+            "{buf: (location, size, split)}:\n"
+            f"  expected {expected}\n  got      {fingerprint}",
         )
         torch.testing.assert_close(
             device_result,
@@ -855,24 +862,28 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         """softmax(dim=0) over (512, 1024): the two reductions (max, sum) and
         the two pointwise intermediates (exp, the normalised body) all reside in
         LX; only the final pointwise output spills to HBM (it is the graph
-        return value, which the caller holds in HBM). Every op is split 16 ways.
+        return value, which the caller holds in HBM). Every op takes a single
+        16-way split of the stride-1 (column) axis: ``((1, 16),)``.
         """
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
-        expected = [
-            ("HBM", 1048576, 16),
-            ("LX", 2048, 16),
-            ("LX", 2048, 16),
-            ("LX", 1048576, 16),
-            ("LX", 1048576, 16),
-        ]
+        expected = {
+            "buf0": ("LX", 2048, (((1, 16),), ())),
+            "buf1": ("LX", 1048576, (((1, 16),), ())),
+            "buf2": ("LX", 1048576, (((1, 16),), ())),
+            "buf3": ("LX", 2048, (((1, 16),), ())),
+            "buf4": ("HBM", 1048576, (((1, 16),), ())),
+        }
         self._assert_prescribed_allocation(f, (x,), expected)
 
     def test_mlp_prescribed_allocation_cpsat(self):
         """SwiGLU MLP. The three matmul (Reduction) outputs and the down-proj
         result land in HBM -- matmul outputs are not LX-residency eligible -- so
         only the SwiGLU pointwise intermediate (the gate/up product feeding the
-        down projection) resides in LX. Every op is split across all 32 cores.
+        down projection) resides in LX. Every op takes a single 32-way split of
+        one axis: the four hidden-width ops split the stride-1024 axis
+        (``((1024, 32),)``), the down-proj output splits stride-256
+        (``((256, 32),)``).
         """
         seq_len, emb_dim, hidden_dim = 128, 256, 4 * 256
 
@@ -889,13 +900,13 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         def mlp(x, gate, up, down):
             return ((x @ up) * torch.nn.functional.silu(x @ gate)) @ down
 
-        expected = [
-            ("HBM", 65536, 32),
-            ("HBM", 262144, 32),
-            ("HBM", 262144, 32),
-            ("HBM", 262144, 32),
-            ("LX", 262144, 32),
-        ]
+        expected = {
+            "buf0": ("HBM", 262144, (((1024, 32),), ())),
+            "buf1": ("HBM", 262144, (((1024, 32),), ())),
+            "buf2": ("HBM", 262144, (((1024, 32),), ())),
+            "buf3": ("LX", 262144, (((1024, 32),), ())),
+            "buf4": ("HBM", 65536, (((256, 32),), ())),
+        }
         self._assert_prescribed_allocation(mlp, (x, gate, up, down), expected)
 
     def test_sdpa_prescribed_allocation_cpsat(self):
@@ -903,8 +914,14 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         attention-score / probability intermediates of the
         matmul -> softmax -> matmul chain); the matmul (Reduction) outputs, the
         empty constant outputs of the decomposition (SpyreConstantFallback), and
-        the final result spill to HBM. Most ops split 32 ways; the softmax body
-        over the key dimension splits 16 ways.
+        the final result spill to HBM.
+
+        This is the case the split structure (rather than a bare core count)
+        actually matters: the ops use *different* 32-core divisions -- a 4x8
+        split across two axes (``((64, 8), (16384, 4))`` and
+        ``((256, 8), (65536, 4))``) for most of the chain, but a single 32-way
+        split (``((256, 32),)``) for one buffer -- alongside 4x4 = 16-way splits
+        (``((1, 8), (256, 4))`` etc.). The empty constant is undivided.
         """
         batch, heads, seq_len, head_dim = 1, 4, 256, 64
         q = self.rand_device((batch, heads, seq_len, head_dim))
@@ -914,20 +931,20 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         def sdpa(q, k, v):
             return torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
-        expected = [
-            ("HBM", 128, 1),
-            ("HBM", 131072, 16),
-            ("HBM", 131072, 32),
-            ("HBM", 131072, 32),
-            ("HBM", 131072, 32),
-            ("HBM", 524288, 32),
-            ("HBM", 524288, 32),
-            ("LX", 131072, 16),
-            ("LX", 131072, 32),
-            ("LX", 131072, 32),
-            ("LX", 524288, 32),
-            ("LX", 524288, 32),
-        ]
+        expected = {
+            "buf0": ("HBM", 131072, (((64, 8), (16384, 4)), ())),
+            "buf1": ("LX", 131072, (((64, 4), (16384, 4)), ())),
+            "buf2": ("HBM", 524288, (((256, 8), (65536, 4)), ())),
+            "buf3": ("LX", 131072, (((1, 8), (256, 4)), ())),
+            "buf4": ("LX", 524288, (((256, 8), (65536, 4)), ())),
+            "buf5": ("LX", 524288, (((256, 8), (65536, 4)), ())),
+            "buf6": ("LX", 131072, (((1, 8), (256, 4)), ())),
+            "buf7": ("HBM", 524288, (((256, 8), (65536, 4)), ())),
+            "buf8": ("HBM", 131072, (((64, 8), (16384, 4)), ())),
+            "buf9": ("HBM", 131072, (((256, 32),), ())),
+            "buf10": ("HBM", 128, ((), ())),
+            "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
+        }
         self._assert_prescribed_allocation(sdpa, (q, k, v), expected)
 
 
