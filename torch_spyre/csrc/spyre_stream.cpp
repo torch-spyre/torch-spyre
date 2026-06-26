@@ -194,18 +194,15 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
-  // Get the flex runtime stream handle
-  flex::RuntimeStream* flex_stream = resolveRuntimeHandle();
-
-  // Create and launch operation
+  // Create and launch operation through SpyreStream's typed launch methods.
   if (host2device) {
-    flex::DmaParams params(cpu_ptr, device_address->total_size(), host2device,
-                           device_address, std::move(dci_ptr));
-    flex_stream->launchOperationH2D(&params);
+    flex::DmaParams params(cpu_ptr, host2device, device_address,
+                           std::move(dci_ptr));
+    launchH2D(&params);
   } else {
-    flex::DmaParams params(cpu_ptr, device_address->total_size(), host2device,
-                           device_address, std::move(dci_ptr));
-    flex_stream->launchOperationD2H(&params);
+    flex::DmaParams params(cpu_ptr, host2device, device_address,
+                           std::move(dci_ptr));
+    launchD2H(&params);
   }
 }
 
@@ -225,9 +222,23 @@ void SpyreStream::executeProgramAsync(
   flex::ComputeParams params(&ctx->composite_addr, std::move(tensor_allocs),
                              arts.bundle_mlir_path);
 
-  // Get the flex runtime stream handle
-  flex::RuntimeStream* flex_stream = resolveRuntimeHandle();
-  flex_stream->launchOperationCompute(&params);
+  launchCompute(&params);
+}
+
+void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  resolveRuntimeHandle()->launchOperationH2D(params);
+}
+
+void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  resolveRuntimeHandle()->launchOperationD2H(params);
+}
+
+void SpyreStream::launchCompute(flex::ComputeParams* params) const {
+  resolveRuntimeHandle()->launchOperationCompute(params);
+}
+
+void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
+  resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
@@ -241,11 +252,10 @@ void SpyreStream::launch(const JobPlan& plan,
   // Create launch context with tensor arguments
   LaunchContext ctx{args};
 
-  // Each JobPlanStep builds its flex operation params and launches them on the
-  // stream in order. flex owns the RuntimeOperation lifecycle.
-  flex::RuntimeStream* flex_stream = resolveRuntimeHandle();
+  // Each JobPlanStep builds its flex operation params and launches them on
+  // this stream in order. flex owns the RuntimeOperation lifecycle.
   for (const auto& step : plan.steps) {
-    step->construct(ctx, flex_stream);
+    step->construct(ctx, *this);
   }
 }
 
@@ -360,8 +370,10 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   // Create corresponding flex stream handle (if not exists)
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
-    flex::RuntimeStream* flex_handle =
-        runtime->createStream(runtime->toPriority(priority));
+    flex::RuntimeStreamPriority streamPriority =
+        priority < 0 ? flex::RuntimeStreamPriority::HIGH
+                     : flex::RuntimeStreamPriority::NORMAL;
+    flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
