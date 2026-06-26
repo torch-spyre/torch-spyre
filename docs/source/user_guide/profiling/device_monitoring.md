@@ -12,38 +12,28 @@ tool directly — `aiu-smi --help` or `aiu-smi dmon --help`.
 
 ## Install
 
-`aiu-monitor` is published on IBM SWG Artifactory under
-`sys-power-hpc-pypi-local`; access to that repository is required.
-**Wheel versions, package names, Python tags, and supported
-architectures evolve** — always browse the live tree before you copy
-an install command:
+`aiu-monitor` ships as a pre-built wheel from your internal IBM package
+mirror. Ask your Spyre enablement contact for the mirror location and
+access. The steps here describe the install pattern. They do not pin a
+specific URL.
 
-[`aiu-monitor/` on Artifactory](https://na.artifactory.swg-devops.com/ui/repos/tree/General/sys-power-hpc-pypi-local/aiu-monitor)
+Wheel versions, package names, Python tags, and supported architectures
+change over time, so browse the live package index before you copy an
+install command. The wheels are organised as
+`<arch>/{stable,dev}/<version>/<wheel>.whl`. Pick the wheel that matches
+your CPU architecture and the Python version of your venv. The wheel
+filename encodes both (e.g. `ibm_aiu_monitor-...-py312-none-linux_x86_64.whl`).
+Prefer the `stable/` channel. A `dev/` channel exists per arch for
+chasing a fix that has not reached `stable/` yet.
 
-The tree is organised as `<arch>/{stable,dev}/<version>/<wheel>.whl`.
-Pick the wheel that matches your CPU architecture and the Python
-version of your venv — the wheel filename encodes both
-(e.g. `…-py312-none-linux_x86_64.whl`).
-
-The snippet below is **illustrative of the install pattern**, not a
-pinned recipe; the URLs will go stale as new releases land. At the
-time of writing, the latest stable was `1.2.1`:
+Install with the URL or local path your mirror provides, for example:
 
 ```bash
-# x86_64, Python 3.12 — torch-spyre-tagged build
-uv pip install \
-  https://na.artifactory.swg-devops.com/artifactory/sys-power-hpc-pypi-local/aiu-monitor/x86_64/stable/1.2.1/ibm_aiu_monitor-1.2.1+torch.spyre-py312-none-linux_x86_64.whl
-
-# ppc64le, Python 3.9 (no torch-spyre build tag at this version)
-uv pip install \
-  https://na.artifactory.swg-devops.com/artifactory/sys-power-hpc-pypi-local/aiu-monitor/ppc64le/stable/1.2.1/ibm_aiu_monitor-1.2.0-py39-none-linux_ppc64le.whl
+# x86_64, Python 3.12, torch-spyre-tagged build
+uv pip install <mirror>/aiu-monitor/x86_64/stable/<version>/ibm_aiu_monitor-<version>+torch.spyre-py312-none-linux_x86_64.whl
 
 uv pip install psutil
 ```
-
-A `dev/` channel also exists per arch (e.g.
-`ppc64le/dev/latest_ubi10/` for the UBI 10 development build) — use
-it only if you're chasing a fix that hasn't reached `stable/` yet.
 
 ## Two-terminal workflow
 
