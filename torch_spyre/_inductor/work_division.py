@@ -636,6 +636,83 @@ def apply_splits(
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
+def enumerate_work_division_candidates(
+    op: ComputedBuffer,
+    max_cores: int,
+) -> list[dict[Symbol, int]]:
+    """Return every permissible core-division split for ``op``.
+
+    A split (``dict[Symbol, int]``, same form as :func:`apply_splits`) is
+    permissible iff: each per-dim factor divides its dim's size,
+    ``prod(factors) <= max_cores``, every tensor's per-core span
+    ``<= MAX_SPAN_BYTES``, and at most one reduction (K) dim is split. A factor
+    of ``1`` means the dim is unsplit; the all-ones single-core split is
+    included when it is itself permissible.
+
+    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
+    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    """
+    # TODO: Enumerate compute bound ops and for seeds or compute optimized
+    # work division where HBM bandwidth can saturate compute.
+
+    it_space = iteration_space_from_op(op)
+
+    # TOPK reductions run single-core (see divide_reduction_op): the only
+    # permissible "division" is the unsplit one.
+    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
+        return [{v: 1 for v in it_space}]
+
+    input_tds, output_td = collect_tensor_deps(
+        op, get_mem_deps_from_rw(op.get_read_writes())
+    )
+    all_tds = input_tds + [output_td]
+
+    symbol_meta = _collect_symbol_metadata(it_space)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, all_tds, symbol_meta
+    )
+
+    # Reduction (K) dims are the iteration vars absent from the output tensor's
+    # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
+    # no ``>= current_min`` floor (we want the full set, including 1).
+    def factors(v: Symbol) -> list[int]:
+        if v in symbol_meta:
+            basis = symbol_meta[v][1]  # granularity
+        elif v in stick_vars:
+            basis = concretize_expr(it_space_adjusted[v])  # stick count
+        else:
+            basis = concretize_expr(it_space[v])  # element count
+        return [int(s) for s in divisors(basis)]
+
+    def create_splits(axis_vars, combo):
+        return dict(zip(axis_vars, combo))
+
+    def valid_split(splits):
+        if math.prod(splits.values()) > max_cores:  # core budget
+            return False
+        if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
+            return False
+        if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
+            get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
+            for td in all_tds
+        ):
+            return False
+        return True
+
+    vars_ = list(it_space_adjusted.keys())
+    candidates = [
+        splits
+        for combo in itertools.product(*(factors(v) for v in vars_))
+        if valid_split(splits := create_splits(vars_, combo))
+    ]
+
+    return candidates
+
+
 def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
     dim_to_split: dict[str, int] = {}
     for _, hint_dict in sorted(get_op_hints(op).items()):

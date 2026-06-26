@@ -79,6 +79,23 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
+def op_read_writes(op: Operation) -> ReadWrites:
+    """``op.get_read_writes()`` memoized on the op instance.
+
+    ``ComputedBuffer.get_read_writes`` re-runs sympy dependency extraction on
+    every call and is not cached upstream, yet its result does not depend on the
+    only thing the LX planner mutates (``op_it_space_splits``). The scratchpad
+    pass calls it hundreds of times, so we cache it under a private key only this
+    helper reads -- a non-planner caller (e.g. later-pass codegen) still goes
+    through the real method.
+    """
+    rw = op.__dict__.get("_ts_cached_read_writes")
+    if rw is None:
+        rw = op.get_read_writes()
+        op.__dict__["_ts_cached_read_writes"] = rw
+    return rw
+
+
 def concretize_expr(expr: Union[Expr, int]) -> int:
     """Concretize a sympy expression to a Python int.
 
@@ -640,7 +657,7 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
 def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
     """Pre-scheduler version of iteration_space: uses op.get_read_writes() instead
     of SchedulerNode.read_writes."""
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
@@ -1194,82 +1211,146 @@ def _is_matmul_op(op: Operation) -> bool:
 
 # TODO: refactor core assignment so the LX planner consumes determined
 # assignments instead of re-deriving them here.
-def _per_core_view_on_buf(
-    op: Operation,
-    dep: MemoryDep,
-    buf_name: str,
-    cache: Optional[dict] = None,
-) -> tuple[PerCoreView, bool]:
-    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+class _ViewPrep(NamedTuple):
+    """Candidate-invariant precompute shared across every core-division
+    candidate of one ``(op, dep, buf_name)``.
 
-    Returns `(view, has_partial_reduction)`. The flag is True when this
-    op's iteration space contains a reduction split — meaning the
-    producer leaves partial sums on most cores. Callers act on it only
-    for write-deps; a read-dep on a K-split input still has a valid work
-    slice.
-
-    Steps:
-      1. Recover {iter-symbol: split} from op.op_it_space_splits.
-      2. Filter to splits that actually slice this buffer (host_stride
-         != 0 in dep.index).
-      3. Place each remaining split on a device dim via stride lookup,
-         producing work_slice_dims keyed by device-dim index.
-      4. Build the core-to-slot mapping (k_fast-aware) and re-key it
-         by device-dim so it's independent of op-local symbol names.
-
-    Pass an optional `cache` dict to memoize results across calls,
-    keyed by (op.op_it_space_splits, dep, buf_name).
+    Everything here depends only on the op, its dep, and the target buffer (not
+    on ``op.op_it_space_splits``), so ``_prepare_per_core_view`` computes it once
+    and ``_per_core_view_from_prep`` reuses it per candidate -- hoisting the
+    sympy-heavy op-level work out of the per-candidate loop.
     """
-    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    if cache is not None:
-        # dicts aren't hashable; freeze each into a frozenset of items so
-        # the key is hashable and order-independent.
-        out, red = coeff_splits
-        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
-        hit = cache.get(key)
-        if hit is not None:
-            return hit
 
-    # Step 1: recover {iter-symbol: split} from op.op_it_space_splits.
-    # The op-level write_index / read_index (for *any* buffer the op
-    # writes / reads, not necessarily buf_name) bridge stride-keyed
-    # coeff_splits back to scheduler symbols.
-    rw = op.get_read_writes()
-    empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
-    if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = empty_view
-        if cache is not None:
-            cache[key] = result
-        return result
+    iter_space: dict
+    write_index: "sympy.Expr"
+    read_index: "sympy.Expr"
+    # concretize_expr(dep.index.coeff(sym)) over the *full* iteration space, so
+    # the per-candidate path does a dict lookup instead of a sympy .coeff() call.
+    dep_coeff: dict
+    device_size: Any
+    stride_map: Any
+    elems_per_stick: int
+    device_stride_to_dim: dict
+    stick_host_stride: Optional[int]
+    num_stick_dim: Optional[int]
+    num_stick: int
+    num_stick_stride: int
+    is_matmul: bool
+
+
+def _prepare_per_core_view(
+    op: Operation, dep: MemoryDep, buf_name: str
+) -> Optional[_ViewPrep]:
+    """Compute the candidate-invariant pieces of a per-core view once.
+
+    Returns ``None`` when ``buf_name``'s layout is not a ``FixedTiledLayout`` --
+    the view is then unrepresentable for *every* candidate, so callers map
+    ``None`` to the unrepresentable result without entering the per-candidate
+    path.
+    """
+    # The op-level write_index / read_index (for *any* buffer the op writes /
+    # reads, not necessarily buf_name) bridge stride-keyed coeff_splits back to
+    # scheduler symbols.
+    rw = op_read_writes(op)
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads), write_index)
     iter_space = iteration_space_from_op(op)
-    per_sym = apply_splits_from_index_coeff(
-        coeff_splits, write_index, read_index, iter_space
-    )
-
-    # Step 2: keep splits that actually slice this buffer, keyed by
-    # their host stride on buf via dep.index.coeff(sym). host_stride == 0
-    # means the split contracts an axis not present on this buffer
-    # (canonical case: a K-split's output dep) and is dropped from the
-    # geometry. The has_partial_reduction flag is op-level — set whenever
-    # the op has any reduction-axis split — and is independent of which
-    # dep we're inspecting here.
-    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
-    splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
-    for sym, split in per_sym.items():
-        host_stride = concretize_expr(dep.index.coeff(sym))
-        if split <= 1 or host_stride == 0:
-            continue
-        splits_by_stride[host_stride] = (int(split), sym)
 
     buf_layout = V.graph.get_buffer(buf_name).layout
     if not isinstance(buf_layout, FixedTiledLayout):
-        return empty_view
+        return None
     dev_layout = buf_layout.device_layout
     device_size = dev_layout.device_size
     stride_map = dev_layout.stride_map
     elems_per_stick = dev_layout.device_dtype.elems_per_stick()
+
+    # Device-dim placement maps -- depend only on the buffer layout.
+    device_stride_to_dim: dict[int, int] = {}
+    for i, s in enumerate(stride_map):
+        if s <= 0:
+            continue
+        prev = device_stride_to_dim.get(s)
+        if prev is None or device_size[i] != 1:
+            device_stride_to_dim[s] = i
+
+    stick_host_stride, num_stick_dim, num_stick, num_stick_stride = None, None, 0, 0
+    if stride_map[-1] > 0:
+        stick_host_stride = stride_map[-1]
+        num_stick_dim = device_stride_to_dim.get(stick_host_stride * elems_per_stick)
+        if num_stick_dim is not None:
+            num_stick = device_size[num_stick_dim]
+            num_stick_stride = stride_map[num_stick_dim]
+
+    # Per-symbol host stride on this buffer, over the full iteration space.
+    # ``apply_splits_from_index_coeff`` returns a dict keyed by exactly the
+    # iteration-space symbols, so precomputing the coeff for every iter symbol
+    # covers every symbol the per-candidate path can ask for.
+    dep_coeff = {sym: concretize_expr(dep.index.coeff(sym)) for sym in iter_space}
+
+    return _ViewPrep(
+        iter_space=iter_space,
+        write_index=write_index,
+        read_index=read_index,
+        dep_coeff=dep_coeff,
+        device_size=device_size,
+        stride_map=stride_map,
+        elems_per_stick=elems_per_stick,
+        device_stride_to_dim=device_stride_to_dim,
+        stick_host_stride=stick_host_stride,
+        num_stick_dim=num_stick_dim,
+        num_stick=num_stick,
+        num_stick_stride=num_stick_stride,
+        is_matmul=_is_matmul_op(op),
+    )
+
+
+def _per_core_view_from_prep(
+    prep: Optional[_ViewPrep], coeff_splits: tuple[dict, dict]
+) -> tuple[PerCoreView, bool, bool]:
+    """Evaluate a per-core view for one candidate division from a precomputed
+    ``_ViewPrep``. This is the only part that depends on ``coeff_splits``.
+
+    See ``_per_core_view_on_buf`` for the meaning of the returned tuple.
+    """
+    # 3-tuple: (view, has_partial_reduction, representable). ``representable`` is
+    # False only on the give-up returns below (a split that slices this buffer
+    # can't be placed on a device dim); cross-op view comparisons must treat it
+    # as "no match", since its empty view means "couldn't tell", not "whole".
+    unrepresentable = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, False)
+    # No real split -> whole-buffer view, representable regardless of layout. Must
+    # precede the ``prep is None`` guard to match the original ordering.
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+    if prep is None:
+        return unrepresentable
+
+    # Step 1: recover {iter-symbol: split} from the candidate coeff_splits.
+    per_sym = apply_splits_from_index_coeff(
+        coeff_splits, prep.write_index, prep.read_index, prep.iter_space
+    )
+
+    # Step 2: keep splits that actually slice this buffer, keyed by their host
+    # stride on buf (precomputed in ``dep_coeff``). host_stride == 0 means the
+    # split contracts an axis not present on this buffer (canonical case: a
+    # K-split's output dep) and is dropped from the geometry. The
+    # has_partial_reduction flag is op-level -- set whenever the op has any
+    # reduction-axis split -- and is independent of which dep we're inspecting.
+    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
+    splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
+    for sym, split in per_sym.items():
+        host_stride = prep.dep_coeff.get(sym, 0)
+        if split <= 1 or host_stride == 0:
+            continue
+        splits_by_stride[host_stride] = (int(split), sym)
+
+    device_size = prep.device_size
+    stride_map = prep.stride_map
+    device_stride_to_dim = prep.device_stride_to_dim
+    stick_host_stride = prep.stick_host_stride
+    num_stick_dim = prep.num_stick_dim
+    num_stick = prep.num_stick
+    num_stick_stride = prep.num_stick_stride
+    iter_space = prep.iter_space
 
     # Step 3: place each split on a device dim via stride lookup.
     #
@@ -1289,22 +1370,8 @@ def _per_core_view_on_buf(
     # num_stick_dim=dim 0 (stride 64). With M-split×4 (h=128) and N-split×2
     # (h=1), N's h matches stick_host_stride → outer-stick dim 0; M's h=128
     # → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dim: dict[int, int] = {}
-    for i, s in enumerate(stride_map):
-        if s <= 0:
-            continue
-        prev = device_stride_to_dim.get(s)
-        if prev is None or device_size[i] != 1:
-            device_stride_to_dim[s] = i
-
-    stick_host_stride, num_stick_dim, num_stick, num_stick_stride = None, None, 0, 0
-    if stride_map[-1] > 0:
-        stick_host_stride = stride_map[-1]
-        num_stick_dim = device_stride_to_dim.get(stick_host_stride * elems_per_stick)
-        if num_stick_dim is not None:
-            num_stick = device_size[num_stick_dim]
-            num_stick_stride = stride_map[num_stick_dim]
-
+    # ``device_stride_to_dim`` and the stick vars are candidate-invariant and
+    # come from ``prep`` (bound above).
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}
     for h, (split, sym) in sorted(splits_by_stride.items()):
@@ -1349,7 +1416,7 @@ def _per_core_view_on_buf(
                 f"stride_map={stride_map} device_size={device_size}; "
                 f"returning empty_view"
             )
-            return empty_view
+            return unrepresentable
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
 
@@ -1357,7 +1424,7 @@ def _per_core_view_on_buf(
     # uses (_should_use_k_fast_mapping), so K-fast matmul ops compare
     # under the K-cohort-adjacent ordering they will actually emit.
     num_cores = int(math.prod(per_sym.values()))
-    is_matmul = _is_matmul_op(op)
+    is_matmul = prep.is_matmul
     if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
         _mapping_func = _k_fast_core_to_slice_mapping
     else:
@@ -1381,7 +1448,50 @@ def _per_core_view_on_buf(
         work_slice_dims=tuple(sorted(work_slice_dims.items())),
         core_to_slot=tuple(pruned_core_to_slot),
     )
-    result = (view, has_partial_reduction)
+    return (view, has_partial_reduction, True)
+
+
+def _per_core_view_on_buf(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    cache: Optional[dict] = None,
+) -> tuple[PerCoreView, bool, bool]:
+    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+
+    Thin wrapper over ``_prepare_per_core_view`` + ``_per_core_view_from_prep``,
+    reading the candidate division from ``op.op_it_space_splits``. Callers
+    sweeping many candidates of one op/edge should call those two directly to
+    amortize the op-level precompute.
+
+    Returns `(view, has_partial_reduction, representable)`. ``has_partial_reduction``
+    is True when the op has a reduction split (partial sums left on most cores);
+    callers act on it only for write-deps. ``representable`` is False only on the
+    give-up cases (a split that slices this buffer can't be placed on a device
+    dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
+    memoize, keyed by (op.op_it_space_splits, dep, buf_name).
+    """
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if cache is not None:
+        # dicts aren't hashable; freeze each into a frozenset of items so
+        # the key is hashable and order-independent.
+        out, red = coeff_splits
+        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
+    # No real split -> whole-buffer view, representable. Short-circuit before
+    # ``_prepare_per_core_view`` touches ``next(iter(rw.writes)).index``, which a
+    # StarDep write lacks.
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+        if cache is not None:
+            cache[key] = result
+        return result
+
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    result = _per_core_view_from_prep(prep, coeff_splits)
     if cache is not None:
         cache[key] = result
     return result

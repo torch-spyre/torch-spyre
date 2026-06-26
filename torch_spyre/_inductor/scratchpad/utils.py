@@ -25,7 +25,12 @@ from torch._inductor.ops_handler import WrapperHandler
 import sympy
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.pass_utils import _per_core_view_on_buf
+from torch_spyre._inductor.pass_utils import (
+    _per_core_view_on_buf,
+    concretize_expr,
+    op_read_writes,
+)
+from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 
 # Op outputs eligible for LX-pinning. `amax` is the lowered form of
 # `max`; both names are listed to match whichever the IR shows.
@@ -93,7 +98,7 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
     for i, op in enumerate(graph.operations):
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
             if buf_name not in liveness:
@@ -118,11 +123,22 @@ def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
         num_cores = num_cores_per_op.get(buf_name, -1)
-        dev_layout = buf.layout.device_layout
+        rw = op_read_writes(op)
+        layout = buf.layout
+        if isinstance(layout, MutationLayoutSHOULDREMOVE) or not isinstance(
+            op, ComputedBuffer
+        ):
+            mem_usage[buf_name] = {
+                "size": -1,
+                "size_per_core": -1 // num_cores,
+                "core_div_mismatch": num_cores < 0,
+                "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+            }
+            continue
+        dev_layout = layout.device_layout
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick
-        rw = op.get_read_writes()
         mem_usage[buf_name] = {
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
@@ -133,10 +149,64 @@ def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
     return mem_usage
 
 
+def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> bool:
+    """True if any consumer reads less than the whole ``buf_name`` (a sliced,
+    partial, or multi-offset read), or if the footprint can't be proven to
+    cover the full buffer.
+
+    An LX-pinned buffer is addressed by a single base (in SDSC codegen the
+    ``start_address`` is ``layout.allocation["lx"]``); unlike the HBM path, a
+    per-access slice offset is *not* folded into that base, and strided
+    partial reads of a multi-dim buffer mis-address. Both failure modes read
+    less than the full buffer per access:
+
+    - multi-offset: ``x[:, 0:512] + x[:, 512:1024]`` — two half reads that
+      both resolve to the LX base, yielding ``x0 + x0``;
+    - partial slice: ``x[:, :, 0:64]`` — a sub-extent read that mis-addresses
+      the 3D LX buffer.
+
+    Only buffers every consumer reads in full (e.g. ``exp(x) + x``) are safe
+    to LX-pin. We are deliberately conservative: an unprovable (symbolic)
+    footprint is treated as unsafe, costing a missed optimization but never
+    correctness.
+
+    Why a guard and not a codegen fix: the root cause is that the SDSC LX
+    address path (compute_ops._start_addr_data) uses only ``start_address``,
+    dropping the per-access view offset that the HBM path folds in via
+    ``core_idx_to_slice_offset``. It is a codegen gap, not a hardware limit.
+    But folding ``sum(offsets)`` into the LX base only fixes part of it: the
+    view offset interacts with per-core work-slicing (at multi-core the split
+    changes which coordinate is constant vs per-core), so a correct fix must
+    reconcile the view offset with the per-core LX work-slice geometry rather
+    than add a single constant. Until that lands, the guard keeps such buffers
+    in HBM (correct, just unpinned).
+    """
+    layout = getattr(graph.get_buffer(buf_name), "layout", None)
+    # No layout, or a layout without a concrete size (e.g. MultiOutputLayout,
+    # NoneLayout): we cannot prove a full read, so treat as unsafe to pin.
+    size = getattr(layout, "size", None)
+    if size is None:
+        return True
+    try:
+        full = math.prod(int(concretize_expr(s)) for s in size)
+    except (TypeError, ValueError):
+        return True
+    for op in graph.operations:
+        for dep in op.get_read_writes().reads:
+            if dep.name != buf_name:
+                continue
+            try:
+                if int(dep.get_numel()) < full:
+                    return True
+            except (TypeError, ValueError):
+                return True
+    return False
+
+
 def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operation]]:
     buf_users_read_and_write: dict[str, list[Operation]] = {}
     for op in graph.operations:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:  # union of the OrderedSets
             buf = dep.name  # buffer name, i.e. a str
             buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [op]
@@ -155,7 +225,7 @@ def _get_buffer_user_deps(
     """
     buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]] = {}
     for op in graph.operations:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:
             buf_user_deps.setdefault(dep.name, []).append((op, dep))
     return buf_user_deps
@@ -196,10 +266,10 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             ref_view = None
             mismatch = False
             for op, dep in users:
-                view, flag = _per_core_view_on_buf(op, dep, buf_name)
+                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name)
                 if ref_view is None:
                     ref_view = view
-                if (flag and dep in op.get_read_writes().writes) or (view != ref_view):
+                if (flag and dep in op_read_writes(op).writes) or (view != ref_view):
                     mismatch = True
                     break
             num_cores = -1 if mismatch else max(_op_num_cores(op) for op, _ in users)
